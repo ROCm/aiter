@@ -1,30 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL AttnRes prefill kernel for Kimi-K3.
+"""FlyDSL AttnRes prefill kernel for Kimi-K3, on the ``attn_res_gate`` contract.
 
-Each workgroup's wave-aligned size is derived from the hidden size. D=1024
-defaults to one 64-thread row per workgroup. ``flydsl_attn_res(...,
-rows_per_wg=4)`` packs four independent one-wave rows into a 256-thread
-workgroup; idle tail waves skip when ``T`` is not a multiple of four.
-Multi-wave rows always stay at one row per workgroup. Their thread count
-depends on ``T``: at ``T <= num_cus`` D=7168 runs 448 threads per row, and
-above the CU count it runs 256.
-Inputs may be contiguous or have padded leading dimensions when their trailing
-stride is one and their row starts are 16-byte aligned. The kernel reads up to
-eight block sources plus the live prefix, scores sources with RMS-normalized
-keys, and mixes raw values with an online softmax accumulator.
-
-Delta update, canonical append snapshot, and output RMSNorm are independent
-compile-time specializations. ``block_write_idx=-1`` disables the snapshot;
-otherwise it must equal ``num_blocks`` in 0..7, so the current prefix is stored
-in the first unused block slot.
+``flydsl_attn_res`` takes the arguments of Triton ``attn_res_gate`` and returns
+the same outputs. The candidates are the ``B`` rows of ``block_residual`` plus
+the prefix; the prefix candidate is the FP32 sum ``prefix + add_hidden [+
+add_hidden2]``, used unrounded. Scores use RMS-normalized candidates against the
+pre-folded ``score_weight``, and an online softmax mixes the raw values.
 """
 
 # Do not add ``from __future__ import annotations``: FlyDSL inspects annotations
 # at trace time and PEP 563 can interfere with its runtime argument detection.
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -251,33 +241,49 @@ def _resolve_rows_per_wg(row_threads: int, rows_per_wg: int | None) -> int:
     return rows_per_wg
 
 
+@dataclass(frozen=True)
+class _AttnResSpec:
+    """Must hold every compile-time choice: it is the ``_build_attn_res`` cache key."""
+
+    hidden_size: int
+    num_blocks: int
+    has_add: bool
+    has_add2: bool
+    close_block: bool
+    output_norm: bool
+    eps: float
+    output_rms_eps: float
+    scale: float
+    rows_per_wg: int
+    wide_grid: bool
+
+    @property
+    def kernel_name(self) -> str:
+        return (
+            f"{KERNEL_NAME}_d{self.hidden_size}_b{self.num_blocks}"
+            f"_r{self.rows_per_wg}_add{int(self.has_add) + int(self.has_add2)}"
+            f"_close{int(self.close_block)}_onorm{int(self.output_norm)}"
+            f"{'_wide' if self.wide_grid else ''}"
+        )
+
+
 @lru_cache(maxsize=256)
-def _build_attn_res(
-    hidden_size: int,
-    num_blocks: int,
-    eps: float,
-    output_norm_eps: float,
-    has_delta: bool,
-    block_write_idx: int,
-    apply_output_norm: bool,
-    rows_per_wg: int,
-    wide_grid: bool,
-):
+def _build_attn_res(spec: _AttnResSpec):
     """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
+    hidden_size = spec.hidden_size
+    num_blocks = spec.num_blocks
+    has_add = spec.has_add
+    has_add2 = spec.has_add2
+    close_block = spec.close_block
+    output_norm = spec.output_norm
+    eps = spec.eps
+    output_rms_eps = spec.output_rms_eps
+    scale = spec.scale
+    wide_grid = spec.wide_grid
     if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
         raise ValueError(f"D={hidden_size} must be a positive multiple of {_VEC_WIDTH}")
     if not 0 <= num_blocks <= _MAX_BLOCKS:
         raise ValueError(f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
-    if not -1 <= block_write_idx < _MAX_BLOCKS:
-        raise ValueError(
-            f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
-            f"got {block_write_idx}"
-        )
-    if block_write_idx >= 0 and block_write_idx != num_blocks:
-        raise ValueError(
-            "this build only emits the canonical append slot: "
-            f"block_write_idx={block_write_idx}, num_blocks={num_blocks}"
-        )
 
     num_vec = hidden_size // _VEC_WIDTH
     row_threads = _block_threads_for(num_vec)
@@ -288,7 +294,7 @@ def _build_attn_res(
                 f"split into 128-bit tiles plus a 64-bit tail, got D={hidden_size}"
             )
         row_threads = _WIDE_ROW_THREADS
-    rows_per_wg = _resolve_rows_per_wg(row_threads, rows_per_wg)
+    rows_per_wg = _resolve_rows_per_wg(row_threads, spec.rows_per_wg)
     block_threads = row_threads * rows_per_wg
     elems_per_thread = hidden_size // row_threads
     full_tiles = elems_per_thread // _VEC_WIDTH
@@ -300,7 +306,6 @@ def _build_attn_res(
     tiles_per_thread = len(tile_widths)
     red_slots = row_threads // _WARP_SIZE
     num_sources = num_blocks + 1
-    write_block = block_write_idx >= 0
     prefetch = (
         _WIDE_SOURCE_PREFETCH_IN_FLIGHT if wide_grid else _SOURCE_PREFETCH_IN_FLIGHT
     )
@@ -308,9 +313,9 @@ def _build_attn_res(
     prefix_slot = 0 if wide_grid else num_blocks
     first_block_slot = 1 if wide_grid else 0
     # One-wave rows have no cross-wave barrier. Mix-only rows put every source
-    # behind one barrier; rows with delta, snapshot, or output norm are slower
-    # that way at large T.
-    mix_only = not (has_delta or write_block or apply_output_norm)
+    # behind one barrier; rows with adds, block stores, or output norm are
+    # slower that way at large T.
+    mix_only = not (has_add or close_block or output_norm)
     if red_slots == 1:
         group_size = 1
     elif wide_grid:
@@ -333,14 +338,6 @@ def _build_attn_res(
     # offsets 1/2/4/8, so more than 8 waves still uses the wave64 butterfly.
     # Production is 7 (D=7168) or 1 (D=1024, which never enters finish).
     use_dpp_finish = 1 < red_slots <= 8
-    kernel_name = (
-        f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{block_threads}"
-        f"_r{rows_per_wg}_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
-        f"_onorm{int(apply_output_norm)}_pf{prefetch_in_flight}_g{group_size}"
-        f"_wr{wave_reduce_mode}"
-    )
-    if wide_grid:
-        kernel_name += "_wide"
 
     @fx.struct
     class SharedStorage:
@@ -350,15 +347,17 @@ def _build_attn_res(
         sumsq: fx.Array[fx.Float32, 2 * group_size * red_slots, 16]
         dot: fx.Array[fx.Float32, 2 * group_size * red_slots, 16]
 
-    @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(name=spec.kernel_name, known_block_size=[block_threads, 1, 1])
     def attn_res_kernel(
         prefix: fx.Tensor,
-        delta: fx.Tensor,
-        blocks: fx.Tensor,
-        norm_weight: fx.Tensor,
-        qk_weight: fx.Tensor,
-        output_norm_weight: fx.Tensor,
-        out: fx.Tensor,
+        add_hidden: fx.Tensor,
+        add_hidden2: fx.Tensor,
+        block_residual: fx.Tensor,
+        score_weight: fx.Tensor,
+        output_rms_weight: fx.Tensor,
+        y: fx.Tensor,
+        prefix_out: fx.Tensor,
+        block_out: fx.Tensor,
         num_tokens: fx.Int32,
     ):
         tid = fx.thread_idx.x
@@ -500,27 +499,24 @@ def _build_attn_res(
                 fx.slice(divided[width], (None, vector_index_for(tile))),
             )
 
+        def row_of(buffer, *index):
+            return divide_row(fx.slice(buffer, (*index, None)))
+
         prefix_buf = fx.rocdl.make_buffer_tensor(prefix)
-        blocks_buf = fx.rocdl.make_buffer_tensor(blocks)
-        norm_weight_buf = fx.rocdl.make_buffer_tensor(norm_weight)
-        qk_weight_buf = fx.rocdl.make_buffer_tensor(qk_weight)
-        out_buf = fx.rocdl.make_buffer_tensor(out)
+        score_weight_buf = fx.rocdl.make_buffer_tensor(score_weight)
+        y_buf = fx.rocdl.make_buffer_tensor(y)
+        if const_expr(num_blocks):
+            blocks_buf = fx.rocdl.make_buffer_tensor(block_residual)
+        if const_expr(close_block):
+            block_out_buf = fx.rocdl.make_buffer_tensor(block_out)
 
         def run_row():
-            prefix_row = fx.slice(prefix_buf, (token, None))
-            out_row = fx.slice(out_buf, (token, None))
-            prefix_div = divide_row(prefix_row)
-            norm_weight_div = divide_row(norm_weight_buf)
-            qk_weight_div = divide_row(qk_weight_buf)
-            out_div = divide_row(out_row)
-            if const_expr(has_delta):
-                delta_buf = fx.rocdl.make_buffer_tensor(delta)
-                delta_row = fx.slice(delta_buf, (token, None))
-                delta_div = divide_row(delta_row)
+            prefix_div = row_of(prefix_buf, token)
+            score_weight_div = divide_row(score_weight_buf)
+            y_div = row_of(y_buf, token)
 
-            def issue_block_source(source_idx):
-                block_row = fx.slice(blocks_buf, (token, source_idx, None))
-                block_div = divide_row(block_row)
+            def issue_block_source(block):
+                block_div = row_of(blocks_buf, token, block)
                 handles = []
                 for tile in range_constexpr(tiles_per_thread):
                     handles.append(issue_bf16_vec(block_div, tile))
@@ -532,37 +528,53 @@ def _build_attn_res(
                     source_local.append(fx.memref_load_vec(handles[tile]))
                 return source_local
 
-            # Prime `prefetch_in_flight` extra block sources above the
-            # prefix/delta/snapshot prologue so their latency overlaps it.
-            # Prefix is already resident. `block_write_idx == num_blocks` is a
-            # build-time invariant, so these sources are disjoint from the
-            # snapshot slot and the kernel never reads an invalid block slot.
+            def take_block_source(block):
+                source_local = load_issued_source(in_flight.pop(0))
+                if const_expr(close_block):
+                    block_out_div = row_of(block_out_buf, token, block)
+                    for tile in range_constexpr(tiles_per_thread):
+                        store_bf16_vec(source_local[tile], block_out_div, tile)
+                return source_local
+
+            # Issue the first block loads before the prefix prologue so their
+            # latency overlaps it.
             in_flight = []
             for source in range_constexpr(min(prefetch_in_flight, num_blocks)):
                 in_flight.append(issue_block_source(source))
 
-            # q = gamma * w is invariant over all depth sources.  Keep q and the
-            # live prefix in registers so the final source requires no global load.
+            # Mix the unrounded FP32 sum, as attn_res_gate does; only the stores
+            # round to BF16.
             q_local = []
             prefix_local = []
+            prefix_rounded = []
+            if const_expr(has_add):
+                add_div = row_of(fx.rocdl.make_buffer_tensor(add_hidden), token)
+                if const_expr(has_add2):
+                    add2_div = row_of(fx.rocdl.make_buffer_tensor(add_hidden2), token)
             for tile in range_constexpr(tiles_per_thread):
-                gamma = load_bf16_vec(norm_weight_div, tile).to(fx.Float32)
-                weight = load_bf16_vec(qk_weight_div, tile).to(fx.Float32)
-                q_local.append(gamma * weight)
+                q_local.append(load_bf16_vec(score_weight_div, tile).to(fx.Float32))
                 prefix_value = load_bf16_vec(prefix_div, tile)
-                if const_expr(has_delta):
-                    delta_value = load_bf16_vec(delta_div, tile).to(fx.Float32)
-                    prefix_value = (prefix_value.to(fx.Float32) + delta_value).to(
-                        fx.BFloat16
-                    )
-                    store_bf16_vec(prefix_value, prefix_div, tile)
+                if const_expr(has_add):
+                    prefix_value = prefix_value.to(fx.Float32) + load_bf16_vec(
+                        add_div, tile
+                    ).to(fx.Float32)
+                    if const_expr(has_add2):
+                        prefix_value = prefix_value + load_bf16_vec(add2_div, tile).to(
+                            fx.Float32
+                        )
+                    prefix_rounded.append(prefix_value.to(fx.BFloat16))
+                else:
+                    prefix_rounded.append(prefix_value)
                 prefix_local.append(prefix_value)
 
-            if const_expr(write_block):
-                block_out_row = fx.slice(blocks_buf, (token, block_write_idx, None))
-                block_out_div = divide_row(block_out_row)
+            if const_expr(has_add):
+                prefix_out_div = row_of(fx.rocdl.make_buffer_tensor(prefix_out), token)
                 for tile in range_constexpr(tiles_per_thread):
-                    store_bf16_vec(prefix_local[tile], block_out_div, tile)
+                    store_bf16_vec(prefix_rounded[tile], prefix_out_div, tile)
+            if const_expr(close_block):
+                block_out_div = row_of(block_out_buf, token, num_blocks)
+                for tile in range_constexpr(tiles_per_thread):
+                    store_bf16_vec(prefix_rounded[tile], block_out_div, tile)
 
             mixed_local = [
                 fx.Vector.filled(tile_widths[tile], 0.0, fx.Float32)
@@ -598,6 +610,8 @@ def _build_attn_res(
                     sumsq * inv_hidden_size + eps, fastmath=fm_fast
                 )
                 logit = dot * reciprocal_rms
+                if const_expr(scale != 1.0):
+                    logit = logit * scale
 
                 new_max = old_max.maximumf(logit)
                 old_scale_active = fmath.exp2(
@@ -627,7 +641,7 @@ def _build_attn_res(
                         in_flight.append(
                             issue_block_source(source + prefetch_in_flight)
                         )
-                    source_local = load_issued_source(in_flight.pop(0))
+                    source_local = take_block_source(source)
                     max_logit, denominator, mixed_local = consume_source(
                         source_local, max_logit, denominator, mixed_local, source % 2
                     )
@@ -636,8 +650,8 @@ def _build_attn_res(
                 )
             else:
                 # Group G independent reductions behind one barrier. Softmax
-                # updates stay in source order. Sources stay in bf16 across the
-                # barrier; the reconvert for the mix is lossless.
+                # updates stay in source order. Block sources stay in bf16
+                # across the barrier; the reconvert for the mix is lossless.
                 for group in range_constexpr(num_groups):
                     start = group * group_size
                     n_members = min(group_size, num_sources - start)
@@ -653,7 +667,7 @@ def _build_attn_res(
                                 in_flight.append(
                                     issue_block_source(block + prefetch_in_flight)
                                 )
-                            source_local = load_issued_source(in_flight.pop(0))
+                            source_local = take_block_source(block)
                         store_source_partials(source_local, slot, buf)
                         group_local.append(source_local)
                     fx.gpu.barrier()
@@ -670,7 +684,7 @@ def _build_attn_res(
                     if const_expr(wide_grid):
                         pin_registers(mixed_local)
 
-            if const_expr(apply_output_norm):
+            if const_expr(output_norm):
                 thread_sumsq = zero
                 for tile in range_constexpr(tiles_per_thread):
                     thread_sumsq = thread_sumsq + (
@@ -678,25 +692,26 @@ def _build_attn_res(
                     ).reduce(ReductionOp.ADD, fastmath=fm_fast)
                 # Last group used (num_groups-1)%2; epilogue takes the other half.
                 sumsq = block_reduce_add(thread_sumsq, num_groups % 2, 0)
-                scale = fmath.rsqrt(
+                norm_scale = fmath.rsqrt(
                     sumsq * inv_hidden_size
-                    + output_norm_eps * denominator * denominator,
+                    + output_rms_eps * denominator * denominator,
                     fastmath=fm_fast,
                 )
 
-                output_norm_weight_buf = fx.rocdl.make_buffer_tensor(output_norm_weight)
-                output_norm_weight_div = divide_row(output_norm_weight_buf)
+                output_rms_weight_div = divide_row(
+                    fx.rocdl.make_buffer_tensor(output_rms_weight)
+                )
                 for tile in range_constexpr(tiles_per_thread):
-                    output_gamma = load_bf16_vec(output_norm_weight_div, tile).to(
+                    output_gamma = load_bf16_vec(output_rms_weight_div, tile).to(
                         fx.Float32
                     )
-                    result = (mixed_local[tile] * scale * output_gamma).to(fx.BFloat16)
-                    store_bf16_vec(result, out_div, tile)
+                    result = mixed_local[tile] * norm_scale * output_gamma
+                    store_bf16_vec(result.to(fx.BFloat16), y_div, tile)
             else:
                 inverse_denominator = 1.0 / denominator
                 for tile in range_constexpr(tiles_per_thread):
                     result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
-                    store_bf16_vec(result, out_div, tile)
+                    store_bf16_vec(result, y_div, tile)
 
         if const_expr(rows_per_wg == 1):
             run_row()
@@ -707,23 +722,27 @@ def _build_attn_res(
     @flyc.jit
     def launch_attn_res(
         prefix: fx.Tensor,
-        delta: fx.Tensor,
-        blocks: fx.Tensor,
-        norm_weight: fx.Tensor,
-        qk_weight: fx.Tensor,
-        output_norm_weight: fx.Tensor,
-        out: fx.Tensor,
+        add_hidden: fx.Tensor,
+        add_hidden2: fx.Tensor,
+        block_residual: fx.Tensor,
+        score_weight: fx.Tensor,
+        output_rms_weight: fx.Tensor,
+        y: fx.Tensor,
+        prefix_out: fx.Tensor,
+        block_out: fx.Tensor,
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         attn_res_kernel(
             prefix,
-            delta,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight,
-            out,
+            add_hidden,
+            add_hidden2,
+            block_residual,
+            score_weight,
+            output_rms_weight,
+            y,
+            prefix_out,
+            block_out,
             num_tokens,
         ).launch(
             grid=((num_tokens + rows_per_wg - 1) // rows_per_wg, 1, 1),
@@ -771,62 +790,60 @@ def _check_row_layout(tensor: torch.Tensor, name: str) -> None:
 
 def flydsl_attn_res(
     prefix: torch.Tensor,
-    delta: torch.Tensor | None,
-    blocks: torch.Tensor,
-    norm_weight: torch.Tensor,
-    qk_weight: torch.Tensor,
-    output_norm_weight: torch.Tensor | None,
-    num_blocks: int,
-    block_write_idx: int,
-    eps: float,
-    output_norm_eps: float,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float = 1e-6,
+    add_hidden: torch.Tensor | None = None,
+    add_hidden2: torch.Tensor | None = None,
+    *,
+    output_rms_weight: torch.Tensor | None = None,
+    output_rms_eps: float = 1e-6,
+    scale: float = 1.0,
+    close_block: bool = False,
+    out_quant_dtype: torch.dtype | None = None,
     rows_per_wg: int | None = None,
     stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """Run a BF16 prefill AttnRes specialization on contiguous or padded rows.
+):
+    """Drop-in for Triton ``attn_res_gate`` on BF16 inputs over ``B + 1`` candidates.
 
-    ``delta`` and ``output_norm_weight`` independently enable the in-place
-    prefix update and output RMSNorm. ``block_write_idx=-1`` disables snapshots;
-    otherwise it must equal ``num_blocks`` in 0..7 and stores the current prefix
-    (post-delta when present) in ``blocks[:, block_write_idx]``. Non-canonical
-    in-range write indices raise ``NotImplementedError``. Out-of-range
-    ``block_write_idx`` or ``num_blocks`` values raise ``ValueError``.
+    ``prefix`` is ``[.., D]``, ``block_residual`` is ``[.., B, D]`` with ``B`` in
+    0..8 (a strided view such as ``cap[:, :B]`` is fine), and ``score_weight``
+    is the pre-folded ``[D]`` scoring vector. ``logit = scale * rstd *
+    dot(v, score_weight)`` with ``rstd`` from ``eps``, softmaxed over the
+    candidates; the raw values are mixed. ``add_hidden`` [and ``add_hidden2``]
+    fold into the prefix candidate as an unrounded FP32 sum. ``output_rms_weight``
+    applies an output RMSNorm with ``output_rms_eps``.
 
-    Multi-dimensional inputs must have unit trailing stride, positive leading
-    strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
-    pointer for ``BufferCopy128b``. Weight vectors must satisfy the same
-    vector-copy layout rules. Each tensor must span less than 4 GiB, and
-    ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64)
-    on the live GPU. ``D`` must be a positive multiple of ``_VEC_WIDTH`` with a
-    wave-aligned row size; D=7168 uses one row per workgroup, with 448 threads
-    when ``T`` is at most the device's CU count. Above the CU count, a
-    multi-wave row uses 256 threads when D splits over 256 threads into 128-bit
-    tiles and at most one 64-bit tail; other rows keep their default width.
-    D=1024 defaults to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
-    independent D=1024 rows into a 256-thread workgroup; packing is rejected
-    when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``, and
-    multi-wave rows reject any value other than 1.
+    Returns ``(y, prefix_out)``, or ``(y, prefix_out, block_out)`` with
+    ``close_block``. ``prefix_out`` is a new BF16 tensor holding the rounded sum
+    when ``add_hidden`` is given, otherwise ``prefix`` itself. ``block_out`` is
+    ``cat([block_residual, prefix_out[..., None, :]], -2)``. Inputs are never
+    mutated.
+
+    Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
+    trailing stride, positive leading strides that are multiples of
+    8, a 16-byte-aligned base pointer, and an extent under 4 GiB.
+    ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64).
+    ``D`` must be a positive multiple of 8 with a wave-aligned row
+    size. ``rows_per_wg`` packs one-wave rows (D=1024) per workgroup; multi-wave
+    rows reject any value other than 1.
     """
-    has_delta = delta is not None
-    apply_output_norm = output_norm_weight is not None
-    if not 0 <= num_blocks <= _MAX_BLOCKS:
-        raise ValueError(f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
-    if not -1 <= block_write_idx < _MAX_BLOCKS:
-        raise ValueError(
-            f"block_write_idx must be -1 or in [0, {_MAX_BLOCKS - 1}], "
-            f"got {block_write_idx}"
-        )
-    write_block = block_write_idx >= 0
-    if write_block and block_write_idx != num_blocks:
-        raise NotImplementedError(
-            "snapshot writes are limited to the canonical append slot: "
-            f"block_write_idx must equal num_blocks, got "
-            f"block_write_idx={block_write_idx}, num_blocks={num_blocks}"
-        )
+    if add_hidden2 is not None and add_hidden is None:
+        raise ValueError("add_hidden2 requires add_hidden")
+    if out_quant_dtype is not None and output_rms_weight is None:
+        raise ValueError("out_quant_dtype requires output_rms_weight")
+    if out_quant_dtype is not None:
+        raise NotImplementedError("out_quant_dtype is not supported yet")
 
-    if prefix.ndim != 2:
-        raise ValueError(f"prefix must have shape [T, D], got {tuple(prefix.shape)}")
-    hidden_size = prefix.shape[1]
+    hidden_size = prefix.shape[-1]
+    if block_residual.ndim < 2 or block_residual.shape[-1] != hidden_size:
+        raise ValueError(
+            f"block_residual must have shape [.., B, {hidden_size}], "
+            f"got {tuple(block_residual.shape)}"
+        )
+    num_blocks = block_residual.shape[-2]
+    if not 0 <= num_blocks <= _MAX_BLOCKS:
+        raise ValueError(f"B must be in [0, {_MAX_BLOCKS}], got {num_blocks}")
     if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
         raise ValueError(
             f"prefix hidden size must be a positive multiple of {_VEC_WIDTH}, "
@@ -835,39 +852,36 @@ def flydsl_attn_res(
     row_threads = _block_threads_for(hidden_size // _VEC_WIDTH)
     rows_per_wg = _resolve_rows_per_wg(row_threads, rows_per_wg)
 
-    if blocks.ndim != 3 or blocks.shape != (
-        prefix.shape[0],
-        _MAX_BLOCKS,
-        hidden_size,
-    ):
+    rows = prefix.reshape(math.prod(prefix.shape[:-1]), hidden_size)
+    blocks = block_residual.reshape(
+        math.prod(block_residual.shape[:-2]), num_blocks, hidden_size
+    )
+    if blocks.shape[0] != rows.shape[0]:
         raise ValueError(
-            "blocks must have shape "
-            f"[T, {_MAX_BLOCKS}, {hidden_size}], got {tuple(blocks.shape)}"
+            f"prefix has {rows.shape[0]} rows but block_residual has "
+            f"{blocks.shape[0]}; the leading dimensions must match"
         )
-    if norm_weight.shape != (hidden_size,) or qk_weight.shape != (hidden_size,):
-        raise ValueError(
-            f"norm_weight and qk_weight must each have shape ({hidden_size},)"
-        )
-    if has_delta and delta.shape != prefix.shape:
-        raise ValueError(
-            f"delta must have shape {tuple(prefix.shape)}, got {tuple(delta.shape)}"
-        )
-    if apply_output_norm and output_norm_weight.shape != (hidden_size,):
-        raise ValueError(
-            "output_norm_weight must have shape "
-            f"({hidden_size},), got {tuple(output_norm_weight.shape)}"
-        )
+    weights = {"score_weight": score_weight.reshape(-1)}
+    if output_rms_weight is not None:
+        weights["output_rms_weight"] = output_rms_weight.reshape(-1)
+    for name, weight in weights.items():
+        if weight.shape != (hidden_size,):
+            raise ValueError(f"{name} must have {hidden_size} elements")
+    adds = {}
+    for name, addend in (("add_hidden", add_hidden), ("add_hidden2", add_hidden2)):
+        if addend is not None:
+            if addend.shape[-1] != hidden_size:
+                raise ValueError(f"{name} must have shape [.., {hidden_size}]")
+            adds[name] = addend.reshape(-1, hidden_size)
+            if adds[name].shape != rows.shape:
+                raise ValueError(f"{name} must have {rows.shape[0]} rows")
 
-    tensors = (prefix, blocks, norm_weight, qk_weight)
-    if has_delta:
-        tensors += (delta,)
-    if apply_output_norm:
-        tensors += (output_norm_weight,)
-    if any(t.device != prefix.device for t in tensors):
-        raise ValueError("all tensors must be on prefix.device")
-    if any(t.dtype != torch.bfloat16 for t in tensors):
+    tensors = {"prefix": rows, "block_residual": blocks, **weights, **adds}
+    if any(t.dtype != torch.bfloat16 for t in tensors.values()):
         raise TypeError("only BF16 inputs are supported")
-    if not all(t.is_cuda for t in tensors):
+    if any(t.device != prefix.device for t in tensors.values()):
+        raise ValueError("all tensors must be on prefix.device")
+    if not prefix.is_cuda:
         raise ValueError("all tensors must be CUDA tensors")
 
     gfx = get_gfx_runtime()
@@ -878,57 +892,85 @@ def flydsl_attn_res(
             "reductions and readlane(..., 63)."
         )
 
-    _check_row_layout(prefix, "prefix")
-    _check_row_layout(blocks, "blocks")
-    if has_delta:
-        _check_row_layout(delta, "delta")
-    _check_row_layout(norm_weight, "norm_weight")
-    _check_row_layout(qk_weight, "qk_weight")
-    if apply_output_norm:
-        _check_row_layout(output_norm_weight, "output_norm_weight")
+    for name, tensor in tensors.items():
+        if tensor.numel():
+            _check_row_layout(tensor, name)
 
-    out = torch.empty(prefix.shape, device=prefix.device, dtype=prefix.dtype)
-    if prefix.shape[0] == 0:
-        return out
-
-    delta_arg = delta if has_delta else prefix
-    output_norm_weight_arg = output_norm_weight if apply_output_norm else norm_weight
-    wide_grid = (
-        row_threads > _WARP_SIZE
-        and prefix.shape[0] > _num_cus(prefix.device)
-        and _wide_row_supported(hidden_size)
+    num_tokens = rows.shape[0]
+    y = torch.empty_like(rows, memory_format=torch.contiguous_format)
+    prefix_out = torch.empty_like(y) if add_hidden is not None else rows
+    block_out = (
+        torch.empty(
+            (num_tokens, num_blocks + 1, hidden_size),
+            device=prefix.device,
+            dtype=prefix.dtype,
+        )
+        if close_block
+        else None
     )
-    with torch.cuda.device(prefix.device):
+    if block_out is not None:
+        _check_row_layout(block_out, "block_out")
+
+    if num_tokens:
+        wide_grid = (
+            row_threads > _WARP_SIZE
+            and num_tokens > _num_cus(prefix.device)
+            and _wide_row_supported(hidden_size)
+        )
+        spec = _AttnResSpec(
+            hidden_size=hidden_size,
+            num_blocks=num_blocks,
+            has_add=add_hidden is not None,
+            has_add2=add_hidden2 is not None,
+            close_block=close_block,
+            output_norm=output_rms_weight is not None,
+            eps=float(eps),
+            output_rms_eps=(
+                float(output_rms_eps) if output_rms_weight is not None else 0.0
+            ),
+            scale=float(scale),
+            rows_per_wg=rows_per_wg,
+            wide_grid=wide_grid,
+        )
+        _launch(spec, tensors, y, prefix_out, block_out, stream)
+
+    leading = prefix.shape[:-1]
+    y_result = y.view(prefix.shape)
+    prefix_result = prefix if add_hidden is None else prefix_out.view(prefix.shape)
+    if not close_block:
+        return y_result, prefix_result
+    return (
+        y_result,
+        prefix_result,
+        block_out.view(*leading, num_blocks + 1, hidden_size),
+    )
+
+
+def _launch(spec, tensors, y, prefix_out, block_out, stream) -> None:
+    rows = tensors["prefix"]
+    with torch.cuda.device(rows.device):
         launch_stream = (
-            torch.cuda.current_stream(prefix.device) if stream is None else stream
+            torch.cuda.current_stream(rows.device) if stream is None else stream
         )
-        if launch_stream.device != prefix.device:
+        if launch_stream.device != rows.device:
             raise ValueError(
-                f"stream must be on {prefix.device}, got {launch_stream.device}"
+                f"stream must be on {rows.device}, got {launch_stream.device}"
             )
-        launcher = _build_attn_res(
-            hidden_size,
-            num_blocks,
-            float(eps),
-            float(output_norm_eps) if apply_output_norm else 0.0,
-            has_delta,
-            block_write_idx,
-            apply_output_norm,
-            rows_per_wg,
-            wide_grid,
-        )
         _run_compiled(
-            launcher,
-            prefix,
-            delta_arg,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight_arg,
-            out,
-            prefix.shape[0],
+            _build_attn_res(spec),
+            rows,
+            tensors.get("add_hidden", rows),
+            tensors.get("add_hidden2", rows),
+            tensors["block_residual"] if spec.num_blocks else rows,
+            tensors["score_weight"],
+            tensors.get("output_rms_weight", rows),
+            y,
+            prefix_out,
+            rows if block_out is None else block_out,
+            rows.shape[0],
             Stream(launch_stream),
         )
         if stream is not None:
-            out.record_stream(launch_stream)
-    return out
+            for output in (y, prefix_out, block_out):
+                if output is not None and output is not rows:
+                    output.record_stream(launch_stream)
