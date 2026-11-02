@@ -80,6 +80,12 @@ def _check_out(out, q, dtype):
 # DSv4 head geometry and the gfx1250 640 B record. The byte layouts themselves
 # are documented once, in the "Formats" section of pa_decode_sparse below.
 _V4_DIM_NOPE = 448
+# Packed cache formats by record width; see pa_decode_sparse's format table.
+_GFX950_PACKED_FMTS = {
+    584: "fp8_dsv4_mla",
+    528: "fp8_dsv41_mla",
+    288: "nvfp4_dsv41_mla",
+}
 _V4_DIM_ROPE = 64
 _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512, the logical head dim
 _V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
@@ -162,6 +168,14 @@ def pa_decode_sparse(
       Q    ``q`` ``[N, H, 512]`` bf16 only (the kernel has no Q scale input).
       ``extra_*`` is supported on the 584 B cache. The ``inv_rope_positions``
       / ``out_mxfp8`` output epilogue is supported.
+
+    gfx950, fp8 (a16w8) -- DeepSeek-V4.1's ``fp8_ds_mla`` record:
+      KV   ``unified_kv`` ``[nb, block, 528]`` uint8. Each token's 512 B of
+           fp8 e4m3 (RoPE included) is followed by its 16 UE8M0 scales, one
+           per 32 elements. Same Q, ``extra_*`` and epilogue as the 584 B cache.
+      ``extra_cache`` may instead be the ``[nb, block, 288]`` uint8 NVFP4
+      compressed record: each token's 256 B of e2m1 pairs (even element in
+      the low nibble) followed by its 32 e4m3 scales, one per 16 elements.
 
     gfx950, bf16:
       KV   ``unified_kv`` ``[nb, block, 512]`` bf16 paged cache (``extra_*``
@@ -693,6 +707,16 @@ def _launch_splits(num_splits):
     return num_splits if num_splits <= 2 else -(-num_splits // 4) * 4
 
 
+def _gfx950_packed_fmt(cache: torch.Tensor) -> str:
+    fmt = _GFX950_PACKED_FMTS.get(cache.shape[-1])
+    if fmt is None:
+        raise ValueError(
+            f"a uint8 block cache must hold {' or '.join(map(str, _GFX950_PACKED_FMTS))}"
+            f" B records on gfx950, got {cache.shape[-1]}"
+        )
+    return fmt
+
+
 def _pa_decode_sparse_gfx950_gluon(
     q,
     cache,
@@ -803,13 +827,17 @@ def _pa_decode_sparse_gfx950_gluon(
         main_fmt = "fp8_g64" if main_is_fp8 else "bf16"
         extra_fmt = main_fmt
     else:
-        main_fmt = "fp8_dsv4_mla" if main_is_fp8 else "bf16"
-        extra_fmt = "fp8_dsv4_mla" if extra_is_fp8 else "bf16"
-        # The fp8_dsv4_mla gather splits slot ids into (page, row) by shifts.
+        main_fmt = _gfx950_packed_fmt(cache) if main_is_fp8 else "bf16"
+        extra_fmt = _gfx950_packed_fmt(extra_cache) if extra_is_fp8 else "bf16"
+        assert main_fmt != "nvfp4_dsv41_mla", (
+            "the 288 B NVFP4 record is the compressed (extra) cache only; the "
+            "sliding-window cache stays fp8"
+        )
+        # The packed gather splits slot ids into (page, row) by shifts.
         for fmt, block in ((main_fmt, main_block), (extra_fmt, extra_block)):
             assert (
-                fmt != "fp8_dsv4_mla" or block & (block - 1) == 0
-            ), f"fp8_dsv4_mla page size must be a power of two, got {block}"
+                fmt == "bf16" or block & (block - 1) == 0
+            ), f"{fmt} page size must be a power of two, got {block}"
 
     # Alignment hint for the page strides so row gathers can vectorize: the largest
     # power of 2 (<= 16) dividing both.
@@ -832,8 +860,8 @@ def _pa_decode_sparse_gfx950_gluon(
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     packed_fp8 = (
         not FLAT_POOL
-        and main_fmt == "fp8_dsv4_mla"
-        and (not has_extra or extra_fmt == "fp8_dsv4_mla")
+        and main_fmt in _GFX950_PACKED_FMTS.values()
+        and (not has_extra or extra_fmt in _GFX950_PACKED_FMTS.values())
     )
     prefill = num_queries >= _PREFILL_MIN_ROWS
     row_tiles = max(avg_main, avg_extra) / BLOCK_K
@@ -941,7 +969,7 @@ def _pa_decode_sparse_gfx950_gluon(
     if num_queries >= _PREFILL_MIN_ROWS:
         # Prefill rows re-read each other's KV rows, so cache the gather instead of .cg.
         prefill_kw["GATHER_CACHE"] = ""
-        if main_fmt == extra_fmt == "fp8_dsv4_mla":
+        if packed_fp8:
             prefill_kw["SLOT_U32"] = max(s0, s1) < (1 << 24)
             nope_chunk = max(1, BLOCK_K // 8)
 
@@ -1060,8 +1088,8 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
         XCD_REMAP=xcd_remap,
-        # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
-        # size.
+        # Gather a tile ahead only for the packed records' 32-head programs below
+        # prefill size.
         DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,

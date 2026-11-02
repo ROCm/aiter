@@ -27,13 +27,15 @@ generation, so the tags here carry the generation instead:
                       (576 B data rows) + an 8 B UE8M0-per-64 trailer after the
                       block's rows (7 scales + 1 B pad). Rope lives inside the
                       512-wide head dim, so V is the whole row.
+    "fp8_dsv41_mla"   528 B: 512 fp8 + 16 UE8M0 scales per token.
+    "nvfp4_dsv41_mla" 288 B: 256 packed fp4 + 32 e4m3 scales (extra cache).
     "fp8_dsv32_mla"   DeepSeek-V3.2 (also Kimi-K3), 656 B per token, token-major
                       records: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope.
                       Rope is appended, so this requires ROPE_SEPARATE.
 
 Tile walks, per segment (_segment):
 
-    _dsv4_segment     fp8_dsv4_mla: slot ids a tile ahead, 16 lanes x 32 B per row,
+    _dsv4_segment     the DeepSeek-V4 records: slot ids a tile ahead, 16 lanes x 32 B per row,
                       softmax row reductions through LDS (_row_reduce_lds)
     _async_segment    ASYNC_LDS: the tile copied straight into LDS (fp8 dots)
     _staged_segment   the other formats: gathered into registers, dequantized,
@@ -354,6 +356,7 @@ class Cfg:
     slot_rope_a_l: gl.constexpr
     gather_rope_l: gl.constexpr
     gather16_l: gl.constexpr
+    gather_fp4_l: gl.constexpr  # gather_l over packed e2m1 pairs
     slot_l: gl.constexpr
     blocked_q: gl.constexpr
     kv_shared: gl.constexpr
@@ -475,6 +478,14 @@ class Cfg:
                 order=[1, 0],
             )
         )
+        self.gather_fp4_l = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[1, GSPT // 2],
+                threads_per_warp=[64 // GATHER_TW1, GATHER_TW1],
+                warps_per_cta=[NUM_WARPS, 1],
+                order=[1, 0],
+            )
+        )
         self.slot_l = gl.constexpr(gl.SliceLayout(1, self.gather_l.value))
         self.blocked_q = gl.constexpr(
             gl.BlockedLayout(
@@ -563,18 +574,26 @@ class Cfg:
             )
 
 
+@gluon.constexpr_function
+def _is_dsv4_record(kind):
+    return kind in ("fp8_dsv4_mla", "fp8_dsv41_mla", "nvfp4_dsv41_mla")
+
+
 @aggregate
 @strip_annotate
 class Fmt:
     """Compile-time description of one segment's cache format."""
 
     # "bf16" | "fp8_scalar" | "fp8_g64"
-    # | "fp8_dsv4_mla" (584 B/token) | "fp8_dsv32_mla" (656 B/token)
+    # | "fp8_dsv4_mla" (584 B/token) | "fp8_dsv41_mla" (528 B/token)
+    # | "nvfp4_dsv41_mla" (288 B/token) | "fp8_dsv32_mla" (656 B/token)
     KIND: gl.constexpr
+    DSV4_WALK: gl.constexpr  # takes _dsv4_segment (both DeepSeek-V4 records)
     IS_FP8: gl.constexpr  # pipeline select: prefetched fp8 loop vs bf16 loop
     BLOCK_SIZE: gl.constexpr
     USE_BUFFER_LOAD: gl.constexpr
     # dsv4 E8M0 dequant: "none" | "upcast" | "asm" (gathers the int16 view)
+    # | "fp4" (nvfp4_dsv41_mla: e2m1 decode times the e4m3 scale)
     DEQ: gl.constexpr
     NOPE_CHUNK: gl.constexpr
     CHUNK_AXIS: gl.constexpr
@@ -588,6 +607,7 @@ class Fmt:
     TOK_U16: gl.constexpr  # the same row in bf16-view units
     ROPE_U16_OFF: gl.constexpr  # bf16-view offset of the rope tail in a row
     SCL_TRAILER_U8: gl.constexpr  # dsv4: scale bytes per token in the block trailer
+    SCL_INLINE_U8: gl.constexpr  # dsv41: byte offset of a token's scales in its row
     TOK_F32: gl.constexpr  # dsmla: f32-view stride per token row
     SCL_F32_OFF: gl.constexpr  # dsmla: f32-view offset of the group scales
     TOK_EL: gl.constexpr  # flat formats: cache elements per token row
@@ -605,17 +625,25 @@ class Fmt:
         CHUNK_AXIS,
     ):
         self.KIND = gl.constexpr(KIND)
+        DSV4_WALK = _is_dsv4_record(KIND)
+        self.DSV4_WALK = gl.constexpr(DSV4_WALK)
         self.IS_FP8 = gl.constexpr(KIND != "bf16")
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
-        self.DEQ = gl.constexpr(DEQ if KIND == "fp8_dsv4_mla" else "none")
+        if KIND == "nvfp4_dsv41_mla":
+            DEQ = "fp4"
+        elif not DSV4_WALK:
+            DEQ = "none"
+        self.DEQ = gl.constexpr(DEQ)
         self.NOPE_CHUNK = gl.constexpr(NOPE_CHUNK)
         self.CHUNK_AXIS = gl.constexpr(CHUNK_AXIS)
         self.NOPE_DIM = gl.constexpr(NOPE_DIM)
 
         KV_DIM = cfg.KV_DIM.value
         ROPE_DIM = cfg.ROPE_DIM.value
-        GROUP = 128 if KIND == "fp8_dsv32_mla" else 64
+        GROUP = {"fp8_dsv32_mla": 128, "fp8_dsv41_mla": 32, "nvfp4_dsv41_mla": 16}.get(
+            KIND, 64
+        )
         NG = KV_DIM // GROUP
         self.GROUP = gl.constexpr(GROUP)
         self.NG = gl.constexpr(NG)
@@ -637,12 +665,25 @@ class Fmt:
             warps_per_cta=[cfg.NUM_WARPS.value, 1, 1],
             order=[2, 1, 0],
         )
+        if KIND == "nvfp4_dsv41_mla":
+            # A lane's GSPT columns are GSPT // GROUP whole groups.
+            scl_l3 = gl.BlockedLayout(
+                size_per_thread=[1, GSPT // GROUP, GROUP],
+                threads_per_warp=[64 // TW1, TW1, 1],
+                warps_per_cta=[cfg.NUM_WARPS.value, 1, 1],
+                order=[2, 1, 0],
+            )
         self.scl_l = gl.constexpr(gl.SliceLayout(2, scl_l3))
 
         # dsv4 row: [NOPE_DIM fp8 | ROPE_DIM bf16] + 8 B UE8M0 per token after
-        # the block; dsmla row: [KV_DIM fp8 | NG f32 | ROPE_DIM bf16] inline.
+        # the block; dsv41 row: [KV_DIM fp8 | NG UE8M0] inline; dsmla row:
+        # [KV_DIM fp8 | NG f32 | ROPE_DIM bf16] inline.
         if KIND == "fp8_dsv4_mla":
             TOK_U8 = NOPE_DIM + 2 * ROPE_DIM  # 448 + 128 = 576
+        elif KIND == "fp8_dsv41_mla":
+            TOK_U8 = KV_DIM + NG  # 512 + 16 = 528
+        elif KIND == "nvfp4_dsv41_mla":
+            TOK_U8 = KV_DIM // 2 + NG  # 256 + 32 = 288
         elif KIND == "fp8_dsv32_mla":
             TOK_U8 = KV_DIM + 4 * NG + 2 * ROPE_DIM  # 512 + 16 + 128 = 656
         else:
@@ -653,6 +694,9 @@ class Fmt:
             (NOPE_DIM // 2) if KIND == "fp8_dsv4_mla" else ((KV_DIM + 4 * NG) // 2)
         )
         self.SCL_TRAILER_U8 = gl.constexpr(8)
+        self.SCL_INLINE_U8 = gl.constexpr(
+            KV_DIM // 2 if KIND == "nvfp4_dsv41_mla" else KV_DIM
+        )
         self.TOK_F32 = gl.constexpr(TOK_U8 // 4)
         self.SCL_F32_OFF = gl.constexpr(KV_DIM // 4)
         # Flat formats gather in cache elements: KV_DIM wide, plus the appended
@@ -673,6 +717,8 @@ class Seg:
         fp8_scalar       u8 cache    --                      f32 scalar k_scale
         fp8_g64          u8 cache    f32 per-64 kv_scales    --
         fp8_dsv4_mla     u8 cache    bf16 view of the cache  --
+        fp8_dsv41_mla    u8 cache    bf16 view of the cache  --
+        nvfp4_dsv41_mla  u8 cache    --                      --
         fp8_dsv32_mla    u8 cache    bf16 view (rope tail)   f32 view (scales)
     """
 
@@ -711,11 +757,36 @@ class Seg:
 
 
 @gluon.jit
+def _fp4_dequant(x_u8, sc, out_l: gl.constexpr):
+    """Expand e2m1 pairs with e4m3 scales to bf16 in out_l."""
+    # The instruction's scale operand is E8M0, so the e4m3 scale is applied
+    # after it; its destination is a register pair, hence int64.
+    pair = gl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_f32_fp4 $0, $1, $2",
+        "=v,v,v",
+        [x_u8.to(gl.int32), gl.full(x_u8.shape, 1.0, gl.float32, x_u8.type.layout)],
+        dtype=gl.int64,
+        is_pure=True,
+        pack=1,
+    )
+    even = (pair & 0xFFFFFFFF).to(gl.int32).to(gl.float32, bitcast=True)
+    odd = (pair >> 32).to(gl.int32).to(gl.float32, bitcast=True)
+    both = gl.join(even, odd).reshape(x_u8.shape[0], 2 * x_u8.shape[1])
+    both = gl.convert_layout(both, out_l, assert_trivial=True)
+    return (both * _fp8_to_f32(sc)).to(gl.bfloat16)
+
+
+@gluon.jit
 def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     """Dequant one fp8 slab into kv_smem[:, off:off+W]. Dequant stays in f32
     (gfx950 has no bf16 multiply). sc: raw UE8M0 byte (dsv4), f32 scale
     (uniform/dsmla), or unused ("fp8_scalar": bare fp8 -> bf16 convert)."""
-    if fmt.DEQ == "asm":
+    if fmt.DEQ == "fp4":
+        gl.static_assert(AXIS == 0, "nvfp4_dsv41_mla dequantizes in row chunks")
+        kv_smem.slice(off, x_u8.shape[0], dim=0).store(
+            _fp4_dequant(x_u8, sc, cfg.gather_l)
+        )
+    elif fmt.DEQ == "asm":
         # x_u8 is the int16 view here, so it has W8 / 2 columns.
         W8: gl.constexpr = x_u8.shape[1] * 2
         # Adjacent fp8 columns share a scale (groups are even), so dropping
@@ -742,7 +813,7 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         else:
             gl.static_assert(
                 fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla",
-                "fp8_dsv4_mla dequantizes with DEQ upcast or asm",
+                "the DeepSeek-V4 records dequantize with DEQ upcast or asm",
             )
             val = (_fp8_to_f32(x_u8) * sc).to(gl.bfloat16)
         if AXIS == 1:
@@ -1729,8 +1800,9 @@ def _dsv4_gather(
     k_rng_col,
     slots,
 ):
-    """Issue one fp8_dsv4_mla tile's gathers from slot ids read a tile earlier.
-    Returns (x, sc, k_rope, valid), valid in the score-column layout."""
+    """Issue one fp8_dsv4_mla / fp8_dsv41_mla tile's gathers from slot ids read a
+    tile earlier. Returns (x, sc, k_rope, valid), valid in the score-column
+    layout; fp8_dsv41_mla's rope is inside x, so its k_rope is x again."""
     SHIFT: gl.constexpr = seg.fmt.BLOCK_SIZE.bit_length() - 1
     gl.static_assert(
         seg.fmt.BLOCK_SIZE == 1 << SHIFT, "fp8_dsv4_mla pages must be a power of two"
@@ -1755,10 +1827,29 @@ def _dsv4_gather(
     bg, pg = _split_slot_pow2(cfg, s_g, SHIFT)
     bgr, pgr = _split_slot_pow2(cfg, s_r, SHIFT)
     nope_row = bg * cs0 + pg * fmt.TOK_U8
-    scl_row = bg * cs0 + (fmt.TOK_U8 << SHIFT) + pg * fmt.SCL_TRAILER_U8
+    if fmt.KIND == "fp8_dsv41_mla" or fmt.KIND == "nvfp4_dsv41_mla":
+        scl_row = nope_row + fmt.SCL_INLINE_U8
+    else:
+        scl_row = bg * cs0 + (fmt.TOK_U8 << SHIFT) + pg * fmt.SCL_TRAILER_U8
     # Scales first (vmcnt counts in order), as the dwords holding each exponent
     # byte (_dsv4_scales extracts it; carried i8 would be repacked).
-    if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD and cfg.SCL_DWORD:
+    if fmt.KIND == "nvfp4_dsv41_mla":
+        # A lane's two e4m3 bytes, widened in _dsv4_scales.
+        sc = _scale_load(
+            cache_ptr,
+            scl_row,
+            scl_row,
+            fmt.USE_BUFFER_LOAD,
+            cfg.gather_l,
+            fmt.scl_l,
+            fmt.NG,
+            cfg.KV_DIM,
+            False,
+            0,
+            CACHE=cfg.GATHER_CACHE,
+            RAW=True,
+        )
+    elif fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD and cfg.SCL_DWORD:
         cols = gl.arange(0, fmt.NG, layout=gl.SliceLayout(0, fmt.scl_l))
         rows = gl.convert_layout(scl_row, gl.SliceLayout(1, fmt.scl_l))
         p32 = cache_ptr.to(gl.pointer_type(gl.int32), bitcast=True)
@@ -1786,11 +1877,22 @@ def _dsv4_gather(
         sc = _cache_load(
             cache_ptr,
             scl_row,
-            offs_full // 64,
+            offs_full // fmt.GROUP,
             fmt.USE_BUFFER_LOAD,
             CACHE=cfg.GATHER_CACHE,
         )
-    if fmt.DEQ == "asm":
+    if fmt.DEQ == "fp4":
+        offs_half = gl.arange(
+            0, cfg.KV_DIM // 2, layout=gl.SliceLayout(0, cfg.gather_fp4_l)
+        )
+        x_u8 = _cache_load(
+            cache_ptr,
+            gl.convert_layout(nope_row, gl.SliceLayout(1, cfg.gather_fp4_l)),
+            offs_half,
+            fmt.USE_BUFFER_LOAD,
+            CACHE=cfg.GATHER_CACHE,
+        )
+    elif fmt.DEQ == "asm":
         # _scaled_upcast_asm reads the same bytes as int16 (4 packed fp8 per VGPR).
         offs_full16 = gl.arange(
             0, cfg.KV_DIM // 2, layout=gl.SliceLayout(0, cfg.gather16_l)
@@ -1810,13 +1912,16 @@ def _dsv4_gather(
             fmt.USE_BUFFER_LOAD,
             CACHE=cfg.GATHER_CACHE,
         )
-    k_rope = _cache_load(
-        seg.alt_ptr,
-        bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
-        offs_rope,
-        fmt.USE_BUFFER_LOAD,
-        CACHE=cfg.GATHER_CACHE,
-    )
+    if fmt.KIND == "fp8_dsv41_mla" or fmt.KIND == "nvfp4_dsv41_mla":
+        k_rope = x_u8  # unread
+    else:
+        k_rope = _cache_load(
+            seg.alt_ptr,
+            bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
+            offs_rope,
+            fmt.USE_BUFFER_LOAD,
+            CACHE=cfg.GATHER_CACHE,
+        )
     return x_u8, sc, k_rope, valid
 
 
@@ -1825,7 +1930,9 @@ def _dsv4_scales(cfg, seg, sc):
     """A _dsv4_gather tile's exponents as u8 in gather_l: [BLOCK_K, NG] dwords or
     bytes are unpacked and widened; the buffer-load gather is already wide."""
     fmt = seg.fmt
-    if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
+    if fmt.KIND == "nvfp4_dsv41_mla":
+        sc = _widen_scales(sc, cfg.gather_l, fmt.NG, cfg.KV_DIM)
+    elif fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
         if cfg.SCL_DWORD:
             cols = gl.arange(0, fmt.NG, layout=gl.SliceLayout(0, fmt.scl_l))
             sc = ((sc >> ((cols & 3) * 8)[None, :]) & 0xFF).to(gl.uint8)
@@ -1852,7 +1959,7 @@ def _dsv4_segment(
     red_smem=None,
     PREFETCH: gl.constexpr = False,
 ):
-    """The fp8_dsv4_mla walk (UNI_TILE). A tile's slot ids are read a tile ahead
+    """The fp8_dsv4_mla / fp8_dsv41_mla walk (UNI_TILE). A tile's slot ids are read a tile ahead
     of its gathers; PREFETCH also issues the gathers a tile ahead, after staging
     the current tile, so the in-flight tile needs no back-edge copy."""
     BK: gl.constexpr = cfg.BLOCK_K
@@ -1978,7 +2085,7 @@ def _segment(
     DSV4_PREFETCH: gl.constexpr,
 ):
     """Walk keys [lo, hi) of one segment with its format's walk."""
-    if seg.fmt.KIND == "fp8_dsv4_mla":
+    if seg.fmt.DSV4_WALK:
         m_i, l_i, acc = _dsv4_segment(
             cfg,
             seg,
@@ -2279,8 +2386,12 @@ def _sparse_mla(
     stores un-normalized partials for the reduce kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Some segment takes _dsv4_segment (see _segment).
-    DSV4_WALK: gl.constexpr = MAIN_FMT == "fp8_dsv4_mla" or (
-        HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
+    DSV4_WALK: gl.constexpr = _is_dsv4_record(MAIN_FMT) or (
+        HAS_EXTRA and _is_dsv4_record(EXTRA_FMT)
+    )
+    gl.static_assert(
+        MAIN_FMT != "nvfp4_dsv41_mla",
+        "nvfp4_dsv41_mla is the compressed (extra) cache; the SWA window stays fp8",
     )
     # Staged walks on 16x16x32: per-tensor fp8, and bf16 with the rope inside.
     # Rope-appended rows with sentinels keep 16x16x16 up to 16 heads (register-bound).
@@ -2307,7 +2418,8 @@ def _sparse_mla(
         "tensor/dsmla formats require UNI_TILE=1",
     )
     gl.static_assert(
-        (not ROPE_SEPARATE) or (MAIN_FMT != "fp8_dsv4_mla" and MAIN_FMT != "fp8_g64"),
+        (not ROPE_SEPARATE)
+        or (not _is_dsv4_record(MAIN_FMT) and MAIN_FMT != "fp8_g64"),
         "dsv4/uniform formats carry rope inside the KV buffer (ROPE_SEPARATE=False)",
     )
     gl.static_assert(
@@ -2354,7 +2466,7 @@ def _sparse_mla(
     )
     gl.static_assert(
         (not DSV4_WALK) or (UNI_TILE and not ASYNC_LDS and not FP8_MFMA),
-        "fp8_dsv4_mla takes the pipelined UNI_TILE walk (bf16 dots)",
+        "the DeepSeek-V4 records take the pipelined UNI_TILE walk (bf16 dots)",
     )
     gl.static_assert(
         (not INV_ROPE) or (ROPE_DIM > 0 and not ROPE_SEPARATE),
