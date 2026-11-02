@@ -2109,8 +2109,14 @@ def make_attention_a2a_kernel(
                 token = global_start + token_lane + half * 16
                 if const_expr(v_pack == AttentionPack.V_FOR_FP6_P):
                     token = fp6p_source_token(token)
+                    if const_expr(codec == "mxfp6_p" and valid_kv_len < seq_full):
+                        # Match the payload path and the canonical producer: padding
+                        # repeats the final valid token, so it joins the group amax.
+                        token = (token < valid_kv_len).select(
+                            token, fx.Int32(valid_kv_len - 1)
+                        )
                 valid = (token >= rank * seq_len) & (token < (rank + 1) * seq_len)
-                if const_expr(valid_kv_len < seq_full):
+                if const_expr(valid_kv_len < seq_full and codec != "mxfp6_p"):
                     valid = valid & (token < valid_kv_len)
                 seq = valid.select(token - rank * seq_len, 0)
                 raw = fx.Vector(

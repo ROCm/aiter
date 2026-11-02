@@ -80,6 +80,7 @@ RECIPES = (
     *(f"packed-{case.name}" for case in _PACKED_CASES),
     "fp6p-mxfp4",
     "fp6p-mxfp6_p",
+    "fp6p-mxfp6_p-tail",
     "hadamard",
     "reuse",
     "e4m3_pc",
@@ -146,6 +147,9 @@ def _supported(recipe, world_size, sequence, heads, gfx, first_sequence):
     # is sequence-independent and runs at the first sequence only.
     if recipe not in _SEQUENCE_DEPENDENT and sequence != first_sequence:
         return False
+    if recipe == "fp6p-mxfp6_p-tail":
+        # Fixed [1, 32, 2, 128] per rank; the split group needs exactly two ranks.
+        return gfx == "gfx950" and world_size == 2
     if recipe.startswith(("packed-", "fp6p-", "v4-consumer")) and sequence % 32:
         return False
     if recipe.startswith("v4-consumer"):
@@ -1052,6 +1056,47 @@ def _check_fp6_p_v(rank, world_size, heads, sequence, device, op_cls, codec):
     return op, lambda: _submit_roles(op, inputs)
 
 
+def _check_fp6_p_v_tail(rank, world_size, device, op_cls):
+    """Split FP6-P group whose second half holds a repeated-final-token tail.
+
+    ws=2, S_local=32, valid_kv_len=33: the last permuted group is token 32
+    plus padding clamped to token 32, so its amax is that token's, not zero.
+    """
+    from aiter.ops.mha_v4_quant import quantize_v_mxfp6_fp6_p
+
+    sequence, heads, valid_kv_len = 32, 2, 33
+    op = op_cls(
+        rank=rank,
+        world_size=world_size,
+        shape=(1, sequence, heads, 128),
+        quant=("mxfp6", "mxfp6_p"),
+        return_packed=True,
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        softmax_scale=0.125,
+        hadamard=True,
+        valid_kv_len=valid_kv_len,
+    )
+    inputs = tuple(
+        _input(rank + 47 * role, heads, sequence, device) for role in range(3)
+    )
+    v = inputs[2]
+    v.fill_(1.0)
+    if rank == 1:
+        v[:, 0] = 64.0  # global token 32
+        v[:, 1:] = 3.0  # padding tokens, arbitrary nonzero
+    full = _full_bshd(v, rank, world_size)[:, :valid_kv_len]
+    expected_payload, expected_scales = quantize_v_mxfp6_fp6_p(full)
+    payloads, scales = _submit_roles(op, inputs)
+    torch.cuda.synchronize()
+    _exact(scales[2].view_as(expected_scales), expected_scales, "fp6p tail V scales")
+    _exact(
+        payloads[2],
+        expected_payload.as_strided(payloads[2].shape, (1,)),
+        "fp6p tail V payload and slack",
+    )
+    return op, lambda: _submit_roles(op, inputs)
+
+
 def _check_hadamard(rank, world_size, heads, sequence, device, op_cls):
     from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
         create_hadamard_matrix,
@@ -1244,6 +1289,8 @@ def _build_check(recipe, rank, world_size, heads, sequence, device, op_cls):
         return _check_native(*args, recipe[len("native-") :])
     if recipe.startswith("packed-"):
         return _check_packed(*args, recipe[len("packed-") :])
+    if recipe == "fp6p-mxfp6_p-tail":
+        return _check_fp6_p_v_tail(rank, world_size, device, op_cls)
     if recipe.startswith("fp6p-"):
         return _check_fp6_p_v(*args, recipe[len("fp6p-") :])
     if recipe.startswith("v4-consumer-"):
