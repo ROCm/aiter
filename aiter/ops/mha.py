@@ -590,6 +590,17 @@ def _fmha_fwd_with_sink_asm(
 ) -> None: ...
 
 
+def _fmha_fwd_asm_sink(
+    sink: Tensor | None, qk_head_dim: int, q_head_num: int, device: torch.device
+) -> Tensor | None:
+    """The gfx1250 D64 kernels are built with a per-head sink (ENABLE_SINK=1) and
+    always read it.  Without a caller sink they get -inf, whose softmax term
+    exp(-inf) = 0 leaves plain attention."""
+    if sink is not None or qk_head_dim != 64:
+        return sink
+    return torch.full((q_head_num,), float("-inf"), dtype=torch.float32, device=device)
+
+
 def fmha_fwd_with_sink_asm(
     q: Tensor,
     k: Tensor,
@@ -607,15 +618,17 @@ def fmha_fwd_with_sink_asm(
       * `sink` is passed through verbatim — it is the value the kernel
         consumes directly (no host-side scaling). It is optional: pass `None`
         for no sink. Whether the kernel reads it is decided inside the `.co`
-        (ENABLE_SINK). When provided it must be a 1-D fp32 tensor of shape
-        [q_head_num].
+        (ENABLE_SINK); the D64 kernels always do, so for them `None` becomes
+        a -inf sink (no sink term). When provided it must be a 1-D fp32
+        tensor of shape [q_head_num].
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
     require_gfx1250_asm("fmha_fwd_with_sink_asm")
-    batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
+    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
+    sink = _fmha_fwd_asm_sink(sink, qk_head_dim, q_head_num, q.device)
 
     if out is None:
         out = torch.empty(
@@ -695,7 +708,9 @@ def fmha_fwd_with_sink_varlen_asm(
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
       * `sink` is passed through verbatim (the value the kernel consumes
-        directly, no host-side scaling); optional. Allocation is caller-side.
+        directly, no host-side scaling); optional. Allocation is caller-side,
+        except that D64 (whose kernels always read it) gets a -inf sink for
+        `None`.
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case ignore the result.
     """
@@ -706,8 +721,9 @@ def fmha_fwd_with_sink_varlen_asm(
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
-    total_q, q_head_num, _qk_head_dim = q.shape
+    total_q, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(2)
+    sink = _fmha_fwd_asm_sink(sink, qk_head_dim, q_head_num, q.device)
 
     if out is None:
         out = torch.empty(
@@ -1994,12 +2010,9 @@ def _flash_attn_forward(
         #
         #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
         #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
-        #   softmax denominator.  There is no "skip sink" mode on this binary,
-        #   so calling it with sink_ptr=None now forwards a null pointer to the
-        #   kernel (the wrapper no longer raises / zero-fills), which the D64
-        #   binary would dereference.  To preserve flash_attn_func's documented
-        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
-        #   D64 here and fall back to CK otherwise.
+        #   softmax denominator.  fmha_fwd_with_sink_asm gives it a -inf sink
+        #   (no sink term) when sink is None, but this router still sends only
+        #   callers with a sink here; D64 without one falls back to CK.
         if hdim_q == 128:
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
@@ -3074,8 +3087,9 @@ def _flash_attn_varlen_forward(
         #   buffer, so routing a caller's sink_ptr to them would silently drop
         #   the sink term -- fall back to CK whenever sink_ptr is set.
         #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
-        #   SINK, so calling with sink_ptr=None would dereference a null pointer
-        #   -- require an explicit sink for D64 and fall back to CK otherwise.
+        #   SINK; the wrapper gives them a -inf sink when sink is None, but this
+        #   router still sends only callers with a sink here -- D64 without one
+        #   falls back to CK.
         if hdim_q in (128, 192):
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
