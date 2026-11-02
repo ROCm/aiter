@@ -41,6 +41,7 @@ def get_shapes():
     shapes = [((1, 32, 1, 2), 32)]  # two elements per group
     shapes += [((2, 64, 3, 5), 32)]  # odd spatial size
     shapes += [((3, 96, 17), 8)]  # 1-D spatial, 12 channels per group
+    shapes += [((1, 32, 100, 33), 32)]  # 3300 per group: a short last block of 4
     shapes += [((2, 320, 64, 64), 32)]  # SD1.5 UNet, 512px
     shapes += [((2, 1280, 16, 16), 32)]  # SD1.5 UNet, lowest level
     shapes += [((1, 128, 256, 256), 32)]  # VAE decoder, split groups
@@ -96,3 +97,86 @@ def test_group_norm_rejects_bad_inputs():
         group_norm(x, 32, weight[:-1], bias)
     with pytest.raises(AssertionError):
         group_norm(x.transpose(2, 3), 32, weight, bias)  # not contiguous
+
+
+def test_group_norm_noncontiguous_affine():
+    """weight/bias with the right shape but a non-unit stride."""
+    x, _, _, _ = generate_group_norm_inputs(
+        (2, 64, 8, 8), 32, torch.float16, False, False
+    )
+    weight = torch.randn(128, device="cuda")[::2]
+    bias = torch.randn(128, device="cuda")[::2]
+    assert weight.shape == (64,) and weight.stride(0) == 2
+    got = group_norm(x, 32, weight, bias)
+    want = run_torch(x, 32, weight, bias, 1e-5, None, None)
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+def test_group_norm_empty_batch():
+    """Degenerate shapes: empty batch, no channels, zero spatial size."""
+    for shape in [(0, 64, 8, 8), (2, 0, 8, 8), (2, 64, 0, 8)]:
+        x = torch.randn(shape, dtype=torch.float16, device="cuda")
+        got = group_norm(x, 32)
+        assert got.shape == x.shape and got.dtype == x.dtype
+
+
+def test_group_norm_empty_activation():
+    """An empty activation name applies no activation, as None does."""
+    x, weight, bias, _ = generate_group_norm_inputs(
+        (2, 64, 8, 8), 32, torch.float16, True, False
+    )
+    got = group_norm(x, 32, weight, bias, activation="")
+    want = run_torch(x, 32, weight, bias, 1e-5, None, None)
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+def test_group_norm_outlier_in_group():
+    """One outlier element in an otherwise-uniform group, against fp64.
+
+    The outlier stays at index 0, where ref is, and its value is not a power of
+    two. At another index, or at 10000.0, an unstable reduction also passes.
+    """
+    x = torch.zeros(1, 1, 32768, dtype=torch.float32, device="cuda")
+    x[0, 0, 0] = 12345.67
+    got = group_norm(x, 1, eps=1e-5)
+    want = F.group_norm(x.double(), 1, eps=1e-5)
+    torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
+
+
+def test_group_norm_outlier_in_group_split():
+    """The outlier case on a group that splits over programs, against fp64.
+
+    It is the only numerical cover of the partial statistics and of their ref.
+    The length gives a last chunk that is shorter than one block.
+    """
+    x = torch.zeros(1, 1, (1 << 20) + 300, dtype=torch.float32, device="cuda")
+    x[0, 0, 0] = 12345.67
+    got = group_norm(x, 1, eps=1e-5)
+    want = F.group_norm(x.double(), 1, eps=1e-5)
+    torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
+
+
+def test_group_norm_inplace_split():
+    """out=x on a shape that splits a group over several programs.
+
+    The apply kernel reads ref from the partial statistics. The result does not
+    change with the program order.
+    """
+    x, weight, bias, t = generate_group_norm_inputs(
+        (1, 128, 256, 256), 32, torch.float16, True, True
+    )
+    want = run_torch(x, 32, weight, bias, 1e-5, t, "silu")
+    got = group_norm(x, 32, weight, bias, temb=t, activation="silu", out=x)
+    assert got.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+def test_group_norm_inplace_inline():
+    """out=x on a shape that keeps each group in one program."""
+    x, weight, bias, t = generate_group_norm_inputs(
+        (2, 320, 32, 32), 32, torch.float16, True, True
+    )
+    want = run_torch(x, 32, weight, bias, 1e-5, t, "silu")
+    got = group_norm(x, 32, weight, bias, temb=t, activation="silu", out=x)
+    assert got.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)

@@ -30,6 +30,16 @@ def _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB: tl.constexpr):
 
 
 @triton.jit
+def _welford_merge(mean_a, m2_a, n_a, mean_b, m2_b, n_b):
+    n = n_a + n_b
+    safe_n = tl.where(n == 0.0, 1.0, n)
+    delta = mean_b - mean_a
+    mean = mean_a + delta * n_b / safe_n
+    m2 = m2_a + m2_b + delta * delta * n_a * n_b / safe_n
+    return mean, m2, n
+
+
+@triton.jit
 def _group_norm_chunk_stats(
     x_ptr,
     t_ptr,
@@ -45,36 +55,29 @@ def _group_norm_chunk_stats(
     HAS_TEMB: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Mean, M2 and count of x - ref over elements [start, end) of one group.
+    """Welford mean, M2 and count of x - ref over elements [start, end) of one group.
 
-    Each lane keeps a sum and a sum of squares of x - ref, and the lanes are
-    reduced once at the end. Because ref is an element of the group, x - ref
-    has a mean near the group spread, so the sums do not cancel.
+    Welford keeps an outlier from cancelling the sum of squares. Only the last
+    loop step is partial, so the running count in the loop is a scalar.
     """
-    s1 = tl.zeros((BLOCK,), dtype=tl.float32)
-    s2 = tl.zeros((BLOCK,), dtype=tl.float32)
+    mean = tl.zeros((BLOCK,), dtype=tl.float32)
+    m2 = tl.zeros((BLOCK,), dtype=tl.float32)
     for off in tl.range(start, end, BLOCK):
         idx = off + tl.arange(0, BLOCK)
         mask = idx < end
         x = _group_norm_load(x_ptr, t_ptr, base, n, g, C, HW, CPG, idx, mask, HAS_TEMB)
-        x = tl.where(mask, x - ref, 0.0)
-        s1 += x
-        s2 += x * x
-    count = (end - start).to(tl.float32)
-    sum1 = tl.sum(s1, axis=0)
-    mean = sum1 / count
-    m2 = tl.maximum(tl.sum(s2, axis=0) - sum1 * mean, 0.0)
-    return mean, m2, count
-
-
-@triton.jit
-def _welford_merge(mean_a, m2_a, n_a, mean_b, m2_b, n_b):
-    n = n_a + n_b
-    safe_n = tl.where(n == 0.0, 1.0, n)
-    delta = mean_b - mean_a
-    mean = mean_a + delta * n_b / safe_n
-    m2 = m2_a + m2_b + delta * delta * n_a * n_b / safe_n
-    return mean, m2, n
+        # A dropped lane takes its own mean, so its delta is zero.
+        x = tl.where(mask, x - ref, mean)
+        inv_n = 1.0 / ((off - start) // BLOCK + 1).to(tl.float32)
+        delta = x - mean
+        mean += delta * inv_n
+        m2 += delta * (x - mean)
+    length = end - start
+    lane = tl.arange(0, BLOCK)
+    count = tl.where(lane < length, (length - lane + BLOCK - 1) // BLOCK, 0).to(
+        tl.float32
+    )
+    return tl.reduce((mean, m2, count), 0, _welford_merge)
 
 
 _group_norm_stats_repr = make_kernel_repr(
@@ -97,12 +100,16 @@ def _group_norm_stats_kernel(
     HAS_TEMB: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Partial statistics of chunk s of group (n, g): part[(n * G + g) * S + s]."""
+    """Partial statistics of chunk s of group (n, g): part[(n * G + g) * S + s].
+
+    It also stores ref. When out is x, another program can write over x's first
+    element of the group.
+    """
     pid = tl.program_id(0)
     s = tl.program_id(1)
     n_split = tl.num_programs(1)
     n = pid // G
-    g = pid % G
+    g = (pid % G).to(tl.int64)
     base = n.to(tl.int64) * C * HW + g * CPG * HW
     start = s * CHUNK
     end = tl.minimum(start + CHUNK, GS)
@@ -110,10 +117,11 @@ def _group_norm_stats_kernel(
     mean, m2, count = _group_norm_chunk_stats(
         x_ptr, t_ptr, base, n, g, C, HW, CPG, start, end, ref, HAS_TEMB, BLOCK
     )
-    out = part_ptr + (pid * n_split + s) * 3
+    out = part_ptr + (pid * n_split + s) * 4
     tl.store(out, mean)
     tl.store(out + 1, m2)
     tl.store(out + 2, count)
+    tl.store(out + 3, ref)
 
 
 _group_norm_apply_repr = make_kernel_repr(
@@ -158,29 +166,31 @@ def _group_norm_apply_kernel(
 ):
     """y = act(group_norm(x + temb) * weight + bias) for chunk s of group (n, g).
 
-    x is (N, C, *) and contiguous. With INLINE_STATS, the program owns the full
-    group and computes its statistics first. Otherwise it merges the partial
-    statistics that _group_norm_stats_kernel wrote for the group.
+    With INLINE_STATS the program owns the full group. If not, it merges the
+    partial statistics, which include ref: when out is x, that element of x can
+    already hold a result.
     """
     pid = tl.program_id(0)
     s = tl.program_id(1)
     n_split = tl.num_programs(1)
     n = pid // G
-    g = pid % G
+    g = (pid % G).to(tl.int64)
     base = n.to(tl.int64) * C * HW + g * CPG * HW
 
-    ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB)
     if INLINE_STATS:
+        ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB)
         mean, m2, count = _group_norm_chunk_stats(
             x_ptr, t_ptr, base, n, g, C, HW, CPG, 0, GS, ref, HAS_TEMB, BLOCK
         )
     else:
+        pbase = part_ptr + pid * n_split * 4
         offs = tl.arange(0, SPLIT_P2)
         pmask = offs < n_split
-        part = part_ptr + (pid * n_split + offs) * 3
+        part = pbase + offs * 4
         means = tl.load(part, mask=pmask, other=0.0)
         m2s = tl.load(part + 1, mask=pmask, other=0.0)
         counts = tl.load(part + 2, mask=pmask, other=0.0)
+        ref = tl.load(pbase + 3)
         mean, m2, count = tl.reduce((means, m2s, counts), 0, _welford_merge)
     rstd = tl.rsqrt(m2 / count + eps)
 

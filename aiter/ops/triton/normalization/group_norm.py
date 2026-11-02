@@ -38,8 +38,8 @@ def group_norm(
 
         out = act(group_norm(x + temb[:, :, None, ...], num_groups, weight, bias, eps))
 
-    A UNet or VAE ResNet block uses this pattern: GroupNorm then SiLU, and in the
-    second norm of a UNet block, the time embedding is added first.
+    A UNet or VAE ResNet block uses this pattern: GroupNorm then SiLU. The second
+    norm of a UNet block adds the time embedding first.
 
     Key parameters:
     - x: (N, C, *) input, contiguous (NCHW, NCDHW or (N, C, L)). C must be a
@@ -50,7 +50,8 @@ def group_norm(
     - temb: optional (N, C) tensor, added to x per channel before the norm.
     - activation: optional activation after the affine ("silu", "gelu",
       "gelu_tanh", "relu", ...).
-    - out: optional output with the shape and dtype of x.
+    - out: optional output with the shape and dtype of x. out can be x, for an
+      in-place update. out must be x, or must not overlap x.
 
     The statistics are computed in fp32. The output is rounded to the dtype of x
     once, after the activation.
@@ -74,6 +75,8 @@ def group_norm(
         assert p is None or p.shape == (
             C,
         ), f"{name} must be ({C},), got {tuple(p.shape)}"
+    weight = weight.contiguous() if weight is not None else None
+    bias = bias.contiguous() if bias is not None else None
     if temb is not None:
         assert temb.shape == (N, C), f"temb must be ({N}, {C}), got {tuple(temb.shape)}"
         assert temb.is_contiguous(), "temb must be contiguous"
@@ -84,6 +87,9 @@ def group_norm(
         assert (
             out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous()
         ), "out must be contiguous, with the shape and dtype of x"
+
+    if x.numel() == 0:
+        return out
 
     HW = math.prod(x.shape[2:])
     CPG = C // num_groups
@@ -100,7 +106,7 @@ def group_norm(
     part = x
     if split > 1:
         part = torch.empty(
-            (n_groups * split * 3,), dtype=torch.float32, device=x.device
+            (n_groups * split * 4,), dtype=torch.float32, device=x.device
         )
         _group_norm_stats_kernel[(n_groups, split)](
             x,
@@ -137,7 +143,7 @@ def group_norm(
         HAS_WEIGHT=weight is not None,
         HAS_BIAS=bias is not None,
         activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
+        use_activation=bool(activation),
         BLOCK=_BLOCK,
         num_warps=8,
     )
