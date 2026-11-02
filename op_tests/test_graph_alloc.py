@@ -85,6 +85,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import _fused_splitk_buffers
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
     from aiter.ops.topk import _get_topk_mb_workspace_keyed
@@ -96,6 +97,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
         "a16w16_gfx1250": _split_k_counters(dev, s),
+        "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
         "a8w8_zero_bias": get_zero_bias_buf_keyed(dev, sid, 64),
         "topk_workspace": _get_topk_mb_workspace_keyed(dev, sid, 4096),
@@ -241,3 +243,88 @@ def test_split_k_gemm_whose_semaphores_are_first_used_inside_a_capture():
     except subprocess.TimeoutExpired:
         pytest.fail("split-K GEMM hung on semaphores never zeroed outside a graph")
     assert proc.returncode == 0 and "OK" in proc.stdout, proc.stderr[-2000:]
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
+def test_fused_split_k_gemm_whose_counters_are_first_used_inside_a_capture():
+    """The gfx950 mxfp8 fused split-K (_fsk) GEMM reduces in the last block to
+    arrive at each tile's counter. Two captures of one shape fork it onto an aux
+    stream, and a graph sharing their pool leaves 7s where the first capture's
+    counters land. Shared counters never reach split_k - 1 in the graph without
+    the zero fill, so its output tiles are never written. Nothing spins, so this
+    runs in-process."""
+    from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+    from aiter.ops.quant import per_group_quant_hip
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.test_common import checkAllclose
+
+    if get_gfx() != "gfx950":
+        pytest.skip("FlyDSL mxscale preshuffle GEMM is gfx950-only")
+    dev = torch.device("cuda:0")
+    m, n, k = 16, 2304, 6144  # a dsv4 mxfp8 row tuned to the kernel below
+    kernel_name = "flydsl_mxpsh_16x64x512_F8_F8_B16_w0_x0_sk6_fsk"
+    w = (torch.randn(n, k, device=dev) * 0.02).to(dtypes.fp8)
+    w_scale = torch.randint(122, 127, (n, k // 32), dtype=torch.uint8, device=dev)
+    w_scale = w_scale.view(dtypes.fp8_e8m0)
+    wq = shuffle_weight(w, layout=(16, 16))
+
+    def gemm(xq, x_scale):
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        return run_gemm_a8w8_mxfp8_gfx950(xq, wq, x_scale, w_scale, out, kernel_name)
+
+    inputs = [
+        per_group_quant_hip(
+            torch.randn(m, k, dtype=torch.bfloat16, device=dev),
+            quant_dtype=dtypes.fp8,
+            group_size=32,
+            scale_type=dtypes.fp8_e8m0,
+        )
+        for _ in range(2)
+    ]
+    gemm(*inputs[0])  # eager warmup: default stream only
+    torch.cuda.synchronize()
+
+    capture, aux = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+    pool = torch.cuda.graph_pool_handle()
+
+    def capture_on_aux(fn):
+        graph = torch.cuda.CUDAGraph()
+        fork, join = torch.cuda.Event(), torch.cuda.Event()
+        with torch.cuda.graph(graph, stream=capture, pool=pool):
+            fork.record()
+            with torch.cuda.stream(aux):
+                fork.wait()
+                result = fn()
+                join.record()
+            join.wait()
+        return graph, result
+
+    def fill_and_free():
+        # Frees an aux-stream block of the shared pool, keeping nothing alive,
+        # so the next capture's scratch is carved from memory each replay of
+        # this graph fills with 7s.
+        torch.full((1 << 18,), 7, dtype=torch.int32, device=dev).sum()
+
+    dirty, _ = capture_on_aux(fill_and_free)
+    graphs, outs = zip(*(capture_on_aux(lambda x=x: gemm(*x)) for x in inputs))
+    for out in outs:
+        out.zero_()
+    dirty.replay()
+    for graph in reversed(graphs):  # the graph that recorded the zero fill last
+        graph.replay()
+    torch.cuda.synchronize()
+
+    def ref(xq, x_scale):
+        a_scale = torch.exp2(x_scale.view(torch.uint8).float() - 127)
+        a = (xq.float().view(m, k // 32, 32) * a_scale[..., None]).view(m, k)
+        b_scale = torch.exp2(w_scale.view(torch.uint8).float() - 127)
+        return a @ (w.float() * b_scale.repeat_interleave(32, 1)).T
+
+    for i, (x, out) in enumerate(zip(inputs, outs)):
+        err = checkAllclose(ref(*x), out.float(), msg=f"graph {i}: ", printLog=False)
+        assert err == 0, (i, err)

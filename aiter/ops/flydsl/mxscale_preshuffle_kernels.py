@@ -26,6 +26,8 @@ import functools
 
 import torch
 
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
+
 # gemm_a8w8_mxfp8_bpreshuffle's gfx950 scales per w_scale block (row-major 1x32
 # x_scale; 1x32 or 32x32 w_scale), defined next to its tune pipelines;
 # re-exported for the runner and AOT.
@@ -58,7 +60,34 @@ def _reduce_exe():
     return set_slp_vectorize_once_used(flyc.jit(launch_splitk_reduce.func), False)
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.cache
+def _fused_splitk_workspace(
+    device: torch.device,
+    stream_id: int,
+    split_k: int,
+    M: int,
+    N: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # Every split stores its whole partial before arriving, so this needs no
+    # initialization and is shared with captures. Never evicted: a captured
+    # graph may point at it.
+    del stream_id
+    with persistent_alloc(device):
+        return torch.empty((split_k, M, N), dtype=dtype, device=device)
+
+
+@capture_scoped_cache
+def _fused_splitk_semaphore(
+    device: torch.device, stream_id: int, num_tiles: int
+) -> torch.Tensor:
+    # Safe to reuse: launches on a stream are ordered and each tile's last
+    # arrival hands its counter back zeroed.
+    del stream_id
+    with persistent_alloc(device):
+        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+
+
 def _fused_splitk_buffers(
     device: torch.device,
     stream_id: int,
@@ -70,10 +99,10 @@ def _fused_splitk_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stream-private partials (BF16 for the coarse small-M path, FP32 for 1x32
     row scales) and per-output-tile arrival counters."""
-    del stream_id
-    workspace = torch.empty((split_k, M, N), dtype=dtype, device=device)
-    semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-    return workspace, semaphore
+    return (
+        _fused_splitk_workspace(device, stream_id, split_k, M, N, dtype),
+        _fused_splitk_semaphore(device, stream_id, num_tiles),
+    )
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -306,16 +335,14 @@ def flydsl_mxscale_preshuffle_gemm(
                     torch.float32 if fused_f32 else torch.bfloat16,
                 )
         else:
-            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors.
-            workspace, semaphore = _fused_splitk_buffers(
-                A.device,
-                0,
-                split_k,
-                M,
-                N,
-                num_tiles,
-                torch.float32 if fused_f32 else torch.bfloat16,
+            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors:
+            # nothing launches, so skip the HIP pool and capture lookups.
+            workspace = torch.empty(
+                (split_k, M, N),
+                dtype=torch.float32 if fused_f32 else torch.bfloat16,
+                device=A.device,
             )
+            semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=A.device)
         _run_compiled(
             gemm_exe,
             ptr_arg(workspace),
