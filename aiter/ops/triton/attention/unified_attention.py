@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
+    gfx12_token_split_tiles,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
@@ -80,6 +81,12 @@ _GFX12_TOKEN_SPLIT_MAX_TILES = int(
 _GFX12_TOKEN_SPLIT_MAX_KV = int(
     os.environ.get("AITER_GFX12_TOKEN_SPLIT_MAX_KV", "262144")
 )
+# Opt-in: compute the token split's tiles per segment in one Triton program instead
+# of the nine torch ops (add, floor-divide, sum, multiply, add, floor-divide, clamp,
+# cast) that run before every 3d launch -- bitwise the same int32, still recomputed
+# from the live seqused_k on every CUDA-graph replay. 13 calls a Qwen3.5 MTP-3 decode
+# step (10 layers + 3 draft passes): 117 kernels become 13.
+_GFX12_TOKEN_SPLIT_FUSED = os.environ.get("AITER_GFX12_TOKEN_SPLIT_FUSED", "0") == "1"
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU overrides the short-query bound above, and
 # PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
@@ -236,21 +243,64 @@ def _gfx950_split_params(params: _UAParams):
 _SW_SPLIT_MAX_Q = 16
 
 
-def _gfx12_token_split(params: _UAParams, tile_size: int):
-    """The token split's grid width (NUM_SEGMENTS) and its tiles per segment.
-
-    Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
-    over _GFX12_TOKEN_SPLIT_PROGRAMS, clamped to [MIN_TILES, MAX_TILES]. Plain torch
-    ops, so a CUDA graph recomputes it from the live context lengths on replay.
-    """
-    tiles = (params.seqused_k + (tile_size - 1)) // tile_size
-    want = tiles.sum() * params.num_kv_heads
+def _gfx12_token_split_tiles_torch(
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+) -> torch.Tensor:
+    """Tiles per segment as plain torch ops (nine kernels): [1] int32."""
+    tiles = (seqused_k + (tile_size - 1)) // tile_size
+    want = tiles.sum() * num_kv_heads
     want = (want + (_GFX12_TOKEN_SPLIT_PROGRAMS - 1)) // _GFX12_TOKEN_SPLIT_PROGRAMS
-    segm_tiles = (
+    return (
         want.clamp(_GFX12_TOKEN_SPLIT_MIN_TILES, _GFX12_TOKEN_SPLIT_MAX_TILES)
         .to(torch.int32)
         .reshape(1)
     )
+
+
+def _gfx12_token_split_tiles_fused(
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+) -> torch.Tensor:
+    """`_gfx12_token_split_tiles_torch` in one single-program Triton launch.
+
+    Bitwise the same [1] int32. No host read of device data and a fixed grid, so
+    it captures into a CUDA graph and recomputes from the live seqused_k on replay.
+    """
+    if seqused_k.dim() != 1:
+        return _gfx12_token_split_tiles_torch(seqused_k, num_kv_heads, tile_size)
+    segm_tiles = torch.empty(1, dtype=torch.int32, device=seqused_k.device)
+    num_seqs = seqused_k.shape[0]
+    gfx12_token_split_tiles[(1,)](
+        seqused_k,
+        segm_tiles,
+        num_seqs,
+        seqused_k.stride(0),
+        num_kv_heads,
+        TILE_SIZE=tile_size,
+        PROGRAMS=_GFX12_TOKEN_SPLIT_PROGRAMS,
+        MIN_TILES=_GFX12_TOKEN_SPLIT_MIN_TILES,
+        MAX_TILES=_GFX12_TOKEN_SPLIT_MAX_TILES,
+        BLOCK=min(1024, max(64, triton.next_power_of_2(num_seqs))),
+        num_warps=4,
+    )
+    return segm_tiles
+
+
+def _gfx12_token_split(params: _UAParams, tile_size: int):
+    """The token split's grid width (NUM_SEGMENTS) and its tiles per segment.
+
+    Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
+    over _GFX12_TOKEN_SPLIT_PROGRAMS, clamped to [MIN_TILES, MAX_TILES]. Device ops
+    only (nine torch ops, or one Triton program under AITER_GFX12_TOKEN_SPLIT_FUSED=1),
+    so a CUDA graph recomputes it from the live context lengths on replay.
+    """
+    if _GFX12_TOKEN_SPLIT_FUSED:
+        segm_tiles = _gfx12_token_split_tiles_fused(
+            params.seqused_k, params.num_kv_heads, tile_size
+        )
+    else:
+        segm_tiles = _gfx12_token_split_tiles_torch(
+            params.seqused_k, params.num_kv_heads, tile_size
+        )
     kv_cover = max(int(params.max_seqlen_k), _GFX12_TOKEN_SPLIT_MAX_KV)
     num_segments = triton.next_power_of_2(
         triton.cdiv(kv_cover, _GFX12_TOKEN_SPLIT_MIN_TILES * tile_size)

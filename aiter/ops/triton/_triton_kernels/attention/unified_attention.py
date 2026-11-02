@@ -1244,3 +1244,49 @@ def attention_output_gate_rows(
         gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
         x = (x.to(tl.float32) * gate).to(out_ptr.type.element_ty)
     tl.store(out_ptr + out_row.to(tl.int64) * out_stride_0 + cols, x, mask=mask)
+
+
+@triton.jit
+def _floor_div_pos(a, b: tl.constexpr):
+    """`a // b` rounded toward minus infinity (torch's integer `//`) for b > 0.
+
+    Triton's integer division truncates like C, which differs only for a < 0."""
+    q = a // b
+    return q - ((q * b != a) & (a < 0)).to(q.dtype)
+
+
+@triton.jit
+def gfx12_token_split_tiles(
+    seqused_k_ptr,  # [num_seqs]
+    segm_tiles_ptr,  # [1] int32, out
+    num_seqs,
+    stride_seqused_k,
+    num_kv_heads,
+    TILE_SIZE: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    MIN_TILES: tl.constexpr,
+    MAX_TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """The gfx1250 token split's tiles per segment, in one program.
+
+    The same integer arithmetic as the torch expression it replaces, so the
+    result is bitwise the same for every input:
+      clamp(floor((sum_i floor((seqused_k[i] + TILE_SIZE - 1) / TILE_SIZE)
+                   * num_kv_heads + PROGRAMS - 1) / PROGRAMS),
+            MIN_TILES, MAX_TILES) as int32.
+    The per-sequence tile count is in seqused_k's own dtype; the sum, the head
+    product and the division by PROGRAMS are int64, as torch's integer `sum`
+    promotes.
+    """
+    acc = tl.zeros([BLOCK], dtype=tl.int64)
+    for start in range(0, num_seqs, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        s = tl.load(
+            seqused_k_ptr + offs * stride_seqused_k, mask=offs < num_seqs, other=0
+        )
+        acc += _floor_div_pos(s + (TILE_SIZE - 1), TILE_SIZE).to(tl.int64)
+    want = tl.sum(acc, axis=0) * num_kv_heads
+    want = _floor_div_pos(want + (PROGRAMS - 1), PROGRAMS)
+    want = tl.minimum(tl.maximum(want, MIN_TILES), MAX_TILES)
+    tl.store(segm_tiles_ptr, want.to(tl.int32))
