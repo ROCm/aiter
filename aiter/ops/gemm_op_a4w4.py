@@ -21,6 +21,119 @@ from ..utility import dtypes
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
+@functools.lru_cache(maxsize=1)
+def _load_a4w4_triton_preshuffle_config(tuned_file: str) -> dict:
+    """Exact routes, separate from CK/ASM so ineligible calls keep their tuned rows."""
+    try:
+        df = pd.read_csv(tuned_file).drop_duplicates()
+    except (OSError, pd.errors.EmptyDataError):
+        return {}
+    keys = ["gfx", "cu_num", "M", "N", "K"]
+    params = [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+    ]
+    configs = df.set_index(keys)[params].to_dict("index")
+    return {
+        key: {
+            **{name: int(value) for name, value in cfg.items()},
+            "cache_modifier": None,
+        }
+        for key, cfg in configs.items()
+    }
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_a4w4_triton_preshuffle_config(m: int, n: int, k: int):
+    configs = _load_a4w4_triton_preshuffle_config(
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE_FILE
+    )
+    return configs.get(("gfx950", 256, m, n, k))
+
+
+def _gemm_a4w4_triton_preshuffle(
+    A,
+    B,
+    A_scale,
+    B_scale,
+    *,
+    gfx,
+    bias,
+    dtype,
+    alpha,
+    beta,
+    bpreshuffle,
+    apreshuffle,
+    global_A_scale,
+    global_B_scale,
+):
+    """Try the compatible dense route; None retains the original CK/ASM dispatch."""
+    m = A.numel() // A.shape[-1]
+    n, k = B.shape[0], A.shape[-1] * 2
+    if not (
+        gfx == "gfx950"
+        and m >= 32
+        and n % 32 == 0
+        and k % 256 == 0
+        and dtype == dtypes.bf16
+        and bpreshuffle in (None, True)
+        and not apreshuffle
+        and bias is None
+        and alpha in (None, 1.0)
+        and beta in (None, 0.0)
+        and global_A_scale is None
+        and global_B_scale is None
+    ):
+        return None
+    if get_cu_num() != 256:
+        return None
+    # A is row-major packed FP4; B and both E8M0 scale buffers are already
+    # shuffled. The Triton API needs stripe views of the same storage.
+    if not (
+        B.ndim == 2
+        and B.shape[1] == k // 2
+        and all(t.is_contiguous() for t in (A, B, A_scale, B_scale))
+        and A.dtype in (dtypes.fp4x2, torch.uint8)
+        and B.dtype in (dtypes.fp4x2, torch.uint8)
+        and all(s.dtype in (dtypes.fp8_e8m0, torch.uint8) for s in (A_scale, B_scale))
+        and all(
+            s.ndim == 2
+            and s.shape[0] >= rows
+            and s.shape[0] % 32 == 0
+            and s.shape[1] == k // 32
+            for s, rows in ((A_scale, m), (B_scale, n))
+        )
+    ):
+        return None
+    config = _get_a4w4_triton_preshuffle_config(m, n, k)
+    # Longer K and larger M/N require exact entries, not a global switch.
+    short_k = 32 <= m <= 64 and 256 <= n <= 768 and n % 256 == 0 and 256 <= k <= 1024
+    if config is None and not short_k:
+        return None
+    try:
+        from .triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+    except ModuleNotFoundError as exc:
+        if exc.name == "triton" or (exc.name and exc.name.startswith("triton.")):
+            return None
+        raise
+    out = gemm_afp4wfp4_preshuffle(
+        A.view(torch.uint8).view(m, k // 2),
+        B.view(torch.uint8).view(n // 16, -1),
+        A_scale.view(torch.uint8).view(A_scale.shape[0] // 32, -1),
+        B_scale.view(torch.uint8).view(B_scale.shape[0] // 32, -1),
+        dtype=dtype,
+        config=None if config is None else dict(config),
+    )
+    return out.view(*A.shape[:-1], n)
+
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -333,6 +446,23 @@ def gemm_a4w4(
             beta=beta,
         )
         return out.view(*A.shape[:-1], out.shape[-1])
+    out = _gemm_a4w4_triton_preshuffle(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        gfx=gfx_arch,
+        bias=bias,
+        dtype=dtype,
+        alpha=alpha,
+        beta=beta,
+        bpreshuffle=bpreshuffle,
+        apreshuffle=apreshuffle,
+        global_A_scale=global_A_scale,
+        global_B_scale=global_B_scale,
+    )
+    if out is not None:
+        return out
     out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(

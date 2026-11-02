@@ -222,6 +222,11 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv",
 )
 
+AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_triton_preshuffle_dispatch.csv",
+)
+
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
@@ -269,6 +274,14 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
 
 
 class AITER_CONFIG:
+    @property
+    def AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_TRITON_PRESHUFFLE,
+            "a4w4_triton_preshuffle_dispatch",
+        )
+
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
