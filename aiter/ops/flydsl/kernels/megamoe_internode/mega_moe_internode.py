@@ -16,16 +16,20 @@ keyword arguments, and ``forward`` / ``forward_prequant`` / ``quantize`` /
 
 A forward is four launches on one stream:
 
-0. MXFP4 quant of ``x``, written as rail records straight into the window;
+0. MXFP4 quant of ``x``, written as rail records straight into the window
+   (``quant.py``);
 1. stage1: InterNodeV1 dispatch to expert tiles + GMM1 + activation + A4
    requant (``stage1.py``);
 2. stage2 kernel1: GEMM2 + weighted push into the node-local plane-slot
-   inbox (``stage2_gemm_push.py``);
+   inbox (``stage2.py``);
 3. stage2 kernel2: node reduce -> rail to the peer node -> combine
-   (``stage2_node_combine.py``).
+   (``stage2.py``).
 
-Shape-dependent tiles come from the stage1/stage2 tune tables.  The
-generation/parity of each forward is derived on the device, so the four
+Package layout: ``layout.py`` is the registered-window layout both stages
+share, ``gemm.py`` the GMM1 / GMM2 bodies, ``communication.py`` the device
+communication primitives and rail GDA externs, ``common.py`` the GEMM helpers,
+and ``mega_moe_internode_config.py`` the per-shape stage1 / stage2 tune tables.
+The generation/parity of each forward is derived on the device, so the four
 launches can be captured into a CUDA graph and replayed.
 """
 
@@ -39,19 +43,28 @@ import torch.distributed as dist
 
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
-from .rail_record_quant import get_rail_record_quant
-from .stage1 import WORKER_BLOCKS, compile_megamoe_tile_ep16_stage1
-from .stage1_abi import (
+from .layout import (
     MAX_FUSED_TOKENS_PER_RANK,
     Stage1ArenaLayout,
+    Stage2ArenaLayout,
     TwoKernelArenaLayout,
     validate_fused_weight_addressing,
 )
-from .stage1_tune import resolve_stage1_tile
-from .stage2_abi import Stage2ArenaLayout
-from .stage2_gemm_push import peer_table_launcher, run_mega_moe_stage2
-from .stage2_node_combine import SCRATCH_WORDS, run_stage2_node_combine
-from .stage2_tune import NUM_QP, lookup_stage2_tune, resolve_gemm2_bn, resolve_gemm2_cu
+from .mega_moe_internode_config import (
+    NUM_QP,
+    lookup_stage2_tune,
+    resolve_gemm2_bn,
+    resolve_gemm2_cu,
+    resolve_stage1_tile,
+)
+from .quant import get_rail_record_quant
+from .stage1 import WORKER_BLOCKS, compile_stage1
+from .stage2 import (
+    SCRATCH_WORDS,
+    peer_table_launcher,
+    run_mega_moe_stage2,
+    run_stage2_node_combine,
+)
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
 
@@ -62,6 +75,8 @@ GPUS_PER_NODE = 8
 TILE_M = 32
 
 _COMM_QUANT = {"none": "none", "fp8": "fp8_blockwise_1x32"}
+# Largest single NIC registration known to work (TPR 4096 DSv4 registers 0.61 GiB).
+_MAX_RDMA_MR_BYTES = 1 << 30
 _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 
 # Window regions read or written by the rail (GDA RDMA).  Only this prefix of
@@ -110,16 +125,20 @@ def _align_up(value: int, alignment: int) -> int:
 
 def build_window_layout(*, model_dim: int, inter_dim: int, experts: int, topk: int,
                         max_tok_per_rank: int, max_routes_per_token_per_rank: int,
-                        tile_group: int) -> TwoKernelArenaLayout:
+                        tile_group: int, comm_quant: str = "fp8") -> TwoKernelArenaLayout:
     """Stage1 and Stage2 layouts sharing one registered window.
 
     Stage2 is embedded right after Stage1's RDMA prefix, so every rail
     target sits in the front of the window and does not move with the
     route capacity.
     """
+    # Rail row width, as k2 sizes it (RECORD_BYTES): fp8 rows carry e8m0 scales.
+    rail_record_bytes = (model_dim + model_dim // 32 if comm_quant == "fp8"
+                         else 2 * model_dim)
     stage2 = Stage2ArenaLayout.create(
         hidden=model_dim, topk=topk, max_tokens=max_tok_per_rank,
         world_size=WORLD_SIZE, gpus_per_node=GPUS_PER_NODE,
+        rail_record_bytes=rail_record_bytes,
     )
     stage1 = Stage1ArenaLayout.create(
         hidden=model_dim, inter=inter_dim, experts=experts, world_size=WORLD_SIZE,
@@ -173,17 +192,8 @@ class MegaMoEInternode:
         topk: int, quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor,
         w2_scale: torch.Tensor, max_tok_per_rank: int, mega_scheme: str = "fixedslot",
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (), activation: str = "silu",
-        comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None,
-        stage1_overrides: dict | None = None):
+        comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None):
     # fmt: on
-        # stage1_overrides: optional stage1 compile overrides for A/B only (keys: tile_ready,
-        # waves_per_eu, lite_sync, acq_one_wave, fan_wt). Defaults are decided by the stage1 compile
-        # path from the shape/split rule; a value that differs from the rule changes the kernel name.
-        self._stage1_overrides = dict(stage1_overrides or {})
-        _bad = set(self._stage1_overrides) - {"tile_ready", "waves_per_eu", "lite_sync", "acq_one_wave",
-                                              "fan_wt"}
-        if _bad:
-            raise ValueError(f"unknown stage1_overrides keys: {sorted(_bad)}")
         del mega_scheme
         route_cap = topk if max_routes_per_token_per_rank is None else max_routes_per_token_per_rank
         self._validate_args(
@@ -238,14 +248,24 @@ class MegaMoEInternode:
         self._gemm2_cu = gemm2_cu or WORKER_BLOCKS
         # Without a table row: one chunk per rail queue is the balanced
         # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
-        self._chunk_tokens = int(s2_tuned.get("return_chunk_tokens", max(4, self.mtpr // NUM_QP)))
+        # Capped at 512 (the TPR 4096 value): k2 unrolls one ready store per chunk
+        # token, so mtpr > 4096 adds chunks instead of widening them.
+        self._chunk_tokens = int(s2_tuned.get(
+            "return_chunk_tokens", max(4, min(512, self.mtpr // NUM_QP))))
 
         self.layout = build_window_layout(
             model_dim=self.model_dim, inter_dim=self.inter_dim, experts=self.experts,
             topk=self.topk, max_tok_per_rank=self.mtpr,
             max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
-            tile_group=self._s1_tile["tile_group"],
+            tile_group=self._s1_tile["tile_group"], comm_quant=self.comm_quant,
         )
+        # One NIC MR covers the rail prefix; past ~1 GiB rail writes stop
+        # landing (ionic). Refuse here instead of hanging in k2.
+        if _align_up(self._rdma_prefix_end(), 64 << 20) > _MAX_RDMA_MR_BYTES:
+            raise ValueError(
+                f"rail-registered prefix {self._rdma_prefix_end() / 2**30:.2f} GiB exceeds "
+                f"{_MAX_RDMA_MR_BYTES / 2**30:.2f} GiB at max_tok_per_rank={self.mtpr}; "
+                "use comm_quant='fp8' or a smaller max_tok_per_rank")
         self._runtime: _CcoRuntime | None = None
         self._closed = False
         try:
@@ -253,17 +273,14 @@ class MegaMoEInternode:
             self._output = torch.empty(
                 (self.mtpr, self.model_dim), dtype=torch.bfloat16, device=self.device)
             self._init_input_records()
-            self._stage1 = compile_megamoe_tile_ep16_stage1(
+            self._stage1 = compile_stage1(
                 self.layout.stage1, self.layout.stage2,
                 rank=self.rank,
                 stage2_window_offset=self.layout.stage2_offset,
                 fanout_shards=int(self._s1_tile["fanout_shards"]),
-                compute_first=self._s1_tile["compute_first"],
                 split_local=bool(self._s1_tile["split_local"]),
-                gmm1_bn=self._s1_tile["gmm1_bn"],
                 activation=self.activation,
                 swiglu_limit=(self.swiglu_limit or None),
-                **self._stage1_overrides,
             )
             self.stage1_kernel_name = self._stage1.kernel_name
             self._init_stage2()
