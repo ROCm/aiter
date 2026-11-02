@@ -3915,6 +3915,35 @@ for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_LDS_PANEL_CONFIGS:
 _next_small_kid = max(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list) + 1
 
 
+def _bpreshuffle_small_tune_eligible(signature):
+    """Limit policy cross-products while keeping geometry and Split-K axes.
+
+    This is a search heuristic, not a shape-support or kernel-legality rule.
+    Full registration preserves IDs and names used by saved tuning results.
+    """
+    pipeline = signature[0]
+    if pipeline == "b_direct":
+        args = signature[1]
+        contiguous_2d = (args[13], args[5], args[16]) == (True, False, True)
+        # Preserve coupled WG/cache/scale policies for contiguous 2D Output0,
+        # including Split-K partials; explore other branches one policy at a time.
+        if contiguous_2d and args[11] == 0:
+            return True
+        return sum((args[8] != 1, (args[9], args[4]) != (0, 0),
+                    args[11] != 0,
+                    (args[13], args[5], args[16], args[18])
+                    != (True, False, True, False))) <= 1
+    if pipeline == "composable":
+        compact, perstage, _direct, _ahead, _cb, _async, _contiguous, normal = signature[2][:8]
+        # Keep both normal modes for compact and per-stage scale loading.
+        return normal or perstage or compact
+    if pipeline == "lds_panel":
+        args = signature[1]
+        return sum((args[5] != 0, (args[6], args[7]) != (0, 0),
+                    args[8], args[12])) <= 1
+    return True
+
+
 def _register_generated_small(signature, traits, geometry, entry, *, fixed_k,
                               max_k=None, split_k=1, wg=1, ca=0, cb=0):
     global _next_small_kid
@@ -3927,6 +3956,7 @@ def _register_generated_small(signature, traits, geometry, entry, *, fixed_k,
     token = "_".join(str(v).lower() for group in params
                      for v in (group if isinstance(group, tuple) else (group,)))
     entry["config_name"] = _bpreshuffle_jit_name(signature[0], bm, bn, bk, wm, wn, token)
+    entry["tune_eligible"] = _bpreshuffle_small_tune_eligible(signature)
     _bpreshuffle_register_ring(
         _next_small_kid, geometry, traits, entry,
         fixed_k=fixed_k, max_k=fixed_k if max_k is None else max_k,
@@ -3984,11 +4014,76 @@ for _args in _bpreshuffle_small_lds_panel_configs():
                               (_bm, _bn, 128, _wm, 2), _entry, fixed_k=_k, max_k=_panel * 128, ca=_ca, cb=_cb)
 
 
+# Append experimental candidates after the complete existing bank. Keep the
+# original enumeration order so saved exact-kid measurements remain replayable.
+def _bpreshuffle_wide_b_direct_configs():
+    for bm, wn, bk, fixed_k, split, wg, caches, output in product(
+        (96, 128), (4, 8), (128, 256), (16384, 21504), (1, 2),
+        (1, 2), _BPRESHUFFLE_JIT_CACHES, (0, 2)
+    ):
+        if split > 1 and output != 0:
+            continue
+        ca, cb = caches
+        args = (bm, 256, 3, 1, cb, False, fixed_k, wn, wg, ca,
+                2, output, bk, True, False, False, True, split, False)
+        if _bpreshuffle_b_direct_legal(args):
+            yield args
+
+
+def _register_b_direct_experiment(args, *, native_c=False):
+    bm, bn, stages, ahead, cb, xcd, fixed_k, wn, wg, ca = args[:10]
+    bk, split = args[12], args[17]
+    traits = _bpreshuffle_traits(_BP_ROOT + "b_direct_traits", *args)
+    if native_c:
+        traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_native_c_traits", traits)
+    entry = _small_pipeline_entry(
+        "b_direct", "b_direct", _BP_ROOT + "b_direct_bulk_panel_kernel", m_align=16)
+    entry["grid_kind"] = "nm"
+    if split > 1:
+        entry.update(host_kind="reduce",
+                     headers=("gfx950/splitk_reduce_gfx950.cuh", *entry["headers"]),
+                     reduce_kernel="splitk_reduce_kernel",
+                     workspace_rule=["mn", 4 * split, 0])
+    next_kid = _next_small_kid
+    _register_generated_small(
+        ("b_direct_native_c" if native_c else "b_direct", args, ""), traits,
+        (bm, bn, bk, 1, wn), entry, fixed_k=fixed_k, split_k=split,
+        wg=wg, ca=ca, cb=cb)
+    if _next_small_kid != next_kid:
+        # This focused bank measures coupled output/cache policies together.
+        # Existing registrations and their eligibility metadata are untouched.
+        a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[next_kid].bpreshuffle_entry[
+            "tune_eligible"] = True
+
+
+for _bpreshuffle_wide_args in _bpreshuffle_wide_b_direct_configs():
+    _register_b_direct_experiment(_bpreshuffle_wide_args)
+
+
+def _bpreshuffle_native_c_configs():
+    for geometry, fixed_k, caches, output in product(
+        ((128, 128, 2), (128, 256, 4), (96, 256, 4)),
+        (16384, 21504), _BPRESHUFFLE_JIT_CACHES, (0, 2)
+    ):
+        bm, bn, wn = geometry
+        ca, cb = caches
+        args = (bm, bn, 3, 1, cb, False, fixed_k, wn, 1, ca,
+                2, output, 128, True, False, False, True, 1, False)
+        if _bpreshuffle_b_direct_legal(args):
+            yield args
+
+
+for _bpreshuffle_native_args in _bpreshuffle_native_c_configs():
+    _register_b_direct_experiment(_bpreshuffle_native_args, native_c=True)
+
+
+
 def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
     if str(gfx).lower().split(":", 1)[0] != "gfx950" or canonical_output_dtype(outdtype) != "bf16_t":
         return []
     return [kid for kid, instance in sorted(get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items())
-            if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)]
+            if (instance.bpreshuffle_entry or {}).get("tune_eligible", True)
+            and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)]
 
 
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):

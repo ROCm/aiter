@@ -475,6 +475,12 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_b_direc
     using namespace opus_gemm_b_direct_detail;
     namespace layout = opus_gemm_b_direct_detail;
     using T          = opus::remove_cvref_t<Traits>;
+    constexpr bool native_c = [] {
+        if constexpr (requires { T::NATIVE_C; })
+            return T::NATIVE_C;
+        else
+            return false;
+    }();
     using Index      = unsigned;
 
     // Prepare tile views, operand rings, scales, and accumulators.
@@ -613,7 +619,7 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_b_direc
                 });
             });
         });
-        if constexpr (!T::C_AGPR && !T::PIN_C)
+        if constexpr (!native_c && !T::C_AGPR && !T::PIN_C)
             static_for<MR * NR>([&](auto ci) {
                 auto& v = c[decltype(ci)::value];
                 asm volatile("" : "+v"(v));

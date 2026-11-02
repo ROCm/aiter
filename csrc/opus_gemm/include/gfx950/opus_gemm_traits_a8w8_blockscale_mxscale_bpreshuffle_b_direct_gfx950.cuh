@@ -16,6 +16,14 @@ struct opus_gemm_bpreshuffle_simple_tail_traits : Base {
     static_assert(Base::BLOCK_SIZE > 0 && Base::BLOCK_SIZE % 64 == 0);
 };
 
+// Opt-in compiler allocation of C; existing traits retain their register policy.
+// This does not enable manual A/C AGPR pinning.
+template<class Base>
+struct opus_gemm_bpreshuffle_native_c_traits : Base {
+    static constexpr bool NATIVE_C = true;
+    static_assert(!Base::PIN_A && !Base::PIN_C);
+};
+
 constexpr int opus_gemm_blockscale_mxscale_bpreshuffle_output_rows(int bm, int bn,
                                                                    int pipeline_bytes) {
     for (int rows = bm; rows >= 16; rows -= 16)
