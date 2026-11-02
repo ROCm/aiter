@@ -1,3 +1,5 @@
+from functools import partial
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -38,6 +40,27 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
     return x, weight, out_dtype, y
 
 
+# The kernel's _silu just calls _silu_exp2, so both names share one reference.
+# Never merge gelu and gelu_tanh: their 4.7e-4 per-element gap hides under atol.
+_TORCH_ACTIVATIONS = {
+    "gelu": F.gelu,
+    "gelu_tanh": partial(F.gelu, approximate="tanh"),
+    "silu": F.silu,
+    "silu_exp2": F.silu,
+    "relu": F.relu,
+}
+
+
+def run_torch(x, w, bias=None, activation=None, gate_first=True):
+    out = F.linear(x, w, bias=bias)
+    half = out.shape[1] // 2
+    first, second = out[:, :half], out[:, half:]
+    gate, value = (first, second) if gate_first else (second, first)
+    if activation is not None:
+        gate = _TORCH_ACTIVATIONS[activation](gate)
+    return gate * value
+
+
 @pytest.mark.parametrize(
     "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None]
 )
@@ -56,21 +79,7 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
         M, N, K, dtype, layout=layout, output=output
     )
 
-    torch_out = F.linear(x, w, bias=None)
-    if activation == "gelu":
-        gating = F.gelu(torch_out[:, : N // 2])
-    elif activation == "gelu_tanh":
-        gating = F.gelu(torch_out[:, : N // 2], approximate="tanh")
-    elif activation == "silu" or activation == "silu_exp2":
-        gating = F.silu(torch_out[:, : N // 2])
-    elif activation == "relu":
-        gating = F.relu(torch_out[:, : N // 2])
-    elif activation is None:
-        gating = torch_out[:, : N // 2]
-    else:
-        raise RuntimeError(f"Unsupported activation: {activation}")
-    torch_y = torch_out[:, N // 2 :]
-    torch_out = gating * torch_y
+    torch_out = run_torch(x, w, activation=activation)
 
     if output:
         triton_out = gemm_a16w16_gated(
@@ -92,4 +101,42 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
     Note: There's a small distinction between Triton and Torch's implementations of silu
     (due to tl.sigmoid() vs torch.sigmoid()). The gated outputs can differ by as much as 3%.
     """
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+def get_bias_gate_x_vals():
+    x_vals = [(1, 2, 1)]  # minimal case
+    x_vals += [(3, 10, 2)]  # irregular shape
+    x_vals += [(128, 1024, 512)]
+    x_vals += [(333, 2560, 640)]  # SD1.5 GEGLU, M not a multiple of the tile
+    x_vals += [(1024, 10240, 1280)]  # SDXL GEGLU
+    return x_vals
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", None])
+@pytest.mark.parametrize("M, N, K", get_bias_gate_x_vals())
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_gemm_a16_w16_gated_bias_gate_side(
+    M: int, N: int, K: int, dtype, bias, gate_first, activation
+):
+    x, w, out_dtype, _ = generate_gemm_a16w16_gated_inputs(
+        M, N, K, dtype, layout="TN", output=False
+    )
+    bias_tensor = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+
+    torch_out = run_torch(
+        x, w, bias=bias_tensor, activation=activation, gate_first=gate_first
+    )
+
+    triton_out = gemm_a16w16_gated(
+        x,
+        w,
+        out_dtype,
+        activation=activation,
+        bias=bias_tensor,
+        gate_first=gate_first,
+    )
+
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)

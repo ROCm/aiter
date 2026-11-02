@@ -1,3 +1,4 @@
+import argparse
 import functools
 import math
 
@@ -34,20 +35,27 @@ def bench_gemm_fn(
     metric: str,
     layout: str,
     activation: str | None = None,
+    bias: bool = False,
+    gate_first: bool = True,
 ):
     c_dtype = torch.bfloat16
 
-    _p_gen = functools.partial(
-        generate_gemm_a16w16_gated_inputs, M, N, K, c_dtype, layout=layout, output=True
-    )
-    _out_vals_keys = ["x", "w", "_", "y"]
+    def _p_gen():
+        # Give every rotating buffer its own bias, like the other operands.
+        x, w, out_dtype, y = generate_gemm_a16w16_gated_inputs(
+            M, N, K, c_dtype, layout=layout, output=True
+        )
+        bias_tensor = torch.randn((N,), dtype=c_dtype, device="cuda") if bias else None
+        return x, w, bias_tensor, out_dtype, y
+
+    _out_vals_keys = ["x", "w", "bias", "_", "y"]
 
     rot_bufs = generate_rotating_buffers_pool(
         [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
     )
 
     kernel_fn = functools.partial(
-        gemm_a16w16_gated, dtype=c_dtype, activation=activation
+        gemm_a16w16_gated, dtype=c_dtype, activation=activation, gate_first=gate_first
     )
 
     # flops: N is pre-gating dimension, output is N//2
@@ -56,6 +64,8 @@ def bench_gemm_fn(
     mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
         "w"
     ].element_size()
+    if bias:
+        mem_read += N * rot_bufs[0]["bias"].element_size()
     mem_write = (M * N // 2) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
@@ -108,6 +118,8 @@ def run_model_benchmark(args):
             metric,
             args.layout,
             activation=args.activation,
+            bias=args.bias,
+            gate_first=args.gate_first,
         )
 
     bench_fn.run(save_path="." if args.o else None, print_data=True)
@@ -131,6 +143,8 @@ def run_shape_benchmark(args):
             metric,
             args.layout,
             activation=args.activation,
+            bias=args.bias,
+            gate_first=args.gate_first,
         )
 
     bench_fn.run(save_path="." if args.o else None, print_data=True)
@@ -144,6 +158,19 @@ def parse_args(args=None):
         type=str,
         default=None,
         help="Activation function for gating (silu, gelu, relu, etc.)",
+    )
+    parser.add_argument(
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add an (N,) bias to the pre-gating output before the activation",
+    )
+    parser.add_argument(
+        "--gate-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the first half of the output as the gate (SwiGLU style). "
+        "Pass --no-gate-first to gate on the second half, as in diffusers GEGLU",
     )
     return get_ff_args(parser, args=args)
 
