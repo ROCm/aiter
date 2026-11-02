@@ -16,6 +16,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
+from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.herd_topk import _kept_routes
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
@@ -24,6 +25,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_buf_tensor,
 )
+from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 
 MAX_EXPERTS_PER_BLOCK = 512
 
@@ -617,6 +619,9 @@ def build_moe_route_psum_fused_module():
     Outputs match ``topids_to_rows`` (contiguous layout) + ``masked_m`` counts
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
     """
+    use_wave_scan = get_rocm_arch().split(":")[0] == "gfx1250"
+    wave_size = 32
+    num_waves = MAX_EXPERTS_PER_BLOCK // wave_size
 
     @flyc.kernel(
         name="moe_route_psum_fused",
@@ -668,27 +673,54 @@ def build_moe_route_psum_fused_module():
             rows_p[route_i32] = row
         gpu.barrier()
 
-        # Phase C: tile-aligned inclusive scan of per-expert counts.
-        if in_expert:
-            m = fx.Uint32(lds_cnt[tid])
-            lds0[tid] = (m + tile_minus_1) // tile_v * tile_v
-            m_p[tid] = m
-        gpu.barrier()
-
-        src = lds0
-        dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
-            if const_expr((offset & (offset - 1)) != 0):
-                continue
+        if const_expr(use_wave_scan):
+            # Phase C: scan within waves, then publish scanned wave totals.
+            aligned = fx.Int32(0)
             if in_expert:
-                val = src[tid]
-                has_prev = tid >= offset
-                prev = fx.Int32(0)
-                if has_prev:
-                    prev = src[tid - offset]
-                dst[tid] = val + prev
+                m = fx.Uint32(lds_cnt[tid])
+                aligned = fx.Int32((m + tile_minus_1) // tile_v * tile_v)
+                m_p[tid] = m
+            lane = fx.Int32(tid % wave_size)
+            wave = fx.Int32(tid // wave_size)
+            inclusive = _warp_inclusive_prefix_i32(aligned, lane, wave_size)
+            if lane == fx.Int32(wave_size - 1):
+                lds1[wave] = inclusive
             gpu.barrier()
-            src, dst = dst, src
+            if wave == fx.Int32(0):
+                active = lane < fx.Int32(num_waves)
+                safe_lane = active.select(lane, fx.Int32(0))
+                wave_total = active.select(lds1[safe_lane], fx.Int32(0))
+                prefix = _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
+                if active:
+                    lds1[lane] = prefix
+            gpu.barrier()
+            prev_wave = (wave > fx.Int32(0)).select(wave - 1, fx.Int32(0))
+            cross = (wave > fx.Int32(0)).select(lds1[prev_wave], fx.Int32(0))
+            lds0[tid] = inclusive + cross
+            gpu.barrier()
+            src = lds0
+        else:
+            # Phase C: tile-aligned inclusive scan of per-expert counts.
+            if in_expert:
+                m = fx.Uint32(lds_cnt[tid])
+                lds0[tid] = (m + tile_minus_1) // tile_v * tile_v
+                m_p[tid] = m
+            gpu.barrier()
+
+            src = lds0
+            dst = lds1
+            for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+                if const_expr((offset & (offset - 1)) != 0):
+                    continue
+                if in_expert:
+                    val = src[tid]
+                    has_prev = tid >= offset
+                    prev = fx.Int32(0)
+                    if has_prev:
+                        prev = src[tid - offset]
+                    dst[tid] = val + prev
+                gpu.barrier()
+                src, dst = dst, src
 
         if in_expert:
             is_not_first = tid != 0
@@ -706,7 +738,11 @@ def build_moe_route_psum_fused_module():
             m = fx.Uint32(max_m)
             expert = row // m
             slot = row - expert * m
-            start = fx.Uint32(s_p[expert])
+            if const_expr(use_wave_scan):
+                previous = (expert > 0).select(expert - 1, fx.Uint32(0))
+                start = (expert > 0).select(fx.Uint32(src[previous]), fx.Uint32(0))
+            else:
+                start = fx.Uint32(s_p[expert])
             rows_p[route_i32] = start + slot
 
     @flyc.jit
