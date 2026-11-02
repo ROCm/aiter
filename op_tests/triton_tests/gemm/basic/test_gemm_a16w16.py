@@ -61,6 +61,7 @@ def get_x_vals():
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    x_vals += [(v, 6144, 1536) for v in (33, 49, 64, 65, 8192)]
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
     x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
@@ -123,6 +124,7 @@ def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
     x_vals = [(16, 1024, 1024)]
+    x_vals += [(33, 6144, 1536), (64, 6144, 1536)]
     x_vals += [(128, 8192, 512)]
     x_vals += [(256, 512, 8192)]
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
