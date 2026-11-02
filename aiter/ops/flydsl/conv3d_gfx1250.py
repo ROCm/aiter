@@ -247,6 +247,7 @@ def run_conv3d_gfx1250(
     variant="bandwidth_bound",
     main_loop_unroll=False,
     packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
+    out=None,  # contiguous bf16 result in output_layout, written in place
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile)."""
@@ -293,10 +294,22 @@ def run_conv3d_gfx1250(
     wo = out_extent(w, 0, dw, kw, sw)
     assert min(do, ho, wo) >= 1
     npq = n * do * ho * wo
+    out_shape = (n, do, ho, wo, k) if out_ndhwc else (n, k, do, ho, wo)
+    if out is not None:
+        assert (
+            tuple(out.shape) == out_shape
+            and out.dtype == torch.bfloat16
+            and out.device == x.device
+            and out.is_contiguous()
+        ), (
+            f"out must be a contiguous bf16 {out_shape} tensor on {x.device}, "
+            f"got {tuple(out.shape)} {out.dtype} on {out.device}"
+        )
 
     if n == 0:
-        empty = (0, do, ho, wo, k) if out_ndhwc else (0, k, do, ho, wo)
-        return torch.empty(empty, device=x.device, dtype=torch.bfloat16)
+        if out is not None:
+            return out
+        return torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
 
     if packed_weight is None:
         w_packed = _prep_weight(weight, k, kt, kh, kw, wc, cgp)
@@ -419,8 +432,11 @@ def run_conv3d_gfx1250(
         kernel_bias = False
         bias_kernel = torch.empty(1, device=x.device, dtype=torch.float32)
     else:
-        out_shape = (n, do, ho, wo, k) if out_ndhwc else (n, k, do, ho, wo)
-        y = torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
+        y = (
+            out
+            if out is not None
+            else torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
+        )
         kernel_bias = has_bias
         bias_kernel = bias_arg
 
@@ -458,9 +474,11 @@ def run_conv3d_gfx1250(
     if sk > 1:
         if has_bias:
             y = y + bias_arg.view(1, k)
-        if out_ndhwc:
-            return y.view(n, do, ho, wo, k).to(torch.bfloat16)
-        out = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
-        out.copy_(y.view(n, do, ho, wo, k).permute(0, 4, 1, 2, 3))
+        y = y.view(n, do, ho, wo, k)
+        if out is None and out_ndhwc:
+            return y.to(torch.bfloat16)
+        if out is None:
+            out = torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
+        out.copy_(y if out_ndhwc else y.permute(0, 4, 1, 2, 3))
         return out
     return y

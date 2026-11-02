@@ -131,24 +131,47 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
 
 
 def generate_data_gfx1250(
-    n, c, d, h, w, k, kt, kh, kw, groups, has_bias, padding, seed=0, device=None
+    n,
+    c,
+    d,
+    h,
+    w,
+    k,
+    kt,
+    kh,
+    kw,
+    groups,
+    has_bias,
+    padding,
+    out_dhw=None,
+    seed=0,
+    device=None,
 ):
     """``generate_data`` plus the operands run_conv3d_gfx1250 prepares per call.
 
     The timed call gets them ready-made, as the GEMM and MoE tuners get their
     quantized and shuffled operands, so ``us`` leaves out the host-side pad,
     channel pad and weight pack; ``x``/``weight`` stay raw for the reference.
+
+    With ``out_dhw`` = (Do, Ho, Wo), ``out`` is the NDHWC result buffer every
+    candidate of the shape writes into. It is preallocated so mp_tuner can
+    NaN-fill it before each candidate (``output_keys``): an output the op
+    allocated itself can be handed the previous candidate's correct result,
+    which hides elements a kernel never writes.
     """
     data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed, device)
     x_tune, w_tune, w_packed = prepare_operands_gfx1250(
         data["x"], data["weight"], padding, groups
     )
-    data.update(x_tune=x_tune, w_tune=w_tune, w_packed=w_packed)
+    out = None
+    if out_dhw is not None:
+        out = torch.empty((n, *out_dhw, k), device=x_tune.device, dtype=dtypes.bf16)
+    data.update(x_tune=x_tune, w_tune=w_tune, w_packed=w_packed, out=out)
     return data
 
 
 def run_flydsl_conv3d_gfx1250(
-    x_tune, w_tune, w_packed, bias, params, tile, wgm, splitk, block_rows
+    x_tune, w_tune, w_packed, bias, out, params, tile, wgm, splitk, block_rows
 ):
     # Same call flydsl_conv_implicit makes on gfx1250, which forwards neither
     # wgm nor splitK: the dispatch derives splitK itself.
@@ -167,6 +190,7 @@ def run_flydsl_conv3d_gfx1250(
         input_layout="NDHWC",
         output_layout="NDHWC",
         packed_weight=w_packed,
+        out=out,
     )
 
 
@@ -404,7 +428,7 @@ class Conv3dTuner(TunerCommon):
         groups = int(kv["groups"])
         has_bias = _parse_tuned_bool(kv["bias"])
         params = _row_params(kv)
-        m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
+        m_gemm, n_gemm, _k_gemm, out_dhw = self._gemm_dims(keys)
         gfx = self.get_gfx()
         is_1250 = str(gfx).startswith("gfx1250")
 
@@ -530,12 +554,15 @@ class Conv3dTuner(TunerCommon):
             )
             shape_args = (n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
             if is_1250:
-                gen, gen_args = generate_data_gfx1250, (*shape_args, params["padding"])
+                gen = generate_data_gfx1250
+                gen_args = (*shape_args, params["padding"], tuple(out_dhw))
                 fn = run_flydsl_conv3d_gfx1250
-                fn_keys = ["x_tune", "w_tune", "w_packed", "bias"]
+                fn_keys = ["x_tune", "w_tune", "w_packed", "bias", "out"]
+                output_keys = ("out",)
             else:
                 gen, gen_args = generate_data, shape_args
                 fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
+                output_keys = None
             tasks.append(
                 (
                     info,
@@ -552,7 +579,7 @@ class Conv3dTuner(TunerCommon):
                     ATOL,
                     strict_compare,
                     None,  # max_abs_delta
-                    None,
+                    output_keys,
                 )
             )
         return tasks

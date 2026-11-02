@@ -204,11 +204,13 @@ purpose: the tuner needs to catch a config that computes the wrong thing, not to
 measure bf16 rounding, and a matching rounding regime puts every correct
 candidate at exactly 0. Each candidate is scored by `strict_compare`, which
 returns 1.0 on any element outside tolerance: `mp_tuner` rounds the ratio to 4
-decimals, so a plain ratio would pass thousands of wrong elements as 0.0. That
-makes this flag a pass/fail switch: anything below 1.0 behaves like 0.0, and 1.0
-lets a wrong candidate win. Use 1.0 only to investigate, never for a shipped
-table -- `op_tests/test_flydsl_conv_implicit.py` fails on any mismatched
-element, so such a row is one that test will reject.
+decimals, so a plain ratio would pass thousands of wrong elements as 0.0. On
+gfx1250 the output buffer is NaN-filled before every candidate, so an element a
+kernel never writes fails it as well; gfx950 candidates allocate their own
+output and get no such check. That makes this flag a pass/fail switch: anything
+below 1.0 behaves like 0.0, and 1.0 lets a wrong candidate win. Use 1.0 only to
+investigate, never for a shipped table -- `op_tests/test_flydsl_conv_implicit.py`
+fails on any mismatched element, so such a row is one that test will reject.
 
 ### `--timeout`
 Per-task watchdog in seconds (default 1800). A worker killed by a GPU
