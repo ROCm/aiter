@@ -60,6 +60,14 @@ def all_reduce_residual(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_one_shot(
+    _fa: int,
+    inp: torch.Tensor,
+    registered_input: bool,
+) -> bool: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,

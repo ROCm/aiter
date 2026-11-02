@@ -509,6 +509,15 @@ void all_reduce_add(fptr_t _fa,
                 addend.data_ptr(), (void*)reg_inp_ptr);
 }
 
+bool all_reduce_one_shot(fptr_t _fa, const aiter_tensor_t& inp, bool registered_input)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    // Same broadcast flag as all_reduce -> _all_reduce (bf16 never broadcasts).
+    bool is_broadcast_reg_outptr = registered_input && inp.dtype() != AITER_DTYPE_bf16;
+    return fa->runs_one_shot(inp.numel() * inp.element_size(), inp.element_size(),
+                             is_broadcast_reg_outptr);
+}
+
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,

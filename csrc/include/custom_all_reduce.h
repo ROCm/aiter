@@ -54,6 +54,9 @@ void all_reduce_residual(fptr_t _fa,
                          const aiter_tensor_t& residual,
                          int64_t reg_inp_ptr,
                          int64_t reg_inp_bytes);
+// Whether all_reduce(inp, use_new=True) runs a one-shot kernel (LL, LL128 or
+// 1-stage). registered_input is reg_inp_ptr == 0 in all_reduce.
+bool all_reduce_one_shot(fptr_t _fa, const aiter_tensor_t& inp, bool registered_input);
 // reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
 // shape the Python wrapper collapsed the input to:
 //   split_dim = 0 (kFirst): only `k` (= numel) used

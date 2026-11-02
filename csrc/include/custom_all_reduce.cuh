@@ -4800,14 +4800,100 @@ class CustomAllreduce
 #undef LAUNCH_LL128_UNROLL2
     }
 
-    // 1-/2-stage crossover of the use_new kernels. Neither is set when the peers
-    // are not fully connected.
+    // LL / LL128 fast path of allreduce for 2-byte dtypes (use_new, output not
+    // broadcast). Sets the block size of the chosen kernel, both 0 for none.
+    // numel notation a*b mirrors the (tokens, hidden) bench shapes.
+    //
+    // gfx950 caps are measured against the 1-/2-stage kernels (bf16/fp16,
+    // TP2/4/8, registered and eager inputs). With an addend, LL / LL128 fuse
+    // the add while 2-stage needs a separate staging add, so they win to larger
+    // sizes. Unaligned sizes (bytes not divisible by world_size * 16) can only
+    // use 1-stage or the slower naive 2-stage kernel, so they get larger caps.
+    void select_ll_path(size_t nbytes, bool has_addend, int& ll_bs, int& ll128_bs) const
+    {
+        const size_t numel = nbytes / 2;
+        ll_bs              = 0;
+        ll128_bs           = 0;
+        if(is_gfx950_)
+        {
+            const bool aligned = nbytes % (world_size_ * 16) == 0;
+            size_t ll_cap_kb = 0, ll128_cap_kb = 0;
+            if(world_size_ == 2)
+            {
+                ll_cap_kb    = has_addend ? 80 : (aligned ? 64 : 72);
+                ll128_cap_kb = has_addend ? (aligned ? 208 : 384) : (aligned ? 0 : 96);
+            }
+            else if(world_size_ == 4)
+                ll_cap_kb = has_addend ? (aligned ? 64 : 112) : (aligned ? 40 : 56);
+            else if(world_size_ == 8)
+                ll_cap_kb = has_addend ? (aligned ? 56 : 96) : (aligned ? 32 : 48);
+            if(nbytes <= ll_cap_kb * 1024)
+                ll_bs = 256;
+            else if(nbytes <= ll128_cap_kb * 1024)
+                ll128_bs = numel <= 16 * 8192 ? 256 : 512;
+        }
+        else if(world_size_ == 8)
+        {
+            if(numel <= 4 * 8192)
+                ll_bs = 256;
+        }
+        else if(world_size_ == 4)
+        {
+            if(numel <= 4 * 7168)
+                ll_bs = 256;
+            else if(numel <= 4 * 8192)
+                ll128_bs = 256;
+        }
+        else if(world_size_ == 2)
+        {
+            if(numel <= 4 * 8192)
+                ll_bs = 256;
+            else if(numel <= 16 * 8192)
+                ll128_bs = 256;
+            else if(numel <= 64 * 7168)
+                ll128_bs = 512;
+        }
+    }
+
+    // 1-/2-stage crossover of the use_new kernels, shared by allreduce and
+    // allreduce_residual. Neither is set when the peers are not fully connected.
     void select_ar_stage(size_t bytes, bool& call_1stage, bool& call_2stage) const
     {
+        // gfx950 (bf16/fp16/fp32, TP2/4/8, with and without residual, broadcast
+        // and non-broadcast, 2KB to 16MB): 2-stage beats 1-stage at every
+        // aligned size. Unaligned sizes run the naive 2-stage kernel, which only
+        // wins from 104KB at TP4 and 256KB at TP8, and at every size at TP2.
+        if(is_gfx950_ &&
+           (world_size_ == 2 || ((world_size_ == 4 || world_size_ == 8) && full_nvlink_)))
+        {
+            size_t max_1stage_bytes = 0;
+            if(bytes % (world_size_ * 16) != 0)
+                max_1stage_bytes = world_size_ == 4 ? 104 * 1024 : world_size_ == 8 ? 256 * 1024 : 0;
+            // 2-stage needs at least one pack per rank, else it launches 0 blocks.
+            call_1stage = bytes < max_1stage_bytes || bytes / 16 < (size_t)world_size_;
+            call_2stage = !call_1stage;
+            return;
+        }
         call_1stage =
             world_size_ == 2 || (full_nvlink_ && ((world_size_ <= 4 && bytes < 160 * 1024) ||
                                                   (world_size_ <= 8 && bytes < 80 * 1024)));
         call_2stage = !call_1stage && full_nvlink_;
+    }
+
+    // Whether allreduce (use_new, no addend) runs a one-shot kernel: LL, LL128
+    // or 1-stage. elem_size is sizeof(T).
+    bool runs_one_shot(size_t nbytes, int elem_size, bool is_broadcast_reg_outptr) const
+    {
+        if(elem_size == 2 && !is_broadcast_reg_outptr)
+        {
+            int ll_bs, ll128_bs;
+            select_ll_path(nbytes, false, ll_bs, ll128_bs);
+            if(ll_bs || ll128_bs)
+                return true;
+        }
+        bool call_1stage, call_2stage;
+        select_ar_stage(nbytes, call_1stage, call_2stage);
+        return call_1stage;
     }
 
     // Write-mode switch, shared by allreduce and allreduce_residual.
@@ -4867,73 +4953,21 @@ class CustomAllreduce
     // `size` here is still the element count (numel); it is divided down to
     // 16-byte packs only after this block. Thresholds were measured on bf16, so
     // the path is gated to 2-byte dtypes (if constexpr also keeps the LL128
-    // 2-byte static_assert out of the fp32 instantiation). numel notation a*b
-    // mirrors the (tokens, hidden) bench shapes.
-    //
-    // gfx950 caps are measured against the 1-/2-stage kernels (bf16/fp16,
-    // TP2/4/8, registered and eager inputs). With an addend, LL / LL128 fuse
-    // the add while 2-stage needs a separate staging add, so they win to larger
-    // sizes. Unaligned sizes (bytes not divisible by world_size * 16) can only
-    // use 1-stage or the slower naive 2-stage kernel, so they get larger caps.
+    // 2-byte static_assert out of the fp32 instantiation).
     if constexpr(sizeof(T) == 2)
     {
         if(use_new && !is_broadcast_reg_outptr)
         {
-            const int numel    = size;
-            int       ll_bs    = 0; // >0 -> LL    with this block size
-            int       ll128_bs = 0; // >0 -> LL128 with this block size
-            if(is_gfx950_)
-            {
-                const bool has_addend = addend != nullptr;
-                const size_t nbytes   = (size_t)numel * sizeof(T);
-                const bool aligned    = nbytes % (world_size_ * 16) == 0;
-                size_t ll_cap_kb = 0, ll128_cap_kb = 0;
-                if(world_size_ == 2)
-                {
-                    ll_cap_kb    = has_addend ? 80 : (aligned ? 64 : 72);
-                    ll128_cap_kb = has_addend ? (aligned ? 208 : 384) : (aligned ? 0 : 96);
-                }
-                else if(world_size_ == 4)
-                {
-                    ll_cap_kb    = has_addend ? (aligned ? 64 : 96) : (aligned ? 40 : 56);
-                    ll128_cap_kb = has_addend && !aligned ? 128 : 0;
-                }
-                else if(world_size_ == 8)
-                    ll_cap_kb = has_addend ? (aligned ? 64 : 96) : (aligned ? 40 : 48);
-                if(nbytes <= ll_cap_kb * 1024)
-                    ll_bs = 256;
-                else if(nbytes <= ll128_cap_kb * 1024)
-                    ll128_bs = numel <= 16 * 8192 ? 256 : 512;
-            }
-            else if(world_size_ == 8)
-            {
-                if(numel <= 4 * 8192)
-                    ll_bs = 256;
-            }
-            else if(world_size_ == 4)
-            {
-                if(numel <= 4 * 7168)
-                    ll_bs = 256;
-                else if(numel <= 4 * 8192)
-                    ll128_bs = 256;
-            }
-            else if(world_size_ == 2)
-            {
-                if(numel <= 4 * 8192)
-                    ll_bs = 256;
-                else if(numel <= 16 * 8192)
-                    ll128_bs = 256;
-                else if(numel <= 64 * 7168)
-                    ll128_bs = 512;
-            }
+            int ll_bs, ll128_bs;
+            select_ll_path((size_t)size * sizeof(T), addend != nullptr, ll_bs, ll128_bs);
             if(ll_bs)
             {
-                allreduce_ll_poc<T>(stream, input, output, numel, ll_bs, addend);
+                allreduce_ll_poc<T>(stream, input, output, size, ll_bs, addend);
                 return;
             }
             if(ll128_bs)
             {
-                allreduce_ll128_unroll2<T>(stream, input, output, numel, ll128_bs, addend);
+                allreduce_ll128_unroll2<T>(stream, input, output, size, ll128_bs, addend);
                 return;
             }
         }
@@ -4965,20 +4999,6 @@ class CustomAllreduce
         int blocks = 16;
         bool call_1stage, call_2stage;
         select_ar_stage(bytes, call_1stage, call_2stage);
-        // gfx950 (bf16/fp16/fp32, TP2/4/8, broadcast and non-broadcast, 16KB to
-        // 16MB): 2-stage beats 1-stage at every aligned size. Unaligned sizes
-        // run the naive 2-stage kernel, which only wins from 104KB at TP4 and
-        // 256KB at TP8, and at every size at TP2.
-        if(is_gfx950_ &&
-           (world_size_ == 2 || ((world_size_ == 4 || world_size_ == 8) && full_nvlink_)))
-        {
-            size_t max_1stage_bytes = 0;
-            if(bytes % (world_size_ * 16) != 0)
-                max_1stage_bytes = world_size_ == 4 ? 104 * 1024 : world_size_ == 8 ? 256 * 1024 : 0;
-            // 2-stage needs at least one pack per rank, else it launches 0 blocks.
-            call_1stage = bytes < max_1stage_bytes || size < world_size_;
-            call_2stage = !call_1stage;
-        }
         if(call_1stage)
         {
             blocks = std::min(kMaxBlocks,
@@ -5139,13 +5159,10 @@ name<T, ngpus, bcast, __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
 
     // The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and, for
     // 2-stage, the same pack count on every rank; the rest go naive. TP6 does
-    // not instantiate the warp-split kernels. TP2 is always 1-stage
-    // (select_ar_stage), so it instantiates only that kernel. Write mode is TP8 only.
+    // not instantiate the warp-split kernels. Write mode is TP8 only.
 #define RESIDUAL_CASE(ngpus)                                                   \
 case ngpus: {                                                                  \
-    if constexpr(ngpus == 2)                                                   \
-        KL_RES(ngpus, cross_device_reduce_1stage, false, true);                \
-    else if constexpr(ngpus == 6)                                              \
+    if constexpr(ngpus == 6)                                                   \
         KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \
     else if(call_2stage && bytes % (ngpus * 16) != 0)                          \
         KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \

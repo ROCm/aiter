@@ -1029,6 +1029,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_reduce_add = None
             self._ops_all_reduce_residual = None
+            self._ops_all_reduce_one_shot = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm_gfx1250
@@ -1055,6 +1056,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce
             self._ops_all_reduce_add = ops.all_reduce_add
             self._ops_all_reduce_residual = ops.all_reduce_residual
+            self._ops_all_reduce_one_shot = ops.all_reduce_one_shot
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm
@@ -1898,19 +1900,27 @@ class CustomAllreduce:
         )
         return out
 
-    def uses_1stage_ar(self, inp: torch.Tensor) -> bool:
-        """Whether custom_all_reduce(inp) runs a one-shot kernel.
+    def uses_1stage_ar(
+        self, inp: torch.Tensor, registered_input: bool | None = None
+    ) -> bool:
+        """Whether custom_all_reduce(inp) runs a one-shot kernel (LL, LL128 or
+        1-stage).
 
-        Mirrors CustomAllreduce::select_ar_stage; gfx1250 has only one-shot
-        kernels (LL and naive).
+        Asks the kernel dispatch itself; gfx1250 has only one-shot kernels (LL
+        and naive). ``registered_input`` defaults to what custom_all_reduce
+        would pass right now.
         """
         if self.disabled:
             return False
-        if self._is_gfx1250 or self.world_size == 2:
+        if self._is_gfx1250:
             return True
-        nbytes = inp.numel() * inp.element_size()
-        limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
-        return self.fully_connected and nbytes < limit
+        if registered_input is None:
+            registered_input = (
+                self._IS_CAPTURING
+                and torch.cuda.is_current_stream_capturing()
+                and self.enable_register_for_capturing
+            )
+        return self._ops_all_reduce_one_shot(self._ptr, inp, registered_input)
 
     def all_reduce_residual(
         self,

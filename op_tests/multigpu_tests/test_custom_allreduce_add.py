@@ -32,27 +32,27 @@ logger = logging.getLogger("aiter")
 KB = 1024
 # Each cutover and one step past it, for sizes divisible by world_size * 16
 # (+0 / +128 B) and not divisible (-16 / +16 B, 1-stage or naive 2-stage).
-# gfx950 aligned cutovers: plain LL 40 / 64 KB, fused LL 64 / 80 KB, fused
-# LL128 208 KB. Unaligned: plain LL 48 / 56 / 72 KB, plain LL128 96 KB, fused
-# LL 80 / 96 KB, fused LL128 128 / 384 KB, 1-stage 104 / 256 KB. Original
-# 1-stage limits: 80 / 160 KB. 16 / 48 / 112 B have fewer 16-byte packs than
-# ranks, which 2-stage can't split (fp32 bypasses LL).
+# gfx950 aligned cutovers: plain LL 32 / 40 / 64 KB, fused LL 56 / 64 / 80 KB,
+# fused LL128 208 KB. Unaligned: plain LL 48 / 56 / 72 KB, plain LL128 96 KB,
+# fused LL 80 / 96 / 112 KB, fused LL128 384 KB, 1-stage 104 / 256 KB.
+# Original limits: 1-stage 80 / 160 KB, TP4 LL128 128 KB. 16 / 48 / 112 B have
+# fewer 16-byte packs than ranks, which 2-stage can't split (fp32 bypasses LL).
 SIZES_BYTES = sorted(
     {16, 48, 112, 16 * KB, 32 * KB + 16, 1024 * KB + 16, 4096 * KB}
     | {
         cap * KB + off
-        for cap in (40, 64, 80, 160, 208, 256, 384, 1024)
+        for cap in (32, 40, 56, 64, 80, 160, 208, 256, 384, 1024)
         for off in (0, 128)
     }
     | {
         cap * KB + off
-        for cap in (48, 56, 72, 80, 96, 104, 128, 160, 256, 384)
+        for cap in (48, 56, 72, 80, 96, 104, 112, 128, 160, 256, 384)
         for off in (-16, 16)
     }
 )
-# Includes back-to-back LL128 calls of different sizes (TP2: fused 128 KB - 16,
-# 112 KB + 16, 208 KB, 256 KB + 16, 88 KB + 16, plain 88 KB + 16; TP4: fused
-# 128 KB - 16, 112 KB + 16), which share the LL128 scratch.
+# Includes back-to-back TP2 LL128 calls of different sizes (fused 128 KB - 16,
+# 112 KB + 16, 208 KB, 256 KB + 16, 88 KB + 16, plain 88 KB + 16), which share
+# the LL128 scratch.
 INTERLEAVE_BYTES = [
     16 * KB,
     80 * KB,
