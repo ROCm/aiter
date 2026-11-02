@@ -265,9 +265,9 @@ def _qsa_paged_mqa_logits_kernel(
     KEY_FMT: tl.constexpr = 0,
     GROUP: tl.constexpr = 32,
 ) -> None:
-    """Score compressed QSA keys from a paged cache: unquantized (KEY_FMT 0),
-    FP8 with a per-row scale (1) or MXFP4 (2). For MXFP4 the even and odd Q dims
-    multiply the low and high nibbles of each key byte."""
+    """Score compressed QSA keys directly from a paged cache: unquantized
+    (KEY_FMT 0), FP8 with a per-row scale (1) or MXFP4 (2). For MXFP4 the even
+    and odd Q dims multiply the low and high nibbles of each key byte."""
     token = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
     if KEY_FMT == 2:
@@ -634,6 +634,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
         columns = tile * BN + tl.arange(0, BN)
         logical_page = columns // PAGE_SIZE
         page_offset = columns % PAGE_SIZE
+        # The width is rounded up; columns < num_columns keeps table reads in bounds.
         page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
         safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
         score = tl.zeros((BMT, BN), dtype=tl.float32)

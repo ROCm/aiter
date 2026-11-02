@@ -293,7 +293,6 @@ def _mxfp4_pack_bits(
     denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
 
     if ROUNDING_MODE == 0:
-        # The FPU's round to nearest even settles the ties of this add.
         denormal_x = qx_fp32 + denorm_mask_float
         denormal_x = denormal_x.to(tl.uint32, bitcast=True)
         denormal_x -= denorm_mask_int
