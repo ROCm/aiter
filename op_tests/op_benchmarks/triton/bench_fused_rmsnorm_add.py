@@ -1,12 +1,18 @@
+import functools
+
 import triton
 
 from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -75,18 +81,32 @@ def run_benchmark(args):
 
     add_residual = args.add_residual
     c_dtype = str_to_torch_dtype[args.dtype]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_rmsnorm_add(M, N, metric, **kwargs):
-        x, weight, res1 = generate_fused_rmsnorm_add_inputs(M, N, c_dtype, add_residual)
         eps = 1e-5
 
-        fn = lambda: fused_rmsnorm_add(
-            x,
-            weight,
-            eps,
-            res1=res1,
+        _p_gen = functools.partial(
+            generate_fused_rmsnorm_add_inputs, M, N, c_dtype, add_residual
         )
+        _out_val_keys = ["x", "weight", "res1"]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
+
+        # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+        sample = rot_bufs[0]
+        x = sample["x"]
+
+        def _run(x, weight, res1):
+            fused_rmsnorm_add(
+                x,
+                weight,
+                eps,
+                res1=res1,
+            )
 
         es = x.element_size()
         mem_read = M * N * es + N * es
@@ -99,7 +119,7 @@ def run_benchmark(args):
 
         flops = 4 * M * N + (M * N if add_residual else 0)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
         if metric == "time":
             return ms

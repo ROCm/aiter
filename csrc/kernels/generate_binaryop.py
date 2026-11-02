@@ -113,7 +113,7 @@ bool binary_op_impl(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t
         auto broadcast_3d_case = [&] (int bcast_dim)
         {
           constexpr int bcast_pattern[3] = {PATTERN_BROADCAST_0, PATTERN_BROADCAST_1, PATTERN_BROADCAST_2};
-          if (!is_support && (input.size(bcast_dim) == 1 || other.size(bcast_dim)) && input.size(bcast_dim) != other.size(bcast_dim))
+          if (!is_support && (input.size(bcast_dim) == 1 || other.size(bcast_dim) == 1) && input.size(bcast_dim) != other.size(bcast_dim))
           {
             is_support = true;
             for (int i = 0; i < 3; ++i)
