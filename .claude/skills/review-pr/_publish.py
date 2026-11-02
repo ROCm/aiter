@@ -2,7 +2,12 @@
 
 The card goes up as a PR *review* (`event: "COMMENT"`, never APPROVE/REQUEST_CHANGES -- this
 bot is advisory and does not gate merges), with the findings that can be anchored attached to
-the lines they are about and the rest left in the review summary. Measured on 14 real cards
+the lines they are about and the rest left in the review summary. A finding that cites a span
+(`path:1002-1012`) is anchored to the whole span, not to its first line: the reader otherwise
+sees a comment pinned to one line of a block the finding is about, which reads as a claim
+about that line. A citation the diff does not reach cannot be anchored at all, and instead
+earns a blob permalink pinned to the head SHA in the summary, so the reader sees the code
+without going to find it by hand. Measured on 14 real cards
 (ATOM's, where this mechanism was built; the shape of an aiter card is the same): a card's
 findings average 2081 characters in one top-level comment, a single finding averages 662, and
 half of all findings cite a line that is inside the PR's diff. Those halves read far better
@@ -136,6 +141,17 @@ def severity(card):
 
 FINDING = re.compile(r"^(🔴|⚠️|📝)\s")
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# A citation that names a span: `path:1002-1012`. Deliberately tight -- an ASCII hyphen with
+# no whitespace around it. The loose form (spaces allowed, or an en/em dash) misreads ordinary
+# prose: a real card writes "flash_kda.py:381 — 6 published tuning candidates", which a loose
+# pattern reads as the span 381..6 and would hand to GitHub as a backwards range, failing the
+# whole review including the summary. Counted over 221 real findings on this bot's own cards,
+# the tight form matched 25 spans with no false positive; the loose form added exactly that
+# one sentence and nothing true.
+CITE_SPAN = re.compile(r"\b([\w./-]+\.[A-Za-z]{1,6}):(\d+)-(\d+)\b")
+# Past this width a span is not a "section" any more -- it is a comment painted over most of
+# a hunk, which says less about where the problem is than the first line alone does.
+MAX_SPAN = 100
 # How much of a finding the summary index shows. Long enough to recognise the finding,
 # short enough that the index stays one line per entry -- which is the whole point of it.
 CLAUSE = 110
@@ -216,28 +232,148 @@ def flagged_citations(pr):
     return out
 
 
-def anchor_for(finding, cmap, flagged):
-    """-> (path, line) the finding may be attached to, or None.
+def citations(finding):
+    """-> [(path, start, end)] in the order the finding writes them; end == start for a
+    plain `path:line`.
 
-    A finding carrying ANY citation the checker flagged is not anchored at all, even if some
-    other citation in the same sentence would resolve: the flag says this finding's pointing
-    is unreliable, and inline is exactly where unreliable pointing costs the most.
+    Spans are matched first and blanked out of the text before the single-line pattern runs
+    over what is left. Otherwise `path:1002-1012` is read twice -- once as the span and once
+    as the plain citation `path:1002` -- and the finding would carry both the block it is
+    about and a second claim about the block's first line.
+    """
+    out, rest = [], finding
+    for m in CITE_SPAN.finditer(finding):
+        a, b = int(m.group(2)), int(m.group(3))
+        # A span that runs backwards is not a span; it is prose that put a number after a
+        # hyphen. Keep its opening line as a plain citation rather than discard the finding's
+        # only pointer -- and never let it reach GitHub as a range.
+        out.append((m.start(), m.group(1), a, b if b > a else a))
+        rest = rest[: m.start()] + " " * (m.end() - m.start()) + rest[m.end() :]
+    for m in check_citations.CITATION.finditer(rest):
+        n = int(m.group(2))
+        out.append((m.start(), m.group(1), n, n))
+    return [(path, a, b) for _, path, a, b in sorted(out)]
+
+
+def resolve_path(path, cmap):
+    """-> the changed file a citation names, or None.
+
+    Cards cite a bare basename constantly. One that matches exactly one changed file is that
+    file; one that matches several is not resolvable, and picking between them is precisely
+    how a comment -- or a link -- lands on code the finding is not about.
+    """
+    if path in cmap:
+        return path
+    base = path.rsplit("/", 1)[-1]
+    same = [k for k in cmap if k.rsplit("/", 1)[-1] == base]
+    return same[0] if len(same) == 1 else None
+
+
+def _unflagged_cites(finding, flagged):
+    """-> the finding's citations, or None if it may not point at anything.
+
+    A finding carrying ANY citation the checker flagged is not anchored and not linked at
+    all, even if some other citation in the same sentence would resolve: the flag says this
+    finding's pointing is unreliable, and inline -- or behind a link the reader follows --
+    is exactly where unreliable pointing costs the most.
     """
     if flagged is None:
         return None
-    cites = check_citations.CITATION.findall(finding)
-    if any(f"{p}:{n}" in flagged for p, n in cites):
+    cites = citations(finding)
+    if any(f"{p}:{a}" in flagged for p, a, _ in cites):
         return None
-    for path, lineno in cites:
-        n = int(lineno)
-        hit = path if path in cmap else None
-        if hit is None:
-            base = path.rsplit("/", 1)[-1]
-            same = [k for k in cmap if k.rsplit("/", 1)[-1] == base]
-            hit = same[0] if len(same) == 1 else None
-        if hit and n in cmap[hit]:
-            return hit, n
+    return cites
+
+
+def anchor_for(finding, cmap, flagged):
+    """-> (path, start, end) the finding may be attached to, or None. end == start is a
+    single-line anchor; end > start is a span.
+    """
+    cites = _unflagged_cites(finding, flagged)
+    if cites is None:
+        return None
+    for path, a, b in cites:
+        hit = resolve_path(path, cmap)
+        if not hit:
+            continue
+        lines = cmap[hit]
+        if b > a:
+            # Every line of the span must be commentable, not just the two ends. GitHub takes
+            # a span only within one hunk, and `commentable` holds one contiguous run per
+            # hunk -- so "every line present" is exactly "inside one hunk". Checking the ends
+            # alone would accept a span that jumps the gap between two hunks, and that single
+            # malformed entry fails the entire review, summary and all other comments with it.
+            if b - a + 1 <= MAX_SPAN and all(n in lines for n in range(a, b + 1)):
+                return hit, a, b
+            # Only part of the span is inside the diff. Anchor the end that is, rather than
+            # drop a real finding because its citation is wider than what the PR touched.
+            if a in lines:
+                return hit, a, a
+            if b in lines:
+                return hit, b, b
+            continue
+        if a in lines:
+            return hit, a, a
     return None
+
+
+def cite_text(path, a, b):
+    """`path:12` or `path:12-18` -- how a human writes the anchor this bot computed."""
+    return f"{path}:{a}" if b == a else f"{path}:{a}-{b}"
+
+
+def comment_for(path, a, b, body):
+    """-> one entry of the review's comments[].
+
+    GitHub spells a span as start_line..line with a side for each end. start_line must be
+    strictly below line, which is why a backwards or degenerate span never gets here: it was
+    already collapsed to a single line in citations().
+    """
+    c = {"path": path, "line": b, "side": "RIGHT", "body": body}
+    if b > a:
+        c["start_line"] = a
+        c["start_side"] = "RIGHT"
+    return c
+
+
+def anchor_label(c):
+    """`path:12-18` for a comments[] entry, span or not -- used when folding anchors back
+    into the summary, where the reader has only the text to go on."""
+    return cite_text(c["path"], c.get("start_line", c["line"]), c["line"])
+
+
+def permalink(path, a, b, sha):
+    """A blob URL pinned to the head SHA. Pinned, not a branch: the branch moves, and a link
+    that drifts off the code it was written about is the same defect as a wrong anchor,
+    arriving later."""
+    frag = f"#L{a}" if b == a else f"#L{a}-L{b}"
+    return f"https://github.com/{REPO}/blob/{sha}/{path}{frag}"
+
+
+def permalinks_for(finding, cmap, flagged, sha):
+    """-> the blob permalinks a finding that could NOT be anchored has earned.
+
+    GitHub will not take a comment on a line outside the diff, correctly, so such a finding
+    stays in the summary as bare text the reader has to go and look up. A permalink is what
+    can be offered instead -- GitHub expands one into the code it names.
+
+    Two gates, and both exist so this never links to the wrong code. The checker's verdict
+    applies exactly as it does to anchoring: a flagged finding gets no link. And the path has
+    to resolve to a file this PR actually touched -- a blob URL built from an unresolved
+    basename is a guess, and a guess that 404s is the better of its two outcomes.
+    """
+    cites = _unflagged_cites(finding, flagged)
+    if cites is None or not sha:
+        return []
+    out = []
+    for path, a, b in cites:
+        hit = resolve_path(path, cmap)
+        if not hit:
+            continue
+        u = permalink(hit, a, b, sha)
+        if u not in out:
+            out.append(u)
+    return out
 
 
 def first_clause(finding, cite=""):
@@ -247,7 +383,11 @@ def first_clause(finding, cite=""):
     # carries -- both cost width and say nothing new there.
     s = re.sub(r"^\[[^\]]{0,60}\]\s*", "", s)
     if cite:
-        s = re.sub(r"^`?" + re.escape(cite) + r"`?[,:]?\s*", "", s)
+        # `(?:-\d+)?` is not decoration. When a finding cites `path:563-569` but only 563 is
+        # inside the diff, the anchor -- and so `cite` -- is `path:563`, and stripping only
+        # that leaves the index line opening with a bare "-569". Found on a real card the
+        # first time this ran over one.
+        s = re.sub(r"^`?" + re.escape(cite) + r"(?:-\d+)?`?[,:]?\s*", "", s)
     for sep in (" — ", " -- ", "; "):
         if sep in s[:CLAUSE + 40]:
             s = s.split(sep, 1)[0]
@@ -279,14 +419,17 @@ def build_review(pr, card, diff_text, flagged, sha):
             continue
         a = anchor_for(ln, cmap, flagged)
         if a:
-            comments.append(
-                {"path": a[0], "line": a[1], "side": "RIGHT", "body": ln.strip()}
-            )
-            index.append(
-                f"- `{a[0]}:{a[1]}` — {first_clause(ln, f'{a[0]}:{a[1]}')}"
-            )
+            comments.append(comment_for(a[0], a[1], a[2], ln.strip()))
+            cite = cite_text(*a)
+            index.append(f"- `{cite}` — {first_clause(ln, cite)}")
         else:
-            loose.append(ln.strip())
+            links = permalinks_for(ln, cmap, flagged, sha)
+            # Each URL alone on its own line. GitHub expands a bare blob permalink into the
+            # code it points at only when nothing shares the line with it; inside the
+            # sentence it collapses to a shortened link, which tells the reader less than the
+            # `path:line` already sitting there. The finding's own text is left exactly as
+            # the card wrote it -- the link is in addition, never instead.
+            loose.append("\n\n".join([ln.strip()] + links))
 
     parts = [p for p in (_line_starting(card, "## "),) if p]
     status = []
@@ -373,8 +516,10 @@ def do_post(pr):
     payload = review_payload(pr)
     assert payload["event"] == "COMMENT", "this bot never approves or requests changes"
     # A review is all-or-nothing: GitHub rejects the whole call -- summary included -- if
-    # any one comments[] entry names a line it will not accept. The anchor set is computed
-    # from the diff's own hunks, but an off-by-one there would lose the entire review,
+    # any one comments[] entry names a line it will not accept. A span anchor is a second
+    # way to produce exactly that: start_line..line must sit inside one hunk, and a range
+    # built across a gap is refused like any bad line. The anchor set is computed from the
+    # diff's own hunks, but an off-by-one there would lose the entire review,
     # which is strictly worse than the plain comment this replaced -- and that plain
     # comment is what aiter's bot posts today, so the degraded path must land a review
     # that is no worse than what it displaced. So: try anchored, and if that is refused,
@@ -392,7 +537,7 @@ def do_post(pr):
                 + "\n\n_The findings below could not be attached to their lines — GitHub "
                 "refused the anchored review, so they are inlined here instead._\n\n"
                 + "\n\n".join(
-                    f'`{c["path"]}:{c["line"]}` — {c["body"]}' for c in payload["comments"]
+                    f"`{anchor_label(c)}` — {c['body']}" for c in payload["comments"]
                 )
             )
             payload["comments"] = []

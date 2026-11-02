@@ -247,7 +247,8 @@ fi
 
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
-# anchoring rule, and the degrade-to-summary fallback. Run them from here so they are not a
+# anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
+# the degrade-to-summary fallback. Run them from here so they are not a
 # file nobody executes -- a test suite that only runs when someone remembers it is the same
 # kind of silence this script exists to break. pytest is not part of the runner's baseline,
 # so its absence is reported out loud rather than passed over: a check that did not run is
@@ -256,7 +257,7 @@ if python3 -c "import pytest" 2>/dev/null; then
   pt=$(cd "$S" && python3 -m pytest _publish_test.py -q 2>&1); pt_rc=$?
   n=$(printf '%s\n' "$pt" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || echo 0)
   if [ "$pt_rc" -eq 0 ]; then
-    echo "  ✅ _publish_test.py: ${n:-0} passed (--post closure, anchoring, degrade-to-summary)"
+    echo "  ✅ _publish_test.py: ${n:-0} passed (--post closure, anchoring + spans + permalinks, degrade-to-summary)"
     ok=$((ok + 1))
   else
     printf '%s\n' "$pt" | grep -E '^(FAILED|ERROR)' | sed 's/^/  ❌ /' || true
@@ -265,7 +266,8 @@ if python3 -c "import pytest" 2>/dev/null; then
   fi
 else
   echo "  ⏭️  _publish_test.py NOT RUN — no pytest on this box. The --post closure, the"
-  echo "      anchoring rule and the degrade-to-summary fallback are unverified here."
+  echo "      anchoring rule (spans, permalinks) and the degrade-to-summary fallback are"
+  echo "      unverified here."
 fi
 
 echo "=== $ok green / $bad red ==="

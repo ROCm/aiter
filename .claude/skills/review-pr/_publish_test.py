@@ -299,3 +299,197 @@ def test_a_review_with_no_anchors_is_not_retried_twice(report, monkeypatch):
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     _publish.main(["9999", "--post"])
     assert len(sent) == 1
+
+
+# ------------------------------------------------------------ range anchors
+#
+# 11 of 36 findings on a batch of real cards cite a span (`layernorm.py:1002-1012`) rather
+# than a line, and every one of them used to be anchored to the span's first line -- so the
+# reader saw a comment pinned to one line of a block the finding was about, which reads as a
+# claim about that line. Counted over this bot's own 221 archived findings the same shape is
+# 25 spans. The diff below has a file with TWO hunks precisely so the gap between them is
+# exercised: a span crossing it is the malformed range that fails the whole review.
+
+RANGE_DIFF = """diff --git a/aiter/ops/layernorm.py b/aiter/ops/layernorm.py
+--- a/aiter/ops/layernorm.py
++++ b/aiter/ops/layernorm.py
+@@ -100,4 +100,8 @@
+ def fused_add_rmsnorm(x, residual, weight, eps):
++    out = torch.empty_like(x)
++    _launch(out, x, residual, weight, eps)
++    return out
+ 
+ 
+ def plain_rmsnorm(x, weight, eps):
+@@ -200,2 +200,3 @@
+ context_at_200
++added_at_201
+ context_at_202
+"""
+
+RANGE_CARD = """## aiter PR #8888 — spans
+
+Review (advisory): ⚠️ NEEDS WORK
+
+⚠️ [verified] `aiter/ops/layernorm.py:101-104` allocates and launches without a `torch.cuda`
+🔴 aiter/ops/layernorm.py:106-201 straddles the gap between the two hunks.
+📝 layernorm.py:5220 is real code this PR does not touch; `fused_add_rmsnorm` is nowhere near.
+📝 nosuchfile.py:12-20 names a file this diff never mentions.
+📝 [verified] layernorm.py:381 — 6 published tuning candidates, written as prose.
+
+_Independent refutation: 4 judged, 0 killed, 4 defended — cross-family._
+"""
+
+
+@pytest.fixture
+def range_report(tmp_path, monkeypatch):
+    d = tmp_path / "PR-8888"
+    d.mkdir()
+    (d / "card.md").write_text(RANGE_CARD, encoding="utf-8")
+    (d / "pr.diff").write_text(RANGE_DIFF, encoding="utf-8")
+    (d / "citations.txt").write_text(
+        "CITATIONS: every cited file:line resolves\n", encoding="utf-8"
+    )
+    (d / "pr_meta.json").write_text('{"headRefOid": "c0ffee1"}', encoding="utf-8")
+    monkeypatch.setattr(_publish, "REPORTS", tmp_path)
+    # REPO is read from the environment at import, and a box with GITHUB_REPOSITORY set
+    # would otherwise make the permalink assertions below pass or fail on the box, not on
+    # the code.
+    monkeypatch.setattr(_publish, "REPO", "ROCm/aiter")
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: RANGE_DIFF)
+    return d
+
+
+def test_a_cited_span_anchors_the_span_not_its_first_line(range_report):
+    pl = _publish.review_payload("8888")
+    c = [x for x in pl["comments"] if x.get("start_line") == 101][0]
+    assert (c["path"], c["start_line"], c["line"]) == ("aiter/ops/layernorm.py", 101, 104)
+    assert c["start_side"] == "RIGHT" and c["side"] == "RIGHT"
+
+
+def test_every_span_anchor_is_shaped_the_way_github_takes_one(range_report):
+    """start_line strictly below line, and a side named for each end. Any other shape is
+    refused, and a refusal takes the summary and every other comment down with it."""
+    for c in _publish.review_payload("8888")["comments"]:
+        if "start_line" in c:
+            assert c["start_line"] < c["line"], c
+            assert c["start_side"] == c["side"] == "RIGHT", c
+        else:
+            assert "start_side" not in c, c
+
+
+def test_a_span_straddling_two_hunks_degrades_to_the_line_that_is_in_the_diff(range_report):
+    """106 is in the first hunk, 201 in the second, and the lines between are in neither.
+    GitHub takes a span only inside one hunk -- so this anchors 106 alone rather than
+    sending a range that would fail the entire review."""
+    c = [x for x in _publish.review_payload("8888")["comments"] if x["line"] == 106]
+    assert len(c) == 1 and "start_line" not in c[0]
+
+
+def test_a_partly_anchorable_span_is_not_dropped(range_report):
+    """The rule is fall back, not discard: a finding whose citation is wider than the diff
+    is still a finding about code in the diff."""
+    bodies = [c["body"] for c in _publish.review_payload("8888")["comments"]]
+    assert any("straddles the gap" in b for b in bodies)
+
+
+def test_the_summary_index_names_the_span(range_report):
+    body = _publish.review_payload("8888")["body"]
+    assert "`aiter/ops/layernorm.py:101-104`" in body
+
+
+def test_a_span_in_prose_is_not_read_as_a_range(range_report):
+    """A real card wrote `flash_kda.py:381 — 6 published tuning candidates`. Read loosely
+    that is the backwards span 381..6, which GitHub refuses -- and the refusal is not of
+    that comment but of the whole review."""
+    cites = _publish.citations("📝 layernorm.py:381 — 6 published tuning candidates.")
+    assert ("layernorm.py", 381, 381) in cites
+    assert not [c for c in cites if c[2] != c[1]]
+
+
+def test_a_span_is_not_also_counted_as_its_own_first_line(range_report):
+    assert _publish.citations("⚠️ a/b/c.py:10-20 and d.py:4") == [
+        ("a/b/c.py", 10, 20),
+        ("d.py", 4, 4),
+    ]
+
+
+# ------------------------------------------------------------ permalinks
+
+
+def test_a_line_outside_the_diff_gets_a_permalink_pinned_to_the_head_sha(range_report):
+    body = _publish.review_payload("8888")["body"]
+    assert (
+        "https://github.com/ROCm/aiter/blob/c0ffee1/aiter/ops/layernorm.py#L5220" in body
+    )
+
+
+def test_a_span_outside_the_diff_links_the_whole_span(range_report):
+    """`#L a -L b` -- the same reason the anchor is a span: the finding is about the block."""
+    monkeypatch_free = _publish.permalink("aiter/ops/layernorm.py", 300, 320, "c0ffee1")
+    assert monkeypatch_free.endswith("#L300-L320")
+
+
+def test_the_permalink_is_in_addition_to_the_human_readable_citation(range_report):
+    body = _publish.review_payload("8888")["body"]
+    assert "layernorm.py:5220 is real code this PR does not touch" in body
+
+
+def test_the_url_sits_alone_on_its_line_so_github_can_expand_it(range_report):
+    """GitHub renders a bare blob permalink as the code it names only when nothing else
+    shares the line. Inside the sentence it is just a shortened link."""
+    body = _publish.review_payload("8888")["body"]
+    url = "https://github.com/ROCm/aiter/blob/c0ffee1/aiter/ops/layernorm.py#L5220"
+    assert [l for l in body.split("\n") if l.strip() == url]
+
+
+def test_an_unresolvable_path_gets_no_permalink(range_report):
+    """nosuchfile.py is in no hunk, so there is nothing to build a blob URL from but the
+    citation's own guess at a path. A link to the wrong code is worse than no link."""
+    body = _publish.review_payload("8888")["body"]
+    assert "nosuchfile.py:12-20" in body  # the finding's text is kept
+    assert "blob/c0ffee1/nosuchfile.py" not in body
+
+
+def test_a_flagged_citation_earns_no_permalink_either(report, monkeypatch):
+    """Same gate as anchoring, same reason: the checker said this finding's pointing is
+    unreliable, and a link the reader follows is where that costs the most."""
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    body = _publish.review_payload("9999")["body"]
+    assert "helper.py:7" in body
+    assert "/blob/deadbeef/" not in body
+
+
+def test_no_citation_check_means_no_permalinks_either(report, monkeypatch):
+    (report / "citations.txt").unlink()
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    pl = _publish.review_payload("9999")
+    assert pl["comments"] == []
+    assert "/blob/" not in pl["body"]
+
+
+# ------------------------------------------------------------ a refused RANGE degrades
+
+
+def test_a_refused_range_review_degrades_and_keeps_the_findings_text(range_report, monkeypatch, capsys):
+    """A malformed span is a new way to fail an all-or-nothing call. The fallback must catch
+    it like any other refusal, and the span's finding must survive into the summary -- a
+    review that sheds it reads exactly like a review that never made it."""
+    fake_api, sent = _refusing_api()
+    monkeypatch.setattr(_publish, "_api", fake_api)
+    _publish.main(["8888", "--post"])
+    assert len(sent) == 2
+    assert sent[0]["comments"] and sent[1]["comments"] == []
+    folded = sent[1]["body"]
+    assert "allocates and launches" in folded, "the span's finding vanished"
+    assert "`aiter/ops/layernorm.py:101-104`" in folded, "folded as a line, not a span"
+    assert "ANCHORS REFUSED -- folded into summary" in capsys.readouterr().out
+
+
+def test_a_collapsed_span_leaves_no_dangling_tail_in_the_index(range_report):
+    """The straddling finding cites `:106-201` and anchors 106 alone, so the citation the
+    index strips is `:106` -- which used to leave the line opening with a bare "-201". Found
+    on a real ATOM card (`prefill_delayer.py:563-569`, anchored at 563) the first time this
+    ran over one."""
+    body = _publish.review_payload("8888")["body"]
+    assert "— -201" not in body and "— -" not in body

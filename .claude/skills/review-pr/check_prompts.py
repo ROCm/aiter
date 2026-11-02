@@ -286,6 +286,87 @@ def check_anchoring_has_a_citation_check():
     return 0
 
 
+def check_range_anchor_shape():
+    """A span anchor is a second way to fail an all-or-nothing call, and it is invisible in
+    a diff that only edits a dict literal. GitHub spells a span as start_line..line with a
+    side for each end; it refuses the whole review -- summary and every other comment with
+    it -- if start_line is not strictly below line, if its side is missing, or if the span
+    reaches outside the hunk. So build a review over a synthetic diff whose file has two
+    hunks, and assert the shape of what comes out rather than the source that produced it.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_publish", HERE / "_publish.py")
+    pub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pub)
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -10,2 +10,4 @@\n ten\n+eleven\n+twelve\n thirteen\n"
+        "@@ -50,1 +50,2 @@\n fifty\n+fiftyone\n"
+    )
+    card = (
+        "## card\n\n"
+        "\u26a0\ufe0f x.py:11-13 is a span inside one hunk.\n"
+        "\U0001f534 x.py:11-51 is a span across the gap between two hunks.\n"
+        "\U0001f4dd x.py:900-910 is a span the diff never reaches.\n"
+    )
+    cs = pub.build_review("1", card, diff, set(), "a" * 40)["comments"]
+    bad = []
+    for c in cs:
+        if "start_line" in c:
+            if not c["start_line"] < c["line"]:
+                bad.append(f"start_line {c['start_line']} is not below line {c['line']}")
+            if c.get("start_side") != c.get("side"):
+                bad.append(f"span on {c['path']} names side {c.get('side')!r} but "
+                           f"start_side {c.get('start_side')!r}")
+        elif "start_side" in c:
+            bad.append(f"{c['path']}:{c['line']} carries start_side with no start_line")
+    spans = [c for c in cs if "start_line" in c]
+    if len(spans) != 1 or (spans and (spans[0]["start_line"], spans[0]["line"]) != (11, 13)):
+        bad.append(f"expected exactly the one in-hunk span 11-13, got "
+                   f"{[(c['start_line'], c['line']) for c in spans]} -- a span across the "
+                   f"gap between hunks is refused like any line outside the diff")
+    if bad:
+        print("\u274c _publish.py builds a span anchor GitHub will not take: %s"
+              % "; ".join(bad))
+        return 1
+    print("\u2705 span anchors well formed: start_line < line, matching sides, inside one hunk")
+    return 0
+
+
+def check_unanchorable_citations_are_linked():
+    """The other half of the same change: a citation GitHub will not take a comment on gets
+    a blob permalink in the summary instead of bare `path:line` text. It is pinned to the
+    head SHA -- a branch link drifts off the code it was written about, which is a wrong
+    anchor arriving late. And it is gated exactly as anchoring is, because a link to the
+    wrong code is worse than no link."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_publish", HERE / "_publish.py")
+    pub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pub)
+    diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -10,2 +10,3 @@\n ten\n+eleven\n twelve\n"
+    card = "## card\n\n\U0001f4dd x.py:900 is context this PR does not touch.\n"
+    sha = "b" * 40
+    want = f"/blob/{sha}/x.py#L900"
+    bad = []
+    body = pub.build_review("1", card, diff, set(), sha)["body"]
+    if want not in body:
+        bad.append("an out-of-diff citation got no permalink pinned to the head SHA")
+    if "x.py:900 is context" not in body:
+        bad.append("the human-readable citation was replaced rather than added to")
+    # flagged -> no link, and no checker at all -> no link
+    if "/blob/" in pub.build_review("1", card, diff, {"x.py:900"}, sha)["body"]:
+        bad.append("a citation check_citations.py flagged was still linked")
+    if "/blob/" in pub.build_review("1", card, diff, None, sha)["body"]:
+        bad.append("a card the checker never ran on was still linked")
+    if bad:
+        print("\u274c _publish.py's permalinks are not gated as anchors are: %s" % "; ".join(bad))
+        return 1
+    print("\u2705 out-of-diff citations linked to the head SHA, and only when the checker vouched")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -309,6 +390,8 @@ def main():
     bad += check_publish_needs_post_flag()
     bad += check_publish_review_is_advisory()
     bad += check_anchoring_has_a_citation_check()
+    bad += check_range_anchor_shape()
+    bad += check_unanchorable_citations_are_linked()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 
