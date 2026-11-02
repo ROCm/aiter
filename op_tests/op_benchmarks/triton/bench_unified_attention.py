@@ -49,6 +49,31 @@ def nvfp4_quant_dequant(tensor):
     return torch_dequant_nvfp4(packed, scales, out_dtype=torch.float32).reshape(shape)
 
 
+def nvfp4_quant_shuffle_cache(cache, scale_preshuffle):
+    """One NVFP4 cache in the kernels' shuffled layout, as dynamic_nvfp4_quant_kv_cache builds it, with the scales
+    preshuffled in scale_preshuffle-row groups (that helper's shuffle_scale_batched uses 128, so pages of 128)."""
+    from op_tests.triton_tests.attention import test_unified_attention as T
+
+    num_blocks, block_size, num_kv_heads, head_size = cache.shape
+    x = cache.view(-1, block_size, num_kv_heads, head_size).permute(0, 2, 1, 3)
+    data, scales = torch_dynamic_mxfp4_quant(x, is_nvfp4=True)
+    scale_k = head_size // 16
+    skw = min(16, 1 << (scale_k - 1).bit_length()) if scale_k >= 4 else scale_k
+    P = scale_preshuffle
+    scales = (
+        scales.view(-1, block_size // P, 4, P // 4, scale_k // skw, skw)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .view(-1, num_kv_heads, block_size * scale_k)
+    )
+    data = T.shuffle_weight(data, arch="gfx950").view(-1, num_kv_heads, block_size * head_size // 2)
+    return (
+        torch.cat([data.view(torch.uint8), scales.view(torch.uint8)], dim=-1)
+        .contiguous()
+        .view(-1, num_kv_heads, block_size, head_size // 2 + scale_k)
+    )
+
+
 def nvfp4_quant_kv_cache_chunked(key_cache, value_cache, blocks_per_chunk=16384):
     """dynamic_nvfp4_quant_kv_cache over chunks of blocks (pages quantize and shuffle independently), so its
     fp32 temporaries stay bounded on large caches."""
@@ -57,9 +82,13 @@ def nvfp4_quant_kv_cache_chunked(key_cache, value_cache, blocks_per_chunk=16384)
         num_blocks = c.shape[0]
         out = None
         for b0 in range(0, num_blocks, blocks_per_chunk):
-            kq, vq = dynamic_nvfp4_quant_kv_cache(
-                c[b0 : b0 + blocks_per_chunk], c[b0 : b0 + blocks_per_chunk]
-            )
+            if c.shape[1] >= 128:
+                kq, vq = dynamic_nvfp4_quant_kv_cache(
+                    c[b0 : b0 + blocks_per_chunk], c[b0 : b0 + blocks_per_chunk]
+                )
+            else:
+                # 64-token pages (A8K4V8's K): scales preshuffled per page
+                kq = vq = nvfp4_quant_shuffle_cache(c[b0 : b0 + blocks_per_chunk], c.shape[1])
             if out is None:
                 out = torch.empty((num_blocks,) + kq.shape[1:], dtype=kq.dtype, device=kq.device)
             out[b0 : b0 + kq.shape[0]] = kq
@@ -82,6 +111,7 @@ def make_inputs(
     nvfp4_q=False,
     nvfp4_kv=False,
     nvfp4_ref=True,
+    nvfp4_v=True,
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(0)
@@ -145,7 +175,12 @@ def make_inputs(
         # fp32 copies of the whole cache: only for a correctness check
         key_ref = nvfp4_quant_dequant(key_cache) if nvfp4_ref else None
         value_ref = nvfp4_quant_dequant(value_cache) if nvfp4_ref else None
-        k_descale = v_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+        k_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+        if nvfp4_v:
+            v_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+        else:
+            # A8K4V8: V stays fp8 (v_fp8, v_descale); the reference reads it with its descale
+            value_ref = v_fp8
     if nvfp4_q:
         q_nvfp4, q_scales = torch_dynamic_mxfp4_quant(
             query.view(-1, head_size_qk), is_nvfp4=True
@@ -203,6 +238,8 @@ def _mode_label(args):
     parts = []
     if args.nvfp4:
         parts.append("a4w4_nvfp4")
+    elif args.k4v8:
+        parts.append("a8k4v8")
     elif args.nvfp4_kv:
         parts.append("a8w4_nvfp4_kv")
     if args.fp8_pv:
@@ -330,12 +367,14 @@ def run_benchmark(custom, args):
             num_blocks=num_blocks,
             fp8_q=args.fp8,
             # NVFP4 K/V needs no fp8 copy (args.fp8 only quantizes Q there)
-            fp8_kv=(args.fp8 and not any_nvfp4) or args.fp8_kv,
+            # NVFP4 K/V needs no fp8 copy (args.fp8 only quantizes Q there); A8K4V8 needs the fp8 V
+            fp8_kv=(args.fp8 and not any_nvfp4) or args.fp8_kv or args.k4v8,
             fp8_output=args.fp8_output,
             out_scale_value=args.out_scale,
             nvfp4_q=args.nvfp4,
             nvfp4_kv=any_nvfp4,
             nvfp4_ref=args.test,
+            nvfp4_v=not args.k4v8,
         )
 
         q_tensor = inputs["q_fp8"] if args.fp8 else inputs["query"]
@@ -347,6 +386,9 @@ def run_benchmark(custom, args):
         if any_nvfp4:
             # already in the shuffled NVFP4 layout
             k_tensor, v_tensor = inputs["k_nvfp4"], inputs["v_nvfp4"]
+            if args.k4v8:
+                # fp8 V in the A8W8 shuffled layout
+                v_tensor = shuffle_kv_cache(inputs["k_fp8"], inputs["v_fp8"])[1]
             if args.nvfp4:
                 q_tensor, q_scales = inputs["q_nvfp4"], inputs["q_scales"]
         # The kernel reads the shuffled layout; the reference below still uses
@@ -477,7 +519,7 @@ def run_benchmark(custom, args):
             nvfp4_bytes(D_HEAD) if any_nvfp4 else D_HEAD * k_tensor.element_size()
         )
         v_bytes = total_k * HK * (
-            nvfp4_bytes(D_HEAD_V) if any_nvfp4 else D_HEAD_V * v_tensor.element_size()
+            nvfp4_bytes(D_HEAD_V) if any_nvfp4 and not args.k4v8 else D_HEAD_V * v_tensor.element_size()
         )
         o_bytes = total_q * HQ * D_HEAD_V * inputs["output"].element_size()
         mem = q_bytes + k_bytes + v_bytes + o_bytes
@@ -559,6 +601,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="A8W4: K, V in NVFP4 (e2m1 + per-16 e4m3 scales), Q in FP8; needs -block_size 128",
     )
     parser.add_argument(
+        "-k4v8",
+        action="store_true",
+        default=False,
+        help="A8K4V8: Q in FP8, K in NVFP4, V in FP8 (shuffled); needs -block_size 128",
+    )
+    parser.add_argument(
         "-nvfp4",
         action="store_true",
         default=False,
@@ -618,14 +666,18 @@ def main(args: list[str] | None = None) -> None:
         )
     if args.fp8_pv and not (args.nvfp4 or args.nvfp4_kv):
         raise ValueError("-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv).")
+    if args.k4v8:
+        if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
+            raise ValueError("-k4v8 is its own KV format; drop -nvfp4 / -nvfp4_kv / -fp8_pv.")
+        args.nvfp4_kv = True
     if args.nvfp4 or args.nvfp4_kv:
         if args.nvfp4 and args.nvfp4_kv:
             raise ValueError("-nvfp4 already quantizes K/V; use one of -nvfp4 / -nvfp4_kv.")
         if args.fp8_kv:
             raise ValueError("-fp8_kv conflicts with NVFP4 K/V.")
-        if args.block_size != 128:
-            # the NVFP4 cache helpers and the gfx1250 kernels' V-scale layout assume 128-token pages
-            raise ValueError("NVFP4 K/V needs -block_size 128.")
+        if args.block_size != 128 and not (args.k4v8 and args.block_size == 64):
+            # the gfx1250 kernels' NVFP4 V-scale layout assumes 128-token pages; an fp8 V (A8K4V8) allows 64
+            raise ValueError("NVFP4 K/V needs -block_size 128 (A8K4V8: 64 or 128).")
         # A8W4 runs Q in FP8; NVFP4 K/V lives only in the shuffled layout
         args.fp8 = args.nvfp4_kv
         args.shuffled_kv_cache = True
