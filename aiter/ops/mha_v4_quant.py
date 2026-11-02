@@ -58,6 +58,17 @@ MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
 
 
+class MhaV4Fp6UnavailableError(NotImplementedError):
+    pass
+
+
+def _check_mxfp6_qk_available() -> None:
+    raise MhaV4Fp6UnavailableError(
+        "MHA v4 FP6 Q/K recipes are temporarily disabled after gfx950 CI "
+        "packing and accuracy failures; use MXFP4 or FP8 Q/K"
+    )
+
+
 def mha_v4_q_multiplier(softmax_scale: float) -> float:
     """Return the Q multiplier expected by the MX attention quantizers."""
     return softmax_scale * MHA_V4_LOG2E
@@ -502,6 +513,7 @@ def mxfp6_k_view(
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q", mutates_args=())
 def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     """Rotate and pack hd128 BSHD Q as MXFP6 E2M3 with E8M0 block scales."""
+    _check_mxfp6_qk_available()
     batch, sequence, heads, head_dim = _validate_bshd_hd128(
         input, "MXFP6 E2M3 Q quantization"
     )
@@ -527,6 +539,7 @@ def quantize_mxfp6_k(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
     """Rotate and pack hd128 BSHD K into raw MXFP6 ASM data and scale buffers."""
+    _check_mxfp6_qk_available()
     batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP6 E2M3 K quantization")
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
     raw = input.new_empty((data_size,), dtype=torch.uint8)
@@ -968,6 +981,7 @@ def quantize_mxfp6_k_hd256(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
     """Rotate and pack hd256 BSHD K into raw MXFP6 ASM data and scale buffers."""
+    _check_mxfp6_qk_available()
     batch, sequence, heads, _ = _validate_bshd_hd256(
         input, "hd256 MXFP6 E2M3 K quantization"
     )

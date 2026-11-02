@@ -40,6 +40,8 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
+    MhaV4Fp6UnavailableError,
+    _check_mxfp6_qk_available,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -50,6 +52,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp6_k_hd256,
+    quantize_mxfp6_q,
+    quantize_mxfp6_q_hd256,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -152,6 +157,25 @@ def test_attention_format_ids_are_stable():
 def test_mha_v4_q_multiplier_recipe():
     softmax_scale = 128**-0.5
     assert mha_v4_q_multiplier(softmax_scale) == softmax_scale * MHA_V4_LOG2E
+
+
+@parametrize("head_dim", [128, 256])
+@parametrize(
+    "v_format", [AttentionFormat.FP8, AttentionFormat.MXFP6, AttentionFormat.MXFP4]
+)
+def test_mha_v4_fp6_qk_temporarily_disabled(head_dim, v_format):
+    with expect_raises(MhaV4Fp6UnavailableError, match="temporarily disabled"):
+        scale_modes_for_formats(AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format)
+    value = torch.empty((1, 1, 1, head_dim), dtype=torch.bfloat16)
+    quant_q, quant_k = (
+        (quantize_mxfp6_q, quantize_mxfp6_k)
+        if head_dim == 128
+        else (quantize_mxfp6_q_hd256, quantize_mxfp6_k_hd256)
+    )
+    with expect_raises(MhaV4Fp6UnavailableError, match="temporarily disabled"):
+        quant_q(value, 1.0)
+    with expect_raises(MhaV4Fp6UnavailableError, match="temporarily disabled"):
+        quant_k(value)
 
 
 def test_mha_v4_f8f6_scale_recipe():
@@ -588,6 +612,8 @@ def test_mha_v4_k_quantizers_reject_an_off_device_mean(quantize):
     Out of process because these checks abort rather than raise, as every AITER_CHECK in that
     translation unit does. All four quantizers share one validator, so all four are covered.
     """
+    if quantize == "quantize_mxfp6_k":
+        _check_mxfp6_qk_available()
     source = textwrap.dedent(f"""
         import torch
         from aiter.ops.mha_v4_quant import {quantize} as quantize
@@ -693,6 +719,8 @@ def check_k_mean_bound(kernel, seq, heads):
 @parametrize("kernel", _K_MEAN_OOB_KERNELS)
 @parametrize("seq,heads", _K_MEAN_OOB_SHAPES)
 def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
+    if kernel == "mxfp6":
+        _check_mxfp6_qk_available()
     check_k_mean_bound(kernel, seq, heads)
 
 
@@ -2157,6 +2185,12 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
     if head_dim != 128:
         # Only all-MXFP6 and all-MXFP4 have kernels past hd128; the rest would raise.
         recipes = {name: recipes[name] for name in ("mxfp6", "mxfp4")}
+    recipes = {
+        name: formats
+        for name, formats in recipes.items()
+        if formats[0] != AttentionFormat.MXFP6
+    }
+    aiter.logger.warning("FP6 Q/K benchmark recipes temporarily disabled")
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(

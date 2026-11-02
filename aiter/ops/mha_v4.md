@@ -3,9 +3,14 @@
 MHA v4 is the BF16-output attention path backed by explicit format, scale, packing, and sparse
 dispatch metadata. Unsupported recipes fail instead of falling back to another attention engine.
 
+FP6 Q/K recipes (`f6f4`, `f6f8`, and all-MXFP6, including hd256) are temporarily disabled
+after gfx950 CI packing and numerical failures. Raw and packed attention calls and the
+FP6 Q/K producers raise `MhaV4Fp6UnavailableError`; tests report these cases as skipped.
+MXFP4 Q/K and FP8 Q/K with MXFP6 V remain available. No substitute format is selected silently.
+
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 and MXFP6 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 on GFX950.
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
 - GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
@@ -31,15 +36,15 @@ V packing and scale modes.
 | MXFP8 | FP8 | dense, sparse |
 | FP8 | FP8 | dense, sparse |
 | FP8 | MXFP6 | dense, sparse |
-| MXFP6 | FP8 | dense, sparse |
-| MXFP6 | MXFP6 | dense, sparse |
-| MXFP6 | MXFP4 | dense, sparse |
+| MXFP6 | FP8 | temporarily disabled |
+| MXFP6 | MXFP6 | temporarily disabled |
+| MXFP6 | MXFP4 | temporarily disabled |
 | MXFP4 | MXFP4 | dense, sparse |
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
 Head dimension 256 exists only for all-MXFP4 and all-MXFP6 Q/K/V, dense, on GFX950. Every other
-recipe, sorted sparse, and GFX942 reject it.
+recipe, sorted sparse, and GFX942 reject it. The all-MXFP6 recipe is temporarily disabled.
 
 ## Ownership
 
