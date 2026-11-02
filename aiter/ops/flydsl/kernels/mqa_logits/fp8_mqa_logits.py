@@ -966,6 +966,8 @@ def _build_kernel_mfma_lds_pipe(
     rs_head: bool = False,
     lds_scales: bool = False,
     head_acc: str = "add",
+    tile_skip: bool = False,
+    dma_guard: bool = False,
 ):
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
@@ -990,7 +992,14 @@ def _build_kernel_mfma_lds_pipe(
     ``lds_scales`` stages the tile's kv_scales into the LDS slot with the same
     async DMA as the KV bytes, instead of a blocking per-n-tile global load
     that every wave repeats. ``head_acc`` picks how each lane sums its head
-    terms (``HEAD_ACC_MODES``).
+    terms (``HEAD_ACC_MODES``). ``tile_skip`` lets a wave skip the B-fragment
+    reads, MFMAs and epilogue of a staged tile that misses its own rows'
+    window (the block's tile loop covers the union of all its rows' windows);
+    the wave still takes part in the tile's DMA and barrier. ``dma_guard``
+    issues no prefetch DMA past the block's last tile (by default the prologue
+    and every iteration prefetch ``prefetch_depth`` tiles ahead regardless),
+    and waits for all of them in the last ``prefetch_depth - 1`` tiles, where
+    fewer newer tiles are in flight than ``_WAIT_VMCNT`` assumes.
     """
     assert head_acc in HEAD_ACC_MODES, f"head_acc={head_acc!r}"
     H = num_heads
@@ -1134,6 +1143,7 @@ def _build_kernel_mfma_lds_pipe(
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
         f"{'_swp' if sw_pipe else ''}"
         f"{'_rs' if rs_head else ''}{'_ls' if lds_scales else ''}"
+        f"{'_ts' if tile_skip else ''}{'_dg' if dma_guard else ''}"
         f"{'' if head_acc == 'add' else f'_h{head_acc}'}{_cl_tag}_flydsl"
     )
 
@@ -1340,6 +1350,15 @@ def _build_kernel_mfma_lds_pipe(
                 weights, H, cp_4xfp32, tc_c_w, M_TILES, mfma.MFMA_N, row_ld
             )
 
+        # This wave's own window: the union of its rows' live windows, for
+        # tile_skip. starts/ends are SGPRs, so the skip test is wave-uniform.
+        wave_start = seq_len_kv
+        wave_end = fx.Int32(0)
+        for j in range_constexpr(RPW):
+            live = starts[j] < ends[j]
+            wave_start = fx.min(wave_start, live.select(starts[j], seq_len_kv))
+            wave_end = fx.max(wave_end, live.select(ends[j], fx.Int32(0)))
+
         # ---- Union KV window across all block rows (all waves cooperate) ----
         u_start = None
         u_end = None
@@ -1396,11 +1415,18 @@ def _build_kernel_mfma_lds_pipe(
         )
 
         # ---- Prologue: prefetch tiles 0..PREFETCH_DEPTH-1 into buffers ----
-        for _p in range_constexpr(PREFETCH_DEPTH):
+        def _prologue_dma(p):
             _dma_kv_tile_to_lds(
-                fx.Int32((_p % NUM_BUFFERS) * SLOT_I32),
-                tile_start + fx.Int32(_p * BKV),
+                fx.Int32((p % NUM_BUFFERS) * SLOT_I32),
+                tile_start + fx.Int32(p * BKV),
             )
+
+        for _p in range_constexpr(PREFETCH_DEPTH):
+            if const_expr(dma_guard):
+                if fx.Int32(_p) < n_tiles:
+                    _prologue_dma(_p)
+            else:
+                _prologue_dma(_p)
 
         def _store_if(pred, out_row_t, col, value):
             """``out_row_t[col] = value`` where ``pred`` holds.
@@ -1445,74 +1471,129 @@ def _build_kernel_mfma_lds_pipe(
             # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
             # i.e. the current tile is complete; then sync so every wave sees the
             # full LDS tile.
-            rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
+            if const_expr(dma_guard and PREFETCH_DEPTH > 1):
+                # Past n_tiles - PD + 1 no prefetch was issued, so fewer than
+                # PD-1 newer tiles are in flight: wait for everything.
+                def _wait_all():
+                    rocdl.s_waitcnt(vmcnt=0)
+
+                def _wait_pipe():
+                    rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
+
+                if t + fx.Int32(PREFETCH_DEPTH) > n_tiles:
+                    _wait_all()
+                else:
+                    _wait_pipe()
+            else:
+                rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
             gpu.barrier()
 
-            # Read all B-frags for this tile from LDS into registers. Hoisting
-            # every (ni,kk) read ahead of the compute nest lets the compiler
-            # batch the LDS loads and hide their lgkmcnt latency behind the MFMA work.
-            b_packs = [None] * N_TILES
-            cols = [None] * N_TILES
-            # kv_scales_tile[ni]: this lane's column scale, applied before the
-            # head reduce. lds_scales + rs_head instead scales once after the
-            # reduce-scatter.
-            kv_scales_tile = [None] * N_TILES
-            rs_scales = [None] * (N_TILES // RS_GROUP)
-            if const_expr(not lds_scales):
-                sc_tile = _scale_tile(col0)
-            else:
-                sc_lds = _lds_scales(slot_dword)
-            for ni in range_constexpr(N_TILES):
-                col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
-                cols[ni] = col
+            def _read_tile():
+                """This tile's B-fragments and column scales out of its slot."""
+                # Read all B-frags for this tile from LDS into registers. Hoisting
+                # every (ni,kk) read ahead of the compute nest lets the compiler
+                # batch the LDS loads and hide their lgkmcnt latency behind the MFMA work.
+                b_packs = [None] * N_TILES
+                cols = [None] * N_TILES
+                # kv_scales_tile[ni]: this lane's column scale, applied before the
+                # head reduce. lds_scales + rs_head instead scales once after the
+                # reduce-scatter.
+                kv_scales_tile = [None] * N_TILES
+                rs_scales = [None] * (N_TILES // RS_GROUP)
                 if const_expr(not lds_scales):
-                    # Column-relative offset into the tile's descriptor; past
-                    # seq_len_kv the hardware returns 0 (masked column).
-                    kv_scales_tile[ni] = fx.Float32(
-                        sc_tile[fx.Int32(ni * mfma.MFMA_N) + lane_mod_N]
+                    sc_tile = _scale_tile(col0)
+                else:
+                    sc_lds = _lds_scales(slot_dword)
+                for ni in range_constexpr(N_TILES):
+                    col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
+                    cols[ni] = col
+                    if const_expr(not lds_scales):
+                        # Column-relative offset into the tile's descriptor; past
+                        # seq_len_kv the hardware returns 0 (masked column).
+                        kv_scales_tile[ni] = fx.Float32(
+                            sc_tile[fx.Int32(ni * mfma.MFMA_N) + lane_mod_N]
+                        )
+                    col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
+                    if const_expr(lds_scales and not rs_head):
+                        kv_scales_tile[ni] = fx.Float32(sc_lds[col_local])
+                    b_packs[ni] = _read_b_frags(slot_dword * fx.Int32(4), ni)
+                if const_expr(lds_scales and rs_head):
+                    for g in range_constexpr(N_TILES // RS_GROUP):
+                        rs_scales[g] = fx.Float32(sc_lds[fx.Int32(g * 64) + lane])
+                return cols, b_packs, kv_scales_tile, rs_scales
+
+            def _dma_next():
+                # Prefetch tile i+PREFETCH_DEPTH into slot (i+PD)%NB.  When NB>PD that
+                # slot != the just-read slot, so no reader-before-writer barrier is
+                # needed (the slot's last reader was iteration i-(NB-PD), already
+                # past this iteration's barrier).  NB==PD reuses the read slot and
+                # requires barrier B first.
+                if const_expr(_need_barrier_b):
+                    gpu.barrier()
+                t_next = t + fx.Int32(PREFETCH_DEPTH)
+                if const_expr(slot_static is None):
+                    next_slot_dword = (t_next % fx.Int32(NUM_BUFFERS)) * fx.Int32(
+                        SLOT_I32
                     )
-                col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
-                if const_expr(lds_scales and not rs_head):
-                    kv_scales_tile[ni] = fx.Float32(sc_lds[col_local])
-                b_packs[ni] = _read_b_frags(slot_dword * fx.Int32(4), ni)
-            if const_expr(lds_scales and rs_head):
-                for g in range_constexpr(N_TILES // RS_GROUP):
-                    rs_scales[g] = fx.Float32(sc_lds[fx.Int32(g * 64) + lane])
+                else:
+                    next_slot_dword = fx.Int32(
+                        ((slot_static + PREFETCH_DEPTH) % NUM_BUFFERS) * SLOT_I32
+                    )
+                col0_next = tile_start + t_next * fx.Int32(BKV)
+                if const_expr(dma_guard):
 
-            # Prefetch tile i+PREFETCH_DEPTH into slot (i+PD)%NB.  When NB>PD that
-            # slot != the just-read slot, so no reader-before-writer barrier is
-            # needed (the slot's last reader was iteration i-(NB-PD), already
-            # past this iteration's barrier).  NB==PD reuses the read slot and
-            # requires barrier B first.
-            if const_expr(_need_barrier_b):
-                gpu.barrier()
-            t_next = t + fx.Int32(PREFETCH_DEPTH)
-            if const_expr(slot_static is None):
-                next_slot_dword = (t_next % fx.Int32(NUM_BUFFERS)) * fx.Int32(SLOT_I32)
-            else:
-                next_slot_dword = fx.Int32(
-                    ((slot_static + PREFETCH_DEPTH) % NUM_BUFFERS) * SLOT_I32
+                    def _prefetch():
+                        _dma_kv_tile_to_lds(next_slot_dword, col0_next)
+
+                    if t_next < n_tiles:
+                        _prefetch()
+                else:
+                    _dma_kv_tile_to_lds(next_slot_dword, col0_next)
+
+            def _compute(read):
+                """Per-row MFMA + epilogue (this wave's RPW rows, all columns)."""
+                cols, b_packs, kv_scales_tile, rs_scales = read
+                out_row_ts = [
+                    _make_out_row_t(logits, _stride_i64, wave_row0 + fx.Int32(j))
+                    for j in range_constexpr(RPW)
+                ]
+                _mfma_and_epilogue(
+                    ep_ctx,
+                    _TileOperands(
+                        col0=col0,
+                        cols=cols,
+                        b_packs=b_packs,
+                        kv_scales=kv_scales_tile,
+                        rs_scales=rs_scales,
+                        out_row_ts=out_row_ts,
+                    ),
                 )
-            col0_next = tile_start + t_next * fx.Int32(BKV)
-            _dma_kv_tile_to_lds(next_slot_dword, col0_next)
 
-            # ---- Per-row MFMA + epilogue (this wave's RPW rows, all columns) ----
-            out_row_ts = [
-                _make_out_row_t(logits, _stride_i64, wave_row0 + fx.Int32(j))
-                for j in range_constexpr(RPW)
-            ]
+            if const_expr(not tile_skip):
+                read = _read_tile()
+                _dma_next()
+                _compute(read)
+            elif const_expr(not _need_barrier_b):
+                # The DMA targets another slot (NB > PD), so the reads can
+                # follow it and a skipped tile reads nothing.
+                _dma_next()
 
-            _mfma_and_epilogue(
-                ep_ctx,
-                _TileOperands(
-                    col0=col0,
-                    cols=cols,
-                    b_packs=b_packs,
-                    kv_scales=kv_scales_tile,
-                    rs_scales=rs_scales,
-                    out_row_ts=out_row_ts,
-                ),
-            )
+                def _read_and_compute():
+                    _compute(_read_tile())
+
+                if (col0 < wave_end) & (col0 + fx.Int32(BKV) > wave_start):
+                    _read_and_compute()
+            else:
+                # NB == PD reuses the read slot: the reads precede barrier B
+                # and the DMA, so only the compute is skipped.
+                read = _read_tile()
+                _dma_next()
+
+                def _compute_read():
+                    _compute(read)
+
+                if (col0 < wave_end) & (col0 + fx.Int32(BKV) > wave_start):
+                    _compute_read()
 
         # Run the loop over KV tiles either unrolled or rolled fashion.
         if const_expr(UNROLL_KV_TILE_LOOP):

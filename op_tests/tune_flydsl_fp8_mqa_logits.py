@@ -144,6 +144,8 @@ def make_space(num_heads: int, head_dim: int) -> SearchSpace:
         Param.boolean("sw_pipe", gate="lds"),
         Param.boolean("rs_head", gate="lds"),
         Param.boolean("lds_scales", gate="lds"),
+        Param.boolean("tile_skip", gate="lds"),
+        Param.boolean("dma_guard", gate="lds"),
         Param.categorical("head_acc", _HEAD_ACC),
         Param.ordinal("waves_per_eu", (1, 2, 3, 4)),
         Param.categorical("split", ("auto", "fixed")),
@@ -183,6 +185,8 @@ def config_from_tag(tag: str) -> dict:
             sw_pipe=bool(m["swp"]),
             rs_head=bool(m["rs"]),
             lds_scales=bool(m["ls"]),
+            tile_skip=bool(m["ts"]),
+            dma_guard=bool(m["dg"]),
         )
     return cfg
 
@@ -198,6 +202,8 @@ def config_label(cfg: dict) -> str:
             s += f"_pd{cfg['prefetch_depth']}"
         s += "_swp" * cfg["sw_pipe"] + "_rs" * cfg["rs_head"]
         s += "_ls" * cfg["lds_scales"]
+        s += "_ts" * cfg.get("tile_skip", False)
+        s += "_dg" * cfg.get("dma_guard", False)
     if cfg.get("head_acc", "add") != "add":
         s += f"_h{cfg['head_acc']}"
     if cfg["waves_per_eu"] != 2:
@@ -339,6 +345,8 @@ class Fp8MqaLogitsBackend:
                     sw_pipe=cfg["sw_pipe"],
                     rs_head=cfg["rs_head"],
                     lds_scales=cfg["lds_scales"],
+                    tile_skip=cfg.get("tile_skip", False),
+                    dma_guard=cfg.get("dma_guard", False),
                 )
             else:
                 launcher = b._build_kernel_mfma_r_w(**common)
@@ -467,7 +475,7 @@ def make(args) -> dict:
     from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
 
     space = make_space(p.num_heads, p.head_dim)
-    auto = config_from_tag(_auto_variant(p.s_q, p.s_k, p.num_heads))
+    auto = config_from_tag(_auto_variant(p.s_q, p.s_k, p.num_heads, p.head_dim))
     return {
         "space": space,
         "backend": Fp8MqaLogitsBackend(p, replays=int(fa.get("replays", 25))),
@@ -494,7 +502,7 @@ def tune_problem(p: Problem, opts) -> dict:
     tag = problem_tag(p)
     space = make_space(p.num_heads, p.head_dim)
     backend = Fp8MqaLogitsBackend(p, replays=opts.replays)
-    auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads)
+    auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads, p.head_dim)
     auto = config_from_tag(auto_tag)
     baseline = space.encode(auto)
     warm = [WarmStart(config_from_tag(t), source="registry") for t in opts.warm]
@@ -584,20 +592,34 @@ def _load_summaries(dirs):
     return rows
 
 
+def _expand_new_knobs(cfg: dict) -> list[dict]:
+    """A winner from before a knob existed, under each of the knob's values
+    (the default first): the lookback after a base change."""
+    out = [cfg]
+    if "head_acc" not in cfg:
+        out = [{**c, "head_acc": h} for c in out for h in _HEAD_ACC]
+    for knob in ("tile_skip", "dma_guard"):
+        if cfg["lds"] and knob not in cfg:
+            out = [{**c, knob: v} for c in out for v in (False, True)]
+    return out
+
+
 def _warm_from(dirs, p: Problem):
-    """Earlier winners as warm starts: this problem's own first, then the
-    other problems' (the space repairs whatever does not fit this H, D)."""
+    """Earlier winners as warm starts: this problem's own first, then those of
+    problems with the same heads and head dim, then the rest (the space
+    repairs whatever does not fit this H, D)."""
     tag = problem_tag(p)
     rows = [r for r in _load_summaries(dirs) if r.get("best_config")]
-    rows.sort(key=lambda r: r["tag"] != tag)
+
+    def rank(r):
+        q = r["problem"]
+        same_hd = (q["num_heads"], q["head_dim"]) == (p.num_heads, p.head_dim)
+        return (r["tag"] != tag, not same_hd)
+
+    rows.sort(key=rank)
     seen, warm = set(), []
     for r in rows:
-        # A winner from before a knob existed is tried under each of its
-        # values (the knob's default first): the lookback after a base change.
-        variants = [r["best_config"]]
-        if "head_acc" not in r["best_config"]:
-            variants = [{**r["best_config"], "head_acc": h} for h in _HEAD_ACC]
-        for cfg in variants:
+        for cfg in _expand_new_knobs(r["best_config"]):
             key = json.dumps(cfg, sort_keys=True)
             if key not in seen:
                 seen.add(key)
@@ -613,7 +635,7 @@ def evaluate_problem(p: Problem, candidates, opts) -> dict:
 
     backend = Fp8MqaLogitsBackend(p, replays=opts.replays)
     space = make_space(p.num_heads, p.head_dim)
-    auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads)
+    auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads, p.head_dim)
     named = [("auto", config_from_tag(auto_tag)), *candidates]
     items, status = [], {}
     for name, cfg in named:

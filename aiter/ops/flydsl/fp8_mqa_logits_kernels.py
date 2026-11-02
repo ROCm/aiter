@@ -253,7 +253,8 @@ def _auto_num_splits(
 # the atom and tile width both vary, and every other knob of the two builders
 # has a segment too, so a gfx950 tag *is* a config:
 #     "mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>"         direct load
-#     "[_lds<NB>[_pd<PD>][_swp][_rs][_ls]]"      LDS pipeline (PD default 2)
+#     "[_lds<NB>[_pd<PD>][_swp][_rs][_ls][_ts][_dg]]"
+#                                                LDS pipeline (PD default 2)
 #     "[_h<fma|fma2>]"                           head_acc (default add)
 #     "[_wpe<N>]"                                waves_per_eu hint (default 2)
 #     "[_ns<N>]"                                 fixed grid.y KV split
@@ -280,6 +281,8 @@ def _mk_builder(
     rs_head=False,
     lds_scales=False,
     head_acc="add",
+    tile_skip=False,
+    dma_guard=False,
 ):
     """Registry entry factory.
 
@@ -315,6 +318,8 @@ def _mk_builder(
             sw_pipe=sw_pipe,
             rs_head=rs_head,
             lds_scales=lds_scales,
+            **({"tile_skip": True} if tile_skip else {}),
+            **({"dma_guard": True} if dma_guard else {}),
         )
     return builder, mfma
 
@@ -525,7 +530,8 @@ DEFAULT_VARIANT = (
 _TAG_RE = re.compile(
     r"^mfma(?P<shape>\d+x\d+x\d+)?(?:_bkv(?P<bkv>\d+))?"
     r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)"
-    r"(?:_lds(?P<lds>\d+)(?:_pd(?P<pd>\d+))?(?P<swp>_swp)?(?P<rs>_rs)?(?P<ls>_ls)?)?"
+    r"(?:_lds(?P<lds>\d+)(?:_pd(?P<pd>\d+))?(?P<swp>_swp)?(?P<rs>_rs)?(?P<ls>_ls)?"
+    r"(?P<ts>_ts)?(?P<dg>_dg)?)?"
     r"(?:_h(?P<ha>fma2?))?(?:_wpe(?P<wpe>\d+))?(?:_ns(?P<ns>\d+))?$"
 )
 
@@ -577,6 +583,8 @@ def _variant_builder(tag):
                 rs_head=bool(m.group("rs")),
                 lds_scales=bool(m.group("ls")),
                 head_acc=m.group("ha") or "add",
+                tile_skip=bool(m.group("ts")),
+                dma_guard=bool(m.group("dg")),
             )
         }
     )
@@ -594,39 +602,43 @@ class _Route:
 
 # Tuned gfx950 routes, (num_heads, head_size) class -> routes by seq_len,
 # shortest first, the last one unbounded. Each tag is the best geomean time over
-# the tuned problems of its seq_len window (causal, misaligned, empty and
-# past-the-end windows, clean_logits on and off). Re-tune after a kernel change.
+# the tuned problems of its seq_len window -- every (num_heads, head_size) at
+# 128x1024, 256x8192, 1024x1024, 1024x1560 and 4096x4096 (plus 8192x8192 at
+# D128) under causal, misaligned and past-the-end windows, causal weighted 2x
+# as the production window -- out of the winners of a search over the whole
+# builder knob space. See op_tests/tune_flydsl_fp8_mqa_logits.py. A route is
+# tuned at the class's own (num_heads, head_size): other sizes that map to the
+# class run untuned and may spill. Re-tune after a kernel change.
 _GFX950_ROUTES = {
     (32, 64): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_wpe1"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_rs_hfma_wpe4_ns2"),
+        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_swp_rs_hfma_wpe4_ns2"),
         _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1_ns2"),
     ),
     (32, 128): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_rs_hfma2_wpe1_ns4"),
-        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe4"),
+        _Route(256, "mfma16x16x128_bkv64_r1_w1_lds4_swp_rs_ls_hfma_ns4"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_rs_hfma2_wpe3_ns2"),
         _Route(None, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4_ns2"),
     ),
     (64, 64): (
         _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
         _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_pd1_swp_rs_hfma_wpe3_ns4"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_ns2"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_rs_ls_hfma_wpe1_ns2"),
     ),
     (64, 128): (
-        _Route(256, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe4"),
-        _Route(2048, "mfma32x32x64_bkv128_r1_w2_lds4_swp_rs_hfma"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma2_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma2_wpe4_ns2"),
         _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_pd1_swp_rs_ls_hfma_wpe3"),
     ),
     (128, 64): (
-        # No seq_len <= 256 problem was tuned at H128 D64, so the 2048 route
-        # covers it too.
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
         _Route(2048, "mfma32x32x64_bkv128_r1_w4_hfma"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_ns2"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_ls_hfma2_wpe1_ns2"),
     ),
     (128, 128): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma_wpe3"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma"),
         _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma_wpe3_ns2"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_wpe4_ns2"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_ns2"),
     ),
 }
 for _routes in _GFX950_ROUTES.values():
@@ -652,9 +664,10 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
     gfx950: the tuned ``_GFX950_ROUTES`` table. ``num_heads`` maps to the
         nearest tuned class (<= 32, 64, >= 128) and ``head_size`` to 64 or
         128 (>= 128); within the class, the first ``_Route`` whose
-        ``max_seq_len`` admits ``seq_len`` wins. Every routed tag uses the
-        32x32x64 atom, so any ``head_size`` that is a multiple of 64 can take
-        its class's route.
+        ``max_seq_len`` admits ``seq_len`` wins. Routed tags use the
+        32x32x64 atom (K=64), except in the 128 head_size class, where a
+        16x16x128 atom (K=128) is also allowed: head sizes are powers of two,
+        so every head_size >= 128 is a multiple of 128.
     """
     if _ARCH == "gfx942":
         rpb2_min_elems = 2**19
