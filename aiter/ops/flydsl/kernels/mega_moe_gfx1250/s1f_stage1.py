@@ -67,8 +67,6 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -85,6 +83,7 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import workgroup_barrier
+from aiter.ops.flydsl.kernels.mega_moe import envs
 from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
     build_gemm_a8w4_tdm_task,
     launch_gemm_a8w4_tdm,
@@ -209,17 +208,10 @@ S1F_BLOCK_RUNS = (4, 2, 8, 8)
 
 # Env overrides for the two tables above (unset = the tables): "N" sets all
 # four tokens-per-rank buckets, "a,b,c,d" sets them in the table order
-# (<=128 / <=1024 / <=2048 / above), e.g. AITER_S1F_BLOCK_RUNS=4,8,8,8.
-def _env_buckets(name, default):
-    v = os.environ.get(name, "").strip()
-    if not v:
-        return default
-    vals = tuple(int(x) for x in v.split(","))
-    return vals * 4 if len(vals) == 1 else vals
-
-
-S1F_PRODUCERS = _env_buckets("AITER_S1F_PRODUCERS", S1F_PRODUCERS)
-S1F_BLOCK_RUNS = _env_buckets("AITER_S1F_BLOCK_RUNS", S1F_BLOCK_RUNS)
+# (<=128 / <=1024 / <=2048 / above), e.g. AITER_S1F_BLOCK_RUNS=4,8,8,8
+# (registered and parsed in mega_moe/envs.py).
+S1F_PRODUCERS = envs.AITER_S1F_PRODUCERS or S1F_PRODUCERS
+S1F_BLOCK_RUNS = envs.AITER_S1F_BLOCK_RUNS or S1F_BLOCK_RUNS
 assert len(S1F_PRODUCERS) == 4 and len(S1F_BLOCK_RUNS) == 4
 
 

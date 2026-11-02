@@ -11,14 +11,10 @@ import torch
 
 from aiter import dtypes, logger
 
+from ...mega_moe import envs
 from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
-from ..config import (
-    _COMPACT_ROUTE_SPEC,
-    _COMPACT_ROUTE_UPTO,
-    _DISPATCH_COMPACT,
-    _WAVE_SIZE,
-)
+from ..config import _DISPATCH_COMPACT, _WAVE_SIZE
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..s1f_ctl import (
@@ -210,29 +206,21 @@ class _CompactDispatch(_Dispatch):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
-        # Overrides (see _COMPACT_ROUTE_UPTO for the default):
+        # Overrides (defaults in mega_moe/envs.py):
         #  AITER_TDM_COMPACT_ROUTE_PARALLEL=0|1 picks the walk for the
         #    BLOCKS/WARPS override (else token-major).
         #  AITER_TDM_COMPACT_ROUTE_UPTO=N keeps the route-parallel walk up to
         #    N tokens/rank with AITER_TDM_COMPACT_ROUTE_SPEC=B,W blocks/warps;
         #    N=0 runs _DISPATCH_COMPACT unchanged.
-        route_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_PARALLEL")
-        upto = int(
-            os.environ.get("AITER_TDM_COMPACT_ROUTE_UPTO", "").strip()
-            or _COMPACT_ROUTE_UPTO
-        )
+        route_parallel = envs.AITER_TDM_COMPACT_ROUTE_PARALLEL
+        upto = envs.AITER_TDM_COMPACT_ROUTE_UPTO
         if blocks_env is not None or warps_env is not None:
             spec = (None, int(blocks_env or "64"), int(warps_env or "8"))
-            if route_env is not None:
-                spec = spec + (route_env == "1",)
+            if route_parallel is not None:
+                spec = spec + (route_parallel,)
             schedule = (spec,)
         elif upto > 0:
-            spec_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_SPEC", "").strip()
-            rb, rw = (
-                tuple(int(v) for v in spec_env.split(","))
-                if spec_env
-                else _COMPACT_ROUTE_SPEC
-            )
+            rb, rw = envs.AITER_TDM_COMPACT_ROUTE_SPEC
             head = tuple(
                 e
                 for e in _DISPATCH_COMPACT
@@ -707,7 +695,7 @@ class _CompactDispatch(_Dispatch):
         """
         if not self.fusion.enabled:
             return
-        if os.environ.get("AITER_S1F_PRECOMPILE", "1") == "0":
+        if not envs.AITER_S1F_PRECOMPILE:
             return
         from ..compact_plan import compact_plan_blocks
         from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb

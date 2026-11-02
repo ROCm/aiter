@@ -21,6 +21,7 @@ import torch
 
 from aiter import ActivationType
 
+from ..mega_moe import envs
 from .arena import _align_up
 
 _log = logging.getLogger("aiter")
@@ -64,29 +65,20 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 # waits out dispatch first. At or below this token count the next layer's plan
 # starts before dispatch returns and overlaps both.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
-# The S1F defaults below (and S1F_BLOCK_RUNS in s1f_stage1.py, the compact
-# route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
-# Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off. Each env var only
-# overrides its default.
+# The S1F defaults (AITER_MEGA_S1F, AITER_S1F_* and the compact route
+# schedule, all registered in mega_moe/envs.py, plus S1F_BLOCK_RUNS in
+# s1f_stage1.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf Endpoints
+# agentic c512: +2.1% gen tok/s/GPU over S1F off. Each env var only overrides
+# its default.
 #: A step whose receive bound exceeds this runs the whole S1F=0 path (see
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
-#: AITER_S1F_MAX_RECV=N overrides it; 0 means no limit.
-_S1F_MAX_RECV_DEFAULT = 4096
-_S1F_MAX_RECV = int(
-    os.environ.get("AITER_S1F_MAX_RECV", "").strip() or _S1F_MAX_RECV_DEFAULT
-)
+#: AITER_S1F_MAX_RECV=N overrides it (default 4096); 0 means no limit.
+_S1F_MAX_RECV = envs.AITER_S1F_MAX_RECV
 #: Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel then runs
 #: its own 256x256 n/k tiles instead of the tuned GEMM1's (e.g. tpr 480's
 #: t64x256x128 GEMM1 can fuse). AITER_S1F_ANY_TILE=0 requires tile_m, tile_n
 #: and tile_k to all match.
-_S1F_ANY_TILE = os.environ.get("AITER_S1F_ANY_TILE", "").strip() != "0"
-
-
-def _s1f_env() -> str:
-    mode = os.environ.get("AITER_MEGA_S1F", "").strip()
-    if mode not in ("", "0", "1"):
-        raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
-    return mode
+_S1F_ANY_TILE = envs.AITER_S1F_ANY_TILE
 
 
 def read_s1f_mode() -> bool:
@@ -96,7 +88,7 @@ def read_s1f_mode() -> bool:
     fit keeps dispatch and GEMM1 as separate launches. ``AITER_MEGA_S1F=0``
     turns it off.
     """
-    return _s1f_env() != "0"
+    return envs.AITER_MEGA_S1F != "0"
 
 
 def _s1f_cu_num() -> int:
@@ -112,7 +104,7 @@ def _fallback_warn(owner, reasons) -> None:
         return
     owner._warned = True
     # S1F is on by default, so only an explicit AITER_MEGA_S1F=1 warns.
-    log = _log.warning if _s1f_env() == "1" else _log.info
+    log = _log.warning if envs.AITER_MEGA_S1F == "1" else _log.info
     log("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
 
 
