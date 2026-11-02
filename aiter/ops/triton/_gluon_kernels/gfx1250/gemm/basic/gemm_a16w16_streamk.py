@@ -14,12 +14,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd_
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 from ....common.utils import swizzled_tile_coords
-from ...tdm_pipeline import (
-    issue_loads,
-    issue_wmma,
-    issue_wmma_khalf,
-    tokens_per_step,
-)
+from ...tdm_pipeline import compute_tile, tokens_per_step
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",
@@ -138,17 +133,18 @@ def gemm_a16w16_streamk_kernel_(
         and _C_PAD_N <= 256
         and _C_TILE_PC <= _B_RING_PC
     )
-    if C_ALIAS_B:
-        SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_C_PAD_N, 16]], [BLOCK_M, BLOCK_N], [1, 0], WMMA_LAYOUT.cga_layout
-        )
-        c_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-            base=c_ptr,
-            shape=(M, N),
-            strides=(stride_cm, stride_cn),
-            block_shape=(BLOCK_M, BLOCK_N),
-            layout=SHARED_LAYOUT_C,
-        )
+    # Built in every case so the tile helper always has the names. It is used only when
+    # C_ALIAS_B is on; otherwise the helper takes the masked store path.
+    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[_C_PAD_N, 16]], [BLOCK_M, BLOCK_N], [1, 0], WMMA_LAYOUT.cga_layout
+    )
+    c_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M, N),
+        strides=(stride_cm, stride_cn),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=SHARED_LAYOUT_C,
+    )
 
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -157,112 +153,31 @@ def gemm_a16w16_streamk_kernel_(
         pid_m, pid_n = swizzled_tile_coords(
             tile_idx, num_pid_m, num_pid_n, GROUP_SIZE_M
         )
-        off_am = pid_m * BLOCK_M
-        off_bn = pid_n * BLOCK_N
-
-        producer = 0
-        consumer = 0
-        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE, layout=WMMA_LAYOUT)
-
-        for _ in gl.static_range(NUM_BUFFERS - 1):
-            producer = issue_loads(
-                producer,
-                a_desc,
-                b_desc,
-                off_am,
-                off_bn,
-                a_buffer,
-                b_buffer,
-                BLOCK_K,
-                TRANSPOSE_B,
-                NUM_BUFFERS,
-            )
-
-        # Steady state: one load issue and one consume per step keep the ring full.
-        for _ in range(gl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
-            producer = issue_loads(
-                producer,
-                a_desc,
-                b_desc,
-                off_am,
-                off_bn,
-                a_buffer,
-                b_buffer,
-                BLOCK_K,
-                TRANSPOSE_B,
-                NUM_BUFFERS,
-            )
-            consumer, accumulator = issue_wmma(
-                consumer,
-                a_buffer,
-                OPERAND_LAYOUT_A,
-                b_buffer,
-                OPERAND_LAYOUT_B,
-                accumulator,
-                (NUM_BUFFERS - 1) * TOKENS,
-                TRANSPOSE_B,
-                NUM_BUFFERS,
-            )
-
-        # KTAIL is a host constexpr decided from the real K, so only one drain path is compiled.
-        # Testing K % BLOCK_K in the kernel materialises both paths and costs even shapes that
-        # never take the branch.
-        if KTAIL:
-            for i in gl.static_range(NUM_BUFFERS - 2):
-                consumer, accumulator = issue_wmma(
-                    consumer,
-                    a_buffer,
-                    OPERAND_LAYOUT_A,
-                    b_buffer,
-                    OPERAND_LAYOUT_B,
-                    accumulator,
-                    (NUM_BUFFERS - 2 - i) * TOKENS,
-                    TRANSPOSE_B,
-                    NUM_BUFFERS,
-                )
-            consumer, accumulator = issue_wmma_khalf(
-                consumer,
-                a_buffer,
-                OPERAND_LAYOUT_A,
-                b_buffer,
-                OPERAND_LAYOUT_B,
-                accumulator,
-                0,
-                TRANSPOSE_B,
-                NUM_BUFFERS,
-                BLOCK_K,
-            )
-        else:
-            for i in gl.static_range(NUM_BUFFERS - 1):
-                consumer, accumulator = issue_wmma(
-                    consumer,
-                    a_buffer,
-                    OPERAND_LAYOUT_A,
-                    b_buffer,
-                    OPERAND_LAYOUT_B,
-                    accumulator,
-                    (NUM_BUFFERS - 2 - i) * TOKENS,
-                    TRANSPOSE_B,
-                    NUM_BUFFERS,
-                )
-
-        if C_ALIAS_B:
-            c_stage = b_buffer.reinterpret(
-                c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], SHARED_LAYOUT_C
-            )
-            gl.barrier()  # every wmma read of the B ring must retire before the overwrite
-            c_stage.store(accumulator.to(c_ptr.type.element_ty))
-            gl.barrier()  # the LDS writes must be visible to the TDM engine
-            gl.amd.cdna5.tdm.async_store(c_desc, [off_am, off_bn], c_stage)
-            # The TDM engine must finish reading LDS before the next tile refills the ring.
-            gl.amd.cdna5.tdm.async_wait(0)
-        else:
-            offs_m = off_am + gl.arange(
-                0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-            )
-            offs_n = off_bn + gl.arange(
-                0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-            )
-            offs_c = stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-            mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-            gl.store(c_ptr + offs_c, accumulator.to(c_ptr.type.element_ty), mask=mask_c)
+        compute_tile(
+            a_desc,
+            b_desc,
+            c_desc,
+            a_buffer,
+            b_buffer,
+            c_ptr,
+            pid_m * BLOCK_M,
+            pid_n * BLOCK_N,
+            M,
+            N,
+            K,
+            stride_cm,
+            stride_cn,
+            OPERAND_LAYOUT_A,
+            OPERAND_LAYOUT_B,
+            WMMA_LAYOUT,
+            SHARED_LAYOUT_C,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            TRANSPOSE_B,
+            ACC_DTYPE,
+            C_ALIAS_B,
+            KTAIL,
+            TOKENS,
+        )
