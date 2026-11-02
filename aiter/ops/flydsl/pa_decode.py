@@ -78,7 +78,7 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = 32 if arch == "gfx1250" else 64
+    wave = props.warp_size
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
@@ -139,11 +139,7 @@ def launch_pa_decode_ps_reduce(
         while 2 * groups <= max_groups and 2 * groups * group_waves * ctas <= budget:
             groups *= 2
         per_seq = rows * kv_heads
-        if (
-            arch != "gfx1250"
-            and ctas * group_waves >= budget
-            and batch * per_seq * per_seq <= 2**30
-        ):
+        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
@@ -215,6 +211,7 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -280,6 +277,13 @@ def pa_decode(
     ``max_context_length``. The reducer and in-kernel merges size their
     partition bound from it, so a smaller value can drop partitions and
     silently truncate attention, including on graph replay.
+
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -721,6 +725,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
         )
 

@@ -333,6 +333,7 @@ void get_pa_metadata_v1(
         block_size,
         max_seqlen_qo,
         uni_seqlen_qo,
+        fast_mode,
         topk,
         max_split_per_batch,
         work_metadata_ptrs,
