@@ -100,15 +100,17 @@ AMAX_FLOOR = 1e-10
 #: Local control block (int32 words, zeroed once by the host). Each counter on
 #: its own 4 KB page: every CTA hits the entry ticket at launch, and an atomic
 #: queued behind those waits tens of us (S1F's CTL_PHEAD note).
-CTL_ENTRY = 0  # u64 entry ticket (words 0-1)
-CTL_PROD = 1024  # + 32 * parity: routes produced
-CTL_CLOSE = 2048  # + 32 * parity: GEMM2 units closed (+1 for the counter reset)
-CTL_QHEAD = 3072  # + 32 * parity: the GEMM work queue head
-CTL_ERR = 4096  # routes dropped for a full expert slot (never expected)
-CTL_SCRATCH = 4128  # target of the idle lanes' zero atomics
+CTL_ENTRY = 0  # u64 entry tickets: N_TICKET of them, TICKET_STRIDE words apart
+N_TICKET = 64
+TICKET_STRIDE = 16
+CTL_PROD = 2048  # + 32 * parity: routes produced
+CTL_CLOSE = 3072  # + 32 * parity: GEMM2 units closed (+1 for the counter reset)
+CTL_QHEAD = 4096  # + 32 * parity: the GEMM work queue head
+CTL_ERR = 5120  # routes dropped for a full expert slot (never expected)
+CTL_SCRATCH = 5152  # target of the idle lanes' zero atomics
 #: Per m-tile: g1_cnt at word 0 and g1_ready at word 32, each on its own
 #: 128 B line, so the ready polls do not queue the completion atomics.
-CTL_G1 = 5120
+CTL_G1 = 6144
 G1_STRIDE = 64
 G1_READY = 32
 #: Words between two CTAs' gate words (one 128 B line each), and where the
@@ -116,8 +118,13 @@ G1_READY = 32
 GATE_STRIDE = 32
 PLAN_PK = 32
 #: Plan replicas: CTA c reads replica c % PLAN_REPS, so a line is read by
-#: G / PLAN_REPS CTAs, not by all of them.
-PLAN_REPS = 16
+#: G / PLAN_REPS CTAs, not by all of them (32 readers on a line cost ~10 us).
+#: A replica is the experts' row counts, 16 bits each.
+PLAN_REPS = 128
+
+#: Words between two experts' slot counters: each on its own 128 B line, so
+#: the peers' atomics on different experts do not serialize on one line.
+RUN_STRIDE = 32
 
 #: Arena control region (``dmk_ctl``), bytes. ``running[2][EPR_PAD]`` takes the
 #: peers' slot atomics; ``src_done`` / ``comb_flag`` one 256 B line per source.
@@ -129,11 +136,12 @@ POLL_SLEEP = int(os.environ.get("AITER_DMK_POLL_SLEEP", "32"))
 #: CTA 0 is the only poller of the peers' flags; it can poll tightly.
 LEAD_SLEEP = 1
 #: A CTA polls only its own gate line, so a short sleep costs no one.
-GATE_SLEEP = 4
+GATE_SLEEP = 32
 
 #: Phase stamps per CTA under AITER_DMK_TRACE: start, ticket, produced,
 #: planned, GEMM1 done, GEMM2 done, combine flags seen, end.
-TR_N = 16
+TR_N = 24
+RT_N = 1024
 
 #: Elements a reduce wave owns per item: 32 lanes x 16.
 RED_ELEMS = WAVE * 16
@@ -146,13 +154,18 @@ def dmk_ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
 
 
 def dmk_epr_pad(experts_per_rank: int) -> int:
-    return (int(experts_per_rank) + WAVE - 1) // WAVE * WAVE
+    """Experts rounded up to whole wave chunks, an even number of them past
+    one (the plan packs two 16-bit counts per dword across chunk pairs)."""
+    ch = (int(experts_per_rank) + WAVE - 1) // WAVE
+    if ch > 1 and ch % 2:
+        ch += 1
+    return ch * WAVE
 
 
 def dmk_src_off(experts_per_rank: int) -> int:
     """The peer flags start 64 KB past the slot counters: CTA 0 polls them
     while the peers' slot atomics land on the counters."""
-    run_bytes = 2 * dmk_epr_pad(experts_per_rank) * 4
+    run_bytes = 2 * dmk_epr_pad(experts_per_rank) * RUN_STRIDE * 4
     return (run_bytes + (64 << 10) - 1) // (64 << 10) * (64 << 10)
 
 
@@ -165,7 +178,7 @@ def dmk_ctl_layout(*, experts_per_rank: int, cap: int, tile_m: int, workers: int
     mt_cap = int(experts_per_rank) * (int(cap) // int(tile_m))
     epr_pad = dmk_epr_pad(experts_per_rank)
     plan = CTL_G1 + mt_cap * G1_STRIDE
-    plan_slot = PLAN_PK + epr_pad
+    plan_slot = (epr_pad // 2 + 31) // 32 * 32
     gate_p = plan + PLAN_REPS * plan_slot
     gate_c = gate_p + int(workers) * GATE_STRIDE
     return {"plan": plan, "plan_slot": plan_slot, "gate_p": gate_p,
@@ -256,8 +269,8 @@ def make_decode_mega(
         raise ValueError("wire row must hold the payload and its e8m0 row")
     if CAP % TM:
         raise ValueError(f"cap={CAP} must be a multiple of tile_m={TM}")
-    if G % WAVE:
-        raise ValueError(f"workers={G} must be a multiple of {WAVE}")
+    if G % WAVE or G % N_TICKET:
+        raise ValueError(f"workers={G} must be a multiple of {WAVE} and {N_TICKET}")
     if npes > WAVE or E != npes * EPR:
         raise ValueError("experts must split evenly over at most 32 ranks")
     EPR_PAD = dmk_epr_pad(EPR)
@@ -281,6 +294,7 @@ def make_decode_mega(
     if MT_CAP > 0xFFFF or CAP > 0xFFFF:
         raise ValueError("the packed plan holds m-tile ends and rows in 16 bits")
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
+    RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
     CTL_ARENA_B = dmk_ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
@@ -483,13 +497,19 @@ def make_decode_mega(
             stamp(0)
 
             # ---- entry ticket (u64) -> generation, parity ----
+            # CTA b takes its ticket on counter b % N_TICKET, which G / N_TICKET
+            # CTAs share and every launch advances by exactly that much: one
+            # counter for all G CTAs queued the last ones ~15 us.
             if is_t0:
                 t64 = fx.Int64(
                     comm_ops.atomic_add_agent(
-                        addr_ctl + fx.Int64(CTL_ENTRY * 4), fx.Int64(1)
+                        addr_ctl
+                        + fx.Int64(CTL_ENTRY * 4)
+                        + fx.Int64((bid & fx.Int32(N_TICKET - 1)) * fx.Int32(TICKET_STRIDE * 4)),
+                        fx.Int64(1),
                     )
                 )
-                l64 = t64 // fx.Int64(G)
+                l64 = t64 // fx.Int64(G // N_TICKET)
                 comm_ops.store_i32_lds(
                     fx.Int64(bc), _i32_lo(l64 % fx.Int64(GEN_MOD)) + fx.Int32(1)
                 )
@@ -514,7 +534,8 @@ def make_decode_mega(
                         buffer_store(
                             fx.Int32(0),
                             rsrc_actl,
-                            (other * fx.Int32(EPR_PAD) + lane + fx.Int32(j * WAVE)),
+                            (other * fx.Int32(EPR_PAD) + lane + fx.Int32(j * WAVE))
+                            * fx.Int32(RUN_STRIDE),
                             cache_modifier=SCOPE_SYS,
                         )
                     if lane < fx.Int32(3):
@@ -553,34 +574,57 @@ def make_decode_mega(
                 dst = gid_s // fx.Int32(EPR)
                 le = gid_s - dst * fx.Int32(EPR)
                 live0 = valid & (lane == fx.Int32(0))
-                # Idle lanes add 0 to a local scratch word: branch-free, so the
-                # return is waited on only at its first use.
-                run_va = fx.Int64(
-                    live0.select(
-                        peer_va(dst, off_ctl)
-                        + fx.Int64((par * fx.Int32(EPR_PAD) + le) * fx.Int32(4)),
-                        addr_ctl + fx.Int64(CTL_SCRATCH * 4),
-                    )
+                # The row loads go out before the slot atomic: loads retire in
+                # issue order, so behind the remote round trip the quant could
+                # not start until the atomic returned.
+                raws = []
+                for jj in range_constexpr(NG):
+                    in_dw = t * fx.Int32(H // 2) + (
+                        lane + fx.Int32(jj * WAVE)
+                    ) * fx.Int32(16)
+                    for c in range_constexpr(4):
+                        raws.append(
+                            buffer_load(
+                                rsrc_x, in_dw + fx.Int32(4 * c), vec_width=4, dtype=T.i32
+                            )
+                        )
+                # Branch-free buffer atomic: idle lanes address past the
+                # resource and touch no memory (an add of 0 by each idle lane
+                # on one scratch word serialized ~1700 atomics per launch), and
+                # the return is waited on only at its first use.
+                rsrc_run = create_buffer_resource_from_addr(
+                    peer_va(dst, off_ctl), num_records_bytes=SRC_OFF
                 )
-                off_l = fx.Int32(
-                    comm_ops.atomic_add_system(
-                        run_va, fx.Int32(live0.select(fx.Int32(1), fx.Int32(0)))
-                    )
+                if const_expr(TRACE):
+                    t_issue = _now()
+                off_l = _buffer_atomic_add_ret(
+                    rsrc_run,
+                    fx.Int32(
+                        live0.select(
+                            (par * fx.Int32(EPR_PAD) + le) * fx.Int32(RUN_STRIDE * 4),
+                            fx.Int32(_OOB),
+                        )
+                    ),
+                    1,
+                    SCOPE_SYS,
                 )
+                if const_expr(TRACE):
+                    rocdl.s_wait_loadcnt(0)
+                    t_back = _now()
+                    if (lane == fx.Int32(0)) & (r < fx.Int32(RT_N)):
+                        rt_va = addr_ctl + fx.Int64(RT_BASE * 4) + fx.Int64(r * fx.Int32(32))
+                        _store_i64_sys(rt_va, t_issue)
+                        _store_i64_sys(rt_va + fx.Int64(8), t_back)
+                        _store_i64_sys(rt_va + fx.Int64(24), fx.Int64(dst))
                 # Lane l owns 32-column groups l + 32 * jj: 64 B of bf16 in,
                 # 16 B of fp4 and one e8m0 byte out (compact_plan._wire_quant).
                 packed = []
                 scales = []
                 for jj in range_constexpr(NG):
-                    g = lane + fx.Int32(jj * WAVE)
-                    in_dw = t * fx.Int32(H // 2) + g * fx.Int32(16)
                     amax = fx.Float32(AMAX_FLOOR)
                     chunks = []
                     for c in range_constexpr(4):
-                        raw = buffer_load(
-                            rsrc_x, in_dw + fx.Int32(4 * c), vec_width=4, dtype=T.i32
-                        )
-                        bf = fx.Vector(raw).bitcast(fx.BFloat16)
+                        bf = fx.Vector(raws[4 * jj + c]).bitcast(fx.BFloat16)
                         chunks.append(bf)
                         f32x8 = bf.to(fx.Float32)
                         for e_ in range_constexpr(8):
@@ -642,6 +686,13 @@ def make_decode_mega(
                         peer_va(dst, off_rowmap) + fx.Int64(row) * fx.Int64(8),
                         num_records_bytes=8,
                     )
+                    if const_expr(TRACE):
+                        if (lane == fx.Int32(0)) & (r < fx.Int32(RT_N)):
+                            _store_i64_sys(
+                                addr_ctl + fx.Int64(RT_BASE * 4)
+                                + fx.Int64(r * fx.Int32(32)) + fx.Int64(16),
+                                _now(),
+                            )
                     meta = fx.Int32(rank * DEST_STRIDE) + r
                     buffer_store(
                         fx.Vector.from_elements([meta, w_bits], dtype=fx.Int32),
@@ -727,80 +778,121 @@ def make_decode_mega(
                 if it >= fx.Int32(SPIN_LIMIT):
                     _trap()
 
+            def plan_from_counts(cnts):
+                """Wave 0: lay the m-tiles out from the per-expert row counts
+                (lane l, chunk j: expert l + 32 j) into the LDS plan."""
+                carry = fx.Int32(0)
+                for j in range_constexpr(EPR_CH):
+                    e_ = lane + fx.Int32(j * WAVE)
+                    c_ = cnts[j]
+                    mt = (c_ + fx.Int32(TM - 1)) // fx.Int32(TM)
+                    incl = _wave32_inclusive_scan_i32(mt, lane) + carry
+                    comm_ops.store_i32_lds(
+                        fx.Int64(lds_end + e_ * fx.Int32(4)),
+                        (incl << fx.Int32(16)) | c_,
+                    )
+                    carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
+                if lane == fx.Int32(0):
+                    comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
+
             if bid == fx.Int32(0):
                 if wave == fx.Int32(0):
                     poll_peer_flags(SRC_OFF)
-                    carry = fx.Int32(0)
+                    stamp(14)
+                    cnts = []
                     for j in range_constexpr(EPR_CH):
                         e_ = lane + fx.Int32(j * WAVE)
-                        live = e_ < fx.Int32(EPR)
                         c_ = _load_i32_sys(
                             rsrc_actl,
-                            par * fx.Int32(EPR_PAD) + e_,
+                            (par * fx.Int32(EPR_PAD) + e_) * fx.Int32(RUN_STRIDE),
                             volatile=False,
                         )
-                        c_ = fx.Int32(live.select(c_, fx.Int32(0)))
+                        c_ = fx.Int32((e_ < fx.Int32(EPR)).select(c_, fx.Int32(0)))
                         c_ = fx.Int32((c_ > fx.Int32(CAP)).select(fx.Int32(CAP), c_))
-                        mt = (c_ + fx.Int32(TM - 1)) // fx.Int32(TM)
-                        incl = _wave32_inclusive_scan_i32(mt, lane) + carry
+                        cnts.append(c_)
+                    plan_from_counts(cnts)
+                    # Pack 16-bit counts: replica dword w holds experts 2w, 2w+1.
+                    # Lane l of half h builds dword 16 h + l / 2 ... via
+                    # bpermute: dword w = cnt(2w) | cnt(2w + 1) << 16.
+                    for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                        w_ = lane + fx.Int32(j2 * WAVE)
+                        lo_e = w_ * fx.Int32(2)
+                        hi_e = lo_e + fx.Int32(1)
+                        lo = fx.Int32(0)
+                        hi = fx.Int32(0)
+                        for j in range_constexpr(EPR_CH):
+                            src_lo = (lo_e - fx.Int32(j * WAVE)) & fx.Int32(WAVE - 1)
+                            src_hi = (hi_e - fx.Int32(j * WAVE)) & fx.Int32(WAVE - 1)
+                            v_lo = fx.Int32(ds_bpermute(T.i32, src_lo * fx.Int32(4), cnts[j]))
+                            v_hi = fx.Int32(ds_bpermute(T.i32, src_hi * fx.Int32(4), cnts[j]))
+                            in_lo = (lo_e >= fx.Int32(j * WAVE)) & (lo_e < fx.Int32((j + 1) * WAVE))
+                            in_hi = (hi_e >= fx.Int32(j * WAVE)) & (hi_e < fx.Int32((j + 1) * WAVE))
+                            lo = fx.Int32(in_lo.select(v_lo, lo))
+                            hi = fx.Int32(in_hi.select(v_hi, hi))
                         comm_ops.store_i32_lds(
-                            fx.Int64(lds_end + e_ * fx.Int32(4)),
-                            (incl << fx.Int32(16)) | c_,
+                            fx.Int64(lds_cnt + w_ * fx.Int32(4)),
+                            lo | (hi << fx.Int32(16)),
                         )
-                        carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
-                    if lane == fx.Int32(0):
-                        comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
-                # Every wave of CTA 0 copies the plan into a quarter of the
-                # CTAs' slots; wave 0 then opens the gates.
-                n_mt0 = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(8))))
+                stamp(15)
+                # Every wave of CTA 0 writes a quarter of the replicas; wave 0
+                # then opens the gates.
                 pk = []
-                for j in range_constexpr(EPR_CH):
+                for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
                     pk.append(
                         fx.Int32(
                             comm_ops.load_i32_lds(
-                                fx.Int64(lds_end + (lane + fx.Int32(j * WAVE)) * fx.Int32(4))
+                                fx.Int64(lds_cnt + (lane + fx.Int32(j2 * WAVE)) * fx.Int32(4))
                             )
                         )
                     )
                 for c in range_constexpr(PLAN_REPS // 4):
-                    slot_w = fx.Int32(PLAN_W) + (wave * fx.Int32(PLAN_REPS // 4) + fx.Int32(c)) * fx.Int32(PLAN_SLOT)
-                    for j in range_constexpr(EPR_CH):
+                    slot_w = fx.Int32(PLAN_W) + (
+                        wave * fx.Int32(PLAN_REPS // 4) + fx.Int32(c)
+                    ) * fx.Int32(PLAN_SLOT)
+                    for j2 in range_constexpr(len(pk)):
                         buffer_store(
-                            pk[j],
+                            pk[j2],
                             rsrc_ctl,
-                            slot_w + fx.Int32(PLAN_PK + j * WAVE) + lane,
+                            slot_w + fx.Int32(j2 * WAVE) + lane,
                             cache_modifier=SCOPE_DEV,
                         )
-                    buffer_store(
-                        n_mt0,
-                        rsrc_ctl,
-                        slot_w + fx.Int32(1),
-                        mask=lane == fx.Int32(0),
-                        cache_modifier=SCOPE_DEV,
-                    )
                 rocdl.s_wait_storecnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
+                stamp(16)
                 if wave == fx.Int32(0):
                     open_gates(GATE_P, GATE_STRIDE)
+                    stamp(17)
             else:
                 if wave == fx.Int32(0):
                     wait_gate(GATE_P, GATE_STRIDE)
-                    slot_w = fx.Int32(PLAN_W) + (bid & fx.Int32(PLAN_REPS - 1)) * fx.Int32(PLAN_SLOT)
+                    stamp(9)
+                    slot_w = fx.Int32(PLAN_W) + (
+                        bid & fx.Int32(PLAN_REPS - 1)
+                    ) * fx.Int32(PLAN_SLOT)
+                    pkw = []
+                    for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                        pkw.append(
+                            _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(j2 * WAVE) + lane)
+                        )
+                    # Unpack: expert e = lane + 32 j sits in dword e / 2.
+                    cnts = []
                     for j in range_constexpr(EPR_CH):
                         e_ = lane + fx.Int32(j * WAVE)
-                        comm_ops.store_i32_lds(
-                            fx.Int64(lds_end + e_ * fx.Int32(4)),
-                            _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(PLAN_PK) + e_),
+                        w_ = e_ >> fx.Int32(1)
+                        j2 = j // 2
+                        src = (w_ - fx.Int32(j2 * WAVE)) & fx.Int32(WAVE - 1)
+                        d_ = fx.Int32(ds_bpermute(T.i32, src * fx.Int32(4), pkw[j2]))
+                        c_ = fx.Int32(
+                            ((e_ & fx.Int32(1)) == fx.Int32(0)).select(
+                                d_ & fx.Int32(0xFFFF), d_ >> fx.Int32(16)
+                            )
                         )
-                    if lane == fx.Int32(0):
-                        comm_ops.store_i32_lds(
-                            fx.Int64(bc + fx.Int32(8)),
-                            _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(1)),
-                        )
+                        cnts.append(fx.Int32((e_ < fx.Int32(EPR)).select(c_, fx.Int32(0))))
+                    plan_from_counts(cnts)
             rocdl.s_wait_dscnt(0)
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
@@ -942,6 +1034,8 @@ def make_decode_mega(
                     e_, mt_idx, rows = decode_mtile(i)
 
                     def a_ready(i=i):
+                        if const_expr(PH & 16):
+                            return
                         stamp(12)
                         rdy_w = fx.Int32(CTL_G1 + G1_READY) + i * fx.Int32(G1_STRIDE)
                         cur = _uniform(_load_i32_dev(rsrc_ctl, rdy_w))
@@ -990,7 +1084,9 @@ def make_decode_mega(
             # CTA 0 alone polls the peers' comb_flag, then opens the gates.
             if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
                 poll_peer_flags(CF_OFF)
+                stamp(18)
                 open_gates(GATE_C, GATE_STRIDE)
+                stamp(19)
             if wave == fx.Int32(0):
                 wait_gate(GATE_C, GATE_STRIDE)
             rocdl.s_wait_dscnt(0)
@@ -1081,6 +1177,15 @@ DMK_TILE = dict(
     num_buffers2=2,
 )
 DMK_CTAS_PER_CU = 2
+# Debug/tuning only: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and
+# AITER_DMK_CTAS_PER_CU override the above.
+if os.environ.get("AITER_DMK_TILE"):
+    _v = [int(x) for x in os.environ["AITER_DMK_TILE"].split(",")]
+    DMK_TILE = dict(zip(
+        ("tile_m", "tile_n", "tile_k", "num_buffers", "tile_n2", "tile_k2",
+         "num_buffers2"), _v))
+if os.environ.get("AITER_DMK_CTAS_PER_CU"):
+    DMK_CTAS_PER_CU = int(os.environ["AITER_DMK_CTAS_PER_CU"])
 
 
 def read_decode_mega_tokens() -> int:
@@ -1180,7 +1285,7 @@ class DecodeMega:
             experts_per_rank=epr, cap=cap, tile_m=t["tile_m"], workers=self.workers
         )
         self.ctl = torch.zeros(
-            self._ctl_words + 2 * TR_N * self.workers,
+            self._ctl_words + 2 * TR_N * self.workers + 8 * RT_N,
             dtype=torch.int32,
             device=device,
         )
@@ -1307,12 +1412,14 @@ class DecodeMega:
         import torch
 
         torch.cuda.synchronize()
-        tr = self.ctl[self._ctl_words :].view(torch.int64).view(self.workers, TR_N)
+        tr = self.ctl[self._ctl_words : self._ctl_words + 2 * TR_N * self.workers]
+        tr = tr.view(torch.int64).view(self.workers, TR_N)
         tr = tr.cpu().double()
         t0 = tr[:, 0].min()
         rel = (tr - t0) / 100.0  # steady counter: 100 MHz -> us
         names = ["start", "ticket", "produced", "planned", "gemm1", "gemm2", "flags", "end",
-                 "p_ready", "-", "p_issued", "p_retired", "g2_wait0", "g2_wait1"]
+                 "p_ready", "gate_seen", "p_issued", "p_retired", "g2_wait0", "g2_wait1"]
+        lead = ["src_seen", "plan_lds", "reps_done", "gates_p", "cf_seen", "gates_c"]
         cols = []
         for k, n in enumerate(names):
             c = rel[:, k]
@@ -1321,6 +1428,21 @@ class DecodeMega:
             if c.numel() == 0:
                 continue
             cols.append(f"{n}={c.min():.1f}/{c.median():.1f}/{c.max():.1f}")
+        rt = self.ctl[self._ctl_words + 2 * TR_N * self.workers :].view(torch.int64)
+        rt = rt.view(RT_N, 4).cpu().double()
+        ok = (rt[:, 0] >= t0) & (rt[:, 1] >= rt[:, 0])
+        if ok.any():
+            r_ = rt[ok]
+            lat = (r_[:, 1] - r_[:, 0]) / 100.0
+            iss = (r_[:, 0] - t0) / 100.0
+            for d in sorted(set(r_[:, 3].long().tolist())):
+                m = r_[:, 3] == d
+                cols.append(
+                    f"atom->r{d}:n={int(m.sum())},issue={iss[m].min():.1f}-{iss[m].max():.1f},"
+                    f"lat={lat[m].min():.1f}/{lat[m].median():.1f}/{lat[m].max():.1f}"
+                )
+        cols.append("cta0:" + ",".join(
+            f"{n}={rel[0, 14 + k]:.1f}" for k, n in enumerate(lead)))
         # The CTAs that finish GEMM2 last: their last unit's wait.
         late = rel[:, 5].argsort(descending=True)[:3].tolist()
         cols.append(
