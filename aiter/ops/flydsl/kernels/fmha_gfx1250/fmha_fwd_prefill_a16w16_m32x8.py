@@ -739,6 +739,11 @@ def _build_managers(
     )
 
 
+# Page indices carried across the loop back edge for the distance-2 index prefetch;
+# one SGPR each, so only worth it while there are few.
+_MAX_CARRIED_PAGE_INDICES = 4
+
+
 class PagedSpec:
     """The paged KV pool as the entry sees it; ``page_size`` compile-time, rest runtime."""
 
@@ -770,8 +775,16 @@ class _ContiguousKVPolicy:
         self.kv_valid = kv_valid
         self.row_base = row_base
 
-    def prepare(self, tile_idx):
+    num_state_slots = 0
+
+    def prepare(self, tile_idx, carried):
+        return None, []
+
+    def indices_for(self, tile_idx):
         return None
+
+    def init_state(self, first_tile_idx):
+        return []
 
     def desc_kwargs(self, page_indices):
         return {}
@@ -815,13 +828,19 @@ class _PagedKVPolicy:
             num_rows % page_size == 0 or page_size % num_rows == 0
         ), f"band of {num_rows} rows and page_size {page_size}: one must divide the other"
         self._num_pages = max(1, num_rows // page_size)
+        # Distance-2 index prefetch. The descriptor BUILD consumes these, and the build
+        # is hoisted above the drain, so loading them in the same body puts s_wait_kmcnt
+        # right on the dependency. Carrying them costs one SGPR each, which only pays
+        # while there are few: page_size >= 8 needs <= 4, page_size 1 would need 32.
+        self._carry = self._num_pages <= _MAX_CARRIED_PAGE_INDICES
+        self.num_state_slots = self._num_pages if self._carry else 0
         # Sentinel for dead rows: the sequence's first token, whose page is referenced
         # by construction (pool row 0's may not be, and NaN there reaches O).
         self._sentinel_row = s_buffer_load(
             ptr_page_indices, page_base, 1, num_records_bytes=num_page_entries * 4
         )[0] * fx.Int32(page_size)
 
-    def prepare(self, tile_idx):
+    def _load(self, tile_idx):
         band_tok0 = self.tile_row0(tile_idx) + self._producer_warp * fx.Int32(
             self._num_rows
         )
@@ -832,6 +851,21 @@ class _PagedKVPolicy:
             self._num_pages,
             num_records_bytes=self._num_page_entries * 4,
         )
+
+    def prepare(self, tile_idx, carried):
+        """This tile's page indices, and the set to carry for the next body."""
+        if not self._carry:
+            return self._load(tile_idx), []
+        # ``carried`` was loaded a body ago for exactly this tile; start the next one now
+        return [fx.Int32(c) for c in carried], self._load(tile_idx + fx.Int32(1))
+
+    def indices_for(self, tile_idx):
+        """Direct load, for the prologue's own start descriptor -- there is no earlier
+        body to have carried it."""
+        return self._load(tile_idx)
+
+    def init_state(self, first_tile_idx):
+        return self._load(first_tile_idx) if self._carry else []
 
     def desc_kwargs(self, page_indices):
         return {
@@ -1097,7 +1131,7 @@ def _attention_prologue(
     # V(start) into slot 0 for body start's dead PV. Built here because the address math is
     # pure; only the ``.async_load()``s go under the warp-type branch.
     _start_valid = _kv_valid(start_tile_idx)
-    _start_pages = _kv_policy.prepare(start_tile_idx)
+    _start_pages = _kv_policy.indices_for(start_tile_idx)
     k_start_desc = _k_desc(
         _k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid, _start_pages
     )
@@ -1414,6 +1448,11 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
     _init = _init + _seed_head
 
+    _kv_state_idx = len(_init)
+    _init = _init + [
+        _raw(v) for v in kv_policy.init_state(start_tile_idx + fx.Int32(1))
+    ]
+
     # ========================================================================
     # Main KV loop -- SOFTWARE-PIPELINED by one tile. The loop variable ``u`` is the
     # SOFTMAX tile, and body tile_idx runs
@@ -1488,6 +1527,9 @@ def _attention_core_multi_kv_tiles(
         head_carry = [
             fx.Vector(state[_head_carry_idx + i]) for i in range(_num_head_carry)
         ]
+        kv_state_prev = list(
+            state[_kv_state_idx : _kv_state_idx + kv_policy.num_state_slots]
+        )
         # The ring's LDS base pointers: banked with the fragments they feed.
         v_curr = [
             schedule_bank(p, bank=1, reason="ring_lds_addr") for p in v_slots[0]
@@ -1509,7 +1551,9 @@ def _attention_core_multi_kv_tiles(
         prefetch_tile_idx = tile_idx + fx.Int32(1)
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
-        prefetch_page_indices = kv_policy.prepare(prefetch_tile_idx)
+        prefetch_page_indices, kv_state_next = kv_policy.prepare(
+            prefetch_tile_idx, kv_state_prev
+        )
 
         # This half's descriptor for the prefetched tile's K (LO) or V (HI) into the
         # oldest slot.
@@ -1727,6 +1771,7 @@ def _attention_core_multi_kv_tiles(
             out += v_slots[i]
         out += [_raw(slot_of[i]) for i in rotation]
         out += [_raw(h) for h in head_next]
+        out += [_raw(v) for v in kv_state_next]
         return out
 
     # ---- Stream softmax tiles [start_tile_idx, num_tiles] through 3 sub-loops split by the
