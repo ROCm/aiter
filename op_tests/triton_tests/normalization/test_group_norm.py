@@ -94,6 +94,8 @@ def test_group_norm_rejects_bad_inputs():
     with pytest.raises(AssertionError):
         group_norm(x, 24, weight, bias)  # 64 is not a multiple of 24
     with pytest.raises(AssertionError):
+        group_norm(x, -32, weight, bias)  # 64 % -32 is 0, so the sign needs a check too
+    with pytest.raises(AssertionError):
         group_norm(x, 32, weight[:-1], bias)
     with pytest.raises(AssertionError):
         group_norm(x.transpose(2, 3), 32, weight, bias)  # not contiguous
@@ -118,6 +120,30 @@ def test_group_norm_empty_batch():
         x = torch.randn(shape, dtype=torch.float16, device="cuda")
         got = group_norm(x, 32)
         assert got.shape == x.shape and got.dtype == x.dtype
+
+
+def test_group_norm_overflow_in_merge():
+    """Two constant halves with a large spread, against fp64.
+
+    The merge term overflows fp32 if it multiplies both counts before it
+    divides. The scale is then zero and the output is all zeros.
+    """
+    # The group is 2x _ELEMENTS_PER_PROGRAM, so the kernel splits and merges it.
+    # Keep the spread tied to the length: fp32 overflows near 1.8e19 / sqrt(length).
+    x = torch.empty(1, 1, 65536, dtype=torch.float32, device="cuda")
+    x[0, 0, :32768] = 1e15
+    x[0, 0, 32768:] = -1e15
+    got = group_norm(x, 1, eps=1e-5)
+    want = F.group_norm(x.double(), 1, eps=1e-5)
+    torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
+
+
+def test_group_norm_rejects_bad_activation():
+    """A bad activation name is rejected, for an empty input too."""
+    for shape in [(2, 64, 8, 8), (0, 64, 8, 8)]:
+        x = torch.randn(shape, dtype=torch.float16, device="cuda")
+        with pytest.raises(KeyError):
+            group_norm(x, 32, activation="no_such_activation")
 
 
 def test_group_norm_empty_activation():

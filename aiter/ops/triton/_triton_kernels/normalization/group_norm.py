@@ -36,8 +36,9 @@ def _welford_merge(mean_a, m2_a, n_a, mean_b, m2_b, n_b):
     n = n_a + n_b
     safe_n = tl.where(n == 0.0, 1.0, n)
     delta = mean_b - mean_a
-    mean = mean_a + delta * n_b / safe_n
-    m2 = m2_a + m2_b + delta * delta * n_a * n_b / safe_n
+    # Divide first, so a large delta overflows fp32 at a higher value.
+    mean = mean_a + delta * (n_b / safe_n)
+    m2 = m2_a + m2_b + delta * delta * (n_a / safe_n) * n_b
     return mean, m2, n
 
 

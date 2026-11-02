@@ -49,12 +49,14 @@ def group_norm(
     - eps: added to the variance.
     - temb: optional (N, C) tensor, added to x per channel before the norm.
     - activation: optional activation after the affine ("silu", "gelu",
-      "gelu_tanh", "relu", ...).
+      "gelu_tanh", "relu", ...). An unknown name raises KeyError.
     - out: optional output with the shape and dtype of x. out can be x, for an
       in-place update. out must be x, or must not overlap x.
 
     The statistics are computed in fp32. The output is rounded to the dtype of x
-    once, after the activation.
+    once, after the activation. The statistics overflow in fp32 when the spread
+    of a group is above about 1.8e19 divided by the square root of its size.
+    The scale of that group is then zero, and its output holds nothing from x.
 
     Returns:
     - out: same shape and dtype as x.
@@ -70,6 +72,7 @@ def group_norm(
     assert x.ndim >= 2, f"x must be (N, C, *), got {tuple(x.shape)}"
     assert x.is_contiguous(), "x must be contiguous"
     N, C = x.shape[0], x.shape[1]
+    assert num_groups > 0, f"num_groups must be positive, got {num_groups}"
     assert C % num_groups == 0, f"C={C} must be a multiple of num_groups={num_groups}"
     for name, p in (("weight", weight), ("bias", bias)):
         assert p is None or p.shape == (
@@ -87,6 +90,10 @@ def group_norm(
         assert (
             out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous()
         ), "out must be contiguous, with the shape and dtype of x"
+
+    # Resolve the activation before the early return, so that a bad name is
+    # rejected for an empty input too.
+    act = _get_activation_from_str(activation) if activation else ""
 
     if x.numel() == 0:
         return out
@@ -142,7 +149,7 @@ def group_norm(
         HAS_TEMB=temb is not None,
         HAS_WEIGHT=weight is not None,
         HAS_BIAS=bias is not None,
-        activation=_get_activation_from_str(activation) if activation else "",
+        activation=act,
         use_activation=bool(activation),
         BLOCK=_BLOCK,
         num_warps=8,
