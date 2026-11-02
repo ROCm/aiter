@@ -512,10 +512,10 @@ def peer_table_launcher(gpus_per_node: int, npes: int):
     def fill_peer_table(window: fx.Int64, table: fx.Int64, offset: fx.Int64):
         if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
             for peer in range(local_peers):
-                address = cco.Window(window).lsa_ptr(fx.Int32(peer), offset)
+                address = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(peer), offset))
                 comm.store_i64_global_relaxed(
                     table + fx.Int64(peer * 8), address)
-            fallback = cco.Window(window).lsa_ptr(fx.Int32(0), offset)
+            fallback = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(0), offset))
             for peer in range(local_peers, total):
                 comm.store_i64_global_relaxed(
                     table + fx.Int64(peer * 8), fallback)
