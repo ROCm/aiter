@@ -182,6 +182,9 @@ def build_gemm_a8w4_tdm_task(
     raw_drain=0,
     defer_c_wait=0,
     tdm_snop=0,
+    a_cache_modifier=0,
+    c_cache_modifier=0,
+    scatter_cache_policy=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -232,6 +235,12 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
+    - ``a_cache_modifier`` / ``c_cache_modifier`` / ``scatter_cache_policy``
+      (decode megakernel): the cache policy (gfx12 CPol, e.g. SCOPE_DEV) of the
+      A and A-scale TDM loads, of the stage-1 quantized output (its TDM store
+      and e8m0 stores), and of the EP-scatter gather stores. One kernel then
+      hands GEMM1's output to GEMM2 across XCCs, and GEMM2's rows to the
+      peers, with no kernel boundary in between.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -518,6 +527,11 @@ def build_gemm_a8w4_tdm_task(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _malign = f"_ma{m_align}" if m_align else ""
+    _cpol = (
+        f"_cp{a_cache_modifier}x{c_cache_modifier}x{scatter_cache_policy}"
+        if a_cache_modifier or c_cache_modifier or scatter_cache_policy
+        else ""
+    )
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -527,7 +541,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_cpol}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -763,12 +777,13 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
+        def make_tdm_store(gt, outer, stride, cache_modifier=0):
             return fx.rocdl.make_tdm_atom(
                 gt,
                 [outer, None],
                 strides=[stride, None],
                 num_warps=num_waves,
+                cache_modifier=cache_modifier,
             )
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
@@ -943,6 +958,7 @@ def build_gemm_a8w4_tdm_task(
                 wv=waves[0],
                 wg_mask=a_mcast_mask,
                 split_inner=tile_m // 16 < len(waves[0]),
+                cache_modifier=a_cache_modifier,
             )
         else:
             add_tdm_loads(
@@ -960,6 +976,7 @@ def build_gemm_a8w4_tdm_task(
                 wv=waves[0],
                 pad=(A_ROW_B, LDS_PAD_A),
                 wg_mask=a_mcast_mask,
+                cache_modifier=a_cache_modifier,
             )
         add_tdm_loads(
             gB_base,
@@ -994,6 +1011,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_KDW,
                 k_adv=0,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
                 target_jobs=as_prologue_jobs,
             )
         elif const_expr(row_major_ascale):
@@ -1012,6 +1030,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=SA_KDW,
                 k_adv=SA_KDW * 4,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
             )
         elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
@@ -1027,6 +1046,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_INNER,
                 k_adv=0,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
                 split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
             )
@@ -1044,6 +1064,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_INNER,
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
+                cache_modifier=a_cache_modifier,
                 split_inner=AS_SUPERS < len(waves[2]),
             )
         add_tdm_loads(
@@ -2119,6 +2140,7 @@ def build_gemm_a8w4_tdm_task(
                                 scale_rsrc,
                                 dst_byte,
                                 mask=is_kgrp0,
+                                cache_modifier=c_cache_modifier,
                             )
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
@@ -2396,7 +2418,7 @@ def build_gemm_a8w4_tdm_task(
                         ),
                         global_byte_offset=_gboff,
                     )
-                    tensor_store_gather(desc)
+                    tensor_store_gather(desc, cache_policy=scatter_cache_policy)
                     if const_expr(ep_quant_bits):
                         # Same rows and slot stride as the payload store; only the
                         # plane base and the row width differ.
@@ -2417,7 +2439,7 @@ def build_gemm_a8w4_tdm_task(
                             ),
                             global_byte_offset=_gboff_s,
                         )
-                        tensor_store_gather(desc_s)
+                        tensor_store_gather(desc_s, cache_policy=scatter_cache_policy)
 
                 # Let every wave issue its own groups directly. This avoids
                 # cloning every descriptor behind a wave-selection branch.
@@ -2454,7 +2476,12 @@ def build_gemm_a8w4_tdm_task(
                         (tile_m // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
+                    atomC = make_tdm_store(
+                        gtC,
+                        (mn_oob + 15) // 16,
+                        out_stride * 16,
+                        cache_modifier=c_cache_modifier,
+                    )
                     src = tensor_view(
                         fx.recast_iter(oc_store, c_q_base_ptr),
                         (tile_m // 16, STORE_N * 16),
@@ -2467,7 +2494,9 @@ def build_gemm_a8w4_tdm_task(
                         gtC = tensor_view(
                             c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
                         )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                        atomC = make_tdm_store(
+                            gtC, mn_oob, out_stride, cache_modifier=c_cache_modifier
+                        )
                         src = tensor_view(
                             fx.recast_iter(oc_store, c_q_base_ptr),
                             (tile_m, STORE_N),

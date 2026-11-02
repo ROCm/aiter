@@ -354,6 +354,19 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
+        dmk = ep.decode_mega
+        if dmk is not None and not quant_bits and bias1 is None and bias2 is None:
+            # Every rank of this MegaMoE runs it (the choice is per instance),
+            # so the ranks always agree on the path.
+            return dmk.forward(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
         step_kw = {}
         s1f = False
         hook = None
@@ -587,6 +600,8 @@ class MegaMoEGfx1250:
         caller that captures a ladder of batch sizes warms every rung through
         here first. A no-op off the compact path.
         """
+        if self._ep.decode_mega is not None:
+            return
         self._ep.warmup(recv_token_bound, token_count)
 
     def prefetch_compact_plan(
@@ -601,6 +616,8 @@ class MegaMoEGfx1250:
         to ``forward`` so the plan overlaps the previous expert GEMM instead.
         A no-op off the compact path.
         """
+        if self._ep.decode_mega is not None:
+            return
         self._ep.prefetch(topk_ids, recv_token_bound)
 
     # -- for callers that drive the transport themselves (ATOM's Triton experts)

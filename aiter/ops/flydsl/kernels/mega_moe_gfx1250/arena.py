@@ -86,6 +86,11 @@ _ARENA_REGION_ORDER = (
     # Stage-1 flag tiles. Last, so every other region's offset stays put when
     # AITER_MEGA_S1F is off and the region is absent.
     "tile_flag",
+    # The decode megakernel's fixed expert slots, their rowmap pairs and its
+    # control words (AITER_MEGA_DECODE); after the rest for the same reason.
+    "dmk_disp",
+    "dmk_rowmap",
+    "dmk_ctl",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

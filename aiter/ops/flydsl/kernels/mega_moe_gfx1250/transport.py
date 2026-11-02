@@ -6,6 +6,7 @@
 import torch
 
 from .arena import SymmetricArena, _ArenaLayout
+from .decode_mega import DecodeMega, decode_mega_reason, decode_mega_regions
 from .mori_caps import _mori_capabilities, _MoriCapabilities
 from .recipe import MegaMoEConfig, MegaMoERecipe, _stage_classes
 from .stages.base import (
@@ -31,7 +32,9 @@ def _arena_layout(config: MegaMoEConfig, caps) -> _ArenaLayout:
     ``required_vmm_bytes`` reports."""
     dispatch, combine = _stage_classes(config.recipe)
     return _ArenaLayout.merge(
-        dispatch.regions(config, caps), combine.regions(config, caps)
+        dispatch.regions(config, caps),
+        combine.regions(config, caps),
+        decode_mega_regions(config),
     )
 
 
@@ -64,10 +67,13 @@ class _EpDispatcher:
             )
         self.layout = _arena_layout(config, caps)
         self.res = _EpResources(SymmetricArena(communicator, self.layout))
+        self.decode_mega = None
         try:
             self.res.allocate(config, self.device)
             self._dispatch.build(self.res)
             self._combine.build(self.res)
+            if decode_mega_reason(config) is None:
+                self.decode_mega = DecodeMega(config, self.res, self.device)
         except BaseException:
             self.close()
             raise

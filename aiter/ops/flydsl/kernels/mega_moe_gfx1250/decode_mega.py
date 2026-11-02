@@ -1,0 +1,1109 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Decode MegaMoE: quant, dispatch, GEMM1, GEMM2 and combine as ONE kernel (gfx1250).
+
+The small-M counterpart of the staged compact path (plan, quant, dispatch,
+GEMM1, GEMM2 + EP scatter, combine sync, reduce: seven launches). Every CTA of
+an all-resident grid of 4-wave CTAs runs the same five phases:
+
+1. PRODUCE. One wave per local token quantizes its bf16 row to the fp4 wire in
+   registers (per-1x32 MX, the HIP quant's RoundUp scale and amax floor, so the
+   bytes match the staged wire), then for each of its routes reserves a slot of
+   the destination expert with one relaxed SCOPE_SYS atomic on that rank's
+   ``running[parity][expert]``, and writes the wire row and its ``(meta, w)``
+   rowmap pair straight into the slot with SCOPE_SYS stores. Expert ``e`` owns
+   rows ``[e * cap, (e + 1) * cap)`` of ``dmk_disp`` on its rank; ``cap`` covers
+   every token of every rank, so a slot never runs out. The wave that finishes
+   this rank's last token stores the generation into every destination's
+   ``src_done[rank]``.
+2. PLAN. Each CTA waits for ``src_done`` of every source, reads the expert
+   counts and lays out the m-tiles (expert-major, ``tile_m`` rows each) in LDS.
+   Every CTA computes the same plan, so no hand-off is needed.
+3. GEMM1 items ``(m, n)`` round-robin over the CTAs: the stage-1 body of
+   ``build_gemm_a8w4_tdm_task`` (act + fp4 quant into a2), its outputs stored
+   SCOPE_DEV. The item completing an m-tile's ``g1_cnt`` publishes
+   ``g1_ready[m] = gen``.
+4. GEMM2 items, after a CTA's GEMM1 items: the A owners wait for the m-tile's
+   ``g1_ready`` (SCOPE_DEV) while the B owners stream W2; A loads SCOPE_DEV; the
+   EP-scatter epilogue writes each weighted row into its token owner's
+   ``comb_inp`` slot with SCOPE_SYS gather stores. A unit-counted close (every
+   GEMM2 unit, plus CTA 0's reset of the next launch's counters) stores the
+   generation into every peer's ``comb_flag[rank]``.
+5. REDUCE. Each CTA waits for every peer's ``comb_flag`` and sums its tokens'
+   top-k slots in k order in fp32, the staged reduce's arithmetic.
+
+Forward progress: producers wait on nothing; the plan waits only on producers
+(all ranks run theirs first); a GEMM1 item waits on nothing; a GEMM2 item waits
+only on GEMM1 items, which every CTA finishes before its first GEMM2 item; the
+reduce waits on the peers' closes, which depend only on the above. All CTAs
+must be resident at once. Every spin traps past its limit.
+
+No launch handshake: rank s writes d's ``dmk_disp`` / ``dmk_rowmap`` /
+``running`` in launch L+1 only after s's launch L ended, which needed d's close
+of L, which comes after every read d made of them in L (and after CTA 0 reset
+the counters launch L+1 uses). Rows of ``comb_inp`` on s are written in L+1
+only for tokens s produced in L+1, i.e. after s's reduce of L.
+
+Generation and parity come from a u64 entry ticket (``G`` per launch), as in
+the S1F stage-1 kernel: every rank launches once per layer, so they agree.
+"""
+
+from __future__ import annotations
+
+import os
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import mori.cco.device.flydsl as cco
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.rocdl import ballot, ds_bpermute, readlane
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.kernels.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
+from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+    _cvt_scalef32_pk8_fp4_bf16 as emit_cvt_scalef32_pk8_fp4_bf16,
+)
+from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+    build_gemm_a8w4_tdm_task,
+    launch_gemm_a8w4_tdm,
+)
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE as _MX_ROUND_UP
+from aiter.utility.mx_types import MxDtypeInt as _MxDtype
+
+from .compact_plan import _wave32_inclusive_scan_i32
+from .config import _WAVE_SIZE as WAVE
+from .s1f_stage1 import (
+    GEN_MOD,
+    SCOPE_DEV,
+    SCOPE_SYS,
+    _i32_lo,
+    _trap,
+    _uniform,
+)
+
+#: HIP ``kAmaxFloor`` (csrc/include/quant_amax_floor.h): the staged wire quant
+#: seeds every group's amax with it, so an all-zero group gets the same e8m0.
+AMAX_FLOOR = 1e-10
+
+#: Local control block (int32 words, zeroed once by the host). Each counter on
+#: its own 128 B line.
+CTL_ENTRY = 0  # u64 entry ticket (words 0-1)
+CTL_PROD = 32  # + 32 * parity: tokens produced
+CTL_CLOSE = 96  # + 32 * parity: GEMM2 units closed (+1 for the counter reset)
+CTL_ERR = 160  # routes dropped for a full expert slot (never expected)
+#: Per m-tile: g1_cnt at word 0, g1_ready at word 16 of a 128 B line.
+CTL_G1 = 256
+G1_STRIDE = 32
+
+#: Arena control region (``dmk_ctl``), bytes. ``running[2][EPR_PAD]`` takes the
+#: peers' slot atomics; ``src_done`` / ``comb_flag`` one 256 B line per source.
+FLAG_STRIDE = 256
+
+#: Polls (each with an s_sleep) before a wait traps, and the sleep between them.
+SPIN_LIMIT = 1 << 22
+POLL_SLEEP = 8
+
+#: Elements a reduce wave owns per item: 32 lanes x 16.
+RED_ELEMS = WAVE * 16
+
+
+def dmk_ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
+    """Bytes of the arena's ``dmk_ctl`` region."""
+    return dmk_src_off(experts_per_rank) + 2 * npes * FLAG_STRIDE
+
+
+def dmk_epr_pad(experts_per_rank: int) -> int:
+    return (int(experts_per_rank) + WAVE - 1) // WAVE * WAVE
+
+
+def dmk_src_off(experts_per_rank: int) -> int:
+    run_bytes = 2 * dmk_epr_pad(experts_per_rank) * 4
+    return (run_bytes + FLAG_STRIDE - 1) // FLAG_STRIDE * FLAG_STRIDE
+
+
+def dmk_ctl_words(*, experts_per_rank: int, cap: int, tile_m: int) -> int:
+    """i32 words of the local control block."""
+    return CTL_G1 + int(experts_per_rank) * (int(cap) // int(tile_m)) * G1_STRIDE
+
+
+def _load_i32_sys(rsrc, word, *, volatile=True):
+    return fx.Int32(
+        buffer_load(
+            rsrc,
+            word,
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=SCOPE_SYS | ((1 << 31) if volatile else 0),
+        )
+    )
+
+
+def make_decode_mega(
+    *,
+    rank,
+    npes,
+    experts,
+    experts_per_rank,
+    topk,
+    model_dim,
+    inter_dim,
+    max_tok_per_rank,
+    cap,
+    row_stride,
+    off_disp,
+    off_rowmap,
+    off_ctl,
+    off_comb_inp,
+    comb_slot_stride,
+    arena_handle,
+    stage1_act,
+    workers,
+    tile_m=16,
+    tile_n=512,
+    tile_k=128,
+    num_buffers=2,
+    tile_n2=512,
+    tile_k2=128,
+    num_buffers2=2,
+    ctas_per_cu=2,
+):
+    """Build the decode megakernel; returns a ``@flyc.jit`` launcher.
+
+    Launcher arguments (positional): ``arg_a2``, ``arg_disp``,
+    ``arg_disp_scale``, ``arg_w1``, ``arg_w1_scale``, ``arg_a2_scale``,
+    ``arg_w2``, ``arg_w2_scale``, ``arg_rowmap`` (pointers), then i64
+    ``arena`` (window handle), ``x``, ``ids``, ``wts``, ``out``, ``ctl``, then
+    ``i32_tok`` (this rank's tokens), ``f32_swiglu_limit``, ``stream``.
+    """
+    if WAVE != 32:
+        raise ValueError("the decode megakernel requires gfx1250 wave32")
+    H, I = int(model_dim), int(inter_dim)
+    E, EPR, K = int(experts), int(experts_per_rank), int(topk)
+    TM, G = int(tile_m), int(workers)
+    CAP, ROW = int(cap), int(row_stride)
+    PAYLOAD = H // 2
+    SCALE_B = H // 32
+    NG = H // 32 // WAVE  # 32-column groups per lane
+    if H % (32 * WAVE) or H % RED_ELEMS:
+        raise ValueError(f"model_dim={H} must be a multiple of {32 * WAVE}")
+    if PAYLOAD + SCALE_B > ROW or ROW % 16:
+        raise ValueError("wire row must hold the payload and its e8m0 row")
+    if CAP % TM:
+        raise ValueError(f"cap={CAP} must be a multiple of tile_m={TM}")
+    if npes > WAVE or E != npes * EPR:
+        raise ValueError("experts must split evenly over at most 32 ranks")
+    EPR_PAD = dmk_epr_pad(EPR)
+    EPR_CH = EPR_PAD // WAVE
+    SRC_OFF = dmk_src_off(EPR)
+    CF_OFF = SRC_OFF + npes * FLAG_STRIDE
+    MT_PER_E = CAP // TM
+    MT_CAP = EPR * MT_PER_E
+    N1 = 2 * I
+    NT1 = N1 // int(tile_n)
+    NT2 = H // int(tile_n2)
+    if N1 % int(tile_n) or H % int(tile_n2):
+        raise ValueError("tile_n / tile_n2 must divide 2*inter_dim / model_dim")
+    DEST_STRIDE = int(max_tok_per_rank) * K
+    RED_CH = H // RED_ELEMS
+    ROWS = EPR * CAP
+    CTL_WORDS = dmk_ctl_words(experts_per_rank=EPR, cap=CAP, tile_m=TM)
+    CTL_ARENA_B = dmk_ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
+
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
+
+    rep2 = get_wmma_m_rep(TM, int(tile_n2), 1, 4, "gemm2")
+    # Debug only: AITER_DMK_PHASES masks phases out (1 produce routes, 2 GEMM1,
+    # 4 GEMM2, 8 reduce); the protocol (tickets, flags, close) always runs.
+    PH = int(os.environ.get("AITER_DMK_PHASES", "15"))
+
+    @flyc.jit
+    def launch(
+        arg_a2: fx.Pointer,
+        arg_disp: fx.Pointer,
+        arg_disp_scale: fx.Pointer,
+        arg_w1: fx.Pointer,
+        arg_w1_scale: fx.Pointer,
+        arg_a2_scale: fx.Pointer,
+        arg_w2: fx.Pointer,
+        arg_w2_scale: fx.Pointer,
+        arg_rowmap: fx.Pointer,
+        arena: fx.Int64,
+        addr_x: fx.Int64,
+        addr_ids: fx.Int64,
+        addr_wts: fx.Int64,
+        addr_out: fx.Int64,
+        addr_ctl: fx.Int64,
+        i32_tok: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
+        stream: fx.Stream,
+    ):
+        lds_holder = [None]
+        meta1_holder = [None]
+        meta2_holder = [None]
+        ready2_holder = [None]
+        common = dict(
+            m_warp=1,
+            n_warp=4,
+            out_is_f16=0,
+            a_is_fp4=1,
+            n_experts=EPR,
+            has_bias=0,
+            cluster_n=1,
+            cluster_m=1,
+            next_stage_prefetch=0,
+            num_waves_per_tensor_tdm=2,
+            tdm_as_in_prologue=0,
+            tdm_b_th=0,
+            lds_soa_load_interleave=0,
+            persistent_workers=G,
+            rolled_drain=0,
+            a_preshuffled=0,
+            m_align=0,
+            explicit_tile=1,
+            lds_base=lds_holder,
+            raw_drain=True,
+            defer_c_wait=False,
+            tdm_snop=True,
+        )
+        g1_task, block, g1_name, _, lay1 = build_gemm_a8w4_tdm_task(
+            K=H,
+            tile_m=TM,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            num_buffers=min(num_buffers, max(1, H // tile_k)),
+            stage1_act=stage1_act,
+            stage1_quant_out=1,
+            quant_wmma_rep=rep2,
+            enable_ep_scatter=0,
+            ep_arena_handle=0,
+            ep_combine_input_offset=0,
+            ep_slot_stride_bytes=0,
+            ep_destination_stride=0,
+            ep_world_size=0,
+            ep_quant_bits=0,
+            row_major_ascale=1,
+            a_row_stride_bytes=ROW,
+            a_scale_row_stride_bytes=ROW,
+            tile_meta=meta1_holder,
+            c_cache_modifier=SCOPE_DEV,
+            **common,
+        )
+        g2_task, block2, g2_name, _, lay2 = build_gemm_a8w4_tdm_task(
+            K=I,
+            tile_m=TM,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            num_buffers=min(num_buffers2, max(1, I // tile_k2)),
+            stage1_act=0,
+            stage1_quant_out=0,
+            quant_wmma_rep=1,
+            enable_ep_scatter=1,
+            ep_arena_handle=arena_handle,
+            ep_combine_input_offset=off_comb_inp,
+            ep_slot_stride_bytes=comb_slot_stride,
+            ep_destination_stride=DEST_STRIDE,
+            ep_world_size=npes,
+            ep_quant_bits=0,
+            row_major_ascale=0,
+            a_row_stride_bytes=0,
+            a_scale_row_stride_bytes=0,
+            tile_meta=meta2_holder,
+            a_ready=ready2_holder,
+            a_cache_modifier=SCOPE_DEV,
+            scatter_cache_policy=SCOPE_SYS,
+            **common,
+        )
+        if block != 4 * WAVE or block2 != block:
+            raise ValueError(f"expected 4-wave GEMM blocks, got {block}/{block2}")
+        ARENA = max(int(lay1["arena"]), int(lay2["arena"]))
+        # LDS beyond the GEMM arena: broadcast words, then the plan's per-expert
+        # inclusive m-tile ends and row counts.
+        BC_B = 64
+        PLAN_B = 2 * EPR_PAD * 4
+        CTRL_B = BC_B + PLAN_B
+        if int(ctas_per_cu) * (((ARENA + CTRL_B) + 2047) // 2048 * 2048) > 327680:
+            raise ValueError(
+                f"{ctas_per_cu} CTAs of {ARENA + CTRL_B} B LDS do not fit one CU"
+            )
+        kname = (
+            f"decode_mega_w{G}_r{rank}of{npes}_c{CAP}"
+            + (f"_ph{PH}" if PH != 15 else "")
+            + f"__{g1_name}__{g2_name}"
+        )
+        # Keep the separate-kernel launcher in this cache key's dependency set.
+        _ = launch_gemm_a8w4_tdm
+
+        @flyc.kernel(name=kname, known_block_size=[block, 1, 1])
+        def kernel(
+            arg_a2: fx.Pointer,
+            arg_disp: fx.Pointer,
+            arg_disp_scale: fx.Pointer,
+            arg_w1: fx.Pointer,
+            arg_w1_scale: fx.Pointer,
+            arg_a2_scale: fx.Pointer,
+            arg_w2: fx.Pointer,
+            arg_w2_scale: fx.Pointer,
+            arg_rowmap: fx.Pointer,
+            arena: fx.Int64,
+            addr_x: fx.Int64,
+            addr_ids: fx.Int64,
+            addr_wts: fx.Int64,
+            addr_out: fx.Int64,
+            addr_ctl: fx.Int64,
+            i32_tok: fx.Int32,
+            f32_swiglu_limit: fx.Float32,
+        ):
+            tid = fx.Int32(fx.thread_idx.x)
+            lane = tid & fx.Int32(WAVE - 1)
+            wave = _uniform(tid >> fx.Int32(5))
+            bid = fx.Int32(fx.block_idx.x)
+            is_t0 = tid == fx.Int32(0)
+
+            smem = fx.SharedAllocator(static=False)
+            arena_ptr = smem.allocate(ARENA, 128)._ptr
+            lds_holder[0] = arena_ptr
+            ctrl_ptr = smem.allocate(CTRL_B, 16)._ptr
+            bc = fx.Int32(
+                arith.index_cast(T.i32, fx.index_cast(T.index, fx.ptrtoint(ctrl_ptr)))
+            )
+            lds_end = bc + fx.Int32(BC_B)
+            lds_cnt = lds_end + fx.Int32(EPR_PAD * 4)
+
+            win = cco.CachedWindow(arena)
+            win_base = win.base
+            win_stride = win.stride
+
+            def peer_va(pe, off):
+                return win_base + fx.Int64(pe) * win_stride + fx.Int64(off)
+
+            my_ctl = peer_va(rank, off_ctl)
+            rsrc_ctl = create_buffer_resource_from_addr(
+                addr_ctl, num_records_bytes=4 * CTL_WORDS
+            )
+            rsrc_actl = create_buffer_resource_from_addr(
+                my_ctl, num_records_bytes=CTL_ARENA_B
+            )
+            tok = fx.Int32(i32_tok)
+
+            # ---- entry ticket (u64) -> generation, parity ----
+            if is_t0:
+                t64 = fx.Int64(
+                    comm_ops.atomic_add_agent(
+                        addr_ctl + fx.Int64(CTL_ENTRY * 4), fx.Int64(1)
+                    )
+                )
+                l64 = t64 // fx.Int64(G)
+                comm_ops.store_i32_lds(
+                    fx.Int64(bc), _i32_lo(l64 % fx.Int64(GEN_MOD)) + fx.Int32(1)
+                )
+                comm_ops.store_i32_lds(
+                    fx.Int64(bc + fx.Int32(4)), _i32_lo(l64) & fx.Int32(1)
+                )
+            rocdl.s_wait_dscnt(0)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+            gen = _uniform(comm_ops.load_i32_lds(fx.Int64(bc)))
+            par = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(4))))
+            other = fx.Int32(1) - par
+
+            # ---- CTA 0: reset the next launch's counters ----
+            # The peers' slot atomics of the next launch land in
+            # running[other] only after this rank's close, which counts this
+            # reset as one unit once its stores have retired.
+            if bid == fx.Int32(0):
+                if wave == fx.Int32(0):
+                    for j in range_constexpr(EPR_CH):
+                        buffer_store(
+                            fx.Int32(0),
+                            rsrc_actl,
+                            (other * fx.Int32(EPR_PAD) + lane + fx.Int32(j * WAVE)),
+                            cache_modifier=SCOPE_SYS,
+                        )
+                    if lane < fx.Int32(2):
+                        buffer_store(
+                            fx.Int32(0),
+                            rsrc_ctl,
+                            (lane == fx.Int32(0)).select(
+                                fx.Int32(CTL_PROD), fx.Int32(CTL_CLOSE)
+                            )
+                            + other * fx.Int32(32),
+                            cache_modifier=SCOPE_DEV,
+                        )
+                    rocdl.s_wait_storecnt(0)
+
+            # ======================== 1. PRODUCE ========================
+            rsrc_x = create_buffer_resource_from_addr(addr_x)
+            rsrc_ids = create_buffer_resource_from_addr(addr_ids)
+            rsrc_wts = create_buffer_resource_from_addr(addr_wts)
+            wave_gid = bid * fx.Int32(4) + wave
+            n_mine = fx.Int32(0)
+            for t in range(wave_gid, tok, G * 4):
+                n_mine = n_mine + fx.Int32(1)
+                # Lane l owns 32-column groups l + 32 * jj: 64 B of bf16 in,
+                # 16 B of fp4 and one e8m0 byte out (compact_plan._wire_quant).
+                packed = []
+                scales = []
+                for jj in range_constexpr(NG):
+                    g = lane + fx.Int32(jj * WAVE)
+                    in_dw = t * fx.Int32(H // 2) + g * fx.Int32(16)
+                    amax = fx.Float32(AMAX_FLOOR)
+                    chunks = []
+                    for c in range_constexpr(4):
+                        raw = buffer_load(
+                            rsrc_x, in_dw + fx.Int32(4 * c), vec_width=4, dtype=T.i32
+                        )
+                        bf = fx.Vector(raw).bitcast(fx.BFloat16)
+                        chunks.append(bf)
+                        f32x8 = bf.to(fx.Float32)
+                        for e_ in range_constexpr(8):
+                            amax = fx.max(amax, abs(f32x8[e_]))
+                    e8m0 = emit_mx_e8m0_scale(
+                        amax, mode=_MX_ROUND_UP, dtype=_MxDtype.FP4_E2M1
+                    )
+                    scale_f32 = (fx.Int32(e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+                    for c in range_constexpr(4):
+                        packed.append(
+                            fx.Int32(
+                                emit_cvt_scalef32_pk8_fp4_bf16(
+                                    chunks[c], scale_f32, i32_ty=T.i32
+                                )
+                            )
+                        )
+                    scales.append(fx.Int32(e8m0) & fx.Int32(0xFF))
+                # Lane q < 8 packs the e8m0 bytes of groups 4q .. 4q+3 of each
+                # 32-group slab into one dword.
+                sc_dw = []
+                for jj in range_constexpr(NG):
+                    w_ = fx.Int32(0)
+                    for b in range_constexpr(4):
+                        src = ((lane & fx.Int32(7)) * fx.Int32(4) + fx.Int32(b)) * fx.Int32(4)
+                        w_ = w_ | (
+                            fx.Int32(ds_bpermute(T.i32, src, scales[jj]))
+                            << fx.Int32(8 * b)
+                        )
+                    sc_dw.append(w_)
+                for k in range_constexpr(K if PH & 1 else 0):
+                    gid = fx.Int32(
+                        buffer_load(
+                            rsrc_ids,
+                            t * fx.Int32(K) + fx.Int32(k),
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    )
+                    w_bits = fx.Int32(
+                        buffer_load(
+                            rsrc_wts,
+                            t * fx.Int32(K) + fx.Int32(k),
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    )
+                    valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
+                    if valid:
+                        dst = gid // fx.Int32(EPR)
+                        le = gid - dst * fx.Int32(EPR)
+                        run_va = peer_va(dst, off_ctl) + fx.Int64(
+                            (par * fx.Int32(EPR_PAD) + le) * fx.Int32(4)
+                        )
+                        off = fx.Int32(0)
+                        if lane == fx.Int32(0):
+                            off = fx.Int32(comm_ops.atomic_add_system(run_va, 1))
+                        off = _uniform(readlane(T.i32, arith.unwrap(off), 0))
+                        if off < fx.Int32(CAP):
+                            row = le * fx.Int32(CAP) + off
+                            # Sized resources: a masked buffer store sends its
+                            # idle lanes to offset 0x7FFFFFFF, which must be OOB.
+                            rsrc_row = create_buffer_resource_from_addr(
+                                peer_va(dst, off_disp) + fx.Int64(row) * fx.Int64(ROW),
+                                num_records_bytes=ROW,
+                            )
+                            for jj in range_constexpr(NG):
+                                buffer_store(
+                                    fx.Vector.from_elements(
+                                        packed[4 * jj : 4 * jj + 4], dtype=fx.Int32
+                                    ),
+                                    rsrc_row,
+                                    (lane + fx.Int32(jj * WAVE)) * fx.Int32(4),
+                                    cache_modifier=SCOPE_SYS,
+                                )
+                            for jj in range_constexpr(NG):
+                                buffer_store(
+                                    sc_dw[jj],
+                                    rsrc_row,
+                                    fx.Int32(PAYLOAD // 4 + jj * 8) + lane,
+                                    mask=lane < fx.Int32(8),
+                                    cache_modifier=SCOPE_SYS,
+                                )
+                            rsrc_rm = create_buffer_resource_from_addr(
+                                peer_va(dst, off_rowmap) + fx.Int64(row) * fx.Int64(8),
+                                num_records_bytes=8,
+                            )
+                            meta = fx.Int32(rank * DEST_STRIDE) + t * fx.Int32(K) + fx.Int32(k)
+                            buffer_store(
+                                fx.Vector.from_elements([meta, w_bits], dtype=fx.Int32),
+                                rsrc_rm,
+                                fx.Int32(0),
+                                mask=lane == fx.Int32(0),
+                                cache_modifier=SCOPE_SYS,
+                            )
+                        else:
+                            if lane == fx.Int32(0):
+                                comm_ops.atomic_add_agent(
+                                    addr_ctl + fx.Int64(CTL_ERR * 4), fx.Int32(1)
+                                )
+            # Publish once this rank's last token has every route in place:
+            # the stores above retire (SCOPE_SYS) before the count, and the
+            # wave completing the count stores gen into every destination.
+            rocdl.s_wait_storecnt(0)
+            done_before = fx.Int32(0)
+            if (n_mine > fx.Int32(0)) & (lane == fx.Int32(0)):
+                done_before = fx.Int32(
+                    comm_ops.atomic_add_agent(
+                        addr_ctl + fx.Int64(CTL_PROD * 4) + fx.Int64(par) * 128, n_mine
+                    )
+                )
+            done_before = _uniform(readlane(T.i32, arith.unwrap(done_before), 0))
+            last = (n_mine > fx.Int32(0)) & (done_before + n_mine == tok)
+            last = last | ((tok == fx.Int32(0)) & (bid == fx.Int32(0)) & (wave == fx.Int32(0)))
+            if last:
+                if lane < fx.Int32(npes):
+                    comm_ops.store_i32_global_system_monotonic(
+                        peer_va(lane, off_ctl)
+                        + fx.Int64(SRC_OFF + rank * FLAG_STRIDE),
+                        gen,
+                    )
+
+            # ======================== 2. PLAN ========================
+            if wave == fx.Int32(0):
+                src = fx.Int32((lane < fx.Int32(npes)).select(lane, fx.Int32(0)))
+                flag_w = fx.Int32(SRC_OFF // 4) + src * fx.Int32(FLAG_STRIDE // 4)
+                cur = _load_i32_sys(rsrc_actl, flag_w)
+                bad = fx.Int32(ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen)))
+                it = fx.Int32(0)
+                while (bad != fx.Int32(0)) & (it < fx.Int32(SPIN_LIMIT)):
+                    fx.rocdl.s_sleep(POLL_SLEEP)
+                    cur = _load_i32_sys(rsrc_actl, flag_w)
+                    bad = fx.Int32(
+                        ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen))
+                    )
+                    it = it + fx.Int32(1)
+                if it >= fx.Int32(SPIN_LIMIT):
+                    _trap()
+                carry = fx.Int32(0)
+                for j in range_constexpr(EPR_CH):
+                    e_ = lane + fx.Int32(j * WAVE)
+                    live = e_ < fx.Int32(EPR)
+                    c_ = _load_i32_sys(
+                        rsrc_actl,
+                        par * fx.Int32(EPR_PAD) + e_,
+                        volatile=False,
+                    )
+                    c_ = fx.Int32(live.select(c_, fx.Int32(0)))
+                    c_ = fx.Int32((c_ > fx.Int32(CAP)).select(fx.Int32(CAP), c_))
+                    mt = (c_ + fx.Int32(TM - 1)) // fx.Int32(TM)
+                    incl = _wave32_inclusive_scan_i32(mt, lane) + carry
+                    comm_ops.store_i32_lds(
+                        fx.Int64(lds_end + e_ * fx.Int32(4)), incl
+                    )
+                    comm_ops.store_i32_lds(fx.Int64(lds_cnt + e_ * fx.Int32(4)), c_)
+                    carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
+                if lane == fx.Int32(0):
+                    comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
+            rocdl.s_wait_dscnt(0)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+            n_mt = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(8))))
+
+            def decode_mtile(i):
+                """(expert, GEMM m-tile index, valid rows) of plan m-tile i: the
+                expert is the number of inclusive m-tile ends <= i."""
+                e_ = fx.Int32(0)
+                for j in range_constexpr(EPR_CH):
+                    e_j = lane + fx.Int32(j * WAVE)
+                    end_j = fx.Int32(
+                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_j * fx.Int32(4)))
+                    )
+                    e_ = e_ + _popc_i32(
+                        fx.Int32(ballot(T.i32, (e_j < fx.Int32(EPR)) & (end_j <= i)))
+                    )
+                e_ = _uniform(e_)
+                e_prev = fx.Int32((e_ > fx.Int32(0)).select(e_ - fx.Int32(1), e_))
+                prev = fx.Int32(
+                    comm_ops.load_i32_lds(fx.Int64(lds_end + e_prev * fx.Int32(4)))
+                )
+                prev = _uniform(fx.Int32((e_ > fx.Int32(0)).select(prev, fx.Int32(0))))
+                jt = i - prev
+                cnt = _uniform(
+                    fx.Int32(
+                        comm_ops.load_i32_lds(fx.Int64(lds_cnt + e_ * fx.Int32(4)))
+                    )
+                )
+                rows = cnt - jt * fx.Int32(TM)
+                rows = fx.Int32((rows > fx.Int32(TM)).select(fx.Int32(TM), rows))
+                return e_, e_ * fx.Int32(MT_PER_E) + jt, rows
+
+            def set_meta1(meta):
+                meta1_holder[0] = meta
+
+            def set_meta2(meta, ready_fn):
+                meta2_holder[0] = meta
+                ready2_holder[0] = ready_fn
+
+            n1 = fx.Int32(N1)
+            n2 = fx.Int32(H)
+            rows_cap = fx.Int32(ROWS)
+
+            total_units = n_mt * fx.Int32(NT2 if PH & 4 else 0) + fx.Int32(1)
+
+            def close_unit():
+                """Wave 0: count one closed unit. The last one (every GEMM2
+                unit's scatter retired, SCOPE_SYS) tells every peer this rank's
+                rows are in its comb_inp."""
+                old = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    old = fx.Int32(
+                        comm_ops.atomic_add_agent(
+                            addr_ctl + fx.Int64(CTL_CLOSE * 4) + fx.Int64(par) * 128,
+                            fx.Int32(1),
+                        )
+                    )
+                old = _uniform(readlane(T.i32, arith.unwrap(old), 0))
+                if old == total_units - fx.Int32(1):
+                    comm_ops.fence_system_release()
+                    if lane < fx.Int32(npes):
+                        comm_ops.store_i32_global_system_monotonic(
+                            peer_va(lane, off_ctl)
+                            + fx.Int64(CF_OFF + rank * FLAG_STRIDE),
+                            gen,
+                        )
+
+            # CTA 0's counter reset (its stores retired above) is one unit.
+            if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
+                close_unit()
+
+            # ======================== 3. GEMM1 ========================
+            for q in range(bid, n_mt * fx.Int32(NT1 if PH & 2 else 0), G):
+                i = q // fx.Int32(NT1)
+                n = q - i * fx.Int32(NT1)
+                e_, mt_idx, rows = decode_mtile(i)
+                set_meta1((e_, rows))
+                g1_task(
+                    arg_a2,
+                    arg_disp,
+                    arg_w1,
+                    arg_disp_scale,
+                    arg_w1_scale,
+                    arg_disp,
+                    arg_disp,
+                    arg_a2_scale,
+                    arg_disp,
+                    rows_cap,
+                    n1,
+                    f32_swiglu_limit,
+                    fx.Float32(1.0),
+                    fx.Float32(1.0),
+                    mt_idx,
+                    n,
+                )
+                # Every wave waited its C / e8m0 stores (SCOPE_DEV) before the
+                # body's closing barrier: count the item.
+                if is_t0:
+                    cnt_va = addr_ctl + fx.Int64(CTL_G1 * 4) + fx.Int64(i) * fx.Int64(
+                        G1_STRIDE * 4
+                    )
+                    old = fx.Int32(comm_ops.atomic_add_agent(cnt_va, fx.Int32(1)))
+                    if old == fx.Int32(NT1 - 1):
+                        buffer_store(
+                            gen,
+                            rsrc_ctl,
+                            fx.Int32(CTL_G1 + 16) + i * fx.Int32(G1_STRIDE),
+                            cache_modifier=SCOPE_DEV,
+                        )
+                        comm_ops.atomic_add_agent(cnt_va, fx.Int32(-NT1))
+
+            # ======================== 4. GEMM2 ========================
+            for q in range(bid, n_mt * fx.Int32(NT2 if PH & 4 else 0), G):
+                i = q // fx.Int32(NT2)
+                n = q - i * fx.Int32(NT2)
+                e_, mt_idx, rows = decode_mtile(i)
+
+                def a_ready(i=i):
+                    rdy_w = fx.Int32(CTL_G1 + 16) + i * fx.Int32(G1_STRIDE)
+                    cur = fx.Int32(
+                        buffer_load(
+                            rsrc_ctl,
+                            rdy_w,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=SCOPE_DEV | (1 << 31),
+                        )
+                    )
+                    it = fx.Int32(0)
+                    while (_uniform(cur) != gen) & (it < fx.Int32(SPIN_LIMIT)):
+                        fx.rocdl.s_sleep(POLL_SLEEP)
+                        cur = fx.Int32(
+                            buffer_load(
+                                rsrc_ctl,
+                                rdy_w,
+                                vec_width=1,
+                                dtype=T.i32,
+                                cache_modifier=SCOPE_DEV | (1 << 31),
+                            )
+                        )
+                        it = it + fx.Int32(1)
+                    if it >= fx.Int32(SPIN_LIMIT):
+                        _trap()
+
+                set_meta2((e_, rows), a_ready)
+                g2_task(
+                    arg_disp,
+                    arg_a2,
+                    arg_w2,
+                    arg_a2_scale,
+                    arg_w2_scale,
+                    arg_disp,
+                    arg_disp,
+                    arg_disp,
+                    arg_rowmap,
+                    rows_cap,
+                    n2,
+                    f32_swiglu_limit,
+                    fx.Float32(1.0),
+                    fx.Float32(1.0),
+                    mt_idx,
+                    n,
+                )
+                if wave == fx.Int32(0):
+                    close_unit()
+
+            # ======================== 5. REDUCE ========================
+            if wave == fx.Int32(0):
+                src = fx.Int32((lane < fx.Int32(npes)).select(lane, fx.Int32(0)))
+                flag_w = fx.Int32(CF_OFF // 4) + src * fx.Int32(FLAG_STRIDE // 4)
+                cur = _load_i32_sys(rsrc_actl, flag_w)
+                bad = fx.Int32(ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen)))
+                it = fx.Int32(0)
+                while (bad != fx.Int32(0)) & (it < fx.Int32(SPIN_LIMIT)):
+                    fx.rocdl.s_sleep(POLL_SLEEP)
+                    cur = _load_i32_sys(rsrc_actl, flag_w)
+                    bad = fx.Int32(
+                        ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen))
+                    )
+                    it = it + fx.Int32(1)
+                if it >= fx.Int32(SPIN_LIMIT):
+                    _trap()
+            rocdl.s_wait_dscnt(0)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+            rsrc_comb = create_buffer_resource_from_addr(peer_va(rank, off_comb_inp))
+            rsrc_out = create_buffer_resource_from_addr(addr_out)
+            for w in range(wave_gid, tok * fx.Int32(RED_CH if PH & 8 else 0), G * 4):
+                t = w // fx.Int32(RED_CH)
+                ch = w - t * fx.Int32(RED_CH)
+                accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
+                for k in range_constexpr(K):
+                    gid = fx.Int32(
+                        buffer_load(
+                            rsrc_ids,
+                            t * fx.Int32(K) + fx.Int32(k),
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    )
+                    valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
+                    slot_b = (t * fx.Int32(K) + fx.Int32(k)) * fx.Int32(comb_slot_stride)
+                    for j in range_constexpr(2):
+                        raw = buffer_load(
+                            rsrc_comb,
+                            (slot_b + ch * fx.Int32(RED_ELEMS * 2) + lane * fx.Int32(32))
+                            // fx.Int32(4)
+                            + fx.Int32(4 * j),
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=SCOPE_SYS,
+                        )
+                        v = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+                        v = valid.select(v, fx.full(8, 0.0, fx.Float32))
+                        accs[j] = accs[j] + v
+                o_dw = (t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)) // fx.Int32(2)
+                for j in range_constexpr(2):
+                    buffer_store(
+                        accs[j].to(fx.BFloat16).bitcast(fx.Int32),
+                        rsrc_out,
+                        o_dw + fx.Int32(4 * j),
+                    )
+
+        kernel(
+            arg_a2,
+            arg_disp,
+            arg_disp_scale,
+            arg_w1,
+            arg_w1_scale,
+            arg_a2_scale,
+            arg_w2,
+            arg_w2_scale,
+            arg_rowmap,
+            arena,
+            addr_x,
+            addr_ids,
+            addr_wts,
+            addr_out,
+            addr_ctl,
+            i32_tok,
+            f32_swiglu_limit,
+        ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
+
+    launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
+    return launch
+
+
+def _popc_i32(x):
+    return fx.Int32(
+        _llvm.call_intrinsic(
+            T.i32, "llvm.ctpop.i32", [arith.unwrap(fx.Int32(x))], [], []
+        )
+    )
+
+
+# ----------------------------------------------------------------------------
+# Host side
+# ----------------------------------------------------------------------------
+
+#: The decode GEMM tiles (both GEMMs): the a4w4 CSV's decode row for this
+#: shape family. The tile does not change the bits (each output element's K
+#: order is the same for every tile), so it is a pure speed choice.
+DMK_TILE = dict(
+    tile_m=16, tile_n=512, tile_k=128, num_buffers=2, tile_n2=512, tile_k2=128,
+    num_buffers2=2,
+)
+DMK_CTAS_PER_CU = 2
+
+
+def read_decode_mega_tokens() -> int:
+    """``AITER_MEGA_DECODE``: the largest ``max_tokens_per_rank`` the decode
+    megakernel serves (0 or unset: off)."""
+    v = os.environ.get("AITER_MEGA_DECODE", "")
+    return int(v) if v.strip() else 0
+
+
+def decode_mega_reason(config) -> str | None:
+    """Why this MegaMoE cannot run the decode megakernel, or None if it can."""
+    from aiter import ActivationType, QuantType
+
+    from .recipe import CombineKind, DispatchKind
+
+    bound = read_decode_mega_tokens()
+    recipe, geo = config.recipe, config.geometry
+    if bound <= 0:
+        return "AITER_MEGA_DECODE is off"
+    if geo.max_tokens_per_rank > bound:
+        return f"max_tokens_per_rank={geo.max_tokens_per_rank} > {bound}"
+    if recipe.dispatch is not DispatchKind.COMPACT or config.dispatch_wire != "fp4":
+        return "needs the compact dispatch on the fp4 wire"
+    if recipe.combine is not CombineKind.FUSED_SCATTER:
+        return "needs the fused-scatter combine"
+    comp = recipe.compute
+    if comp.activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        return f"activation {comp.activation} not supported"
+    if comp.quant_type != QuantType.per_1x32 or comp.hidden_pad or comp.intermediate_pad:
+        return "needs per_1x32 quant and no padding"
+    H, I = config.hidden_dim, geo.inter_dim
+    t = DMK_TILE
+    if H % (32 * WAVE) or (2 * I) % t["tile_n"] or H % t["tile_n2"]:
+        return f"hidden {H} / inter {I} do not tile"
+    if config.world_size > WAVE or geo.experts % config.world_size:
+        return "experts must split evenly over at most 32 ranks"
+    return None
+
+
+def dmk_cap(config) -> int:
+    """Rows each local expert reserves: every token of every rank."""
+    tm = DMK_TILE["tile_m"]
+    rows = config.world_size * config.geometry.max_tokens_per_rank
+    return (rows + tm - 1) // tm * tm
+
+
+def dmk_wire_row(config) -> int:
+    h = config.hidden_dim
+    return (h // 2 + h // 32 + 127) // 128 * 128
+
+
+def decode_mega_regions(config) -> dict:
+    """The arena regions the decode megakernel adds ({} when it is off)."""
+    if decode_mega_reason(config) is not None:
+        return {}
+    epr, cap = config.experts_per_rank, dmk_cap(config)
+    return {
+        "dmk_disp": epr * cap * dmk_wire_row(config),
+        "dmk_rowmap": epr * cap * 8,
+        "dmk_ctl": dmk_ctl_arena_bytes(
+            npes=config.world_size, experts_per_rank=epr
+        ),
+    }
+
+
+class DecodeMega:
+    """The decode megakernel bound to one MegaMoE's arena and combine."""
+
+    def __init__(self, config, res, device):
+        import torch
+
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        from ..tensor_shim import _run_compiled  # noqa: F401  (import check)
+
+        self.config = config
+        self.res = res
+        geo = config.geometry
+        arena = res.arena
+        epr, cap = config.experts_per_rank, dmk_cap(config)
+        self.cap = cap
+        self.row = dmk_wire_row(config)
+        t = DMK_TILE
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
+
+        rep2 = get_wmma_m_rep(t["tile_m"], t["tile_n2"], 1, 4, "gemm2")
+        rows = epr * cap
+        inter = geo.inter_dim
+        # Zeroed once: dmk_ctl's counters, parity words and generation flags.
+        arena.zero("dmk_ctl")
+        self.a2 = torch.empty((rows, inter // 2), dtype=torch.uint8, device=device)
+        self.a2_scale = torch.empty(
+            (rows // rep2, inter // 32 * rep2), dtype=torch.uint8, device=device
+        )
+        self.ctl = torch.zeros(
+            dmk_ctl_words(experts_per_rank=epr, cap=cap, tile_m=t["tile_m"]),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.workers = int(get_cu_num()) * DMK_CTAS_PER_CU
+        self._launch = None
+        self._act_key = None
+
+    def _launcher(self, stage1_act):
+        if self._launch is None or self._act_key != stage1_act:
+            config, arena = self.config, self.res.arena
+            geo = config.geometry
+            self._launch = make_decode_mega(
+                rank=config.rank,
+                npes=config.world_size,
+                experts=geo.experts,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                model_dim=config.hidden_dim,
+                inter_dim=geo.inter_dim,
+                max_tok_per_rank=geo.max_tokens_per_rank,
+                cap=self.cap,
+                row_stride=self.row,
+                off_disp=arena.offset("dmk_disp"),
+                off_rowmap=arena.offset("dmk_rowmap"),
+                off_ctl=arena.offset("dmk_ctl"),
+                off_comb_inp=arena.offset("comb_inp"),
+                comb_slot_stride=config.combine_slot_stride_for(0),
+                arena_handle=arena.handle,
+                stage1_act=stage1_act,
+                workers=self.workers,
+                ctas_per_cu=DMK_CTAS_PER_CU,
+                **DMK_TILE,
+            )
+            self._act_key = stage1_act
+        return self._launch
+
+    def forward(self, hidden_states, topk_weights, topk_ids, *, w1, w2, w1_scale,
+                w2_scale):
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+        import torch
+
+        from aiter import ActivationType
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_weight_uint8
+
+        from ..tensor_shim import _run_compiled
+
+        comp = self.config.recipe.compute
+        swiglu = comp.activation == ActivationType.Swiglu
+        stage1_act = 2 if swiglu else 1
+        sl = (
+            float(comp.swiglu_limit)
+            if comp.swiglu_limit
+            else (7.0 if swiglu else float("inf"))
+        )
+        tokens = int(hidden_states.shape[0])
+        arena = self.res.arena
+        out = self.res.combine_output
+
+        def ptr(addr):
+            # Every buffer here is at least 16 B aligned (torch, arena regions,
+            # and the e8m0 plane one 3584 B payload into the wire row).
+            return flyc.from_c_void_p(fx.Uint8, int(addr), assumed_align=16)
+
+        disp = arena.local_ptr("dmk_disp")
+        w1_u8 = _grouped_weight_uint8(w1)
+        w2_u8 = _grouped_weight_uint8(w2)
+        if os.environ.get("AITER_DMK_DEBUG") and not getattr(self, "_dbg_done", 0):
+            self._dbg_done = 1
+            regs = {n: (arena.local_ptr(n), arena.size(n)) for n, _ in arena.layout.regions}
+            print(
+                f"[dmk r{self.config.rank}] regions="
+                + " ".join(f"{n}:{a:#x}+{z:#x}" for n, (a, z) in regs.items())
+                + f" a2={self.a2.data_ptr():#x}+{self.a2.nbytes:#x}"
+                + f" a2s={self.a2_scale.data_ptr():#x}+{self.a2_scale.nbytes:#x}"
+                + f" ctl={self.ctl.data_ptr():#x}+{self.ctl.nbytes:#x}"
+                + f" w1={w1_u8.data_ptr():#x}+{w1_u8.nbytes:#x}"
+                + f" w1s={w1_scale.data_ptr():#x}+{w1_scale.nbytes:#x}"
+                + f" w2={w2_u8.data_ptr():#x}+{w2_u8.nbytes:#x}"
+                + f" w2s={w2_scale.data_ptr():#x}+{w2_scale.nbytes:#x}"
+                + f" x={hidden_states.data_ptr():#x} out={out.data_ptr():#x}+{out.nbytes:#x}"
+                + f" cap={self.cap} row={self.row} G={self.workers}",
+                flush=True,
+            )
+        _run_compiled(
+            self._launcher(stage1_act),
+            ptr(self.a2.data_ptr()),
+            ptr(disp),
+            ptr(disp + self.config.hidden_dim // 2),
+            ptr(w1_u8.data_ptr()),
+            ptr(w1_scale.data_ptr()),
+            ptr(self.a2_scale.data_ptr()),
+            ptr(w2_u8.data_ptr()),
+            ptr(w2_scale.data_ptr()),
+            ptr(arena.local_ptr("dmk_rowmap")),
+            arena.handle,
+            hidden_states.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            out.data_ptr(),
+            self.ctl.data_ptr(),
+            tokens,
+            sl,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+        return self.res.output(tokens)
+
+    def errors(self) -> int:
+        """Routes dropped for a full expert slot since construction."""
+        return int(self.ctl[CTL_ERR].item())
+
+
+__all__ = [
+    "DecodeMega",
+    "decode_mega_reason",
+    "decode_mega_regions",
+    "dmk_ctl_arena_bytes",
+    "dmk_ctl_words",
+    "dmk_epr_pad",
+    "make_decode_mega",
+    "read_decode_mega_tokens",
+]
