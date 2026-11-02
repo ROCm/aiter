@@ -51,9 +51,40 @@ from .tensor_shim import (
 )
 
 
-def is_fx_set_register_available():
+def is_explicit_vgpr_partition_available():
     """Return whether this FlyDSL build supports explicit register placement."""
-    return callable(getattr(fx, "set_register", None))
+    return callable(getattr(rocdl, "sched_vgpr", None)) or callable(
+        getattr(fx, "set_register", None)
+    )
+
+
+def _pin_rmem_vgpr(storage, start):
+    """Use SSA scheduling on new FlyDSL and allocation placement on old builds."""
+    if callable(getattr(rocdl, "sched_vgpr", None)):
+        # Keep the adapter in this helper's source so edits to its accessors
+        # participate in the launcher's recursive JIT dependency cache key.
+        class ScheduledVgprTensor:
+            def __init__(self, storage, start):
+                self.storage = storage
+                self.start = start
+
+            def load(self):
+                # sched_vgpr returns a new SSA value; consumers must use it.
+                return Vec(rocdl.sched_vgpr(_raw(self.storage.load()), self.start))
+
+            def store(self, value):
+                # Schedule each promoted SSA read. Pinning both sides of a
+                # carried value adds competing live ranges to the same slot.
+                return self.storage.store(value)
+
+            def ir_value(self):
+                # Tensor-based MMA consumes rmem rather than the SSA vector.
+                self.storage.store(self.load())
+                return _raw(self.storage)
+
+        return ScheduledVgprTensor(storage, start)
+    fx.set_register(storage, register_class=fx.rocdl.VGPR, start=start)
+    return storage
 
 
 TDM_DESCRIPTOR_VERSION = 1
@@ -107,7 +138,7 @@ if TDM_EARLY_TIMEOUT not in (0, 1):
     raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
-    EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
+    EXPLICIT_VGPR_PARTITION and is_explicit_vgpr_partition_available()
 )
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
@@ -222,9 +253,12 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    # Capture the helper in the launcher's dependency key as well as in the
+    # nested kernel closure. Accessor changes must invalidate compiled code.
+    pin_rmem_vgpr = _pin_rmem_vgpr
     assert explicit_vgpr_partition in (0, 1)
     explicit_vgpr_partition = bool(
-        explicit_vgpr_partition and is_fx_set_register_available()
+        explicit_vgpr_partition and is_explicit_vgpr_partition_available()
     )
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
@@ -1317,9 +1351,8 @@ def launch_gemm_a8w4_tdm(
         if const_expr(explicit_vgpr_partition):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
-                fx.set_register(
+                c_frags[idx] = pin_rmem_vgpr(
                     c_frags[idx],
-                    register_class=fx.rocdl.VGPR,
                     start=(256 if resident_ring_addresses else (64 if pinned_fp4_prefill else 256))
                         + idx * WMMA_VECTOR_DWORDS,
                 )
@@ -1335,16 +1368,23 @@ def launch_gemm_a8w4_tdm(
                 # A tied identity emits no instruction, but its side effect
                 # keeps zero materialization from sinking past the wait.
                 zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
-                cf.store(
-                    llvm_dialect.InlineAsmOp(
-                        res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
-                        operands_=[zero],
-                        asm_string="",
-                        constraints="=v,0",
-                        has_side_effects=True,
-                        is_align_stack=False,
-                    ).res
-                )
+                if const_expr(explicit_vgpr_partition
+                              and callable(getattr(rocdl, "sched_vgpr", None))):
+                    # Generic inline-asm "v" constrains the result to Lo256.
+                    # SSA scheduling cannot widen that class to the pinned C
+                    # range. Keep the scheduling barriers and pin C at reads.
+                    cf.store(zero)
+                else:
+                    cf.store(
+                        llvm_dialect.InlineAsmOp(
+                            res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                            operands_=[zero],
+                            asm_string="",
+                            constraints="=v,0",
+                            has_side_effects=True,
+                            is_align_stack=False,
+                        ).res
+                    )
             rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
@@ -1389,13 +1429,18 @@ def launch_gemm_a8w4_tdm(
                     else:
                         fx.gemm(
                             wmma_atoms[wn % 2][wm % 2],
-                            c_frags[idx],
-                            wt[wn],
-                            act[i],
-                            c_frags[idx],
+                            _raw(c_frags[idx]),
+                            _raw(wt[wn]),
+                            _raw(act[i]),
+                            _raw(c_frags[idx]),
                             scale_a=scale_a,
                             scale_b=scale_b,
                         )
+                        if const_expr(explicit_vgpr_partition
+                                      and callable(getattr(rocdl, "sched_vgpr", None))):
+                            # fx.gemm writes rmem directly, so bind its promoted
+                            # result before the next MMA or the epilogue reads it.
+                            c_frags[idx].store(c_frags[idx].load())
 
         DS_A = 2 if a_is_fp4 else 4
         # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
@@ -1439,12 +1484,12 @@ def launch_gemm_a8w4_tdm(
                              (576 if pinned_fp4_prefill else 768) + slot_idx * 128)
                 reg = slot_base
                 for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
+                    a[wm] = pin_rmem_vgpr(a[wm], start=reg)
                     reg += ACT_NDW
                 if const_expr(resident_ring_addresses):
                     reg = 768 if slot_idx == 0 else 832
                 for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
+                    b[wn] = pin_rmem_vgpr(b[wn], start=reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= ((832 if slot_idx == 0 else 896)
                                if resident_ring_addresses else slot_base + 128)
@@ -1452,8 +1497,8 @@ def launch_gemm_a8w4_tdm(
             sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(resident_ring_addresses):
                 assert SA_WIDTH == SB_WIDTH == 4
-                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=16 + slot_idx * 8)
-                fx.set_register(sb, register_class=fx.rocdl.VGPR, start=20 + slot_idx * 8)
+                sa = pin_rmem_vgpr(sa, start=16 + slot_idx * 8)
+                sb = pin_rmem_vgpr(sb, start=20 + slot_idx * 8)
             return RmemSlot(
                 a=a,
                 b=b,
@@ -1835,8 +1880,9 @@ def launch_gemm_a8w4_tdm(
                     extra_b1 = [fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                                 for _ in range_constexpr(2)]
                     for wn in range_constexpr(2):
-                        fx.set_register(extra_b1[wn], register_class=fx.rocdl.VGPR,
-                                        start=896 + wn * WMMA_VECTOR_DWORDS)
+                        extra_b1[wn] = pin_rmem_vgpr(
+                            extra_b1[wn], start=896 + wn * WMMA_VECTOR_DWORDS
+                        )
                     alternate_b1 = RmemSlot(a=rmem_slots[1].a,
                         b=extra_b1 + rmem_slots[1].b[2:],
                         sa=rmem_slots[1].sa, sb=rmem_slots[1].sb)
@@ -2824,7 +2870,9 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
 }
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
-    launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
+    # New FlyDSL rejects maxnreg; waves_per_eu is the supported occupancy hint.
+    if not callable(getattr(rocdl, "sched_vgpr", None)):
+        launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
 
 
 @lru_cache(maxsize=2)
@@ -2843,5 +2891,6 @@ def get_gemm_a8w4_tdm_register_launcher(explicit_vgpr_partition):
     )
     if explicit_vgpr_partition:
         launcher.compile_hints["waves_per_eu"] = 1
-        launcher.compile_hints["maxnreg"] = 1024
+        if not callable(getattr(rocdl, "sched_vgpr", None)):
+            launcher.compile_hints["maxnreg"] = 1024
     return launcher
