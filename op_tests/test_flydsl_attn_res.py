@@ -5,21 +5,28 @@
 
 Usage:
     pytest -q op_tests/test_flydsl_attn_res.py
+    python op_tests/test_flydsl_attn_res.py
+    python op_tests/test_flydsl_attn_res.py --tokens 17 320 --blocks 7 8
+    python op_tests/test_flydsl_attn_res.py --cache warm cold
 """
 
+import argparse
 import dataclasses
 import itertools
 import math
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_attn_res
 from aiter.ops.flydsl.kernels import attn_res as attn_res_kernel
 from aiter.ops.torch_ref.attn_res import attn_res as attn_res_reference
+from aiter.test_common import benchmark, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -38,6 +45,9 @@ _FP8_STEP_REL = 2.0**-3
 # One FP8 step is relative only above e4m3's subnormals; near zero the slack is
 # absolute, in units of the per-token scale.
 _FP8_NEAR_ZERO_SLACK_SCALES = 1.0
+# run_perftest num_rotate_args: 1 reuses one arg set (L2-resident), 0 rotates
+# copies so each timed iteration reads cold HBM.
+_ROTATE_ARGS = {"warm": 1, "cold": 0}
 # A correctly rounded BF16 output is within 2**-8 of its row's peak magnitude;
 # 1e-5 covers FP32 accumulation before that rounding.
 _ORACLE_MAX_REL = 2.0**-8 + 1e-5
@@ -71,6 +81,7 @@ MIX = _Config()
 ALL_ON = _Config(add=True, close=True, onorm=True)
 ALL_ON_FP8 = dataclasses.replace(ALL_ON, fp8=True)
 EVERY_FEATURE = _Config(add=True, add2=True, close=True, onorm=True, scale=0.7)
+_BENCH_CONFIGS = {"mix": MIX, "all-on": ALL_ON, "all-on fp8": ALL_ON_FP8}
 
 
 def _flag_surface():
@@ -121,21 +132,28 @@ def _make_inputs(
     )
 
 
-def _call(fn, inputs, cfg: _Config, **extra):
-    return fn(
+def _gate_args(inputs, cfg: _Config):
+    args = (
         inputs.prefix,
         inputs.block_residual,
         inputs.score_weight,
         _EPS,
         inputs.add_hidden if cfg.add else None,
         inputs.add_hidden2 if cfg.add2 else None,
-        output_rms_weight=inputs.output_rms_weight if cfg.onorm else None,
-        output_rms_eps=_OUT_EPS,
-        scale=cfg.scale,
-        close_block=cfg.close,
-        out_quant_dtype=dtypes.fp8 if cfg.fp8 else None,
-        **extra,
     )
+    kwargs = {
+        "output_rms_weight": inputs.output_rms_weight if cfg.onorm else None,
+        "output_rms_eps": _OUT_EPS,
+        "scale": cfg.scale,
+        "close_block": cfg.close,
+        "out_quant_dtype": dtypes.fp8 if cfg.fp8 else None,
+    }
+    return args, kwargs
+
+
+def _call(fn, inputs, cfg: _Config, **extra):
+    args, kwargs = _gate_args(inputs, cfg)
+    return fn(*args, **kwargs, **extra)
 
 
 def _assert_bf16_close(actual: torch.Tensor, expected: torch.Tensor, msg: str):
@@ -458,3 +476,109 @@ def test_flydsl_attn_res_rejects_tensors_over_4gib():
 
     with pytest.raises(ValueError, match="4 GiB"):
         flydsl_attn_res(prefix, block_residual, inputs.score_weight, _EPS)
+
+
+def _moved_bytes(tokens: int, hidden_size: int, num_blocks: int, cfg: _Config):
+    """HBM bytes moved, excluding the [D] weight vectors."""
+    reads = num_blocks + 1 + int(cfg.add) + int(cfg.add2)
+    writes = int(cfg.add) + (num_blocks + 1) * int(cfg.close)
+    y_bytes = (1 if cfg.fp8 else 2) * hidden_size + 4 * int(cfg.fp8)
+    return tokens * (2 * hidden_size * (reads + writes) + y_bytes)
+
+
+@benchmark()
+def benchmark_flydsl_attn_res(
+    tokens: int,
+    hidden_size: int,
+    num_blocks: int,
+    config: str,
+    rows_per_wg: int = 1,
+    cache: str = "warm",
+):
+    cfg = _BENCH_CONFIGS[config]
+    err = _run_and_check(
+        tokens, num_blocks, cfg, hidden_size=hidden_size, rows_per_wg=rows_per_wg
+    )
+    args, kwargs = _gate_args(_make_inputs(tokens, hidden_size, num_blocks), cfg)
+    _, us = run_perftest(
+        flydsl_attn_res,
+        *args,
+        **kwargs,
+        rows_per_wg=rows_per_wg,
+        num_rotate_args=_ROTATE_ARGS[cache],
+    )
+
+    k = num_blocks + 1
+    # ~4D (sumsq + dot) + 2D mix per candidate; optional output RMS ~4D.
+    flops = tokens * hidden_size * (6 * k + 4 * int(cfg.onorm))
+    return {
+        "gfx": get_gfx(),
+        "us": round(us, 3),
+        "TFLOPS": round(flops / us / 1e6, 2),
+        "TB/s": round(_moved_bytes(tokens, hidden_size, num_blocks, cfg) / us / 1e6, 3),
+        "err": err,
+    }
+
+
+def main():
+    if get_gfx() not in _SUPPORTED_GFX:
+        aiter.logger.warning("flydsl_attn_res unsupported on %s; skipping", get_gfx())
+        return
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[1, 4, 17, 320],
+        help="Prefill token counts to test and benchmark",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        nargs="+",
+        default=[_MAX_BLOCKS],
+        help="Block counts B to benchmark",
+    )
+    parser.add_argument(
+        "--config",
+        nargs="+",
+        choices=tuple(_BENCH_CONFIGS),
+        default=list(_BENCH_CONFIGS),
+        help="mix: no add/close/norm; all-on: add_hidden + close_block + output norm",
+    )
+    parser.add_argument(
+        "--cache",
+        nargs="+",
+        choices=tuple(_ROTATE_ARGS),
+        default=["warm"],
+        help="Cache states to time: warm reuses one arg set, cold reads HBM",
+    )
+    args = parser.parse_args()
+    for hidden_size, num_blocks in itertools.product(
+        (_D, _D_SMALL), range(_MAX_BLOCKS + 1)
+    ):
+        test_flydsl_attn_res_num_blocks(hidden_size, num_blocks)
+    # R=4 is D=1024-only: packing a multi-wave D=7168 row is rejected.
+    shapes = ((_D, 1), (_D_SMALL, 1), (_D_SMALL, 4))
+    results = [
+        benchmark_flydsl_attn_res(
+            tokens,
+            hidden_size,
+            num_blocks,
+            config,
+            rows_per_wg=rows_per_wg,
+            cache=cache,
+        )
+        for (hidden_size, rows_per_wg), num_blocks, config, tokens, cache in (
+            itertools.product(shapes, args.blocks, args.config, args.tokens, args.cache)
+        )
+    ]
+    aiter.logger.info(
+        "flydsl_attn_res summary (markdown):\n%s",
+        pd.DataFrame(results).to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
