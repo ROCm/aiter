@@ -521,8 +521,11 @@ void all_gather_unreg(fptr_t _fa,
 
     if(data_bytes > reg_bytes)
         throw std::runtime_error("registered buffer is too small to contain the input");
-    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
-                            hipMemcpyDeviceToDevice, stream));
+    if(data_bytes != 0)
+    {
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_buffer, inp.data_ptr(), data_bytes, hipMemcpyDeviceToDevice, stream));
+    }
     _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
 }
