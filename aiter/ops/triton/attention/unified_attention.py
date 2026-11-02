@@ -168,9 +168,11 @@ def _length_aware_split(config, params: _UAParams):
     if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
         return None
     budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
-    # the kernels sum the KV lengths and round that up by budget in int32, and
-    # pack the sequences before an item in 15 bits and the items before it in 16
-    if params.num_seqs * params.max_seqlen_k + budget >= 2**31:
+    # the kernels round sum(seq_len) up by budget and seq_len up by its segments'
+    # tiles in int32 (a shuffled tile is the page), and pack the sequences before
+    # an item in 15 bits and the items before it in 16
+    tile = max(config["TILE_SIZE"], params.block_size)
+    if params.num_seqs * params.max_seqlen_k + budget + num_segments * tile >= 2**31:
         return None
     if budget + params.num_seqs >= 2**16 or params.num_seqs >= 2**15:
         return None

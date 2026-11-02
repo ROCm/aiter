@@ -939,6 +939,9 @@ def test_length_aware_split_scope() -> None:
     edge = {"num_seqs": 1023, "num_kv_heads": 1}
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=2_099_202)) is None
+    # and round one sequence up by its segments' tiles in int32
+    one = {"num_seqs": 1, "num_kv_heads": 1}
+    assert _length_aware_split(*_gfx950_split(**one, max_seqlen_k=2**31 - 2048)) is None
     # find_work_item unpacks the sequences before an item from 15 bits
     wide = {**vars(params), "max_seqlen_k": 1 << 15}
     assert _length_aware_split(
