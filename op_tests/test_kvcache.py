@@ -159,11 +159,11 @@ def test_reshape_and_cache(
     )
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
     device = key.device
-    k_cache = torch.empty(k_cache_shape, dtype=DType_KVCache, device=device)
-    v_cache = torch.empty(v_cache_shape, dtype=DType_KVCache, device=device)
+    k_cache = torch.zeros(k_cache_shape, dtype=DType_KVCache, device=device)
+    v_cache = torch.zeros(v_cache_shape, dtype=DType_KVCache, device=device)
     if quantCfg:
-        k_scale = torch.empty(kv_scale_shape, device=key.device)
-        v_scale = torch.empty_like(k_scale)
+        k_scale = torch.zeros(kv_scale_shape, device=key.device)
+        v_scale = torch.zeros_like(k_scale)
         quantCfg["k_scale"] = k_scale.clone()
         quantCfg["v_scale"] = v_scale.clone()
     slot_mapping = torch.tensor(
