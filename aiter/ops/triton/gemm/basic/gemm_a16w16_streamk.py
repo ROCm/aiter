@@ -26,6 +26,36 @@ def _num_cus(device_index):
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _pick_split(streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
+    """Smallest split that fills the machine with the remainder sub-tiles.
+
+    Split M before N: narrowing N shrinks the per-CTA N width, which feeds the TDM pad interval
+    and the aliased C store. A sub-tile must stay divisible by the cluster and keep enough
+    elements for each CTA on the axis that it splits.
+
+    The two axes have different floors. M needs 32, which is what the warp grid needs. N needs
+    64, because a per-CTA N of 32 makes a bf16 row of only 64 bytes, and both the TDM transfer
+    and the C store want 128. At an equal sub-tile area and an equal sub-tile count, a per-CTA
+    N of 32 measured -11.2% against 64, while 128 against 64 measured -0.3%. The floor is
+    therefore a cliff at 32, not a preference for a wide N.
+    """
+    sm, sn = 1, 1
+    if not streamk_tiles:
+        return sm, sn
+
+    def ok(blk, split, ctas, floor):
+        return blk % (split * ctas) == 0 and (blk // split) // ctas >= floor
+
+    # Split only while the sub-tiles still fit ONE wave. Going past num_sms turns one partly
+    # idle wave into two full ones of half-size tiles, which is slower: at 12 left-over tiles on
+    # 16 workers a 2x split gives 24 sub-tiles, so 1 wave becomes 2 and the shape loses 6%.
+    while streamk_tiles * sm * sn * 2 <= num_sms and ok(BLOCK_M, sm * 2, CTAS_M, 32):
+        sm *= 2
+    while streamk_tiles * sm * sn * 2 <= num_sms and ok(BLOCK_N, sn * 2, CTAS_N, 64):
+        sn *= 2
+    return sm, sn
+
+
 @functools.lru_cache(maxsize=128)
 def _build_layouts(BLOCK_M, BLOCK_N, BLOCK_K, ctas_per_cga, num_warps, TRANSPOSE_B):
     """Build the WMMA, operand and shared layouts for one cluster-wide tile.
@@ -134,6 +164,30 @@ def gemm_a16w16_streamk_(
     num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     NUM_SMS = min(_num_cus(x.device.index) // num_ctas, num_tiles)
 
+    # StreamK remainder: the tiles left over after the whole waves. There is nothing to balance
+    # until the machine holds at least one full wave, so a shape with too few tiles gets zero.
+    STREAMK_TILES = 0 if num_tiles <= NUM_SMS else num_tiles % NUM_SMS
+    SPLIT_M, SPLIT_N = _pick_split(
+        STREAMK_TILES, NUM_SMS, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
+    )
+    if SPLIT_M * SPLIT_N == 1:
+        STREAMK_TILES = (
+            0  # one sub-tile for each tile is the phase-1 path, so keep it there
+        )
+    rem = (
+        _build_layouts(
+            BLOCK_M // SPLIT_M,
+            BLOCK_N // SPLIT_N,
+            BLOCK_K,
+            (CTAS_M, CTAS_N),
+            num_warps,
+            TRANSPOSE_B,
+        )
+        if STREAMK_TILES
+        else (None,) * 5
+    )
+    wmma_r, dot_r_a, dot_r_b, shared_r_a, shared_r_b = rem
+
     # KTAIL is decided here, from the real K, so only one drain path is compiled.
     KTAIL = 1 if (K % BLOCK_K) == (BLOCK_K // 2) else 0
 
@@ -171,6 +225,14 @@ def gemm_a16w16_streamk_(
         CTAS_N=CTAS_N,
         GROUP_SIZE_M=GROUP_SIZE_M,
         KTAIL=KTAIL,
+        STREAMK_TILES=STREAMK_TILES,
+        SPLIT_M=SPLIT_M,
+        SPLIT_N=SPLIT_N,
+        SHARED_REM_A=shared_r_a,
+        SHARED_REM_B=shared_r_b,
+        OPERAND_REM_A=dot_r_a,
+        OPERAND_REM_B=dot_r_b,
+        WMMA_REM=wmma_r,
         num_warps=num_warps,
         num_ctas=num_ctas,
         waves_per_eu=waves_per_eu,

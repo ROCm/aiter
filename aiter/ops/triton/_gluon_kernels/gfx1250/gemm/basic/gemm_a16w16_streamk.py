@@ -5,6 +5,11 @@
 A cluster of CTAS_M x CTAS_N CTAs multicasts its TDM loads and computes one BLOCK_M x BLOCK_N tile
 together, so BLOCK_M and BLOCK_N are cluster-wide. The epilogue aliases the dead B ring as the C
 stage, which costs no extra LDS.
+
+The tiles that do not fill a whole wave are the StreamK remainder. Phase 2 splits each of them
+into SPLIT_M x SPLIT_N sub-tiles and spreads the sub-tiles over the clusters, so the last wave is
+full. Each sub-tile is computed over the whole K and written straight to C, so there is no scratch
+and no reduction.
 """
 
 import triton.experimental.gluon.language as gl
@@ -25,6 +30,9 @@ _GLUON_REPR_KEYS = [
     "CTAS_N",
     "TRANSPOSE_B",
     "KTAIL",
+    "STREAMK_TILES",
+    "SPLIT_M",
+    "SPLIT_N",
     "NUM_SMS",
     "num_warps",
     "num_ctas",
@@ -65,6 +73,14 @@ def gemm_a16w16_streamk_kernel_(
     CTAS_N: gl.constexpr = 1,
     GROUP_SIZE_M: gl.constexpr = 2,
     KTAIL: gl.constexpr = 0,
+    STREAMK_TILES: gl.constexpr = 0,
+    SPLIT_M: gl.constexpr = 1,
+    SPLIT_N: gl.constexpr = 1,
+    SHARED_REM_A: gl.constexpr = None,
+    SHARED_REM_B: gl.constexpr = None,
+    OPERAND_REM_A: gl.constexpr = None,
+    OPERAND_REM_B: gl.constexpr = None,
+    WMMA_REM: gl.constexpr = None,
 ):
     """BLOCK_M and BLOCK_N are cluster-wide; each CTA owns BLOCK_M / CTAS_M by BLOCK_N / CTAS_N."""
     gl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
@@ -149,7 +165,8 @@ def gemm_a16w16_streamk_kernel_(
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
 
-    for tile_idx in range(pid, num_tiles, NUM_SMS):
+    # Phase 1: the tiles that fill whole waves, one tile for each cluster.
+    for tile_idx in range(pid, num_tiles - STREAMK_TILES, NUM_SMS):
         pid_m, pid_n = swizzled_tile_coords(
             tile_idx, num_pid_m, num_pid_n, GROUP_SIZE_M
         )
@@ -181,3 +198,95 @@ def gemm_a16w16_streamk_kernel_(
             KTAIL,
             TOKENS,
         )
+
+    # Phase 2: the StreamK remainder. Each leftover tile becomes SPLIT_M x SPLIT_N sub-tiles, so
+    # more clusters share the last wave. A sub-tile runs the same pipeline on its own layouts.
+    if STREAMK_TILES:
+        SUB_M: gl.constexpr = BLOCK_M // SPLIT_M
+        SUB_N: gl.constexpr = BLOCK_N // SPLIT_N
+        SPLITS: gl.constexpr = SPLIT_M * SPLIT_N
+        _CR_PAD_N: gl.constexpr = SUB_N // CTAS_N
+        C_ALIAS_R: gl.constexpr = (
+            (not TRANSPOSE_B)
+            and _C_ELEM == 2
+            and _CR_PAD_N <= 256
+            and (SUB_M // CTAS_M) * _CR_PAD_N * _C_ELEM
+            <= NUM_BUFFERS * BLOCK_K * _CR_PAD_N * 2
+        )
+        SHARED_REM_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[_CR_PAD_N, 16]], [SUB_M, SUB_N], [1, 0], WMMA_REM.cga_layout
+        )
+        ar_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(SUB_M, BLOCK_K),
+            layout=SHARED_REM_A,
+        )
+        if TRANSPOSE_B:
+            br_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=b_ptr,
+                shape=(N, K),
+                strides=(stride_bn, stride_bk),
+                block_shape=(SUB_N, BLOCK_K),
+                layout=SHARED_REM_B,
+            )
+        else:
+            br_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=b_ptr,
+                shape=(K, N),
+                strides=(stride_bk, stride_bn),
+                block_shape=(BLOCK_K, SUB_N),
+                layout=SHARED_REM_B,
+            )
+        cr_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(SUB_M, SUB_N),
+            layout=SHARED_REM_C,
+        )
+        ar_buffer = gl.allocate_shared_memory(
+            ar_desc.dtype,
+            shape=[NUM_BUFFERS] + ar_desc.block_shape,
+            layout=ar_desc.layout,
+        )
+        br_buffer = gl.allocate_shared_memory(
+            br_desc.dtype,
+            shape=[NUM_BUFFERS] + br_desc.block_shape,
+            layout=br_desc.layout,
+        )
+        for sub_idx in range(pid, STREAMK_TILES * SPLITS, NUM_SMS):
+            tile_idx = num_tiles - STREAMK_TILES + sub_idx // SPLITS
+            sub = sub_idx % SPLITS
+            pid_m, pid_n = swizzled_tile_coords(
+                tile_idx, num_pid_m, num_pid_n, GROUP_SIZE_M
+            )
+            compute_tile(
+                ar_desc,
+                br_desc,
+                cr_desc,
+                ar_buffer,
+                br_buffer,
+                c_ptr,
+                pid_m * BLOCK_M + (sub // SPLIT_N) * SUB_M,
+                pid_n * BLOCK_N + (sub % SPLIT_N) * SUB_N,
+                M,
+                N,
+                K,
+                stride_cm,
+                stride_cn,
+                OPERAND_REM_A,
+                OPERAND_REM_B,
+                WMMA_REM,
+                SHARED_REM_C,
+                SUB_M,
+                SUB_N,
+                BLOCK_K,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+                ACC_DTYPE,
+                C_ALIAS_R,
+                KTAIL,
+                TOKENS,
+            )
