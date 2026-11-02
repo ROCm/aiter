@@ -1078,6 +1078,112 @@ def test_grouped_swiglu_m3_tp_decode(tokens):
     )
 
 
+@pytest.mark.parametrize("experts", [1, 17, 31, 32, 33, 64, 129, 255, 256, 257, 512])
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+@pytest.mark.parametrize("tile_m,n_warp", [(16, 1), (32, 2), (64, 4)])
+@pytest.mark.parametrize("workers", [0, 16])
+def test_grouped_expert_lookup_replays_dynamic_routes(
+    experts, data_format, tile_m, n_warp, workers, monkeypatch
+):
+    """Exercise repeated endpoints, wave tails and the wide/static fallback."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import grouped_gemm_mxfp4 as gemm
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    for key, value in {
+        "TILE_M": tile_m,
+        "TILE_N": max(128, n_warp * 64),
+        "TILE_K": 256,
+        "NUM_BUFFERS": 3,
+        "M_WARP": 1,
+        "N_WARP": n_warp,
+    }.items():
+        monkeypatch.setenv(f"AITER_TDM_{key}", str(value))
+    monkeypatch.setenv("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", str(min(n_warp, 2)))
+    for stage in ("", "1", "2"):
+        monkeypatch.setenv(f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}", str(workers))
+    # Keep the standalone router: negative ids must not depend on the separate
+    # fused-route implementation. A small worker grid revisits multiple tasks.
+    monkeypatch.setattr(grouped, "_FUSED_ROUTE_PSUM_MAX_NUMEL", 0)
+    launches = []
+    launch = gemm._run_compiled
+
+    def record_launch(*args, **kwargs):
+        spec = kwargs["specialization_key"]
+        launches.append((spec[0][1], spec[5][4]))
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(gemm, "_run_compiled", record_launch)
+    calls, references = [], []
+    public_moe, numeric_reference = fused_moe, _torch_moe_ref
+
+    def capture_moe(*args, **kwargs):
+        kwargs["quant_dtype_a"] = dtypes.fp4x2 if data_format == "a4w4" else dtypes.fp8
+        calls.append((args, kwargs))
+        return public_moe(*args, **kwargs)
+
+    def capture_reference(*args, **kwargs):
+        references.append((args, kwargs))
+        return numeric_reference(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "fused_moe", capture_moe)
+    monkeypatch.setitem(globals(), "_torch_moe_ref", capture_reference)
+    tokens, topk = 65, min(2, experts)
+    out, expected, _, _ = _run_grouped_via_fused_moe(
+        experts=experts,
+        tokens=tokens,
+        topk=topk,
+        model_dim=512,
+        inter_dim=512,
+        data_format=data_format,
+        activation=ActivationType.Swiglu,
+        use_bias=True,
+        bias_column_pattern=True,
+        seed=4101,
+    )
+    assert _logits_diff(out, expected) < LOGITS_DIFF_TOL
+    assert launches == [(tile_m, workers), (tile_m, workers)]
+    monkeypatch.setattr(gemm, "_run_compiled", launch)
+    assert len(calls) == len(references) == 1
+    args, kwargs = calls[0]
+    reference_args, reference_kwargs = references[0]
+    # Reference slices alias the original routing tensors; replay mutates data,
+    # never addresses. Keep the existing independent fp32 reference and tolerance.
+    kwargs["output"] = torch.empty_like(out)
+    for _ in range(3):
+        public_moe(*args, **kwargs)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = public_moe(*args, **kwargs)
+        ids = torch.arange(tokens * topk, dtype=torch.int32).reshape(tokens, topk)
+        for mode in ("first", "last", "alternating", "empty", "spread"):
+            if mode == "first":
+                args[4].fill_(0)
+            elif mode == "last":
+                args[4].fill_(experts - 1)
+            elif mode == "empty":
+                args[4].fill_(-1)
+            else:
+                args[4].copy_(
+                    ids % 2 * (experts - 1) if mode == "alternating" else ids % experts
+                )
+            args[0].neg_()
+            args[3].fill_(0 if mode == "empty" else 1 / topk)
+            graph.replay()
+            assert torch.isfinite(replayed).all()
+            if mode == "empty":
+                assert not replayed.count_nonzero()
+            else:
+                expected = numeric_reference(*reference_args, **reference_kwargs).to(
+                    replayed.dtype
+                )
+                assert _logits_diff(replayed, expected) < LOGITS_DIFF_TOL, mode
+    torch.cuda.current_stream().wait_stream(stream)
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
