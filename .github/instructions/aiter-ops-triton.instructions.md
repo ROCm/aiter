@@ -87,10 +87,17 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
-`<d_type>` is `config_name.lower().replace("-", "_")`. Flag:
+`<d_type>` is `config_name.lower().replace("-", "_")`. A family tuned on a
+CU count other than the arch's default can have its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
+`DEFAULT.json` (for example `gfx1250/96cu/`). Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
+- A `<cu_num>cu/` tree for the CU count the plain folder was tuned on. That
+  count reads the plain folder.
+- A `<cu_num>cu/` folder without `DEFAULT.json`. The loaders read a tree
+  whole or not at all, and a folder without `DEFAULT.json` is not a tree.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
@@ -110,6 +117,12 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
   runtime caches. Do not commit them.
 
 ## Configs: JSON contents
+
+In all config files, flag:
+
+- A comment or a note in a JSON file, for example a `"_comment"` or `"_note"`
+  key. Config files have only config values. Put the explanation in the code
+  that reads the config, or in the PR description.
 
 In GEMM configs, flag:
 
@@ -180,7 +193,9 @@ This applies to Triton and Gluon. Flag:
   the only one.
 - A new arch or backend fallback chain in a loader. The only allowed fallbacks
   are MHC (gfx942) and Triton `fused_clamp_act_mul` (gfx950). Both use the
-  `arch=` argument.
+  `arch=` argument. The choice `resolve_config_dir()` makes between the
+  `<cu_num>cu/` tree and the plain folder is not a fallback chain: a loader
+  reads one tree whole.
 - A raw config list in `@triton.autotune`. Use `autotune_configs()`:
 
   ```python
@@ -233,8 +248,13 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 
 - Flag `device="cuda"`, `torch.device("cuda")` and `.cuda()` in wrappers and
   launch code. Allocate on the device of the input:
-  `torch.empty(shape, dtype=x.dtype, device=x.device)`. Docstring examples and
-  tests can use `"cuda"`.
+  `torch.empty(shape, dtype=x.dtype, device=x.device)`. Docstring examples,
+  tests, benchmarks and the tuning scripts can use `"cuda"`.
+- Flag a floating-point allocation without an explicit `dtype` in library
+  code. Do not flag integer constructors without a `dtype`: `arange`,
+  `randint`, `randperm` and lists of Python ints infer `int64`. Flag
+  `torch.set_default_device` and `torch.set_default_dtype` in library code.
+  The default device and dtype are global state.
 - Flag a new public wrapper without a docstring. The docstring tells what the
   kernel computes, the arguments, the return value and the limits.
 - Flag `print(...)` or a new logger in library code. Use
@@ -275,6 +295,24 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - Flag configs in tests: dicts with `BLOCK_SIZE_*`, `num_warps` or
   `waves_per_eu`, or a literal `config=` argument. Tests use the config that
   the wrapper loads.
+- Flag a tensor that a test or benchmark makes without `device="cuda"`. A
+  multi-GPU test uses the CUDA device of its rank. A benchmark with a
+  `--device` option uses that option.
+- Flag a floating-point tensor that a test or benchmark makes without an
+  explicit `dtype`. Do not flag integer constructors without a `dtype`:
+  `arange`, `randint`, `randperm` and lists of Python ints infer `int64`.
+- Flag `.cuda()`, `.to("cuda")` and `.to(device)` on a tensor that the test
+  made on the CPU. Make the tensor directly on the GPU.
+- Flag `torch.set_default_device`, `torch.set_default_dtype` and
+  `torch.set_default_tensor_type` in tests and benchmarks. These calls change
+  the defaults for all later tests in the same pytest process. Do not flag a
+  context manager that sets a default and restores the previous one on exit,
+  such as `_with_default_device` in `attention/test_mha_dao_ai.py` or
+  `with_default_dtype` in `op_tests/triton_tests/utils/types.py`. It tests
+  that library code does not depend on the default.
+- Flag `torch.load` without `map_location`.
+- Do not flag `device="cpu"` in a test that checks that the wrapper rejects
+  CPU inputs.
 - Flag `print(...)` of tensors, shapes or timings, and
   `if __name__ == "__main__"` report blocks. Tests check results with asserts
   (`torch.testing.assert_close`). Do not flag the old prints in

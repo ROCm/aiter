@@ -157,17 +157,15 @@ class ATileLoader:
                 source_row = packed & fx.Int32(0xFFFFFF)
             row_byte = source_row * fx.Int32(self._row_bytes)
             if const_expr(self._swizzle):
-                col_i32 = chunk * fx.Int32(4)
+                col_i32 = chunk * 4
                 swizzle_mask = (
-                    (row & fx.Int32(14)) << fx.Int32(1)
-                    if const_expr(self._is_fp4)
-                    else (row & fx.Int32(15)) << fx.Int32(2)
+                    (row & 14) << 1 if const_expr(self._is_fp4) else (row & 15) << 2
                 )
                 swz = row * fx.Int32(row_stride_i32) + (col_i32 ^ swizzle_mask)
                 lds_byte = swz * fx.Int32(4)
             else:
-                lds_byte = lin * fx.Int32(16)
-            self._chunks.append((lds_byte, row_byte + chunk * fx.Int32(16)))
+                lds_byte = lin * 16
+            self._chunks.append((lds_byte, row_byte + chunk * 16))
 
     def load_regs(self, k_step_byte_off):
         """Read this K-step's 16-B chunks gmem->reg (VMEM); only the K-step offset varies. Returns (lds_off, vec4)."""
@@ -185,7 +183,7 @@ class ATileLoader:
 
     def store(self, lds_dst, regs, base_i32=0):
         """Scatter loaded chunks into LDS via ds_write (precomputed lds_byte incl. swizzle). base_i32 = ping/pong."""
-        base_bytes = fx.Int32(base_i32) * fx.Int32(4)
+        base_bytes = fx.Int32(base_i32) * 4
         for lds_byte, v in regs:
             dst = fx.make_view(
                 fx.add_offset(
@@ -201,7 +199,7 @@ class ATileLoader:
     def prefetch_to_lds(self, k_step_byte_off, lds_dst, base_i32=0):
         """Issue swizzled direct global-to-LDS copies with a wave-uniform LDS base."""
         koff = fx.Int32(k_step_byte_off)
-        base_bytes = fx.Int32(base_i32) * fx.Int32(4)
+        base_bytes = fx.Int32(base_i32) * 4
         lds_elem = fx.recast_iter(
             fx.Uint8 if const_expr(self._is_fp4) else fx.Float8E4M3FN,
             lds_dst.ptr,
@@ -230,9 +228,9 @@ class ATileLoader:
                     physical_chunk = physical % fx.Int32(chunks_per_row)
                     if const_expr(self._swizzle):
                         logical_chunk = (
-                            physical_chunk ^ ((row & fx.Int32(14)) >> fx.Int32(1))
+                            physical_chunk ^ ((row & 14) >> 1)
                             if const_expr(self._is_fp4)
-                            else physical_chunk ^ (row & fx.Int32(15))
+                            else physical_chunk ^ (row & 15)
                         )
                     else:
                         logical_chunk = physical_chunk
@@ -284,15 +282,11 @@ class AS2RLoader:
         """Load one K=128 A operand; FP4 uses one 16B chunk and FP8 uses two."""
         row = fx.Int32(mi * 16) + fx.Int32(self._lane % 16)
         row_i32 = row * fx.Int32(self._k_step_bytes // 4) + fx.Int32(base_i32)
-        klane4 = fx.Int32(self._lane // 16) * fx.Int32(4)
+        klane4 = fx.Int32(self._lane // 16) * 4
 
         def _c(col):  # per-row XOR bank swizzle (must match ATileLoader.store)
             if const_expr(self._swizzle):
-                mask = (
-                    (row & fx.Int32(14)) << fx.Int32(1)
-                    if const_expr(self._is_fp4)
-                    else (row & fx.Int32(15)) << fx.Int32(2)
-                )
+                mask = (row & 14) << 1 if const_expr(self._is_fp4) else (row & 15) << 2
                 return col ^ mask
             return col
 
@@ -300,9 +294,7 @@ class AS2RLoader:
         lo = self._load_16b(lds_src, row_i32 + _c(col_lo)).bitcast(fx.Int64)
         if const_expr(self._is_fp4):
             return Vec(lo).bitcast(fx.Int32)
-        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + fx.Int32(16))).bitcast(
-            fx.Int64
-        )
+        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + 16)).bitcast(fx.Int64)
         return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
             fx.Int32
         )
@@ -419,9 +411,7 @@ class AScaleLoader:
                 unit_elems=4,
             )
             dst = fx.make_view(
-                fx.add_offset(
-                    fx.recast_iter(fx.Int32, lds_ascale.ptr), lin * fx.Int32(4)
-                ),
+                fx.add_offset(fx.recast_iter(fx.Int32, lds_ascale.ptr), lin * 4),
                 fx.make_layout(4, 1),
             )
             fragment = fx.make_rmem_tensor(4, fx.Int32)
@@ -464,7 +454,7 @@ class AScaleLoader:
             @flyc.jit
             def copy_chunk(lin: fx.Int32):
                 if lin < fx.Int32(n16):
-                    source_group = (base + lin * fx.Int32(16)) // fx.Int32(16)
+                    source_group = (base + lin * 16) // fx.Int32(16)
                     copy_group(lin, source_group)
 
             for c in range_constexpr(0, n16, self._total_threads):
@@ -521,7 +511,7 @@ class MfmaScaleGU:
             for osa in range(4)
             for osb in range(4)
         }
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
 
     def idx(self, mi, ni):
         return mi * self._num_acc_n + ni
@@ -544,7 +534,7 @@ class MfmaScaleGU:
             scale_a=sa_v,
             scale_b=sb_v,
         )
-        return Vec(c_frag.load())
+        return c_frag.load()
 
     def call(self, a_load, b, acc, sa, sb):
         """Non-pipelined lazy-A K-step: a_load(mi,ksub) on demand (one A operand live -> low VGPR, wins small bs)."""

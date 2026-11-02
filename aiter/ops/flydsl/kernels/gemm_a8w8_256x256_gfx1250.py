@@ -377,7 +377,7 @@ def launch_gemm_a8w8_256x256(
                         + fx.Int32(local_y) * cluster_m
                         + cluster_plane
                     )
-                    mask = fx.Int32(1) << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
+                    mask = 1 << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
             inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=tensor,
@@ -415,8 +415,8 @@ def launch_gemm_a8w8_256x256(
                 fx.Int32(global_step),
             )
 
-        dgroup0 = Vec.filled(4, 0, fx.Int32)
-        dgroup1 = Vec.filled(8, 0, fx.Int32)
+        dgroup0 = fx.full(4, 0, fx.Int32)
+        dgroup1 = fx.full(8, 0, fx.Int32)
         tdm_lds_step, tdm_global_step = fx.Int32(0), fx.Int32(0)
         if wave == 0:
             dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(0)
@@ -429,9 +429,9 @@ def launch_gemm_a8w8_256x256(
 
         tdm_desc = tdm_ops.TDMDescriptor2D(as_ir_value(dgroup0), as_ir_value(dgroup1))
         tdm_base_lds, tdm_base_lo, tdm_base_hi = (
-            fx.Int32(dgroup0[1]),
-            fx.Int32(dgroup0[2]),
-            fx.Int32(dgroup0[3]),
+            dgroup0[1],
+            dgroup0[2],
+            dgroup0[3],
         )
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):
@@ -1131,27 +1131,25 @@ def launch_gemm_a8w8_256x256(
                 bounded_m=bounded_m,
             )
         else:
-            gtC = _gv(
-                gC_base,
-                c_off_rt,
-                (tile_m, C_LDS_ROW),
-                (C_LDS_ROW, 1),
-            )
-            atomC = fx.rocdl.make_tdm_atom(
+            c_tile = (tile_m, C_LDS_ROW)
+            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gtC,
-                [mn_oob, tile_n],
-                strides=[ldc64, None],
+                fx.make_layout(c_tile, (C_LDS_ROW, 1)),
+                c_tile,
                 num_warps=num_waves,
             )
-            fx.copy(
-                atomC,
-                _view(
-                    fx.recast_iter(partial_elem, base_ptr),
-                    (tile_m, C_LDS_ROW),
-                    (C_LDS_ROW, 1),
-                ),
-                gtC,
+            blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
+            sC = _view(
+                fx.recast_iter(partial_elem, base_ptr),
+                (c_tile, 1),
+                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
             )
+            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+            )
+            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
             if const_expr(persistent_n_tiles == 1):
                 tdm_ops.tensor_wait(0)
 

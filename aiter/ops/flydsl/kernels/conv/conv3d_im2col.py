@@ -595,13 +595,11 @@ class Im2colGather:
         high = u >= fx.Int64(pad) + ext_i  # v >= extent
         mid = u - fx.Int64(pad)  # v, where in range
         if const_expr(pad_mode == "replicate"):
-            r = high.select(ext_i - fx.Int64(1), mid)
+            r = high.select(ext_i - 1, mid)
             r = low.select(fx.Int64(0), r)
         elif const_expr(pad_mode == "reflect"):
             # [a b c d e] pad 2 -> [c b a b c d e d c]: -v near, 2*(extent-1) - v far.
-            r = high.select(
-                (ext_i - fx.Int64(1)) * fx.Int64(2) + fx.Int64(pad) - u, mid
-            )
+            r = high.select((ext_i - 1) * 2 + fx.Int64(pad) - u, mid)
             r = low.select(fx.Int64(pad) - u, r)
         else:  # circular: v + extent near, v - extent far
             r = high.select(u - fx.Int64(pad) - ext_i, mid)

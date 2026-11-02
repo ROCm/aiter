@@ -14,7 +14,6 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T
@@ -412,18 +411,12 @@ def _as_ptr(p, dtype=None):
 
 
 def atomic_add_bf16(ptr_base, reg_vec):
-    """Pairwise BF16 atomic add unsupported by UniversalAtomic."""
+    """Pairwise BF16 atomic add with four-byte alignment."""
+    ptr_type = fx.PointerType.get(fx.BFloat16.ir_type, ptr_base.address_space, 4)
     for i in range_constexpr(reg_vec.numel // 2):
         pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], fx.BFloat16)
-        llvm_ptr = fx.to_llvm_ptr(ptr_base + i * 2)
-        llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.fadd,
-            llvm_ptr,
-            pair,
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        )
+        ptr = fx.recast_iter(ptr_type, ptr_base + i * 2)
+        fx.atomic_add(ptr, pair, syncscope="agent")
 
 
 def make_1d_coord_tensor(target, target_mode_index, iter0):
@@ -576,7 +569,7 @@ class FlyObjCache:
     @flyc.jit
     def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
         assert abc in ["A", "B", "C"]
-        if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
+        if fx.const_expr(src.address_space == rocdl.TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(src.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(src.dtype, copy_atom_bits)
@@ -630,7 +623,7 @@ class FlyObjCache:
     @local_cache
     def get_tiled_copy_coalesced_mn(self, tensor, copy_atom_bits=128, num_threads=256):
         """Build a coalesced copy for tensors whose two innermost modes are M, N."""
-        if fx.const_expr(tensor.address_space == TargetAddressSpace.BufferDesc):
+        if fx.const_expr(tensor.address_space == rocdl.TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(tensor.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(tensor.dtype, copy_atom_bits)
@@ -680,7 +673,6 @@ def dump_ir(enable_debug_info=True):
     import os
 
     import flydsl
-    from flydsl._mlir import ir
     from flydsl.utils.env import DebugEnvManager
 
     DebugEnvManager.enable_debug_info = enable_debug_info

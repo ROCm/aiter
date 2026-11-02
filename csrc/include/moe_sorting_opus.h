@@ -45,7 +45,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               aiter_tensor_t& moe_buf,
                               aiter_tensor_t& activation_quant,
                               aiter_tensor_t& activation_scale_token,
-                              int num_experts);
+                              int num_experts,
+                              std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -1184,6 +1185,24 @@ struct MoeSortingKernel
 
 namespace impl {
 
+// Vector `i` of a [tokens, topk] id tensor holding `numel` ids. Under a device-side
+// token count (LocalToken) the vector loops run to that count rounded up to the
+// vector width, which can pass the tensor's end when the count is its height; the
+// vector that would is read id by id, its ids past the end -1 (no expert).
+template <typename VecType, typename IndexType, int Vec>
+OPUS_D VecType moe_sorting_load_topk_vec(const VecType* p, opus::index_t i, opus::index_t numel)
+{
+    if((i + 1) * Vec <= numel)
+        return p[i];
+    const IndexType* ids = reinterpret_cast<const IndexType*>(p);
+    VecType x;
+    opus::static_for<Vec>([&](auto j) {
+        const opus::index_t idx = i * Vec + j.value;
+        x[j.value]              = idx < numel ? ids[idx] : static_cast<IndexType>(-1);
+    });
+    return x;
+}
+
 // [expert, padded_tokens]
 OPUS_H_D opus::index_t moe_sorting_mp_mesh_stride(opus::index_t tokens)
 {
@@ -1756,7 +1775,8 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
             i += gridDim.x * kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<Problem::SubTokenTile>([&](auto j) {
                 IndexType eid = x[j.value]; // ext_vector_type must use int to []
                 uint32_t curr_token_id, curr_topk_id;
@@ -1911,7 +1931,8 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 #pragma unroll index_pack
         for(opus::index_t i = threadIdx.x; i < total_elem; i += kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<index_pack>([&](auto j) {
                 IndexType eid_x = x[j.value]; // ext_vector_type must use int to []
                 if(eid_x == eid)
@@ -2250,7 +2271,8 @@ struct MoeSortingMultiPhaseKernel_P01
             for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
                 i += kBlockSize * gridDim.x)
             {
-                auto x = p_topk_ids[i];
+                auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                    p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
                 opus::static_for<Problem::SubTokenTile>([&](auto j) {
                     IndexType eid = x[j.value]; // ext_vector_type must use int to []
                     uint32_t curr_token_id, curr_topk_id;

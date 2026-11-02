@@ -343,7 +343,7 @@ def compile_mega_moe_stage1(
         gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
         gate_epoch = fx.Int32(generation + fx.Int64(1))
         if const_expr(compact_dispatch):
-            is_owner = fx.Int32(0) == fx.Int32(1)
+            is_owner = fx.Int32(0) == 1
             is_producer = ticket < fx.Int32(dispatch_blocks)
             producer_slot = ticket
         else:
@@ -380,8 +380,8 @@ def compile_mega_moe_stage1(
                         remote_launch_ready, fx.Int32(fz_rank), launch_epoch
                     )
                     comm_ops.wait_i32_until_greater_than(
-                        a_launch_ready + fx.Int64(peer) * fx.Int64(4),
-                        launch_epoch - fx.Int32(1),
+                        a_launch_ready + fx.Int64(peer) * 4,
+                        launch_epoch - 1,
                     )
                     comm_ops.fence_system_acquire()
                 if tid == fx.Int32(0):
@@ -428,7 +428,7 @@ def compile_mega_moe_stage1(
             tile_state_byte_offset = (
                 fx.Int64(payload_parity)
                 * fx.Int64(tile_state_stride)
-                * fx.Int64(4)
+                * 4
             )
             a_ready_tile_queue = a_ready_tile_queue + tile_state_byte_offset
             a_ready_tile_epoch = a_ready_tile_epoch + tile_state_byte_offset
@@ -448,7 +448,7 @@ def compile_mega_moe_stage1(
                 if tid == fx.Int32(0):
                     comm_ops.wait_i32_until_equals(
                         a_pair_order_ready
-                        + fx.Int64(payload_parity) * fx.Int64(4),
+                        + fx.Int64(payload_parity) * 4,
                         payload_expected,
                     )
                     comm_ops.fence_system_acquire()
@@ -503,7 +503,7 @@ def compile_mega_moe_stage1(
         expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
         nv_rsrc = ptr_buf_tensor(fx.get_iter(num_valid_ids), fx.Int32)
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
-        os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
+        os_nbytes = tokens * fx.Int32(scale_cols) + 8192
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
@@ -552,7 +552,7 @@ def compile_mega_moe_stage1(
             local_plan_ready = disp_rsrc[fx.Int32(int(DispatchSlot.PLAN_READY))]
             ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             comm_ops.wait_i32_until_equals(
-                local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
+                local_plan_ready + fx.Int64(ready_index) * 4, payload_expected)
             # PLAN_READY is published with a system-scope release after the
             # planner rewrites TILE_EXPECTED.  Match that scope so a runtime
             # layout transition cannot reuse the previous invocation's
@@ -566,7 +566,7 @@ def compile_mega_moe_stage1(
         num_valid = nv_rsrc[fx.Int32(0)]
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
-        use_ready_order = fx.Int32(0) == fx.Int32(1)
+        use_ready_order = fx.Int32(0) == 1
         if const_expr(compact_dispatch):
             max_expert_tiles = ptr_buf_tensor(
                 a_max_expert_tiles, fx.Int32, **bounded(4)
@@ -579,7 +579,7 @@ def compile_mega_moe_stage1(
                 addr_tile_expected, fx.Int32, **bounded(TILE_STATE_BYTES)
             )[tile_index]
             comm_ops.wait_i32_until_equals(
-                addr_tile_ready + fx.Int64(tile_index) * fx.Int64(4),
+                addr_tile_ready + fx.Int64(tile_index) * 4,
                 expected_tiles,
             )
 
@@ -639,7 +639,7 @@ def compile_mega_moe_stage1(
                         local_work = fx.Int32(
                             comm_ops.atomic_add_agent(
                                 a_work_head
-                                + fx.Int64(work_shard) * fx.Int64(64),
+                                + fx.Int64(work_shard) * 64,
                                 fx.Int32(work_batch),
                             )
                         )
@@ -651,7 +651,7 @@ def compile_mega_moe_stage1(
                     local_work = fx.Int32(
                         comm_ops.atomic_add_agent(
                             a_work_head
-                            + fx.Int64(work_shard) * fx.Int64(64),
+                            + fx.Int64(work_shard) * 64,
                             fx.Int32(work_batch),
                         )
                     )
@@ -676,7 +676,7 @@ def compile_mega_moe_stage1(
                     if tid == fx.Int32(0):
                         comm_ops.wait_i32_until_equals(
                             a_ready_tile_epoch
-                            + fx.Int64(ready_slot) * fx.Int64(4),
+                            + fx.Int64(ready_slot) * 4,
                             payload_epoch,
                         )
                         comm_ops.fence_system_acquire()

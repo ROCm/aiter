@@ -21,13 +21,15 @@ from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 FP8_DTYPE = dtypes.fp8
+# The kernel's amax floor: aiter::kAmaxFloor in csrc/include/quant_amax_floor.h.
+AMAX_FLOOR = 1e-10
 
 
 def _torch_per_head_fp8_quant(x: Tensor) -> tuple[Tensor, Tensor]:
     """Reference per-(batch, head) fp8 quant (amax/240 descale)."""
     _batch_size, _num_tokens, _num_heads, _head_size = x.shape
     x32 = x.float()
-    amax = x32.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-8)
+    amax = x32.abs().amax(dim=(1, 3), keepdim=True).clamp(min=AMAX_FLOOR)
     descale = amax / 240.0
     q = (x32 / descale).to(FP8_DTYPE)
     scale = descale.squeeze(-1).squeeze(1)

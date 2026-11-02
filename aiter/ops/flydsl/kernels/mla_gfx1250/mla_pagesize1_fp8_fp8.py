@@ -152,7 +152,7 @@ def _softmax_group(
     yield
 
     tile_vectors = []
-    sum_vector = Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32)
+    sum_vector = fx.full(QK_ACC_DWORDS, 0.0, fx.Float32)
     for n_tile in range(KV_N_TILES):
         with fx.fastmath(ctx.fm_no_inf):
             if mask_bounds:
@@ -758,7 +758,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 accumulators = []
                 for g in range_constexpr(G):
                     accumulator = fx.make_rmem_tensor(QK_ACC_DWORDS, fx.Float32)
-                    accumulator.store(Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32))
+                    accumulator.store(fx.full(QK_ACC_DWORDS, 0.0, fx.Float32))
                     accumulators.append(accumulator)
                 for fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                     rocdl.s_wait_dscnt(
@@ -1344,7 +1344,7 @@ def launch_mla_pagesize1_fp8_fp8(
             next_offset = stream_next_start - (kv_start + tile_count * KV_TILE_TOKENS)
             stream = (next_in_flight, next_offset, stream_next_end)
 
-            zero_out = Vec.filled(PV_ACC_DWORDS, 0.0, fx.Float32)
+            zero_out = fx.full(PV_ACC_DWORDS, 0.0, fx.Float32)
             seed_producer_start = kv_start + KV_PROLOGUE_TILES * KV_TILE_TOKENS
             safe_seed_start = (seed_producer_start < kv_end).select(
                 seed_producer_start,
@@ -1364,10 +1364,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 [fx.Float32(float("-inf"))] * G,
                 [fx.Float32(0.0)] * G,
                 [zero_out for _ in range_constexpr(G * pv_d_tiles_per_wave)],
-                [
-                    Vec.filled(PACKED_PROB_WORDS, 0, fx.Int32)
-                    for _ in range_constexpr(G)
-                ],
+                [fx.full(PACKED_PROB_WORDS, 0, fx.Int32) for _ in range_constexpr(G)],
                 seed_page_indices,
                 start_slot,
                 load_first_k(start_slot),
@@ -1409,7 +1406,7 @@ def launch_mla_pagesize1_fp8_fp8(
 
             with fx.fastmath(fm_no_inf):
                 running_sum = [s + _xor16_f32(s) for s in running_sum]
-            has_mass = [running_sum[g] > fx.Float32(0.0) for g in range_constexpr(G)]
+            has_mass = [running_sum[g] > 0.0 for g in range_constexpr(G)]
             output_scales = [
                 has_mass[g].select(
                     fx.Float32(rocdl.rcp(T.f32, running_sum[g].ir_value())),

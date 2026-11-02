@@ -6,6 +6,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "quant.h"
 
 #include <cstdint>
@@ -142,7 +143,7 @@ template <MxScaleRoundMode RoundMode>
 __device__ __forceinline__ float
 group_amax(const opus::vector_t<float, kValuesPerThread>& values)
 {
-    float local_amax = RoundMode == MxScaleRoundMode::RoundUp ? 1.0e-10f : 0.0f;
+    float local_amax = RoundMode == MxScaleRoundMode::RoundUp ? aiter::kAmaxFloor : 0.0f;
 #pragma unroll
     for(int i = 0; i < kValuesPerThread; ++i)
         local_amax = fmaxf(local_amax, fabsf(values[i]));

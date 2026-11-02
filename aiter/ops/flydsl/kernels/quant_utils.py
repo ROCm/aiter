@@ -124,18 +124,11 @@ def emit_mx_e8m0_scale(
         )
     target_max_pow2, max_pos_inv_bits, mbits = _DTYPE_CFG[dtype_int]
 
-    c0_i32 = fx.Int32(0)
-    c1_i32 = fx.Int32(1)
-    c23_i32 = fx.Int32(23)
-    c0xFF_i32 = fx.Int32(0xFF)  # E8M0 exponent mask
-    c0x7FFFFF_i32 = fx.Int32(0x7FFFFF)  # f32 mantissa mask
-    target_max_pow2_i32 = fx.Int32(target_max_pow2)
-
     def _clamp_u8(x):
         # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
         # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
         # otherwise corrupt the stored uint8.
-        return fx.min(fx.max(x, c0_i32), c0xFF_i32).ir_value()
+        return fx.min(fx.max(x, 0), 0xFF).ir_value()
 
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
@@ -146,34 +139,28 @@ def emit_mx_e8m0_scale(
         inv_max_pos_f32 = fx.Int32(max_pos_inv_bits).bitcast(fx.Float32)
         working = local_max * inv_max_pos_f32
         working_i32 = working.bitcast(fx.Int32)
-        mantissa = working_i32 & c0x7FFFFF_i32
-        biased_exp = (working_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = mantissa != c0_i32
-        exp_field = mant_nonzero.select(
-            biased_exp + c1_i32,
-            biased_exp,
-        )
+        mantissa = working_i32 & 0x7FFFFF
+        biased_exp = (working_i32 >> 23) & 0xFF
+        mant_nonzero = mantissa != 0
+        exp_field = mant_nonzero.select(biased_exp + 1, biased_exp)
         return _clamp_u8(exp_field)
 
     if mode_int == _M.RoundDown:
         # floor_pow2(amax) / 2^target_max_pow2: drop the f32 mantissa, then
         # subtract target_max_pow2 from the biased exponent.
         amax_i32 = local_max.bitcast(fx.Int32)
-        biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        return _clamp_u8(biased_exp - target_max_pow2_i32)
+        biased_exp = (amax_i32 >> 23) & 0xFF
+        return _clamp_u8(biased_exp - target_max_pow2)
 
     if mode_int == _M.Ceil:
         # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
         # the exponent if any mantissa bit is set.
         amax_i32 = local_max.bitcast(fx.Int32)
-        mantissa = amax_i32 & c0x7FFFFF_i32
-        biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = mantissa != c0_i32
-        biased_exp_bumped = mant_nonzero.select(
-            biased_exp + c1_i32,
-            biased_exp,
-        )
-        return _clamp_u8(biased_exp_bumped - target_max_pow2_i32)
+        mantissa = amax_i32 & 0x7FFFFF
+        biased_exp = (amax_i32 >> 23) & 0xFF
+        mant_nonzero = mantissa != 0
+        biased_exp_bumped = mant_nonzero.select(biased_exp + 1, biased_exp)
+        return _clamp_u8(biased_exp_bumped - target_max_pow2)
 
     if mode_int == _M.Even:
         # round_pow2_special(amax) / 2^target_max_pow2: add a half-step at
@@ -183,12 +170,10 @@ def emit_mx_e8m0_scale(
         # 1.0625 * 2^k (mbits=3, FP8 e4m3) etc. -- mantissa-precision-
         # aware ties-to-even on the power-of-2 lattice.
         val_to_add = 1 << (23 - mbits - 1)
-        c_val_add = fx.Int32(val_to_add)
-        c_sign_exp_mask = fx.Int32(0xFF800000)
         amax_i32 = local_max.bitcast(fx.Int32)
-        amax_rounded = (amax_i32 + c_val_add) & c_sign_exp_mask
-        biased_exp = (amax_rounded >> c23_i32) & c0xFF_i32
-        return _clamp_u8(biased_exp - target_max_pow2_i32)
+        amax_rounded = (amax_i32 + val_to_add) & 0xFF800000
+        biased_exp = (amax_rounded >> 23) & 0xFF
+        return _clamp_u8(biased_exp - target_max_pow2)
 
     raise ValueError(
         f"emit_mx_e8m0_scale: unknown mode int {mode_int} for {mode!r} "
@@ -217,33 +202,25 @@ def emit_f32_to_e2m1(qx_f32):
         bit 3, magnitude at bits 0-2). Pack two nibbles into a byte for
         FP4x2 storage.
     """
-    c0x7_i32 = fx.Int32(0x7)
-    c0x80000000_i32 = fx.Int32(0x80000000)
-    c0x7FFFFFFF_i32 = fx.Int32(0x7FFFFFFF)
-    c0x3F800000_i32 = fx.Int32(0x3F800000)  # 1.0f
-    c0x40C00000_i32 = fx.Int32(0x40C00000)  # 6.0f
-    c0x4A800000_i32 = fx.Int32(0x4A800000)  # denorm bias
-    c0xC11FFFFF_i32 = fx.Int32(0xC11FFFFF)  # normal bias
+    denorm_bias = fx.Int32(0x4A800000)
 
     qx = fx.Float32(qx_f32).bitcast(fx.Int32)
-    s = qx & c0x80000000_i32
-    qx_abs = qx & c0x7FFFFFFF_i32
+    s = qx & 0x80000000
+    qx_abs = qx & 0x7FFFFFFF
     qx_abs_u = fx.Uint32(qx_abs)
-    denormal_mask = qx_abs_u < fx.Uint32(c0x3F800000_i32)
-    normal_mask = (qx_abs_u < fx.Uint32(c0x40C00000_i32)) & (
-        qx_abs_u >= fx.Uint32(c0x3F800000_i32)
-    )
+    denormal_mask = qx_abs_u < 0x3F800000
+    normal_mask = (qx_abs_u < 0x40C00000) & (qx_abs_u >= 0x3F800000)
 
-    denorm_f32 = qx_abs.bitcast(fx.Float32) + c0x4A800000_i32.bitcast(fx.Float32)
-    denormal_x = denorm_f32.bitcast(fx.Int32) - c0x4A800000_i32
+    denorm_f32 = qx_abs.bitcast(fx.Float32) + denorm_bias.bitcast(fx.Float32)
+    denormal_x = denorm_f32.bitcast(fx.Int32) - denorm_bias
 
-    mant_odd = fx.Int32((qx_abs_u >> fx.Uint32(22)) & fx.Uint32(1))
-    normal_x = qx_abs + c0xC11FFFFF_i32 + mant_odd
-    normal_x = fx.Uint32(normal_x) >> fx.Uint32(22)
+    mant_odd = fx.Int32((qx_abs_u >> 22) & 1)
+    normal_x = qx_abs + 0xC11FFFFF + mant_odd
+    normal_x = fx.Uint32(normal_x) >> 22
 
-    e2m1 = normal_mask.select(normal_x, c0x7_i32)
+    e2m1 = normal_mask.select(normal_x, 7)
     e2m1 = denormal_mask.select(denormal_x, e2m1)
-    return ((fx.Uint32(s) >> fx.Uint32(28)) | fx.Uint32(e2m1)).ir_value()
+    return ((fx.Uint32(s) >> 28) | fx.Uint32(e2m1)).ir_value()
 
 
 def emit_amax_e8m0_native_scale(
@@ -271,9 +248,6 @@ def emit_amax_e8m0_native_scale(
     if not all_vals:
         raise ValueError("emit_amax_e8m0_native_scale needs at least one value")
     c_flt_max = fx.Float32(3.4028234663852886e38)
-    c16 = fx.Int32(16)
-    c23 = fx.Int32(23)
-    c_wave = fx.Int32(wave_size)
 
     # A tree, not a linear accumulate: a chain of N maxes is N deep and every
     # step stalls on the last (one s_delay_alu each), while a tree is log-deep
@@ -298,13 +272,13 @@ def emit_amax_e8m0_native_scale(
             nxt.append(acc)
         level = nxt
     block_amax = fx.minnumf(level[0], c_flt_max)
-    peer = block_amax.shuffle_xor(c16, c_wave)
+    peer = block_amax.shuffle_xor(16, wave_size)
     block_amax = fx.maxnumf(block_amax, peer)
     if amax_gain is not None:
         block_amax = block_amax * fx.Float32(amax_gain)
 
     e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
-    scale_f32 = (fx.Int32(e8m0) << c23).bitcast(fx.Float32).ir_value()
+    scale_f32 = (fx.Int32(e8m0) << 23).bitcast(fx.Float32).ir_value()
     e8m0_byte = fx.Uint8(e8m0).ir_value()
     return scale_f32, e8m0_byte
 

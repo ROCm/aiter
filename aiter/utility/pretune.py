@@ -261,6 +261,10 @@ def run_pretune(
     if build_one_module is not None:
         tune_args = core.get_args_of_build(ops_name=module_name)
         if isinstance(tune_args, dict) and tune_args.get("srcs"):
+            tune_args = {
+                **tune_args,
+                "md_name": tune_args.get("md_name") or module_name,
+            }
             logger.info(f"[pretune] building {module_name}")
             build_one_module(tune_args)
         else:
@@ -315,6 +319,7 @@ def run_pretune(
     core.clear_build(inf_module)
     inf_args = core.get_args_of_build(ops_name=inf_module)
     if isinstance(inf_args, dict) and inf_args.get("srcs"):
+        inf_args = {**inf_args, "md_name": inf_args.get("md_name") or inf_module}
         if build_one_module is not None:
             build_one_module(inf_args)
         else:

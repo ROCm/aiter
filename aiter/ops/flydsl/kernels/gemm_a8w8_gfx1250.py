@@ -62,12 +62,37 @@ def launch_gemm_a8w8(
     batch: fx.Int32 = 1,
     a_preshuffle: Constexpr[bool] = False,
     a_scale_preshuffled: Constexpr[bool] = False,
+    b_scale_32x32: Constexpr[bool] = False,
+    k_tail: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
     if a_scale_preshuffled and not mx32:
         raise ValueError("a_scale_preshuffled is supported only for mxfp8_32")
+    # b_scale_32x32: B scale is the raw row-major [N/32, K/32] 32x32 block
+    # scale (one e8m0 per 32x32 weight block) instead of the n32k4-shuffled
+    # [N, K/32] 1x32 one. A 32x32 block is a 1x32 scale repeated over its 32
+    # rows, so every lane of a 32-column group reads the same word.
+    if b_scale_32x32 and not mx32:
+        raise ValueError("b_scale_32x32 is supported only for mxfp8_32")
     preload = preload_ks > 0
+    # k_tail: K is a multiple of 32 but not of tile_k. The k-tile count rounds
+    # up and the last tile's K-advancing TDM loads clamp their inner extent to
+    # the valid K, so the hardware zero-fills the rest and those products add
+    # nothing. Only the row-major layouts are covered: a shuffled A or n32k4
+    # scale does not keep its leading K bytes contiguous.
+    if k_tail and not (
+        mx32
+        and b_scale_32x32
+        and not a_preshuffle
+        and not a_scale_preshuffled
+        and split_k == 1
+        and not preload
+    ):
+        raise ValueError(
+            "[FlyDSL gfx1250] k_tail needs mxfp8_32 with a 32x32 B scale, a "
+            "row-major A and A scale, split_k 1 and no scale preload"
+        )
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
     if a_preshuffle and batched:
@@ -79,19 +104,25 @@ def launch_gemm_a8w8(
         raise ValueError(
             f"[FlyDSL gfx1250] a_preshuffle needs an even tile_m, got {tile_m}"
         )
-    if batched and not (mx128 and split_k == 1):
+    if batched and not (is_mxscale and split_k == 1):
         raise ValueError(
-            "[FlyDSL gfx1250] the batched path needs mx128 and split_k==1, got "
+            "[FlyDSL gfx1250] the batched path needs mxscale and split_k==1, got "
             f"is_mxscale={is_mxscale}, block_size={block_size}, split_k={split_k}"
+        )
+    if batched and mx32 and a_scale_preshuffled:
+        raise ValueError(
+            "[FlyDSL gfx1250] the batched mxfp8_32 path reads a row-major "
+            "[M, B, K/32] A scale; a_scale_preshuffled is 2-D only"
         )
     if preload and not (
         batched
+        and mx128
         and cluster_m == 1
         and cluster_n == 1
         and preload_ks % (tile_k // 128) == 0
     ):
         raise ValueError(
-            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched, no cluster "
+            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched mx128, no cluster "
             f"and a multiple of tile_k/128={tile_k // 128}; got batched={batched}, "
             f"cluster={cluster_m}x{cluster_n}"
         )
@@ -141,7 +172,11 @@ def launch_gemm_a8w8(
         if mx32
         else ((tile_m, K_WS) if sa_m_major else (K_WS, tile_m))
     )
-    SB_SHAPE = (tile_n // 32, tile_k) if mx32 else (N_BLOCKS, K_WS)
+    SB_SHAPE = (
+        ((tile_n // 32, tile_k // 32) if b_scale_32x32 else (tile_n // 32, tile_k))
+        if mx32
+        else (N_BLOCKS, K_WS)
+    )
     STAGE_SA = ((SA_SHAPE[0] * SA_SHAPE[1] + 15) // 16) * 16
     STAGE_SB = ((SB_SHAPE[0] * SB_SHAPE[1] + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -182,6 +217,8 @@ def launch_gemm_a8w8(
         + (f"_pre{preload_ks}" if preload else "")
         + ("_apre" if a_preshuffle else "")
         + ("_aspre" if a_scale_preshuffled else "")
+        + ("_bs32x32" if b_scale_32x32 else "")
+        + ("_ktail" if k_tail else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -198,7 +235,11 @@ def launch_gemm_a8w8(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
     ):
-        K_TILES = i32_k // (tile_k * split_k)
+        if const_expr(k_tail):
+            K_TILES = (i32_k + tile_k - 1) // tile_k
+            K_REM = i32_k - (K_TILES - 1) * tile_k  # valid K of the last tile
+        else:
+            K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
         ldc64 = fx.Int64(i32_ldc)
@@ -230,6 +271,10 @@ def launch_gemm_a8w8(
                 (i32_m + 31) // 32 - blk_m // 32
                 if const_expr(a_scale_preshuffled)
                 else mn_oob
+            )
+            # Batched A scale is [M, B, K//32]: its row stride is B * K//32.
+            stride_ask64 = (
+                fx.Int64(i32_stride_ascale_k) if const_expr(batched) else k64 // 32
             )
         elif const_expr(mx128):
             nb_oob = (i32_n // 128 - blk_n // 128) if not ALIGNED_N else None
@@ -320,19 +365,26 @@ def launch_gemm_a8w8(
                         return fx.Int64(kt) * tile_k
 
                 else:
-                    sa_off0 = blk_m64 * (k64 // 32)
+                    sa_off0 = blk_m64 * stride_ask64
+                    if const_expr(batched):
+                        sa_off0 = sa_off0 + bz64 * (k64 // 32)
                     gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k // 32, 1))
-                    atomSA = _tdm1(gSA, sa_oob, None, k64 // 32, a_mask)
+                    atomSA = _tdm1(gSA, sa_oob, None, stride_ask64, a_mask)
 
                     def sa_imm(kt):
                         return fx.Int64(kt) * (tile_k // 32)
 
-                sb_off0 = blk_n64 // 32 * k64
-                gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (tile_k, 1))
-                atomSB = _tdm1(gSB, None, None, k64, b_mask)
+                # Both B scale layouts hold N*K/1024 (32x32) or N*K/32 (n32k4)
+                # bytes per batch, one 32-row super-row after another.
+                sb_row = k64 // 32 if const_expr(b_scale_32x32) else k64
+                sb_off0 = blk_n64 // 32 * sb_row
+                if const_expr(batched):
+                    sb_off0 = sb_off0 + bz64 * (fx.Int64(i32_n) // 32) * sb_row
+                gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (SB_SHAPE[1], 1))
+                atomSB = _tdm1(gSB, None, None, sb_row, b_mask)
 
                 def sb_imm(kt):
-                    return fx.Int64(kt) * tile_k
+                    return fx.Int64(kt) * SB_SHAPE[1]
 
             else:
                 sb_off0 = blk_n64 // 128 * (k64 // 128)
@@ -364,19 +416,28 @@ def launch_gemm_a8w8(
             if wave == w:
                 fx.copy(atom, gt, lv, imm_offset=imm_offset)
 
+        def _tail(atom, full, rem, kt):
+            # On the last k-tile, clamp the inner extent to the valid K.
+            if const_expr(not k_tail):
+                return atom
+            is_last = fx.Int32(kt) == K_TILES - 1
+            return fx.atom_set_value(
+                atom, "extent_1", is_last.select(fx.Int32(rem), fx.Int32(full))
+            )
+
         def issue(s, kt):
             pa = _buf_ptr(s)
             ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
             _wcopy(
                 W_A,
-                atomA,
+                _tail(atomA, A_TDM_ROW, K_REM if k_tail else 0, kt),
                 gA,
                 _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
                 ktg * A_TDM_ROW,
             )
             _wcopy(
                 W_B,
-                atomB,
+                _tail(atomB, tile_k * 16, K_REM * 16 if k_tail else 0, kt),
                 gB,
                 _lv(
                     fx.add_offset(pa, STAGE_A),
@@ -388,14 +449,14 @@ def launch_gemm_a8w8(
             if const_expr(is_mxscale and not preload):
                 _wcopy(
                     W_SA,
-                    atomSA,
+                    _tail(atomSA, tile_k // 32, K_REM // 32 if k_tail else 0, kt),
                     gSA,
                     _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
                     sa_imm(ktg),
                 )
                 _wcopy(
                     W_SB,
-                    atomSB,
+                    _tail(atomSB, tile_k // 32, K_REM // 32 if k_tail else 0, kt),
                     gSB,
                     _lv(fx.add_offset(pa, SB_OFF), SB_SHAPE, (SB_SHAPE[1], 1)),
                     sb_imm(ktg),
@@ -498,7 +559,10 @@ def launch_gemm_a8w8(
         def load_sb(buf, sbuf, wn, ks):
             if const_expr(mx32):
                 col = wnb + wn * 16 + lane16
-                word = (col // 32) * SC_WORDS + ks * 32 + (col % 32)
+                if const_expr(b_scale_32x32):
+                    word = (col // 32) * (tile_k // 128) + ks
+                else:
+                    word = (col // 32) * SC_WORDS + ks * 32 + (col % 32)
                 return lds_load_b32(buf, SB_OFF + word * 4)[0]
             if const_expr(ALIGNED_N):
                 n_block = (
@@ -552,7 +616,7 @@ def launch_gemm_a8w8(
             )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
-            cf.store(Vec.filled(8, 0.0, fx.Float32))
+            cf.store(fx.full(8, 0.0, fx.Float32))
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -760,10 +824,10 @@ def launch_gemm_a8w8(
             sa_view = fx.Tensor(fx.make_view(gSA_base, fx.make_layout(i32_m, 1)))
             sb_view = fx.Tensor(fx.make_view(gSB_base, fx.make_layout(i32_n, 1)))
             sa_buf = fx.rocdl.make_buffer_tensor(
-                sa_view, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
+                sa_view, max_size=False, num_records_bytes=i32_m * 4
             )
             sb_buf = fx.rocdl.make_buffer_tensor(
-                sb_view, max_size=False, num_records_bytes=i32_n * fx.Int32(4)
+                sb_view, max_size=False, num_records_bytes=i32_n * 4
             )
             sa_lay, sb_lay = (fx.make_layout(1, 1), fx.make_layout(4, 1))
             sa_tiles = fx.logical_divide(sa_buf, sa_lay)

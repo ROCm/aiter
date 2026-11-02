@@ -347,9 +347,15 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     void* moe_buf,
     uint8_t* activation_quant,
     uint8_t* activation_scale_token,
-    int tokens)
+    int tokens,
+    const int32_t* num_local_tokens)
 {
+    // moe_buf is zeroed whole, so a row past the local-token count reads 0
+    // rather than what the buffer held; only the local rows are sorted and
+    // quantized, as moe_sorting_opus_fwd sorts them.
     zero_moe_output<kSortQuantCtas>(moe_buf, tokens);
+    if(num_local_tokens != nullptr)
+        tokens = min(tokens, *num_local_tokens);
     if(blockIdx.x == 0)
     {
         build_sorted_metadata<NumExperts, TopK>(
@@ -410,7 +416,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               aiter_tensor_t& moe_buf,
                               aiter_tensor_t& activation_quant,
                               aiter_tensor_t& activation_scale_token,
-                              int num_experts)
+                              int num_experts,
+                              std::optional<aiter_tensor_t> num_local_tokens)
 {
     using namespace aiter::mxfp4_moe;
 
@@ -525,6 +532,10 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
     uint8_t* activation_quant_ptr = static_cast<uint8_t*>(activation_quant.data_ptr());
     uint8_t* activation_scale_token_ptr =
         static_cast<uint8_t*>(activation_scale_token.data_ptr());
+    const int32_t* num_local_tokens_ptr =
+        num_local_tokens.has_value()
+            ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
+            : nullptr;
 #define AITER_MXFP4_SORT_QUANT_LAUNCH(NUM_EXPERTS, TOPK)                            \
     if(num_experts == (NUM_EXPERTS) && topk == (TOPK))                              \
     {                                                                               \
@@ -540,7 +551,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                 moe_buf_ptr,                                                        \
                 activation_quant_ptr,                                               \
                 activation_scale_token_ptr,                                         \
-                tokens);                                                            \
+                tokens,                                                             \
+                num_local_tokens_ptr);                                              \
     }
     AITER_MXFP4_SORT_QUANT_ROUTES(AITER_MXFP4_SORT_QUANT_LAUNCH)
 #undef AITER_MXFP4_SORT_QUANT_LAUNCH

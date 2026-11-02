@@ -40,6 +40,7 @@ from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_remap_ep_module,
     build_moe_contiguous_psum_remap_module,
     build_moe_route_psum_fused_module,
+    build_moe_route_psum_herd_module,
 )
 from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 from aiter.ops.flydsl.kernels.moe_gather_reduce import build_moe_gather_reduce_module
@@ -118,6 +119,23 @@ def run_torch_scatter_copy(src, dst, dst_src):
     keep = dst_src >= 0
     out[keep] = src[dst_src[keep].long()]
     return out
+
+
+def run_torch_herd_drop(cand_ids, cand_scores, E, scale):
+    tokens, kp1 = cand_ids.shape
+    pop = torch.bincount(cand_ids.reshape(-1).long(), minlength=E)
+    order = torch.argsort(cand_ids, dim=1)
+    ids, scores = cand_ids.gather(1, order), cand_scores.gather(1, order)
+    cp = pop[ids.long()]
+    least = cp == cp.min(1, keepdim=True).values
+    s = torch.where(least, scores, torch.full_like(scores, float("inf")))
+    least &= s == s.min(1, keepdim=True).values
+    cols = torch.arange(kp1).expand(tokens, kp1)
+    drop = torch.where(least, cols, torch.full_like(cols, kp1)).min(1).values
+    keep = cols != drop[:, None]
+    kept_ids = ids[keep].reshape(tokens, kp1 - 1)
+    kept = scores[keep].reshape(tokens, kp1 - 1)
+    return kept_ids, kept / kept.sum(1, keepdim=True).clamp_min(1e-20) * scale
 
 
 def run_torch_gather_reduce(grouped, rmap, w, dtype):
@@ -302,6 +320,7 @@ def test_psum_remap(numel, E, tile_m):
     rows0[::101] = -1  # DROPPED_ROUTE_ROW must be left untouched
     masked = counts.clone()
     nvr = torch.tensor([numel], dtype=I32)
+    null_row_to_token = torch.empty(0, dtype=I32)
 
     ref_starts = run_torch_psum(masked, tile_m)[0]
     keep = rows0.cpu() >= 0
@@ -326,6 +345,8 @@ def test_psum_remap(numel, E, tile_m):
             route_max_m,
             tile_m,
             ptr_arg(nvr),
+            ptr_arg(null_row_to_token),
+            1,  # topk, unused while row_to_token is null.
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
@@ -395,6 +416,7 @@ def test_psum_remap_ep(numel, E, tile_m, topk):
 
     masked = counts.clone()
     nvr = torch.tensor([numel], dtype=I32)
+    null_row_to_token = torch.empty(0, dtype=I32)
     gather_w = (torch.rand(numel) * 2 - 1).to(torch.bfloat16)
     tis = torch.randint(0, max_tok * 4, (tokens,), dtype=I32)
     cap_rows = E * route_max_m
@@ -443,6 +465,7 @@ def test_psum_remap_ep(numel, E, tile_m, topk):
             topk,
             max_tok,
             slot_stride,
+            ptr_arg(null_row_to_token),
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
@@ -630,17 +653,18 @@ def test_scatter_copy_token(num_dst, row_bytes):
 
 
 @benchmark()
-def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype):
+def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
     """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)]."""
     out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
     launch = build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, 1, vec_dwords, "f32"
+        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
     )
+    wdt = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[w_dtype]
     rows_total = max(64, tokens * topk)
     grouped = (torch.randn(rows_total, model_dim) * 0.5).to(dtype)
     rmap = torch.randint(0, rows_total, (tokens, topk), dtype=I32)
     rmap[0, 0] = -1  # DROPPED_ROUTE_ROW must contribute nothing
-    w = torch.rand(tokens, topk, dtype=torch.float32)
+    w = torch.rand(tokens, topk, dtype=torch.float32).to(wdt)
     nvt = torch.tensor([tokens], dtype=I32)
     ref = run_torch_gather_reduce(grouped, rmap, w, dtype)
     out = torch.full((tokens, model_dim), 7.0, dtype=dtype)
@@ -659,7 +683,9 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype):
 
     esz = grouped.element_size()
     # topk source rows read + one row written per token, plus the (t,k) maps
-    nbytes = tokens * (topk * model_dim + model_dim) * esz + tokens * topk * 8
+    nbytes = tokens * (topk * model_dim + model_dim) * esz + tokens * topk * (
+        rmap.element_size() + w.element_size()
+    )
     flops = tokens * topk * model_dim * 2  # one multiply-add per contribution
     ret = {"gfx": get_gfx()}
     # eager vs graph replay are the two candidates: on the decode path these
@@ -814,17 +840,32 @@ def test_route_maps(numel, E, topk, max_m):
     return ret
 
 
+def _decode_topk_ids(tokens, E, topk):
+    """Decode routing with a fused shared expert: each token picks topk-1
+    distinct routed experts from [0, E-1) and always routes to expert E-1."""
+    routed = torch.rand(tokens, E - 1).topk(topk - 1, dim=1).indices
+    shared = torch.full((tokens, 1), E - 1, dtype=routed.dtype)
+    return torch.cat([routed, shared], dim=1).to(I32).contiguous()
+
+
 @benchmark()
-def test_route_psum_fused(numel, E, tile_m):
+def test_route_psum_fused(numel, E, tile_m, topk=0):
     """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
 
     Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
     so the checks are the union: exact masked_m/starts/psum against the torch
     prefix sum, and the row invariants against the *contiguous* bands it emits.
+
+    With ``topk`` set, routing is decode-shaped (``_decode_topk_ids``) and max_m
+    is the TP grouped path's.
     """
     launch = build_moe_route_psum_fused_module()
-    max_m = max(512, 4 * numel // E)
-    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    if topk:
+        topk_ids = _decode_topk_ids(numel // topk, E, topk).reshape(-1)
+        max_m = max(tile_m, (numel + tile_m - 1) // tile_m * tile_m)
+    else:
+        max_m = max(512, 4 * numel // E)
+        topk_ids = torch.randint(0, E, (numel,), dtype=I32)
     counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
     assert max_m > int(counts.max()), "max_m too small for this shape"
     ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
@@ -873,6 +914,76 @@ def test_route_psum_fused(numel, E, tile_m):
         assert bool(
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
+        assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_route_psum_herd(tokens, E, topk, tile_m):
+    launch = build_moe_route_psum_herd_module(topk)
+    kp1 = topk + 1
+    scale = 2.5
+    max_m = max(512, 4 * tokens * topk // E)
+    cand_ids = torch.rand(tokens, E).topk(kp1, dim=1).indices.to(I32)
+    cand_scores = torch.rand(tokens, kp1, dtype=torch.float32)
+    kept_ids, kept_w = run_torch_herd_drop(cand_ids, cand_scores, E, scale)
+    counts = torch.bincount(kept_ids.reshape(-1).long(), minlength=E).to(I32)
+    ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
+
+    numel = tokens * topk
+    rows = torch.full((numel,), -99, dtype=I32)
+    gw = torch.full((numel,), -99.0, dtype=torch.float32)
+    masked = torch.full((E,), -99, dtype=I32)
+    starts = torch.full((E,), -99, dtype=I32)
+    psum = torch.full((E,), -99, dtype=I32)
+    # Unread without has_num_valid_rows; a null pointer stands in for it.
+    no_count = torch.empty(0, dtype=I32)
+
+    def fn():
+        launch(
+            ptr_arg(cand_ids),
+            ptr_arg(cand_scores),
+            ptr_arg(rows),
+            ptr_arg(gw),
+            ptr_arg(masked),
+            ptr_arg(starts),
+            ptr_arg(psum),
+            tokens,
+            E,
+            max_m,
+            tile_m,
+            scale,
+            ptr_arg(no_count),
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    nbytes = tokens * kp1 * 2 * 4 + numel * 2 * 4 + E * 3 * 4
+    ret = {"gfx": get_gfx()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        rows.fill_(-99)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            counts.float(), masked.float(), rtol=0, atol=0, msg=f"{name}: masked_m"
+        )
+        checkAllclose(
+            ref_starts.float(), starts.float(), rtol=0, atol=0, msg=f"{name}: starts"
+        )
+        checkAllclose(
+            ref_psum.float(), psum.float(), rtol=0, atol=0, msg=f"{name}: psum"
+        )
+        checkAllclose(
+            kept_w.reshape(-1), gw, rtol=1e-6, atol=1e-6, msg=f"{name}: gather_w"
+        )
+        r = rows.cpu().long()
+        ids = kept_ids.reshape(-1).cpu().long()
+        lo = ref_starts.cpu().long()[ids]
+        assert bool(
+            ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
+        ), f"{name}: row outside its kept expert's contiguous band"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1105,10 +1216,18 @@ def main():
     summarize(
         "moe_gather_reduce",
         [
-            test_gather_reduce(t, md, tk, v, dmap[d])
-            for d, t, md, tk, v in itertools.product(
-                args.dtype, args.tokens, args.model_dim, args.topk, args.vec
+            test_gather_reduce(t, md, tk, v, dmap[d], wd)
+            for d, wd, t, md, tk, v in itertools.product(
+                args.dtype,
+                ("f32", "bf16", "f16"),
+                args.tokens,
+                args.model_dim,
+                args.topk,
+                args.vec,
             )
+            # Route weights arrive as native f32, or already cast to the output
+            # dtype by the EP route kernel.
+            if wd in ("f32", d)
         ],
     )
     # Real decode shape (model_dim=7168) at both vector widths -- swept apart from
@@ -1116,8 +1235,10 @@ def main():
     summarize(
         "moe_gather_reduce (model_dim=7168)",
         [
-            test_gather_reduce(t, 7168, tk, v, dmap[args.dtype[0]])
-            for t, tk, v in itertools.product(args.tokens, args.topk, args.vec)
+            test_gather_reduce(t, 7168, tk, v, dmap[args.dtype[0]], wd)
+            for wd, t, tk, v in itertools.product(
+                ("f32", args.dtype[0]), args.tokens, args.topk, args.vec
+            )
         ],
     )
     summarize(
@@ -1172,6 +1293,24 @@ def main():
             for n, E, tm in itertools.product(
                 args.numel, [e for e in args.experts if e <= 512], args.tile_m
             )
+        ],
+    )
+    # MiniMax-M3 TP decode: 128 routed + 1 fused shared expert, top-5.
+    summarize(
+        "moe_route_psum_fused (M3 decode)",
+        [test_route_psum_fused(t * 5, 129, 64, topk=5) for t in (1, 4, 16)],
+    )
+    summarize(
+        "moe_route_psum_herd",
+        [
+            test_route_psum_herd(t, E, tk, tm)
+            for t, E, tk, tm in itertools.product(
+                args.tokens + [128],
+                [e for e in args.experts if e <= 512] + [256],
+                args.topk + [6],
+                args.tile_m,
+            )
+            if tk + 1 <= E
         ],
     )
     summarize(

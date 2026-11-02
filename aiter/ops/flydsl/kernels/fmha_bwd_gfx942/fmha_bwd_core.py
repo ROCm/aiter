@@ -117,7 +117,7 @@ def _exp2(x):
 
 
 def _zero4():
-    return fx.Vector.filled(4, 0.0, fx.Float32)
+    return fx.full(4, 0.0, fx.Float32)
 
 
 def _elem(acc4, i):

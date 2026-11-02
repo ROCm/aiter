@@ -449,6 +449,77 @@ def _run_paged_attention_ragged_nhd(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("seq_len", [256, 512])
+def test_paged_attention_ragged_fp8_logits_stay_in_normal_range(seq_len):
+    """FP8 KV decode must not lose precision to subnormal softmax probabilities.
+
+    Regression test for the e4m3 logits rescale. On the FP8 path the softmax
+    probabilities are cast to e4m3; normalizing them to sum=1 first leaves them
+    near ``1/seq_len``, which at a 256-token partition is ~2^-8 -- SUBNORMAL in
+    e4m3, whose smallest normal is 2^-6. The relative ulp there is 1/2, so the
+    cast injects error that scales with how far below 2^-6 the probabilities
+    sit. The BF16 path has the exponent range to hold those values exactly,
+    which is why only the FP8 branch needs the rescale.
+
+    Both arms are the same kernel over the same KV values -- one reading the
+    cache as FP8, the other as BF16 upcast from that same FP8 -- so the only
+    difference measured here is the in-kernel probability cast.
+
+    An elementwise ``assert_close`` does not see this at these lengths: the
+    output is a probability-weighted sum over ``seq_len`` values, so individual
+    errors average out and no single element exceeds a 3e-2 tolerance. The
+    aggregate relative error does see it. Measured on gfx950 / ROCm 7.2.4,
+    seq_len 512: 9.55% without the rescale, 3.40% with it. The residual is the
+    floor for this design -- the probabilities are still e4m3, just no longer
+    subnormal.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = 2
+    num_query_heads = 96
+    num_kv_heads = 8
+    head_size = 128
+    block_size = 1
+    num_blocks = num_seqs * seq_len
+
+    query = torch.randn(
+        (num_seqs, num_query_heads, head_size), dtype=dtypes.bf16, device=device
+    )
+    key_fp8 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    ).to(dtypes.fp8)
+    value_fp8 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    ).to(dtypes.fp8)
+
+    kv_indptr = torch.arange(
+        0, (num_seqs + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+    )
+    kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones((num_seqs,), dtype=torch.int32, device=device)
+
+    args = (kv_indptr, kv_page_indices, kv_last_page_lens, seq_len)
+    expected = _run_paged_attention_ragged_nhd(
+        query, key_fp8.to(dtypes.bf16), value_fp8.to(dtypes.bf16), *args, "auto"
+    )
+    actual = _run_paged_attention_ragged_nhd(
+        query, key_fp8, value_fp8, *args, "fp8_e4m3"
+    )
+
+    expected, actual = expected.float(), actual.float()
+    rel_err = ((actual - expected).abs().sum() / expected.abs().sum()).item()
+    assert rel_err < 6e-2, (
+        f"FP8 decode diverges from the BF16 path by {rel_err:.2%} at "
+        f"seq_len={seq_len}; softmax probabilities are likely being cast to "
+        f"e4m3 while subnormal (expected <6%, ~3.4% when correct)"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_paged_attention_ragged_glm_gqa_fp8_kv_nhd():
     """GLM-style GQA decode should consume FP8 KV cache directly.
 
@@ -1038,6 +1109,18 @@ if __name__ == "__main__":
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
+
+    # CI runs this file as `python3 op_tests/test_pa_ragged.py` (see
+    # .github/scripts/aiter_test.sh), not under pytest, so the pytest-style
+    # tests below are only reached if called from here. Run the FP8 KV checks
+    # first: they take ~18s and they are the ones guarding in-kernel precision,
+    # so a failure should surface before the long sweep rather than after it.
+    print("[test] FP8 KV cache checks")
+    test_paged_attention_ragged_glm_gqa_fp8_kv_nhd()
+    for seq_len in (256, 512):
+        test_paged_attention_ragged_fp8_logits_stay_in_normal_range(seq_len)
+    print("[test] FP8 KV cache checks passed")
+
     if args.pa_variant != [PAVariant.Shomy, PAVariant.Asm]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [

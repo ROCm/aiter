@@ -21,6 +21,31 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
 
 
 @triton.jit
+def attention_mask(
+    offs_m,
+    offs_n,
+    seqlen_q,
+    seqlen_k,
+    IS_CAUSAL: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+):
+    """Allowed query/key pairs; negative window sizes mean unbounded."""
+    query_pos = offs_m[:, None] + seqlen_k - seqlen_q
+    key_pos = offs_n[None, :]
+    allowed = (offs_m[:, None] < seqlen_q) & (key_pos < seqlen_k)
+    if IS_CAUSAL:
+        allowed = allowed & (key_pos <= query_pos)
+    if USE_SLIDING_WINDOW:
+        if WINDOW_SIZE_LEFT >= 0:
+            allowed = allowed & (key_pos >= query_pos - WINDOW_SIZE_LEFT)
+        if WINDOW_SIZE_RIGHT >= 0:
+            allowed = allowed & (key_pos <= query_pos + WINDOW_SIZE_RIGHT)
+    return allowed
+
+
+@triton.jit
 def compute_alibi_block(
     alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False
 ):

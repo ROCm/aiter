@@ -35,6 +35,7 @@ from .gemm_a16wfp4_helpers import (
     reduce_dense_k_wave,
     store_dense_bf16,
 )
+from .kernels_common import set_slp_vectorize_once_used
 
 __all__ = ["compile_gemm_a16wfp4"]
 
@@ -211,4 +212,4 @@ def compile_gemm_a16wfp4(
             stream=stream,
         )
 
-    return launch
+    return set_slp_vectorize_once_used(launch, False)

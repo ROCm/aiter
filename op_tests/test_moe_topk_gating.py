@@ -935,6 +935,46 @@ def bench_topk_gating_shared(
     return ret
 
 
+@benchmark()
+def bench_topk_gating_pad_rows(num_experts, num_tokens, topk, score_func, dtype):
+    """num_valid_rows: rows below the count must match an unmasked launch bit
+    for bit; rows at or past it must carry id -1 and weight 0. The count is
+    swept over none, some and all rows of the same launch."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    need_renorm = score_func != "softmax"
+
+    def run(num_valid_rows):
+        weights = torch.full(
+            (num_tokens, topk), float("nan"), dtype=torch.float32, device="cuda"
+        )
+        ids = torch.full((num_tokens, topk), 7, dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            weights,
+            ids,
+            gating_output,
+            bias,
+            need_renorm=need_renorm,
+            routed_scaling_factor=2.5,
+            score_func=score_func,
+            num_valid_rows=num_valid_rows,
+        )
+        return weights, ids
+
+    w_all, ids_all = run(None)
+    bad = 0
+    for n in sorted({0, num_tokens // 2, num_tokens}):
+        count = torch.tensor([n], dtype=torch.int32, device="cuda")
+        w, ids = run(count)
+        bad += not torch.equal(ids[:n], ids_all[:n])
+        bad += not torch.equal(w[:n].view(torch.int32), w_all[:n].view(torch.int32))
+        bad += not bool((ids[n:] == -1).all() and (w[n:] == 0).all())
+    count = torch.tensor([num_tokens // 2], dtype=torch.int32, device="cuda")
+    _, us = run_perftest(run, count)
+    return {"gfx": get_gfx(), "fused us": us, "pad bad": bad}
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("topk_gating unsupported on %s; skipping", get_gfx())
@@ -976,11 +1016,21 @@ def main():
         "--score-func",
         dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=["sigmoid", "softplus", "softmax", "nan", "ties", "eplb", "shared"],
+        default=[
+            "sigmoid",
+            "softplus",
+            "softmax",
+            "nan",
+            "ties",
+            "eplb",
+            "shared",
+            "pad-rows",
+        ],
         help="Comma-separated list of sections to run: "
-        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared "
+        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows "
         "(default: all except biased-sigmoid). "
-        "Sigmoid, softplus and softmax are named after score functions; nan, ties and eplb "
+        "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
+        "eplb and pad-rows "
         "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
@@ -1209,6 +1259,27 @@ def main():
             print(f"\nERROR: {len(errors)} shared-expert config(s) failed!")
             print(errors.to_string(index=False))
             failed_sections.append("shared")
+
+    # -- num_valid_rows: pad rows routed to -1, real rows untouched ----------
+    if "pad-rows" in sections:
+        pad_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = pd.DataFrame([bench_topk_gating_pad_rows(*cfg) for cfg in pad_configs])
+        aiter.logger.info(
+            "topk_gating pad-rows summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        errors = df[df["pad bad"] > 0]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} pad-rows config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("pad-rows")
 
     if failed_sections:
         print(

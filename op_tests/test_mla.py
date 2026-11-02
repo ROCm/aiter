@@ -6,6 +6,7 @@ import itertools
 import random
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -23,6 +24,84 @@ torch.set_printoptions(sci_mode=False)
 
 def check_support(dtype, kv_dtype, nhead):
     return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
+
+
+def check_asm_decode_rejects_unsupported_widths():
+    """The gfx942/gfx950 decode kernels take no row width: they assume 576-wide
+    rows (656 bytes per packed byte-KV token, dense within a page) and 512-wide
+    outputs."""
+    batch_size, nhead, ctx_lens = 4, 16, 300
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = qo_indptr * ctx_lens
+    kv_indices = torch.arange(batch_size * ctx_lens, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    scale = torch.ones(1, dtype=torch.float)
+
+    def decode(q, kv_buffer, v_head_dim=512):
+        out = torch.empty((batch_size, nhead, v_head_dim), dtype=torch.bfloat16)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer,
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            1,
+            q_scale=scale,
+            kv_scale=scale,
+        )
+
+    for dtype, kvtype in [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, dtypes.fp8),
+        (dtypes.fp8, dtypes.fp8),
+    ]:
+        q = torch.randn((batch_size, nhead, 512)).to(dtype)
+        kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 512)).to(kvtype)
+        with pytest.raises(RuntimeError, match="576-element MLA rows"):
+            decode(q, kv_buffer)
+
+    q = torch.randn((batch_size, nhead, 576), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 576), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="only support v_head_dim 512"):
+        decode(q, kv_buffer, v_head_dim=256)
+    # 512 fp8 latent + 4 fp32 scales per token, without the 64 bf16 RoPE elements.
+    with pytest.raises(RuntimeError, match="byte KV must be"):
+        decode(q, torch.zeros((batch_size * ctx_lens, 528), dtype=torch.uint8))
+    # The right shape, but every page aliases a single byte.
+    with pytest.raises(RuntimeError, match=r"byte KV must be.*stride\(1\) 0 "):
+        decode(q, torch.zeros(1, dtype=torch.uint8).expand(batch_size * ctx_lens, 656))
+
+    # mla_decode_fwd sizes splitData from the output, so only a direct call can
+    # pair a 512-wide output with a narrower splitData.
+    num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+        None, batch_size, batch_size * ctx_lens, nhead, 1, torch.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="splitData with v_head_dim 512"):
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            work_meta_data=None,
+            work_indptr=None,
+            work_info_set=None,
+            max_seqlen_q=1,
+            page_size=1,
+            nhead_kv=1,
+            softmax_scale=1.0 / 576**0.5,
+            splitData=torch.empty(
+                (batch_size, num_kv_splits, nhead, 256), dtype=torch.float
+            ),
+            splitLse=torch.empty(
+                (batch_size, num_kv_splits, nhead, 1), dtype=torch.float
+            ),
+            output=torch.empty((batch_size, nhead, 512), dtype=torch.bfloat16),
+        )
 
 
 def cal_diff(
@@ -605,13 +684,21 @@ def test_mla(
     asm_supports_mtp = decode_qlen <= 4
     # --no-causal needs a non-masked (msk0) kernel. decode_qlen==1 always works:
     # a single query token makes the mask a no-op, so the dispatch reuses the
-    # masked kernel. Beyond that the non-persistent side only ships fp8/fp8 msk0
-    # builds for nhead=128 (any qlen) and nhead=16 qlen 3/4 -- see the ps=0,
-    # causal=0 rows of hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
+    # masked kernel. For longer queries, gfx950 ships a non-causal BF16 kernel
+    # for nhead=8 qlen=2, plus fp8/fp8 msk0 builds for nhead=128 (any qlen) and
+    # nhead=16 qlen 3/4 -- see the ps=0, causal=0 rows of
+    # hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
     # get_heuristic_kernel_mla, so skip it instead of killing the sweep.
     asm_supports_non_causal = (
         is_causal
         or decode_qlen == 1
+        or (
+            get_gfx() == "gfx950"
+            and dtype == dtypes.bf16
+            and kvtype == dtypes.bf16
+            and nhead == 8
+            and decode_qlen == 2
+        )
         or (
             dtype == dtypes.fp8
             and kvtype == dtypes.fp8
@@ -915,6 +1002,11 @@ def main():
                 cp_world_size=1,
             )
         return
+
+    if get_gfx() in ("gfx942", "gfx950"):
+        check_asm_decode_rejects_unsupported_widths()
+        aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
+
     for nhead, decode_qlen in args.nhead:
         df = []
         for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(

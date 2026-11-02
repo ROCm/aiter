@@ -57,7 +57,7 @@ def test_fused_silu_mul(shape, dtype, use_explicit_out):
 def test_fused_silu_mul_requires_even_last_dim():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    x = torch.randn(2, 3, device="cuda")
+    x = torch.randn(2, 3, device="cuda", dtype=torch.float32)
     with pytest.raises(AssertionError, match="even"):
         fused_silu_mul(x)
 
