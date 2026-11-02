@@ -216,13 +216,12 @@ def plan_pa_decode(
     must fit the device's per-block shared-memory capacity.
 
     Lengths include MTP tokens. Positive windows include each query's position;
-    0 and -1 disable them. Plans cover the MTP window union: match the window
-    and query length when decoding or refreshing. Dense plans ignore query length.
+    nonpositive windows disable them. Plans cover the MTP window union: match
+    the window and query length when decoding or refreshing. Dense plans ignore
+    query length.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")

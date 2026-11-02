@@ -8,7 +8,6 @@ from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from ..tensor_shim import _to_raw
 from .traits import MFMA_ACC_ELEMS
 
 
@@ -106,9 +105,9 @@ class Gfx1250Gemm:
         if const_expr(bf16):
             result = fx.rocdl.wmma_f32_16x16x32_bf16(
                 fx.Vector.make_type(8, fx.Float32),
-                _to_raw(a),
-                _to_raw(b),
-                _to_raw(acc),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
                 modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
                 reuseA=False,
                 reuseB=False,
@@ -120,9 +119,9 @@ class Gfx1250Gemm:
         else:
             result = fx.rocdl.wmma_f32_16x16x64_fp8_fp8(
                 fx.Vector.make_type(8, fx.Float32),
-                _to_raw(a),
-                _to_raw(b),
-                _to_raw(acc),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
                 modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
                 reuseA=False,
                 reuseB=False,

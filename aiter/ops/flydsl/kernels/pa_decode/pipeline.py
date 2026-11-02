@@ -248,12 +248,14 @@ class PaDecodePipeline:
             if const_expr(self.traits.MTP4_FUSED):
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
-                self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1), tt1)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
         next_state[self.traits.K_SLOT] = k_next
 
         gpu.barrier()
@@ -298,6 +300,7 @@ class PaDecodePipeline:
 
             gpu.barrier()
 
+            v_masks = self.kv.tail_masks(tile_valid)
             v_next_chunks = []
             for m in range_constexpr(self.traits.M_TILES):
                 p_base = self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
@@ -335,6 +338,10 @@ class PaDecodePipeline:
                 )
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.mask_v_chunk(
+                            v_vh_shared[vh], v_masks, tile_valid
+                        )
                     v_vh = v_vh_shared[vh]
                     op = self.gemm.pv(v_vh, p_ops) * fx.full(
                         self.traits.OP_ELEMS, v_max_scaled, fx.Float32
@@ -435,7 +442,13 @@ class PaDecodePipeline:
                 )
 
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
+                if const_expr(m == 0):
+                    v_masks = self.kv.tail_masks(tile_valid)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.mask_v_chunk(
+                            v_vh_shared[vh], v_masks, tile_valid
+                        )
                     v_vh = v_vh_shared[vh]
                     op = self.gemm.pv(v_vh, p_ops)
                     if const_expr(self.traits.per_token_kv):
@@ -506,14 +519,18 @@ class PaDecodePipeline:
                 # page16 defers K until the P barrier.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
                 if const_expr(not self.traits.PAGE16_VPIPE):
                     k_next = self.kv.load_k_from_pages(phys_vec1)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
         if const_expr(self.traits.SCALES_BEFORE_CURRENT_V):
             # Issue V after scale staging so scale waits do not drain V.
             v_vh_shared = [
@@ -597,10 +614,11 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
+        v_masks = self.kv.tail_masks(tile_valid)
         # vh outer, m inner: each M-tile is a separate accumulator chain on the
         # same V operand.
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
-            v_vh = v_vh_batch[vh]
+            v_vh = self.kv.mask_v_chunk(v_vh_batch[vh], v_masks, tile_valid)
             for m in range_constexpr(self.traits.M_TILES):
                 op = self.gemm.pv(v_vh, p_ops[m])
                 if const_expr(self.traits.per_token_kv):
@@ -880,23 +898,40 @@ class Gfx1250Pipeline:
         if const_expr(t.packed_lds):
             initial.append(fx.Float32(1.0))
         resident_q = (
-            not t.bf16 and (t.head_dim == 128 or t.packed_lds) and t.m_tiles == 1
+            not t.bf16
+            and (t.head_dim == 128 or t.packed_lds)
+            and (t.m_tiles == 1 or t.fp8_multi_tile)
         )
         if const_expr(resident_q):
             gpu.barrier()
-            q_operands = [
-                self.mem.operand(d * 128, t.q_stride, 128, ctx.lane16, ctx.half)
-                for d in range_constexpr(t.head_dim // 128)
-            ]
-            q_scale = fx.Float32(
-                self.mem.load(ctx.lane16 * t.q_stride + t.head_dim, fx.Float32)[0]
-            )
+            q_operands, q_scales = [], []
+            for m in range_constexpr(t.m_tiles):
+                q_operands.append(
+                    [
+                        self.mem.operand(
+                            m * 16 * t.q_stride + d * 128,
+                            t.q_stride,
+                            128,
+                            ctx.lane16,
+                            ctx.half,
+                        )
+                        for d in range_constexpr(t.head_dim // 128)
+                    ]
+                )
+                q_scales.append(
+                    fx.Float32(
+                        self.mem.load(
+                            (m * 16 + ctx.lane16) * t.q_stride + t.head_dim,
+                            fx.Float32,
+                        )[0]
+                    )
+                )
         for token_i, state in range(begin, end, t.TOKENS, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
             if const_expr(t.use_tdm):
                 tdm_ops.tensor_wait(0)
-                if const_expr(t.async_page):
+                if const_expr(t.async_page or t.page16_async_scales):
                     fx.rocdl.s_wait_asynccnt(0)
             else:
                 fx.rocdl.s_wait_asynccnt(0)
@@ -950,6 +985,17 @@ class Gfx1250Pipeline:
                     vnorm = fx.Float32(
                         rcp_f32((vfactor != 0.0).select(vfactor, fx.Float32(1.0)))
                     )
+            # All query tiles read the same chunk. Retain its WMMA
+            # operands instead of reloading K/V from LDS for each tile.
+            if const_expr(t.fp8_multi_tile):
+                packed_k_operands = [
+                    [
+                        self.mem.packed_k_operand(kv_off, n, d)
+                        for d in range_constexpr(t.head_dim // 128)
+                    ]
+                    for n in range_constexpr(t.TOKENS // 64)
+                ]
+                page_v_operands = self.mem.page_v_operands(kv_off)
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 if const_expr(t.q_tiles != t.m_tiles):
@@ -959,7 +1005,7 @@ class Gfx1250Pipeline:
                 row = m * 16 + ctx.lane16
                 qscale = fx.Float32(1.0)
                 if const_expr(resident_q):
-                    qscale = q_scale
+                    qscale = q_scales[m]
                 elif const_expr(not t.bf16):
                     qscale = fx.Float32(
                         self.mem.load(
@@ -983,22 +1029,18 @@ class Gfx1250Pipeline:
                 for n in range_constexpr(t.TOKENS // 64):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
                     for d in range_constexpr(t.head_dim // qk_k):
-                        if const_expr(t.packed_lds):
-                            if const_expr(t.TOKENS == 128):
-                                a = self.mem.page_k_operand(
-                                    kv_off + d * 128 * 128,
-                                    ctx.warp * 32 + n * 16,
-                                    ctx.lane16,
-                                    ctx.half,
-                                )
-                            else:
-                                a = self.mem.packed_operand(
-                                    kv_off + ctx.warp * t.head_dim * 16 + d * qk_k * 16,
-                                    16,
-                                    qk_k,
-                                    ctx.lane16,
-                                    ctx.half,
-                                )
+                        if const_expr(t.fp8_multi_tile):
+                            a = packed_k_operands[n][d]
+                        elif const_expr(t.packed_lds):
+                            a = self.mem.packed_k_operand(kv_off, n, d)
+                        elif const_expr(t.bf16_page16_packed):
+                            a = self.mem.bf16_k_operand(
+                                kv_off + ctx.warp * t.head_dim * 32,
+                                0,
+                                d * qk_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
                         else:
                             a = self.mem.operand(
                                 kv_off
@@ -1010,7 +1052,7 @@ class Gfx1250Pipeline:
                                 ctx.half,
                             )
                         if const_expr(resident_q):
-                            b = q_operands[d]
+                            b = q_operands[m][d]
                         else:
                             b = self.mem.operand(
                                 q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
@@ -1112,16 +1154,21 @@ class Gfx1250Pipeline:
                     )
                 # Prefetch V operands before waiting for cross-wave P stores.
                 pv_k = 32 if t.bf16 else t.TOKENS
-                if const_expr(t.packed_lds):
+                if const_expr(t.fp8_multi_tile):
+                    v_operands = page_v_operands
+                elif const_expr(t.packed_lds):
+                    v_operands = self.mem.page_v_operands(kv_off)
+                elif const_expr(t.bf16_page16_packed):
                     v_operands = [
                         [
-                            self.mem.packed_operand(
-                                kv_off + t.k_bytes + (vh * 64 + ctx.warp * 16) * 16,
-                                t.head_dim,
-                                t.TOKENS,
+                            self.mem.bf16_v_operand(
+                                kv_off + t.k_bytes,
+                                vh * 64 + ctx.warp * 16,
+                                d * pv_k,
                                 ctx.lane16,
                                 ctx.half,
                             )
+                            for d in range_constexpr(t.TOKENS // pv_k)
                         ]
                         for vh in range_constexpr(vh_count)
                     ]
