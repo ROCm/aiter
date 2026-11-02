@@ -312,6 +312,22 @@ class MegaMoEInternode:
         if str(comm_quant) not in _COMM_QUANT:
             raise ValueError(f"comm_quant must be one of {sorted(_COMM_QUANT)}, got {comm_quant!r}")
 
+    def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        """Point the next forwards at another layer's weights (same layouts as
+        the constructor).  One instance serves every shape-identical MoE layer;
+        the kernels read the weight addresses as runtime arguments, so a CUDA
+        graph captured after this call keeps that layer's addresses."""
+        for name, tensor in (("w1", w1), ("w1_scale", w1_scale), ("w2", w2), ("w2_scale", w2_scale)):
+            if tensor.device != self.device:
+                raise ValueError(f"{name} is on {tensor.device}, expected {self.device}")
+        self._check_weight_bytes(w1, w1_scale, w2, w2_scale)
+        self._w1 = _as_bytes(w1)
+        self._w1_scale = _as_bytes(w1_scale)
+        self._w2 = _as_bytes(w2)
+        self._w2_scale = _as_bytes(w2_scale)
+        self._k1_ptrs["arg_bq"] = self._w2.data_ptr()
+        self._k1_ptrs["arg_bscale"] = self._w2_scale.data_ptr()
+
     def _check_weight_bytes(self, w1, w1_scale, w2, w2_scale) -> None:
         expected = {
             "w1": self.epr * 2 * self.inter_dim * self.model_dim // 2,
