@@ -616,6 +616,18 @@ def _check_large_m_edges(
         if large._active_layer_slot != bound[0] or large.w2 is not bound[1]:
             raise AssertionError("a refused large-input bind_layer changed its state")
     slot_refusal = "PASS" if len(refusals) == 2 else "RANGE-ONLY"
+    # Stage1 reads scales as E8M0 bytes: another 1-byte dtype is refused before any launch.
+    x_q, x_scale = moe.quantize(x)
+    for label, stage1 in (
+        ("main", lambda s: moe._run_fused_stage1(x_q, weights, s, ids)),
+        ("large", lambda s: moe._large_m.forward_prequant(x_q, s, weights, ids)),
+    ):
+        try:
+            stage1(x_scale.view(torch.float8_e4m3fn))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label} Stage1 accepted float8_e4m3fn scales")
 
     layout = {
         "arch": "gfx950",
@@ -641,7 +653,8 @@ def _check_large_m_edges(
         print(
             f"[LARGE-M] bs={tokens} explicit_stream=PASS "
             f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS "
-            f"strided_weights=PASS xcd_gate=PASS slot_refusal={slot_refusal}",
+            f"strided_weights=PASS xcd_gate=PASS slot_refusal={slot_refusal} "
+            "scale_dtype=PASS",
             flush=True,
         )
 

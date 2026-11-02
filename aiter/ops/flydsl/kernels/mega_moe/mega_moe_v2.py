@@ -10,6 +10,7 @@ import mori.shmem as ms
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.utility import dtypes
 
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
@@ -869,8 +870,11 @@ class MegaMoEV2:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        if not scales.is_contiguous() or scales.element_size() != 1 or scales.device != self.dev:
-            raise ValueError(f"scales must be contiguous 1-byte E8M0 on {self.dev}")
+        # Other 1-byte dtypes would be read as E8M0 exponents without error.
+        if scales.dtype not in (torch.uint8, dtypes.fp8_e8m0):
+            raise ValueError(f"scales must be E8M0 (uint8 or {dtypes.fp8_e8m0}), got {scales.dtype}")
+        if not scales.is_contiguous() or scales.device != self.dev:
+            raise ValueError(f"scales must be contiguous on {self.dev}")
         if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
             # The kernel reads a full row of scales per token.
             raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
