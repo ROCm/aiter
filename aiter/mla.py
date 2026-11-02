@@ -1425,6 +1425,92 @@ def mla_decode_fwd(
         use_flydsl_ps1 = use_ps1_asm or head_plan.backend == _MlaBackendId.FLYDSL_PS1
         if use_flydsl_ps1:
             pass
+        elif (
+            nhead == 16
+            or (
+                get_gfx() == "gfx942"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx942"
+                and nhead in (16, 32, 64)
+                and nhead * max_seqlen_q == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 8
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 4
+            )
+            or (
+                get_gfx() == "gfx942"
+                and nhead == 8
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and max_seqlen_q == 2
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
+            )
+            or (
+                # gfx942 native qh64 fp8 persistent decode (PR #3188) was only
+                # validated at page_size=64. At page_size=1 (the layout vLLM MLA
+                # uses) mla_a8w8_qh64_qseqlen1_gqaratio64_v3_ps.co does an
+                # out-of-bounds GPU access and faults on the first decode. Gate
+                # the native path to the validated page_size=64; other page sizes
+                # fall through to the qh16 fold (pre-#3188 path, runs correctly).
+                # Repro: op_tests/test_mla_qh64_gfx942_pagesize1.py
+                get_gfx() == "gfx942"
+                and nhead == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
+                and page_size == 64
+            )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 96
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q <= 6
+            )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and nhead == 12
+                and nhead * max_seqlen_q <= 128
+            )
+        ):
+            pass
         elif head_plan.plan in (
             _MlaHeadPlanKind.NATIVE,
             _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
