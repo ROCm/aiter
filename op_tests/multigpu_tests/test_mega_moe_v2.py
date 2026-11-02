@@ -599,12 +599,14 @@ def _check_large_m_edges(
     if moe.w2 is not bound_w2:
         raise AssertionError("a refused bind_layer changed the bound weights")
     # The same for the large-input runtime itself: a refused binding keeps its slot and weights.
+    # Strided weights for another slot need two slots (--large-m-state-slots); one slot checks the range only.
     large = moe._large_m
     bound = (large._active_layer_slot, large.w2)
-    for slot, w2 in (
-        ((bound[0] + 1) % large.state_slots, large.w2.transpose(-1, -2)),
-        (1 << 20, large.w2.clone()),
-    ):
+    refusals = [(1 << 20, large.w2.clone())]
+    other_slot = (bound[0] + 1) % large.state_slots
+    if other_slot != bound[0]:
+        refusals.append((other_slot, large.w2.transpose(-1, -2)))
+    for slot, w2 in refusals:
         try:
             large.bind_layer(slot, large._s1_w1, large._s1_w1_scale, w2, large.w2_scale)
         except ValueError:
@@ -613,6 +615,7 @@ def _check_large_m_edges(
             raise AssertionError("the large-input runtime accepted a refused binding")
         if large._active_layer_slot != bound[0] or large.w2 is not bound[1]:
             raise AssertionError("a refused large-input bind_layer changed its state")
+    slot_refusal = "PASS" if len(refusals) == 2 else "RANGE-ONLY"
 
     layout = {
         "arch": "gfx950",
@@ -638,7 +641,7 @@ def _check_large_m_edges(
         print(
             f"[LARGE-M] bs={tokens} explicit_stream=PASS "
             f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS "
-            "strided_weights=PASS xcd_gate=PASS",
+            f"strided_weights=PASS xcd_gate=PASS slot_refusal={slot_refusal}",
             flush=True,
         )
 
@@ -951,7 +954,8 @@ def main():
     parser.add_argument("--expect-large-m", action="store_true")
     parser.add_argument("--compare-main", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
-    parser.add_argument("--large-m-state-slots", type=int, default=1)
+    # Two by default, so the edge checks can bind another slot.
+    parser.add_argument("--large-m-state-slots", type=int, default=2)
     parser.add_argument("--layer-stress-cycles", type=int, default=0)
     parser.add_argument("--route-switch-rounds", type=int, default=0)
     args = parser.parse_args()
