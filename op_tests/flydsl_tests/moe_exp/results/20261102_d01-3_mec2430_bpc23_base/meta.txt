@@ -1,0 +1,17 @@
+start      2026-11-02 00:42:49 UTC
+host       heliosr-1b114-d01-3   boot 2026-11-01 23:42:32 (system clock, UTC)
+repo       f471dc7f4 2026-11-01 21:25:09 +0000 moe_exp: 2026-11-01 baseline at 8ea2265dc; profiler probe
+dirty      0 modified tracked files
+python     3.12.3 | torch 2.11.0+rocm10.1.0a20260820 | flydsl 0.3.3.dev882 | aiter 0.1.27.dev297+g34a8bad6a @ /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/__init__.py
+site       /data/lixzhang/flydsl_moe_exp/site_8ea2265dc
+firmware   CP_MEC1 FW_VERSION: 2430 PM FW_VERSION: 02.125.15.00
+clock       MAX_CLK: 2400 MHz
+power cap   SOCKET_POWER_LIMIT: 2500 W  SOCKET_POWER_LIMIT: 3700 W
+variants   base
+rounds     5 timed (+ warm-up round 0)
+args       --scenario kernel --data-format a4w4 --experts 64 --tokens 1536 --topk 8 --model-dim 7168 --inter-dim 2048 --act silu --no-bias --iters 128 --no-check-aot-cache --data-init uniform --scale-init uniform
+base env   AITER_FLYDSL_MMA_FIRST_GROUP=4 AITER_FLYDSL_MMA_GROUP=4 AITER_FLYDSL_DS_FIRST_N=8 AITER_USE_GROUPED_GEMM=1 AITER_GROUPED_DEBUG=0 ENABLE_CK=0 FLYDSL_DUMP_IR=1 AITER_LOG_MORE=1 AITER_MOE_EXPERT_BALANCE=true AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+node tuning (added after the run) perf_setup_BPC23.sh v2026.10.29 applied 2026-11-02 00:25 UTC on this boot
+           (power-cycled boot 23:42 UTC): voltage offset -82 mV, CSC DVO offset 25 mV (agt_internal), CPU governor
+           performance, numa_balancing 0, amdgpu default params (MTYPE RW, XNACK off). perf_env.sh NOT sourced
+           (it sets ROCM_PATH/LD_LIBRARY_PATH to /opt/rocm and HSA_XNACK=1). Clock skew probe 00:42 UTC: +0.016 ms (ok).

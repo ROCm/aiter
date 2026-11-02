@@ -9,6 +9,10 @@ AITER run_perftest's profiler settings and prints how many device events came ba
 Healthy: 256 events per trial. 0 = the profiler's kernel tracing is broken on this
 node/boot (seen 2026-11-01 on heliosr-1b114-d01-3, MEC 2430, while rocprofv3
 --kernel-trace still recorded every kernel); only graph_us is then valid.
+The cause there: after warm reboots the GPU's REALTIME counter (kernel completion
+timestamps) ran 38.8 s per reboot ahead of KFD's clock counter (which ROCr uses to
+convert GPU ticks to host time), so every kernel record fell outside the profiler
+window. A power cycle re-aligned them (2026-11-01 23:42 UTC boot: 256 of 256).
 
 usage: python op_tests/flydsl_tests/moe_exp/profiler_probe.py   (no aiter import)
 """

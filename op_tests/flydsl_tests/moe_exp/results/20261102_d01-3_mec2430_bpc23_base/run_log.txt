@@ -1,0 +1,26 @@
+start      2026-11-02 00:42:49 UTC
+host       heliosr-1b114-d01-3   boot 2026-11-01 23:42:32 (system clock, UTC)
+repo       f471dc7f4 2026-11-01 21:25:09 +0000 moe_exp: 2026-11-01 baseline at 8ea2265dc; profiler probe
+dirty      0 modified tracked files
+python     3.12.3 | torch 2.11.0+rocm10.1.0a20260820 | flydsl 0.3.3.dev882 | aiter 0.1.27.dev297+g34a8bad6a @ /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/__init__.py
+site       /data/lixzhang/flydsl_moe_exp/site_8ea2265dc
+firmware   CP_MEC1 FW_VERSION: 2430 PM FW_VERSION: 02.125.15.00
+clock       MAX_CLK: 2400 MHz
+power cap   SOCKET_POWER_LIMIT: 2500 W  SOCKET_POWER_LIMIT: 3700 W
+variants   base
+rounds     5 timed (+ warm-up round 0)
+args       --scenario kernel --data-format a4w4 --experts 64 --tokens 1536 --topk 8 --model-dim 7168 --inter-dim 2048 --act silu --no-bias --iters 128 --no-check-aot-cache --data-init uniform --scale-init uniform
+base env   AITER_FLYDSL_MMA_FIRST_GROUP=4 AITER_FLYDSL_MMA_GROUP=4 AITER_FLYDSL_DS_FIRST_N=8 AITER_USE_GROUPED_GEMM=1 AITER_GROUPED_DEBUG=0 ENABLE_CK=0 FLYDSL_DUMP_IR=1 AITER_LOG_MORE=1 AITER_MOE_EXPERT_BALANCE=true AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+[2026-11-02 00:42:49 UTC] base_r0 queued 
+[2026-11-02 00:43:16 UTC] base_r0 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.91 gemm1: profiler_us = 74.10 gemm2: profiler_us = 51.71 quant_a1: graph_us = 20.37 gemm1: graph_us = 74.67 gemm2: graph_us = 51.73 
+[2026-11-02 00:43:16 UTC] base_r1 queued 
+[2026-11-02 00:43:44 UTC] base_r1 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.89 gemm1: profiler_us = 73.73 gemm2: profiler_us = 52.08 quant_a1: graph_us = 20.31 gemm1: graph_us = 74.81 gemm2: graph_us = 51.79 
+[2026-11-02 00:43:44 UTC] base_r2 queued 
+[2026-11-02 00:44:12 UTC] base_r2 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.75 gemm1: profiler_us = 74.53 gemm2: profiler_us = 51.67 quant_a1: graph_us = 20.34 gemm1: graph_us = 75.04 gemm2: graph_us = 51.75 
+[2026-11-02 00:44:12 UTC] base_r3 queued 
+[2026-11-02 00:44:40 UTC] base_r3 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.67 gemm1: profiler_us = 74.72 gemm2: profiler_us = 52.22 quant_a1: graph_us = 20.26 gemm1: graph_us = 74.85 gemm2: graph_us = 51.80 
+[2026-11-02 00:44:40 UTC] base_r4 queued 
+[2026-11-02 00:45:09 UTC] base_r4 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.73 gemm1: profiler_us = 74.97 gemm2: profiler_us = 52.50 quant_a1: graph_us = 20.33 gemm1: graph_us = 74.96 gemm2: graph_us = 51.99 
+[2026-11-02 00:45:09 UTC] base_r5 queued 
+[2026-11-02 00:45:37 UTC] base_r5 rc=0  idle: GPU use 0%, VRAM 168 MB | quant_a1: profiler_us = 21.65 gemm1: profiler_us = 74.63 gemm2: profiler_us = 52.52 quant_a1: graph_us = 20.38 gemm1: graph_us = 75.03 gemm2: graph_us = 51.82 
+[2026-11-02 00:45:37 UTC] DONE

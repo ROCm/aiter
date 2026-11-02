@@ -1,0 +1,287 @@
+[moe-exp] idle: GPU use 0%, VRAM 168 MB
+[aiter INFO] 2026-11-02 00:43:20.013 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/jit/core.py:1045 - get_module_custom_op
+import [module_aiter_core] under /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/jit/module_aiter_core.so
+[aiter INFO] 2026-11-02 00:43:20.644 - MainProcess:154018 - /data/lixzhang/aiter-branches/flydsl-moe-exp/op_tests/flydsl_tests/test_flydsl_grouped_gemm.py:1203 - set_data_format
+grouped GEMM data format: a4w4
+[aiter INFO] 2026-11-02 00:43:20.863 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/jit/core.py:1045 - get_module_custom_op
+import [module_moe_asm] under /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/jit/module_moe_asm.so
+[aiter INFO] 2026-11-02 00:43:20.902 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/jit/core.py:748 - get_config_file
+merge tuned file under model_configs/ and configs/ /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/gptoss_gfx1250_tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/kimik3tp8_tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/qwen3_5_397b_tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/kimik3_gfx1250_tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/dsv41_tuned_grouped_fmoe.csv:/data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/configs/model_configs/minimax_m3_gfx1250_tuned_grouped_fmoe.csv
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_route/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_contiguous_psum_remap/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_quant_fd7168_r8_fp4_pk8_w16/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds
+[flydsl.compile] dump 00_origin -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/dump-base/moe_gather_reduce_bf16_d7168_tk8_sk1_v4_wf32_frlds/21_final_isa.s
+[aiter INFO] 2026-11-02 00:43:40.269 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:93 - wrapper
+avg: 56.178538710810244 us/iter from cuda.Event
+/home/lixzhang/gfx1250/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1102 00:43:40.382262305 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter INFO] 2026-11-02 00:43:40.324 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:361 - post_process_data
+abnormal data indices: {1538, 1284, 10, 523, 1291, 1550, 656, 18, 531, 1557, 664, 2329, 2336, 1835, 1842, 695, 1853, 702, 1861, 1360, 1367, 219, 227, 998, 1006, 1530}
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 9.734000000000378
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 13.820000000000164
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.697999999999979
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.217000000000098
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 9.97400000000016
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.458000000000538
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.538000000000011
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 9.774000000000001
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.337999999999965
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 11.976999999999862
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 10.695999999999913
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.298000000000684
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 13.338999999999942
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.25799999999981
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.216999999999643
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 13.739999999999782
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.096999999999753
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 9.532999999999902
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 10.9350000000004
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.216999999999643
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.577999999999975
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.177000000000021
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 11.537000000000035
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.417999999999665
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 12.137000000000171
+[aiter INFO] 2026-11-02 00:43:40.325 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 15.30199999999968
+[aiter INFO] 2026-11-02 00:43:40.336 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:447 - get_trace_perf
+                                                                              name   cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot 115.0            0.0          1,105.6              9.6        CUDA            2
+1                                             moe_apre_quant_fd7168_r8_fp4_pk8_w16 115.0            0.0          1,412.2             12.3        CUDA            2
+[avg us/iter]                                                                  NaN   NaN            0.0             21.9              NaN         NaN          NaN
+[aiter INFO] 2026-11-02 00:43:40.353 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:93 - wrapper
+avg: 112.71074187243357 us/iter from cuda.Event
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:361 - post_process_data
+abnormal data indices: {9, 940, 1261, 1231, 370}
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 79.56
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 81.28200000000015
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 84.36700000000019
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 83.40499999999975
+[aiter INFO] 2026-11-02 00:43:40.387 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 82.28399999999988
+[aiter INFO] 2026-11-02 00:43:40.393 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:447 - get_trace_perf
+                                                                                                                                                            name   cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain 123.0            0.0          9,068.9             73.7        CUDA            2
+[avg us/iter]                                                                                                                                                NaN   NaN            0.0             73.7              NaN         NaN          NaN
+[aiter INFO] 2026-11-02 00:43:40.406 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:93 - wrapper
+avg: 87.60746085317805 us/iter from cuda.Event
+[aiter INFO] 2026-11-02 00:43:40.434 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:361 - post_process_data
+abnormal data indices: {1120, 1122, 8, 911, 148, 374}
+[aiter INFO] 2026-11-02 00:43:40.434 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 60.371000000000095
+[aiter INFO] 2026-11-02 00:43:40.434 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 57.246000000000095
+[aiter INFO] 2026-11-02 00:43:40.434 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 58.328
+[aiter INFO] 2026-11-02 00:43:40.435 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 58.64899999999989
+[aiter INFO] 2026-11-02 00:43:40.435 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 57.24599999999998
+[aiter INFO] 2026-11-02 00:43:40.435 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:363 - post_process_data
+abnormal data: 60.53099999999995
+[aiter INFO] 2026-11-02 00:43:40.440 - MainProcess:154018 - /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/test_common.py:447 - get_trace_perf
+                                                                                                                                                  name   cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain 122.0            0.0          6,353.9             52.1        CUDA            2
+[avg us/iter]                                                                                                                                      NaN   NaN            0.0             52.1              NaN         NaN          NaN
+[moe-exp] quant_a1: profiler_us = 21.89
+[moe-exp] gemm1: profiler_us = 73.73
+[moe-exp] gemm2: profiler_us = 52.08
+[moe-exp] quant_a1: graph_us = 20.31 (median of 10 replays x 128 launches, range 20.27-20.35, after 1 s idle)
+[moe-exp] gemm1: graph_us = 74.81 (median of 10 replays x 128 launches, range 73.62-86.30, after 1 s idle)
+[moe-exp] gemm2: graph_us = 51.79 (median of 10 replays x 128 launches, range 51.54-52.39, after 1 s idle)
+[moe-exp] saved output /data/lixzhang/flydsl_moe_exp/runs/base8ea_20261102_0042/out/base_r1.pt (1536, 7168)
+[sanity a4w4 silu] kernel: logits_diff=3.4249e-06 rel_l2=2.6172e-03 (gate<0.01, ref_norm=4.5061e+06)
+[kernel-bench a4w4 silu] gemm1: us = 73.73, FLOPS = 721554505728, TFLOPS = 9786.28, Bandwidth = 14856.24 GB/s
+[kernel-bench a4w4 silu] gemm2: us = 52.08, FLOPS = 360777252864, TFLOPS = 6927.17, Bandwidth = 13222.60 GB/s
+
+[precision summary]
+| data_format   | act   | data_init   | scale_init   |   seed |   experts |   tokens |   topk |   model_dim |   inter_dim |   logits_diff |     rel_l2 | pass   | us   |   gemm1_us |   gemm2_us |   gemm1_TFLOPS |   gemm1_Bandwidth (GB/s) |   gemm2_TFLOPS |   gemm2_Bandwidth (GB/s) |
+|:--------------|:------|:------------|:-------------|-------:|----------:|---------:|-------:|------------:|------------:|--------------:|-----------:|:-------|:-----|-----------:|-----------:|---------------:|-------------------------:|---------------:|-------------------------:|
+| a4w4          | silu  | uniform     | uniform      |      0 |        64 |     1536 |      8 |        7168 |        2048 |   3.42494e-06 | 0.00261722 | True   |      |    73.7312 |    52.0815 |        9786.28 |                  14856.2 |        6927.17 |                  13222.6 |

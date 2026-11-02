@@ -103,7 +103,7 @@ is the Python launcher bound to one eager run's tensors, so calling it re-launch
   does nothing: every launch reads the same inputs and writes the same outputs. The test prints gemm1 and gemm2;
   `bench_driver.py` prints all three (`[moe-exp] <name>: profiler_us`), from the same values. If it prints
   `n/a` (the test: `us = nan`), the profiler trace had no kernel events; `profiler_probe.py` checks whether the
-  node's torch profiler records kernels at all.
+  node's torch profiler records kernels at all (on d01-3 it stopped after warm reboots; see the 2026-11-01 results).
 - **graph_us**: after the test has timed all three callables, `bench_driver.py` captures each callable 128 times
   into one CUDA graph, replays it 10 times, and times each replay with CUDA events: the median time per launch.
   No profiler; launches run back to back and the number includes the ~1.5 us gaps between kernels. The GPU idles
@@ -133,9 +133,34 @@ Why the two timers differ. They time different launch regimes, and only one of t
 Rules we follow for numbers worth comparing: one shape per process; interleave the variants being compared;
 median of 3 or more timed rounds; compare only numbers from the same boot; keep `meta.txt` with the results.
 Clocks, power limits and firmware matter: a node whose perf settings were not re-applied after a reboot can run
-5-20% slow.
+5-20% slow. After a reboot also run `profiler_probe.py`: if it gets no events, profiler_us stays n/a on that boot.
 
 ## Results
+
+### 2026-11-02, heliosr-1b114-d01-3 (MI450X), at 8ea2265dc, MEC 2430, BPC23 perf setup applied
+
+`results/20261102_d01-3_mec2430_bpc23_base/` (meta.txt, summary.txt, run_log.txt, one full process log,
+profiler_probe.txt). Command: `LOCK=gpu-lock IDLE_CHECK=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 5` with the
+kit at f471dc7f4, 5 timed rounds, one process each, 00:42-00:45 UTC.
+
+| Kernel | profiler_us (median, range) | graph_us (median, range) | TB/s (profiler) | TB/s (graph) |
+|---|---|---|---|---|
+| quant_a1 | 21.73 (21.65-21.89) | 20.33 (20.26-20.38) | - | - |
+| gemm1 | 74.63 (73.73-74.97) | 74.96 (74.81-75.04) | 14.18 | 14.12 |
+| gemm2 | 52.22 (51.67-52.52) | 51.80 (51.75-51.99) | 13.19 | 13.29 |
+
+- Node state: boot 2026-11-01 23:42 UTC after a power cycle; MEC firmware 2430 (sha256 d798bf71...), PM 02.125.15.00,
+  MAX_CLK 2400 MHz, 2.5 kW socket power limit. `perf_setup_BPC23.sh` v2026.10.29 applied at 00:25 UTC: voltage
+  offset -82 mV, CSC DVO offset 25 mV, CPU governor performance, NUMA balancing off, amdgpu default parameters
+  (MTYPE RW, XNACK off). Its `perf_env.sh` was not sourced: it points `ROCM_PATH` and `LD_LIBRARY_PATH` at
+  /opt/rocm instead of the venv's ROCm, and its only non-default setting is `HSA_XNACK=1`.
+- The torch profiler records kernels again on this boot (`profiler_probe.py`: 256 of 256 events), so profiler_us is
+  back.
+- Correct in every round (`logits_diff=3.4249e-06`, `rel_l2=2.6172e-03`); all 6 outputs bit-identical.
+- Against 2026-11-01 (same code and firmware; another boot, perf settings not applied): graph_us +0.4% quant_a1,
+  +0.3% gemm1, +0.2% gemm2, so no measurable change from the perf setup. Different boots, so a rough comparison.
+- profiler_us and graph_us agree within 0.8% (gemm1 74.63 vs 74.96, gemm2 52.22 vs 51.80). On 2026-10-28
+  (2489bae2d, MEC 2560) profiler_us was 3.6% (gemm1) and 9.6% (gemm2) above graph_us.
 
 ### 2026-11-01, heliosr-1b114-d01-3 (MI450X), at 8ea2265dc
 
@@ -153,7 +178,10 @@ each, 21:15-21:21 UTC.
   (the test prints `us = nan`) and a single, implausible event (2.85 ms) for quant_a1 in 2 of 5 rounds.
   `profiler_probe.py` gets 0 of 256 events for plain torch copies and matmuls on the same boot, while rocprofv3
   `--kernel-trace` records every kernel. So the node's torch-profiler path is broken, not this code; on
-  2026-10-29 (MEC 2560) the same code gave profiler numbers.
+  2026-10-29 (MEC 2560) the same code gave profiler numbers. Cause, found the same day: the GPU's REALTIME counter,
+  which stamps kernel completion, ran 38.8 s ahead of KFD's clock counter, which ROCr uses to convert GPU ticks to
+  host time, so every kernel record landed outside the profiler's window. Each warm reboot added another 38.8 s
+  (77.7 s after the next one); a power cycle re-aligned them (2026-11-02 results).
 - Correct in every round (`logits_diff=3.4249e-06`, `rel_l2=2.6172e-03`); all 6 outputs bit-identical.
 - Node state: boot 2026-11-01 08:28 UTC, MEC firmware 2430 (`gc_12_1_0_mec.bin` sha256 d798bf71...), PM
   02.125.15.00, MAX_CLK 2400 MHz, 2.5 kW socket power limit, the node's perf settings not re-applied after that boot.
