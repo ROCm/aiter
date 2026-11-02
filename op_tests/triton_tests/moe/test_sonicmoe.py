@@ -129,7 +129,7 @@ def test_sonicmoe_pre_routed_forward_backward(activation):
     out, _ = moe_pre_routed_inputs(
         x,
         scores,
-        torch.tensor(counts, dtype=torch.int32),
+        torch.tensor(counts, dtype=torch.int32, device="cuda"),
         w1,
         None,
         w2,
@@ -166,8 +166,12 @@ def test_grouped_gemm_blockwise_fp8_matches_dequantized_torch():
     experts, m, k, n = len(counts), sum(counts), 128, 128
     a_scale = torch.rand(m, 1, device="cuda", dtype=torch.float32) + 0.5
     b_scale = torch.rand(experts, 1, 1, device="cuda", dtype=torch.float32) + 0.5
-    a = torch.randn(m, k, device="cuda").clamp(-2, 2).to(fp8)
-    b = torch.randn(experts, k, n, device="cuda").clamp(-2, 2).to(fp8)
+    a = torch.randn(m, k, device="cuda", dtype=torch.float32).clamp(-2, 2).to(fp8)
+    b = (
+        torch.randn(experts, k, n, device="cuda", dtype=torch.float32)
+        .clamp(-2, 2)
+        .to(fp8)
+    )
     offsets = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
     actual = grouped_gemm(
         a,
@@ -194,8 +198,8 @@ def test_grouped_wgrad_validates_scale_rows_per_expert():
     a = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
     offsets = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    a_scale = torch.ones(1, 128, device="cuda")
-    b_scale = torch.ones(1, 128, device="cuda")
+    a_scale = torch.ones(1, 128, device="cuda", dtype=torch.float32)
+    b_scale = torch.ones(1, 128, device="cuda", dtype=torch.float32)
 
     with pytest.raises(ValueError, match=r"A_scale must have shape \[2, 128\]"):
         grouped_gemm(

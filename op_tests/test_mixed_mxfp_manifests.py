@@ -14,24 +14,33 @@ _MANIFESTS = (
         "f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         "mxfp6_mxfp4_c0_256_padk2",
         "a6w4_asm_tuned_gemm.csv",
-        3,
+        25,
+        6,
     ),
     (
         "f4f6gemm",
         "f4f6gemm_bf16_per1x32Fp4Fp6.csv",
         "mxfp4_c0_mxfp6_256_padk2",
         "a4w6_asm_tuned_gemm.csv",
-        2,
+        24,
+        6,
     ),
 )
 
 
 @pytest.mark.parametrize(
-    ("module", "manifest_name", "pack_layout", "tuned_name", "exact_count"),
+    (
+        "module",
+        "manifest_name",
+        "pack_layout",
+        "tuned_name",
+        "exact_count",
+        "generic_count",
+    ),
     _MANIFESTS,
 )
 def test_mixed_mxfp_manifest_objects(
-    module, manifest_name, pack_layout, tuned_name, exact_count
+    module, manifest_name, pack_layout, tuned_name, exact_count, generic_count
 ):
     manifest_dir = _REPO_ROOT / "hsa" / "gfx950" / module
     with (manifest_dir / manifest_name).open(newline="") as manifest_file:
@@ -40,17 +49,20 @@ def test_mixed_mxfp_manifest_objects(
     kernel_names = {row["knl_name"] for row in rows}
     assert len(rows) >= 4
     assert len(kernel_names) == len(rows)
+    entrypoints = {}
     for kernel_name in kernel_names:
         match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", kernel_name)
         assert match is not None
         declared_length, entrypoint = match.groups()
         assert int(declared_length) == len(entrypoint)
         assert entrypoint.startswith(f"{module}_")
+        entrypoints[kernel_name] = entrypoint
     assert len({row["co_name"] for row in rows}) == len(rows)
     assert {row["co_name"] for row in rows} == {
         path.name for path in manifest_dir.glob("*.co")
     }
     for row in rows:
+        assert row["co_name"] == f"{entrypoints[row['knl_name']]}.co"
         assert row["pack_layout"] == pack_layout
         assert row["tile_M"] == row["tile_N"] == row["block_size"] == "256"
         assert row["splitK"] == "0"
@@ -74,13 +86,18 @@ def test_mixed_mxfp_manifest_objects(
         code_object_bytes = code_object.read_bytes()
         assert code_object_bytes.startswith(b"\x7fELF")
         assert row["knl_name"].encode() in code_object_bytes
-    assert (
-        sum(
-            any(int(row[name]) > 0 for name in ("exact_M", "exact_N", "exact_K"))
-            for row in rows
-        )
-        == exact_count
+    actual_exact_count = sum(
+        any(int(row[name]) > 0 for name in ("exact_M", "exact_N", "exact_K"))
+        for row in rows
     )
+    assert actual_exact_count == exact_count
+    assert len(rows) - actual_exact_count == generic_count
+    assert {row["knl_name"] for row in rows if "dmabig_m82" in row["knl_name"]} == {
+        f"_ZN5aiter44{module}_bf16_per1x32"
+        f"{'Fp6Fp4' if module == 'f6f4gemm' else 'Fp4Fp6'}"
+        f"_dmabig_m82_s{swizzle}_ntE"
+        for swizzle in (0, 3)
+    }
 
     tuned_path = _REPO_ROOT / "aiter" / "configs" / tuned_name
     with tuned_path.open(newline="") as tuned_file:

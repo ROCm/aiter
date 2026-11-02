@@ -88,6 +88,9 @@ TUNED_KEY_COLUMNS = (
 )
 TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
 TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
+# Optional result column: output rows of a block's 2D patch (kH x kW reuse).
+# A table without it, or an empty cell, means 1 (consecutive rows).
+TUNED_BLOCK_ROWS_COLUMN = "block_r"
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
 TUNED_LIBTYPE_COLUMN = "libtype"
@@ -123,6 +126,15 @@ def _parse_tuned_bool(value) -> bool:
     if normalized in {"1", "true", "yes"}:
         return True
     raise ValueError(f"Expected True/False, got {value!r}")
+
+
+def _parse_block_rows(value) -> int:
+    """A tuned-CSV ``block_r`` cell; missing, empty or "Null" (pre-column rows) is 1."""
+    try:
+        rows = int(float(value))
+    except (TypeError, ValueError):
+        return 1
+    return max(rows, 1)
 
 
 def _is_matmul_shape(*, groups, kt, kh, kw, st, sh, sw, pt, ph, pw) -> bool:
@@ -179,8 +191,12 @@ def _implicit_param_from_problem(
     out_ndhwc,
     pad_mode="zeros",
     dyn_hw=False,
+    kw_reuse=None,
+    block_rows=1,
 ):
     """Compile param for a caller-facing problem (unpadded ``C``)."""
+    if kw_reuse is None:
+        kw_reuse = bool(AITER_CONV3D_KW_REUSE)
     return make_conv3d_implicit_param(
         n,
         groups * _pad_channels(c // groups),
@@ -208,8 +224,18 @@ def _implicit_param_from_problem(
         groups,
         out_ndhwc,
         dyn_hw,
+        kw_reuse,
+        block_rows,
     )
 
+
+# Share the im2col input across filter taps in LDS when the layer allows it
+# (see make_im2col_plan): the kW strip, and the kH x kW 2D output block where
+# a tuned row sets block_r. Part of the compile key. Temporary rollback switch
+# while the reuse paths are validated: 0 gives one A tile per tap, but the
+# tuned tables are tuned with it on, and some of their tiles then hold one
+# block per CU instead of two.
+AITER_CONV3D_KW_REUSE = int(os.environ.get("AITER_CONV3D_KW_REUSE", "1"))
 
 # Runtime D/H/W so one artifact serves every resolution. Set 0 to compile per
 # size (tiny fixed-shape workloads). BIG_IN/BIG_OUT/M-chunking stay static.
@@ -245,7 +271,7 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """``{(gfx, cu_num, *shape): (tile, wgm, splitk)}``. Empty dict on any failure."""
+    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows)}``. Empty dict on any failure."""
     try:
         import pandas as pd
 
@@ -307,6 +333,7 @@ def _load_tuned_table():
                 splitk = None
             if splitk is not None:
                 splitk = splitk or 1
+            block_rows = _parse_block_rows(getattr(row, TUNED_BLOCK_ROWS_COLUMN, None))
             table[key] = (
                 (
                     int(row.tile_m),
@@ -316,6 +343,7 @@ def _load_tuned_table():
                 ),
                 int(row.wgm),
                 splitk,
+                block_rows,
             )
         if skipped_libtypes:
             from aiter import logger
@@ -365,9 +393,10 @@ def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
                 f"for the exact config."
             )
             return
+        br_s = f", block_rows={hit[3]}" if hit[3] > 1 else ""
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
-            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}."
+            f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}{br_s}."
         )
         return
 
@@ -439,11 +468,11 @@ def _borrow_tuned_tile(dev, key):
     f = dict(zip(TUNED_KEY_COLUMNS, key))
     if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
         return None
-    return (hit[0], hit[1], None)
+    return (hit[0], hit[1], None, hit[3])
 
 
 def _lookup_tuned_tile(key, device):
-    """Tuned (tile, wgm, splitk) for this device, or a borrowed same-layer row."""
+    """Tuned (tile, wgm, splitk, block_rows) for this device, or a borrowed same-layer row."""
     del device
     if key is None:
         return None
@@ -729,6 +758,7 @@ def _conv3d_impl(
     wgm=None,
     input_layout="NCDHW",
     output_layout="NCDHW",
+    block_rows=None,
 ):
     _check_layouts(3, input_layout, output_layout)
 
@@ -888,7 +918,7 @@ def _conv3d_impl(
     x_ndhwc = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    def _run(the_tile, the_wgm=1, tuned_splitk=None):
+    def _run(the_tile, the_wgm=1, tuned_splitk=None, the_block_rows=1):
         # Caller splitk= wins; else freeze the CSV value so AOT and runtime share a key.
         sk_arg = splitk if splitk is not None else tuned_splitk
         sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, the_tile, groups)
@@ -928,6 +958,7 @@ def _conv3d_impl(
                 out_ndhwc,
                 pad_mode,
                 dyn_hw,
+                block_rows=the_block_rows,
             )
         )
         _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
@@ -935,13 +966,14 @@ def _conv3d_impl(
 
     forced_wgm = None if wgm is None else max(1, int(wgm))
     tuned_splitk = None
+    chosen_block_rows = 1
     if tile is not None:
         chosen_tile = tuple(tile)
         chosen_wgm = 1 if forced_wgm is None else forced_wgm
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
-            chosen_tile, chosen_wgm, tuned_splitk = hit
+            chosen_tile, chosen_wgm, tuned_splitk, chosen_block_rows = hit
             if forced_wgm is not None:
                 chosen_wgm = forced_wgm
         else:
@@ -952,7 +984,14 @@ def _conv3d_impl(
                 else forced_wgm
             )
 
-    y, sk = _run(chosen_tile, chosen_wgm, tuned_splitk=tuned_splitk)
+    if block_rows is not None:
+        chosen_block_rows = max(1, int(block_rows))
+    y, sk = _run(
+        chosen_tile,
+        chosen_wgm,
+        tuned_splitk=tuned_splitk,
+        the_block_rows=chosen_block_rows,
+    )
     if sk > 1:
         if has_bias:
             y = y + bias_arg.view(1, k)

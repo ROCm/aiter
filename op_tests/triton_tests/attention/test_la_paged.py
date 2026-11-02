@@ -102,7 +102,6 @@ def test_persistent_lean_attention(
     logger.info("Q shape=%s", q.shape)
     logger.info("K shape=%s", k.shape)
     logger.info("V shape=%s", v.shape)
-    torch.set_printoptions(threshold=10000)
 
     block_tables = []  # kv block tables used by lean attention
     ref_block_tables = []  # kv block tables used to compute reference results

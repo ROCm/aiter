@@ -17,6 +17,7 @@ pays a pre-transpose on top that no tile choice affects.
         -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 """
 
+import functools
 import os
 import time
 from typing import Any, ClassVar
@@ -30,20 +31,31 @@ from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
+    max_lds_bytes,
     tile_kernel_name,
 )
 from aiter.ops.flydsl.conv_kernels import (
     LIBTYPE_FLYDSL,
+    TUNED_BLOCK_ROWS_COLUMN,
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
     TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
     _check_supported_arch,
+    _implicit_param_from_problem,
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
 )
-from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import out_extent
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
+    make_conv_geometry,
+    make_tile_config,
+    out_extent,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
+    make_im2col_plan,
+    plan_lds_bytes,
+)
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -57,6 +69,7 @@ RESULT_LIST = [
     # This tuner only enumerates FlyDSL candidates, so it always writes that.
     TUNED_LIBTYPE_COLUMN,
     *TUNED_RESULT_COLUMNS,
+    TUNED_BLOCK_ROWS_COLUMN,
     "splitK",
     "us",
     "kernelName",
@@ -67,6 +80,11 @@ RESULT_LIST = [
 
 # Readings per shape in the compare benchmark; the gate keeps the fastest.
 RUN_CONFIG_REPS = 3
+
+# Output-block widths swept for kH x kW reuse: each tile also runs with
+# block_rows = TILE_M / cols for every cols here that divides it (rows >= 2),
+# where make_im2col_plan takes the 2D block up.
+BLOCK_COLS = (32, 64, 128)
 
 # Same tolerance as op_tests/test_flydsl_conv_implicit.py. The reference is bf16
 # rather than fp32 on purpose: the tuner needs to catch a config that computes
@@ -104,7 +122,7 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
     return {"x": x, "weight": weight, "bias": bias}
 
 
-def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
+def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=1):
     # splitk is pinned rather than re-derived by the dispatch, so the CSV column
     # is the value that was timed and AOT compiles the artifact the runtime asks
     # for.
@@ -114,6 +132,7 @@ def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
         bias=bias,
         tile=tile,
         wgm=wgm,
+        block_rows=block_rows,
         splitk=splitk,
         input_layout=LAYOUT,
         output_layout=LAYOUT,
@@ -322,8 +341,62 @@ class Conv3dTuner(TunerCommon):
         params = _row_params(kv)
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
 
+        # crs is built from the *padded* per-group channel count, matching what
+        # the kernel computes; splitK divisibility depends on it.
+        cgp = _pad_channels(c // groups)
+        crs = cgp * kt * kh * kw
+
+        def splitk_for(tile):
+            # num_cu explicitly, so the CU count behind the split is the same
+            # one the policy enumerated against and the tuned row is stamped
+            # with; the device probe it would fall back to is a second source.
+            return _resolve_splitk(
+                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
+            )
+
+        def plan_for(tile, block_rows):
+            param = _implicit_param_from_problem(
+                n, c, d, h, w, k, kt, kh, kw,
+                *params["stride"], *params["padding"], *params["dilation"],
+                groups, has_bias, splitk_for(tile), tile, 1, True,
+                block_rows=block_rows,
+            )  # fmt: skip
+            try:
+                return make_im2col_plan(
+                    param, make_conv_geometry(param), make_tile_config(tile)
+                )
+            except AssertionError:
+                return None  # the gather cannot reach this tile's span
+
+        @functools.cache
+        def block_rows_options(tile):
+            # (block_rows, plan): 1 (consecutive rows), plus every 2D output
+            # block the plan takes up. Cached: the policy's relaxation passes and
+            # the candidate filter below ask for the same tiles.
+            opts = [(1, plan_for(tile, 1))]
+            for cols in BLOCK_COLS:
+                rows = tile[0] // cols
+                if rows >= 2 and rows * cols == tile[0]:
+                    plan = plan_for(tile, rows)
+                    if plan is not None and plan.kh_reuse:
+                        opts.append((rows, plan))
+            return opts
+
+        def lds_bytes_fn(tile):
+            # The LDS the runtime will allocate for this tile on this shape:
+            # the kW / kH x kW reuse layouts differ from the default path's.
+            sizes = [
+                plan_lds_bytes(p) for _, p in block_rows_options(tile) if p is not None
+            ]
+            return min(sizes) if sizes else float("inf")
+
         configs = get_flydsl_conv3d_configs(
-            m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+            m_gemm,
+            n_gemm,
+            groups,
+            self.get_cu_num(),
+            max_configs=max_configs,
+            lds_bytes_fn=lds_bytes_fn,
         )
         # BASELINE_TILES covers the heuristic default but not a borrowed one: a
         # tile tuned at another resolution of this layer can fall outside this
@@ -332,16 +405,19 @@ class Conv3dTuner(TunerCommon):
             (self.get_gfx(), self.get_cu_num()),
             _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
         )
-        if borrowed is not None and (*borrowed[0], borrowed[1]) not in configs:
-            configs.append((*borrowed[0], borrowed[1]))
-
-        # crs is built from the *padded* per-group channel count, matching what
-        # the kernel computes; splitK divisibility depends on it.
-        cgp = _pad_channels(c // groups)
-        crs = cgp * kt * kh * kw
+        candidates = [
+            (*cfg5, r)
+            for cfg5 in configs
+            for r, plan in block_rows_options(tuple(cfg5[:4]))
+            if r == 1 or plan_lds_bytes(plan) <= max_lds_bytes()
+        ]
+        if borrowed is not None:
+            b = (*borrowed[0], borrowed[1], borrowed[3])
+            if b not in candidates:
+                candidates.append(b)
 
         tasks = []
-        for tile_m, tile_n, wave_m, wave_n, wgm in configs:
+        for tile_m, tile_n, wave_m, wave_n, wgm, block_rows in candidates:
             tile = (tile_m, tile_n, wave_m, wave_n)
             # splitK is derived, not swept. A split only buys occupancy where
             # the M/N grid alone cannot fill the device, and measured against
@@ -351,12 +427,7 @@ class Conv3dTuner(TunerCommon):
             # pinned rather than re-derived at dispatch, so the column records
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
-            # num_cu explicitly, so the CU count behind the split is the same
-            # one the policy enumerated against and the tuned row is stamped
-            # with; the device probe it would fall back to is a second source.
-            sk = _resolve_splitk(
-                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
-            )
+            sk = splitk_for(tile)
             info = (
                 keys,
                 tile_m,
@@ -365,7 +436,9 @@ class Conv3dTuner(TunerCommon):
                 wave_n,
                 wgm,
                 sk,
-                tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm),
+                block_rows,
+                tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm)
+                + (f"_r{block_rows}" if block_rows > 1 else ""),
             )
             tasks.append(
                 (
@@ -373,7 +446,7 @@ class Conv3dTuner(TunerCommon):
                     generate_data,
                     (n, c, d, h, w, k, kt, kh, kw, groups, has_bias),
                     run_flydsl_conv3d,
-                    (["x", "weight", "bias"], params, tile, wgm, sk),
+                    (["x", "weight", "bias"], params, tile, wgm, sk, block_rows),
                     {},
                     conv3d_ref,
                     (["x", "weight", "bias"], params),
@@ -466,7 +539,17 @@ class Conv3dTuner(TunerCommon):
         rows = []
         for el in results:
             info, time, err_ratio = el
-            keys, tile_m, tile_n, wave_m, wave_n, wgm, splitk, kernel_name = info
+            (
+                keys,
+                tile_m,
+                tile_n,
+                wave_m,
+                wave_n,
+                wgm,
+                splitk,
+                block_rows,
+                kernel_name,
+            ) = info
             tflops, bw = self.calculate(el)
             row = dict(zip(self.keys, keys))
             row.update(
@@ -477,6 +560,7 @@ class Conv3dTuner(TunerCommon):
                     "wave_m": wave_m,
                     "wave_n": wave_n,
                     "wgm": wgm,
+                    TUNED_BLOCK_ROWS_COLUMN: block_rows,
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,

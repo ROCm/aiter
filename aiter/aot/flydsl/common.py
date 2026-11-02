@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
+
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
-_DEFAULT_MAX_WORKERS = 64
 _DEFAULT_MAX_RETRIES = 2
-_DEFAULT_MEM_PER_WORKER_GB = 2.0
 _MAX_ERRORS_IN_MSG = 10
 
 
@@ -30,10 +30,8 @@ class OpKind(enum.Enum):
     construction errors instead of silently routing to the wrong code path."""
 
     MOE = "moe"
-    MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
     CONV = "conv"
-    GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
     MEGA_MOE = "mega_moe"
     FMHA_FP8 = "fmha_fp8"
@@ -133,31 +131,68 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
+def aot_target_archs() -> set[str] | None:
+    """The archs ``GPU_ARCHS`` names, as the wheel build sets it; ``None``
+    when it is unset or ``native``, meaning every arch the tables have."""
+    value = os.environ.get("GPU_ARCHS", "").strip()
+    if not value or value.lower() == "native":
+        return None
+    return {arch.strip() for arch in value.split(";") if arch.strip()}
+
+
+def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
+    """Environment of a process that replays the runtime for ``arch``. aiter
+    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
+    process starts with ``GPU_ARCHS`` naming ``arch`` and with
+    ``AITER_AOT_REPLAY=1``, under which aiter's runtime arch queries answer
+    ``arch`` instead of probing a device. The GPUs stay hidden, and aiter is
+    imported in full rather than in AOT mode."""
+    env = dict(os.environ)
+    env.pop("AITER_AOT_IMPORT", None)
+    env.update(
+        GPU_ARCHS=arch,
+        AITER_AOT_REPLAY="1",
+        HIP_VISIBLE_DEVICES="-1",
+        ROCR_VISIBLE_DEVICES="-1",
+        CUDA_VISIBLE_DEVICES="-1",
+    )
+    if workers is not None:
+        env["AITER_MAX_JOBS"] = str(workers)
+    return env
+
+
+def check_replay_process(arch: str) -> None:
+    """Raise unless this process started with ``replay_env(arch)``, so that
+    what aiter fixed at import belongs to ``arch``."""
+    from aiter.utility import dtypes
+
+    if os.environ.get("AITER_AOT_REPLAY") != "1" or os.environ.get("GPU_ARCHS") != arch:
+        raise RuntimeError(
+            f"replaying {arch} needs AITER_AOT_REPLAY=1 and GPU_ARCHS={arch} set "
+            "before aiter is imported (see replay_env)"
+        )
+    expected = dtypes.defaultDtypes[arch]["fp8"]
+    if dtypes.fp8 is not expected:
+        raise RuntimeError(
+            f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
+            f"{arch} needs {expected}"
+        )
+
+
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     """Load DEFAULT_CSVS + parse_csv for the named kind and return its
     job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
     runs their module-level imports, which pull in FlyDSL (e.g.
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import production_jobs
-
-        # Ships both V4-Pro and Kimi-K3 so neither JITs online at serving time.
-        return production_jobs()
     if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import default_jobs
 
         return default_jobs()
-    if kind is OpKind.MOE:
-        from .moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GEMM:
+    if kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CONV:
         from .conv import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
@@ -166,20 +201,12 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import compile_one_config
-    elif kind is OpKind.FMHA_FP8:
+    if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import compile_one_config
-    elif kind is OpKind.MOE:
-        from .moe import compile_one_config
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.CONV:
         from .conv import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
     else:
@@ -190,22 +217,12 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
+    configure_worker_subprocesses()
     result = worker(**kwargs)
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)
     os.replace(tmp_path, out_path)
-
-
-def _affinity_aware_cpu_count() -> int:
-    """Number of CPUs this process may actually use (respects cgroup /
-    cpuset limits via ``sched_getaffinity``, unlike ``os.cpu_count()``).
-    Falls back to ``cpu_count`` and is clamped to >=1."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 0
-    return max(n, 1)
 
 
 def get_kernel_timeout() -> float:
@@ -232,39 +249,8 @@ def get_max_retries() -> int:
         ) from e
 
 
-def _memory_worker_cap(default_workers: int) -> int:
-    env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
-    try:
-        per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_MEM_PER_WORKER_GB must be a number, got {env!r}"
-        ) from e
-    if per_gb <= 0:
-        return default_workers
-    try:
-        import psutil
-
-        avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:  # noqa: BLE001
-        return default_workers
-    return min(default_workers, max(1, int(avail_gb / per_gb)))
-
-
 def get_max_workers(num_jobs: int) -> int:
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-        # Auto path only: also bound by memory so we never trip the OOM-killer.
-        max_workers = _memory_worker_cap(max_workers)
-    return min(max_workers, num_jobs)
+    return get_worker_count_for(num_jobs)
 
 
 def _run_file_pool(
@@ -440,12 +426,34 @@ def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
+    # MoE and MegaMoE replay the runtime itself, which needs aiter fully
+    # imported for the target arch, so they run in processes of their own.
+    from .mega_moe import run as run_mega_moe_replay
+    from .moe import DEFAULT_CSVS as MOE_CSVS
+    from .moe import run as run_moe_replay
+
+    replay_errors = []
+    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+    if moe_failed_archs:
+        replay_errors.append(
+            f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)"
+        )
+    if run_mega_moe_replay():
+        replay_errors.append("FlyDSL MEGA_MOE replay failed")
+
+    pooled_kinds = [
+        kind for kind in OpKind if kind not in (OpKind.MOE, OpKind.MEGA_MOE)
+    ]
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in OpKind:
+    for kind in pooled_kinds:
         for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
 
     if not all_jobs:
+        if replay_errors:
+            raise AssertionError(
+                f"[aiter] FlyDSL AOT failures: {'; '.join(replay_errors)}"
+            )
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return
 
@@ -460,7 +468,7 @@ def run_aot(cache_dir: str) -> None:
 
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
+        f"({'+'.join(k.name for k in pooled_kinds)}), "
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
 
@@ -483,9 +491,9 @@ def run_aot(cache_dir: str) -> None:
             result_dir,
         )
 
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
+        ok_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
+        fail_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
+        errors: list[str] = list(replay_errors)
         for (kind, _job), result, spec in zip(all_jobs, raw, specs):
             label = spec[2]
             if result is not None and result.get("compile_time") is not None:
@@ -499,7 +507,7 @@ def run_aot(cache_dir: str) -> None:
                 fail_by_kind[kind] += 1
                 errors.append(f"FlyDSL {label} produced no kernel")
 
-        for kind in OpKind:
+        for kind in pooled_kinds:
             print(
                 f"[aiter] FlyDSL {kind.name} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
@@ -513,7 +521,9 @@ def run_aot(cache_dir: str) -> None:
                 suffix = (
                     f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
                 )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
+            tally = ", ".join(
+                f"{k.name}: {fail_by_kind[k]} failed" for k in pooled_kinds
+            )
             raise AssertionError(
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )

@@ -517,6 +517,7 @@ def per_1x32_mx_quant_hip(
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
+    scale_layout_m32k4: bool = False,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -536,12 +537,30 @@ def per_1x32_mx_quant_hip(
               MXFP8 "split" path  (per_1x32 quant -> sorted-scale shuffle)
               that mirrors the existing MXFP4 split path.
 
+    ``scale_layout_m32k4=True`` (fp4x2 output only here) writes the e8m0 scale
+    straight into the gfx1250 ASM / FlyDSL GEMM A-scale layout, the bytes of
+    :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`: ``(pad32(m), n // 32)``,
+    pad rows 0x7F, ``shuffle`` ignored, ``n % 128 == 0``. fp8 output takes this
+    layout through ``per_group_quant_hip(scale_layout_m32k4=True)``.
+
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
     """
     m, n = x.shape
     assert n % 32 == 0, f"n={n} must be divisible by 32"
     device = x.device
+    if scale_layout_m32k4:
+        assert (
+            quant_dtype == dtypes.fp4x2 and num_rows is None and scale is None
+        ), "scale_layout_m32k4 here needs fp4x2 output, no num_rows and no static scale"
+        scale = torch.empty(
+            ((m + 31) // 32 * 32, n // 32), dtype=torch.uint8, device=device
+        ).view(dtypes.fp8_e8m0)
+        y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
+        dynamic_per_group_scaled_quant(
+            y, x, scale, 32, num_rows=None, scale_layout_m32k4=True
+        )
+        return y, scale
 
     # Per-dtype defaults / validation.
     if quant_dtype == dtypes.fp4x2:
@@ -709,6 +728,7 @@ def get_torch_act(aType):
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
         ActivationType.GeluTanh: lambda x: F.gelu(x, approximate="tanh"),
+        ActivationType.Relu2: lambda x: F.relu(x) ** 2,
     }
     return tmp.get(aType, NotImplementedError)
 
@@ -817,8 +837,8 @@ def dynamic_per_group_scaled_quant(
 
     Only ``group_size`` in {32, 64, 128} is supported.
 
-    ``scale_layout_m32k4=True`` (fp8 output, e8m0 scale, ``group_size == 32``)
-    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout,
+    ``scale_layout_m32k4=True`` (fp8 or fp4x2 output, e8m0 scale, ``group_size == 32``)
+    writes the scale directly in the gfx1250 ASM / FlyDSL GEMM A-scale layout,
     i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
     ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
     as 0x7F, and ``shuffle_scale`` is ignored.
@@ -934,6 +954,7 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     num_valid_ids: torch.Tensor,
     token_num: int,
     block_m: int,
+    total_routes: int,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
 ) -> None:
@@ -941,6 +962,10 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
     sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
     for MXFP4, fp8 for MXFP8.
+
+    ``total_routes`` is ``token_num * topk``. A zero ``sorted_weights`` entry
+    zeroes its route's row only where each route owns an input row (as many
+    rows as routes); a row shared by a token's routes is always quantized.
     """
 
 
@@ -1171,12 +1196,14 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        # The routing top-k goes in explicitly: at stage1 ``input`` has only M
+        # rows, from which the HIP kernel would infer a top-k of 1.
         common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
         if num_experts_upper_bound is None:
-            fused_dynamic_mx_quant_moe_sort_hip(*common, group_size, sorted_weights)
+            fused_dynamic_mx_quant_moe_sort_hip(
+                *common, token_num * topk, group_size, sorted_weights
+            )
         else:
-            # Pass the routing top-k explicitly: at stage1 ``input`` has only M
-            # rows, from which the HIP kernel would infer a top-k of 1.
             fused_dynamic_mx_quant_moe_sort_hip_bounded(
                 *common,
                 token_num * topk,

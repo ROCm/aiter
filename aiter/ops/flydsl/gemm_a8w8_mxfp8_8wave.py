@@ -107,6 +107,7 @@ def compile_mxfp8_8wave_gemm(
     waves_per_eu: int,
     xcd_swizzle: int,
     scale_preshuffled: bool = False,
+    w_scale_block: str = "1x32",
 ):
     """Compile (and memoize) an 8-wave mxfp8 launcher."""
     _lazy_import()
@@ -119,6 +120,8 @@ def compile_mxfp8_8wave_gemm(
         scale_preshuffled=bool(scale_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        b_scale_block=w_scale_block,
+        a_scale_block="1x128" if w_scale_block == "128x128" else "1x32",
     )
 
 
@@ -136,13 +139,18 @@ def flydsl_mxfp8_8wave_gemm(
     *,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    w_scale_block: str = "1x32",
 ) -> Tensor:
     """Run the 8-wave mxfp8 GEMM; writes into ``Out`` and returns it.
 
     XQ: ``(M, K)`` fp8 e4m3. WQ: ``(N, K)`` fp8 e4m3 in ``shuffle_weight``
     ``(16, 16)`` layout. x_scale ``[M, K/32]`` / w_scale ``[N, K/32]`` e8m0,
     row-major and unshuffled; a 1-D scale pair is the ``shuffle_scale_w4``
-    layout over rows padded to 256. Out: ``(M, N)`` bf16.
+    layout over rows padded to 256. ``w_scale_block="32x32"`` takes a row-major
+    w_scale ``[N/32, K/32]`` (N a multiple of 32); ``"128x128"`` the blockscale
+    pair, w_scale ``[N/128, K/128]`` (N a multiple of 128, K >= 512) and x_scale
+    a contiguous ``(M, K/128)`` holding the column-major ``[K/128, M]`` bytes, as
+    bmm's transposed x_scale. Out: ``(M, N)`` bf16.
 
     M need not be a multiple of 256 nor N: out-of-range A/B/scale reads return
     zero via the buffer descriptors, C row overflow is dropped the same way, and
@@ -181,6 +189,21 @@ def flydsl_mxfp8_8wave_gemm(
             "[FlyDSL mxfp8 8wave] x_scale and w_scale must both be row-major 2-D "
             "or both pre-shuffled 1-D"
         )
+    # w_scale rows per scale row, x_scale K per scale column.
+    blocks = {"1x32": (1, 32), "32x32": (32, 32), "128x128": (128, 128)}
+    if w_scale_block not in blocks:
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave] w_scale_block must be one of {sorted(blocks)}, "
+            f"got {w_scale_block!r}"
+        )
+    w_rows, x_k = blocks[w_scale_block]
+    if w_rows > 1 and (scale_preshuffled or N % w_rows != 0):
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave] a {w_scale_block} w_scale is row-major 2-D with "
+            f"N a multiple of {w_rows}, got N={N}"
+        )
+    if w_scale_block == "128x128" and K < 512:
+        raise ValueError("[FlyDSL mxfp8 8wave] a 128x128 w_scale needs K >= 512")
     if scale_preshuffled:
         want = {
             "x_scale": -(-M // 256) * 256 * K // 32,
@@ -188,7 +211,10 @@ def flydsl_mxfp8_8wave_gemm(
         }
         got = {"x_scale": x_scale.numel(), "w_scale": w_scale.numel()}
     else:
-        want = {"x_scale": (M, K // SCALE_GROUP), "w_scale": (N, K // SCALE_GROUP)}
+        want = {
+            "x_scale": (M, K // x_k),
+            "w_scale": (N // w_rows, K // x_k),
+        }
         got = {"x_scale": tuple(x_scale.shape), "w_scale": tuple(w_scale.shape)}
     for name, t in (("x_scale", x_scale), ("w_scale", w_scale)):
         if got[name] != want[name]:
@@ -213,6 +239,7 @@ def flydsl_mxfp8_8wave_gemm(
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
         scale_preshuffled=scale_preshuffled,
+        w_scale_block=w_scale_block,
     )
 
     out_contig = Out.contiguous()
@@ -276,6 +303,7 @@ def run_gemm_a8w8_mxfp8_8wave(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    w_scale_block: str = "1x32",
 ) -> Tensor:
     """Dispatch entry: decode a tuned mxfp8 8wave kernelName and run the kernel."""
     cfg = parse_mxfp8_8wave_kernel_name(kernel_name)
@@ -296,4 +324,5 @@ def run_gemm_a8w8_mxfp8_8wave(
         Out,
         waves_per_eu=cfg["waves_per_eu"],
         xcd_swizzle=cfg["xcd_swizzle"],
+        w_scale_block=w_scale_block,
     )

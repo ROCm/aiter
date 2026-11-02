@@ -185,7 +185,7 @@ def gemm_a16w16_persistent_kernel_(
                 c_ptr
                 + stride_cm * offs_cm[:, None]
                 + stride_cn * offs_cn[None, :]
-                + pid_k * stride_ck
+                + pid_k.to(tl.int64) * stride_ck
             )
             if EVEN_MN:
                 tl.store(c_ptrs, c)

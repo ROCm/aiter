@@ -7,12 +7,14 @@
 (auto-selected: ASM on gfx950, portable path elsewhere).
 """
 
-import argparse
-
 import torch
 import triton
 
 from aiter.ops.triton.quant.quant_mxfp8 import convert_from_mxfp8, convert_to_mxfp8
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
@@ -54,14 +56,10 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark MXFP8 convert", allow_abbrev=False)
+    parser = get_parser(kernel_name="MXFP8 convert")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

@@ -12,31 +12,27 @@ try:
 except (ImportError, AttributeError):
     quant = None
 
-# Try to import comms module (requires iris)
+# Import the comms package. Its Iris-based primitives exist only when Iris is installed.
 try:
     from aiter.ops.triton import comms
+except ImportError:
+    comms = None
 
+IRIS_COMM_AVAILABLE = comms is not None and comms.IRIS_COMM_AVAILABLE
+if IRIS_COMM_AVAILABLE:
     # Re-export communication primitives at this level for convenience
     from aiter.ops.triton.comms import (  # noqa: F401  deliberate re-export for convenience
-        IRIS_COMM_AVAILABLE,
         IrisCommContext,
         all_gather,
         reduce_scatter,
         reduce_scatter_rmsnorm_quant_all_gather,
     )
 
-    _COMMS_AVAILABLE = True
-except ImportError:
-    # Iris not available - comms module won't be available
-    _COMMS_AVAILABLE = False
-    IRIS_COMM_AVAILABLE = False
-    comms = None
-
 __all__ = []
 if quant is not None:
     __all__.append("quant")
 
-if _COMMS_AVAILABLE:
+if IRIS_COMM_AVAILABLE:
     __all__.extend(
         [
             "IRIS_COMM_AVAILABLE",
@@ -119,7 +115,6 @@ _BACKWARD_COMPAT_MAP = {
     "mha_onekernel_bwd": "attention.mha_onekernel_bwd",
     "mha_v3": "attention.mha_v3",
     "mha": "attention.mha",
-    "mla_decode": "attention.mla_decode",
     "mla_decode_rope": "attention.mla_decode_rope",
     "pa_decode": "attention.pa_decode",
     "pa_mqa_logits": "attention.pa_mqa_logits",

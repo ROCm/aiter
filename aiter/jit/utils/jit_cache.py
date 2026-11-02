@@ -5,6 +5,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -34,6 +35,37 @@ _ABANDONED_ARTIFACT_PREFIXES = (
 _copy2 = shutil.copy2
 _link = os.link
 _replace = os.replace
+
+
+def _windows_blob_gen_argv(
+    python_executable, blob_gen_cmd, blob_dir, blob_dir_placeholder
+):
+    command = blob_gen_cmd.strip()
+    if command.startswith(('"', "'")):
+        quote = command[0]
+        script_end = command.find(quote, 1)
+        if script_end < 0:
+            raise ValueError(f"Unterminated blob generator script path: {command}")
+        script = command[1:script_end]
+        raw_args = command[script_end + 1 :].strip()
+    else:
+        script_match = re.match(r"^(.*?\.py)(?:\s+(.*))?$", command, re.IGNORECASE)
+        if script_match is None:
+            raise ValueError(
+                f"Blob generator command must start with a .py script: {command}"
+            )
+        script, raw_args = script_match.groups()
+    argv = [python_executable, script]
+    if not raw_args:
+        return argv
+
+    lexer = shlex.shlex(raw_args, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    for token in lexer:
+        argv.append(token.replace(blob_dir_placeholder, blob_dir))
+    return argv
 
 
 def _posix_path(path):
@@ -291,12 +323,26 @@ def stage_blob_sources(
 
         output_dir = os.path.join(staging_dir, "")
         for command in commands:
-            formatted_command = command.format(output_dir)
-            # shlex.split() reads a backslash as an escape, so a Windows
-            # separator would be swallowed. Both platforms accept "/".
-            args = [python_executable, *shlex.split(_posix_path(formatted_command))]
+            if IS_WINDOWS:
+                blob_dir_placeholder = f"AITER_BLOB_DIR_{uuid.uuid4().hex}"
+                formatted_command = command.format(blob_dir_placeholder)
+                args = _windows_blob_gen_argv(
+                    python_executable,
+                    formatted_command,
+                    output_dir,
+                    blob_dir_placeholder,
+                )
+            else:
+                formatted_command = command.format(output_dir)
+                args = [
+                    python_executable,
+                    *shlex.split(_posix_path(formatted_command)),
+                ]
             if log_commands and logger is not None:
-                logger.info("exec_blob ---> %s", shlex.join(args))
+                command_line = (
+                    subprocess.list2cmdline(args) if IS_WINDOWS else shlex.join(args)
+                )
+                logger.info("exec_blob ---> %s", command_line)
             subprocess.run(args, check=True)
 
         generated_build_inputs = [

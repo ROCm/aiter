@@ -229,7 +229,7 @@ def test_attn_res_gate_add_hidden2_requires_add_hidden():
     prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
         32, 256, 2, torch.float32, with_add=False
     )
-    add_hidden2 = torch.randn(32, 256, device="cuda")
+    add_hidden2 = torch.randn(32, 256, device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="add_hidden2 requires add_hidden"):
         attn_res_gate(prefix, block_residual, score_weight, 1e-6, None, add_hidden2)
 

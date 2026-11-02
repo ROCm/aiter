@@ -23,7 +23,22 @@ def _f32_to_ord(val):
     return is_nan.select(fx.Int32(0x7FFFFFFF), ords)
 
 
-def _row_length(row, row_ends, width, next_n):
+def _bounded_row_len(row_lens, row, width, full_rows):
+    """Row `row`'s live length, never past `width`.
+
+    A full-rows build reads no tensor. Otherwise the row's own entry, clamped:
+    a length past the row would read the zeros an out-of-bounds buffer load
+    returns, and select them as scores.
+    """
+    if const_expr(full_rows):
+        return width
+    return fx.min(row_lens[row], width)
+
+
+def _row_length(row, row_ends, width, next_n, full_rows=False):
+    """Row `row`'s live length; `full_rows` builds read none and use `width`."""
+    if const_expr(full_rows):
+        return width
     request = row // next_n
     offset = row % next_n
     row_len = row_ends[request] - next_n + offset + 1
@@ -31,12 +46,14 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
-def _row_view(input, row_starts, row_ends, row, width, next_n, packed):
+def _row_view(input, row_starts, row_ends, row, width, next_n, packed, full_rows=False):
     """Return a regular row or its packed slice from the input's first row."""
     if const_expr(packed):
         return fx.make_view(
             fx.add_offset(fx.get_iter(input), row_starts[row]),
-            fx.make_layout((_row_length(row, row_ends, width, next_n),), (1,)),
+            fx.make_layout(
+                (_row_length(row, row_ends, width, next_n, full_rows),), (1,)
+            ),
         )
     return fx.slice(input, (row, None))
 
