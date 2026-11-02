@@ -346,7 +346,7 @@ jobs:
           # Detect ROCm flavor of the builder image to pick a torch index
           # Image tag looks like pytorch/manylinux2_28-builder:rocm7.2
           IMG="${BUILD_DOCKER_IMAGE}"
-          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.1 / rocm7.0
+          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.14 / rocm10.0 / rocm10.1
           ROCM_NUM="${ROCM_TAG#rocm}"      # 7.2
           # Allow caller to override the torch wheel index (e.g. pin a release
           # to a specific ROCm flavor's PyTorch ABI). Defaults preserve the
@@ -379,6 +379,15 @@ jobs:
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
               ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "${TORCH_SPEC}"
+              # ROCm >= 7.14 builder images pip-install ROCm into the image python3,
+              # not ${PYBIN}, and torch only pulls rocm[libraries] into ${PYBIN}.
+              # Add the devel SDK (headers, hipcc) at the exact same version.
+              if ${PYBIN}/python -c "import rocm_sdk" 2>/dev/null; then
+                ROCM_SDK_VERSION="$(${PYBIN}/pip show rocm | sed -n "s/^Version: //p")"
+                echo "pip ROCm SDK ${ROCM_SDK_VERSION}: installing rocm[devel]"
+                ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "rocm[devel]==${ROCM_SDK_VERSION}"
+                ${PYBIN}/python -m rocm_sdk init
+              fi
               # flydsl 0.1.9.dev599+ ships manylinux_2_28 wheels via AMD mirror
               # (see ROCm/FlyDSL#527 backport). Required at build time since
               # v0.1.15 setup.py imports aiter.aot.flydsl.gemm during start_aot().
@@ -420,6 +429,12 @@ jobs:
               # gcc-toolset-13 is the default manylinux_2_28 toolchain
               source /opt/rh/gcc-toolset-13/enable 2>/dev/null || true
               export PATH="${PYBIN}:${PATH}"
+              if python -c "import rocm_sdk" 2>/dev/null; then
+                export ROCM_HOME="$(python -m rocm_sdk path --root)"
+                export ROCM_PATH="${ROCM_HOME}"
+                export PATH="$(python -m rocm_sdk path --bin):${PATH}"
+                echo "Using pip ROCm SDK: ROCM_HOME=${ROCM_HOME}"
+              fi
               python --version
               which python gcc
               gcc --version | head -1
