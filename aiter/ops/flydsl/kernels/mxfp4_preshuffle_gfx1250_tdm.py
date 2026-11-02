@@ -3,7 +3,6 @@
 
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
-import math
 import os
 from collections import namedtuple
 
@@ -568,23 +567,24 @@ def launch_gemm_a8w4_tdm(
             elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
-        has_work = blk_m < tile_map[n_experts - 1]
-
-        # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
-        # result with the padding sentinel so it remains defined outside the
-        # dynamic branch and the existing main-body guard stays valid.
-        expert = blk_m * 0 + n_experts
-        if has_work:
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(
-                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-            ):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
+        # psum is sorted, so the owning expert is the count of experts ending at
+        # or before blk_m (n_experts for the padded tail). Every lane loads a
+        # strided slice in one round trip instead of a dependent log2(E) bisect.
+        psum_hits = fx.Int32(0)
+        for i in range_constexpr(ceildiv(n_experts, WAVE)):
+            e_idx = lane + i * WAVE
+            if const_expr((i + 1) * WAVE <= n_experts):
+                psum_hits = psum_hits + (tile_map[e_idx] <= blk_m).select(1, 0)
+            else:
+                e_ok = e_idx < n_experts
+                end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
+                psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
+        for sh in range_constexpr(int.bit_length(WAVE) - 1):
+            psum_hits = psum_hits + psum_hits.shuffle_xor(
+                fx.Int32(1 << sh), fx.Int32(WAVE)
+            )
+        expert = rocdl.readfirstlane(T.i32, psum_hits)
+        has_work = expert < n_experts
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
