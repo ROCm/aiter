@@ -29,17 +29,10 @@ On gfx1250 --mxscale_table times the mxfp8_128 kernels the 2-D dispatch runs
 (flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common, row-major A) on 128x128
 shapes, and a row's kernelId is the kernel's id in that list.
 
-OPUS uses one normal pass: shape/traits filtering -> benchmark candidates ->
-select the fastest valid result. No historical OPUS seeds or time-based retries.
-Every available legal CO and JIT geometry baseline is retained. Joint compute
-settings stay in a shape/resource-derived range; secondary layouts get mode
-coverage. The range accounts for CU fill, the A ring, and scale-panel LDS.
---opus_max_candidates 0 runs the full legal search directly.
+OPUS calculates a shape/resource range, benchmarks it once, and selects the
+fastest valid result. Legal COs and a low-LDS baseline per JIT tile are retained.
 """
 
-import ast
-import csv
-import json
 import math
 import re
 import sys
@@ -135,130 +128,16 @@ def _opus_geometry(instance):
     )
 
 
-def _normalize_opus_geometry(value):
-    """Accept [pipeline, BM, BN, BK, TM, TN] or named geometry fields."""
-    if isinstance(value, dict):
-        fields = {str(key).lower().replace("_", ""): val for key, val in value.items()}
-        tile = fields.get("tile")
-        waves = fields.get("wavelayout")
-        if tile is not None and waves is not None:
-            value = (fields["pipeline"], *tile, *waves)
-        else:
-            value = tuple(
-                fields[key] for key in ("pipeline", "bm", "bn", "bk", "tm", "tn")
-            )
-    if not isinstance(value, (tuple, list)) or len(value) != 6:
-        raise ValueError("geometry must contain pipeline, BM, BN, BK, TM, TN")
-    pipeline = str(value[0]).strip()
-    if not pipeline:
-        raise ValueError("geometry pipeline must not be empty")
-    dimensions = tuple(int(str(dimension).strip()) for dimension in value[1:])
-    if min(dimensions) <= 0:
-        raise ValueError("geometry dimensions must be positive integers")
-    return (pipeline, *dimensions)
-
-
-def load_opus_geometry_file(path):
-    """Read shape-specific geometries without importing any GPU code.
-
-    CSV rows have M,N,K and pipeline,BM,BN,BK,TM,TN (B_M etc. also work),
-    or a JSON old_opus_geometry/opus_geometry field containing the same tuple
-    or named fields. Historical tuple literals are accepted too. Repeated rows
-    select multiple geometries; blank geometry fields in analysis tables skip
-    shapes for which no historical geometry was recorded.
-    """
-    by_shape = defaultdict(set)
-    with open(path, newline="", encoding="utf-8-sig") as stream:
-        for line, row in enumerate(csv.DictReader(stream), start=2):
-            try:
-                fields = {
-                    key.lower().replace("_", ""): value for key, value in row.items()
-                }
-                shape = tuple(int(fields[key]) for key in ("m", "n", "k"))
-                if min(shape) <= 0:
-                    raise ValueError("shape dimensions must be positive integers")
-                encoded = fields.get("oldopusgeometry") or fields.get("opusgeometry")
-                if not encoded and (
-                    "oldopusgeometry" in fields or "opusgeometry" in fields
-                ):
-                    continue
-                if encoded:
-                    try:
-                        value = json.loads(encoded)
-                    except json.JSONDecodeError:
-                        value = ast.literal_eval(encoded)
-                    singular = isinstance(value, dict) or (
-                        isinstance(value, (list, tuple))
-                        and len(value) == 6
-                        and isinstance(value[0], str)
-                    )
-                    values = [value] if singular else value
-                else:
-                    values = [fields]
-                if not values:
-                    raise ValueError("shape has no requested OPUS geometry")
-                by_shape[shape].update(
-                    _normalize_opus_geometry(value) for value in values
-                )
-            except (ValueError, TypeError, KeyError, SyntaxError) as exc:
-                raise ValueError(
-                    f"{path}:{line}: invalid OPUS geometry: {exc}"
-                ) from exc
-    if not by_shape:
-        raise ValueError(f"{path}: no OPUS geometry rows")
-    return dict(by_shape)
-
-
+_OPUS_B_DEFAULTS = (None,) * 4 + tuple(
+    map(str, (0, "false", 7168, 4, 1, 0, 2, 0, 256, "false", "false", "false", 0))
+)
 _OPUS_TRAIT_DEFAULTS = {
-    "prefetch_b_vgpr": (None,) * 4
-    + (
-        "0",
-        "false",
-        "7168",
-        "4",
-        "1",
-        "0",
-        "2",
-        "0",
-        "256",
-        "false",
-        "false",
-        "false",
-        "0",
+    "prefetch_b_vgpr": _OPUS_B_DEFAULTS,
+    "prefetch_b_vgpr_overlap": (*_OPUS_B_DEFAULTS, "0"),
+    "pingpong_lds": tuple(
+        map(str, (192, 256, 128, 0, 4, 0, 0, 0, "false", "false", "false", 0, 8))
     ),
-    "prefetch_b_vgpr_overlap": (None,) * 4
-    + (
-        "0",
-        "false",
-        "7168",
-        "4",
-        "1",
-        "0",
-        "2",
-        "0",
-        "256",
-        "false",
-        "false",
-        "false",
-        "0",
-        "0",
-    ),
-    "pingpong_lds": (
-        "192",
-        "256",
-        "128",
-        "0",
-        "4",
-        "0",
-        "0",
-        "0",
-        "false",
-        "false",
-        "false",
-        "0",
-        "8",
-    ),
-    "wave_interleave": ("256", "0", "4", "true", "0", "0", "4"),
+    "wave_interleave": tuple(map(str, (256, 0, 4, "true", 0, 0, 4))),
 }
 
 
@@ -361,20 +240,25 @@ def _opus_schedule_modes(pipeline, profile):
     }
 
 
-def _opus_representative_variants(kids, registry, m, n, k):
-    """Low-LDS baseline followed by greedy coverage of legal scheduling modes.
-
-    The count follows the modes present in the registry, with no fixed number
-    of variants per tile and no use of historical timing or winning kernels.
-    Covering these modes does not cover their entire Cartesian product.
-    """
+def _opus_representative_variants(kids, registry, m, n, k, *, secondary=False):
+    """Keep low-LDS and coupled scheduling modes; sample secondary publication."""
+    pipeline = registry[kids[0]].bpreshuffle_entry["pipeline"]
     profiles = {}
     for kid in sorted(kids):
-        profile = _opus_variant_profile(registry[kid], m, n)
-        profiles.setdefault(profile, kid)
+        profiles.setdefault(_opus_variant_profile(registry[kid], m, n), kid)
     profiles = {kid: profile for profile, kid in profiles.items()}
+    if secondary and pipeline == "prefetch_b_vgpr_overlap":
+        publications = sorted({int(profile[17]) for profile in profiles.values()})
+        if len(publications) > 3:
+            midpoint = (publications[0] + publications[-1]) / 2
+            middle = min(publications, key=lambda value: abs(value - midpoint))
+            retained = {publications[0], middle, publications[-1]}
+            profiles = {
+                kid: profile
+                for kid, profile in profiles.items()
+                if int(profile[17]) in retained
+            }
     footprints = {kid: _opus_jit_lds(registry[kid], k) for kid in profiles}
-    pipeline = registry[kids[0]].bpreshuffle_entry["pipeline"]
     modes = {
         kid: _opus_schedule_modes(pipeline, profile)
         for kid, profile in profiles.items()
@@ -392,28 +276,14 @@ def _opus_representative_variants(kids, registry, m, n, k):
     return selected
 
 
-def _opus_rank_geometries(groups, m, n, cu_num, top_geometries):
-    """Keep the existing shape ranking independently for each pipeline/BK/layout."""
-    if not top_geometries:
-        return set(groups)
+def _opus_best_geometries(geometries, m, n, cu_num):
+    """Choose a representative tile independently for each pipeline/BK/layout."""
     by_layout = defaultdict(list)
-    for geometry in groups:
-        pipeline, bm, bn, bk, wm, wn = geometry
-        tiles = math.ceil(m / bm) * math.ceil(n / bn)
-        padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
-        occupancy = tiles / max(cu_num, 1)
-        cost = (
-            0.25 * (padding - 1)
-            + 0.25 * max(0, 1 - occupancy)
-            + 0.1 * (math.ceil(occupancy) / occupancy - 1)
-            + 8 / bm
-            + 8 / bn
-        )
-        by_layout[(pipeline, bk, wm, wn)].append((cost, geometry))
+    for geometry in geometries:
+        by_layout[(geometry[0], *geometry[3:])].append(geometry)
     return {
-        geometry
-        for geometries in by_layout.values()
-        for _, geometry in sorted(geometries)[:top_geometries]
+        min(group, key=lambda g: (_opus_geometry_cost(g, m, n, cu_num), g))
+        for group in by_layout.values()
     }
 
 
@@ -532,11 +402,7 @@ def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
                 if rotated:
                     # This changes the A live set, LDS waits, and B queue clamp.
                     # Cover its resource modes even when full-A tiles rank higher.
-                    secondary.update(
-                        _opus_rank_geometries(
-                            {g: groups[g] for g in rotated}, m, n, cu_num, 1
-                        )
-                    )
+                    secondary.update(_opus_best_geometries(rotated, m, n, cu_num))
         elif pipeline == "pingpong_lds":
             core = [
                 g for g in tiles if g[4] * g[5] == 8 and 3 <= g[1] // (g[4] * 16) <= 4
@@ -562,9 +428,7 @@ def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
                     chosen = {g for g in resident if g[1] * g[2] == max_area}
                     (primary if underfilled else secondary).update(chosen)
         elif pipeline == "wave_interleave":
-            ranked = _opus_rank_geometries(
-                {g: groups[g] for g in tiles}, m, n, cu_num, 1
-            )
+            ranked = _opus_best_geometries(tiles, m, n, cu_num)
             for geometry in ranked:
                 (primary if geometry[4] * geometry[5] == 8 else secondary).add(geometry)
         else:
@@ -573,98 +437,44 @@ def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
             g in secondary for g in tiles
         ):
             # A registry/shape may have no core or two-resident-block layout.
-            secondary.update(
-                _opus_rank_geometries({g: groups[g] for g in tiles}, m, n, cu_num, 1)
-            )
+            secondary.update(_opus_best_geometries(tiles, m, n, cu_num))
     return _opus_refine_geometry_range(primary, secondary, m, n, k, cu_num)
 
 
-def _opus_secondary_variants(kids, registry, m, n, k):
-    """Cover resource modes and early/middle/late publication in secondary tiles.
-
-    PublishM moves the A request within the first B fragment's M repeats.
-    Complete publication/queue/cache products remain in the primary range.
-    """
-    pipeline = registry[kids[0]].bpreshuffle_entry["pipeline"]
-    if pipeline == "prefetch_b_vgpr_overlap":
-        profiles = {
-            kid: _opus_schedule_profile(
-                pipeline, registry[kid].bpreshuffle_entry["traits"]
-            )
-            for kid in kids
-        }
-        publications = sorted({int(profile[17]) for profile in profiles.values()})
-        if len(publications) > 3:
-            midpoint = (publications[0] + publications[-1]) / 2
-            middle = min(publications, key=lambda value: abs(value - midpoint))
-            retained = {publications[0], middle, publications[-1]}
-            kids = [kid for kid in kids if int(profiles[kid][17]) in retained]
-    return _opus_representative_variants(kids, registry, m, n, k)
-
-
-def _opus_joint_routes(kids, registry, m, n):
-    """Keep complete joint settings on baseline compute and tile-order routes.
-
-    B-VGPR and overlap keep all queues/caches/publication points on the default
-    LDS-output route. M-repeat keeps all K/panel/cache/fragment/guard settings
-    with ungrouped or the smallest registered M grouping. Interleave is small
-    enough to retain all its settings. Alternate output/M-group routes also get
-    trait-mode coverage below. No historical kernel or time enters this filter.
-    """
-    pipeline = registry[kids[0]].bpreshuffle_entry["pipeline"]
+def _opus_joint_routes(kids, registry, m, n, k):
+    """Expand joint parameters within panel, output, grouping and queue limits."""
+    instance = registry[kids[0]]
+    pipeline = instance.bpreshuffle_entry["pipeline"]
+    if pipeline == "pingpong_lds":
+        em = instance.B_M // (instance.T_M * 16)
+        if not (instance.T_M * instance.T_N == 8 and 3 <= em <= 4):
+            # A two-block geometry must also fit each variant's scale panel.
+            resident = [
+                kid for kid in kids if _opus_jit_lds(registry[kid], k) <= 80 * 1024
+            ]
+            kids = resident or kids
     profiles = {
         kid: _opus_schedule_profile(pipeline, registry[kid].bpreshuffle_entry["traits"])
         for kid in kids
     }
     if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        default_output = _OPUS_TRAIT_DEFAULTS[pipeline][11]
-        primary = [kid for kid in kids if profiles[kid][11] == default_output]
+        kids = [kid for kid in kids if profiles[kid][11] == "0"]
     elif pipeline == "pingpong_lds":
-        nonzero = min(
-            (int(profile[5]) for profile in profiles.values() if int(profile[5]) > 0),
-            default=0,
+        smallest = min(
+            (int(p[5]) for p in profiles.values() if int(p[5]) > 0), default=0
         )
-        primary = [kid for kid in kids if int(profiles[kid][5]) in (0, nonzero)]
-    else:
-        primary = kids
-    # B distances can clamp to the same effective queue; GroupN can be
-    # overwritten or inactive for this shape. Keep one canonical representative
-    # of each such identical route, without merging different joint settings.
+        kids = [kid for kid in kids if int(profiles[kid][5]) in (0, smallest)]
+    # Merge only identical effective B queues and inactive GroupN policies.
     unique = {}
-    for kid in sorted(primary):
+    for kid in sorted(kids):
         unique.setdefault(_opus_variant_profile(registry[kid], m, n), kid)
-    return list(unique.values())
-
-
-def _opus_calculated_joint_routes(kids, registry, m, n, k):
-    """Keep complete combinations within actual panel/queue/order resources."""
-    instance = registry[kids[0]]
-    pipeline = instance.bpreshuffle_entry["pipeline"]
-    if pipeline == "pingpong_lds":
-        em = instance.B_M // (instance.T_M * 16)
-        core = instance.T_M * instance.T_N == 8 and 3 <= em <= 4
-        if not core:
-            # This geometry was admitted for two resident blocks. A larger
-            # panel can change it to one, so check each variant's actual LDS.
-            resident = [
-                kid
-                for kid in kids
-                if _opus_jit_lds(registry[kid], k) <= 160 * 1024 // 2
-            ]
-            if resident:
-                kids = resident
-    routes = _opus_joint_routes(kids, registry, m, n)
+    routes = list(unique.values())
     if not routes:
         return routes
     if pipeline == "wave_interleave":
-        profiles = {
-            kid: _opus_schedule_profile(
-                pipeline, registry[kid].bpreshuffle_entry["traits"]
-            )
-            for kid in routes
-        }
         smallest = min(
-            (int(p[2]) for p in profiles.values() if int(p[2]) > 0), default=0
+            (int(profiles[kid][2]) for kid in routes if int(profiles[kid][2]) > 0),
+            default=0,
         )
         routes = [kid for kid in routes if int(profiles[kid][2]) in (0, smallest)]
     elif pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
@@ -672,8 +482,7 @@ def _opus_calculated_joint_routes(kids, registry, m, n, k):
             kid: int(_opus_variant_profile(registry[kid], m, n)[3][5:])
             for kid in routes
         }
-        # Bound B-ring words by the full-A fragment live set, keeping the next
-        # available queue level when the registered distances straddle it.
+        # Keep the queue level nearest to, or just above, the full-A live set.
         target = max((instance.B_K // 128) * (instance.B_M // 16) - 1, 1)
         bound = min(
             (ahead for ahead in aheads.values() if ahead >= target),
@@ -683,136 +492,40 @@ def _opus_calculated_joint_routes(kids, registry, m, n, k):
     return routes
 
 
-def _opus_filtered_candidates(
-    candidates, registry, m, n, k, cu_num, top_geometries, cap
-):
-    """Calculate the search range, retaining every legal CO/geometry baseline."""
-    selected = {
-        kid for kid, instance in candidates if instance.bpreshuffle_co is not None
-    }
+def opus_candidates(m, n, k, *, cu_num):
+    """Calculate one shape/resource range, retaining legal COs and tile baselines."""
+    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
+    legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
+    if not legal:
+        return []
+    selected = {kid for kid in legal if registry[kid].bpreshuffle_co is not None}
     co_count = len(selected)
     groups = defaultdict(list)
-    for kid, instance in candidates:
-        if instance.bpreshuffle_co is None:
-            groups[_opus_geometry(instance)].append(kid)
-    if top_geometries is None:
-        primary, secondary = _opus_calculate_geometry_range(
-            groups, registry, m, n, k, cu_num
-        )
-    else:
-        primary = _opus_rank_geometries(groups, m, n, cu_num, top_geometries)
-        secondary = set()
+    for kid in legal:
+        if registry[kid].bpreshuffle_co is None:
+            groups[_opus_geometry(registry[kid])].append(kid)
+    primary, secondary = _opus_calculate_geometry_range(
+        groups, registry, m, n, k, cu_num
+    )
     for kids in groups.values():
         selected.add(min(kids, key=lambda kid: (_opus_jit_lds(registry[kid], k), kid)))
     for geometry in primary:
+        selected.update(_opus_joint_routes(groups[geometry], registry, m, n, k))
+    for geometry in sorted(primary | secondary):
         selected.update(
-            _opus_calculated_joint_routes(groups[geometry], registry, m, n, k)
-            if top_geometries is None
-            else _opus_joint_routes(groups[geometry], registry, m, n)
-        )
-    required = len(selected)
-    if cap is not None and cap < required:
-        raise ValueError(
-            f"OPUS cap {cap} would discard the protected search range for {(m, n, k)}; "
-            f"need at least {required}, or 0 for the full legal search"
-        )
-    policies = {
-        geometry: [
-            kid
-            for kid in (
-                _opus_secondary_variants(groups[geometry], registry, m, n, k)
-                if geometry in secondary
-                else _opus_representative_variants(groups[geometry], registry, m, n, k)
+            _opus_representative_variants(
+                groups[geometry], registry, m, n, k, secondary=geometry in secondary
             )
-            + (
-                _opus_secondary_variants(groups[geometry], registry, m, n, k)
-                if top_geometries == 0
-                else []
-            )
-            if kid not in selected
-        ]
-        for geometry in sorted(primary | secondary)
-    }
-    for rank in range(max(map(len, policies.values()), default=0)):
-        for geometry, variants in policies.items():
-            if cap is not None and len(selected) >= cap:
-                return [(kid, registry[kid]) for kid in sorted(selected)]
-            if rank < len(variants):
-                selected.add(variants[rank])
+        )
     print(
-        f"[OPUS range] shape={(m, n, k)} primary={len(primary)} "
-        f"secondary={len(secondary)} geometries={len(groups)} "
-        f"co={co_count} protected={required} candidates={len(selected)}",
+        f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
+        f"primary={len(primary)} secondary={len(secondary)} "
+        f"co={co_count} candidates={len(selected)}",
         flush=True,
     )
     return [(kid, registry[kid]) for kid in sorted(selected)]
-
-
-def opus_candidates(
-    m, n, k, *, cu_num, top_geometries=None, geometries=None, max_candidates=None
-):
-    """Filter legal kernels by shape/traits, then tune the returned set once.
-
-    The default computes a tile/resource range using shape and kernel traits.
-    Full joint settings remain in that range; secondary states get mode coverage.
-    A nonnegative top_geometries explicitly selects the prior geometry ranking.
-    max_candidates=0 runs the full legal space. Explicit geometry files retain
-    the full requested space unless a positive cap requests parameter filtering.
-    """
-    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
-
-    if top_geometries is not None and (
-        type(top_geometries) is not int or top_geometries < 0
-    ):
-        raise ValueError("opus_top_geometries must be None or an integer >= 0")
-    if max_candidates is not None and (
-        type(max_candidates) is not int or max_candidates < 0
-    ):
-        raise ValueError("opus_max_candidates must be an integer >= 0")
-    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
-    candidates = [
-        (kid, registry[kid])
-        for kid in candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
-    ]
-    legal_count = len(candidates)
-    if geometries is not None:
-        requested = {_normalize_opus_geometry(geometry) for geometry in geometries}
-        if not requested:
-            raise ValueError(f"No requested OPUS geometry for shape {(m, n, k)}")
-        missing = requested - {_opus_geometry(instance) for _, instance in candidates}
-        if missing:
-            raise ValueError(
-                f"OPUS geometries unavailable for {(m, n, k)}: {sorted(missing)}"
-            )
-        candidates = [
-            (kid, instance)
-            for kid, instance in candidates
-            if _opus_geometry(instance) in requested
-        ]
-    if not candidates:
-        return []
-    exhaustive = max_candidates == 0 or (
-        geometries is not None and max_candidates is None
-    )
-    if exhaustive:
-        result = candidates
-    else:
-        result = _opus_filtered_candidates(
-            candidates,
-            registry,
-            m,
-            n,
-            k,
-            cu_num,
-            0 if geometries is not None else top_geometries,
-            max_candidates,
-        )
-    print(
-        f"[OPUS search] shape={(m, n, k)} legal={legal_count} "
-        f"candidates={len(result)} mode={'full' if exhaustive else 'filtered'}",
-        flush=True,
-    )
-    return result
 
 
 def ensure_opus_kids_compiled(kids, *, cu_num):
@@ -1009,41 +722,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "Prebuild COs with csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
         )
 
-        self.parser.add_argument(
-            "--opus_top_geometries",
-            type=int,
-            default=None,
-            help="Default: calculate tile/resource ranges from shape and traits. "
-            "Set an integer to use the previous top-N geometry ranking per "
-            "pipeline/BK/wave layout; 0 applies parameter filters to all geometries.",
-        )
-        self.parser.add_argument(
-            "--opus_max_candidates",
-            type=int,
-            default=None,
-            help="Default: calculated shape/resource ranges with no fixed count. "
-            "0 runs the full legal search. A positive cap cannot remove the "
-            "protected range; "
-            "too-small caps raise an error. There is no automatic expansion.",
-        )
-        self.parser.add_argument(
-            "--opus_geometry_file",
-            help="Optional CSV selecting pipeline,BM,BN,BK,TM,TN per M,N,K. "
-            "Search the complete requested space unless a positive cap is set.",
-        )
-
     def pre_process(self, args):
         self._mxscale_table = args.mxscale_table
-        if args.opus_top_geometries is not None and args.opus_top_geometries < 0:
-            self.parser.error("--opus_top_geometries must be >= 0")
-        if args.opus_max_candidates is not None and args.opus_max_candidates < 0:
-            self.parser.error("--opus_max_candidates must be >= 0")
-        if args.opus_geometry_file and (
-            not self._mxscale_table or args.libtype == "flydsl"
-        ):
-            self.parser.error(
-                "--opus_geometry_file requires --mxscale_table and OPUS tuning"
-            )
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
         super().pre_process(args)
@@ -1126,31 +806,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             else {}
         )
         opus_by_shape = {}
-        geometry_path = getattr(args, "opus_geometry_file", None)
-        geometry_by_shape = (
-            load_opus_geometry_file(geometry_path) if geometry_path else None
-        )
         if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
             for row in untunedf.itertuples():
                 if row.w_scale_block == "128x128":
                     shape = (int(row.M), int(row.N), int(row.K))
-                    if geometry_by_shape is not None and shape not in geometry_by_shape:
-                        raise ValueError(
-                            f"{geometry_path}: no OPUS geometry for shape {shape}"
-                        )
-                    opus_by_shape[shape] = opus_candidates(
-                        *shape,
-                        cu_num=cu_num,
-                        top_geometries=getattr(args, "opus_top_geometries", None),
-                        geometries=(
-                            geometry_by_shape[shape]
-                            if geometry_by_shape is not None
-                            else None
-                        ),
-                        max_candidates=getattr(args, "opus_max_candidates", None),
-                    )
+                    opus_by_shape[shape] = opus_candidates(*shape, cu_num=cu_num)
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
         for i in range(len(untunedf)):
