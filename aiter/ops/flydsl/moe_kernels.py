@@ -2042,6 +2042,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2117,6 +2118,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            use_valid_token_count=use_valid_token_count,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2368,6 +2370,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2389,6 +2392,9 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    use_valid_token_count: atomic a16w-mix only; bound scatter rows by
+        num_valid_ids[1] (the sort's real token count) when out is padded.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2421,6 +2427,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        use_valid_token_count=use_valid_token_count,
     )
 
 

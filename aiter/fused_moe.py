@@ -2604,6 +2604,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    use_valid_token_count=False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2661,6 +2662,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
@@ -2854,6 +2856,7 @@ def _mxfp4_a4w4_stage2(
     use_nt=False,
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
+    use_valid_token_count=False,
 ):
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
     if atomic:
@@ -2945,6 +2948,7 @@ def _mxfp4_a4w4_stage2(
         D_INTER_REAL=inter_real,
         topk=topk,
         xcd_swizzle=_xcd2,
+        use_valid_token_count=use_valid_token_count,
     )
 
     if atomic:
@@ -3181,6 +3185,7 @@ def _mxfp4_a4w4_stage2_fw(
         use_nt=cfg["use_nt"],
         cshuffle=cfg["cshuffle"],
         inter_real=inter_real,
+        use_valid_token_count=use_valid_token_count,
     )
 
     if out is not moe_out:
@@ -5064,11 +5069,15 @@ def fused_moe_2stages(
             "flydsl_moe2_layout_"
         )
     )
-    if uses_flydsl_v2_stage2:
+    if stage2_func in (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_wrapper,
+        _mxfp4_a4w4_stage2_fw,
+    ):
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
-        if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-            # FP8 route-output reduction applies the route weights after GEMM2.
-            extra_stage2_args["topk_weights"] = topk_weights
+    if uses_flydsl_v2_stage2 and not doweight_stage1 and _flydsl_stage2_fp8_enabled():
+        # FP8 route-output reduction applies the route weights after GEMM2.
+        extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
     if m_indices is not None:
