@@ -373,7 +373,12 @@ def compile_tdm_compact_plan(
     modulo the block (:func:`compact_dense_comb_slots` bounds the total). The
     plan writes ``comb_slot[route]`` for the reduce, and the run table of
     :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
-    The hist matrix lives in block 0's LDS. With ``plan_blocks > 1`` block 0
+    Padding, the per-source prefix and that run table are one pass. A row
+    longer than a wave is one warp per 32 segments (every warp, not one warp
+    per source); the chunk carry is a prefix of those warp sums across one
+    LDS barrier. ``plan_blocks == 1`` publishes each segment's intra-0 slot
+    so the route loop loads it once. The hist matrix lives in block 0's LDS.
+    With ``plan_blocks > 1`` block 0
     still builds that prefix and publishes each segment's slot of intra 0
     (the exclusive padded prefix of this rank's row plus the first compact
     row's residue) in ``block_hist[seg]``; the other blocks add their
@@ -631,6 +636,10 @@ def compile_tdm_compact_plan(
             lds_segstart = fx.Int64(fx.ptrtoint(segstart_ptr))
             row0_ptr = smem.allocate(npes * segs * 4, 16)._ptr
             lds_row0 = fx.Int64(fx.ptrtoint(row0_ptr))
+            if const_expr(n_chunks > 1):
+                # Padded sum of one (src, 32-segment chunk), for the carry.
+                csum_ptr = smem.allocate(npes * n_chunks * 4, 16)._ptr
+                lds_csum = fx.Int64(fx.ptrtoint(csum_ptr))
         if const_expr(use_sparse):
             pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
@@ -1278,98 +1287,114 @@ def compile_tdm_compact_plan(
             _lds_barrier()
 
             if const_expr(dense_comb):
-                # Each count becomes its run's padded size in place: the run
-                # starts at its first row's residue in a fresh block and ends
-                # on one, so its slots and rows agree modulo the block.
+                # Padded size of one source's run, then the exclusive prefix
+                # of those sizes. One warp owns one (src, 32-segment) chunk, so
+                # a 384-segment row is one round on 12 warps instead of 12
+                # serial rounds on the 4 source warps. segs <= 32 needs no
+                # carry and folds pad + prefix + emit into this pass.
                 _a = COMBINE_SLOT_ALIGN
-                for seg in range(tid, segs, plan_threads):
-                    row = comm_ops.load_i32_lds(
-                        lds_segstart + fx.Int64(seg) * fx.Int64(4)
-                    )
-                    for src in range_constexpr(npes):
-                        at = fx.Int64(src * segs) + fx.Int64(seg)
-                        mat = fx.Int64(src * hist_dwords) + fx.Int64(seg)
-                        cnt = comm_ops.load_i32_lds(lds_matrix + mat * fx.Int64(4))
-                        comm_ops.store_i32_lds(lds_row0 + at * fx.Int64(4), row)
-                        padded = ((row & fx.Int32(_a - 1)) + cnt + fx.Int32(_a - 1)) & (
-                            fx.Int32(-_a)
+
+                def _row0_and_padded(src_i, seg_i, live_i):
+                    expert_start = live_i.select(_ld(lds_segstart, seg_i), fx.Int32(0))
+                    row = expert_start
+                    row0_v = expert_start
+                    cnt_v = fx.Int32(0)
+                    for s in range_constexpr(npes):
+                        c = live_i.select(
+                            _ld(lds_matrix, fx.Int32(s * hist_dwords) + seg_i),
+                            fx.Int32(0),
                         )
-                        comm_ops.store_i32_lds(
-                            lds_matrix + mat * fx.Int64(4),
-                            (cnt > fx.Int32(0)).select(padded, fx.Int32(0)),
+                        take = src_i == fx.Int32(s)
+                        row0_v = take.select(row, row0_v)
+                        cnt_v = take.select(c, cnt_v)
+                        row = row + c
+                    residue = row0_v & fx.Int32(_a - 1)
+                    padded = (residue + cnt_v + fx.Int32(_a - 1)) & fx.Int32(-_a)
+                    padded = (cnt_v > fx.Int32(0)).select(padded, fx.Int32(0))
+                    # select() is a raw arith value; the wave scan wants Int32.
+                    return fx.Int32(row0_v), fx.Int32(padded)
+
+                def _publish(src_i, seg_i, row0_v, excl):
+                    """Run-table entry (this rank's experts) and intra-0 slot."""
+                    in_mine = (seg_i >= fx.Int32(rank * epr)) & (
+                        seg_i < fx.Int32((rank + 1) * epr)
+                    )
+                    if in_mine:
+                        e = seg_i - fx.Int32(rank * epr)
+                        item = e * fx.Int32(npes) + src_i
+                        base_e = excl + (row0_v & fx.Int32(_a - 1))
+                        tab = fx.Int32(epr) + item * fx.Int32(2)
+                        buffer_store(row0_v, rsrc_psum, tab)
+                        buffer_store(base_e - row0_v, rsrc_psum, tab + fx.Int32(1))
+                    if src_i == fx.Int32(rank):
+                        send = _ld(lds_hist, seg_i)
+                        slot0 = excl + (send & fx.Int32(_a - 1))
+                        if const_expr(plan_blocks == 1):
+                            _st(lds_pref, seg_i, slot0)
+                        else:
+                            # Keep lds_segstart as expert_start until every
+                            # warp has recomputed row0 from it.
+                            _st(lds_total, seg_i, slot0)
+                            buffer_store(slot0, rsrc_bhist, seg_i)
+
+                if const_expr(n_chunks == 1):
+                    if warp < npes:
+                        src = warp_u
+                        seg = lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        row0_v, padded = _row0_and_padded(src, seg_s, live)
+                        incl = _wave32_inclusive_scan_i32(padded, lane)
+                        if live:
+                            _publish(src, seg, row0_v, incl - padded)
+                else:
+                    n_jobs = npes * n_chunks
+                    for job in range(
+                        warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)
+                    ):
+                        src = job // fx.Int32(n_chunks)
+                        ch = job - src * fx.Int32(n_chunks)
+                        seg = ch * fx.Int32(WAVE) + lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        _row0, padded = _row0_and_padded(src, seg_s, live)
+                        incl = _wave32_inclusive_scan_i32(padded, lane)
+                        # Uniform readlane: a later partial exec must not be
+                        # the only producer of lane 31's sum.
+                        chunk_total = fx.Int32(
+                            readlane(T.i32, arith.unwrap(incl), WAVE - 1)
                         )
-                        row = row + cnt
-                fx.barrier()
-                # Each src row of the matrix becomes its inclusive prefix in
-                # place, one warp per row. Row src's entry one segment back is
-                # then the padded start of its run there. Pitch is hist_dwords:
-                # the matrix is stored that way, padded past segs.
-                if warp < npes:
-                    row_base = lds_matrix + fx.Int64(warp) * fx.Int64(hist_dwords * 4)
-                    carry = arith.constant(0)
-                    for chunk in range(0, segs, WAVE):
-                        s = fx.Int32(chunk) + lane
-                        in_seg = s < fx.Int32(segs)
-                        s_addr = row_base + fx.Int64(
-                            in_seg.select(s, fx.Int32(0))
-                        ) * fx.Int64(4)
-                        cnt = arith.constant(0)
-                        if in_seg:
-                            cnt = comm_ops.load_i32_lds(s_addr)
-                        inclusive = _wave32_inclusive_scan_i32(cnt, lane)
-                        if in_seg:
-                            comm_ops.store_i32_lds(s_addr, carry + inclusive)
-                        carry = carry + readlane(T.i32, inclusive, WAVE - 1)
-                fx.barrier()
-
-                def incl_at(src, seg):
-                    return comm_ops.load_i32_lds(
-                        lds_matrix
-                        + (fx.Int64(src) * fx.Int64(hist_dwords) + fx.Int64(seg))
-                        * fx.Int64(4)
-                    )
-
-                def excl_at(src, seg):
-                    has_prev = seg > fx.Int32(0)
-                    prev = incl_at(src, has_prev.select(seg - 1, fx.Int32(0)))
-                    return has_prev.select(prev, fx.Int32(0))
-
-                # Run table for gemm2: src's rows of local expert e start at
-                # row0[src][seg] and map onto src's slots local_base_src[seg] + i,
-                # so their slot is row + delta.
-                for item in range(tid, epr * npes, plan_threads):
-                    e = item // fx.Int32(npes)
-                    src = item - e * fx.Int32(npes)
-                    seg = fx.Int32(rank * epr) + e
-                    row_start = comm_ops.load_i32_lds(
-                        lds_row0
-                        + (fx.Int64(src) * fx.Int64(segs) + fx.Int64(seg)) * fx.Int64(4)
-                    )
-                    local_base = excl_at(src, seg) + (row_start & fx.Int32(_a - 1))
-                    tab = fx.Int32(epr) + item * fx.Int32(2)
-                    buffer_store(row_start, rsrc_psum, tab)
-                    buffer_store(local_base - row_start, rsrc_psum, tab + fx.Int32(1))
+                        if live:
+                            _st(lds_row0, src * fx.Int32(segs) + seg, incl - padded)
+                        if lane_i == fx.Int32(0):
+                            _st(lds_csum, src * fx.Int32(n_chunks) + ch, chunk_total)
+                    _lds_barrier()
+                    for job in range(
+                        warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)
+                    ):
+                        src = job // fx.Int32(n_chunks)
+                        ch = job - src * fx.Int32(n_chunks)
+                        seg = ch * fx.Int32(WAVE) + lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        carry = fx.Int32(0)
+                        for prev in range_constexpr(n_chunks):
+                            prev_i = fx.Int32(prev)
+                            add = _ld(lds_csum, src * fx.Int32(n_chunks) + prev_i)
+                            carry = carry + (prev_i < ch).select(add, fx.Int32(0))
+                        if live:
+                            row0_v, _padded = _row0_and_padded(src, seg_s, live)
+                            excl = carry + _ld(lds_row0, src * fx.Int32(segs) + seg)
+                            _publish(src, seg, row0_v, excl)
+                _lds_barrier()
                 if const_expr(plan_blocks > 1):
-                    # Slot of intra 0 for this rank. Row 0 of block_hist held
-                    # this block's counts; the merge rewrites only the other
-                    # rows, and those are read after barrier[1], so row 0
-                    # carries slot0 out on the same release as send_base.
-                    # lds_pref is free after the scan and holds this block's
-                    # exclusive offset (0 here) for the comb_slot walk.
+                    # Row 0 of block_hist carries slot0 out on the same release
+                    # as send_base. lds_pref is this block's exclusive offset.
                     for seg in range(tid, segs, plan_threads):
-                        send = comm_ops.load_i32_lds(
-                            lds_hist + fx.Int64(seg) * fx.Int64(4)
-                        )
-                        slot0 = excl_at(fx.Int32(rank), seg) + (
-                            send & fx.Int32(_a - 1)
-                        )
-                        comm_ops.store_i32_lds(
-                            lds_segstart + fx.Int64(seg) * fx.Int64(4), slot0
-                        )
-                        comm_ops.store_i32_lds(
-                            lds_pref + fx.Int64(seg) * fx.Int64(4), fx.Int32(0)
-                        )
-                        buffer_store(slot0, rsrc_bhist, seg)
+                        slot0 = _ld(lds_total, seg)
+                        _st(lds_segstart, seg, slot0)
+                        _st(lds_pref, seg, fx.Int32(0))
+                    _lds_barrier()
 
         if const_expr(plan_blocks > 1):
             if const_expr(early_release):
@@ -1605,19 +1630,8 @@ def compile_tdm_compact_plan(
                 if const_expr(dense_comb):
                     own_seg = valid.select(segment, fx.Int32(0))
                     if const_expr(plan_blocks == 1):
-                        has_prev = own_seg > fx.Int32(0)
-                        local_base = comm_ops.load_i32_lds(
-                            lds_matrix
-                            + (
-                                fx.Int64(rank * hist_dwords)
-                                + fx.Int64(has_prev.select(own_seg - 1, fx.Int32(0)))
-                            )
-                            * fx.Int64(4)
-                        )
-                        # send_base is this run's first compact row on dest.
-                        local_base = has_prev.select(local_base, fx.Int32(0)) + (
-                            send_base & fx.Int32(COMBINE_SLOT_ALIGN - 1)
-                        )
+                        # Intra-0 slot, published by the dcomb pass.
+                        local_base = _ld(lds_pref, own_seg)
                     else:
                         # intra counts only this block's routes. slot0 is the
                         # segment's intra-0 slot; lds_pref is the block offset.
