@@ -487,7 +487,7 @@ class PaDecodePipeline:
         q_ops_all,
         q_scale_vec,
     ):
-        """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
+        """Overlap QK, page/scale prefetch and PV for up to four padded query tiles.
 
         Every M-tile reuses one K tile and one V gather, owns private P and Lsum
         slots, and keeps its own accumulator chain. The tile's memory-op sequence
