@@ -523,6 +523,118 @@ def test_fp8_paged_mqa_logits(
 
 
 @benchmark()
+def test_fp8_paged_mqa_logits_large_pool(pool_gib, next_n):
+    """Small contexts in a pool crossing the signed-shape / buffer-offset limits."""
+    batch, kv_len = 2, 128
+    inp = _build_inputs(batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE)
+    shuffled, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    num_blocks = (pool_gib * (1 << 30)) // (KV_BLOCK_SIZE * INDEX_DIM) + 1
+    pool = torch.empty(
+        (num_blocks, KV_BLOCK_SIZE, 1, INDEX_DIM),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    # Place distinct pages on both sides of the 32-bit byte-offset boundary.
+    physical = torch.tensor(
+        [0, num_blocks // 2, num_blocks - 2, num_blocks - 1], dtype=torch.int64
+    )
+    pool[physical] = shuffled
+    tables = physical[inp.block_tables.long()].to(torch.int32)
+    ref = run_torch(
+        inp.q_fp8,
+        inp.kv_cache_fp8,
+        inp.weights,
+        inp.context_lens,
+        inp.block_tables,
+        inp.max_model_len,
+        inp.fp8_dtype,
+    )
+
+    def flydsl():
+        out.fill_(float("-inf"))
+        return flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            pool,
+            inp.weights,
+            out,
+            inp.context_lens,
+            tables,
+            inp.max_model_len,
+            SplitKV=1,
+        )
+
+    flops, nbytes = _roofline(
+        batch, next_n, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
+    )
+    return _time_candidates(
+        {"flydsl": (flydsl, out)}, ref, flops, nbytes, "large-pool paged fp8_mqa_logits"
+    )
+
+
+def test_fp8_paged_mqa_logits_large_context_pool(batch, kv_len, next_n):
+    """Full decode shapes whose packed KV allocation exceeds signed i32."""
+    inp = _build_inputs(2, 1, HEADS, HEAD_DIM, 128, _E4M3_NATIVE)
+    shuffled = preshuffle_kv_data(inp.kv_cache_fp8, HEAD_DIM)
+    blocks = batch * (kv_len // KV_BLOCK_SIZE)
+    pool = torch.empty((blocks, KV_BLOCK_SIZE, 1, INDEX_DIM), dtype=torch.uint8)
+    physical = torch.tensor([0, blocks // 2, blocks - 2, blocks - 1], dtype=torch.int64)
+    pool[physical] = shuffled
+    q = torch.randn((batch, next_n, HEADS, HEAD_DIM)).to(_E4M3_NATIVE)
+    weights = torch.randn((batch * next_n, HEADS))
+    template_tables = inp.block_tables[torch.arange(batch) % 2]
+    short_ref = run_torch(
+        q,
+        inp.kv_cache_fp8,
+        weights,
+        torch.full((batch,), 128, dtype=torch.int32),
+        template_tables,
+        128,
+        inp.fp8_dtype,
+    )
+    # Recompute the short reference without the query-tail mask before repeating.
+    for row in range(next_n - 1):
+        short_ref[row::next_n, 128 - next_n + row + 1 :] = run_torch(
+            q[:, row : row + 1],
+            inp.kv_cache_fp8,
+            weights.reshape(batch, next_n, HEADS)[:, row].contiguous(),
+            torch.full((batch,), 128, dtype=torch.int32),
+            template_tables,
+            128,
+            inp.fp8_dtype,
+        )[:, 128 - next_n + row + 1 :]
+    ref = short_ref.repeat(1, kv_len // 128)
+    lengths = kv_len - next_n + 1 + torch.arange(next_n)
+    ref.masked_fill_(
+        torch.arange(kv_len)[None, :] >= lengths.repeat(batch)[:, None], float("-inf")
+    )
+    tables = physical[template_tables.long()].repeat(1, kv_len // 128).to(torch.int32)
+    seq = torch.full((batch,), kv_len, dtype=torch.int32)
+    for layout in ("1d", "2d"):
+        out = torch.full_like(ref, float("-inf"))
+        flydsl_fp8_paged_mqa_logits(
+            q,
+            pool,
+            weights,
+            out,
+            _context_lens_arg(seq, next_n, layout),
+            tables,
+            kv_len,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+        )
+        _grade(
+            ref, out, f"large context pool B={batch} ctx={kv_len} nn={next_n} {layout}"
+        )
+    aiter.logger.info(
+        "large context pool ok: B=%s ctx=%s nn=%s bytes=%s",
+        batch,
+        kv_len,
+        next_n,
+        pool.numel(),
+    )
+
+
+@benchmark()
 def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
     """Mean-Nq decode: scattered 44362-block pool, production output stride."""
     q_dtype = _Q_DTYPE[dtype]
@@ -984,6 +1096,13 @@ def main():
         help="Batch for the >2 GiB KV-pool table (gfx1250).",
     )
     parser.add_argument(
+        "--pool-gib",
+        type=int,
+        nargs="*",
+        default=[2, 4],
+        help="Pool sizes crossing the signed-shape and buffer-byte-offset limits.",
+    )
+    parser.add_argument(
         "--hist-nq",
         type=int,
         nargs="*",
@@ -1061,6 +1180,18 @@ def main():
     ]
     if big:
         _summarize("fp8_paged_mqa_logits_big_cache", big)
+
+    large_pool = [
+        test_fp8_paged_mqa_logits_large_pool(pool_gib, next_n)
+        for pool_gib, next_n in itertools.product(args.pool_gib, [1, 4])
+    ]
+    if large_pool:
+        _summarize("fp8_paged_mqa_logits_large_pool", large_pool)
+
+    if get_gfx() == "gfx950":
+        for batch, kv_len in ((256, 65536), (128, 131072), (256, 131072)):
+            for next_n in (1, 4):
+                test_fp8_paged_mqa_logits_large_context_pool(batch, kv_len, next_n)
 
     hist = [
         test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype)

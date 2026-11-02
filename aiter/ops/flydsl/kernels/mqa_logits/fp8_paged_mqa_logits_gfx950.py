@@ -3,9 +3,11 @@
 
 """gfx950 H32/D128/KVB64 ragged paged FP8 MQA-logits kernel.
 
-One 8-wave workgroup owns one ``(sequence, SplitKV slice)``. Waves 0..3
-compute the four N=16 tiles in one page and replay every live query row.
-Waves 4..7 stream the next page directly into the idle LDS bank.
+One workgroup owns one ``(sequence, SplitKV slice)`` and replays every
+live query row. Width 1 uses four compute and two loader waves with one
+factored LDS row; widths 2..4 use four compute and four loader waves with
+four factored LDS rows. Wider queries retain eight-row LDS storage.
+Loaders stream the next page directly into the idle LDS bank.
 """
 
 from functools import lru_cache
@@ -13,7 +15,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -55,6 +57,11 @@ W_LDS_OFF = Q_LDS_OFF + Q_LDS_BYTES
 
 _NEUTRAL_E8M0 = 0x7F7F7F7F
 _GFX950 = "gfx950"
+# gfx950's 32-wave cap permits five 6-wave or four 8-wave factored CTAs.
+NN1_CTA_CAP = 5
+NN4_CTA_CAP = 4
+# The eight-row allocation is LDS-limited to three CTAs/CU.
+NN8_CTA_CAP = 3
 DEFAULT_COMPILE_HINTS = {"waves_per_eu": 6, "fast_fp_math": True}
 
 
@@ -114,10 +121,16 @@ def _lds_i32x4(base_i32, byte_off):
     return fx.ptr_load(ptr, result_type=T.vec(4, T.i32))
 
 
-def _load_q_pack_lds(q_base, row, head, lane_div_16):
-    """Lane-owned contiguous K32 segment for a 16x16x128 A operand."""
-    base = q_base + row * Q_ROW_BYTES + head * HEAD_DIM + lane_div_16 * 32
-    return _concat_i32x4(_lds_i32x4(base, 0), _lds_i32x4(base, 16))
+def _load_q_pack_lds(q_base, q_layout, row, head, lane_div_16, factor_rows=False):
+    """Lane-owned K32 segment for a 16x16x128 A operand."""
+    col = lane_div_16 * 32
+    if factor_rows:
+        # The 4096-byte row stride is outside Swizzle<3,4,4> bits.
+        q_base = q_base + row * Q_ROW_BYTES
+        row = 0
+    lo = fx.Int32(fx.get_scalar(fx.crd2idx((row, head, col), q_layout)))
+    hi = fx.Int32(fx.get_scalar(fx.crd2idx((row, head, col + 16), q_layout)))
+    return _concat_i32x4(_lds_i32x4(q_base, lo), _lds_i32x4(q_base, hi))
 
 
 def _load_k_pack_lds(k_base, tile, lane_mod_16, lane_div_16):
@@ -173,19 +186,28 @@ def _make_out_row_view(logits, stride_out, row):
 
 @lru_cache(maxsize=8)
 def device_cu_count(device_index: int) -> int:
-    try:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
-    except Exception:  # noqa: BLE001
-        return 256
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _build_kernel(ctx_stride: int):
-    # ctx_stride is a build-time constant: 1 for a [B] context_lens (the
-    # pre-2D kernel and name), n for a (B, n) table (its own build and name).
-    kernel_name = (
-        "fp8_paged_mqa_logits_gfx950_H32_D128_bkv64_kvb64_"
-        "nn8_w8_lds2_mfma16_ntg2l_flydsl"
-    )
+def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_waves=4):
+    threads = (COMPUTE_WAVES + loader_waves) * 64
+    waves = threads // 64
+    kernel_name = "fp8_paged_mqa_logits_gfx950_H32_D128_bkv64_kvb64_nn8_w8_lds2_mfma16_ntg2l_flydsl"
+    factor_rows = reserved_rows < MAX_NN
+    if factor_rows:
+        kernel_name = kernel_name.replace("nn8", f"nn{reserved_rows}") + "_serial"
+    if rebase_kv:
+        kernel_name += "_pagebase"
+    if loader_waves != 4:
+        kernel_name = kernel_name.replace("w8", f"w{waves}") + f"_load{loader_waves}"
+    max_nn = reserved_rows
+    q_bytes = max_nn * Q_ROW_BYTES
+    w_bytes = max_nn * W_ROW_BYTES
+    k_bytes = K_LDS_BYTES
+    q_offset = k_bytes
+    w_offset = q_offset + q_bytes
+    shared_bytes = w_offset + w_bytes
+
     if ctx_stride != 1:
         kernel_name += f"_cs{ctx_stride}"
 
@@ -203,9 +225,9 @@ def _build_kernel(ctx_stride: int):
 
     @fx.struct
     class SharedStorage:
-        raw: fx.Array[fx.Uint8, LDS_BYTES, 16]
+        raw: fx.Array[fx.Uint8, shared_bytes, 16]
 
-    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel(
         Q: fx.Tensor,
         KV_cache: fx.Tensor,
@@ -232,7 +254,6 @@ def _build_kernel(ctx_stride: int):
         pid_batch = umod(bid, batch_size)
         pid_split = udiv(bid, batch_size)
 
-        q_t = GTensor(Q, dtype=T.i32, shape=(-1,))
         kv_t = GTensor(KV_cache, dtype=T.i32, shape=(-1,))
         w_t = GTensor(weights, dtype=T.i32, shape=(-1,))
         context_t = GTensor(context_lens, dtype=T.i32, shape=(-1,))
@@ -252,8 +273,8 @@ def _build_kernel(ctx_stride: int):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.raw.ptr))
-        q_lds_base = lds_base + Q_LDS_OFF
-        w_lds_base = lds_base + W_LDS_OFF
+        q_lds_base = lds_base + q_offset
+        w_lds_base = lds_base + w_offset
 
         def _issue_dma(rsrc, dst_byte, src_byte, *, aux):
             rocdl.raw_ptr_buffer_load_lds(
@@ -266,21 +287,45 @@ def _build_kernel(ctx_stride: int):
                 aux,
             )
 
+        # Keep 16-byte segments intact and spread adjacent heads over 64 banks.
+        q_layout = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(3, 4, 4)),
+            fx.make_layout((max_nn, NUM_HEADS, HEAD_DIM), (Q_ROW_BYTES, HEAD_DIM, 1)),
+        )
+        q_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        q_ptr = fx.inttoptr(
+            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+            fx.ptrtoint(fx.get_iter(Q)),
+        )
+        q_chunks = fx.rocdl.make_buffer_tensor(
+            fx.make_view(q_ptr, fx.make_layout((4, 2**29), (1, 4)))
+        )
+
         # Cached prologue: live Q rows and their f32 head weights.
         q_batch_base = pid_batch * stride_q_batch
-        for rep in range_constexpr(Q_LDS_BYTES // (THREADS * 16)):
-            ci = tid + rep * THREADS
+        for rep in range_constexpr((q_bytes + threads * 16 - 1) // (threads * 16)):
+            ci = tid + rep * threads
             row = udiv(ci * 16, Q_ROW_BYTES)
             pred = row < nn
 
-            def _copy_q(_ci=ci):
+            def _copy_q(_ci=ci, _row=row):
                 byte = _ci * 16
-                _issue_dma(
-                    q_t.rsrc,
-                    Q_LDS_OFF + byte,
-                    q_batch_base + byte,
-                    aux=0,
+                head = umod(udiv(byte, HEAD_DIM), NUM_HEADS)
+                col = umod(byte, HEAD_DIM)
+                dst_byte = fx.Int32(
+                    fx.get_scalar(fx.crd2idx((_row, head, col), q_layout))
                 )
+                frag = fx.make_rmem_tensor(4, fx.Int32)
+                fx.copy(
+                    q_copy,
+                    fx.slice(q_chunks, (None, udiv(q_batch_base + byte, 16))),
+                    frag,
+                )
+                dst = fx.inttoptr(
+                    fx.PointerType.get(T.i32, fx.AddressSpace.Shared, 16),
+                    q_lds_base + dst_byte,
+                )
+                fx.ptr_store(frag.load(), dst)
 
             _guarded(pred, _copy_q)
 
@@ -292,12 +337,12 @@ def _build_kernel(ctx_stride: int):
             byte = _ci * 16
             _issue_dma(
                 w_t.rsrc,
-                W_LDS_OFF + byte,
+                w_offset + byte,
                 w_batch_base + byte,
                 aux=0,
             )
 
-        _guarded((ci_w < W_LDS_BYTES // 16) & (w_row < nn), _copy_w)
+        _guarded((ci_w < w_bytes // 16) & (w_row < nn), _copy_w)
         _wait_all()
         gpu.barrier()
 
@@ -313,17 +358,31 @@ def _build_kernel(ctx_stride: int):
                 )
             )
 
+        def _page_buffer(physical):
+            # Buffer offsets are 32-bit even when the allocation is larger.
+            ptr = fx.add_offset(fx.get_iter(KV_cache), fx.Int64(physical) * PAGE_BYTES)
+            return fx.rocdl.make_buffer_tensor(
+                fx.make_view(ptr, fx.make_layout(PAGE_BYTES, 1)),
+                num_records_bytes=PAGE_BYTES,
+            )
+
         def _copy_page(bank_base, page, copy_tid, copy_threads, reps):
             physical = _load_physical(page)
+            if const_expr(rebase_kv):
+                rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(_page_buffer(physical)))
+                page_base = fx.Int32(0)
+            else:
+                rsrc = kv_t.rsrc
+                page_base = physical * PAGE_BYTES
             for rep in range_constexpr(reps):
                 ci = copy_tid + rep * copy_threads
                 pred = ci < PAGE_CHUNKS
 
-                def _copy(_chunk=ci, _physical=physical):
+                def _copy(_chunk=ci, _rsrc=rsrc, _page_base=page_base):
                     _issue_dma(
-                        kv_t.rsrc,
+                        _rsrc,
                         bank_base + _chunk * 16,
-                        _physical * PAGE_BYTES + _chunk * 16,
+                        _page_base + _chunk * 16,
                         aux=2,
                     )
 
@@ -353,13 +412,20 @@ def _build_kernel(ctx_stride: int):
                 KV_BLOCK_SIZE * HEAD_DIM + (token_base + lane_mod_16) * 4,
             )
 
+            _compute_pack(page, tile, b_pack, scale)
+
+        def _compute_pack(page, tile, b_pack, scale):
+            token_base = tile * MFMA_N
+
             def _score_row(r):
                 a_packs = [
                     _load_q_pack_lds(
                         q_lds_base,
+                        q_layout,
                         r,
                         mi * MFMA_M + lane_mod_16,
                         lane_div_16,
+                        factor_rows,
                     )
                     for mi in range_constexpr(M_TILES)
                 ]
@@ -379,20 +445,23 @@ def _build_kernel(ctx_stride: int):
                     value,
                 )
 
-            for r in range_constexpr(MAX_NN):
+            for r in range_constexpr(max_nn):
 
                 def _do(_r=r):
-                    _score_row(fx.Int32(_r))
+                    if const_expr(factor_rows):
+                        _score_row(_r)
+                    else:
+                        _score_row(fx.Int32(_r))
 
                 _guarded(fx.Int32(r) < nn, _do)
 
         if page_lo < page_hi:
-            # All 512 threads fill the first page (two 16-byte issues max).
+            # The full workgroup fills the first page before role specialization.
             _copy_page(
                 fx.Int32(0),
                 page_lo,
                 tid,
-                fx.Int32(THREADS),
+                fx.Int32(threads),
                 2,
             )
             _wait_all()
@@ -425,8 +494,8 @@ def _build_kernel(ctx_stride: int):
                         _bank_base,
                         _page,
                         _helper_tid,
-                        fx.Int32((WAVES - COMPUTE_WAVES) * 64),
-                        3,
+                        fx.Int32((waves - COMPUTE_WAVES) * 64),
+                        (PAGE_CHUNKS + loader_waves * 64 - 1) // (loader_waves * 64),
                     )
 
                 _guarded(
@@ -474,7 +543,7 @@ def _build_kernel(ctx_stride: int):
             stride_out,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
-            block=(THREADS, 1, 1),
+            block=(threads, 1, 1),
             stream=stream,
         )
 
@@ -483,9 +552,9 @@ def _build_kernel(ctx_stride: int):
     return launch
 
 
-@lru_cache(maxsize=MAX_NN)
-def _compile(ctx_stride: int = 1):
-    return _build_kernel(ctx_stride)
+@lru_cache(maxsize=128)
+def _compile(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_waves=4):
+    return _build_kernel(ctx_stride, rebase_kv, reserved_rows, loader_waves)
 
 
 def flydsl_fp8_paged_mqa_logits(
@@ -506,8 +575,9 @@ def flydsl_fp8_paged_mqa_logits(
 ):
     """Paged FP8 MQA logits for contiguous Q ``[B, next_n, 32, 128]``.
 
-    ``next_n`` may be 1..8. The compiled kernel reserves LDS for eight rows;
-    ``next_n_lens`` optionally selects fewer live rows per sequence.
+    ``next_n`` may be 1..8. The default path reserves one LDS row for
+    width 1, four for widths 2..4, otherwise eight. ``next_n_lens`` optionally
+    selects fewer live rows per sequence.
 
     ``context_lens``: int32, contiguous, on ``q_fp8``'s device. Either
 
@@ -583,9 +653,13 @@ def flydsl_fp8_paged_mqa_logits(
     if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
         raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
 
-    # One page fills all four compute SIMDs. Target three resident WGs/CU,
-    # matching the 50 KiB LDS allocation. Auto mode reads the runtime context
-    # maximum once; explicit SplitKV is graph-capture safe.
+    reserved_rows = 1 if next_n == 1 else 4 if next_n <= 4 else MAX_NN
+    loader_waves = 2 if next_n == 1 else 4
+    cta_cap = (
+        NN1_CTA_CAP if next_n == 1 else NN4_CTA_CAP if next_n <= 4 else NN8_CTA_CAP
+    )
+
+    # Auto mode retains its runtime-context sync; explicit SplitKV is capture-safe.
     if SplitKV is None or int(SplitKV) <= 0:
         real_pages = max(
             1,
@@ -596,22 +670,22 @@ def flydsl_fp8_paged_mqa_logits(
             if TotalCuCount is None
             else int(TotalCuCount)
         )
-        split_kv = max(
-            1,
-            min(real_pages, (total_cu * 3 + batch_size - 1) // batch_size),
-        )
+        # Rows replay inside each CTA: only B * SplitKV contributes to the grid.
+        split_kv = max(1, min(real_pages, total_cu * cta_cap // batch_size))
     else:
         split_kv = max(1, int(SplitKV))
 
     grid_blocks = batch_size * split_kv
-    launcher = _compile(int(ctx_stride))
-    launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
+    launcher = _compile(
+        int(ctx_stride), kv_cache.numel() > 0xFFFFFFFF, reserved_rows, loader_waves
+    )
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):
         _run_compiled(
             launcher,
             q_fp8,
-            kv_cache.reshape(-1),
+            # Dynamic tensor dimensions are packed as i32 by FlyDSL.
+            kv_cache,
             weights,
             out_logits,
             context_lens,

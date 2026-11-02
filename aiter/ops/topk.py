@@ -1200,10 +1200,76 @@ _FLYDSL_TOPK_DECODE_GATES = {
             (131072, 200_000, 48),
             (200_000, None, 64),
         ),
-        False: ((131_072, None, 32),),
+        False: ((131_072, None, 64),),
     },
 }
+# Packed rows retain main's measured multi-CTA gates and never use sampled.
+_FLYDSL_TOPK_PACKED_DECODE_GATES = {
+    arch: dict(gates) for arch, gates in _FLYDSL_TOPK_DECODE_GATES.items()
+}
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
+
+# Sampled-threshold selector (gfx950, stable=False, k=2048, no values, seq_lens
+# given). It is slower than one-block at narrow widths, and at 65536 only wins
+# for next_n >= 2. Multi-CTA stays ahead when the shortest full-context row
+# can promote to two parts (32768 elements per unstable part).
+# (minimum width, minimum next_n), any entry matching selects sampled.
+_FLYDSL_SAMPLED_DECODE_GATES = ((98_304, 1), (65_536, 2))
+_FLYDSL_SAMPLED_DECODE_K = 2048
+_FLYDSL_MULTI_CTA_MIN_ROW_LEN = 2 * 32_768
+# Dispatch sees only the max width, not per-row lengths. Multi-CTA's 2-4 us win
+# at 48-64 full-length rows becomes a ~22% loss on ragged batches, while sampled
+# is robust to raggedness, so multi-CTA outranks sampled only up to this row count.
+_FLYDSL_MULTI_CTA_OVER_SAMPLED_MAX_ROWS = 32
+_FLYDSL_TOPK_SAMPLED_ENABLED = os.environ.get(
+    "AITER_TOPK_SAMPLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _select_flydsl_topk_decode_path(
+    arch: str,
+    stable: bool,
+    width: int,
+    num_rows: int,
+    next_n: int,
+    k: int,
+    sampled_ok: bool = True,
+    packed: bool = False,
+) -> str:
+    """Pure host-side tier choice: "multi_cta", "sampled" or "one_block".
+
+    Uses the physical width only (seq_lens is device-resident); width - next_n + 1
+    is a host-side proxy for the shortest row of a full-context batch, not a
+    bound on actual lengths. ``sampled_ok`` is False when the call needs
+    something the sampled kernel lacks (values output, absent seq_lens).
+    Packed rows use the packed gates and never select sampled."""
+    multi_cta = _flydsl_topk_decode_shape_supported(
+        arch, stable, width, num_rows, k, packed
+    )
+    use_sampled = (
+        _FLYDSL_TOPK_SAMPLED_ENABLED
+        and sampled_ok
+        and not packed
+        and arch == "gfx950"
+        and not stable
+        and k == _FLYDSL_SAMPLED_DECODE_K
+    )
+    # Multi-CTA outranks sampled only at next_n == 1; at next_n=4, width 131072
+    # sampled beat multi-CTA at every row count measured (16 to 128).
+    if multi_cta and (
+        not use_sampled
+        or (
+            next_n == 1
+            and width - next_n + 1 >= _FLYDSL_MULTI_CTA_MIN_ROW_LEN
+            and num_rows <= _FLYDSL_MULTI_CTA_OVER_SAMPLED_MAX_ROWS
+        )
+    ):
+        return "multi_cta"
+    if use_sampled and any(
+        width >= w and next_n >= n for w, n in _FLYDSL_SAMPLED_DECODE_GATES
+    ):
+        return "sampled"
+    return "one_block"
 
 
 @functools.lru_cache(maxsize=128)
@@ -1213,14 +1279,16 @@ def _flydsl_topk_decode_shape_supported(
     width: int,
     num_rows: int,
     k: int,
+    packed: bool = False,
 ) -> bool:
     if k not in _FLYDSL_TOPK_DECODE_KS:
         return False
+    gates = _FLYDSL_TOPK_PACKED_DECODE_GATES if packed else _FLYDSL_TOPK_DECODE_GATES
     return any(
         min_width <= width
         and (max_width is None or width <= max_width)
         and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
+        for min_width, max_width, max_rows in gates[arch][stable]
     )
 
 
@@ -1237,6 +1305,7 @@ def _should_use_flydsl_topk_decode(
     values: torch.Tensor | None = None,
     *,
     width: int | None = None,
+    packed: bool = False,
 ) -> bool:
     """Whether the call goes to the FlyDSL decode top-k: gated by the row
     width -- the logits' own, or the plane ``width`` packed rows stand for."""
@@ -1247,7 +1316,7 @@ def _should_use_flydsl_topk_decode(
     ):
         return False
 
-    arch = get_gfx()
+    arch = get_gfx_runtime()
     if arch not in _FLYDSL_TOPK_DECODE_GATES:
         return False
 
@@ -1257,6 +1326,7 @@ def _should_use_flydsl_topk_decode(
         logits.shape[1] if width is None else width,
         num_rows,
         k,
+        packed,
     ):
         return False
 
@@ -1319,7 +1389,7 @@ def top_k_per_row_decode(
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel; the scratch
+    """Per-row top-k (decode) with multi-CTA, sampled and one-block tiers; scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
     side never allocates device scratch.
 
@@ -1335,14 +1405,42 @@ def top_k_per_row_decode(
     Packed rows: ``logits`` is a flat buffer, row r's scores at element
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
     indices relative to that start. ``plane_width`` is the width of the plane
-    the rows stand for: it bounds every row and picks the kernel exactly as
-    that plane would, so a packed call runs what its plane call runs."""
+    the rows stand for: it bounds every row and uses the packed multi-CTA
+    gates. Packed calls never use sampled selection."""
     if row_starts is not None:
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,
             row_starts, plane_width,
         )  # fmt: skip
-    if _should_use_flydsl_topk_decode(
+    path = "one_block"
+    arch = get_gfx_runtime()
+    if (
+        not _FLYDSL_TOPK_DECODE_DISABLED
+        and isinstance(logits, torch.Tensor)
+        and logits.ndim == 2
+        and arch in _FLYDSL_TOPK_DECODE_GATES
+    ):
+        path = _select_flydsl_topk_decode_path(
+            arch,
+            stable,
+            logits.shape[1],
+            numRows,
+            next_n,
+            k,
+            values is None and seqLens is not None,
+        )
+    if path == "sampled":
+        from .flydsl.topk.topk_per_row import (
+            flydsl_sampled_topk_decode,
+            is_flydsl_sampled_topk_supported,
+        )
+
+        if is_flydsl_sampled_topk_supported(
+            logits, next_n, seqLens, indices, numRows, stride0, stride1, k
+        ):
+            return flydsl_sampled_topk_decode(logits, next_n, seqLens, indices, k)
+        path = "one_block"
+    if path == "multi_cta" and _should_use_flydsl_topk_decode(
         logits,
         next_n,
         seqLens,
@@ -1472,6 +1570,7 @@ def _top_k_per_row_decode_packed(
         stable,
         values,
         width=plane_width,
+        packed=True,
     ):
         return flydsl_topk.flydsl_top_k_per_row_decode(
             view,

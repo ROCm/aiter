@@ -30,6 +30,7 @@ op_tests/test_flydsl_dcp_topk_merge.py	15
 op_tests/test_flydsl_fmha.py	4
 op_tests/test_flydsl_fp8_mqa_logits.py	60
 op_tests/test_flydsl_fp8_paged_mqa_logits.py	5
+op_tests/test_flydsl_fp8_paged_mqa_local_topk.py	19
 op_tests/test_flydsl_gather_kv_b_proj.py	4
 op_tests/test_flydsl_gdr_mtp.py	67
 op_tests/test_flydsl_hc_mix.py	12
