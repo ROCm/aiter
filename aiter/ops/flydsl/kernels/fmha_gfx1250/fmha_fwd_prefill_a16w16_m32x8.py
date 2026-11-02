@@ -3340,9 +3340,6 @@ def _ensure_bshd_kernel(
     _launch_fns[key] = _launch
 
 
-SUPPORTED_PAGED_QK_HDIM = (64, 128, 256)  # 192 needs two gather segments; see the gate
-
-
 def _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
     """The page pool and its metadata, as the gather loader needs them."""
     if k.dim() != v.dim() or k.dim() not in (3, 4):
@@ -3393,10 +3390,6 @@ def flash_attn_a16w16_m32x8_supported(
     num_q, num_kv = q.shape[-2], k.shape[-2]
     if mode == "paged":
         if not _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
-            return False
-        # hdim 192 splits K into two pow2 gather segments while a 128 V stays at one, so
-        # the halves would declare different tensorcnt. Phase 1 declines it.
-        if qk_hdim not in SUPPORTED_PAGED_QK_HDIM:
             return False
     elif block_table is not None:
         return False

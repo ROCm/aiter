@@ -1230,7 +1230,7 @@ def main():
         for (
             (d_qk, d_v), shape, dtype, page_size, causal, lse, sink, window
         ) in itertools.product(
-            [h for h in d_qk_v if _flydsl_serves(*h) and h[0] != 192],
+            [h for h in d_qk_v if _flydsl_serves(*h)],
             thd_shapes,
             paged_dtypes,
             args.page_size,
