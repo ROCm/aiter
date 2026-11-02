@@ -101,7 +101,10 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
     kv_heads, page_size = key.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    value_dim = value.shape[-1]
+    output = torch.zeros(
+        (*queries.shape[:-1], value_dim), dtype=torch.float32, device=query.device
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(lengths.cpu().tolist()):
@@ -126,14 +129,15 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
         # Empty query rows have no attention mass, including with -inf sinks.
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim)
 
 
 def _make_inputs(
     query_length,
     kv_heads,
     group_size,
-    dim,
+    head_dim,
+    value_dim,
     page_size,
     dtype,
     pattern,
@@ -153,12 +157,16 @@ def _make_inputs(
         # Block-table padding beyond the live pages must not reach the kernel.
         table = torch.nn.functional.pad(table, (0, table_width - pages_per_seq))
     query = torch.empty(
-        (batch * query_length, kv_heads * group_size, dim), dtype=dtype, device=device
+        (batch * query_length, kv_heads * group_size, head_dim),
+        dtype=dtype,
+        device=device,
     ).uniform_(-0.5, 0.5)
     key = torch.empty(
-        (num_pages, kv_heads, page_size, dim), dtype=dtype, device=device
+        (num_pages, kv_heads, page_size, head_dim), dtype=dtype, device=device
     ).uniform_(-0.5, 0.5)
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        (num_pages, kv_heads, page_size, value_dim), dtype=dtype, device=device
+    ).uniform_(-0.5, 0.5)
 
     if pattern == "constant":
         query.zero_()
@@ -231,7 +239,121 @@ _COMMON_CASES = [
         for pattern in ("small_query", "probability_tail")
     ],
 ]
+_ASYMMETRIC_BASE = {
+    "query_length": 8,
+    "group_size": 16,
+    "head_dim": 192,
+    "value_dim": 128,
+    "block_size": 64,
+    "max_partitions": 8,
+    "sink_dtype": torch.float32,
+    "capture": True,
+    # Empty rows, short-context residuals, and page/tile boundaries.
+    "lengths": (0, 1, 7, 8, 16, 17, 32, 33, 63, 64, 65, 255, 256, 257, 1027),
+}
+_ASYMMETRIC_WINDOW_CASES = [
+    (
+        f"asymmetric-window-{window}",
+        dict(
+            _ASYMMETRIC_BASE,
+            window=window,
+            sink_dtype=None if window in (0, 2) else torch.float32,
+            capture=window in (0, 2, 33, 1025),
+            lengths=(*_ASYMMETRIC_BASE["lengths"], 8192),
+        ),
+    )
+    # Full attention, minimum windows, FP8 residual cutoff, and wider masks.
+    for window in (0, 1, 2, 32, 33, 128, 1025, 2**31 + 1)
+]
+_ASYMMETRIC_MULTIHEAD_CASES = [
+    (
+        f"asymmetric-kv{heads}-gqa{group}-w{window}",
+        dict(
+            _ASYMMETRIC_BASE,
+            kv_heads=heads,
+            group_size=group,
+            window=window,
+            pattern="varied",
+            max_partitions=4,
+        ),
+    )
+    # Per-token scales need both residual and ordinary-window paths.
+    for heads, group, window in ((2, 16, 4), (4, 8, 128))
+]
+_ASYMMETRIC_GENERAL_CASES = [
+    (
+        name,
+        dict(
+            _ASYMMETRIC_BASE,
+            kv_heads=2,
+            pattern="varied",
+            max_partitions=4,
+            query_length=qlen,
+            group_size=group,
+            block_size=page,
+            window=window,
+        ),
+    )
+    for name, qlen, group, page, window in (
+        ("asymmetric-qlen1-page16", 1, 8, 16, 0),
+        ("asymmetric-qlen3-page128", 3, 8, 128, 33),
+        ("asymmetric-qlen12-gqa32", 12, 32, 64, 2048),
+        ("asymmetric-qlen64", 64, 8, 64, 0),
+    )
+]
+# The common FP8 cases cover the dtype/scale/layout product. Rotate those
+# variants across the new widths instead of repeating the product for each.
+_FP8_HEAD_CASES = [
+    (
+        f"head{dim}-mtp",
+        {
+            "head_dim": dim,
+            "kv_dtype": "fp8",
+            "query_dtype": dtype,
+            "scale_mode": scale_mode,
+            "trans_v": trans_v,
+            "query_length": 3,
+            "group_size": 8,
+            "kv_heads": 2,
+            "block_size": 64,
+            "max_partitions": 4,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": dim in (192, 960),
+        },
+    )
+    for dim, dtype, scale_mode, trans_v in (
+        (192, torch.bfloat16, "per-tensor", True),
+        (320, torch.bfloat16, "per-token", True),
+        (448, torch.float16, "per-tensor", False),
+        (576, torch.bfloat16, "per-tensor", False),
+        (704, torch.float16, "per-token", True),
+        (832, torch.bfloat16, "per-token", False),
+        (960, torch.float16, "per-token", False),
+    )
+]
 _FP8_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_GENERAL_CASES,
+    *_ASYMMETRIC_MULTIHEAD_CASES,
+    *_ASYMMETRIC_WINDOW_CASES,
+    (
+        "asymmetric-large-window-grid",
+        dict(
+            _ASYMMETRIC_BASE,
+            window=1024,
+            lengths=(0, 1, 8, 16, 17, 257, 1027, 8192) * 16,
+        ),
+    ),
+    (
+        "asymmetric-full-long",
+        dict(
+            _ASYMMETRIC_BASE,
+            window=0,
+            sink_dtype=None,
+            capture=False,
+            lengths=(16384,) * 8,
+        ),
+    ),
     (
         "packed-mtp4",
         {
@@ -271,6 +393,106 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *[
+        (
+            f"swa-general-q{qlen}-d{dim}-v{vdim}",
+            {
+                "query_length": qlen,
+                "head_dim": dim,
+                "value_dim": vdim,
+                "group_size": group,
+                "kv_heads": heads,
+                "block_size": page,
+                "window": window,
+                "max_partitions": parts,
+                "lengths": (0, 1, 7, 127, 257, 2047, 4097, 8192) * (batch // 8),
+                "sink_dtype": torch.float32,
+                "capture": True,
+            },
+        )
+        for qlen, dim, vdim, group, heads, page, window, parts, batch in (
+            (1, 64, 64, 8, 2, 16, 127, 1, 8),
+            (2, 192, 192, 16, 1, 64, 512, 4, 8),
+            (3, 128, 128, 16, 1, 64, 512, 8, 48),
+            (4, 256, 256, 8, 2, 128, 1023, 4, 8),
+            (5, 128, 128, 16, 1, 64, 4096, 1, 8),
+            (6, 512, 512, 16, 1, 64, 2048, 1, 8),
+            (7, 192, 128, 8, 2, 16, 1025, 4, 8),
+            (8, 1024, 1024, 16, 1, 128, 2048, 4, 8),
+        )
+    ],
+    *_ASYMMETRIC_GENERAL_CASES,
+    *_ASYMMETRIC_MULTIHEAD_CASES,
+    # BF16 has no FP8 residual cutoff; retain the shared mask/length coverage.
+    *[
+        case
+        for case in _ASYMMETRIC_WINDOW_CASES
+        if case[1]["window"] not in (2, 32, 33)
+    ],
+    *[
+        (
+            f"qlen8-d128-w{window}-np{parts}",
+            {
+                "query_length": 8,
+                "group_size": 16,
+                "head_dim": 128,
+                "block_size": 64,
+                "max_partitions": parts,
+                "window": window,
+                "sink_dtype": torch.float32,
+                "capture": window in (1023, 2048),
+                "lengths": (
+                    (0, 1, 127, 2047, 2048, 2049, 4097, 8192)
+                    if window == 2048
+                    else (0, 1, 127, 128, 129, 257, 515, 1027)
+                ),
+            },
+        )
+        for window, parts in (
+            (512, 4),
+            (1023, 8),
+            (1025, 8),
+            (1024, 1),
+            (1024, 4),
+            (1023, 1),
+            (1025, 1),
+            (2048, 1),
+            (2048, 4),
+            (2048, 8),
+            (2048, 16),
+        )
+    ],
+    *[
+        (
+            f"qlen8-d128-w2048-b32-np{parts}",
+            {
+                "query_length": 8,
+                "group_size": 16,
+                "head_dim": 128,
+                "block_size": 64,
+                "max_partitions": parts,
+                "window": 2048,
+                "sink_dtype": torch.float32,
+                "capture": True,
+                "lengths": (0, 1, 127, 2047, 2048, 2049, 4097, 8192) * 4,
+            },
+        )
+        for parts in (4, 8)
+    ],
+    (
+        "qlen8-d128-w2048-context-bound",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": 2048,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 1, 127, 128, 129, 257, 511, 512),
+        },
+    ),
     (
         "mtp",
         {
@@ -437,9 +659,11 @@ _INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tolerance=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(
+        output.float(), reference, atol=tolerance, rtol=tolerance
+    )
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -460,12 +684,15 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
 
     def unexpected_compile(**_):
-        pytest.fail("invalid BF16 inputs reached kernel compilation")
+        pytest.fail("invalid inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    value_dim = query.shape[-1] if case["value_dim"] is None else case["value_dim"]
     with pytest.raises(case["error"], match=case["match"]):
         pa.pa_decode(
-            torch.empty_like(query),
+            torch.empty(
+                (*query.shape[:-1], value_dim), dtype=query.dtype, device=query.device
+            ),
             query,
             key,
             value,
@@ -534,8 +761,28 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 ("per-tensor", "per-token"),
                 (False, True),
             )
+            if geometry.get("value_dim") is None
+            or (
+                dtype == torch.bfloat16
+                and trans_v
+                and (scale_mode == "per-tensor" or geometry.get("kv_heads", 1) > 1)
+            )
+        ],
+        *[
+            pytest.param(geometry, id=f"fp8-{name}")
+            for name, geometry in _FP8_HEAD_CASES
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+        pytest.param(
+            dict(
+                _ASYMMETRIC_GENERAL_CASES[1][1],
+                kv_dtype="fp8",
+                query_dtype=torch.float16,
+                scale_mode="per-token",
+                trans_v=False,
+            ),
+            id="fp8-asymmetric-fp16-plain-v",
+        ),
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
         *[
             pytest.param(
@@ -559,6 +806,7 @@ def test_pa_decode(case, device, monkeypatch):
             "kv_heads": 1,
             "group_size": 8,
             "head_dim": 128,
+            "value_dim": None,
             "block_size": 64,
             "max_partitions": 1,
             "window": 0,
@@ -587,13 +835,9 @@ def test_pa_decode(case, device, monkeypatch):
     if get_gfx_runtime() == "gfx1250":
         if case.get("invalid_input") in ("fp16-query", "plain-v"):
             pytest.skip("gfx1250 supports FP16 queries and plain BF16 V caches")
-        if (
-            case["kv_dtype"] == "bf16"
-            and case["head_dim"] % 128
-            and case["head_dim"] != 64
-        ):
+        if case["head_dim"] % 128 and case["head_dim"] != 64:
             pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
-    query_length, kv_heads, group_size, dim, page, window = (
+    query_length, kv_heads, group_size, head_dim, page, window = (
         case[name]
         for name in (
             "query_length",
@@ -604,12 +848,16 @@ def test_pa_decode(case, device, monkeypatch):
             "window",
         )
     )
+    value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
+    if value_dim != head_dim and arch not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
         kv_heads,
         group_size,
-        dim,
+        head_dim,
+        value_dim,
         page,
         case["query_dtype"],
         case["pattern"],
@@ -645,12 +893,12 @@ def test_pa_decode(case, device, monkeypatch):
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]
     key_cache = (
-        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        key.reshape(pages, kv_heads, page, head_dim // vector, vector)
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        value.reshape(pages, kv_heads, page // vector, vector, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case["trans_v"]
@@ -678,7 +926,15 @@ def test_pa_decode(case, device, monkeypatch):
             )
         ),
     }
-    arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
+    arguments = (
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        head_dim**-0.5,
+        query_length,
+    )
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
@@ -700,7 +956,12 @@ def test_pa_decode(case, device, monkeypatch):
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
-    output = torch.full_like(query, float("nan"))
+    output = torch.full(
+        (*query.shape[:-1], value_dim),
+        float("nan"),
+        dtype=query.dtype,
+        device=device,
+    )
     workspace = {}
     if case["capture"]:
         scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
@@ -708,7 +969,7 @@ def test_pa_decode(case, device, monkeypatch):
             "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "temporary_output": torch.empty(
-                (*scalar_shape, dim), dtype=query.dtype, device=device
+                (*scalar_shape, value_dim), dtype=query.dtype, device=device
             ),
         }
 
@@ -726,7 +987,10 @@ def test_pa_decode(case, device, monkeypatch):
             window,
             sinks,
         )
-        _check_output(output, reference)
+        tolerance = (
+            1e-2 if case["kv_dtype"] == "fp8" and value_dim != head_dim else 5e-3
+        )
+        _check_output(output, reference, tolerance)
 
     launch()
     check()
@@ -748,6 +1012,44 @@ def test_pa_decode(case, device, monkeypatch):
             check()
 
 
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_asymmetric_multihead_large_address(kv_dtype, device):
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    fp8 = (
+        torch.float8_e4m3fnuz if get_gfx_runtime() == "gfx942" else torch.float8_e4m3fn
+    )
+    dtype = torch.bfloat16 if kv_dtype == "bf16" else fp8
+    vector = 8 if kv_dtype == "bf16" else 16
+    element_bytes = 2 if kv_dtype == "bf16" else 1
+    # Both referenced K and V pages lie above a 2 GiB byte offset.
+    page = 2**31 // (2 * 128 * 64 * element_bytes) + 1
+    key = torch.empty(
+        (page + 1, 2, 192 // vector, 64, vector), dtype=dtype, device=device
+    )
+    value = torch.empty(
+        (page + 1, 2, 64 // vector, 128, vector), dtype=dtype, device=device
+    )
+    key[0].zero_()
+    value[0].zero_()
+    key[page].zero_()
+    value[page, 0].fill_(2)
+    value[page, 1].fill_(4)
+    query = torch.zeros((8, 16, 192), dtype=torch.bfloat16, device=device)
+    output = torch.empty((8, 16, 128), dtype=query.dtype, device=device)
+    context = torch.tensor([64], dtype=torch.int32, device=device)
+    table = torch.tensor([[page]], dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 2, query_length=8, max_partitions=4)
+    pa.pa_decode(
+        output, query, key, value, context, table, 192**-0.5, 8, work_plan=plan
+    )
+    expected = torch.empty_like(output)
+    expected[:, :8].fill_(2)
+    expected[:, 8:].fill_(4)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
 def _poison_unowned(cache, scale, owned, fill):
     """Overwrite K/V rows no sequence owns (and their per-token scales)."""
     rows = ~owned[:, None, :].expand(-1, cache.shape[1], -1)
@@ -767,12 +1069,27 @@ def _poison_unowned(cache, scale, owned, fill):
 
 @pytest.mark.parametrize("fill", ["nan", "inf"])
 @pytest.mark.parametrize(
-    "query_length,kv_heads,group_size,head_dim",
-    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
-)
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize(
-    "kv", ["fp8-per-tensor", "fp8-per-tensor-plain-v", "fp8-per-token", "bf16"]
+    "kv,block_size,query_length,kv_heads,group_size,head_dim",
+    [
+        # Generic multi-query, page16/page64 D256 pipe, and page128 prefetch.
+        ("fp8-per-tensor", 16, 4, 1, 16, 128),
+        ("fp8-per-tensor", 16, 4, 2, 8, 256),
+        ("fp8-per-tensor", 64, 4, 2, 8, 256),
+        ("fp8-per-tensor", 128, 1, 1, 8, 128),
+        # Plain V addressing across all page sizes and single/multi-query paths.
+        ("fp8-per-tensor-plain-v", 16, 4, 2, 8, 256),
+        ("fp8-per-tensor-plain-v", 64, 1, 1, 8, 128),
+        ("fp8-per-tensor-plain-v", 128, 4, 1, 16, 128),
+        # Scalar/vector scale staging, single-query and gfx950 query splitting.
+        ("fp8-per-token", 16, 4, 2, 8, 256),
+        ("fp8-per-token", 64, 4, 1, 16, 128),
+        ("fp8-per-token", 128, 1, 1, 8, 128),
+        ("fp8-per-token", 128, 4, 1, 16, 128),
+        # Both BF16 tail-mask implementations, with multiple heads/M-tiles.
+        ("bf16", 16, 1, 1, 8, 128),
+        ("bf16", 64, 4, 2, 8, 256),
+        ("bf16", 128, 4, 1, 16, 128),
+    ],
 )
 def test_pa_decode_unowned_kv_rows(
     device, kv, block_size, query_length, kv_heads, group_size, head_dim, fill
@@ -793,6 +1110,7 @@ def test_pa_decode_unowned_kv_rows(
         query_length,
         kv_heads,
         group_size,
+        head_dim,
         head_dim,
         block_size,
         torch.bfloat16,
