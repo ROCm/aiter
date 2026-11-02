@@ -347,7 +347,7 @@ def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device)
 
 
 @benchmark()
-def test_mha_flydsl_paged(
+def test_flydsl_mha_fwd_paged(
     seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, causal, lse, sink, window
 ):
     """Paged KV: the pool is page-indexed, Q is ragged exactly as in thd."""
@@ -410,7 +410,7 @@ def test_mha_flydsl_paged(
 
 
 @benchmark()
-def test_mha_flydsl_varlen(
+def test_flydsl_mha_fwd_varlen(
     seqs_q,
     seqs_k,
     H_q,
@@ -557,7 +557,7 @@ def test_mha_flydsl_varlen(
 
 
 @benchmark()
-def test_mha_flydsl_batch(
+def test_flydsl_mha_fwd_batch(
     B, sq, sk, H_q, H_kv, d_qk, d_v, dtype, causal, return_lse, sink, window
 ):
     """One batched (bshd) case: ``[B, S, H, D]``, uniform seq_len, no cu_seqlens."""
@@ -1206,7 +1206,7 @@ def main():
         ):
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
-                test_mha_flydsl_varlen(
+                test_flydsl_mha_fwd_varlen(
                     seqs_q,
                     seqs_k,
                     H_q,
@@ -1241,7 +1241,7 @@ def main():
         ):
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
-                test_mha_flydsl_paged(
+                test_flydsl_mha_fwd_paged(
                     seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size,
                     dtype[0], causal, lse, sink, window,
                 )
@@ -1255,7 +1255,7 @@ def main():
         ):
             B, sq, sk, H_q, H_kv = shape
             rows.append(
-                test_mha_flydsl_batch(
+                test_flydsl_mha_fwd_batch(
                     B,
                     sq,
                     sk,
