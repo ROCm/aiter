@@ -364,6 +364,8 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s);
 
 inline constexpr int kFmhaHd192SplitKvMinSplits = 2;
 inline constexpr int kFmhaHd192SplitKvMaxSplits = 8;
+inline constexpr int kFmhaHd192SplitKvQTile     = 128;
+inline constexpr int kFmhaHd192SplitKvKvTile   = 32;
 
 float fmha_fwd_v3_splitkv(mha_fwd_args args,
                           int num_splits,

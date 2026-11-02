@@ -310,15 +310,16 @@ float fmha_fwd_v3_splitkv(mha_fwd_args a,
     AITER_CHECK(selected != nullptr, "no matching fmha_fwd_v3_splitkv code object");
 
     fmha_fwd_v3_args args;
-    init_fmha_fwd_v3_args(args, a, 128, arch);
-    const int kv_tiles    = (a.seqlen_k + 31) / 32;
+    init_fmha_fwd_v3_args(args, a, kFmhaHd192SplitKvQTile, arch);
+    const int kv_tiles =
+        (a.seqlen_k + kFmhaHd192SplitKvKvTile - 1) / kFmhaHd192SplitKvKvTile;
     const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
     AITER_CHECK(split_tiles * (num_splits - 1) < kv_tiles,
                 "split partition would contain an empty final split");
 
     // This variant maps grid Y to the split ID, s_v_Bs to keys per split,
     // and s_o_Bs to the byte stride between split-major output planes.
-    args.s_v_Bs = split_tiles * 32;
+    args.s_v_Bs = split_tiles * kFmhaHd192SplitKvKvTile;
     args.s_o_Bs = a.seqlen_q * args.s_o_Seqs;
     args.s_lse  = 1;
 
@@ -329,7 +330,8 @@ float fmha_fwd_v3_splitkv(mha_fwd_args a,
     });
 
     size_t arg_size   = sizeof(args);
-    const int q_tiles = (a.seqlen_q + 127) / 128;
+    const int q_tiles =
+        (a.seqlen_q + kFmhaHd192SplitKvQTile - 1) / kFmhaHd192SplitKvQTile;
     return ck_tile::launch_kernel(stream_config,
                                   [=](const ck_tile::stream_config& stream_config_) mutable {
                                       void* args_ptr       = &args;

@@ -12,12 +12,15 @@ num_splits (asm_mha_varlen_fwd.cu): 0 = auto, 1 = unsplit production kernel,
 Sk >= 8192, and Q_tiles * heads <= 2 * CU.
 
 q/k/v are packed THD, batch 1, BF16, D_QK=192 / D_V=128, non-causal — the
-layout the model uses for this kernel.
+layout the model uses for this kernel. Split-KV also requires dense packed
+cu_seqlens_q = [0, q.size(0)] and cu_seqlens_k = [0, k.size(0)]; anything
+else stays on the unsplit kernel (or raises when num_splits is forced).
 """
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 
 import argparse
+import functools
 import itertools
 import math
 
@@ -32,8 +35,7 @@ from aiter.test_common import assertAllclose, benchmark, run_perftest
 
 torch.set_default_device("cuda")
 
-# fmha_fwd_v3_splitkv requires gfx942 and rejects MI308.  The public wrapper
-# still runs on other gfx942 cards; this file only times the split-KV kernel.
+# The split-KV kernel needs gfx942 and does not support MI308; main() skips both.
 SUPPORTED_GFX = ["gfx942"]
 
 HD_QK = 192
@@ -48,6 +50,9 @@ _SHAPES = [
     (4096, 8192, 12),  # first auto split-3
     (4096, 42700, 12),  # Kimi-K3 packed-varlen ticket
 ]
+
+# Shapes that already timed unsplit/public in this process (one pass per shape).
+_TIMED_SHAPES = set()
 
 
 def run_torch(q, k, v, scale):
@@ -109,6 +114,18 @@ def _inputs(sq, sk, hq):
     return q, k, v, cu_q, cu_k, scale
 
 
+@functools.lru_cache(maxsize=1)
+def _case(sq, sk, hq):
+    """Reuse inputs + CPU reference across num_splits for one shape."""
+    torch.manual_seed(0)
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    scale = 1.0 / math.sqrt(HD_QK)
+    ref_out, ref_lse = run_torch(q, k, v, scale)
+    return q, k, v, scale, ref_out, ref_lse
+
+
 def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal=False):
     """Full fmha_v3_varlen_fwd entry: caller args reach the impl, including out=."""
     if out is None:
@@ -161,24 +178,23 @@ def _public(q, k, v, cu_q, cu_k, scale, return_lse, out=None):
 
 @benchmark()
 def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
-    torch.manual_seed(0)
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    q, k, v, scale, ref_out, ref_lse = _case(sq, sk, hq)
     cu_q = torch.tensor([0, sq], dtype=torch.int32)
     cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
     out_buf = torch.empty(sq, hq, HD_V, dtype=q.dtype)
-
-    ref_out, ref_lse = run_torch(q, k, v, scale)
     flops, nbytes = _flops_bytes(hq, sq, sk, q.element_size())
 
-    candidates = {
-        # Production unsplit ASM (num_splits=1).
-        "unsplit": lambda: _v3_fwd(q, k, v, cu_q, cu_k, scale, 1, return_lse)[:2],
-        # The path the model actually runs.
-        "public": lambda: _public(q, k, v, cu_q, cu_k, scale, return_lse, out=out_buf),
-    }
+    # Time unsplit/public once per shape; only forced splitkv repeats per ns.
+    candidates = {}
+    shape_key = (sq, sk, hq, return_lse)
+    if shape_key not in _TIMED_SHAPES:
+        _TIMED_SHAPES.add(shape_key)
+        candidates["unsplit"] = lambda: _v3_fwd(
+            q, k, v, cu_q, cu_k, scale, 1, return_lse
+        )[:2]
+        candidates["public"] = lambda: _public(
+            q, k, v, cu_q, cu_k, scale, return_lse, out=out_buf
+        )
     # Forced split is rejected when the last KV partition would be empty.
     if not _empty_final_split(sk, num_splits):
         candidates["splitkv"] = lambda: _v3_fwd(
@@ -189,6 +205,7 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
         "gfx": get_gfx(),
         "cu": get_cu_num(),
         "q_wgs": ((sq + 127) // 128) * hq,
+        "ns": num_splits,
     }
     outs = {}
     for name, fn in candidates.items():
@@ -230,6 +247,16 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
         ret["public_eq_splitkv"] = int(public_eq_splitkv)
         if auto_split and num_splits == 3:
             assert public_eq_splitkv, (sq, sk, hq, "public auto should be split-3")
+    elif "splitkv" in outs and auto_split and num_splits == 3:
+        # public was timed on an earlier ns for this shape; check against split-3.
+        public_out = _public(q, k, v, cu_q, cu_k, scale, return_lse, out=out_buf)[0]
+        assert torch.equal(public_out, outs["splitkv"]), (
+            sq,
+            sk,
+            hq,
+            "public auto should be split-3",
+        )
+        ret["public_eq_splitkv"] = 1
     return ret
 
 
@@ -334,7 +361,7 @@ def _check_cuda_graph():
     q, k, v, cu_q, cu_k, scale = _inputs(129, 8192, 4)
     sq, sk = q.shape[0], k.shape[0]
     for _ in range(3):
-        flash_attn_varlen_func(
+        eager = flash_attn_varlen_func(
             q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
         )
     torch.cuda.synchronize()
@@ -348,6 +375,8 @@ def _check_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, first)
+    # Split path has no atomics; graph replay must match the eager warm-up.
+    assert torch.equal(captured, eager)
 
 
 def _check_forced_split_writes_out():
@@ -439,6 +468,8 @@ def main():
     )
     args = parser.parse_args()
 
+    _TIMED_SHAPES.clear()
+    _case.cache_clear()
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
             aiter.logger.warning("hd192 split-KV is bf16-only; skipping %s", dtype)

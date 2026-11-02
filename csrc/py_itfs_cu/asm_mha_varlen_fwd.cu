@@ -11,8 +11,6 @@ namespace aiter {
 namespace {
 
 constexpr int kHd192SplitKvDefaultSplits  = 3;
-constexpr int kHd192SplitKvQTile          = 128;
-constexpr int kHd192SplitKvTile           = 32;
 constexpr int kHd192SplitKvAutoMinKvTiles = 256;
 
 // 0: auto. 1: force the unsplit production kernel. 2-8: force that split count.
@@ -25,9 +23,10 @@ int select_hd192_splitkv_num_splits(
         return num_splits;
     if(num_splits == 1 || !kernel_compatible)
         return 1;
-    if(seqlen_k < kHd192SplitKvAutoMinKvTiles * kHd192SplitKvTile)
+    if(seqlen_k < kHd192SplitKvAutoMinKvTiles * kFmhaHd192SplitKvKvTile)
         return 1;
-    const int q_wgs = ((seqlen_q + kHd192SplitKvQTile - 1) / kHd192SplitKvQTile) * nhead;
+    const int q_wgs =
+        ((seqlen_q + kFmhaHd192SplitKvQTile - 1) / kFmhaHd192SplitKvQTile) * nhead;
     if(q_wgs > static_cast<int>(2 * get_num_cu_func()))
         return 1;
     return kHd192SplitKvDefaultSplits;
@@ -267,7 +266,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
 
 
 std::vector<at::Tensor>
-static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
+fmha_v3_varlen_fwd(at::Tensor &q,      // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
@@ -482,6 +481,15 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
                 "num_splits must be between 0 and ",
                 kFmhaHd192SplitKvMaxSplits);
     const bool split_forced = num_splits >= kFmhaHd192SplitKvMinSplits;
+    // Split-KV is only selected when the packed-varlen contract matches the
+    // ASM kernel: gfx942 (not MI308), BF16, D_QK=192 / D_V=128, batch 1,
+    // non-causal, no SWA/bias/dropout/paged/padded cu_seqlens, and
+    // max_seqlen_{q,k} equal the packed buffer lengths. The host gate uses
+    // those buffer lengths for split width; the kernel still reads
+    // cu_seqlens_k[1]-cu_seqlens_k[0]. Copying cu_seqlens to the host would
+    // break CUDA-graph capture, so this path requires dense packed lengths
+    // cu_seqlens_q = [0, q.size(0)] and cu_seqlens_k = [0, k.size(0)]. Any
+    // other shape stays on the unsplit kernel (or TORCH_CHECKs when forced).
     const bool splitkv_compatible =
         get_gpu_arch() == "gfx942" &&
         q_dtype == torch::kBFloat16 && !is_mi308_device() &&
@@ -501,7 +509,8 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
     const bool use_hd192_splitkv = num_splits > 1;
     if(use_hd192_splitkv && max_seqlen_k > 0)
     {
-        const int kv_tiles    = (max_seqlen_k + kHd192SplitKvTile - 1) / kHd192SplitKvTile;
+        const int kv_tiles =
+            (max_seqlen_k + kFmhaHd192SplitKvKvTile - 1) / kFmhaHd192SplitKvKvTile;
         const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
         TORCH_CHECK(split_tiles * (num_splits - 1) < kv_tiles,
                     "num_splits=",
@@ -593,68 +602,6 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
     }
 
     return {out, softmax_lse, p, rng_state};
-}
-
-std::vector<at::Tensor>
-fmha_v3_varlen_fwd(at::Tensor &q,
-                   const at::Tensor &k,
-                   const at::Tensor &v,
-                   const at::Tensor &cu_seqlens_q,
-                   const at::Tensor &cu_seqlens_k,
-                   int max_seqlen_q,
-                   int max_seqlen_k,
-                   int min_seqlen_q,
-                   float p_dropout,
-                   float softmax_scale,
-                   float logits_soft_cap,
-                   bool zero_tensors,
-                   bool is_causal,
-                   int window_size_left,
-                   int window_size_right,
-                   bool return_softmax_lse,
-                   bool return_dropout_randval,
-                   int how_v3_bf16_cvt,
-                   std::optional<at::Tensor> out,
-                   std::optional<const at::Tensor> block_table,
-                   std::optional<const at::Tensor> bias,
-                   std::optional<const at::Tensor> alibi_slopes,
-                   std::optional<const at::Tensor> q_descale,
-                   std::optional<const at::Tensor> k_descale,
-                   std::optional<const at::Tensor> v_descale,
-                   std::optional<at::Generator> gen,
-                   std::optional<const at::Tensor> cu_seqlens_q_padded,
-                   std::optional<const at::Tensor> cu_seqlens_k_padded,
-                   int num_splits)
-{
-    return fmha_v3_varlen_fwd_impl(q,
-                                   k,
-                                   v,
-                                   cu_seqlens_q,
-                                   cu_seqlens_k,
-                                   max_seqlen_q,
-                                   max_seqlen_k,
-                                   min_seqlen_q,
-                                   p_dropout,
-                                   softmax_scale,
-                                   logits_soft_cap,
-                                   zero_tensors,
-                                   is_causal,
-                                   window_size_left,
-                                   window_size_right,
-                                   return_softmax_lse,
-                                   return_dropout_randval,
-                                   how_v3_bf16_cvt,
-                                   out,
-                                   block_table,
-                                   bias,
-                                   alibi_slopes,
-                                   q_descale,
-                                   k_descale,
-                                   v_descale,
-                                   gen,
-                                   cu_seqlens_q_padded,
-                                   cu_seqlens_k_padded,
-                                   num_splits);
 }
 
 } // namespace torch_itfs
