@@ -13,6 +13,7 @@
 #include "mx_quant_utils.h"
 #include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
+#include <stdexcept>
 
 namespace aiter {
 
@@ -20,7 +21,7 @@ namespace aiter {
 // MXFP8 ASM GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes),
 //     scale[(row / 32) * n + (g / 4) * 128 + (row % 32) * 4 + g % 4],
 // and the grid is padded to a multiple of 32 rows whose blocks only write the pad scales (0x7F).
-template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1, bool scale_m32k4 = false>
+template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1, bool scale_m32k4 = false, bool round_before_quant = false>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
     DTYPE_I* residual_out,
@@ -38,7 +39,8 @@ __global__ void add_rmsnorm_quant_kernel(
     int out_stride,
     int group_size,
     bool shuffle_scale=false,
-    bool emit_e8m0_scale=false)
+    bool emit_e8m0_scale=false,
+    bool apply_rounding=false)
     {
         static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * thread_data_size % 16 == 0 ? 16 : 8;
         static_assert(thread_data_size * sizeof(DTYPE_I) % load_chunk_bytes == 0, "thread_data_size * sizeof(DTYPE_I) must be a multiple of load_chunk_bytes");
@@ -218,7 +220,24 @@ __global__ void add_rmsnorm_quant_kernel(
 
             if constexpr(FUSE_QUANT)
             {
+                // The template gate keeps legacy instantiations free of the
+                // new path. Keep conversion runtime-selected in the rounded
+                // instantiation: -ffast-math otherwise folds the narrow/widen
+                // pair and changes split-path rounding, including signed zero.
+                if constexpr(round_before_quant)
+                {
+                    if(apply_rounding)
+                    {
+                        // Preserve the intermediate input-dtype rounding.
+                        for(int i = 0; i < thread_data_size; ++i)
+                            thread_data_float[i] = static_cast<float>(
+                                opus::cast<DTYPE_I>(thread_data_float[i]));
+                    }
+                }
                 float thread_max = aiter::kAmaxFloor;
+                if constexpr(round_before_quant)
+                    if(apply_rounding && n != 32 && n != 64 && n != 128)
+                        thread_max = 0.f;
                 if constexpr(thread_data_size % 2 == 0)
                 {
                     for(int i = 0; i < thread_data_size; i += 2)
@@ -346,6 +365,9 @@ __global__ void add_rmsnorm_quant_kernel(
     ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, false)
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, SCALE_M32K4) \
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_R(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, SCALE_M32K4, false)
+
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL_R(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, SCALE_M32K4, ROUND_BEFORE_QUANT) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
     using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
@@ -356,13 +378,13 @@ __global__ void add_rmsnorm_quant_kernel(
     const int grid_rows = SCALE_M32K4 ? (m + 31) / 32 * 32 : m; \
     dim3 grid((grid_rows + num_row_per_block - 1) / num_row_per_block); \
     dim3 block(BlockSize); \
-    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block, SCALE_M32K4><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
+    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block, SCALE_M32K4, ROUND_BEFORE_QUANT><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
                                                                                                      reinterpret_cast<float*>(scale.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
-                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale); \
+                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale, ROUND_BEFORE_QUANT); \
                                                                                                      });
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
@@ -487,9 +509,18 @@ __global__ void add_rmsnorm_quant_kernel(
         int group_size = 0,
         bool shuffle_scale = false,
         bool gemma_norm = false,
-        bool scale_layout_m32k4 = false
+        bool scale_layout_m32k4 = false,
+        bool round_before_quant = false
     )
     {
+        if(round_before_quant &&
+           !(input.dim() == 2 && input.size(1) > 0 && input.size(1) <= 8192 &&
+             input.size(1) % 32 == 0 && out.dtype() == AITER_DTYPE_fp8 &&
+             scale.dtype() == AITER_DTYPE_fp32 && group_size == 0 &&
+             !shuffle_scale && !scale_layout_m32k4))
+            throw std::runtime_error(
+                "round_before_quant requires 32-aligned per-token FP8 with FP32 scales");
+
         int n = input.size(1);
         int m = input.numel() / n;
         int input_stride = input.stride(0);
@@ -504,6 +535,39 @@ __global__ void add_rmsnorm_quant_kernel(
         const bool emit_e8m0_scale = scale.element_size() == 1;
         AITER_CHECK(!emit_e8m0_scale || group_size != 0, __func__,
                     " e8m0 byte scale requires group_size != 0");
+        if(round_before_quant)
+        {
+            // Instantiate the split-compatible FP8 epilogue separately so
+            // existing quantization kernels keep their original code path.
+#define ROUND_BEFORE_QUANT_IMPL(BLOCK, TDS) \
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_R(opus::fp8_t, BLOCK, TDS, true, true, true, false, true)
+            if(n <= 512)
+            {
+                ROUND_BEFORE_QUANT_IMPL(64, 8);
+            }
+            else if(n <= 1024)
+            {
+                ROUND_BEFORE_QUANT_IMPL(128, 8);
+            }
+            else if(n <= 2048)
+            {
+                ROUND_BEFORE_QUANT_IMPL(256, 8);
+            }
+            else if(n <= 4096)
+            {
+                ROUND_BEFORE_QUANT_IMPL(256, 16);
+            }
+            else if(n <= 6144)
+            {
+                ROUND_BEFORE_QUANT_IMPL(256, 24);
+            }
+            else
+            {
+                ROUND_BEFORE_QUANT_IMPL(256, 32);
+            }
+#undef ROUND_BEFORE_QUANT_IMPL
+            return;
+        }
         if(scale_layout_m32k4)
         {
             check_scale_m32k4(out, scale, group_size, m, n, emit_e8m0_scale);

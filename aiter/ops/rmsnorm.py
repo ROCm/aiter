@@ -600,7 +600,16 @@ def add_rmsnorm_quant(
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
     scale_layout_m32k4: bool = False,
-) -> None: ...
+    round_before_quant: bool = False,
+) -> None:
+    """Residual add + RMSNorm + dynamic quantization.
+
+    ``round_before_quant`` preserves the split norm -> per-token FP8 quant
+    semantics: round normalized values to the input dtype before amax and
+    conversion, including the standalone quantizer's zero-row scale policy.
+    Requires a 32-aligned hidden size <= 8192 and unshuffled FP32 per-token
+    scales. The default retains direct FP32-to-quantized behavior.
+    """
 
 
 @compile_ops("module_rmsnorm_quant", develop=True)
