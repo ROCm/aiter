@@ -1101,12 +1101,7 @@ def gemm_a16w16(
                 f"got address {tensor.data_ptr():#x} and {row_stride_bytes} bytes"
             )
 
-    current = torch.cuda.current_stream()
-    if stream is None:
-        stream = (
-            current if current.device == device else torch.cuda.current_stream(device)
-        )
-    elif stream.device != device:
+    if stream is not None and stream.device != device:
         raise ValueError(f"stream is on {stream.device}, the operands on {device}")
 
     if out_dtype is None:
@@ -1124,13 +1119,9 @@ def gemm_a16w16(
                 f"(got shape {list(out.shape)}, strides {out.stride()})"
             )
 
-    on_stream = (
-        contextlib.nullcontext() if stream == current else torch.cuda.stream(stream)
-    )
     if m == 0 or n == 0:
-        with on_stream:
-            if out is None:
-                out = torch.empty((m, n), dtype=out_dtype, device=device)
+        if out is None:
+            out = torch.empty((m, n), dtype=out_dtype, device=device)
         return out.view(m, n)
 
     _check_flat_buffer_capacity("A", _tensor_span_bytes(a))
@@ -1184,47 +1175,56 @@ def gemm_a16w16(
         workspace_elems = num_tiles * split_k * param.block_m * param.block_n
         _check_flat_buffer_capacity("split-K workspace", workspace_elems * 4)
 
-    # Allocate on the launch stream, so the caching allocator orders reuse of
-    # these buffers after the kernel, and copy back on it. Entering the stream
-    # context costs ~8 us of host time, so it is skipped when already current.
-    with on_stream:
-        if out is None:
-            out = torch.empty((m, n), dtype=out_dtype, device=device)
-        out = out.view(m, n)
-        if f32_accum_for_bf16:
-            kernel_out = torch.empty((m, n), dtype=torch.float32, device=device)
-        else:
-            kernel_out = out
-        semaphore, signal = get_split_k_buffers(
-            stream.cuda_stream, device, split_k, split_k_reduce
+    # The index form of the guard costs ~0.6 us of host time, ~1.4 us less than
+    # passing the torch.device.
+    with torch.cuda.device(device.index):
+        current = torch.cuda.current_stream()
+        if stream is None:
+            stream = current
+        # Allocate on the launch stream, so the caching allocator orders reuse of
+        # these buffers after the kernel, and copy back on it. Entering the stream
+        # context costs ~8 us of host time, so it is skipped when already current.
+        on_stream = (
+            contextlib.nullcontext() if stream == current else torch.cuda.stream(stream)
         )
-        if split_k_reduce:
-            # Partial tiles of every split; the last split of a tile reduces them.
-            workspace = torch.empty(
-                (workspace_elems,),
-                dtype=torch.float32,
-                device=device,
+        with on_stream:
+            if out is None:
+                out = torch.empty((m, n), dtype=out_dtype, device=device)
+            out = out.view(m, n)
+            if f32_accum_for_bf16:
+                kernel_out = torch.empty((m, n), dtype=torch.float32, device=device)
+            else:
+                kernel_out = out
+            semaphore, signal = get_split_k_buffers(
+                stream.cuda_stream, device, split_k, split_k_reduce
             )
-        else:
-            workspace = signal
-        dispatch_args = (
-            _dynamic_tensor_arg(kernel_out, 1),
-            _dynamic_tensor_arg(a, 1),
-            _dynamic_tensor_arg(b, 0),
-            semaphore,
-            signal,
-            workspace,
-            split_k,
-            param,
-            stream,
-        )
-        run_cached(
-            gemm_a16w16_gfx942,
-            *dispatch_args,
-            constexpr_param=param,
-            compiler=flyc.compile,
-            dispatch_args=dispatch_args,
-        )
-        if f32_accum_for_bf16:
-            out.copy_(kernel_out)
+            if split_k_reduce:
+                # Partial tiles of every split; the last split of a tile reduces them.
+                workspace = torch.empty(
+                    (workspace_elems,),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                workspace = signal
+            dispatch_args = (
+                _dynamic_tensor_arg(kernel_out, 1),
+                _dynamic_tensor_arg(a, 1),
+                _dynamic_tensor_arg(b, 0),
+                semaphore,
+                signal,
+                workspace,
+                split_k,
+                param,
+                stream,
+            )
+            run_cached(
+                gemm_a16w16_gfx942,
+                *dispatch_args,
+                constexpr_param=param,
+                compiler=flyc.compile,
+                dispatch_args=dispatch_args,
+            )
+            if f32_accum_for_bf16:
+                out.copy_(kernel_out)
     return out

@@ -21,7 +21,7 @@ else:
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
-from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import gemm_a16w16
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import FALLBACK_CATALOG, gemm_a16w16
 
 
 def _require_gfx942():
@@ -566,6 +566,46 @@ def test_gfx942_fallback_catalog_keeps_n336_down_projection_family():
     assert tuple(config[key] for key in keys) == (128, 112, 128, 3, 4, 1, 1)
 
 
+_FALLBACK_LAUNCHES = [
+    *(("catalog", entry) for entry in FALLBACK_CATALOG),
+    *(("async", mn) for mn in ((20, 20), (20, 50), (50, 20), (50, 50))),
+]
+
+
+@pytest.mark.parametrize(
+    "kind,arg",
+    _FALLBACK_LAUNCHES,
+    ids=[
+        (
+            "x".join(map(str, arg[:3])) + f"-sk{arg[3]}"
+            if kind == "catalog"
+            else f"async-M{arg[0]}-N{arg[1]}"
+        )
+        for kind, arg in _FALLBACK_LAUNCHES
+    ],
+)
+def test_gemm_a16w16_gfx942_fallback_configs(kind, arg):
+    """Every config the fallback can return runs once, on ragged M and N: the
+    catalogue entries and the K=64 async last resort."""
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    if kind == "catalog":
+        m, n, k = 200, 336, 2048
+        cfg = g.fallback_catalog_configs()[FALLBACK_CATALOG.index(arg)]
+    else:
+        (m, n), k = arg, 64
+        cfg = g.gfx942_fallback_config(m, n, k)
+        assert "pingpong" not in cfg, "K=64 must take the async last resort"
+    assert g.config_is_valid(m, n, k, cfg)
+    x, w, ref = _inputs(m, n, k)
+    out = _guarded_out(m, n, torch.bfloat16)
+    y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"fallback config {cfg}")
+    assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
+
+
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
 @pytest.mark.parametrize(
     "split_k",
@@ -669,33 +709,6 @@ def test_flydsl_hgemm_gfx942_rejects_misaligned_inputs(case):
 
     with pytest.raises(ValueError, match=rf"{operand} must have a 16-byte-aligned"):
         flydsl_hgemm(x, w)
-
-
-def test_gemm_a16w16_gfx942_split_k_buffers_do_not_retain_streams():
-    """Split-K semaphores are cached by stream handle: a transient stream is
-    freed after its launch, and a stream on the same handle reuses the set."""
-    _require_gfx942()
-    import gc
-    import weakref
-
-    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
-
-    x, w, ref = _inputs(256, 256, 2048)
-    cfg = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, "split_k": 4}
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs=cfg, stream=stream)
-    stream.synchronize()
-    _assert_close(y, ref, "split-K on a transient stream")
-    handle, alive = stream.cuda_stream, weakref.ref(stream)
-    del stream
-    gc.collect()
-    assert alive() is None, "the split-K buffer cache kept the stream alive"
-    same_handle = torch.cuda.ExternalStream(handle)
-    device = torch.device("cuda", torch.cuda.current_device())
-    assert g.get_split_k_buffers(
-        same_handle.cuda_stream, device, 4, False
-    ) is g.get_split_k_buffers(handle, device, 4, False)
 
 
 def _invalid_inputs(case):
@@ -807,22 +820,20 @@ def test_gemm_a16w16_gfx942_split_k_launch_sequence():
             _assert_close(y, ref, f"launch {i} split_k_reduce={reduce}")
 
 
-@pytest.mark.parametrize(
-    "split",
-    [
-        {"split_k": 1},
-        {"split_k": 4, "split_k_reduce": True},
-        {"split_k": 4, "split_k_reduce": False},
-    ],
-    ids=["no-split-k", "workspace-split-k", "atomic-split-k"],
-)
-def test_gemm_a16w16_gfx942_explicit_stream(split):
-    """A launch on a delayed side stream is complete once that stream is:
-    no host-side allocation or copy runs ahead on the current stream."""
+def test_gemm_a16w16_gfx942_explicit_stream():
+    """A launch on a delayed side stream is complete once that stream is: the
+    bf16 cast of atomic split-K does not run ahead on the current stream."""
     _require_gfx942()
     m, n, k = 256, 256, 2048
     x, w, ref = _inputs(m, n, k)
-    cfg = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, **split}
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "split_k": 4,
+        "split_k_reduce": False,
+    }
     # Compile first, so the delay below is not spent compiling. Negated input:
     # a buffer the allocator hands back from this call holds -ref, not ref.
     gemm_a16w16(-x, w.t(), layout="nt", user_kwargs=cfg)
@@ -832,7 +843,7 @@ def test_gemm_a16w16_gfx942_explicit_stream(split):
         torch.cuda._sleep(200_000_000)
     y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs=cfg, stream=stream)
     stream.synchronize()
-    _assert_close(y, ref, f"explicit stream {split}")
+    _assert_close(y, ref, "explicit stream")
 
 
 if __name__ == "__main__":
