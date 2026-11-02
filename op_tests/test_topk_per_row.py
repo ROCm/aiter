@@ -1002,7 +1002,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    default=[8, 4096, 90000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
@@ -1012,7 +1012,7 @@ parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[512, 1024, 2048],
+    default=[512, 2048],
     nargs="+",
     help="""top-k elements per row. The radix backend supports any positive
     int; the `_fast` ASM-kernel path only supports 2048 and is skipped
@@ -1045,7 +1045,7 @@ parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
-    default=[4, 8, 16, 24],
+    default=[4],
     nargs="+",
     help="""decode_batch_size batch size.
     e.g.: -b 4""",
@@ -1055,7 +1055,7 @@ parser.add_argument(
     "-n",
     "--next_n",
     type=int,
-    default=[1, 2, 3, 4],
+    default=[1, 4],
     nargs="+",
     help="""next_n elements per sequence in a row.
     e.g.: -n 4""",
@@ -1070,6 +1070,20 @@ parser.add_argument(
     nargs="+",
     help="""Specify method for generating logits.
     e.g.: -d random""",
+)
+
+# CI runs `python3 <file>` with no arguments, so the defaults above stay small.
+_FULL_MATRIX = {
+    "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    "top_k": [512, 1024, 2048],
+    "decode_batch_size": [4, 8, 16, 24],
+    "next_n": [1, 2, 3, 4],
+}
+
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help="""run the full benchmark matrix; overrides -c, -k, -b and -n.""",
 )
 
 _REGRESSIONS = {
@@ -1092,6 +1106,8 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+if args.full:
+    vars(args).update(_FULL_MATRIX)
 
 # Regressions run in CI via `python3 <file>`.
 for name in args.regressions:
