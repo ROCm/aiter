@@ -222,18 +222,13 @@ def _store(fmt, values, page_rows):
 
 def _dequant(fmt, cache, scale):
     from aiter.ops.qsa import FP4_GROUP
+    from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
     if scale is None:
         return cache.float()
     if fmt == "fp8":
         return cache.float() * scale.unsqueeze(-1)
-    grid = torch.tensor(
-        E2M1 + tuple(-x for x in E2M1), dtype=torch.float32, device="cuda"
-    )
-    codes = cache.long()
-    values = torch.stack([grid[codes & 15], grid[codes >> 4]], dim=-1).flatten(-2)
-    exponent = scale.float().repeat_interleave(FP4_GROUP, dim=-1)
-    return values * torch.exp2(exponent - 127)
+    return mxfp4_to_f32(cache) * e8m0_to_f32(scale).repeat_interleave(FP4_GROUP, dim=-1)
 
 
 def _rel(a, b):

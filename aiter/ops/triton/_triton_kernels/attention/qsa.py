@@ -12,6 +12,7 @@ each GROUP dims, rounded up so that no value clips.
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _mxfp4_e8m0_to_fp32,
     _mxfp4_quant_op,
@@ -73,6 +74,28 @@ def _e2m1_value_lo(code):
     return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
 
 
+@triton.jit
+def _store_fp8_row(
+    values_ptr,
+    cache_ptr,
+    scale_ptr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    FP8_MAX_C: tl.constexpr,
+):
+    dims = tl.arange(0, BLOCK_D)
+    x = tl.load(values_ptr + dims[None, :], mask=dims[None, :] < HEAD_DIM, other=0.0)
+    y, scale = _fp8_quant_op(
+        x.to(tl.float32), 1, BLOCK_D, BLOCK_D, FP8_MAX_C, -FP8_MAX_C
+    )
+    tl.store(
+        cache_ptr + dims,
+        tl.reshape(y, (BLOCK_D,)).to(cache_ptr.dtype.element_ty),
+        mask=dims < HEAD_DIM,
+    )
+    tl.store(scale_ptr + tl.arange(0, 1), tl.reshape(scale, (1,)))
+
+
 @triton.jit(repr=_qsa_store_rows_fp8_repr)
 def _qsa_store_rows_fp8_kernel(
     cache_ptr,
@@ -101,44 +124,32 @@ def _qsa_store_rows_fp8_kernel(
     (V with K) uses the same slots and strides."""
     row = tl.program_id(0)
     head = tl.program_id(1)
-    dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slots_ptr + row)
     valid = (row < num_rows) & (slot >= 0) & (slot < num_slots)
     if not valid:
         return
     slot = slot.to(tl.int64)
-    cache_offset = slot * stride_cache_slot + head * stride_cache_head + dims
+    cache_offset = slot * stride_cache_slot + head * stride_cache_head
     scale_offset = slot * stride_scale_slot + head * stride_scale_head
-    x = tl.load(
-        values_ptr + row * stride_value_row + head * stride_value_head + dims,
-        mask=dims < HEAD_DIM,
-        other=0.0,
-    ).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-12)
-    y = tl.clamp(x * (FP8_MAX_C / amax), -FP8_MAX_C, FP8_MAX_C)
-    tl.store(
+    _store_fp8_row(
+        values_ptr + row * stride_value_row + head * stride_value_head,
         cache_ptr + cache_offset,
-        y.to(cache_ptr.dtype.element_ty),
-        mask=dims < HEAD_DIM,
+        scale_ptr + scale_offset,
+        HEAD_DIM,
+        BLOCK_D,
+        FP8_MAX_C,
     )
-    tl.store(scale_ptr + scale_offset, amax / FP8_MAX_C)
     if HAS_SECOND:
-        x = tl.load(
+        _store_fp8_row(
             second_values_ptr
             + row * stride_second_value_row
-            + head * stride_second_value_head
-            + dims,
-            mask=dims < HEAD_DIM,
-            other=0.0,
-        ).to(tl.float32)
-        amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-12)
-        y = tl.clamp(x * (FP8_MAX_C / amax), -FP8_MAX_C, FP8_MAX_C)
-        tl.store(
+            + head * stride_second_value_head,
             second_cache_ptr + cache_offset,
-            y.to(second_cache_ptr.dtype.element_ty),
-            mask=dims < HEAD_DIM,
+            second_scale_ptr + scale_offset,
+            HEAD_DIM,
+            BLOCK_D,
+            FP8_MAX_C,
         )
-        tl.store(second_scale_ptr + scale_offset, amax / FP8_MAX_C)
 
 
 @triton.jit(repr=_qsa_store_rows_fp4_repr)
