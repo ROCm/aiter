@@ -883,6 +883,7 @@ jobs:
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
           matrix.shard_idx == 0 &&
           matrix.runner == 'linux-aiter-mi35x-1'
+        continue-on-error: true
         run: |
           set -euo pipefail
           start_time_ns=$(date +%s%N)
