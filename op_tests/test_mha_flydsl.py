@@ -1143,24 +1143,14 @@ def main():
     d_qk_v = args.d_qk_v or SUPPORTED_D_QK_V
     case_rng = random.Random(args.seed)
 
-    def _cases(hdims, shapes, label):
-        """The sweep for one layout, randomly thinned to --max-cases.
+    def _sample(axes, label):
+        """One sweep's product, randomly thinned to --max-cases.
 
-        The axes multiply fast (hdim pairs x shapes x causal x lse x sink x window), so
-        sample the product rather than trim an axis: every combination stays reachable,
-        and a different --seed walks a different slice of it. The sample is drawn over
-        product INDICES -- materializing millions of tuples to keep a few hundred costs
-        hundreds of MB on a partial-axis run. ``_flydsl_serves`` depends only on the hdim
-        axis, so filtering it up front leaves the index space exact."""
-        axes = [
-            [h for h in hdims if _flydsl_serves(*h)],
-            shapes,
-            served_dtypes,
-            causals,
-            lses,
-            sinks,
-            windows,
-        ]
+        The axes multiply fast, so sample the product rather than trim an axis: every
+        combination stays reachable, and a different --seed walks a different slice of
+        it. The sample is drawn over product INDICES -- materializing millions of tuples
+        to keep a few hundred costs hundreds of MB on a partial-axis run. Every sweep
+        goes through here, so --max-cases bounds the run as a whole."""
         total = math.prod(len(a) for a in axes)
         if not args.max_cases or total <= args.max_cases:
             return list(itertools.product(*axes))
@@ -1180,6 +1170,22 @@ def main():
             picked.append(tuple(reversed(combo)))
         return picked
 
+    def _cases(hdims, shapes, label):
+        """One layout's sweep. ``_flydsl_serves`` depends only on the hdim axis, so
+        filtering it up front leaves the index space exact."""
+        return _sample(
+            [
+                [h for h in hdims if _flydsl_serves(*h)],
+                shapes,
+                served_dtypes,
+                causals,
+                lses,
+                sinks,
+                windows,
+            ],
+            label,
+        )
+
     requested_dtypes = list(
         itertools.product(args.dtype_q, args.dtype_kv or args.dtype_q)
     )
@@ -1197,11 +1203,14 @@ def main():
     _b8_dtypes = [d for d in served_dtypes if d[0] in _B8_TORCH or d[1] in _B8_TORCH]
     if args.descale and _b8_dtypes:
         rows = []
-        for (d_qk, d_v), shape, dtype, causal in itertools.product(
-            [h for h in d_qk_v if _flydsl_serves(*h)],
-            thd_shapes,
-            _b8_dtypes,
-            causals,
+        for (d_qk, d_v), shape, dtype, causal in _sample(
+            [
+                [h for h in d_qk_v if _flydsl_serves(*h)],
+                thd_shapes,
+                _b8_dtypes,
+                causals,
+            ],
+            "fp8 descale",
         ):
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
