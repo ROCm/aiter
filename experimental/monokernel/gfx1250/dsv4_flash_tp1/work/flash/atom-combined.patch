@@ -1,0 +1,797 @@
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -89,6 +89,7 @@
+ )
+ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+ from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
++from atom.model_ops.dsv4_hybrid import dsv4_hybrid_hc, dsv4_hybrid_projection
+ from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
+ from atom.model_ops.linear import (
+     ColumnParallelLinear,
+@@ -176,6 +177,8 @@
+     x: torch.Tensor,
+     positions: torch.Tensor,
+     layer_name: str,
++    x_quant: torch.Tensor | None = None,
++    x_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     return torch.empty_like(x)
+ 
+@@ -185,6 +188,8 @@
+     x: torch.Tensor,
+     positions: torch.Tensor,
+     layer_name: str,
++    x_quant: torch.Tensor | None = None,
++    x_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     # WIDE split (legacy / FULL cudagraph path): the whole attention (pre + core
+     # + post) is a single eager splitting op. Used when NOT doing PIECEWISE
+@@ -192,7 +197,7 @@
+     # so there are no inter-piece tensors to stabilise. Unchanged from baseline.
+     atom_config = get_current_atom_config()
+     self = atom_config.compilation_config.static_forward_context[layer_name]
+-    return self.forward_impl(x, positions)
++    return self.forward_impl(x, positions, x_quant, x_scale)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2492,6 +2497,7 @@
+         self.eps = args.norm_eps
+         self.scale_fmt = args.scale_fmt
+         self.skip_topk = False
++        self.hybrid_projection = False
+ 
+         qc = args.quant_config
+         p = prefix  # e.g. "layers.7.attn"
+@@ -2837,6 +2843,8 @@
+         self,
+         x: torch.Tensor,
+         positions: torch.Tensor,
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+         # Resolve to a plain bool: Dynamo folds it, and traced _attn_pre reads it.
+@@ -2845,7 +2853,9 @@
+         )
+         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
+             return self._forward_piecewise_attention(x, positions)
+-        return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
++        return torch.ops.aiter.v4_attention_with_output(
++            x, positions, self.layer_name, x_quant, x_scale
++        )
+ 
+     def _forward_piecewise_attention(
+         self,
+@@ -2897,6 +2907,8 @@
+         x: torch.Tensor,
+         positions: torch.Tensor,
+         run_indexer_proj: bool = True,
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ):
+         """Graphable projection/norm prelude shared by both attention paths.
+ 
+@@ -2916,7 +2928,19 @@
+             x = x.clone()
+             act_quant_inplace(x, 128, "ue8m0")
+ 
+-        qkv_a = self.wqkv_a(x)
++        if self.hybrid_projection:
++            qkv_a = dsv4_hybrid_projection(
++                x if x_quant is None else x_quant,
++                self.wqkv_a.weight,
++                x_scale,
++                self.wqkv_a.weight_scale,
++            )
++        else:
++            qkv_a = (
++                self.wqkv_a(x)
++                if x_quant is None
++                else self.wqkv_a(x_quant, x_scale=x_scale)
++            )
+         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+         assert (
+             not _V4_FORCE_UE8M0_QUANT
+@@ -3068,6 +3092,8 @@
+         self,
+         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
+         """Compute attention for `x` at absolute token `positions`.
+ 
+@@ -3109,7 +3135,7 @@
+         # FULL order: compressor launch overlaps projections, then inline
+         # QK-norm/RoPE, compressor join, paged core, and output projection.
+         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
+-            x, positions, run_indexer_proj=False
++            x, positions, run_indexer_proj=False, x_quant=x_quant, x_scale=x_scale
+         )
+         qkn = self._qk_norm_rope(q, kv_pre, positions)
+         self._attn_compress(
+@@ -3986,7 +4012,8 @@
+         return routed
+ 
+     def single_stream_moe_forward(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [num_tokens, dim]
+         """Sequential: shared_experts → routed_experts → combine."""
+         shared = self.shared_experts(x) if self.shared_experts is not None else None
+@@ -4000,7 +4027,8 @@
+         )
+ 
+     def dual_stream_moe_forward(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [num_tokens, dim]
+         """Run shared_experts on `alt_stream` in parallel with routed_experts
+         on the current stream. Mirrors V2's pattern. Both reads of `x` are
+@@ -4133,6 +4161,37 @@
+         self.enable_fused_hc = (
+             self._mhc_fused_post_pre is not None and self.layer_id != 0
+         )
++        cg = get_current_atom_config().compilation_config.cudagraph_mode
++        projection = self.attn.wqkv_a
++        self.hybrid_hc = (
++            os.environ.get("ATOM_DSV4_HYBRID", "0") == "1"
++            and get_gfx_runtime() == "gfx1250"
++            and args.dim in (4096, 7168)
++            and args.hc_mult == 4
++            and not _V4_FORCE_UE8M0_QUANT
++            and cg is not None
++            and not cg.requires_piecewise_compilation()
++            and projection.params_dtype == torch.float8_e4m3fn
++            and projection.blockscale_e8m0_scale
++            and projection.native_a8_group_rows is None
++            and not projection.use_mxscale_shuffle
++            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
++        )
++        self.attn.hybrid_projection = (
++            self.hybrid_hc
++            and os.environ.get("ATOM_DSV4_HYBRID_GEMM", "0") == "1"
++            and args.dim == 7168
++            and args.q_lora_rank + args.head_dim == 2048
++        )
++        self.hybrid_max_tokens = min(
++            128, int(os.environ.get("ATOM_DSV4_HYBRID_MAX_TOKENS", "128"))
++        )
++        if self.layer_id == 0:
++            logger.info(
++                "DSV4 hybrid mHC quant enabled=%s max_tokens=%s",
++                self.hybrid_hc,
++                self.hybrid_max_tokens,
++            )
+ 
+     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
+     HC_POST_MULT = 2.0
+@@ -4387,16 +4446,34 @@
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+     ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
+         # ----- Attention sub-layer with mHC mixing -----
+-        hc_state = self.fuse_hc(
+-            hc_state,
+-            self.hc_attn_fn,
+-            self.hc_attn_scale,
+-            self.hc_attn_base,
+-            self.attn_norm.weight,
+-            self.norm_eps,
+-        )
++        x_quant = x_scale = None
++        if self.hybrid_hc and hc_state.x_prev is not None:
++            post, comb, x, res, x_quant, x_scale = dsv4_hybrid_hc(
++                hc_state.x_prev,
++                hc_state.residual,
++                hc_state.post_mix,
++                hc_state.comb_mix,
++                self.hc_attn_fn,
++                self.hc_attn_scale,
++                self.hc_attn_base,
++                self.attn_norm.weight,
++                self.norm_eps,
++                self.hc_eps,
++                self.hc_sinkhorn_iters,
++                hc_state.res_preshuffle,
++            )
++            hc_state = HCState(res, post.squeeze(-1), comb, x, hc_state.res_preshuffle)
++        else:
++            hc_state = self.fuse_hc(
++                hc_state,
++                self.hc_attn_fn,
++                self.hc_attn_scale,
++                self.hc_attn_base,
++                self.attn_norm.weight,
++                self.norm_eps,
++            )
+         x = hc_state.x_prev
+-        x = self.attn(x, positions)  # [num_tokens, dim]
++        x = self.attn(x, positions, x_quant, x_scale)  # [num_tokens, dim]
+         hc_state.x_prev = x
+         hc_state = self.fuse_hc(
+             hc_state,
+@@ -4445,7 +4522,8 @@
+         self.hc_eps = hc_eps
+ 
+     def get_logits(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [bs, vocab]
+         """Project to vocab logits via the inherited `ParallelLMHead.forward`,
+         which handles last-token slicing (prefill) + tgemm.mm + all-gather.
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -408,6 +408,13 @@
+     prefix: str = "",
+     mxscale_shuffle: bool = False,
+ ) -> torch.Tensor:
++    from atom.model_ops.dsv4_hybrid import try_dsv4_attention_projection
++
++    candidate = try_dsv4_attention_projection(
++        x, weight, x_scale, w_scale, dtype, prefix, mxscale_shuffle
++    )
++    if candidate is not None:
++        return candidate
+     return _blockscale_preshuffle_gemm(mxscale_shuffle)(
+         x, weight, x_scale, w_scale, dtype
+     )
+--- /dev/null
++++ b/atom/model_ops/dsv4_hybrid.py
+@@ -0,0 +1,303 @@
++"""Opt-in gfx1250 mHC epilogue quantization for DSV4 decode."""
++
++import os
++import torch
++from aiter.jit.utils.torch_guard import torch_compile_guard
++
++_CHECK = os.environ.get("ATOM_DSV4_HYBRID_CHECK", "0") == "1"
++_checked = 0
++_HC_CHECK_LIMIT = int(os.environ.get("ATOM_DSV4_HYBRID_HC_CHECK_LIMIT", "16"))
++_hc_checks = {}
++_MAX_TOKENS = min(128, int(os.environ.get("ATOM_DSV4_HYBRID_MAX_TOKENS", "128")))
++
++
++def _hybrid_fake(
++    x,
++    residual,
++    post,
++    comb,
++    fn,
++    scale,
++    base,
++    norm_weight,
++    rms_eps=1e-6,
++    hc_eps=1e-6,
++    sinkhorn_iters=20,
++    res_preshuffle=True,
++):
++    m, c = x.shape
++    return (
++        torch.empty((m, 4, 1), device=x.device, dtype=torch.float32),
++        torch.empty((m, 4, 4), device=x.device, dtype=torch.float32),
++        torch.empty_like(x),
++        torch.empty_like(residual),
++        torch.empty_like(x, dtype=torch.float8_e4m3fn),
++        torch.empty((m, c // 128), device=x.device, dtype=torch.float8_e8m0fnu),
++    )
++
++
++@torch_compile_guard(gen_fake=_hybrid_fake, mutates_args=[])
++def dsv4_hybrid_hc(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    fn: torch.Tensor,
++    scale: torch.Tensor,
++    base: torch.Tensor,
++    norm_weight: torch.Tensor,
++    rms_eps: float = 1e-6,
++    hc_eps: float = 1e-6,
++    sinkhorn_iters: int = 20,
++    res_preshuffle: bool = True,
++) -> tuple[
++    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
++]:
++    from aiter.ops.triton.fusions.mhc import mhc_post_pre_quant_gfx1250
++
++    # Concrete shape dispatch belongs inside the opaque op: Dynamo compiles
++    # the model at a large warmup shape and reuses it for small graph captures.
++    if not 0 < x.shape[0] <= _MAX_TOKENS:
++        import aiter
++        from aiter.ops.quant import per_group_quant_hip
++
++        ref = aiter.mhc_fused_post_pre(
++            x,
++            residual,
++            post,
++            comb,
++            fn,
++            scale,
++            base,
++            rms_eps,
++            hc_eps,
++            hc_eps,
++            2.0,
++            sinkhorn_iters,
++            norm_weight,
++            rms_eps,
++            w_preshuffle_bf16=fn.dtype == torch.int32,
++            res_preshuffle=res_preshuffle,
++            backend="gluon",
++        )
++        q, qs = per_group_quant_hip(
++            ref[2],
++            quant_dtype=torch.float8_e4m3fn,
++            group_size=128,
++            transpose_scale=True,
++            scale_type=torch.float8_e8m0fnu,
++        )
++        return (*ref, q, qs)
++
++    result = mhc_post_pre_quant_gfx1250(
++        x,
++        residual,
++        post,
++        comb,
++        fn,
++        scale,
++        base,
++        norm_weight,
++        eps=rms_eps,
++        hc_pre_eps=hc_eps,
++        hc_post_mult_value=2.0,
++        sinkhorn_iters=sinkhorn_iters,
++        hc_sinkhorn_eps=hc_eps,
++        norm_eps=rms_eps,
++        res_preshuffle=res_preshuffle,
++    )
++    global _checked
++    if (
++        _CHECK
++        and _checked < _HC_CHECK_LIMIT
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        import aiter
++        from aiter.ops.quant import per_group_quant_hip
++
++        ref = aiter.mhc_fused_post_pre(
++            x,
++            residual,
++            post,
++            comb,
++            fn,
++            scale,
++            base,
++            rms_eps,
++            hc_eps,
++            hc_eps,
++            2.0,
++            sinkhorn_iters,
++            norm_weight,
++            rms_eps,
++            w_preshuffle_bf16=fn.dtype == torch.int32,
++            res_preshuffle=res_preshuffle,
++            backend="gluon",
++        )
++        for actual, expected in zip(result[:4], ref):
++            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++        q, qs = per_group_quant_hip(
++            ref[2],
++            quant_dtype=torch.float8_e4m3fn,
++            group_size=128,
++            transpose_scale=True,
++            scale_type=torch.float8_e8m0fnu,
++        )
++        torch.testing.assert_close(
++            result[4].view(torch.uint8), q.view(torch.uint8), rtol=0, atol=0
++        )
++        torch.testing.assert_close(
++            result[5].view(torch.uint8), qs.view(torch.uint8), rtol=0, atol=0
++        )
++        _checked += 1
++        hc_key = f"{x.shape[0]},{x.shape[1]}"
++        _hc_checks[hc_key] = _hc_checks.get(hc_key, 0) + 1
++        hc_count = _hc_checks[hc_key]
++        if _HC_CHECK_LIMIT > 16 and (hc_count == 2 or hc_count % 128 == 0):
++            print(
++                f"DSV4 hybrid mHC {hc_key}: {hc_count} exact live checks passed",
++                flush=True,
++            )
++        if _checked == 16:
++            print("DSV4 hybrid mHC: 16 exact live checks passed", flush=True)
++    return result
++
++
++_projection_checked = 0
++
++
++def _projection_fake(x, weight, x_scale, weight_scale):
++    return torch.empty(
++        (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16
++    )
++
++
++@torch_compile_guard(gen_fake=_projection_fake, mutates_args=[])
++def dsv4_hybrid_projection(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    x_scale: torch.Tensor | None,
++    weight_scale: torch.Tensor,
++) -> torch.Tensor:
++    """Use AITER's tuned gfx1250 split-K projection for small decode batches."""
++    from aiter.ops.quant import per_group_quant_hip
++    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
++
++    if x_scale is None:
++        x, x_scale = per_group_quant_hip(
++            x,
++            quant_dtype=torch.float8_e4m3fn,
++            group_size=128,
++            transpose_scale=True,
++            scale_type=torch.float8_e8m0fnu,
++        )
++    if not 0 < x.shape[0] <= 64:
++        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
++
++        return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++    result = gemm_afp8wfp8_preshuffle(
++        x,
++        weight,
++        x_scale.view(torch.uint8),
++        weight_scale.view(torch.uint8),
++        backend="gluon",
++        is_x_scale_transposed=True,
++    )
++    global _projection_checked
++    if (
++        _CHECK
++        and _projection_checked < 16
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
++
++        reference = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++        torch.testing.assert_close(result, reference, rtol=0, atol=0)
++        _projection_checked += 1
++        if _projection_checked == 16:
++            print("DSV4 hybrid projection: 16 exact live checks passed", flush=True)
++    return result
++
++
++_ATTN = os.environ.get("ATOM_DSV4_HYBRID_ATTN", "0") == "1"
++_attention_checks = {}
++_ATTENTION_CHECK_LIMIT = int(os.environ.get("ATOM_DSV4_HYBRID_ATTN_CHECK_LIMIT", "2"))
++_attention_configs = None
++
++
++def try_dsv4_attention_projection(
++    x, weight, x_scale, weight_scale, dtype, prefix, mxscale_shuffle
++):
++    """Attention-only override inside the existing opaque Linear operation.
++
++    Keep the Linear caller's quantization, bias, and TP all-reduce unchanged.
++    Dispatch on concrete shapes, and retain native execution for every shape
++    or scale layout absent from the measured configuration table.
++    """
++    if not _ATTN or mxscale_shuffle or dtype != torch.bfloat16:
++        return None
++    if not prefix.endswith(
++        (".attn.wqkv_a", ".attn.wq_b", ".attn.indexer.wq_b", ".attn.wo_b")
++    ):
++        return None
++    if x.ndim != 2 or x.dtype != torch.float8_e4m3fn:
++        return None
++    if (
++        x_scale.dtype != torch.float8_e8m0fnu
++        or weight_scale.dtype != torch.float8_e8m0fnu
++    ):
++        return None
++    from aiter.jit.utils.chip_info import get_gfx_runtime
++
++    if get_gfx_runtime() != "gfx1250":
++        return None
++    global _attention_configs
++    if _attention_configs is None:
++        from pathlib import Path
++        from aiter.ops.triton.utils.config_utils import load_config_json
++
++        _attention_configs = load_config_json(
++            Path(
++                os.environ.get(
++                    "ATOM_DSV4_HYBRID_ATTN_CONFIG",
++                    str(Path(__file__).with_name("dsv4_attention_configs.json")),
++                )
++            )
++        )
++    key = f"{x.shape[0]},{weight.shape[0]},{weight.shape[1]}"
++    config = _attention_configs.get(key)
++    if config is None:
++        return None
++    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
++
++    result = gemm_afp8wfp8_preshuffle(
++        x,
++        weight,
++        x_scale.view(torch.uint8),
++        weight_scale.view(torch.uint8),
++        backend="gluon",
++        is_x_scale_transposed=True,
++        config=dict(config),
++    )
++    count = _attention_checks.get(key, 0)
++    if (
++        _CHECK
++        and count < _ATTENTION_CHECK_LIMIT
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
++
++        reference = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++        torch.testing.assert_close(result, reference, rtol=0, atol=0)
++        _attention_checks[key] = count + 1
++        if count == 1 or (count + 1) % 128 == 0:
++            rank = (
++                torch.distributed.get_rank()
++                if torch.distributed.is_initialized()
++                else 0
++            )
++            print(
++                f"DSV4 hybrid attention rank={rank} {key}: {count + 1} exact live checks passed",
++                flush=True,
++            )
++    return result
+--- /dev/null
++++ b/atom/model_ops/dsv4_attention_configs.json
+@@ -0,0 +1,66 @@
++{
++  "64,16384,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 2,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "128,16384,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 4,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "64,8192,1536": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 2,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": ".ca",
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "128,8192,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  }
++}
+--- /dev/null
++++ b/atom/model_ops/dsv4_flash_attention_configs.json
+@@ -0,0 +1,178 @@
++{
++  "1,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,8192,1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "64,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "64,32768,1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "128,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  }
++}

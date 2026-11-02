@@ -1,0 +1,677 @@
+{
+  "baseline_A": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 36,
+    "ds_store": 10
+  },
+  "baseline_G": {
+    "vgpr": 130,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "barriers": 10,
+    "ds_load": 35,
+    "ds_store": 12
+  },
+  "optimized_2launch": {
+    "vgpr": 221,
+    "spills": 0,
+    "lds": 0,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 0,
+    "ds_store": 0
+  },
+  "16_4_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 99,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 4,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_4_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 159,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_4_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 261,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_8_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 215,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_8_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 186,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_8_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 216,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_16_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 126,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_16_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 140,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "16_32_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 99,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 4,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_4_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 99,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_4_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_4_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 359,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 32,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_8_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 99,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_8_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_8_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 284,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 32,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_16_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 178,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_16_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 206,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_32_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 110,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 8,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_4_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_4_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 258,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 32,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_4_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 537,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 64,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_8_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_8_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 258,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 32,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_8_True_1_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 430,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 64,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_16_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_16_True_1_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 342,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 32,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "64_32_True_1_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 182,
+    "spills": 0,
+    "lds": 4,
+    "wmma": 16,
+    "barriers": 0,
+    "ds_load": 1,
+    "ds_store": 1
+  },
+  "32_4_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 86,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_4_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 159,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_4_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 261,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_8_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 216,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_8_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 187,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_8_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 217,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_16_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 127,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_16_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "32_32_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 78,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 92,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 359,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 92,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 352,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_16_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 152,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_16_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 206,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_32_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 110,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 258,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 537,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 64,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 258,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_2_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 528,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 64,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_16_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_16_True_2_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 342,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_32_True_2_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 8,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 86,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 159,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_4_True_4_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 261,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 216,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 187,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_8_True_4_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 217,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_16_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 127,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_16_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 142,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "64_32_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 78,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 92,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_4_True_4_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 359,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 92,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 232,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_8_True_4_512_1_True_True_.ca_True_False_1": {
+    "vgpr": 352,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 32,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_16_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 152,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_16_True_4_256_1_True_True_.ca_True_False_1": {
+    "vgpr": 206,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 16,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  },
+  "128_32_True_4_128_1_True_True_.ca_True_False_1": {
+    "vgpr": 110,
+    "spills": 0,
+    "lds": 16,
+    "wmma": 8,
+    "barriers": 6,
+    "ds_load": 3,
+    "ds_store": 3
+  }
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 2.442
+  },
+  {
+    "name": "_gemm_mxfp8_preshuffle_gfx1250_bandwidth_bound_kernel_BLOCK_SIZE_M_32_BLOCK_SIZE_N_32_BLOCK_SIZE_K_256_GROUP_SIZE_M_1_A_SCALE_K_GROUP_128_A_SCALE_TRANSPOSED_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_4096_EVEN_K_1_num_warps_4_waves_per_eu_1_cache_modifier_NONE_NUM_BUFFERS_3_LOOP_UNROLL_FACTOR_1_B_SCALE_TDM_1_CTAS_M_1_CTAS_N_1",
+    "us": 7.21
+  },
+  {
+    "name": "_ZN5aiter18act_and_mul_kernelIDF16bDF16bTnPFfRKT_EXadL_ZNS_11silu_kernelIDF16bEEfS3_EELi8ELb1ELi3EEEvPT0_PS2_if",
+    "us": 3.004
+  },
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 2.924
+  },
+  {
+    "name": "_gemm_mxfp8_preshuffle_gfx1250_bandwidth_bound_kernel_BLOCK_SIZE_M_32_BLOCK_SIZE_N_32_BLOCK_SIZE_K_256_GROUP_SIZE_M_1_A_SCALE_K_GROUP_128_A_SCALE_TRANSPOSED_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_num_warps_4_waves_per_eu_1_cache_modifier_NONE_NUM_BUFFERS_3_LOOP_UNROLL_FACTOR_1_B_SCALE_TDM_1_CTAS_M_1_CTAS_N_1",
+    "us": 5.207
+  }
+]

@@ -1,0 +1,962 @@
+[
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "normal",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "absent",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "normal",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "absent",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "normal",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "absent",
+    "error": 0.0
+  },
+  {
+    "pages": 1,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 1,
+    "mode": "normal",
+    "error": 6.977034900046419e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 6.364111413859064e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 1,
+    "mode": "absent",
+    "error": 7.3144597990904e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 2,
+    "mode": "normal",
+    "error": 5.792704541818239e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 5.4392885431298055e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 2,
+    "mode": "absent",
+    "error": 0.00010781106539070606
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 4,
+    "mode": "normal",
+    "error": 9.501292879576795e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 1.5089951830304926e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 4,
+    "mode": "absent",
+    "error": 9.387819591211155e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 0,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 1,
+    "mode": "normal",
+    "error": 1.694489037618041e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 4.3530744733288884e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 1,
+    "mode": "absent",
+    "error": 5.0390008254908025e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 2,
+    "mode": "normal",
+    "error": 1.008050730888499e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 6.919352017575875e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 2,
+    "mode": "absent",
+    "error": 9.829273767536506e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 4,
+    "mode": "normal",
+    "error": 9.210188181896228e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 6.853967533970717e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 4,
+    "mode": "absent",
+    "error": 9.734046761877835e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 64,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 1,
+    "mode": "normal",
+    "error": 9.167229291051626e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 6.364111413859064e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 1,
+    "mode": "absent",
+    "error": 9.167229291051626e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 2,
+    "mode": "normal",
+    "error": 6.42014347249642e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 5.4392885431298055e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 2,
+    "mode": "absent",
+    "error": 6.42014347249642e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 4,
+    "mode": "normal",
+    "error": 6.638435297645628e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 1.5089951830304926e-06
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 4,
+    "mode": "absent",
+    "error": 6.638435297645628e-05
+  },
+  {
+    "pages": 128,
+    "t": 127,
+    "slot": 127,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "normal",
+    "error": 1.058786529029021e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 4.471223655855283e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "absent",
+    "error": 8.796314068604261e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "normal",
+    "error": 1.665486161073204e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 1.07606865640264e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "absent",
+    "error": 0.00010869803372770548
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "normal",
+    "error": 1.694719867373351e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 1.6943276932579465e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "absent",
+    "error": 8.110050112009048e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 0,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 1,
+    "mode": "normal",
+    "error": 7.350948180828709e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 1.2023646377201658e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 1,
+    "mode": "absent",
+    "error": 5.047702870797366e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 2,
+    "mode": "normal",
+    "error": 9.867387234407943e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 5.55821725356509e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 2,
+    "mode": "absent",
+    "error": 6.788537575630471e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 4,
+    "mode": "normal",
+    "error": 9.918217074300628e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 5.603742010862334e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 4,
+    "mode": "absent",
+    "error": 7.058043411234394e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 64,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 1,
+    "mode": "normal",
+    "error": 3.7483298456209013e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 6.022826255502878e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 1,
+    "mode": "absent",
+    "error": 9.167229291051626e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 2,
+    "mode": "normal",
+    "error": 4.251997779647354e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 8.52977973408997e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 2,
+    "mode": "absent",
+    "error": 6.42014347249642e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 4,
+    "mode": "normal",
+    "error": 5.4881570576981176e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 8.531435014447197e-06
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 4,
+    "mode": "absent",
+    "error": 6.638435297645628e-05
+  },
+  {
+    "pages": 128,
+    "t": 128,
+    "slot": 127,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 1,
+    "mode": "normal",
+    "error": 7.875332812545821e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 2.1554087652475573e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 1,
+    "mode": "absent",
+    "error": 7.90038175182417e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 2,
+    "mode": "normal",
+    "error": 6.098523044784088e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 8.62161978147924e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 2,
+    "mode": "absent",
+    "error": 9.866749314824119e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 4,
+    "mode": "normal",
+    "error": 9.592170681571588e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 4,
+    "mode": "absent",
+    "error": 0.00010346432100050151
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 0,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 1,
+    "mode": "normal",
+    "error": 4.999563770979876e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 1.5785888081154553e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 1,
+    "mode": "absent",
+    "error": 0.00010571972234174609
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 2,
+    "mode": "normal",
+    "error": 5.014054295315873e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 1.4278878097684355e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 2,
+    "mode": "absent",
+    "error": 8.562805305700749e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 4,
+    "mode": "normal",
+    "error": 5.5920286285982e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 2.715241365081056e-09
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 4,
+    "mode": "absent",
+    "error": 0.0001089156066882424
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 512,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 1,
+    "mode": "normal",
+    "error": 1.1292620001768228e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 1,
+    "mode": "duplicate",
+    "error": 2.1554087652475573e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 1,
+    "mode": "absent",
+    "error": 9.347679588245228e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 1,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 2,
+    "mode": "normal",
+    "error": 9.200740350934211e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 2,
+    "mode": "duplicate",
+    "error": 8.62161978147924e-05
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 2,
+    "mode": "absent",
+    "error": 0.00010757768905023113
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 2,
+    "mode": "invalid",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 4,
+    "mode": "normal",
+    "error": 7.0246655923256185e-06
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 4,
+    "mode": "duplicate",
+    "error": 0.0
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 4,
+    "mode": "absent",
+    "error": 0.0001009870320558548
+  },
+  {
+    "pages": 1024,
+    "t": 1024,
+    "slot": 1023,
+    "split": 4,
+    "mode": "invalid",
+    "error": 0.0
+  }
+]

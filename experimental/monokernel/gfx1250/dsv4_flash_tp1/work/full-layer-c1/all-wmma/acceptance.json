@@ -1,0 +1,31 @@
+{
+  "scope": "isolated Flash layer0 C1",
+  "all_learned_gemms_and_attention_products_use_wmma": true,
+  "initial_reference_pass": true,
+  "additional_cases_pass": false,
+  "serving_eligible": false,
+  "one_kernel_per_layer": true,
+  "full_vs_regions_exact": true,
+  "source_call_audit": [
+    "activation",
+    "attention_wmma",
+    "dev_load",
+    "dev_store",
+    "linear",
+    "mhc_post",
+    "mhc_pre",
+    "mhc_wmma",
+    "norm",
+    "pack",
+    "partial_norm",
+    "quant",
+    "range",
+    "rope",
+    "route",
+    "routed_linear",
+    "sinkhorn",
+    "sync",
+    "wmma_matvec"
+  ],
+  "reason": "Numerical gate fails on token 7; full-layer latency regresses. Native ATOM/task quality not validated."
+}

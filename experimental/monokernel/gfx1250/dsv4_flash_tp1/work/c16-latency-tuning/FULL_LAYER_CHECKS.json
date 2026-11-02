@@ -1,0 +1,314 @@
+[
+  {
+    "type": "SWA",
+    "source": "paired-final-micro-16-0.json",
+    "m": 16,
+    "ratio": 0,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 428,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          323.4248459339142,
+          323.0968415737152
+        ],
+        "second_us": 323.0968415737152
+      },
+      {
+        "mode": 1,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 412,
+        "spills": 0,
+        "lds": 186884,
+        "rounds_us": [
+          295.8473712205887,
+          295.61327397823334
+        ],
+        "second_us": 295.61327397823334
+      }
+    ],
+    "groups": {}
+  },
+  {
+    "type": "CSA",
+    "source": "paired-final-micro-16-4.json",
+    "m": 16,
+    "ratio": 4,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 425,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          365.54884910583496,
+          366.1848157644272
+        ],
+        "second_us": 366.1848157644272
+      },
+      {
+        "mode": 1,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 416,
+        "spills": 0,
+        "lds": 186884,
+        "rounds_us": [
+          343.3869928121567,
+          343.25428307056427
+        ],
+        "second_us": 343.25428307056427
+      }
+    ],
+    "groups": {}
+  },
+  {
+    "type": "HCA",
+    "source": "paired_final-final-micro-16-128.json",
+    "m": 16,
+    "ratio": 128,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 418,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          367.49155819416046,
+          367.2587275505066
+        ],
+        "second_us": 367.2587275505066
+      },
+      {
+        "mode": 1,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 414,
+        "spills": 0,
+        "lds": 186884,
+        "rounds_us": [
+          345.7752764225006,
+          345.8503931760788
+        ],
+        "second_us": 345.8503931760788
+      }
+    ],
+    "groups": {}
+  }
+]

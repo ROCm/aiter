@@ -1,0 +1,15 @@
+{
+  "vgpr": 492,
+  "lds": 133088,
+  "spills": 0,
+  "graph_nodes": {
+    "native": 560,
+    "two_fused_regions": 32,
+    "single_full_layer": 16
+  },
+  "health": {
+    "attention": true,
+    "ffn": 0,
+    "moe": 0
+  }
+}

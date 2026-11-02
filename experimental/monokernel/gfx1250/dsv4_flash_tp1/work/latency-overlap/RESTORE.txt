@@ -1,0 +1,31 @@
+Resume / reproduce
+
+1. Preserve the whole archive, not only MONOKERNEL_RESUME.txt. It contains sources,
+   pre-edit backups, source dependencies, ATOM overlay, fixtures, scripts and results.
+2. Use the matching ROCm image and model recorded in environment.json. The model
+   checkpoint and Docker image layers are external prerequisites, not in this archive.
+3. Extract archive contents into /home/vigokhal/dsv4-monokernel and mount that directory
+   as /work in the GPU container. Preserve /data/DeepSeek-V4-Flash.
+4. Inspect atom-status.txt and atom-working-tree.patch. atom-overlay contains the
+   actual modified/untracked runtime files; back up destination files before copying
+   that overlay onto /app/ATOM. Do NOT rerun integrated-c8/integrate.py: it is an old
+   generator and would overwrite the current optimized source.
+5. For selected serving, run:
+     HIP_VISIBLE_DEVICES=0 HTTP_PORT=8250 PORT=8251 CONCURRENCY=8 \
+       bash /work/latency-overlap/run-selected.sh fused
+   In another shell, run:
+     python /work/integrated-c8/client_when_ready.py 8250 resumed-selected 8
+   The client script runs twice automatically. Use round2 only.
+6. For prior monokernel comparison, use integrated-c8/run.sh fused with
+   ATOM_DSV4_TILE_MASK=0 ATOM_DSV4_EDGE_MASK=0 ATOM_DSV4_OVERLAP=0.
+   For native ATOM use integrated-c8/run.sh baseline. One server start per config.
+7. Standalone validation example:
+     HIP_VISIBLE_DEVICES=0 TEST_BATCHES=1,2,4,8 REP=20 EDGE_MASK=0 TILE_MASK=192 \
+     EARLY_MASK=2 RUN_ID=recheck-swa python /work/latency-overlap/whole_tiles.py
+   Use whole_compressed.py and RATIO=4 or128 for CSA/HCA. Use distinct GPUs per worker.
+8. Read STATE.txt and DEPENDENCIES.tsv before enabling any experimental bit.
+   Pure-load tile semaphores have replay failures. Broad extra prefetch stalls.
+   Existing bounded QB L2 prefetch / TDM stays enabled in selected path.
+9. All new knobs default OFF in runtime_batch.py. Selected recipe is explicit.
+   No new branch/image was pushed by this experiment. Historical push records refer
+   to earlier source states, not this archive.

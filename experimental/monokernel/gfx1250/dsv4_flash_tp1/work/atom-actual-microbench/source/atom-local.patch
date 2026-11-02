@@ -1,0 +1,287 @@
+diff --git a/atom/model_ops/fused_moe_triton.py b/atom/model_ops/fused_moe_triton.py
+index bade07cad..8ab3bb879 100644
+--- a/atom/model_ops/fused_moe_triton.py
++++ b/atom/model_ops/fused_moe_triton.py
+@@ -498,6 +498,16 @@ def _fused_experts_silu_gugu(
+         )
+ 
+     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
++    from atom.model_ops.dsv4_flash_moe import try_moe, validate
++    mk, mk_check = try_moe(x_fp8,x_scale,w1,w2,w13_scale,w2_scale,
++        routing_data,gather_indx,scatter_indx,_swiglu_limit_or_none(swiglu_limit),
++        eligible=(_preshuffled and get_arch()=="gfx1250" and
++            w13_swizzle_layout=="GFX1250_SCALE" and w2_swizzle_layout=="GFX1250_SCALE" and
++            a13_scale is None and a2_scale is None and w1_bias is None and w2_bias is None and
++            not apply_router_weight_on_input and gate_valid is None and y_out is None and ep_scatter is None))
++    if mk is not None and not mk_check:
++        return mk
++
+ 
+     # GEMM1: SiLU(gate)*up fused into write-back.
+     #
+@@ -547,7 +557,7 @@ def _fused_experts_silu_gugu(
+             interm, torch.float8_e4m3fn, axis=-1
+         )
+ 
+-    return moe_gemm_a8w4(
++    mk_reference = moe_gemm_a8w4(
+         interm_fp8,
+         w2,
+         interm_scale,
+@@ -567,6 +577,11 @@ def _fused_experts_silu_gugu(
+         ep_scatter=ep_scatter,
+     )
+ 
++    if mk is not None:
++        validate(mk,mk_reference,w1)
++        return mk
++    return mk_reference
++
+ 
+ def triton_kernel_moe_forward(
+     hidden_states: torch.Tensor,
+diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
+index b601e74ea..73bbfe455 100644
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -408,6 +408,13 @@ def gemm_a8w8_blockscale_preshuffle_impl(
+     prefix: str = "",
+     mxscale_shuffle: bool = False,
+ ) -> torch.Tensor:
++    from atom.model_ops.dsv4_hybrid import try_dsv4_attention_projection
++
++    candidate = try_dsv4_attention_projection(
++        x, weight, x_scale, w_scale, dtype, prefix, mxscale_shuffle
++    )
++    if candidate is not None:
++        return candidate
+     return _blockscale_preshuffle_gemm(mxscale_shuffle)(
+         x, weight, x_scale, w_scale, dtype
+     )
+diff --git a/atom/models/deepseek_v4.py b/atom/models/deepseek_v4.py
+index a59797526..0962226a2 100644
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -89,6 +89,7 @@ from atom.model_ops.communication_op import (
+ )
+ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+ from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
++from atom.model_ops.dsv4_hybrid import dsv4_hybrid_hc, dsv4_hybrid_projection
+ from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
+ from atom.model_ops.linear import (
+     ColumnParallelLinear,
+@@ -176,6 +177,8 @@ def _v4_attention_fake(
+     x: torch.Tensor,
+     positions: torch.Tensor,
+     layer_name: str,
++    x_quant: torch.Tensor | None = None,
++    x_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     return torch.empty_like(x)
+ 
+@@ -185,6 +188,8 @@ def v4_attention_with_output(
+     x: torch.Tensor,
+     positions: torch.Tensor,
+     layer_name: str,
++    x_quant: torch.Tensor | None = None,
++    x_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     # WIDE split (legacy / FULL cudagraph path): the whole attention (pre + core
+     # + post) is a single eager splitting op. Used when NOT doing PIECEWISE
+@@ -192,7 +197,7 @@ def v4_attention_with_output(
+     # so there are no inter-piece tensors to stabilise. Unchanged from baseline.
+     atom_config = get_current_atom_config()
+     self = atom_config.compilation_config.static_forward_context[layer_name]
+-    return self.forward_impl(x, positions)
++    return self.forward_impl(x, positions, x_quant, x_scale)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2492,6 +2497,7 @@ class DeepseekV4Attention(nn.Module):
+         self.eps = args.norm_eps
+         self.scale_fmt = args.scale_fmt
+         self.skip_topk = False
++        self.hybrid_projection = False
+ 
+         qc = args.quant_config
+         p = prefix  # e.g. "layers.7.attn"
+@@ -2837,6 +2843,8 @@ class DeepseekV4Attention(nn.Module):
+         self,
+         x: torch.Tensor,
+         positions: torch.Tensor,
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+         # Resolve to a plain bool: Dynamo folds it, and traced _attn_pre reads it.
+@@ -2845,7 +2853,9 @@ class DeepseekV4Attention(nn.Module):
+         )
+         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
+             return self._forward_piecewise_attention(x, positions)
+-        return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
++        return torch.ops.aiter.v4_attention_with_output(
++            x, positions, self.layer_name, x_quant, x_scale
++        )
+ 
+     def _forward_piecewise_attention(
+         self,
+@@ -2897,6 +2907,8 @@ class DeepseekV4Attention(nn.Module):
+         x: torch.Tensor,
+         positions: torch.Tensor,
+         run_indexer_proj: bool = True,
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ):
+         """Graphable projection/norm prelude shared by both attention paths.
+ 
+@@ -2916,7 +2928,19 @@ class DeepseekV4Attention(nn.Module):
+             x = x.clone()
+             act_quant_inplace(x, 128, "ue8m0")
+ 
+-        qkv_a = self.wqkv_a(x)
++        if self.hybrid_projection:
++            qkv_a = dsv4_hybrid_projection(
++                x if x_quant is None else x_quant,
++                self.wqkv_a.weight,
++                x_scale,
++                self.wqkv_a.weight_scale,
++            )
++        else:
++            qkv_a = (
++                self.wqkv_a(x)
++                if x_quant is None
++                else self.wqkv_a(x_quant, x_scale=x_scale)
++            )
+         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+         assert (
+             not _V4_FORCE_UE8M0_QUANT
+@@ -3068,6 +3092,8 @@ class DeepseekV4Attention(nn.Module):
+         self,
+         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
+         """Compute attention for `x` at absolute token `positions`.
+ 
+@@ -3109,7 +3135,7 @@ class DeepseekV4Attention(nn.Module):
+         # FULL order: compressor launch overlaps projections, then inline
+         # QK-norm/RoPE, compressor join, paged core, and output projection.
+         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
+-            x, positions, run_indexer_proj=False
++            x, positions, run_indexer_proj=False, x_quant=x_quant, x_scale=x_scale
+         )
+         qkn = self._qk_norm_rope(q, kv_pre, positions)
+         self._attn_compress(
+@@ -3986,7 +4012,8 @@ class MoE(nn.Module):
+         return routed
+ 
+     def single_stream_moe_forward(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [num_tokens, dim]
+         """Sequential: shared_experts → routed_experts → combine."""
+         shared = self.shared_experts(x) if self.shared_experts is not None else None
+@@ -4000,7 +4027,8 @@ class MoE(nn.Module):
+         )
+ 
+     def dual_stream_moe_forward(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [num_tokens, dim]
+         """Run shared_experts on `alt_stream` in parallel with routed_experts
+         on the current stream. Mirrors V2's pattern. Both reads of `x` are
+@@ -4133,6 +4161,37 @@ class Block(nn.Module):
+         self.enable_fused_hc = (
+             self._mhc_fused_post_pre is not None and self.layer_id != 0
+         )
++        cg = get_current_atom_config().compilation_config.cudagraph_mode
++        projection = self.attn.wqkv_a
++        self.hybrid_hc = (
++            os.environ.get("ATOM_DSV4_HYBRID", "0") == "1"
++            and get_gfx_runtime() == "gfx1250"
++            and args.dim in (4096, 7168)
++            and args.hc_mult == 4
++            and not _V4_FORCE_UE8M0_QUANT
++            and cg is not None
++            and not cg.requires_piecewise_compilation()
++            and projection.params_dtype == torch.float8_e4m3fn
++            and projection.blockscale_e8m0_scale
++            and projection.native_a8_group_rows is None
++            and not projection.use_mxscale_shuffle
++            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
++        )
++        self.attn.hybrid_projection = (
++            self.hybrid_hc
++            and os.environ.get("ATOM_DSV4_HYBRID_GEMM", "0") == "1"
++            and args.dim == 7168
++            and args.q_lora_rank + args.head_dim == 2048
++        )
++        self.hybrid_max_tokens = min(
++            128, int(os.environ.get("ATOM_DSV4_HYBRID_MAX_TOKENS", "128"))
++        )
++        if self.layer_id == 0:
++            logger.info(
++                "DSV4 hybrid mHC quant enabled=%s max_tokens=%s",
++                self.hybrid_hc,
++                self.hybrid_max_tokens,
++            )
+ 
+     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
+     HC_POST_MULT = 2.0
+@@ -4387,16 +4446,34 @@ class Block(nn.Module):
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+     ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
+         # ----- Attention sub-layer with mHC mixing -----
+-        hc_state = self.fuse_hc(
+-            hc_state,
+-            self.hc_attn_fn,
+-            self.hc_attn_scale,
+-            self.hc_attn_base,
+-            self.attn_norm.weight,
+-            self.norm_eps,
+-        )
++        x_quant = x_scale = None
++        if self.hybrid_hc and hc_state.x_prev is not None:
++            post, comb, x, res, x_quant, x_scale = dsv4_hybrid_hc(
++                hc_state.x_prev,
++                hc_state.residual,
++                hc_state.post_mix,
++                hc_state.comb_mix,
++                self.hc_attn_fn,
++                self.hc_attn_scale,
++                self.hc_attn_base,
++                self.attn_norm.weight,
++                self.norm_eps,
++                self.hc_eps,
++                self.hc_sinkhorn_iters,
++                hc_state.res_preshuffle,
++            )
++            hc_state = HCState(res, post.squeeze(-1), comb, x, hc_state.res_preshuffle)
++        else:
++            hc_state = self.fuse_hc(
++                hc_state,
++                self.hc_attn_fn,
++                self.hc_attn_scale,
++                self.hc_attn_base,
++                self.attn_norm.weight,
++                self.norm_eps,
++            )
+         x = hc_state.x_prev
+-        x = self.attn(x, positions)  # [num_tokens, dim]
++        x = self.attn(x, positions, x_quant, x_scale)  # [num_tokens, dim]
+         hc_state.x_prev = x
+         hc_state = self.fuse_hc(
+             hc_state,
+@@ -4445,7 +4522,8 @@ class ParallelHead(ParallelLMHead):
+         self.hc_eps = hc_eps
+ 
+     def get_logits(
+-        self, x: torch.Tensor  # [num_tokens, dim]
++        self,
++        x: torch.Tensor,  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [bs, vocab]
+         """Project to vocab logits via the inherited `ParallelLMHead.forward`,
+         which handles last-token slicing (prefill) + tgemm.mm + all-gather.

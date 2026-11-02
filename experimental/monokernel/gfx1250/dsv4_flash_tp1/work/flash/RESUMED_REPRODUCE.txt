@@ -1,0 +1,47 @@
+Resumed Flash experiments, 2026-10-19
+
+TP1, one gfx1250 GPU; real routing; no EP/speculation/prefix cache.
+1024 input /1024 output tokens;4*C requests; first full client warmup,
+second full client reported. Profiles use50 output tokens separately.
+
+Host launch (stops/restarts ONLY vigokhal_dsv4_tp4, checks for GPU users,
+preserves current ATOM compilation cache under a unique backup name):
+ bash launch_resumed.sh resumed_final
+ docker exec -w /work/flash vigokhal_dsv4_tp4 bash /work/flash/run_resumed_suite.sh resumed_final
+Repeat with resumed_baseline for all hybrid flags0, or resumed_no_moe for
+hybrid projections/mHC with routed MoE fusion0 (C1 ablation).
+Fresh baseline and candidate use separate compiler caches and processes.
+
+Selected candidate behavior:
+ mHC+FP8 quant fusion for rows1..16 (including unlisted intermediate buckets).
+ Exact unsplit attention/shared-expert projection configs only at rows1/8.
+ Routed FP4 MoE gate/up+SwiGLU+MXFP8quant+down+reduction in one launch atC1.
+ Router/input quant and shared expert are retained separate; this is NOT a
+ full-layer monokernel. High rows retain library MoE/projections.
+ Existing public AITER gfx1250 math is reused with DEV-scoped intermediate
+ TDM/buffer operations and drained relaxed GPU semaphore publication.
+
+Baseline is runtime flag-disabled source with identical model and workload.
+Original-image source reconstruction: atom-resume-combined.patch in ATOM,
+aiter-hybrid.patch in AITER. Current container already has both installed.
+The published TP4 image remains independent and contains none of these new
+Flash experiments. The portable stopped-state image in the handoff predates
+resumed benchmarks; host current files/results are authoritative for new work.
+
+Live exact validation: resumed_validation_summary.json (43MoE layers,249
+requests acrossC1/8/16/32/64/128; selected projection counts256/640).
+Timing reports: python summarize_resumed.py reads ONLY *_run2_*.json.
+Old candidate_run2 timings used split-K later rejected for real-input mismatch;
+never substitute those numbers for the current corrected implementation.
+
+Recommendation after serving ablation:
+  bash launch_resumed.sh resumed_no_moe
+This enables the hybrid projections/mHC but keeps library routed MoE.
+The full six-bucket comparison used resumed_final (experimental C1 MoE ON).
+The separate resumed_no_moe C1 result was faster:5.731ms vs5.825ms TPOT.
+Do not present those two configurations as one uniform measured suite.
+
+Isolated additional C8/C16 MoE prototype (NOT part of serving):
+  docker exec -w /work/flash -e HIP_VISIBLE_DEVICES=0 vigokhal_dsv4_tp4 python build_moe_multitoken.py
+  docker exec -w /work/flash -e HIP_VISIBLE_DEVICES=0 vigokhal_dsv4_tp4 python test_moe_multitoken.py
+Run only with no other GPU work. Inspect MOE_MULTITOKEN_REPORT.txt first.

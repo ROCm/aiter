@@ -1,0 +1,11 @@
+{
+  "hashes_verified": 5556,
+  "python_parsed": 1932,
+  "shell_parsed": 83,
+  "gpu_tests_run": false,
+  "staged_source_hashes_verified": 5556,
+  "staged_files": 5562,
+  "model": "flash",
+  "tp": 1,
+  "note": "Original snapshot bytes preserved, including historical whitespace. No GPU execution or new model accuracy qualification."
+}

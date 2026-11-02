@@ -1,0 +1,43 @@
+gfx1250 DeepSeek V4 upstream-style hybrid integration
+
+Upstream: ROCm/ATOM main53e4fb52403707ab07b69ee909501ea3cc25ca5c. Audit: UPSTREAM_AUDIT.txt. No gfx1250-specific mono or DeepseekV4ForCausalLM mono installer was found in this main snapshot; remote branches/unmerged PRs were not exhaustively searched.
+
+Checkout: /home/vigokhal/ATOM-gfx1250-integration; branch gfx1250-dsv4-hybrid. Code: atom/models/deepseek_v4_mono. Uses the shared post-load installer registry, deployment refusals, LazyRunner, TP bind/prepare agreement, per-width refusal, graph-safe warmup and native fallback. The native inner compiled model remains available. Views share loaded weights and bind only after KV cache addresses are fixed. Hash-routing IDs, attention/FFN stream ordering and TP reductions are preserved.
+
+Activation: ATOM_DSV4_MONO=1 and ATOM_MONO_ENABLE=1. The new model-specific flag defaults0. Launch scripts/serve_dsv4_mono_gfx1250.sh flash or pro; also installed in the test container at /app/scripts/serve_dsv4_mono_gfx1250.sh. Baseline: ATOM_DSV4_MONO=0. Public AITER mHC quant wrapper required; dependency patch bundled.
+
+Flash TP1: decode1..16 rows; mHC reduce/apply+RMSNorm epilogue adds FP8 quant/E8M0 scales, with separate tuned attention/shared-expert GEMMs at1/8 rows.
+Pro TP4: decode1..64 rows; same mHC/quant fusion, separate unsplit QKV GEMMs at captured widths through64 and multicast attention/indexer projections at64. Missing tuning keys retain native GEMM. Prefill,C128,and unsupported deployments remain native. Routed MoE stays native for both profiles. This is regional hybrid fusion, not a new full-layer monokernel or a port of gfx950 MFMA code.
+
+CORRECTNESS FIX: live Pro C8 on rank3 exposed1/16384 BF16 QKV output elements differing under split-K (absolute0.00390625). That configuration and its first wheel are rejected. All shipped tables now use NUM_KSPLIT=1; a regression test enforces it. The older published TP4 image is unchanged; set ATOM_DSV4_HYBRID_GEMM=0 to avoid its known split-K QKV path. Earlier Pro timings describe the older configuration and must not be attributed to this corrected integration.
+
+Validation:91 focused CPU regression tests passed; black/ruff and git diff --check passed. Complete patch applies to a clean checkout of the pinned upstream commit. Wheel build passed and includes both tuning JSON files; wheel-verification.json and installed-source-check.json record fingerprints. The local tests namespace needed a temporary tests/__init__.py marker because of an unrelated preinstalled package; it was removed.
+
+flash_compiled: client2 completed249 requests, C1/8/16/32/64/128,24 generated tokens/request; client1 preserved separately.
+flash_eager: client2 completed249 requests, C1/8/16/32/64/128,24 generated tokens/request; client1 preserved separately.
+pro_eager_unsplit: client2 completed249 requests, C1/8/16/32/64/128,24 generated tokens/request; client1 preserved separately.
+pro_compiled_unsplit: client2 completed249 requests, C1/8/16/32/64/128,24 generated tokens/request; client1 preserved separately.
+
+Exact eager regional checks (not Python assertions during graph replay):
+flash: {'exact_keys_reaching_16': 598, 'regions': {'wqkv_a': 86, 'wq_b': 86, 'wo_b': 86, 'shared.gate_up_proj': 86, 'shared.w2': 86, 'mhc': 126, 'indexer.wq_b': 42}, 'errors': 0}
+pro: {'exact_keys_reaching_16': 2784, 'regions': {'wqkv_a': 1220, 'mhc': 1200, 'wq_b': 244, 'indexer.wq_b': 120}, 'errors': 0}
+
+No new TPOT/TTFT/throughput claims are made from these short correctness clients. Report second full clients when rebenchmarking the corrected integration. Flash graph-vs-eager generated text varied in18/249 requests, including17 atC128 where both use native execution; this comparison is not a proof of full-model equivalence. Exact regional comparisons passed; full task-accuracy evaluation is not claimed.
+
+Artifacts include complete source, patch, current wheel under wheels/, its AITER dependency patch, rejected experiments/logs under explicit rejected names, all client1/client2 results and reproduction scripts. Do not install wheels-rejected-splitk. Model weights remain under/data and are not bundled. No new Docker image was published.
+
+LATEST TP4 C16 RERUN COMPLETE — 2026-10-19
+Exactly one server launch per configuration, two full clients against each
+unchanged server, ONLY second full client reported. Pro TP4, C16,64requests,
+1024in/1024out,real routing,seed0,ignoreEOS,CUDA graphs,profiling/checks off.
+Same current ATOM53e4fb5+corrected unsplit integration for both variants.
+Baseline meanTPOT21.226944ms,TTFT475.767748ms,total1476.495503tokens/s.
+Hybrid meanTPOT16.006508ms,TTFT474.620049ms,total1944.518545tokens/s.
+Hybrid TPOT reduction24.593%;total throughput gain31.698%.
+PID/start ticks unchanged within each arm; baseline21/1185305,hybrid21/1240407.
+All client1/client2 JSON and logs,source fingerprints,controller and protocol:
+ /home/vigokhal/dsv4-monokernel/tp4-c16-rerun-20261019/
+Read REPORT.txt and RUN_PROTOCOL.txt there. Container stopped. No pending job.
+The older22.274755ms baseline belongs to the older checkout. This fresh result
+is4.7% lower; do not attribute the difference solely to client warmup.
+

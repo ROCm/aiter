@@ -1,0 +1,218 @@
+[
+  {
+    "name": "style0_sem0_u1",
+    "resources": {
+      "vgpr": 115,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style1_sem0_u1",
+    "resources": {
+      "vgpr": 115,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style2_sem0_u1",
+    "resources": {
+      "vgpr": 115,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style0_sem0_u4",
+    "resources": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style1_sem0_u4",
+    "resources": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style2_sem0_u4",
+    "resources": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 0,
+    "epoch_min": 0,
+    "epoch_max": 0
+  },
+  {
+    "name": "style1_sem1_u4",
+    "resources": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 1,
+    "epoch_min": 1,
+    "epoch_max": 1
+  },
+  {
+    "name": "style2_sem1_u4",
+    "resources": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192
+    },
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "ready": 1,
+    "epoch_min": 1,
+    "epoch_max": 1
+  }
+]

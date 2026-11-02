@@ -1,0 +1,1 @@
+Stopped explicitly at user request, 2026-10-19 02:45 UTC. Container vigokhal_dsv4_tp4 is stopped. Latest final-validation launch was interrupted during warmup; NOT a completed validation. See /home/vigokhal/MONOKERNEL_RESUME.txt for authoritative handoff. Earlier Flash REPORT.txt is stale.

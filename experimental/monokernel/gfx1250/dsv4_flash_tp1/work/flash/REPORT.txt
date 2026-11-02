@@ -1,0 +1,83 @@
+DeepSeek V4 Flash: gfx1250 single-GPU hybrid results
+
+The integrated candidate retains baseline MoE, fuses mHC normalization with
+input quantization, and selects measured Gluon attention GEMMs by decode shape.
+One-launch mHC and mHC-to-QKV regions were built and tested, but were slower
+and are not integrated. A full-layer attention-plus-MoE monokernel was not built.
+The evidence supports this hybrid; it does not establish that every possible
+full-layer implementation would lose. See design.txt for the full-layer graph.
+
+Serving results: SECOND full client only; first full client discarded.
+TPOT and TTFT are means in milliseconds. Total tok/s includes input and output.
+Concurrency | TPOT baseline -> hybrid | TTFT baseline -> hybrid | Total tok/s baseline -> hybrid
+          1 |   13.120 ->    7.324 |   191.681 ->   190.016 |      150.4 ->      266.6
+          8 |   13.969 ->    8.286 |   346.085 ->   332.414 |     1119.2 ->     1859.7
+         16 |    6.930 ->    6.788 |   482.900 ->   362.386 |     4326.3 ->     4483.8
+
+Per-concurrency TPOT reduction: C1 44.17%, C8 40.69%, C16 2.05%
+
+Method
+Image rocm/fw-bringup-mlperf:gfx1250-atom-20261015; /data/DeepSeek-V4-Flash.
+43 layers, hidden 4096, HC4, QLoRA1024, 64 attention heads, FP4 routed experts.
+HIP_VISIBLE_DEVICES=0, TP1, no EP/speculation/prefix cache; actual routing.
+BF16 KV and FP8 index cache match the supplied TP1 script. Its inverted
+FAKE_EPLB conditional was corrected. ISL1024, OSL1024, 4*C requests, seed0,
+ignoreEOS, saturated load. Each arm/bucket runs a full warmup client then a
+second full client. Profiles are separate 50-output-token clients at C1/16/128.
+All timings, including failed or slower experiments, remain in JSON/logs.
+TTFT includes batching/queue effects; its changes are not attributed solely
+to the decode kernels. Only one primary paired serving measurement per bucket
+was taken; small percent differences need more repetitions to establish stability.
+
+Decode evidence and attribution
+Walked backward from each trace end to the last prefill. Each final suffix has
+50 decode steps; all kernels mapped to model operators, zero unmatched kernels.
+42 separate per-group quantization launches disappear per decode step.
+At C1, total launches rise from1546 to1590 because the selected QKV-A/output
+GEMMs use split-K reductions. At C16/128, launches fall from1632 to1590.
+The large low-row gain is primarily better GEMM dispatch, not fewer launches.
+At C1, summed kernel time for wo_b drops2658->454us/step, QKV-A1173->231us,
+main Q1155->292us, and indexer Q1135->150us. These sums are not wall time:
+compressor/MoE auxiliary streams overlap. MoE dominates the high-row profile.
+
+Fusion and synchronization experiments
+Original-arithmetic mHC stage walk: split-K producers, residual/partial
+publication, bounded grid barrier, per-row norm/Sinkhorn/quant consumers.
+Compared with a no-spin last-producer variant that serializes row epilogues.
+Extended the region with the existing Gluon QKV GEMM and a separate phase
+counter. All final variants passed exact intermediates, two forwards,1000
+graph replays with BF16 sign-flipping payloads, and uint32 counter wrap.
+Resource records:119488B LDS,153-160 VGPRs in the tested variants, zero spills.
+At C1, mHC+QKV one launch12.54us vs separate10.71us. At C16,14.75vs12.48us.
+Relaxed polling plus one acquire did not rescue the fused path.
+An explicit device-scope version uses buffer_load/store and TDM load/store
+with SCOPE_DEV, drains stores before relaxed semaphore publication, and
+removes broad global_wb/global_inv. It passed all eight mHC test cases but
+still lost: C1 grid barrier5.86vs4.77us, C16 6.64vs5.39us. No claim of reduced
+HBM traffic is made; hardware traffic counters were not collected.
+
+Projection selection
+192 tuning cases cover the four attention projections at all six row counts.
+Compile/resource failures are retained. Successful candidates were compared
+exactly against native outputs. Finalists use32 rotating weight allocations
+and five alternating baseline/candidate timing samples, avoiding a single
+hot-weight result.11 configurations met the selection threshold; all other
+shapes/prefixes/dtypes retain native dispatch. The JSON stores each selection.
+
+Validation
+Real-decode eager validation is pending; do not treat this report as final.
+Existing mHC+quant passed exact baseline checks for M1/2/7/8/16/32/64/128
+including HIP quant bytes and graph replay. All11 selected projections passed
+exact startup checks on loaded model weights. Operation equality is not a
+full-model quality benchmark or a claim of deterministic concurrent text output.
+
+Integration and artifacts
+atom-combined.patch + aiter-hybrid.patch apply to original image files;
+atom-flash.patch is incremental on Pro round two. Reverse-apply checks passed.
+REPRODUCE.txt describes flags, scripts, validation and compile-cache isolation.
+The first hybrid launch failed before any benchmark because ATOM reused a
+four-output baseline compiled subgraph for a six-output hybrid call. Baseline
+cache was preserved; a fresh candidate ATOM cache and separate Inductor cache
+fixed startup. This failure log is retained. Pro changes remain opt-in.
+Raw profiler traces and compile caches remain in the workspace; compact
+per-kernel CSVs, reports, patches, source, ISA, tests and results are packaged.

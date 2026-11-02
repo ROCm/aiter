@@ -1,0 +1,8 @@
+{
+  "status": "complete",
+  "saved_utc": "2026-10-20T17:29:11.212640+00:00",
+  "scope": "Flash C1 complete Q/KV preparation isolated ablation",
+  "recommended": "QKVRegion(mode=\"two\")",
+  "serving_integration": false,
+  "archive": "/home/vigokhal/monokernel-handoff/qkv-complete-ablation-20261020.tgz"
+}

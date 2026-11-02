@@ -1,0 +1,343 @@
+[
+  {
+    "m": 4,
+    "ratio": 0,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      },
+      "2": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      },
+      "3": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      },
+      "4": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "tile_mask": 0,
+        "overlap": 0,
+        "vgpr": 426,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          214.50849622488022,
+          214.84775096178055
+        ],
+        "second_us": 214.84775096178055
+      },
+      {
+        "mode": 1,
+        "tile_mask": 192,
+        "overlap": 2,
+        "vgpr": 418,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          206.84702694416046,
+          207.08616077899933
+        ],
+        "second_us": 207.08616077899933
+      },
+      {
+        "mode": 2,
+        "tile_mask": 192,
+        "overlap": 0,
+        "vgpr": 418,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          207.1124017238617,
+          207.27887749671936
+        ],
+        "second_us": 207.27887749671936
+      },
+      {
+        "mode": 3,
+        "tile_mask": 128,
+        "overlap": 0,
+        "vgpr": 422,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          209.02402698993683,
+          209.28190648555756
+        ],
+        "second_us": 209.28190648555756
+      },
+      {
+        "mode": 4,
+        "tile_mask": 128,
+        "overlap": 2,
+        "vgpr": 422,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          209.10662412643433,
+          208.98643881082535
+        ],
+        "second_us": 208.98643881082535
+      }
+    ]
+  }
+]

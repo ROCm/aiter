@@ -1,0 +1,50 @@
+[
+  {
+    "m": 8,
+    "checks": {
+      "norm": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "q": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kv": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "attention": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "output": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "mhc_post": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "final": {
+        "exact": false,
+        "rms": 5.538298637475236e-07,
+        "max_abs": 0.0009765625
+      },
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 434,
+    "lds": 157156,
+    "spills": 0
+  }
+]

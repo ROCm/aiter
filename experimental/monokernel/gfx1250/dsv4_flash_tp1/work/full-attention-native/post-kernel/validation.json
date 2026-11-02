@@ -1,0 +1,9 @@
+{
+  "cases": 512,
+  "modes": [
+    128,
+    256
+  ],
+  "outputs_bitwise_equal": true,
+  "elements_checked": 16777216
+}

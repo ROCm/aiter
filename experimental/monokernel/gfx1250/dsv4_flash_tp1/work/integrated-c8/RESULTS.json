@@ -1,0 +1,352 @@
+{
+  "model": "DeepSeek-V4-Flash",
+  "tp": 1,
+  "ep": false,
+  "concurrency": 8,
+  "input_len": 1024,
+  "output_len": 1024,
+  "num_prompts": 64,
+  "method": "One server start per configuration; two clients; report second client only. Median TTFT/TPOT. Total throughput includes input+output tokens. Native GPU0, previous GPU1, optimized GPU3.",
+  "results": {
+    "native": {
+      "completed": 64,
+      "median_ttft_ms": 288.87075949933205,
+      "median_tpot_ms": 13.680812415442569,
+      "total_token_throughput": 1146.9870514829643,
+      "output_throughput": 573.4935257414821,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/integrated-native-c8-round2.json"
+    },
+    "previous": {
+      "completed": 64,
+      "median_ttft_ms": 313.1232589985302,
+      "median_tpot_ms": 15.781996538124677,
+      "total_token_throughput": 996.3358298514463,
+      "output_throughput": 498.16791492572315,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/integrated-previous-c8-round2.json"
+    },
+    "optimized": {
+      "completed": 64,
+      "median_ttft_ms": 319.52100150010665,
+      "median_tpot_ms": 12.301315853372444,
+      "total_token_throughput": 1271.7108125854645,
+      "output_throughput": 635.8554062927323,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/integrated-optimized-c8-round2.json"
+    }
+  },
+  "accuracy": {
+    "native": {
+      "metrics": {
+        "gsm8k": {
+          "name": "gsm8k",
+          "alias": "gsm8k",
+          "sample_len": 32,
+          "exact_match,strict-match": 0.96875,
+          "exact_match_stderr,strict-match": 0.03125,
+          "exact_match,flexible-extract": 0.96875,
+          "exact_match_stderr,flexible-extract": 0.03125
+        }
+      },
+      "path": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-integrated-native-c8/__data__DeepSeek-V4-Flash/results_2026-10-21T19-38-05.957036.json"
+    },
+    "previous": {
+      "metrics": {
+        "gsm8k": {
+          "name": "gsm8k",
+          "alias": "gsm8k",
+          "sample_len": 32,
+          "exact_match,strict-match": 0.9375,
+          "exact_match_stderr,strict-match": 0.04347552147751577,
+          "exact_match,flexible-extract": 0.9375,
+          "exact_match_stderr,flexible-extract": 0.04347552147751577
+        }
+      },
+      "path": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-integrated-previous-c8/__data__DeepSeek-V4-Flash/results_2026-10-21T19-38-06.562351.json"
+    },
+    "optimized": {
+      "metrics": {
+        "gsm8k": {
+          "name": "gsm8k",
+          "alias": "gsm8k",
+          "sample_len": 32,
+          "exact_match,strict-match": 0.96875,
+          "exact_match_stderr,strict-match": 0.03125,
+          "exact_match,flexible-extract": 0.96875,
+          "exact_match_stderr,flexible-extract": 0.03125
+        }
+      },
+      "path": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-integrated-optimized-c8/__data__DeepSeek-V4-Flash/results_2026-10-21T19-45-40.240462.json"
+    }
+  },
+  "compiled": {
+    "1": {
+      "layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "ratios": [
+        0,
+        4,
+        128
+      ],
+      "vgpr": [
+        432,
+        434,
+        435
+      ],
+      "lds": [
+        157156
+      ],
+      "spills": [
+        0
+      ]
+    },
+    "2": {
+      "layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "ratios": [
+        0,
+        4,
+        128
+      ],
+      "vgpr": [
+        432,
+        434,
+        436
+      ],
+      "lds": [
+        157156
+      ],
+      "spills": [
+        0
+      ]
+    },
+    "4": {
+      "layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "ratios": [
+        0,
+        4,
+        128
+      ],
+      "vgpr": [
+        432,
+        434,
+        436
+      ],
+      "lds": [
+        157156
+      ],
+      "spills": [
+        0
+      ]
+    },
+    "8": {
+      "layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "ratios": [
+        0,
+        4,
+        128
+      ],
+      "vgpr": [
+        432,
+        434,
+        436
+      ],
+      "lds": [
+        157156
+      ],
+      "spills": [
+        0
+      ]
+    }
+  },
+  "integrated": [
+    "local QKV input quant and early bounded QB prefetch; split16 retains B3",
+    "direct paged SWA/HCA/CSA attention; row-interleaved8splits; no compact-cache staging",
+    "native-derived fused attention mHCpost+FFNpre/RMSNorm with packed weights, explicit FMAs, dedicated64producer barrier, warp specialization, adapted coefficient/residual layouts",
+    "parallel routing metadata",
+    "routedMoE BN256 BK512 two buffers, active-expert scheduling and coherent polling",
+    "HCA four-way pooling plus compressor subgroup barrier for ratio4"
+  ],
+  "integration_adjustments": [
+    "HCA compressor subgroup barriers timed out in full-kernel integration; use all256 barriers before/after parallel pooling. Preserve ratio4 subgroup and mHC64producer barrier.",
+    "Preserve negative BatchIds on padding, destination bounds, 8-field production plans, FP32 cross-layer residual statistic inputs."
+  ],
+  "limitations": [
+    "Attention split reduction and HCA pooling order differ from previous/native; not bitwise equivalent overall.",
+    "Synthetic full-layer tests can amplify small attention differences through quantization/routing; saved errors retained, no blanket exactness claim.",
+    "GSM8K is a32-example3shot smoke test, max512 output tokens, not full accuracy qualification.",
+    "No ProTP4 run or image/branch push in this integration turn."
+  ]
+}

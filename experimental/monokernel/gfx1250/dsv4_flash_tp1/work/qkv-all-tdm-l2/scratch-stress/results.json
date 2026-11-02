@@ -1,0 +1,54 @@
+[
+  {
+    "mode": "global_control",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "tdm_late",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "tdm_early",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "tdm_early_l2",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  }
+]

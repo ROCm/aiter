@@ -1,0 +1,74 @@
+[
+  {
+    "name": "baseline_A",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  }
+]

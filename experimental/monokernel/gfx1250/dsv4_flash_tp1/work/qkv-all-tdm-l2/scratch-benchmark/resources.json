@@ -1,0 +1,74 @@
+{
+  "global_control": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "tdm_late": {
+    "qa": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "tdm_early": {
+    "qa": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "tdm_early_l2": {
+    "qa": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 343,
+      "spills": 0,
+      "lds": 73856,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

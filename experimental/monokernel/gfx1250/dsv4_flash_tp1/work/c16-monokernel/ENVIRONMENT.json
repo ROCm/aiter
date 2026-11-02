@@ -1,0 +1,24 @@
+{
+  "date_utc": "2026-10-21T23:33:13.979494+00:00",
+  "container": "vigokhal_dsv4_tp4",
+  "image": "rocm/fw-bringup-mlperf:gfx1250-atom-20261015",
+  "image_id": "sha256:d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a",
+  "ATOM_HEAD": "f19778df4054e94d64d6f6bf6dd68f5681bd5945",
+  "AITER_HEAD": "7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe",
+  "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+  "triton": "3.8.0",
+  "architecture": "gfx1250",
+  "experiment": "Flash TP1 C8/C16 region microbenchmarks",
+  "flags": {
+    "ATOM_USE_TRITON_GEMM": "1",
+    "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": "1",
+    "ATOM_USE_TRITON_MOE": "1",
+    "AITER_TRITON_USE_HERD": "1"
+  },
+  "full_layer_flags": {
+    "TILE_MASK": 192,
+    "OVERLAP": 2,
+    "EDGE_MASK": 0
+  },
+  "native_source_note": "Installed modified ATOM/AITER trees, same container as prior experiments; new C16 source is isolated under /work/c16-monokernel."
+}

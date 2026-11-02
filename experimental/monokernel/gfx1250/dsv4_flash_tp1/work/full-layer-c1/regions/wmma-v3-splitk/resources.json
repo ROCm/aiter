@@ -1,0 +1,11 @@
+{
+  "n_regs": 158,
+  "n_spills": 0,
+  "shared": 16384,
+  "sgpr_spills": [
+    "0"
+  ],
+  "vgpr_spills": [
+    "0"
+  ]
+}

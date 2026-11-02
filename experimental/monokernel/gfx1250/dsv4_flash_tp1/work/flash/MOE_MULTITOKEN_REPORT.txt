@@ -1,0 +1,14 @@
+C8/C16 resident-task routed MoE experiment — completed
+
+Isolated prototype only; never installed into serving. All12 cases passed exact intermediate quantized payload/scales, weighted down output and final output;1000 changing-input graph replays per case and uint32 semaphore wraparound passed. Initial reduction failures were uint16 offset overflow; widening scatter indices to int32 fixed them. Failure logs are preserved.
+
+Two resident grids (128/256 CTAs),3/5 LDS buffers, DEV-scoped intermediate traffic, explicit store drains and relaxed GPU semaphore phases were tested. Reported runtime LDS65824/109728B; runtime metadata reports0 spills for these variants. This does not override the separate C1 ISA SGPR-spill finding. Synthetic packed FP4 weights,256 experts,top6,H4096,intermediate2048. Distributed routing uses random logits; hot routing concentrates on6 experts. Five alternating graph timing samples, medians shown. These are microbenchmarks, not serving clients.
+
+M | routing | best grid/buffers | library us | candidate us
+8 | distinct | 256/5 | 43.277 | 70.797
+8 | hot | 256/3 | 13.449 | 15.275
+16 | distinct | 256/5 | 81.521 | 125.282
+16 | hot | 256/3 | 13.731 | 17.128
+
+Decision: retain library routed MoE at C8/C16. Larger LDS buffering and bounded resident semaphore synchronization did not compensate for the task serialization/phase overhead in this implementation. This is not evidence that every possible MoE fusion is slower.
+Reproduce with build_moe_multitoken.py then test_moe_multitoken.py; full results moe_multitoken_results.json, log moe_multitoken_corrected.log, generated ISA moe-m*.amdgcn.

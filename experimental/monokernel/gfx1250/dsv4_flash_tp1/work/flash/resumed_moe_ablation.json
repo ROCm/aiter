@@ -1,0 +1,13 @@
+{
+  "fused": {
+    "mean_tpot_ms": 5.825129416911107,
+    "mean_ttft_ms": 179.66817700005322,
+    "total_token_throughput": 333.59549596982606
+  },
+  "library_moe": {
+    "mean_tpot_ms": 5.731083826735044,
+    "mean_ttft_ms": 180.58114875020692,
+    "total_token_throughput": 338.8600912881546
+  },
+  "fused_tpot_reduction_pct": -1.6409739068437235
+}

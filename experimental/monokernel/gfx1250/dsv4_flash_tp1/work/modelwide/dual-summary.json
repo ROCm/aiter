@@ -1,0 +1,598 @@
+{
+  "valid_reference": "dual-native-level0-responses.json",
+  "notes": [
+    "Earlier early-binding runs cached MoE views before child weight preparation: exclude from native-path acceptance.",
+    "Compressor invalid-harness-strides run is invalid.",
+    "Compressor late run failed with illegal access using prepared weight layout; raw-checkpoint rerun is separate."
+  ],
+  "regions": {
+    "qkv": {
+      "kv": {
+        "cases": 860,
+        "exact": 855,
+        "worst": {
+          "layer": 15,
+          "ratio": 128,
+          "group": "qkv",
+          "position": 1029,
+          "query": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "kv": {
+            "rms": 0.00042522407602518797,
+            "max_abs": 0.0078125,
+            "neq": 2,
+            "finite": true
+          },
+          "qa_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_quant": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qb_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          }
+        }
+      },
+      "qa_projection": {
+        "cases": 860,
+        "exact": 860,
+        "worst": {
+          "layer": 0,
+          "ratio": 0,
+          "group": "qkv",
+          "position": 5,
+          "query": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "kv": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_quant": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qb_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          }
+        }
+      },
+      "qa_quant": {
+        "cases": 860,
+        "exact": 859,
+        "worst": {
+          "layer": 13,
+          "ratio": 128,
+          "group": "qkv",
+          "position": 1027,
+          "query": {
+            "rms": 0.000732152140699327,
+            "max_abs": 0.03125,
+            "neq": 1781,
+            "finite": true
+          },
+          "kv": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_quant": {
+            "rms": 5.431889803730883e-05,
+            "max_abs": 0.25,
+            "neq": 1,
+            "finite": true
+          },
+          "qb_projection": {
+            "rms": 0.0005020488169975579,
+            "max_abs": 0.0009765625,
+            "neq": 1764,
+            "finite": true
+          }
+        }
+      },
+      "qb_projection": {
+        "cases": 860,
+        "exact": 859,
+        "worst": {
+          "layer": 13,
+          "ratio": 128,
+          "group": "qkv",
+          "position": 1027,
+          "query": {
+            "rms": 0.000732152140699327,
+            "max_abs": 0.03125,
+            "neq": 1781,
+            "finite": true
+          },
+          "kv": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_quant": {
+            "rms": 5.431889803730883e-05,
+            "max_abs": 0.25,
+            "neq": 1,
+            "finite": true
+          },
+          "qb_projection": {
+            "rms": 0.0005020488169975579,
+            "max_abs": 0.0009765625,
+            "neq": 1764,
+            "finite": true
+          }
+        }
+      },
+      "query": {
+        "cases": 860,
+        "exact": 753,
+        "worst": {
+          "layer": 13,
+          "ratio": 128,
+          "group": "qkv",
+          "position": 1027,
+          "query": {
+            "rms": 0.000732152140699327,
+            "max_abs": 0.03125,
+            "neq": 1781,
+            "finite": true
+          },
+          "kv": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_projection": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "qa_quant": {
+            "rms": 5.431889803730883e-05,
+            "max_abs": 0.25,
+            "neq": 1,
+            "finite": true
+          },
+          "qb_projection": {
+            "rms": 0.0005020488169975579,
+            "max_abs": 0.0009765625,
+            "neq": 1764,
+            "finite": true
+          }
+        }
+      }
+    },
+    "compressor_indexer": {
+      "cache": {
+        "cases": 105,
+        "exact": 104,
+        "worst": {
+          "layer": 14,
+          "ratio": 4,
+          "group": "compressor_indexer",
+          "position": 1031,
+          "kv_state": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "score_state_neq": 0,
+          "health": 0,
+          "cache": {
+            "rms": 1.3523913366952911e-05,
+            "max_abs": 0.015625,
+            "neq": 1,
+            "finite": true
+          },
+          "scale": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          }
+        }
+      },
+      "kv_state": {
+        "cases": 420,
+        "exact": 420,
+        "worst": {
+          "layer": 2,
+          "ratio": 4,
+          "group": "compressor_indexer",
+          "position": 5,
+          "kv_state": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "score_state_neq": 0,
+          "health": 0
+        }
+      },
+      "scale": {
+        "cases": 105,
+        "exact": 105,
+        "worst": {
+          "layer": 2,
+          "ratio": 4,
+          "group": "compressor_indexer",
+          "position": 7,
+          "kv_state": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "score_state_neq": 0,
+          "health": 0,
+          "cache": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "scale": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          }
+        }
+      }
+    },
+    "compressor_main": {
+      "cache": {
+        "cases": 125,
+        "exact": 122,
+        "worst": {
+          "layer": 15,
+          "ratio": 128,
+          "group": "compressor_main",
+          "position": 1151,
+          "kv_state": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "score_state_neq": 0,
+          "health": 0,
+          "cache": {
+            "rms": 0.00019579798390623182,
+            "max_abs": 0.001953125,
+            "neq": 1,
+            "finite": true
+          }
+        }
+      },
+      "kv_state": {
+        "cases": 820,
+        "exact": 820,
+        "worst": {
+          "layer": 2,
+          "ratio": 4,
+          "group": "compressor_main",
+          "position": 5,
+          "kv_state": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "score_state_neq": 0,
+          "health": 0
+        }
+      }
+    },
+    "mhc_attn": {
+      "comb": {
+        "cases": 860,
+        "exact": 0,
+        "worst": {
+          "layer": 1,
+          "ratio": 0,
+          "group": "mhc_attn",
+          "position": 11,
+          "input": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "post": {
+            "rms": 3.152285046326142e-07,
+            "max_abs": 2.7939677238464355e-09,
+            "neq": 2,
+            "finite": true
+          },
+          "comb": {
+            "rms": 4.1708329945322475e-07,
+            "max_abs": 3.5762786865234375e-07,
+            "neq": 15,
+            "finite": true
+          }
+        }
+      },
+      "input": {
+        "cases": 860,
+        "exact": 666,
+        "worst": {
+          "layer": 38,
+          "ratio": 4,
+          "group": "mhc_attn",
+          "position": 6,
+          "input": {
+            "rms": 0.00018502048624213785,
+            "max_abs": 0.0009765625,
+            "neq": 21,
+            "finite": true
+          },
+          "post": {
+            "rms": 2.0097121478102054e-07,
+            "max_abs": 1.1920928955078125e-07,
+            "neq": 4,
+            "finite": true
+          },
+          "comb": {
+            "rms": 1.3281743482806974e-09,
+            "max_abs": 1.862645149230957e-09,
+            "neq": 10,
+            "finite": true
+          }
+        }
+      },
+      "post": {
+        "cases": 860,
+        "exact": 166,
+        "worst": {
+          "layer": 1,
+          "ratio": 0,
+          "group": "mhc_attn",
+          "position": 9,
+          "input": {
+            "rms": 1.2044703908031806e-05,
+            "max_abs": 3.0517578125e-05,
+            "neq": 2,
+            "finite": true
+          },
+          "post": {
+            "rms": 1.0385384712208179e-06,
+            "max_abs": 1.0244548320770264e-08,
+            "neq": 2,
+            "finite": true
+          },
+          "comb": {
+            "rms": 1.4234598211260163e-07,
+            "max_abs": 1.1920928955078125e-07,
+            "neq": 14,
+            "finite": true
+          }
+        }
+      }
+    },
+    "mhc_ffn": {
+      "comb": {
+        "cases": 860,
+        "exact": 0,
+        "worst": {
+          "layer": 13,
+          "ratio": 128,
+          "group": "mhc_ffn",
+          "position": 1027,
+          "input": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "post": {
+            "rms": 7.106201138640245e-08,
+            "max_abs": 1.1920928955078125e-07,
+            "neq": 2,
+            "finite": true
+          },
+          "comb": {
+            "rms": 3.1193553695629817e-07,
+            "max_abs": 2.980232238769531e-07,
+            "neq": 15,
+            "finite": true
+          }
+        }
+      },
+      "input": {
+        "cases": 860,
+        "exact": 725,
+        "worst": {
+          "layer": 21,
+          "ratio": 128,
+          "group": "mhc_ffn",
+          "position": 1153,
+          "input": {
+            "rms": 0.0003254844923503697,
+            "max_abs": 0.0078125,
+            "neq": 3,
+            "finite": true
+          },
+          "post": {
+            "rms": 3.286622174414333e-08,
+            "max_abs": 5.960464477539063e-08,
+            "neq": 3,
+            "finite": true
+          },
+          "comb": {
+            "rms": 1.929402237976774e-08,
+            "max_abs": 2.9802322387695312e-08,
+            "neq": 12,
+            "finite": true
+          }
+        }
+      },
+      "post": {
+        "cases": 860,
+        "exact": 115,
+        "worst": {
+          "layer": 2,
+          "ratio": 4,
+          "group": "mhc_ffn",
+          "position": 7,
+          "input": {
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "neq": 0,
+            "finite": true
+          },
+          "post": {
+            "rms": 6.169207154016476e-07,
+            "max_abs": 4.0978193283081055e-08,
+            "neq": 4,
+            "finite": true
+          },
+          "comb": {
+            "rms": 8.052882805031913e-08,
+            "max_abs": 1.1920928955078125e-07,
+            "neq": 14,
+            "finite": true
+          }
+        }
+      }
+    },
+    "attention": {
+      "output": {
+        "cases": 860,
+        "exact": 855,
+        "worst": {
+          "layer": 1,
+          "ratio": 0,
+          "group": "attention",
+          "position": 8,
+          "output": {
+            "rms": 3.253554314142093e-05,
+            "max_abs": 0.001953125,
+            "neq": 2,
+            "finite": true
+          },
+          "health": 0,
+          "length": 9
+        }
+      }
+    },
+    "ffn": {
+      "output": {
+        "cases": 860,
+        "exact": 859,
+        "worst": {
+          "layer": 15,
+          "ratio": 128,
+          "group": "ffn",
+          "position": 1031,
+          "output": {
+            "rms": 0.00041734141996130347,
+            "max_abs": 0.001953125,
+            "neq": 56,
+            "finite": true
+          }
+        }
+      }
+    },
+    "output_projection": {
+      "output": {
+        "cases": 860,
+        "exact": 859,
+        "worst": {
+          "layer": 20,
+          "ratio": 4,
+          "group": "output_projection",
+          "position": 1154,
+          "output": {
+            "rms": 0.00014355615712702274,
+            "max_abs": 0.0078125,
+            "neq": 29,
+            "finite": true
+          }
+        }
+      }
+    }
+  },
+  "responses": {
+    "qkv-late": {
+      "completed": 3,
+      "matches": [
+        true,
+        true,
+        true
+      ]
+    },
+    "compressor-packed": {
+      "completed": 3,
+      "matches": [
+        true,
+        true,
+        true
+      ]
+    },
+    "mhc-final": {
+      "completed": 3,
+      "matches": [
+        true,
+        true,
+        true
+      ]
+    },
+    "attention_output_ffn-final": {
+      "completed": 3,
+      "matches": [
+        true,
+        true,
+        true
+      ]
+    }
+  }
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "mode": "fused",
+    "error": 0.0
+  },
+  {
+    "mode": "l2",
+    "error": 0.0
+  },
+  {
+    "mode": "early",
+    "error": 0.0
+  },
+  {
+    "mode": "both",
+    "error": 0.0
+  }
+]

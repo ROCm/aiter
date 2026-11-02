@@ -1,0 +1,248 @@
+[
+  {
+    "m": 2,
+    "checks": [
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 2.9801281442587424e-08,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 3.319586272532149e-11,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_full_qkv": 26.932454420443303,
+        "fused_full_qkv": 17.33582368269404
+      },
+      {
+        "native_full_qkv": 26.60300349662317,
+        "fused_full_qkv": 17.685794257735953
+      }
+    ],
+    "vgpr": 151,
+    "lds": 115152,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "checks": [
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 2.1072937173016726e-08,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 2.3473320509559414e-11,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_full_qkv": 26.68565990998573,
+        "fused_full_qkv": 18.159928842224463
+      },
+      {
+        "native_full_qkv": 26.606138249769568,
+        "fused_full_qkv": 18.162752595578805
+      }
+    ],
+    "vgpr": 151,
+    "lds": 115152,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "checks": [
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 1.4901044842474676e-08,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 1.5258719940902665e-05,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 1.9073447674600175e-06,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 1.659835636991236e-11,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qb_neq": 0,
+        "q_rms": 0.0,
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_full_qkv": 27.013098631853833,
+        "fused_full_qkv": 19.024428839218906
+      },
+      {
+        "native_full_qkv": 27.14115732667074,
+        "fused_full_qkv": 18.977921202467385
+      }
+    ],
+    "vgpr": 151,
+    "lds": 115152,
+    "spills": 0
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "status": "complete; GPU work stopped; artifacts ready for archive verification",
+  "deadline_utc": "2026-10-20T01:55:00Z",
+  "recommended_launcher": "accepted.QAKVNorm(split=16)",
+  "scope": "isolated Flash Q-A/KV projection and first weighted RMSNorm",
+  "native_fp8_rejected": true,
+  "serving_integration": false,
+  "benchmark_round_reported": 2,
+  "archive": "/home/vigokhal/monokernel-handoff/qkv-asm-opt-20261020.tgz",
+  "saved_at_utc": "2026-10-20T01:50:01.967594+00:00",
+  "gpu_processes_at_stop": "none"
+}

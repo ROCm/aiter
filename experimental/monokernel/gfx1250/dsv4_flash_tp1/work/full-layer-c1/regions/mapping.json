@@ -1,0 +1,84 @@
+[
+  {
+    "name": "attention_input_mhc",
+    "start": 0,
+    "end": 4,
+    "operations": [
+      "mhc_mix(R, HAF, HAS, HAB, MixA, GRID)",
+      "sinkhorn(MixA)",
+      "mhc_pre(R, MixA, X, GRID)",
+      "norm(X, AN, X, 4096, 1, True, GRID)",
+      "quant(X, XQ, 4096, 128, GRID)"
+    ]
+  },
+  {
+    "name": "qkv_projections_norm_rope",
+    "start": 5,
+    "end": 10,
+    "operations": [
+      "matvec(XQ, QA, QAS, QL, 1024, 4096, 8, GRID)\nmatvec(XQ, KVW, KVS, KV, 512, 4096, 8, GRID)",
+      "norm(QL, QN, QL, 1024, 1, True, GRID, False)\nnorm(KV, KN, KV, 512, 1, True, GRID, False)",
+      "quant(QL, QLQ, 1024, 128, GRID)",
+      "matvec(QLQ, QB, QBS, Q, 32768, 1024, 8, GRID)",
+      "norm(Q, QN, Q, 512, 64, False, GRID, False)",
+      "rope(Q, Cos, Sin, QRot, 64, False, GRID)\nrope(KV, Cos, Sin, KVRot, 1, False, GRID)"
+    ]
+  },
+  {
+    "name": "cache_and_attention",
+    "start": 11,
+    "end": 12,
+    "operations": [
+      "if gl.program_id(0) == 0:\n    i = gl.arange(0, 512, layout=gl.BlockedLayout([1], [32], [4], [0]))\n    dev_store(dev_load(KVRot, i, cache='.cg'), Cache, 127 * 512 + i, cache='.cg')",
+      "attention(QRot, KVRot, Cache, Sink, AO, GRID)"
+    ]
+  },
+  {
+    "name": "attention_output_projections",
+    "start": 13,
+    "end": 17,
+    "operations": [
+      "rope(AO, Cos, Sin, AR, 64, True, GRID)",
+      "quant(AR, AQ, 32768, 128, GRID)",
+      "matvec(AQ, OA, OAS, OL, 8192, 4096, 8, GRID, True)",
+      "quant(OL, OLQ, 8192, 128, GRID)",
+      "matvec(OLQ, OB, OBS, Attn, 4096, 8192, 8, GRID)"
+    ]
+  },
+  {
+    "name": "attention_post_ffn_pre",
+    "start": 18,
+    "end": 22,
+    "operations": [
+      "mhc_post(Attn, R, MixA, R2, GRID)",
+      "mhc_mix(R2, HFN, HFS, HFB, MixF, GRID)",
+      "sinkhorn(MixF)",
+      "mhc_pre(R2, MixF, FF, GRID)",
+      "norm(FF, FN, FF, 4096, 1, True, GRID)"
+    ]
+  },
+  {
+    "name": "router_shared_routed_moe",
+    "start": 23,
+    "end": 30,
+    "operations": [
+      "quant(FF, FFQ, 4096, 128, GRID)\nquant(FF, FFMX, 4096, 32, GRID)\nmatvec(FF, Gate, Gate, Logits, 256, 4096, 16, GRID)",
+      "route(Logits, Tid, Token, Ids, Gamma)\nmatvec(FFQ, SW1, SS1, SG, 2048, 4096, 8, GRID)\nmatvec(FFQ, SW3, SS3, SU, 2048, 4096, 8, GRID)",
+      "activation(SG, SU, SA, 2048, GRID)",
+      "quant(SA, SAQ, 2048, 128, GRID)",
+      "matvec(SAQ, SW2, SS2, SO, 4096, 2048, 8, GRID)\nfor slot in range(6):\n    expert = dev_load(Ids, slot, cache='.cg').to(gl.int64)\n    matvec(FFMX, EW1 + expert * 2048 * 2048, ES1 + expert * 2048 * 128, EG + slot * 2048, 2048, 4096, 4, GRID, FLOAT_OUT=True)\n    matvec(FFMX, EW3 + expert * 2048 * 2048, ES3 + expert * 2048 * 128, EU + slot * 2048, 2048, 4096, 4, GRID, FLOAT_OUT=True)",
+      "activation(EG, EU, EA, 6 * 2048, GRID, False)",
+      "quant(EA, EAQ, 6 * 2048, 32, GRID)",
+      "for slot in range(6):\n    expert = dev_load(Ids, slot, cache='.cg').to(gl.int64)\n    matvec(EAQ + slot * 2048, EW2 + expert * 4096 * 1024, ES2 + expert * 4096 * 64, EO + slot * 4096, 4096, 2048, 4, GRID, Gamma=Gamma + slot)"
+    ]
+  },
+  {
+    "name": "expert_sum_final_mhc",
+    "start": 31,
+    "end": 32,
+    "operations": [
+      "i = gl.arange(0, 256, layout=gl.BlockedLayout([1], [32], [4], [0]))\nfor tile in range(gl.program_id(0), 16, GRID):\n    c = tile * 256 + i\n    value = gl.full((256,), 0.0, gl.float32, gl.BlockedLayout([1], [32], [4], [0]))\n    for reduce_slot in gl.static_range(6):\n        value += dev_load(EO, reduce_slot * 4096 + c, cache='.cg').to(gl.float32)\n    value = value.to(gl.bfloat16).to(gl.float32) + dev_load(SO, c, cache='.cg').to(gl.float32)\n    dev_store(value.to(gl.bfloat16), Sum, c, cache='.cg')",
+      "mhc_post(Sum, R2, MixF, Out, GRID)"
+    ]
+  }
+]

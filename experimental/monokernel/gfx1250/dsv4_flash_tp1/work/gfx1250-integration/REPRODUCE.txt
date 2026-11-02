@@ -1,0 +1,34 @@
+Current upstream integration checkout:
+ /home/vigokhal/ATOM-gfx1250-integration
+Branch: gfx1250-dsv4-hybrid
+Base: 53e4fb52403707ab07b69ee909501ea3cc25ca5c (ROCm/ATOM main)
+
+Read docs/deepseek_v4_gfx1250_mono.md in that checkout. The package is
+atom.models.deepseek_v4_mono. Activation requires ATOM_DSV4_MONO=1 and
+ATOM_MONO_ENABLE=1. Disable ATOM_DSV4_MONO for the native baseline.
+
+Host validation helper (ONLY own container, preserves old compile cache):
+ bash /home/vigokhal/dsv4-monokernel/gfx1250-integration/start_server.sh flash eager
+ bash /home/vigokhal/dsv4-monokernel/gfx1250-integration/start_server.sh pro compiled
+Do not launch while unrelated GPU users are present. Source is copied to
+/opt/atom-gfx1250-integration in vigokhal_dsv4_tp4; original /app/ATOM is unchanged.
+The public launcher is also copied to /app/scripts/serve_dsv4_mono_gfx1250.sh.
+The original published TP4 image has not been replaced or pushed again.
+
+Portable source installation:
+ pip install -e /path/to/ATOM-gfx1250-integration
+ bash /path/to/ATOM-gfx1250-integration/scripts/serve_dsv4_mono_gfx1250.sh flash
+ # or pro with all four gfx1250 GPUs free
+The AITER public mHC quant wrapper is required; apply the bundled AITER patch
+to its compatible base if absent. The existing stopped-state image already
+contains that dependency. Model weights remain separate under /data.
+
+client_smoke.py issues two clients with249 requests each acrossC1/8/16/32/64/128,
+24 generated tokens/request, real routing. Client2 is the reported client;
+these are correctness/capture smokes, NOT new TPOT/TTFT performance benchmarks.
+Exact checks on actual inputs run only in eager mode, outside graph capture.
+
+CPU checks:90 passed after isolating the local tests package with a temporary
+empty /opt/atom-gfx1250-integration/tests/__init__.py marker (removed afterwards).
+The preinstalled environment's separate tests package otherwise shadows
+upstream tests.aiter_stub. Diagnostic failing logs are retained.

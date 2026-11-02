@@ -1,0 +1,166 @@
+{
+  ".": {
+    "kernel_count": 7,
+    "resources": {
+      "cache_and_attention": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_output_projections": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_input_mhc": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "router_shared_routed_moe": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_post_ffn_pre": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "qkv_projections_norm_rope": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "expert_sum_final_mhc": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      }
+    }
+  },
+  "expert-tiles": {
+    "kernel_count": 7,
+    "resources": {
+      "cache_and_attention": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_output_projections": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_input_mhc": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "router_shared_routed_moe": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "attention_post_ffn_pre": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "qkv_projections_norm_rope": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      },
+      "expert_sum_final_mhc": {
+        "sgpr_spills": [
+          "0"
+        ],
+        "vgpr_spills": [
+          "0"
+        ],
+        "scratch_bytes": [
+          "0"
+        ]
+      }
+    }
+  }
+}

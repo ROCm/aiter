@@ -1,0 +1,68 @@
+{
+  "case": 3,
+  "ratio": 4,
+  "head_dim": 512,
+  "quant": false,
+  "validation": [
+    {
+      "position": 3,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1023,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1024,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1151,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1535,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 2047,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    }
+  ],
+  "timings": [
+    {
+      "native_us": 4.775906214490533,
+      "fused_us": 5.890078144147992
+    },
+    {
+      "native_us": 4.755249945446849,
+      "fused_us": 5.906968843191862
+    }
+  ],
+  "registers": 314,
+  "shared": 19456
+}

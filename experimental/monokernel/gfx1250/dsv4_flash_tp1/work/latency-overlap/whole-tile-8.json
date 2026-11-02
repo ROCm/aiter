@@ -1,0 +1,99 @@
+[
+  {
+    "m": 8,
+    "ratio": 0,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "kv": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "attn": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "outproj": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnres": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "ffnnorm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "router": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_up": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "shared_down": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "moe": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "sum": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "vgpr": 424,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          252.37870365381244,
+          257.6575994491577
+        ],
+        "second_us": 257.6575994491577
+      },
+      {
+        "mode": 1,
+        "vgpr": 424,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          254.90023295084634,
+          252.41079926490784
+        ],
+        "second_us": 252.41079926490784
+      }
+    ]
+  }
+]

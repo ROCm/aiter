@@ -1,0 +1,164 @@
+{
+  "two_launch": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 273,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_atomic": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_load_rt": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_load_ht": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_atomic": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_load_rt": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_load_ht": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_vector_load": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_vector_load": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

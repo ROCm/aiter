@@ -1,0 +1,114 @@
+[
+  {
+    "mode": "two",
+    "prefetch": "none",
+    "tdm": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "none",
+    "tdm": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "none",
+    "tdm": true,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "speculative",
+    "tdm": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "speculative",
+    "tdm": true,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "non_speculative",
+    "tdm": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "prefetch": "non_speculative",
+    "tdm": true,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  }
+]

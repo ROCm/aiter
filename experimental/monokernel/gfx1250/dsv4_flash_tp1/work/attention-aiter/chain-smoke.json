@@ -1,0 +1,18 @@
+[
+  {
+    "fused": false,
+    "error": 5.4881570576981176e-06,
+    "health": 0,
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  {
+    "fused": true,
+    "error": 5.4881570576981176e-06,
+    "health": 0,
+    "vgpr": 372,
+    "lds": 131584,
+    "spills": 0
+  }
+]

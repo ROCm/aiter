@@ -1,0 +1,272 @@
+[
+  {
+    "file": "mhc_mono_m1_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "mhc_mono_m16_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "mhc_mono_m8_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 3
+  },
+  {
+    "file": "mhc_mono_m1_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 6
+  },
+  {
+    "file": "mhc_mono_m32_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 3
+  },
+  {
+    "file": "mhc_mono_m16_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 13,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 6
+  },
+  {
+    "file": "mhc_mono_m16_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 3
+  },
+  {
+    "file": "mhc_mono_m32_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "mhc_mono_m8_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 13,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 6
+  },
+  {
+    "file": "mhc_mono_m8_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "mhc_mono_m1_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 3
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m1_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m16_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m8_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m1_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 2
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m32_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m16_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 12,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 2
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m16_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m32_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m8_last0_qkv1.amdgcn",
+    "sgpr_spill_count": 12,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 2,
+    "global_inv_instructions": 2
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m8_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "relaxed-poll/mhc_mono_m1_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 1,
+    "global_inv_instructions": 1
+  },
+  {
+    "file": "device-scope/mhc_mono_m1_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m16_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m8_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m32_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m16_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m32_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m8_last1_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  },
+  {
+    "file": "device-scope/mhc_mono_m1_last0_qkv0.amdgcn",
+    "sgpr_spill_count": 0,
+    "vgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "global_wb_instructions": 0,
+    "global_inv_instructions": 0
+  }
+]

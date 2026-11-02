@@ -1,0 +1,6 @@
+[
+  {
+    "name": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+    "dur_us": 4.086
+  }
+]

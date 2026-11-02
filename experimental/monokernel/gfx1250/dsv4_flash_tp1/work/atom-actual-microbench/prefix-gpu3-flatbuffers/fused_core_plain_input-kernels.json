@@ -1,0 +1,22 @@
+[
+  {
+    "name": "optimized_prefix",
+    "us": 35.012,
+    "args": {
+      "device": 5,
+      "stream": 0,
+      "correlation": 115,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        256,
+        1,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  }
+]

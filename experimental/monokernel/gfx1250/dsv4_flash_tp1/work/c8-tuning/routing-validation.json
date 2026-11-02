@@ -1,0 +1,1154 @@
+[
+  {
+    "m": 1,
+    "seed": 0,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 0,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 1,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 1,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 2,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 2,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 3,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 3,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 4,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 4,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 5,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 5,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 6,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 6,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 7,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 1,
+    "seed": 7,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 0,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 0,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 1,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 1,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 2,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 2,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 3,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 3,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 4,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 4,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 5,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 5,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 6,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 6,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 7,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 2,
+    "seed": 7,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 0,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 0,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 1,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 1,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 2,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 2,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 3,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 3,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 4,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 4,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 5,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 5,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 6,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 6,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 7,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 4,
+    "seed": 7,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 0,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 0,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 1,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 1,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 2,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 2,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 3,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 3,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 4,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 4,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 5,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 5,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 6,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 6,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 7,
+    "bias": false,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  },
+  {
+    "m": 8,
+    "seed": 7,
+    "bias": true,
+    "equal": true,
+    "fields": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "health": 0
+  }
+]

@@ -1,0 +1,21 @@
+Whole-monokernel optimization pass — 2026-10-21
+
+Flash TP1, all43decode layers, C8,1024input/1024output,64requests
+One server start per configuration, client twice, second client only. Configurations assigned separate GPUs.
+
+Configuration	Median_TTFT_ms	Median_TPOT_ms	Total_tokens_per_second
+native	287.847	13.699	1145.589
+previous	284.013	12.029	1310.365
+selected	300.068	11.696	1338.508
+
+Selected: mHC pre reads shuffled input directly; final mHC post writes shuffled output directly; early OA/OB TDM. Earlier local input quant and bounded QB L2/TDM retained.
+Every eligible decode layer remains a single attention+shared/routed-MoE kernel. Native prefill dispatch retained.
+Both previous/selected A/B include corrected output TDM prologue ordering.
+No automatic serving-default change. Use run-selected.sh.
+
+Matched text checks versus previous: {'native': [False, False, False], 'previous': [True, True, True], 'selected': [True, True, True]}
+Three greedy128-token prompt smoke checks only; no new GSM8K run.
+
+Finer producer/consumer and tile/expert readiness was implemented throughout the layer, not only QB. Pure-load combined replay has unresolved health failures; atomic-read controls passed SWA/HCA but regressed. These candidates remain unselected. Extra broad L2-prefetch variants stalled and remain off.
+See DEPENDENCIES.tsv for all32 chronological handoffs and their status. See MICROBENCH.txt for C1/2/4/8 SWA/CSA/HCA full-layer A/B. Sources, failed logs, pre-edit backups, restore notes, ATOM overlay and image identifiers are retained.
+No new image or Git push performed.

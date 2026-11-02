@@ -1,0 +1,450 @@
+[
+  {
+    "region": "Attention mHC pre + RMSNorm",
+    "id": "mhc_pre",
+    "C8_prior": {
+      "native": 8.51712515577674,
+      "fused": 6.949140457436442
+    },
+    "C16_prior": {
+      "native": 8.6172497831285,
+      "fused": 7.188249845057726
+    },
+    "C16_current": {
+      "native": 8.656062185764313,
+      "fused": 7.255859207361937
+    },
+    "checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 8.830060323816724e-06,
+        "max_abs": 6.103515625e-05
+      },
+      "residual_exact": true,
+      "post": {
+        "finite": true,
+        "relative_rms": 2.535262000336047e-09,
+        "max_abs": 1.6298145055770874e-09
+      },
+      "comb": {
+        "finite": true,
+        "relative_rms": 6.606330771319335e-08,
+        "max_abs": 1.7881393432617188e-07
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/mhc_pre.json"
+  },
+  {
+    "region": "CSA compressor: projection + pool/norm/RoPE + state/cache write",
+    "id": "compress_case0_pos1023",
+    "C8_prior": {
+      "native": 10.370546486228704,
+      "fused": 9.803453460335732
+    },
+    "C16_prior": {
+      "native": 10.490109212696552,
+      "fused": 9.894844144582748
+    },
+    "C16_current": {
+      "native": 10.352999903261662,
+      "previous": 9.892953094094992,
+      "fused": 9.820968843996525
+    },
+    "checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 1.6727857428122661e-06,
+        "max_abs": 0.0001220703125
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/compress_case0_pos1023.json"
+  },
+  {
+    "region": "CSA indexer compressor: projection + pool/norm/RoPE/quant + state/cache write",
+    "id": "compress_case2_pos1023",
+    "C8_prior": {
+      "native": 7.214562501758337,
+      "fused": 7.993234321475029
+    },
+    "C16_prior": {
+      "native": 7.388593629002571,
+      "fused": 8.560343645513058
+    },
+    "C16_current": {
+      "native": 7.2420937940478325,
+      "previous": 8.675484452396631,
+      "fused": 8.547796867787838
+    },
+    "checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/compress_case2_pos1023.json"
+  },
+  {
+    "region": "CSA identity top-k + index packing (256 compressed tokens)",
+    "id": "identity_csa_256",
+    "C8_prior": {
+      "native": 2.5663437554612756,
+      "fused": 1.3507812400348485
+    },
+    "C16_prior": {
+      "native": 2.6333124842494726,
+      "fused": 1.3582968967966735
+    },
+    "C16_current": {
+      "native": 2.6627343613654375,
+      "fused": 1.3689218903891742
+    },
+    "checks": {
+      "topk_equal": true,
+      "indices_equal": true,
+      "health": 0
+    },
+    "source": "native-c16/final/identity_csa_256.json"
+  },
+  {
+    "region": "HCA compressor: projection + pool/norm/RoPE + state/cache write",
+    "id": "compress_case1_pos1023",
+    "C8_prior": {
+      "native": 11.1999218352139,
+      "fused": 15.922640450298786
+    },
+    "C16_prior": {
+      "native": 10.89132810011506,
+      "fused": 15.589625108987093
+    },
+    "C16_current": {
+      "native": 10.978328064084053,
+      "previous": 18.1033443659544,
+      "fused": 11.316953226923943
+    },
+    "checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 1.0668365080235276e-09,
+        "max_abs": 2.9802322387695312e-08
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/compress_case1_pos1023.json"
+  },
+  {
+    "region": "Input quant + QKVA + norms/RoPE + QB + KV-cache write",
+    "id": "qkv_cache",
+    "C8_prior": {
+      "native": 27.715218253433704,
+      "fused": 18.353719264268875
+    },
+    "C16_prior": {
+      "native": 13.075843919068575,
+      "fused": 18.381280824542046
+    },
+    "C16_current": {
+      "native": 13.29800020903349,
+      "previous": 18.388125114142895,
+      "fused": 17.132500186562538
+    },
+    "checks": {
+      "q": {
+        "finite": true,
+        "relative_rms": 4.346853543779616e-08,
+        "max_abs": 3.0517578125e-05
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      }
+    },
+    "source": "native-c16/final/qkv_cache.json"
+  },
+  {
+    "region": "SWA attention + split-KV reduction (128 KV)",
+    "id": "attention_128",
+    "C8_prior": {
+      "native": 7.494952995330095,
+      "fused": 8.081468753516674
+    },
+    "C16_prior": {
+      "native": 10.948906652629375,
+      "fused": 10.443140752613544
+    },
+    "C16_current": {
+      "native": 10.917562525719404,
+      "fused": 10.410562623292208
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.0016612785402685404,
+      "max_abs": 0.000244140625
+    },
+    "source": "native-c16/final/attention_128_s4.json"
+  },
+  {
+    "region": "CSA attention + split-KV reduction (384 KV)",
+    "id": "attention_384",
+    "C8_prior": {
+      "native": 9.556812234222889,
+      "fused": 9.397812653332949
+    },
+    "C16_prior": {
+      "native": 12.530656531453133,
+      "fused": 13.021375052630901
+    },
+    "C16_current": {
+      "native": 12.653296813368797,
+      "fused": 13.172812294214964
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.001982874935492873,
+      "max_abs": 0.0001220703125
+    },
+    "source": "native-c16/final/attention_384_s4.json"
+  },
+  {
+    "region": "HCA attention + split-KV reduction (136 KV)",
+    "id": "attention_136",
+    "C8_prior": {
+      "native": 7.930594030767679,
+      "fused": 8.288015611469746
+    },
+    "C16_prior": {
+      "native": 11.46906241774559,
+      "fused": 10.79554669559002
+    },
+    "C16_current": {
+      "native": 11.412062216550112,
+      "fused": 10.895031038671732
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.0018596833106130362,
+      "max_abs": 0.000244140625
+    },
+    "source": "native-c16/final/attention_136_s4.json"
+  },
+  {
+    "region": "Inverse RoPE + quant + OA/OB projections",
+    "id": "output_projection",
+    "C8_prior": {
+      "native": 63.68400156497955,
+      "fused": 24.126093834638596
+    },
+    "C16_prior": {
+      "native": 15.773609280586243,
+      "fused": 29.408358968794346
+    },
+    "C16_current": {
+      "native": 15.970749780535698,
+      "previous": 29.467186890542507,
+      "fused": 26.11342165619135
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "source": "native-c16/final/output_projection.json"
+  },
+  {
+    "region": "Attention mHC post + FFN mHC pre/RMSNorm",
+    "id": "mhc_post_pre",
+    "C8_prior": {
+      "native": 5.3123123943805695,
+      "fused": 6.69001555070281
+    },
+    "C16_prior": {
+      "native": 5.458187311887741,
+      "fused": 6.741953082382679
+    },
+    "C16_current": {
+      "native": 5.418109241873026,
+      "fused": 6.246843608096242
+    },
+    "checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 3.8518832297995687e-05,
+        "max_abs": 0.000244140625
+      },
+      "residual": {
+        "finite": true,
+        "relative_rms": 1.258293468708871e-05,
+        "max_abs": 0.000244140625
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/mhc_post_pre.json"
+  },
+  {
+    "region": "Router GEMM + shared expert (up/activation/quant/down)",
+    "id": "shared_router",
+    "C8_prior": {
+      "native": 51.4182485640049,
+      "fused": 17.732812091708183
+    },
+    "C16_prior": {
+      "native": 17.019858583807945,
+      "fused": 18.649186939001083
+    },
+    "C16_current": {
+      "native": 16.997280530631542,
+      "previous": 19.087296910583973,
+      "fused": 15.28223417699337
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "source": "native-c16/final/shared_router.json"
+  },
+  {
+    "region": "Expert selection + routing metadata",
+    "id": "routing",
+    "C8_prior": {
+      "native": 7.860531099140644,
+      "fused": 6.325093796476722
+    },
+    "C16_prior": {
+      "native": 9.738359600305557,
+      "fused": 9.846624918282032
+    },
+    "C16_current": {
+      "native": 9.602484293282032,
+      "fused": 9.878515731543303
+    },
+    "checks": {
+      "hist_equal": true,
+      "gather_equal": true,
+      "scatter_equal": true,
+      "scales": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "native HERD enabled at C16; excludes router GEMM"
+    },
+    "source": "native-c16/final/routing.json"
+  },
+  {
+    "region": "Routed MoE: input quant + up/SwiGLU/quant + down/reduce",
+    "id": "routed_moe",
+    "C8_prior": {
+      "native": 48.90335910022259,
+      "fused": 56.23184330761433
+    },
+    "C16_prior": {
+      "native": 80.09201288223267,
+      "fused": 89.64134380221367
+    },
+    "C16_current": {
+      "native": 79.90039139986038,
+      "fused": 90.12382850050926
+    },
+    "checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "health": 0,
+      "note": "routing metadata prepared outside both timings; input MXFP8 quantization included in both"
+    },
+    "source": "native-c16/final_paired/routed_moe.json"
+  },
+  {
+    "region": "Shared+routed sum + final mHC post",
+    "id": "sum_final_mhc_post",
+    "C8_prior": {
+      "native": 4.9611718859523535,
+      "fused": 3.2442499650642276
+    },
+    "C16_prior": {
+      "native": 5.054437555372715,
+      "fused": 4.283281276002526
+    },
+    "C16_current": {
+      "native": 5.121390568092465,
+      "fused": 4.329593852162361
+    },
+    "checks": {
+      "raw": {
+        "finite": true,
+        "relative_rms": 1.4157850742340088,
+        "max_abs": 1.365234375
+      },
+      "plain": {
+        "finite": true,
+        "relative_rms": 1.5991114196367562e-05,
+        "max_abs": 0.0009765625
+      },
+      "health": 0
+    },
+    "source": "native-c16/final/sum_final_mhc_post.json"
+  },
+  {
+    "region": "Whole FFN region (overlaps previous four rows)",
+    "id": "whole_ffn",
+    "C8_prior": {
+      "native": 153.6673605442047,
+      "fused": 82.30406045913696
+    },
+    "C16_prior": {
+      "native": 111.63243651390076,
+      "fused": 123.38320165872574
+    },
+    "C16_current": {
+      "native": 114.11729827523232,
+      "previous": 124.41962212324142,
+      "fused": 117.68829450011253
+    },
+    "checks": {
+      "final": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "same checkpoint experts and inputs; learned router/HERD at C16, final layout differs natively"
+    },
+    "source": "native-c16/final_paired/whole_ffn.json"
+  }
+]

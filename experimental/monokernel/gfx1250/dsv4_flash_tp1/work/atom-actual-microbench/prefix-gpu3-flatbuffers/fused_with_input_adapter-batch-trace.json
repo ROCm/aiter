@@ -1,0 +1,3237 @@
+
+  {
+    "schemaVersion": 1,
+    "deviceProperties": [
+    {
+      "id": 0, "name": "AMD Radeon Graphics", "totalGlobalMem": 463856467968,
+      "computeMajor": 12, "computeMinor": 5,
+      "maxThreadsPerBlock": 1024, "maxThreadsPerMultiprocessor": 2048,
+      "regsPerBlock": 131072, "warpSize": 32,
+      "sharedMemPerBlock": 327680, "numSms": 256
+    , "maxSharedMemoryPerMultiProcessor": 327680
+    }
+    ],
+      "trace_id": "DF2CF5AF67F34EB0B0D9BF24890947E0",
+      "hip_driver_version": 71626315,
+      "hip_runtime_version": 71626315,
+      "roctracer_version": 4.1,
+  "displayTimeUnit": "ms",
+  "baseTimeNanoseconds": 1790857026000000000,
+  "traceEvents": [
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 43608, "tid": 43608,
+    "ts": 1677827451684.073, "dur": 65.421,
+    "args": {
+            "cid": 215, "correlation": 123
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 43608, "tid": 43608, "ts": 1677827451684.073,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 43608, "tid": 43608,
+    "ts": 1677827451755.165, "dur": 4289.691,
+    "args": {
+            "cid": 48, "correlation": 124
+    }
+  },
+  {
+    "ph": "f", "id": 124, "pid": 43608, "tid": 43608, "ts": 1677827451755.165,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 43608, "tid": 43608,
+    "ts": 1677827456050.507, "dur": 0.220,
+    "args": {
+            "cid": 48, "correlation": 125
+    }
+  },
+  {
+    "ph": "f", "id": 125, "pid": 43608, "tid": 43608, "ts": 1677827456050.507,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451696.151, "dur": 2.042,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451696.151,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451698.955, "dur": 39.899,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451698.955,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451739.616, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451739.616,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451742.100, "dur": 36.053,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451742.100,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451779.396, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451779.396,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451782.040, "dur": 37.014,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451782.040,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451819.856, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451819.856,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451822.420, "dur": 37.135,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451822.420,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451860.317, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451860.317,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451862.881, "dur": 35.252,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451862.881,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451898.895, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451898.895,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451901.419, "dur": 36.213,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451901.419,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451939.075, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451939.075,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451941.519, "dur": 36.093,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451941.519,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827451978.494, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451978.494,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827451980.978, "dur": 36.213,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827451980.978,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452017.994, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452017.994,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452020.437, "dur": 36.854,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452020.437,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452058.174, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452058.174,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452060.617, "dur": 35.813,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452060.617,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452097.713, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452097.713,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452100.197, "dur": 37.976,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452100.197,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452138.935, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452138.935,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452141.419, "dur": 35.332,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452141.419,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452177.553, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452177.553,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452179.997, "dur": 37.935,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452179.997,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452218.695, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452218.695,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452221.178, "dur": 35.893,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452221.178,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452258.314, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452258.314,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452260.798, "dur": 38.857,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452260.798,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452300.497, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452300.497,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452303.181, "dur": 35.933,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452303.181,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452339.916, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452339.916,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452342.440, "dur": 38.136,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452342.440,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452381.339, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452381.339,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452383.862, "dur": 36.855,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452383.862,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452421.960, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452421.960,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452424.483, "dur": 38.096,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452424.483,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452463.342, "dur": 1.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452463.342,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452465.905, "dur": 36.054,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452465.905,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452502.721, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452502.721,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452505.405, "dur": 36.493,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452505.405,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452542.661, "dur": 1.962,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452542.661,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452545.385, "dur": 35.011,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452545.385,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452581.719, "dur": 1.962,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452581.719,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452584.443, "dur": 38.537,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452584.443,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452624.023, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452624.023,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452626.506, "dur": 36.694,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452626.506,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452664.003, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452664.003,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452666.526, "dur": 37.135,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452666.526,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452704.423, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452704.423,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452706.907, "dur": 36.293,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452706.907,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452744.443, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452744.443,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452746.967, "dur": 35.572,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452746.967,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452783.502, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452783.502,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452785.986, "dur": 36.413,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452785.986,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452823.161, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452823.161,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452825.685, "dur": 36.254,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452825.685,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452862.701, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452862.701,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452865.184, "dur": 36.134,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452865.184,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452902.601, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452902.601,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452905.084, "dur": 35.372,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452905.084,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452941.299, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452941.299,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452943.822, "dur": 28.562,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452943.822,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827452973.186, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452973.186,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827452975.590, "dur": 28.442,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827452975.590,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453004.794, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453004.794,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453007.197, "dur": 28.362,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453007.197,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453036.802, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453036.802,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453039.206, "dur": 27.560,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453039.206,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453067.568, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453067.568,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453070.012, "dur": 27.560,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453070.012,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453098.494, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453098.494,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453100.938, "dur": 28.161,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453100.938,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453129.862, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453129.862,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453132.265, "dur": 27.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453132.265,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453161.189, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453161.189,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453163.592, "dur": 30.124,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453163.592,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453194.559, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453194.559,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453196.962, "dur": 28.001,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453196.962,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453225.765, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453225.765,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453228.169, "dur": 30.565,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453228.169,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453259.496, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453259.496,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453261.860, "dur": 27.840,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453261.860,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453290.943, "dur": 1.602,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453290.943,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453293.307, "dur": 28.321,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453293.307,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453322.430, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453322.430,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453325.074, "dur": 29.003,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453325.074,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453354.839, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453354.839,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453357.363, "dur": 28.041,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453357.363,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453386.166, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453386.166,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453388.690, "dur": 28.562,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453388.690,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453418.495, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453418.495,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453420.858, "dur": 28.482,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453420.858,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453450.142, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453450.142,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453452.586, "dur": 27.600,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453452.586,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453480.988, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453480.988,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453483.592, "dur": 28.282,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453483.592,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453512.676, "dur": 1.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453512.676,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453515.240, "dur": 28.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453515.240,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453545.124, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453545.124,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453547.688, "dur": 28.162,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453547.688,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453576.852, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453576.852,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453579.296, "dur": 27.520,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453579.296,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453607.618, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453607.618,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453610.062, "dur": 28.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453610.062,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453639.466, "dur": 1.722,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453639.466,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453641.950, "dur": 27.600,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453641.950,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453670.793, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453670.793,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453673.317, "dur": 28.321,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453673.317,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453702.481, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453702.481,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453705.205, "dur": 28.561,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453705.205,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453734.569, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453734.569,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453736.972, "dur": 31.046,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453736.972,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453768.780, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453768.780,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453771.304, "dur": 28.962,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453771.304,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453801.509, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453801.509,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453803.913, "dur": 27.961,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453803.913,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453832.636, "dur": 1.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453832.636,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453835.200, "dur": 30.204,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453835.200,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453866.206, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453866.206,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453868.730, "dur": 28.201,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453868.730,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453897.693, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453897.693,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453900.217, "dur": 28.322,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453900.217,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453929.741, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453929.741,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453932.265, "dur": 28.282,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453932.265,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453961.349, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453961.349,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453963.793, "dur": 27.680,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453963.793,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827453992.235, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453992.235,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827453994.919, "dur": 27.921,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827453994.919,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454023.642, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454023.642,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454026.086, "dur": 28.081,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454026.086,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454055.690, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454055.690,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454058.374, "dur": 27.921,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454058.374,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454087.057, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454087.057,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454089.461, "dur": 35.973,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454089.461,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454126.196, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454126.196,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454128.640, "dur": 28.201,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454128.640,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454157.603, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454157.603,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454160.207, "dur": 27.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454160.207,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454189.050, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454189.050,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454191.734, "dur": 29.283,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454191.734,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454221.860, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454221.860,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454224.383, "dur": 28.202,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454224.383,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454253.547, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454253.547,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454255.951, "dur": 30.925,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454255.951,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454287.638, "dur": 1.602,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454287.638,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454290.042, "dur": 28.001,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454290.042,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454319.326, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454319.326,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454321.729, "dur": 28.242,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454321.729,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454350.773, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454350.773,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454353.137, "dur": 28.401,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454353.137,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454382.300, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454382.300,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454384.944, "dur": 27.841,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454384.944,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454413.547, "dur": 1.962,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454413.547,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454416.271, "dur": 27.841,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454416.271,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454445.355, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454445.355,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454447.999, "dur": 28.201,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454447.999,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454477.163, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454477.163,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454479.526, "dur": 27.320,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454479.526,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454507.568, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454507.568,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454510.252, "dur": 28.322,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454510.252,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454539.376, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454539.376,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454542.060, "dur": 28.562,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454542.060,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454571.905, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454571.905,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454574.589, "dur": 27.961,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454574.589,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454603.312, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454603.312,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454605.716, "dur": 27.480,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454605.716,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454633.958, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454633.958,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454636.361, "dur": 27.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454636.361,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454664.964, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454664.964,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454667.368, "dur": 27.600,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454667.368,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454696.251, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454696.251,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454698.815, "dur": 28.362,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454698.815,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454727.979, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454727.979,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454730.503, "dur": 28.001,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454730.503,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454759.266, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454759.266,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454761.830, "dur": 30.364,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454761.830,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454792.956, "dur": 1.802,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454792.956,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454795.520, "dur": 28.562,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454795.520,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454825.365, "dur": 1.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454825.365,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454827.929, "dur": 27.841,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454827.929,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454856.532, "dur": 1.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454856.532,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454859.056, "dur": 31.446,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454859.056,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454891.344, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454891.344,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454893.708, "dur": 28.041,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454893.708,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454922.511, "dur": 1.761,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454922.511,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454925.035, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454925.035,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454954.399, "dur": 1.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454954.399,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454956.962, "dur": 28.122,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454956.962,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827454985.886, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454985.886,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827454988.249, "dur": 27.801,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827454988.249,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455016.812, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455016.812,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455019.216, "dur": 28.041,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455019.216,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455047.979, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455047.979,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455050.423, "dur": 28.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455050.423,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455080.428, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455080.428,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455082.871, "dur": 28.162,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455082.871,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455111.835, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455111.835,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455114.238, "dur": 27.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455114.238,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455142.641, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455142.641,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455145.045, "dur": 27.880,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455145.045,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455173.688, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455173.688,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455176.091, "dur": 28.562,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455176.091,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455205.856, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455205.856,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455208.299, "dur": 29.564,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455208.299,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455238.705, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455238.705,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455241.069, "dur": 27.600,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455241.069,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455269.431, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455269.431,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455271.835, "dur": 30.444,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455271.835,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455303.042, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455303.042,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455305.525, "dur": 27.841,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455305.525,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455334.609, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455334.609,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455337.053, "dur": 27.961,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455337.053,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455365.816, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455365.816,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455368.460, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455368.460,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455397.343, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455397.343,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455399.987, "dur": 27.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455399.987,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455428.430, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455428.430,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455431.074, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455431.074,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455460.438, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455460.438,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455463.122, "dur": 27.800,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455463.122,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455491.765, "dur": 1.882,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455491.765,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455494.409, "dur": 28.762,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455494.409,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455523.973, "dur": 2.242,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455523.973,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455526.978, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455526.978,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455555.821, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455555.821,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455558.465, "dur": 28.001,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455558.465,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455587.709, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455587.709,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455590.353, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455590.353,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455619.276, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455619.276,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455621.960, "dur": 28.081,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455621.960,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455650.843, "dur": 1.682,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455650.843,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455653.287, "dur": 27.841,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455653.287,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455681.890, "dur": 1.922,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455681.890,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455684.694, "dur": 28.362,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455684.694,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455714.339, "dur": 1.681,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455714.339,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455716.782, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455716.782,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455745.706, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455745.706,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455748.069, "dur": 28.322,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455748.069,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455777.193, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455777.193,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455779.597, "dur": 32.007,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455779.597,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455812.406, "dur": 1.721,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455812.406,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455815.010, "dur": 29.162,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455815.010,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455845.415, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455845.415,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455847.779, "dur": 28.121,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455847.779,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455876.662, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455876.662,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455879.186, "dur": 30.925,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455879.186,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455910.914, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455910.914,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455913.317, "dur": 28.081,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455913.317,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455942.200, "dur": 1.642,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455942.200,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455944.564, "dur": 30.485,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455944.564,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827455976.252, "dur": 1.641,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455976.252,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827455978.615, "dur": 28.322,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827455978.615,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2", "pid": 5, "tid": 0,
+    "ts": 1677827456007.779, "dur": 1.601,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827456007.779,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "optimized_prefix", "pid": 5, "tid": 0,
+    "ts": 1677827456010.142, "dur": 28.482,
+    "args": {
+            "device": 5, "stream": 0,      "correlation": 123, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 123, "pid": 5, "tid": 0, "ts": 1677827456010.142,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 0,
+    "args": {
+      "labels": "CPU"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 0,
+    "args": {
+      "sort_index": 43608
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 0, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 0, "tid": 0,
+    "args": {
+      "labels": "GPU 0"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 0, "tid": 0,
+    "args": {
+      "sort_index": 5000000
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 1, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 1, "tid": 0,
+    "args": {
+      "labels": "GPU 1"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 1, "tid": 0,
+    "args": {
+      "sort_index": 5000001
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 2, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 2, "tid": 0,
+    "args": {
+      "labels": "GPU 2"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 2, "tid": 0,
+    "args": {
+      "sort_index": 5000002
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 3, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 3, "tid": 0,
+    "args": {
+      "labels": "GPU 3"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 3, "tid": 0,
+    "args": {
+      "sort_index": 5000003
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 4, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 4, "tid": 0,
+    "args": {
+      "labels": "GPU 4"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 4, "tid": 0,
+    "args": {
+      "sort_index": 5000004
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 5, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 5, "tid": 0,
+    "args": {
+      "labels": "GPU 5"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 5, "tid": 0,
+    "args": {
+      "sort_index": 5000005
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 6, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 6, "tid": 0,
+    "args": {
+      "labels": "GPU 6"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 6, "tid": 0,
+    "args": {
+      "sort_index": 5000006
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 7, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 7, "tid": 0,
+    "args": {
+      "labels": "GPU 7"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 7, "tid": 0,
+    "args": {
+      "sort_index": 5000007
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 8, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 8, "tid": 0,
+    "args": {
+      "labels": "GPU 8"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 8, "tid": 0,
+    "args": {
+      "sort_index": 5000008
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 9, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 9, "tid": 0,
+    "args": {
+      "labels": "GPU 9"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 9, "tid": 0,
+    "args": {
+      "sort_index": 5000009
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 10, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 10, "tid": 0,
+    "args": {
+      "labels": "GPU 10"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 10, "tid": 0,
+    "args": {
+      "sort_index": 5000010
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 11, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 11, "tid": 0,
+    "args": {
+      "labels": "GPU 11"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 11, "tid": 0,
+    "args": {
+      "sort_index": 5000011
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 12, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 12, "tid": 0,
+    "args": {
+      "labels": "GPU 12"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 12, "tid": 0,
+    "args": {
+      "sort_index": 5000012
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 13, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 13, "tid": 0,
+    "args": {
+      "labels": "GPU 13"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 13, "tid": 0,
+    "args": {
+      "sort_index": 5000013
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 14, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 14, "tid": 0,
+    "args": {
+      "labels": "GPU 14"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 14, "tid": 0,
+    "args": {
+      "sort_index": 5000014
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1677827451665.981, "pid": 15, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1677827451665.981, "pid": 15, "tid": 0,
+    "args": {
+      "labels": "GPU 15"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 15, "tid": 0,
+    "args": {
+      "sort_index": 5000015
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 1677827451665.981, "pid": 5, "tid": 0,
+    "args": {
+      "name": "stream 0 "
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 5, "tid": 0,
+    "args": {
+      "sort_index": 0
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 43608,
+    "args": {
+      "name": "thread 43608 (python)"
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 43608,
+    "args": {
+      "sort_index": 43608
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 43608,
+    "args": {
+      "name": "thread 43608 (python)"
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 1677827451665.981, "pid": 43608, "tid": 43608,
+    "args": {
+      "sort_index": 43608
+    }
+  },
+  {
+    "ph": "X", "cat": "Trace", "ts": 1677827451625.311, "dur": 4427.633,
+    "pid": "Spans", "tid": "PyTorch Profiler",
+    "name": "PyTorch Profiler (0)",
+    "args": {
+      "Op count": 0
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1677827451625.311,
+    "pid": "Spans", "tid": 0,
+    "args": {
+      "sort_index": 536870912
+    }
+  },
+  {
+    "name": "Iteration Start: PyTorch Profiler", "ph": "i", "s": "g",
+    "pid": "Traces", "tid": "Trace PyTorch Profiler", "ts": 1677827451625.311
+  },
+  {
+    "name": "Record Window End", "ph": "i", "s": "g",
+    "pid": "", "tid": "", "ts": 1677827456139.885
+  }
+  ],
+  "traceName": "/work/atom-actual-microbench/prefix-gpu3-flatbuffers/fused_with_input_adapter-batch-trace.json"
+}

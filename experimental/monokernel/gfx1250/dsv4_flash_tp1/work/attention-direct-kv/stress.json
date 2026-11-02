@@ -1,0 +1,47 @@
+[
+  {
+    "kind": "attention",
+    "split": 1,
+    "checked_invocations": 10240,
+    "max_error": 0.00014963380817789584,
+    "passed": true
+  },
+  {
+    "kind": "attention",
+    "split": 2,
+    "checked_invocations": 10240,
+    "max_error": 0.00014881727111060172,
+    "passed": true
+  },
+  {
+    "kind": "attention",
+    "split": 4,
+    "checked_invocations": 10240,
+    "max_error": 0.00014131311036180705,
+    "passed": true
+  },
+  {
+    "kind": "chain",
+    "fused": false,
+    "split": 1,
+    "checked_invocations": 10240,
+    "max_error": 3.0066021281527355e-05,
+    "passed": true
+  },
+  {
+    "kind": "chain",
+    "fused": true,
+    "split": 1,
+    "checked_invocations": 10240,
+    "max_error": 3.0066021281527355e-05,
+    "passed": true
+  },
+  {
+    "kind": "chain",
+    "fused": true,
+    "split": 4,
+    "checked_invocations": 10240,
+    "max_error": 3.4639117075130343e-05,
+    "passed": true
+  }
+]

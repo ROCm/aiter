@@ -1,0 +1,22 @@
+{
+  "gpu_work_started": false,
+  "image": "rocm/fw-bringup:dsv4_tp4_mk_expts",
+  "expected_digest": "sha256:aabe8ff74d659cd4cd25bbe7c25e5b85e4cd72f26cf3377dd63511a8b9509c24",
+  "local_image_id": "sha256:aabe8ff74d659cd4cd25bbe7c25e5b85e4cd72f26cf3377dd63511a8b9509c24",
+  "container_status": "exited",
+  "checkpoint_shards_present": 46,
+  "source_sha256": {
+    "concurrency-rollout/qa_batch.py": "dda0787cf68fbb09d65d7636d3ad31894bdb8bf4e91fce34e0df0e1709ed4a76",
+    "concurrency-rollout/qkv_batch.py": "fb9a927d8271db58ebbed05893339233a31d4b327c09264d604d125ce8872f77",
+    "concurrency-rollout/qkv_integration.py": "b599c9b4d91074ba9c5faa3559ab6b6596087eaee8b4efb721672a3b6801a3e0",
+    "modelwide/runtime.py": "cb16a70528659e042229ccd2ef05b39a5d912c42190df375400cc1a9bf289d67",
+    "modelwide/model_layer_precise.py": "4dbef339370220fb946f49bb307a70e87c65a01aa9081ee42f0ff2b221c9c947",
+    "modelwide/install.py": "b4e30fd5cebb692d2f31279db2eed9349fee82b51e295326d26f0a1da282ceb5",
+    "concurrency-rollout/server.sh": "a0a7e8798af327e6a30699eca2dc12b9c0438dc671b33872bf2c62a079c95fd6",
+    "concurrency-rollout/eager-server.sh": "58f86f837a7849ed910363bd79c210a89bf32789987f77791c4047160de4a5dc",
+    "concurrency-rollout/clients.sh": "dc05d5af8b463407a4a177bfc0af032263cee9f6644f08877fcdc531991ac2d7",
+    "concurrency-rollout/run_flash_experiment.sh": "44c73580d9a6d84e1c9306ffba8cd02b83cc12d418fd9c7dcf0d1052af927a82"
+  },
+  "archive_sha256": "6a6b86f0a177004ef6c8281b4fd40a2acc9170ed7da37f2061c986cb1807b6e9",
+  "checks_passed": true
+}

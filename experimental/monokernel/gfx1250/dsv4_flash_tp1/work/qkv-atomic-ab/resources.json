@@ -1,0 +1,134 @@
+{
+  "A_scratch_separate_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "B_atomic_fused_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [
+      "global_atomic_add_f32 v6, v2, s[14:15] scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v3, s[14:15] offset:4 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v4, s[14:15] offset:8 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v5, s[14:15] offset:12 scale_offset scope:SCOPE_DEV"
+    ],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "C_atomic_separate_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [
+      "global_atomic_add_f32 v4, v0, s[14:15] scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v4, v1, s[14:15] offset:4 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v4, v2, s[14:15] offset:8 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v4, v3, s[14:15] offset:12 scale_offset scope:SCOPE_DEV"
+    ],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "D_scratch_fused_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "E_atomic_devscope_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [
+      "global_atomic_add_f32 v6, v2, s[14:15] scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v3, s[14:15] offset:4 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v4, s[14:15] offset:8 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v5, s[14:15] offset:12 scale_offset scope:SCOPE_DEV"
+    ],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "F_scratch_devscope_norm": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "G_atomic_devscope_tail_reset": {
+    "vgpr": 130,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "float_atomic_lines": [
+      "global_atomic_add_f32 v6, v2, s[14:15] scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v3, s[14:15] offset:4 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v4, s[14:15] offset:8 scale_offset scope:SCOPE_DEV",
+      "global_atomic_add_f32 v6, v5, s[14:15] offset:12 scale_offset scope:SCOPE_DEV"
+    ],
+    "scratch": [
+      ".amdhsa_private_segment_fixed_size 0"
+    ],
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  }
+}

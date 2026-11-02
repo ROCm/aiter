@@ -1,0 +1,7 @@
+{
+  "kernel_count": 1,
+  "kernels": [
+    "packed_full_layer"
+  ],
+  "same_math_split_launches": 33
+}

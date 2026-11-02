@@ -1,0 +1,73 @@
+{
+  "workload": "Flash TP1, 1K input / 1K output, concurrency 1",
+  "round": 2,
+  "units": "microseconds",
+  "rows": [
+    {
+      "native_region": "Attention mHC post + FFN mHC pre + RMSNorm + shared-input quant",
+      "candidate": "Fused quant in mHC reduction",
+      "native_us": 6.512703141197562,
+      "candidate_us": 4.8168867360800505
+    },
+    {
+      "native_region": "Router BF16 projection (layer 0)",
+      "candidate": "Native retained",
+      "native_us": 3.000117256306112,
+      "candidate_us": null
+    },
+    {
+      "native_region": "HERD routing",
+      "candidate": "Native retained",
+      "native_us": 6.818312685936689,
+      "candidate_us": null
+    },
+    {
+      "native_region": "Shared input FP8 quant",
+      "candidate": "Native retained",
+      "native_us": 1.3078984338790178,
+      "candidate_us": null
+    },
+    {
+      "native_region": "Shared gate/up projection",
+      "candidate": "Existing selected C1 Gluon WMMA/TDM GEMM",
+      "native_us": 27.755300514400005,
+      "candidate_us": 4.209421807900071
+    },
+    {
+      "native_region": "Clamped SiLU times up",
+      "candidate": "Native retained",
+      "native_us": 1.4513906207866967,
+      "candidate_us": null
+    },
+    {
+      "native_region": "Shared down-input FP8 quant",
+      "candidate": "Native retained",
+      "native_us": 1.2917772983200848,
+      "candidate_us": null
+    },
+    {
+      "native_region": "Shared down projection",
+      "candidate": "Existing selected C1 Gluon WMMA/TDM GEMM",
+      "native_us": 14.25195299088955,
+      "candidate_us": 2.7006054297089577
+    },
+    {
+      "native_region": "Complete shared expert chain (five launches)",
+      "candidate": "Same chain with candidate GEMMs",
+      "native_us": 47.434914857149124,
+      "candidate_us": 14.067625161260366
+    },
+    {
+      "native_region": "Routed input quant + expert GEMMs/SwiGLU/requant + combine",
+      "candidate": "Separate quant + persistent fused MoE",
+      "native_us": 13.139625079929829,
+      "candidate_us": 14.709468465298414
+    },
+    {
+      "native_region": "Shared/routed add + extracted mHC post",
+      "candidate": "Single combine_post kernel",
+      "native_us": 4.5867187436670065,
+      "candidate_us": 1.6351015656255186
+    }
+  ]
+}

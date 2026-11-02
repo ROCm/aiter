@@ -1,0 +1,194 @@
+{
+  "native": [
+    {
+      "c": 1,
+      "same_text": [
+        false
+      ],
+      "choices": 1,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        false,
+        false
+      ],
+      "choices": 2,
+      "finish_reasons": [
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        false,
+        false,
+        false,
+        true
+      ],
+      "choices": 4,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+        true
+      ],
+      "choices": 8,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    }
+  ],
+  "selected": [
+    {
+      "c": 1,
+      "same_text": [
+        true
+      ],
+      "choices": 1,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        true,
+        true
+      ],
+      "choices": 2,
+      "finish_reasons": [
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        true,
+        false,
+        true,
+        true
+      ],
+      "choices": 4,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "choices": 8,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    }
+  ],
+  "replica": [
+    {
+      "c": 1,
+      "same_text": [
+        true
+      ],
+      "choices": 1,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        true,
+        true
+      ],
+      "choices": 2,
+      "finish_reasons": [
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        false,
+        false,
+        true,
+        true
+      ],
+      "choices": 4,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "choices": 8,
+      "finish_reasons": [
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "JITFunction(isolated:qkv_cache)": {
+    "regs": 206,
+    "spills": 0,
+    "lds": 198160
+  },
+  "JITFunction(previous.isolated:qkv_cache)": {
+    "regs": 416,
+    "spills": 0,
+    "lds": 186880
+  }
+}

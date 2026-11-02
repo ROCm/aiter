@@ -1,0 +1,66 @@
+# Actual ATOM versus fused prototype: Flash C1, 1024/1024
+
+These baseline calls invoke the actual installed ATOM/AITER/FlyDSL implementations, confirmed against a live server decode trace. They replace the earlier custom unfused controls. All times below are second-round medians in microseconds, measured with GPU events over flat graphs using the same buffers on every repetition. Each pair runs on the same GPU. These are isolated warm-weight microbenchmarks, not serving performance or full-layer measurements.
+
+| Actual ATOM region | Fused prototype region | Actual ATOM µs | Prototype µs | GPU | Launches native / prototype |
+|---|---|---:|---:|---:|---:|
+| mHC + input RMSNorm | `unshuffle + candidate` | 7.3667 | 7.6619 | 1 | 3 / 2 |
+| Input quant + QA/KV + norm/quant + QB + Q/KV norm/RoPE + cache write | `complete + cache_store` | 26.7203 | 12.5713 | 2 | 5 / 2 |
+| Attention + split-KV reduction (see boundary note) | `attention_kernel including cache write` | 11.1278 | 8.5286 | 3 | 2 / 1 |
+| QKV through attention reduction, matched combined boundary | `qkv_attention` | 43.9061 | 20.2342 | 3 | 7 / 1 |
+| Full layer-0 start through attention reduction | `unshuffle + optimized_prefix` | 54.5632 | 32.1261 | 0 | 10 / 2 |
+
+The complete matched sequence is 1.698x faster (41.12% less latency) as a timing experiment. It is NOT an accepted numerical replacement for ATOM.
+
+## Boundaries and workload
+
+- Flash single GPU, one decode token, TP1; 1024 prompt tokens and 1024 output tokens. Layer0 has hidden4096, four mHC streams, QA1024+KV512, QB32768,64 attention heads×512.
+- Layer0 sliding-window attention consumes128 KV rows throughout this decode workload. Native metadata capacity16384 follows max_num_seqs128 and selects128 splits; our kernel uses4. Native index capacity was verified in source and split specialization in live trace. A synthetic T1024 dense-attention row is not this layer0 workload.
+- Native QKV already includes the cache write in its FlyDSL norm/RoPE kernel. The isolated prototype attention row also includes a cache write, so that diagnostic row has extra work. The combined QKV+attention row and complete sequence count the write exactly once on each side and are the matched comparisons.
+- Native layer0 input is shuffled. Prototype core expects plain layout. The matched mHC and complete-sequence rows include the required unshuffle adapter; complete prototype therefore launches two kernels. Its core alone measured 29.7969 µs, but has a different input boundary.
+- Rows overlap. Do not add isolated medians to predict the combined result; cache/workspace traffic and dependencies differ. The table is graph-region latency, not summed profiler durations.
+- Weights come from the checkpoint fixture. Tests use checkpoint embedding/live-input fixtures and deterministic synthetic inputs/KV caches. They are actual operator/shape microbenchmarks, not a replay of all serving activations.
+- This sequence ends before inverse RoPE/output projections, the following residual/mHC stage, and MoE. Compressed-attention layers have extra compressor/indexer work and different KV lengths; no full-model speedup follows from layer0.
+
+## Numerical status — not accepted for integration
+
+- mHC:1/137 inputs exceeds the existing0.001 relative-RMS gate; worstX0.0010611. Native normalizes using FP32 mixture squares before BF16 rounding; prototype sums squares after BF16 rounding.
+- QKV:216/222 tests fail the0.001 gate; maximumQ error0.0092700 andKV0.00181375 over positions1024/1536/2047. Inputquant bytes/scales match. Native unsplit QA accumulation differs from prototype split16 accumulation; subsequent FP8 quantization amplifies differences. Applying prototype norm/quant to identical nativeQA output matches in four diagnostic cases.
+- Attention native-versus-prototype relativeRMS≈0.00213. On the tested synthetic case the prototype is closer to a BF16-rounded FP32 reference, but it still does not match native semantics at the existing gate.
+- Whole sequence error0.0022118, above0.001. Mailbox health and finite-output checks pass. Stable-buffer graph output poisoning/replay restores expected outputs; graph implementation correctness is separate from native numerical equivalence.
+- No ATOM integration or new GSM8K acceptance is claimed. Correctness parity must be resolved before using timing gains as a deployment result.
+
+## Exact native kernel names, in layer0 order
+
+- `mhc_res_unshuffle_h4096_hc4_ks64_b2`
+- `void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)`
+- `void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 9, 4, 1, 4096, 1024, 1024, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)`
+- `_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii`
+- `gemm_a8w8_mx128_t16x512x256_mw1_nw4_nb2_sk1_cm1_cn1`
+- `_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb`
+- `gemm_a8w8_mx128_t16x1024x128_mw1_nw4_nb2_sk1_cm1_cn1`
+- `qk_norm_rope_H64_D512_RD64_kvw_r4_w32_flydsl`
+- `_pa_decode_sparse_BLOCK_H_16_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128`
+- `_pa_decode_sparse_reduce_BLOCK_H_1_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128`
+
+## Evidence and reproduction
+
+- ATOM commit f19778df4054e94d64d6f6bf6dd68f5681bd5945; AITER7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe. Local ATOM differences and model config are saved in source/.
+- Container vigokhal_dsv4_tp4, image rocm/fw-bringup-mlperf:gfx1250-atom-20261015. Host dsv4-monokernel is mounted at /work. Existing ROCm, PyTorch, AITER, FlyDSL and ATOM environment is required.
+- GPU0 ran one baseline server and two full1024/1024 C1 client runs. A brief profiler window during client2 captured22 forwards, each explicitly marked tokens=1 prefill=0 decode=1. Trace confirms all10 baseline kernels. Client2 includes profiler overhead and is dispatch evidence, not a clean serving-performance claim.
+- live-decode-verification.json preserves per-forward kernel sums separately from microbenchmark times. Profiler timing is not mixed into the table.
+- Primary sources: mhc/timings.json; qkv/fixed-results.json; attention-flatbuffers/results.json; qkv-attention-flatbuffers/timings.json; prefix-gpu0-flatbuffers/timings.json. All retain both rounds and raw samples.
+- Crosscheck GPU3 full sequence:54.7057µs native vs31.2727µs including adapter. prefix-gpu3-flatbuffers/all-batch-trace.json verifies128 copies of each expected native/prototype kernel; poison-graph-validation.json verifies executed outputs.
+- attention/graphbatch.py FlatGraphBatch captures one invocation and clones topologically ordered kernel nodes into a serial flat HIP graph, preserving buffer addresses. Native paths here are serial. Non-kernel/non-empty nodes are rejected.128 repeats for main groups; mHC256; five warmups and40 alternating-order samples per round. Report round2 only.
+- Initial multi-allocation captures and intermediate childgraph measurements are preserved as diagnostics, not primary. Childgraph scheduling overhead is avoided in final flat graphs. A ROCTracer crash after QKV final timing affected only its later profiling; independent graph-node/output checks and live/standalone traces remain available.
+
+Reproduce individual primary comparisons (each runs both rounds; save old results before rerun):
+
+```sh
+docker exec -e HIP_VISIBLE_DEVICES=1 -e PYTHONPATH=/app/aiter:/app/ATOM vigokhal_dsv4_tp4 bash -c 'cd /work/atom-actual-microbench/mhc && python bench.py'
+docker exec -e HIP_VISIBLE_DEVICES=2 -e PYTHONPATH=/app/aiter:/app/ATOM vigokhal_dsv4_tp4 bash -c 'cd /work/atom-actual-microbench/qkv && python bench_fixed.py'
+docker exec -e HIP_VISIBLE_DEVICES=3 -e PYTHONPATH=/app/aiter:/app/ATOM vigokhal_dsv4_tp4 bash -c 'cd /work/atom-actual-microbench/qkv-attention-flatbuffers && python bench.py'
+docker exec -e HIP_VISIBLE_DEVICES=0 -e PYTHONPATH=/app/aiter:/app/ATOM vigokhal_dsv4_tp4 bash -c 'cd /work/atom-actual-microbench/prefix-gpu0-flatbuffers && python bench.py'
+```
+
+Run one process per assigned GPU. Keep the included mhc-optimized directory as the sibling fixture/source dependency. No server or benchmark is left running.

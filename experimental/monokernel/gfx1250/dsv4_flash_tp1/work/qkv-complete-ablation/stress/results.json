@@ -1,0 +1,28 @@
+[
+  {
+    "mode": "two",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 6.859730638097972e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "single256",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 6.859730638097972e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  }
+]

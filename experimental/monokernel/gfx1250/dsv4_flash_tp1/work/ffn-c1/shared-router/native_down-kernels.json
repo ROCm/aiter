@@ -1,0 +1,6 @@
+[
+  {
+    "name": "gemm_a8w8_mx128_t16x1024x128_mw1_nw4_nb2_sk1_cm1_cn1",
+    "us": 15.262
+  }
+]

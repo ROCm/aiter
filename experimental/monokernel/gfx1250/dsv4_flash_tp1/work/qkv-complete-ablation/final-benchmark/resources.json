@@ -1,0 +1,56 @@
+{
+  "separate": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 92,
+      "spills": 0,
+      "lds": 0,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "two": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 86,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "single256": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "complete": {
+      "vgpr": 115,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

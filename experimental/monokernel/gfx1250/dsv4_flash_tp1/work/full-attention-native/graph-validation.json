@@ -1,0 +1,17 @@
+{
+  "actual_atom_extracted_boundary": {
+    "poison_replaced": true,
+    "exact_eager": true,
+    "health": true
+  },
+  "fused_single_launch": {
+    "poison_replaced": true,
+    "exact_eager": true,
+    "health": true
+  },
+  "staged_prototype_control": {
+    "poison_replaced": true,
+    "exact_eager": true,
+    "health": true
+  }
+}

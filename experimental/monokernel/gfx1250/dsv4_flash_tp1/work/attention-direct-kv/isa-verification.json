@@ -1,0 +1,14 @@
+{
+  "False": {
+    "atomic_add_instructions": 6,
+    "tdm": true,
+    "wmma": true,
+    "l2_prefetch": true
+  },
+  "True": {
+    "atomic_add_instructions": 5,
+    "tdm": true,
+    "wmma": true,
+    "l2_prefetch": true
+  }
+}

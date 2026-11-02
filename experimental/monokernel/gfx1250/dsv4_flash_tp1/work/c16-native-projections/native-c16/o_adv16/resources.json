@@ -1,0 +1,12 @@
+{
+  "JITFunction(isolated:output)": {
+    "regs": 117,
+    "spills": 0,
+    "lds": 265376
+  },
+  "JITFunction(previous.isolated:output)": {
+    "regs": 228,
+    "spills": 0,
+    "lds": 168928
+  }
+}

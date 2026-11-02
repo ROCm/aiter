@@ -1,0 +1,55 @@
+{
+  "native_with_scatter": {
+    "kernel_count": 640,
+    "inner_node_types": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "output_equal": [
+      true,
+      true
+    ],
+    "health": 0
+  },
+  "native_without_scatter": {
+    "kernel_count": 640,
+    "inner_node_types": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "output_equal": [
+      true,
+      true
+    ],
+    "health": 0
+  },
+  "fused": {
+    "kernel_count": 128,
+    "inner_node_types": [
+      0
+    ],
+    "output_equal": [
+      true,
+      true
+    ],
+    "health": 0
+  },
+  "fused_plus_scatter": {
+    "kernel_count": 256,
+    "inner_node_types": [
+      0,
+      0
+    ],
+    "output_equal": [
+      true,
+      true
+    ],
+    "health": 0
+  }
+}

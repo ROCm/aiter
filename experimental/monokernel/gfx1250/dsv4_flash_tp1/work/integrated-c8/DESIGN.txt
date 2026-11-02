@@ -1,0 +1,48 @@
+Integrated C8 full attention+MoE layer, one resident256-CTA launch.
+
+Data flow:
+residual unshuffle -> attention mHC pre/RMSNorm -> compressor/indexer/selection
+ -> QKV -> paged attention/reduce -> inverseRoPE/output projections
+ -> fused attention mHCpost + FFN mHCpre/RMSNorm
+ -> quant/router + shared expert -> top6/routing metadata
+ -> routedMoE up/SwiGLU/down/reduce -> shared+routed add + finalmHCpost
+ -> shuffled residual + bounded valid-row currentKV scatter.
+
+QKV selected LOCAL=True PRE=True SPLITS16 BN128 SEM=False ATOMIC=False.
+192 projection CTAs quantize their own BF16 inputs via TDM and use scaled FP8 WMMA.
+B1 removed. QB bounded prefetch before B2; early QB TDM retained. B3 retained because
+QA-only readiness did not win. QA/KV finish16CTAs; QB256CTAs; Qnorm/RoPE512tasks.
+
+Attention: real paged pool; no compact copy. Split8. Row-fast mapping spreads C8
+across256CTAs. SWA128:256usefulCTAs. HCA136/144:160usefulCTAs/96inactive.
+CSA384/512/640:256usefulCTAs. TDM16KV x512 tiles,16queryheads/CTA, currentKV
+substituted locally. Skip inactive partial stores. All256 barrier then512head
+reduction tasks on256CTAs. Scratch strides8splits, allocated capacity64 retained.
+
+Attention mHC pre:256projectionCTAs =2Ntiles x128Ksplits; all8rows/tile, BF16
+high/low weight WMMA.16tailCTAs (2/token); one computes input/RMSNorm, one
+post/comb coefficients and Sinkhorn; duplicate some statistics to avoid extra sync.
+
+Attention mHCpost+FFNpre:64producerCTAs, each covers64channels per4heads/all8rows.
+Native-derived post residual update, packedBF16 hi/lo projection, unrounded FP32
+sqrsum. Plain residual and24-stride coefficients adapted. Dedicated64CTA barrier.
+8reducers (one/token), native warp-specialized apply and Sinkhorn. Pack post/comb
+into FFN Mix layout. Full256 barrier before router/shared/MoE. Does not consume
+FP32MID afterward because pre is already complete; FP32 cross-layer statistic
+inputs and final residual outputs remain in existing path.
+
+Routing: per-row top6 plus per-row metadata parallelization, same topk semantics.
+RoutedMoE:BN256 BK512 twoTDMbuffers, activeexpert tasks, coherent-load phase polling.
+HCAcompressor:4CTAs/token,32historicalrows/CTA, partialsoftmax merge, currentrow,
+norm/RoPE/cache+state. Production8-field plans and invalidBatchId masks preserved.
+INTEGRATION CHANGE: HCA's subgroup barriers timed out in combinedkernel; all256
+barriers used before/after pooling. Ratio4 keeps N/16 producer subgroup barrier;
+no parallelpool onratio4/indexer. Fullstate tests and graph replay records retained.
+
+All-grid/subgroup sync: finish memory operations, CTAbarrier, one GPU-scope atomic
+arrival/CTA, monotonic target, device-coherent load polling with bounded wait and
+healthflag. Counter allocations are disjoint for256phase,compressor subgroup,mHC64.
+
+Source generation scripts are historical, not rebuild recipes; use final sources.
+No exact full-model equivalence claim: splitsoftmax/pooling arithmetic grouping
+changes numerical rounding. Check RESULTS.json and raw stage/accuracy evidence.

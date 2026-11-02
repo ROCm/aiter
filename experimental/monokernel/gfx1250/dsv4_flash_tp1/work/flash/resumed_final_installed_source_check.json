@@ -1,0 +1,22 @@
+{
+  "dsv4_hybrid.py": {
+    "sha256": "8c22b278e6306d25485eb6927dab7fc22a7587ba55db8d027ca4b91aa83be99a",
+    "matches_saved_source": true
+  },
+  "dsv4_flash_moe.py": {
+    "sha256": "a4862a7dfb83534a325b37320a9137b0ce68a5b5659138c57ec94f96a664be4d",
+    "matches_saved_source": true
+  },
+  "dsv4_flash_moe_kernel.py": {
+    "sha256": "0288b345429fa92eb8f20ef883b4a3daf800dcb512fe24ae98967e1aa060e46a",
+    "matches_saved_source": true
+  },
+  "dsv4_flash_moe_stage.py": {
+    "sha256": "7f6fd66948f9b7cd4abe266a407cc358bc322ab937c3d3d4d77d40d928b0f17c",
+    "matches_saved_source": true
+  },
+  "dsv4_flash_final_configs.json": {
+    "sha256": "bb34452544c20e713ba7c1286b37ed735698f2f947d5adf8649a440e5c168fb0",
+    "matches_saved_source": true
+  }
+}

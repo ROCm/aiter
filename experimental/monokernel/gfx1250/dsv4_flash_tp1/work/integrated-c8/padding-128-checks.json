@@ -1,0 +1,146 @@
+[
+  {
+    "m": 2,
+    "checks": {
+      "norm": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "q": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kv": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "attention": {
+        "exact": false,
+        "rms": 0.0008597116684541106,
+        "max_abs": 0.0009765625
+      },
+      "output": {
+        "exact": false,
+        "rms": 0.011800335720181465,
+        "max_abs": 0.0005035400390625
+      },
+      "mhc_post": {
+        "exact": false,
+        "rms": 0.0009356346563436091,
+        "max_abs": 0.0078125
+      },
+      "compressor_state": false,
+      "final": {
+        "exact": false,
+        "rms": 0.001481281709857285
+      },
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 432,
+    "lds": 157156,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "checks": {
+      "norm": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "q": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kv": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "attention": {
+        "exact": false,
+        "rms": 0.00046792998909950256,
+        "max_abs": 0.00390625
+      },
+      "output": {
+        "exact": false,
+        "rms": 0.007286963984370232,
+        "max_abs": 0.001007080078125
+      },
+      "mhc_post": {
+        "exact": false,
+        "rms": 0.0012022600276395679,
+        "max_abs": 0.0078125
+      },
+      "compressor_state": false,
+      "final": {
+        "exact": false,
+        "rms": 0.0013090558350086212
+      },
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 432,
+    "lds": 157156,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "checks": {
+      "norm": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "q": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kv": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "attention": {
+        "exact": false,
+        "rms": 0.0005911162006668746,
+        "max_abs": 0.001953125
+      },
+      "output": {
+        "exact": false,
+        "rms": 0.009709802456200123,
+        "max_abs": 0.0009765625
+      },
+      "mhc_post": {
+        "exact": false,
+        "rms": 0.0010481079807505012,
+        "max_abs": 0.0078125
+      },
+      "compressor_state": true,
+      "final": {
+        "exact": false,
+        "rms": 0.024097077548503876
+      },
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 432,
+    "lds": 157156,
+    "spills": 0
+  }
+]

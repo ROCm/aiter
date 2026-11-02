@@ -1,0 +1,14 @@
+{
+  "gpu": "AMD Radeon Graphics",
+  "arch": "gfx1250",
+  "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+  "source_sha256": {
+    "bench-acqrel.py": "0cfa80363f048fc529e8eeefab6a5178bbadb66688c0af589c0f94f887f728f2",
+    "kernels-acqrel.py": "282810433d6f5a40410bd89b08b5ff5cecdb50f9930012fdc770b0c0ac5d92a5",
+    "kernels.py": "629bc8e8219ec0c648975457bb8be8b4c05301676f004b8ae83d405a736b1a9a",
+    "device_scope_helpers.py": "25ece4f0f6e7606587f22b174cdb9cdd60e8e89f1bac6fcb4594a107b3e61805",
+    "bench.py": "e1f6cf8bae88f0337dfeb9c1924659c10880573216286a1ef2386af7231400b9"
+  },
+  "fixture_sha256": "cbdf50c40882da23449d5d595c3df8376163b87c677c5b0db51850d49c391b55",
+  "note": "After timing, input fixture copied unchanged into this standalone directory and harness load path updated; kernels unchanged."
+}

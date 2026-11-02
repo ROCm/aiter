@@ -1,0 +1,18 @@
+[
+  "model_layer_batch.py",
+  "runtime_batch.py",
+  "scratch_batch.py",
+  "qkv_candidate.py",
+  "qa_candidate.py",
+  "attention_paged.py",
+  "aiter_paged.py",
+  "mhc_integrated.py",
+  "mhc_native_inline.py",
+  "ffn_batch.py",
+  "optimized_routing.py",
+  "optimized_moe.py",
+  "optimized_moe_stage.py",
+  "optimized_compressor.py",
+  "install.py",
+  "run.sh"
+]

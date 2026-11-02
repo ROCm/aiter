@@ -1,0 +1,24 @@
+{
+  "file": "scratch-benchmark/l2_nonspec_tdm-qa.amdgcn",
+  "device_prefetch_lines": [
+    77,
+    90,
+    95,
+    104,
+    859,
+    864,
+    869,
+    874
+  ],
+  "tdm_issue_lines": [
+    111,
+    879
+  ],
+  "tdm_completion_wait_lines": [
+    2323
+  ],
+  "poll_load_lines": [
+    2139,
+    2178
+  ]
+}

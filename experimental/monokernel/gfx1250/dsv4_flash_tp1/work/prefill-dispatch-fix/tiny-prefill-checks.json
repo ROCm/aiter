@@ -1,0 +1,252 @@
+[
+  {
+    "input_tokens": 1,
+    "native": {
+      "id": "cmpl-c2cc4f28c60548b4b51993003444b5d3",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\uff0c\u4f46\u200c\u662f\u200c\uff0c",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 8,
+        "total_tokens": 9,
+        "ttft_s": 5.8006,
+        "tpot_s": 0.0136,
+        "latency_s": 5.8957
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-4b0ed52d1a6743b6a5415c0a438dddc0",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\uff0c\u4f46\u200c\u662f\u200c\uff0c",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 8,
+        "total_tokens": 9,
+        "ttft_s": 5.9204,
+        "tpot_s": 0.0108,
+        "latency_s": 5.9958
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "text_equal": true
+  },
+  {
+    "input_tokens": 2,
+    "native": {
+      "id": "cmpl-e8204e14bcb94168b79a04c5bc42f1af",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ua8c3\ua8c4\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 8,
+        "total_tokens": 10,
+        "ttft_s": 0.1591,
+        "tpot_s": 0.0136,
+        "latency_s": 0.2544
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-39aaa9d8dba247c4a515ddc1579c9386",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ua4b3\u80e3\ue2a8",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 8,
+        "total_tokens": 10,
+        "ttft_s": 0.18,
+        "tpot_s": 0.0108,
+        "latency_s": 0.2555
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "text_equal": false
+  },
+  {
+    "input_tokens": 4,
+    "native": {
+      "id": "cmpl-b339a490ba4044bda15321e23dd57434",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ua924\ua924\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 8,
+        "total_tokens": 12,
+        "ttft_s": 0.1552,
+        "tpot_s": 0.0136,
+        "latency_s": 0.2506
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-0a445fb8b5d64226b884790efb893218",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ua924\ua924\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 8,
+        "total_tokens": 12,
+        "ttft_s": 0.1779,
+        "tpot_s": 0.0107,
+        "latency_s": 0.2531
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "text_equal": true
+  },
+  {
+    "input_tokens": 8,
+    "native": {
+      "id": "cmpl-c155ad87fbaf423381202763358ebedd",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n> \uff5cDSML\uff5c 2023-",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 8,
+        "completion_tokens": 8,
+        "total_tokens": 16,
+        "ttft_s": 0.1591,
+        "tpot_s": 0.0136,
+        "latency_s": 0.2546
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-4edbb68673b14f928e7e6b736b8be065",
+      "object": "text_completion",
+      "created": 1792612546,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n> \uff5cDSML\uff5c 2023-",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 8,
+        "completion_tokens": 8,
+        "total_tokens": 16,
+        "ttft_s": 0.1737,
+        "tpot_s": 0.0107,
+        "latency_s": 0.2489
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "text_equal": true
+  },
+  {
+    "input_tokens": 1024,
+    "native": {
+      "id": "cmpl-0f4152ac9fad455b82495b212c1672f4",
+      "object": "text_completion",
+      "created": 1792612547,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 8,
+        "total_tokens": 1032,
+        "ttft_s": 0.1505,
+        "tpot_s": 0.0137,
+        "latency_s": 0.2467
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-f74d9bd5cc274e58b9095460a12061e6",
+      "object": "text_completion",
+      "created": 1792612547,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 8,
+        "total_tokens": 1032,
+        "ttft_s": 0.1512,
+        "tpot_s": 0.0108,
+        "latency_s": 0.227
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "text_equal": true
+  }
+]

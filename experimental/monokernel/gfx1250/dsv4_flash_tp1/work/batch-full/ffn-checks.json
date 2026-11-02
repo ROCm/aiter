@@ -1,0 +1,42 @@
+[
+  {
+    "m": 1,
+    "equal": true,
+    "fp32": true,
+    "finite": true,
+    "health": 0,
+    "vgpr": 199,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "m": 2,
+    "equal": true,
+    "fp32": true,
+    "finite": true,
+    "health": 0,
+    "vgpr": 199,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "equal": true,
+    "fp32": true,
+    "finite": true,
+    "health": 0,
+    "vgpr": 199,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "equal": true,
+    "fp32": true,
+    "finite": true,
+    "health": 0,
+    "vgpr": 199,
+    "lds": 133088,
+    "spills": 0
+  }
+]

@@ -1,0 +1,146 @@
+[
+  {
+    "mode": "separate",
+    "metrics": {
+      "y": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "qp": {
+        "relative_rms": 9.169804798148107e-06,
+        "max_abs": 6.103515625e-05,
+        "finite": true
+      },
+      "q": {
+        "relative_rms": 2.6985380827682093e-06,
+        "max_abs": 0.00048828125,
+        "finite": true
+      },
+      "kv": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      }
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "resources": {
+      "vgpr": 92,
+      "spills": 0,
+      "lds": 0
+    }
+  },
+  {
+    "mode": "qa_fused",
+    "metrics": {
+      "y": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "qp": {
+        "relative_rms": 9.169804798148107e-06,
+        "max_abs": 6.103515625e-05,
+        "finite": true
+      },
+      "q": {
+        "relative_rms": 2.6985380827682093e-06,
+        "max_abs": 0.00048828125,
+        "finite": true
+      },
+      "kv": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      }
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "resources": {
+      "vgpr": 92,
+      "spills": 0,
+      "lds": 0
+    }
+  },
+  {
+    "mode": "two",
+    "metrics": {
+      "y": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "qp": {
+        "relative_rms": 9.169804798148107e-06,
+        "max_abs": 6.103515625e-05,
+        "finite": true
+      },
+      "q": {
+        "relative_rms": 2.6985380827682093e-06,
+        "max_abs": 0.00048828125,
+        "finite": true
+      },
+      "kv": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      }
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "resources": {
+      "vgpr": 92,
+      "spills": 0,
+      "lds": 2048
+    }
+  },
+  {
+    "mode": "single",
+    "metrics": {
+      "y": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "qp": {
+        "relative_rms": 9.169804798148107e-06,
+        "max_abs": 6.103515625e-05,
+        "finite": true
+      },
+      "q": {
+        "relative_rms": 2.6985380827682093e-06,
+        "max_abs": 0.00048828125,
+        "finite": true
+      },
+      "kv": {
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "finite": true
+      }
+    },
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    },
+    "resources": {
+      "vgpr": 115,
+      "spills": 0,
+      "lds": 8192
+    }
+  }
+]

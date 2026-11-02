@@ -1,0 +1,15 @@
+{
+  "native_error": 0.011706002056598663,
+  "staged_error": 0.0,
+  "staged_equal": true,
+  "health": {
+    "attention": true,
+    "ffn": 0,
+    "moe": 0
+  },
+  "resources": {
+    "vgpr": 492,
+    "lds": 133088,
+    "spills": 0
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "allow_flush_denorm": false,
+  "allowed_dot_input_precisions": [
+    "ieee",
+    "bf16x3",
+    "bf16x6"
+  ],
+  "arch": "gfx1250",
+  "backend_name": "hip",
+  "debug": false,
+  "default_dot_input_precision": "ieee",
+  "deprecated_fp8_dot_operand_dtypes": [],
+  "enable_fp_fusion": false,
+  "extern_libs": [
+    [
+      "ocml",
+      "/app/triton-mi450/python/triton/backends/amd/lib/ocml.bc"
+    ],
+    [
+      "ockl",
+      "/app/triton-mi450/python/triton/backends/amd/lib/ockl.bc"
+    ]
+  ],
+  "fpsan_homomorphic_casts": false,
+  "global_scratch_align": 1,
+  "global_scratch_size": 0,
+  "hash": "f13fbbfb581852bb9f120cc514ddf87b88c0dae4239d27e4ba5f391732d1652b",
+  "instrumentation_mode": "",
+  "kpack": 1,
+  "launch_cooperative_grid": false,
+  "launch_pdl": false,
+  "llvm_fn_attrs": [],
+  "matrix_instr_nonkdim": 0,
+  "max_num_imprecise_acc_default": 0,
+  "name": "qkv_batch",
+  "num_ctas": 1,
+  "num_stages": 2,
+  "num_warps": 4,
+  "profile_scratch_align": 1,
+  "profile_scratch_size": 0,
+  "sanitize_overflow": true,
+  "schedule_hint": "",
+  "shared": 258048,
+  "supported_fp8_dtypes": [
+    "fp8e4b8",
+    "fp8e4nv",
+    "fp8e5",
+    "fp8e5b16"
+  ],
+  "target": "GPUTarget(backend='hip', arch='gfx1250', warp_size=32)",
+  "tensordesc_meta": [],
+  "triton_version": "3.8.0",
+  "warp_size": 32,
+  "waves_per_eu": 0
+}

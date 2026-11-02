@@ -1,0 +1,8 @@
+{
+  "equal_plain_post": true,
+  "output_layout": "plain [1,4,4096]",
+  "kernels": [
+    "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+    "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)"
+  ]
+}

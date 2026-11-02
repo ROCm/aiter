@@ -1,0 +1,63 @@
+Flash C1 full-layer isolated prototype — completed single-launch experiment
+
+This is one complete uncompressed Flash layer (layer0), including mHC, QKV and
+output projections, Q/K norms+RoPE, sliding-window cache write, attention with
+sink, inverse RoPE/grouped LoRA, hash routing, shared expert, six routed FP4
+experts, and final mHC residual. Profiler proves ONE kernel named full_layer.
+
+It is NOT whole-model serving. The current prototype does not cover ratio4/
+ratio128 compression and indexer layers, learned routing, ATOM paged-cache
+metadata, or Pro TP4. It uses real checkpoint weights/embedding with controlled
+synthetic historical cache and rotary-angle inputs. No TPOT/TTFT/tok/s or GSM8K.
+
+Second isolated timing round ONLY (first preserved/discarded):
+Variant | same-math 33-launch control us | full-layer one-launch us | overhead
+Acquire/release | 345.645 | 442.635 | 28.06%
+Device-scope buffers/semaphore | 353.805 | 382.555 | 8.13%
+Device-scope full layer is 13.57% faster than acquire/release full layer.
+These are microbenchmarks, NOT full clients or native ATOM baseline comparisons.
+The two controls have different memory instructions; do not silently substitute
+one control for the other's baseline.
+
+Validated: all recorded intermediates exactly match the same-arithmetic split
+control, 1000 changing-payload full-layer graph replays, signed/unsigned counter
+wrap, 1000 standalone sync replays, missing-producer diagnostic return. Explicit
+buffer ISA: 693 payload instructions all device scoped; zero global_wb/global_inv.
+Registers:207 VGPRs;0 VGPR spills,130 SGPR spills into VGPR lanes;
+private scratch0 bytes. Compiler reports shared allocation2048 bytes.
+The earlier blanket no-spills statement was incomplete; see resources-audited.json.
+Independent torch reference output RMS relative error 0.000362393
+(0.03624%), max abs 0.00390625.
+This is approximate reference agreement, not exact native ATOM equivalence.
+
+Why the initial approaches did not win:
+- Earlier C1 mHC+QKV:12.54us fused vs10.71us separate. Resident-grid handoff,
+  synchronization and decomposition costs can exceed one saved launch.
+- Earlier routed-MoE serving ablation:5.825129ms vs5.731084ms library MoE.
+  Isolated MoE improved in some tests but serving did not; stream overlap and
+  critical-path changes remain hypotheses, not a measured causal decomposition.
+- This full-layer prototype: broad synchronization generated32 global writebacks
+  and96 global invalidations. Replacing that protocol improved latency but still
+  loses to its own split control. Current vector matvecs are not tuned WMMA;
+  a slow correctness-first implementation does not disprove full-layer fusion.
+
+All code, failures, generated ISA, exact comparison JSON, reference checks, and
+single-launch profiler traces are saved here. See REPRODUCE.txt and DESIGN.txt.
+The pushed ATOM branch and published images are unchanged.
+
+Additional tested variants, second isolated timing round only:
+- On-demand pointer table:full2551.136us vs split353.678us. Eliminated scalar
+  spills (SGPR88,VGPR261,SGPR/VGPR spills0,scratch0), but greatly increased
+  latency. Runtime occupancy query reports3 resident blocks/CU. Rejected.
+- Local mHC/norm/quant + activation/quant + final reduction/post fusion:
+  full409.592us vs split354.216us. Removed global stage boundaries, but increased
+  scalar spills to156 and VGPRs to222; more serial local work. Exact control and
+  reference checks passed; slower, rejected. The cause is not fully isolated.
+- Generic .cg variant:full360.134us vs split335.597us passed tests, but generic
+  .cg compiled to non-temporal traffic hints, NOT explicit device scope for
+  payloads. Do not use as proof of the coherent-L2 semaphore protocol.
+
+Best qualified implementation:buffer-scoped/kernel.py. The full-layer shader
+still uses vector matvec arithmetic and global stage barriers. Extend with
+known-good WMMA stages and live ATOM tensor replay before pursuing full serving.
+All experiments finished; no server or GPU job remains running.

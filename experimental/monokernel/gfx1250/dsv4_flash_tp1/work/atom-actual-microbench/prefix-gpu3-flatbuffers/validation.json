@@ -1,0 +1,7 @@
+{
+  "attention_output_rel_rms": 0.0022118038032203913,
+  "health": true,
+  "threshold": 0.001,
+  "note": "Core uses plain residual; adapter row starts with actual ATOM shuffled residual. Native cached indices capacity16384, true128. Different native arithmetic may fail gate; timing is not correctness acceptance.",
+  "health_after_timing": true
+}

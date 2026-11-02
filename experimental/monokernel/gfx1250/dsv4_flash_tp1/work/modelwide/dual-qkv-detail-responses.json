@@ -1,0 +1,71 @@
+[
+  {
+    "id": "cmpl-2dd6d30a921247b58711ba7f0dc94033",
+    "object": "text_completion",
+    "created": 1792545304,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Paris. * Je * French *",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 8,
+      "total_tokens": 13,
+      "ttft_s": 1.5139,
+      "tpot_s": 0.1663,
+      "latency_s": 2.6782
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  },
+  {
+    "id": "cmpl-456d82a3d7174ede9e8afa16462fc6d0",
+    "object": "text_completion",
+    "created": 1792545306,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": "HHHHHHHH",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1024,
+      "completion_tokens": 8,
+      "total_tokens": 1032,
+      "ttft_s": 0.4244,
+      "tpot_s": 0.1638,
+      "latency_s": 1.5713
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  },
+  {
+    "id": "cmpl-5d261ec23ebc471190dc09bff9918219",
+    "object": "text_completion",
+    "created": 1792545306,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": "HHHH",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1151,
+      "completion_tokens": 4,
+      "total_tokens": 1155,
+      "ttft_s": 0.3291,
+      "tpot_s": 0.1649,
+      "latency_s": 0.824
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  }
+]

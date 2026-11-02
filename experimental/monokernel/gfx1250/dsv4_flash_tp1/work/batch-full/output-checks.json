@@ -1,0 +1,70 @@
+[
+  {
+    "m": 1,
+    "checks": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5": true,
+      "6": true,
+      "7": true
+    },
+    "health": 0,
+    "vgpr": 124,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 2,
+    "checks": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5": true,
+      "6": true,
+      "7": true
+    },
+    "health": 0,
+    "vgpr": 124,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "checks": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5": true,
+      "6": true,
+      "7": true
+    },
+    "health": 0,
+    "vgpr": 124,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "checks": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5": true,
+      "6": true,
+      "7": true
+    },
+    "health": 0,
+    "vgpr": 124,
+    "lds": 41440,
+    "spills": 0
+  }
+]

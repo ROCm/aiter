@@ -1,0 +1,2345 @@
+{
+  "seed": 9781,
+  "inputs": 64,
+  "kind": "o",
+  "stage": 4,
+  "maxima": {
+    "xq": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "xs": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "oa": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "aq": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "ob": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "as": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    }
+  },
+  "data": [
+    {
+      "input": 0,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 1,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 2,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 3,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 4,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 5,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 6,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 7,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 8,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 9,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 10,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 11,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 12,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 13,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 14,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 15,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 16,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 17,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 18,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 19,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 20,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 21,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 22,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 23,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 24,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 25,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 26,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 27,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 28,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 29,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 30,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 31,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 32,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 33,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 34,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 35,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 36,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 37,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 38,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 39,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 40,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 41,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 42,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 43,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 44,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 45,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 46,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 47,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 48,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 49,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 50,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 51,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 52,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 53,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 54,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 55,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 56,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 57,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 58,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 59,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 60,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 61,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 62,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    },
+    {
+      "input": 63,
+      "validation": {
+        "xq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "xs": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "oa": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "aq": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "ob": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "as": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    }
+  ],
+  "health": 0
+}

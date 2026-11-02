@@ -1,0 +1,122 @@
+C8 full-layer monokernel: attention regions
+=========================================
+All regions reuse the same 256 resident CTAs; rows below do not represent
+separate launches. Native mHC warp specialization adds worker warps, while
+main computation uses four-warp layouts. CTA counts describe the stated
+uniform C8 shapes; ragged attention has per-row split activity.
+
+Attention mHC pre + RMSNorm
+--------------------------
+Residual [8 tokens, 4 streams, 4096 channels]
+    |
+    | First 16 CTAs issue early TDM residual + norm-weight loads
+    v
+256 projection CTAs = 2 output tiles x 128 K splits
+  Each: all 8 tokens, 16 output columns, K=128
+  BF16 WMMA using high/low parts of FP32 weights
+  Store partials for 24 mixing coefficients per token
+    |
+==== All-256 atomic-arrival / coherent-load-poll barrier ====
+    |
+16 finishing CTAs = 2 per token
+    +--------------------------+----------------------------+
+    | 8 CTAs: pre mix          | 8 CTAs: post/comb mix      |
+    | Reduce partials          | Reduce partials            |
+    | Mix 4 residual streams   | Post coefficients          |
+    | RMSNorm, native rounding | 4x4 Sinkhorn normalization |
+    | Write attention input    | Save post/comb for later   |
+    +--------------------------+----------------------------+
+    | Some statistics duplicated to avoid another barrier
+==== All-256 barrier ====
+    |
+Compressor/indexer -> QKV
+
+Attention mHC post + FFN mHC pre/RMSNorm
+--------------------------------------
+Attention output + residual + saved post/comb coefficients
+    |
+64 producer CTAs
+  Each: all 8 tokens, all 4 streams, 64 channels/stream
+  TDM-load output/residual/packed next-pre weights
+  R'[dst] = post[dst]*attention + sum_src comb[src,dst]*R[src]
+    +--------------------------+----------------------------+
+    | Store BF16 updated R'    | Next-pre WMMA on R'        |
+    | Plain residual layout    | FP32 projection partials   |
+    |                          | Unrounded FP32 sum squares |
+    +--------------------------+----------------------------+
+    |
+==== Dedicated 64-producer arrival/load-poll barrier ====
+    |
+8 reducer CTAs, one per token; warp-specialized work
+    +--------------------------+----------------------------+
+    | Main warp group          | Worker warp                |
+    | Fold partials/statistics | Post coefficients          |
+    | Pre mix + FFN RMSNorm    | Sinkhorn comb matrix       |
+    | Write FFN input          | Write next post/comb       |
+    +--------------------------+----------------------------+
+    | CTA-local synchronization joins worker
+    | Pack coefficients into FFN Mix[M,24]
+==== All-256 barrier ====
+    |
+Router / shared expert / routed MoE
+
+Final FFN mHC post, after shared+routed add:
+  256 CTAs = 8 tokens x 32 channel tiles; 128 channels per CTA.
+  Mix FFN output into four residual streams -> next residual.
+  No cross-CTA reduction inside this post operation.
+
+HCA attention + split reduction (group 6b)
+-----------------------------------------
+Q [8,64,512] + real paged KV indices: 136/144 entries per token
+    |
+256 task slots = 8 tokens x 4 head groups x 8 split slots
+  16 query heads per group; TDM tile = 16 KV entries x 512
+    |
+  Split 0:   0..31     Split 1: 32..63    Split 2: 64..95
+  Split 3:  96..127    Split 4: 128..end (8 or 16 entries)
+  Splits 5..7: inactive, no partial stores
+    |
+160 working CTAs = 8 tokens x 4 groups x 5 active splits
+  Bounded prefetch -> TDM gather -> QK -> softmax -> weighted V
+  Substitute current KV locally at its destination
+  Store partial max, sum, and weighted-V accumulator
+    |
+==== All-256 barrier, including inactive CTAs ====
+    |
+256 reducer CTAs: 512 token/head tasks, 2 tasks per CTA
+  Mask inactive splits; merge statistics/weighted V + sink
+  Write attention output [8,64,512]
+    |
+==== All-256 barrier before output projection ====
+
+CSA attention + split reduction (group 6c)
+-----------------------------------------
+Q [8,64,512] + selected paged CSA KV entries
+    |
+256 working CTAs = 8 tokens x 4 head groups x 8 splits
+
+  KV entries/token | Entries/split | TDM tiles/split
+         384       |      48       |       3
+         512       |      64       |       4
+         640       |      80       |       5
+
+  Each CTA: 1 token, 16 query heads, 1 KV split
+  Bounded prefetch -> TDM tiles -> QK / online softmax / weighted V
+  Store partial max, sum, and weighted-V accumulator
+    |
+==== All-256 barrier ====
+    |
+256 reducer CTAs: 512 token/head tasks, 2 tasks per CTA
+  Merge 8 split results + attention sink -> [8,64,512]
+    |
+==== All-256 barrier before output projection ====
+
+Both attention paths access paged KV directly: no compact-cache copy.
+Current-KV substitution avoids waiting for its cache store, but Q/current-KV
+production must still finish before attention. HCA/CSA compression occurs
+before these attention regions.
+
+Synchronization uses one atomic arrival per CTA, a monotonic epoch target,
+and device-coherent load polling. Polls do not use atomic-add-zero. The mHC
+64-producer counter is separate from the all-256 phase counter. Waits are
+bounded and set a health flag on failure.

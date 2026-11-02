@@ -1,0 +1,46 @@
+"""Opt-in multirow full-layer serving adapter. Experimental; C1 adapter unchanged."""
+import os,sys,logging
+sys.path[:0]=['/work/batch-full','/work/modelwide','/work/concurrency-rollout','/work/full-attention-native','/work/full-attention-native/prefix','/work/full-attention-native/output-kernel','/work/ffn-c1/moe']
+import runtime as base
+import torch
+from scratch_batch import BatchState
+from model_layer_batch import model_layer
+from binding import LayerWeights,compressor_args
+base._MAX_BATCH=8
+_shared={}
+log=logging.getLogger(__name__)
+class ServingLayer(base.ServingLayer):
+ def execute(self,residual,positions,md):
+  m=residual.shape[0]
+  if not 1 <= m <= 8:raise RuntimeError(f'Unsupported full monokernel batch {m}')
+  if self.weights is None:
+   self.weights=LayerWeights(self.block)
+   w=self.weights
+   w.out=torch.empty((8,4,4096),device='cuda',dtype=torch.bfloat16)
+   w.my=torch.empty((8,2048 if w.ratio==4 else 1024),device='cuda',dtype=torch.bfloat16)
+   w.iy=torch.empty((8,512),device='cuda',dtype=torch.bfloat16)
+   w.top=torch.empty((8,512),device='cuda',dtype=torch.int32)
+  b=self.block;w=self.weights;r=w.ratio;a=b.attn;t={0:128,4:640,128:144}[r]
+  if (m,t) not in _shared:_shared[m,t]=BatchState(m,t)
+  s=_shared[m,t];A=list(s.a);F=list(s.f);A[0]=residual
+  for i,v in w.a.items():A[i]=v
+  for i,v in w.f.items():F[i]=v
+  cos,sin=a.rotary_emb.cos_sin_2d()
+  if r:MC,MM=compressor_args(a.compressor,md,r);MW=w.compressor_weights['main']
+  else:MC=();MM=();MW=self.dummy
+  if r==4:IC,IM=compressor_args(a.indexer.compressor,md,4);IW=w.compressor_weights['indexer']
+  else:IC=();IM=();IW=self.dummy
+  name={0:'swa',4:'csa',128:'hca'}[r];ptr=getattr(md,'kv_indptr_'+name);idx=getattr(md,'kv_indices_'+name)
+  extra=s.extra()[:-1]+(w.out,)
+  kwargs=dict(MM=MM,IM=IM,RATIO=r,ENVELOPE=md.envelope_rows,**w.meta,**self.extra,HAS_BIAS=w.bias is not None,M=m,BLOCK_STRIDE=md.block_tables.stride(0),T=t,BatchIds=md.batch_id_per_q_token,num_warps=4,enable_fp_fusion=False)
+  args=(tuple(A),tuple(F),MC,IC,MW,IW,w.my,w.iy,positions,cos,sin,a.unified_kv,idx,ptr,md.swa_dest_rows[r],w.top,md.block_tables,w.bias if w.bias is not None else self.dummy,*extra)
+  obj=model_layer[(256,)](*args,**kwargs)
+  self.calls+=1
+  if (r,m) not in getattr(self,'reported',set()):
+   if not hasattr(self,'reported'):self.reported=set()
+   self.reported.add((r,m))
+   log.warning('MULTIROW FULL MONOKERNEL layer=%d batch=%d ratio=%d VGPR=%d LDS=%d spills=%d',b.layer_id,m,r,obj.n_regs,obj.metadata.shared,obj.n_spills)
+  if os.getenv('ATOM_DSV4_BATCH_FULL_CHECK')=='1':
+   torch.cuda.synchronize()
+   if int(s.a[30]) or int(s.f[-1]):raise RuntimeError('Full monokernel barrier health failed')
+  return w.out[:m]

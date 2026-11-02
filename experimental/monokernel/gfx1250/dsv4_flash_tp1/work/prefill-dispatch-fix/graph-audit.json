@@ -1,0 +1,20 @@
+{
+  "native": {
+    "cache_dir": "/root/.cache/atom/torch_compile_cache/530db60e73/rank_0/backbone",
+    "sha256": "81c8e27ebacb2f4a5616cab05edff50874e98f4923f2d8138713d35014d775dd",
+    "custom_op_calls": 0,
+    "clone_lines": 0
+  },
+  "fixed": {
+    "cache_dir": "/root/.cache/atom/torch_compile_cache/530db60e73/rank_0/backbone",
+    "sha256": "81c8e27ebacb2f4a5616cab05edff50874e98f4923f2d8138713d35014d775dd",
+    "custom_op_calls": 0,
+    "clone_lines": 0
+  },
+  "wrapped": {
+    "cache_dir": "/root/.cache/atom/torch_compile_cache/c81069c363/rank_0/backbone",
+    "sha256": "d977725c267bd9ed50caae02510cf00d6bcb8da60dc261ab5def6adebc48487a",
+    "custom_op_calls": 43,
+    "clone_lines": 0
+  }
+}

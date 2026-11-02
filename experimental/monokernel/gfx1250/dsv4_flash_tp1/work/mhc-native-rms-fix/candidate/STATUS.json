@@ -1,0 +1,18 @@
+{
+  "complete": true,
+  "scope": "Flash C1 mHC optimization and full prefix",
+  "gpus_used": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "splits": 4,
+  "selected_modes": {
+    "128": "opt_both",
+    "1024": "opt"
+  },
+  "serving_integrated": false,
+  "reported_round": 2,
+  "stress_checks": 20480
+}

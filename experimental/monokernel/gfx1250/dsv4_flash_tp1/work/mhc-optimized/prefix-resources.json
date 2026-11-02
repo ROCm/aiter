@@ -1,0 +1,42 @@
+{
+  "t128_fused": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_opt": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_opt_l2": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_opt_both": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_fused": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_opt": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_opt_l2": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_opt_both": {
+    "vgpr": 419,
+    "lds": 131584,
+    "spills": 0
+  }
+}

@@ -1,0 +1,37 @@
+[
+  {
+    "m": 8,
+    "ratio": 128,
+    "checks": {
+      "final": {
+        "exact": false,
+        "max_abs": 0.03125,
+        "relative_rms": 3.408389966352843e-05
+      },
+      "norm": {
+        "exact": false,
+        "max_abs": 6.103515625e-05,
+        "relative_rms": 3.3719666703291296e-07
+      },
+      "q": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      }
+    },
+    "resources": [
+      {
+        "new": false,
+        "vgpr": 432,
+        "spills": 0,
+        "lds": 157156
+      },
+      {
+        "new": true,
+        "vgpr": 424,
+        "spills": 0,
+        "lds": 157156
+      }
+    ]
+  }
+]

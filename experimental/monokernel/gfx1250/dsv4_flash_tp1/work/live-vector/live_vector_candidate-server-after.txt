@@ -1,0 +1,13 @@
+    PID                  STARTED COMMAND
+      1 Mon Oct 19 23:03:59 2026 /bin/sleep infinity
+      7 Mon Oct 19 23:04:09 2026 bash /work/live-vector/candidate.sh
+     13 Mon Oct 19 23:04:09 2026 bash /work/flash/serve.sh
+     14 Mon Oct 19 23:04:09 2026 python -m atom.entrypoints.openai_server -tp 1 --model /data/DeepSeek-V4-Flash --kv_cache_dtype bf16 --index-cache-dtype fp8 --no-enable_prefix_caching --disable_uvicorn_access_log --max-num-seqs 128 --cudagraph-capture-sizes [1,2,4,8,16,32,64,128]
+     15 Mon Oct 19 23:04:09 2026 tee server.log
+    174 Mon Oct 19 23:04:11 2026 bash -c for i in {1..240}; do if curl -sf localhost:8000/health >/dev/null; then bash /work/live-vector/paired-clients.sh live_vector_candidate; exit; fi; sleep 2; done
+    521 Mon Oct 19 23:04:13 2026 /usr/local/bin/python -c from multiprocessing.resource_tracker import main;main(23)
+    522 Mon Oct 19 23:04:13 2026 ATOM::EngineCore
+    775 Mon Oct 19 23:04:17 2026 ATOM::TP0
+   3279 Mon Oct 19 23:04:44 2026 /usr/local/bin/python /usr/local/lib/python3.12/dist-packages/torch/_inductor/compile_worker/__main__.py --pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler --kind=fork --workers=32 --parent=775 --read-fd=77 --write-fd=80 --torch-key=/EjYNqcnsePin0l+TKcDe73/G+YrNCdsUYTooBxyFQY=
+   3523 Mon Oct 19 23:04:51 2026 bash /work/live-vector/paired-clients.sh live_vector_candidate
+   4496 Mon Oct 19 23:07:17 2026 ps -eo pid,lstart,args

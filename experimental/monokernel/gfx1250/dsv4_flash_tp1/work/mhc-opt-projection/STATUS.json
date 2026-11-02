@@ -1,0 +1,13 @@
+{
+  "complete": true,
+  "scope": "Flash C1 mHC through attention reduction",
+  "splits": 4,
+  "native_serving": false,
+  "validation_cases": 64,
+  "stress": {
+    "checked_invocations": 9216,
+    "max_error": 0,
+    "passed": true
+  },
+  "reported_round": 2
+}

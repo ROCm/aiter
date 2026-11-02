@@ -1,0 +1,29 @@
+[
+  {
+    "name": "actual_atom",
+    "kernel_count": 24,
+    "expected": 24,
+    "names": {
+      "mhc_res_unshuffle_h4096_hc4_ks64_b2": 8,
+      "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)": 8,
+      "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 9, 4, 1, 4096, 1024, 1024, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)": 8
+    }
+  },
+  {
+    "name": "optimized_fused",
+    "kernel_count": 8,
+    "expected": 8,
+    "names": {
+      "candidate": 8
+    }
+  },
+  {
+    "name": "optimized_with_unshuffle",
+    "kernel_count": 16,
+    "expected": 16,
+    "names": {
+      "mhc_res_unshuffle_h4096_hc4_ks64_b2": 8,
+      "candidate": 8
+    }
+  }
+]

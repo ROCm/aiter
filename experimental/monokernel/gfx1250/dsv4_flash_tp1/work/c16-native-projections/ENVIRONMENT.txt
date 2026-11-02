@@ -1,0 +1,8 @@
+Container: vigokhal_dsv4_tp4
+Image base: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Image ID: sha256:d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a
+Host mount: /home/vigokhal/dsv4-monokernel -> /work
+ATOM: /app/ATOM
+AITER: /app/aiter
+Model: /data/DeepSeek-V4-Flash
+GPU experiments: TP1, one worker per GPU across four gfx1250 GPUs

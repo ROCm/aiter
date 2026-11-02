@@ -1,0 +1,92 @@
+[
+  {
+    "round": 1,
+    "results": {
+      "bk128_bn16_g256": {
+        "us": 11.493753641843796,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 162,
+          "spills": 0,
+          "lds": 13008
+        },
+        "health": 0
+      },
+      "bk128_bn32_g256": {
+        "us": 11.688890401273966,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 162,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk256_bn16_g256": {
+        "us": 11.739437468349934,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 205,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn32_g256": {
+        "us": 12.01109355315566,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 222,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      }
+    }
+  },
+  {
+    "round": 2,
+    "results": {
+      "bk128_bn16_g256": {
+        "us": 11.475136503577232,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 162,
+          "spills": 0,
+          "lds": 13008
+        },
+        "health": 0
+      },
+      "bk128_bn32_g256": {
+        "us": 11.687015648931265,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 162,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk256_bn16_g256": {
+        "us": 11.74585148692131,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 205,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn32_g256": {
+        "us": 12.073214631527662,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 222,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      }
+    }
+  }
+]

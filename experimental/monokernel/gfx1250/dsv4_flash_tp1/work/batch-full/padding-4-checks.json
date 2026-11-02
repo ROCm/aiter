@@ -1,0 +1,68 @@
+[
+  {
+    "m": 2,
+    "checks": {
+      "norm": true,
+      "q": true,
+      "kv": true,
+      "attention": true,
+      "output": true,
+      "mhc_post": true,
+      "compressor_state": true,
+      "indexer_state": true,
+      "final": true,
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 678,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "checks": {
+      "norm": true,
+      "q": true,
+      "kv": true,
+      "attention": true,
+      "output": true,
+      "mhc_post": true,
+      "compressor_state": true,
+      "indexer_state": true,
+      "final": true,
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 678,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "checks": {
+      "norm": true,
+      "q": true,
+      "kv": true,
+      "attention": true,
+      "output": true,
+      "mhc_post": true,
+      "compressor_state": true,
+      "indexer_state": true,
+      "final": true,
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 679,
+    "lds": 133088,
+    "spills": 0
+  }
+]

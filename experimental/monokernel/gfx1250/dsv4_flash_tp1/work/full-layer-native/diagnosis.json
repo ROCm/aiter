@@ -1,0 +1,212 @@
+[
+  {
+    "position": 2047,
+    "case": 13,
+    "native_rms": 0.3574734330177307,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "native_ids": [
+      [
+        6,
+        61,
+        62,
+        91,
+        99,
+        161
+      ]
+    ],
+    "our_ids": [
+      6,
+      44,
+      61,
+      62,
+      99,
+      161
+    ],
+    "native_ffn_on_fused_attention_ids": [
+      [
+        6,
+        44,
+        61,
+        62,
+        99,
+        161
+      ]
+    ],
+    "same_input_ffn_rms": 4.766798156197183e-08,
+    "ffn_norm_rms": 0.0
+  },
+  {
+    "position": 1024,
+    "case": 4,
+    "native_rms": 0.10082954913377762,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "native_ids": [
+      [
+        5,
+        39,
+        105,
+        117,
+        178,
+        188
+      ]
+    ],
+    "our_ids": [
+      5,
+      39,
+      78,
+      105,
+      117,
+      188
+    ],
+    "native_ffn_on_fused_attention_ids": [
+      [
+        5,
+        39,
+        78,
+        105,
+        117,
+        188
+      ]
+    ],
+    "same_input_ffn_rms": 2.512067709403709e-08,
+    "ffn_norm_rms": 0.0
+  },
+  {
+    "position": 2047,
+    "case": 0,
+    "native_rms": 0.0980086401104927,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "native_ids": [
+      [
+        5,
+        34,
+        39,
+        78,
+        82,
+        155
+      ]
+    ],
+    "our_ids": [
+      5,
+      34,
+      78,
+      82,
+      104,
+      155
+    ],
+    "native_ffn_on_fused_attention_ids": [
+      [
+        5,
+        34,
+        78,
+        82,
+        104,
+        155
+      ]
+    ],
+    "same_input_ffn_rms": 5.428496478998568e-06,
+    "ffn_norm_rms": 0.0
+  },
+  {
+    "position": 2047,
+    "case": 9,
+    "native_rms": 0.04104456678032875,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "native_ids": [
+      [
+        6,
+        44,
+        91,
+        99,
+        104,
+        159
+      ]
+    ],
+    "our_ids": [
+      6,
+      44,
+      91,
+      99,
+      104,
+      159
+    ],
+    "native_ffn_on_fused_attention_ids": [
+      [
+        6,
+        44,
+        91,
+        99,
+        104,
+        159
+      ]
+    ],
+    "same_input_ffn_rms": 0.0,
+    "ffn_norm_rms": 0.0
+  },
+  {
+    "position": 1536,
+    "case": 9,
+    "native_rms": 0.03579976409673691,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "native_ids": [
+      [
+        6,
+        44,
+        91,
+        99,
+        104,
+        159
+      ]
+    ],
+    "our_ids": [
+      6,
+      44,
+      91,
+      99,
+      104,
+      159
+    ],
+    "native_ffn_on_fused_attention_ids": [
+      [
+        6,
+        44,
+        91,
+        99,
+        104,
+        159
+      ]
+    ],
+    "same_input_ffn_rms": 1.819885492304607e-10,
+    "ffn_norm_rms": 0.0
+  }
+]

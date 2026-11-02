@@ -1,0 +1,80 @@
+[
+  {
+    "input": "The capital of France is",
+    "response": {
+      "id": "cmpl-e134d4f7b5c44703acb8941b3520a1b6",
+      "object": "text_completion",
+      "created": 1792544997,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": " Paris. * Je * French *",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 8,
+        "total_tokens": 13,
+        "ttft_s": 1.8993,
+        "tpot_s": 0.1413,
+        "latency_s": 2.8888
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  },
+  {
+    "input": 1024,
+    "response": {
+      "id": "cmpl-e9593555217a47dba7153c742ff132b4",
+      "object": "text_completion",
+      "created": 1792544998,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "HHHHHHHH",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 8,
+        "total_tokens": 1032,
+        "ttft_s": 0.3952,
+        "tpot_s": 0.1411,
+        "latency_s": 1.3827
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  },
+  {
+    "input": 1151,
+    "response": {
+      "id": "cmpl-0f2d6562f25d4e5da2bd53e9c5efafb8",
+      "object": "text_completion",
+      "created": 1792545002,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "HHHH",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1151,
+        "completion_tokens": 4,
+        "total_tokens": 1155,
+        "ttft_s": 3.4193,
+        "tpot_s": 0.1429,
+        "latency_s": 3.8482
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  }
+]

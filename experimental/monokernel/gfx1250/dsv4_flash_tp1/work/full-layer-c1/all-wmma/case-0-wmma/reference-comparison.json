@@ -1,0 +1,212 @@
+{
+  "X": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "MixA": {
+    "exact": false,
+    "max_abs": 4.470348358154297e-08,
+    "rms_relative": 2.216077987782228e-08,
+    "nonfinite": 0
+  },
+  "XQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "QL": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "KV": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "QLQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Q": {
+    "exact": false,
+    "max_abs": 1.430511474609375e-06,
+    "rms_relative": 5.345113507360111e-08,
+    "nonfinite": 0
+  },
+  "QRot": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "KVRot": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "AO": {
+    "exact": false,
+    "max_abs": 0.000244140625,
+    "rms_relative": 1.3574127478932496e-05,
+    "nonfinite": 0
+  },
+  "AR": {
+    "exact": false,
+    "max_abs": 0.000244140625,
+    "rms_relative": 1.3572896023106296e-05,
+    "nonfinite": 0
+  },
+  "AQ": {
+    "exact": false,
+    "max_abs": 1.52587890625e-05,
+    "rms_relative": 8.215243951781304e-07,
+    "nonfinite": 0
+  },
+  "OL": {
+    "exact": false,
+    "max_abs": 0.0001220703125,
+    "rms_relative": 8.16332521935692e-06,
+    "nonfinite": 0
+  },
+  "OLQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Attn": {
+    "exact": false,
+    "max_abs": 0.000244140625,
+    "rms_relative": 7.182577974162996e-06,
+    "nonfinite": 0
+  },
+  "R2": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "FF": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "MixF": {
+    "exact": false,
+    "max_abs": 1.4156103134155273e-07,
+    "rms_relative": 1.3440507018458447e-07,
+    "nonfinite": 0
+  },
+  "FFQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "FFMX": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Logits": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Ids": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Gamma": {
+    "exact": false,
+    "max_abs": 3.5762786865234375e-07,
+    "rms_relative": 3.9658186778979143e-07,
+    "nonfinite": 0
+  },
+  "SG": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "SU": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "SA": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "SAQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "SO": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "EG": {
+    "exact": false,
+    "max_abs": 2.384185791015625e-07,
+    "rms_relative": 1.8769069853874498e-08,
+    "nonfinite": 0
+  },
+  "EU": {
+    "exact": false,
+    "max_abs": 9.5367431640625e-07,
+    "rms_relative": 4.6574331946658276e-08,
+    "nonfinite": 0
+  },
+  "EA": {
+    "exact": false,
+    "max_abs": 7.62939453125e-06,
+    "rms_relative": 6.614612857447355e-08,
+    "nonfinite": 0
+  },
+  "EAQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "EO": {
+    "exact": false,
+    "max_abs": 0.0078125,
+    "rms_relative": 2.0344165022834204e-05,
+    "nonfinite": 0
+  },
+  "Sum": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Out": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  }
+}

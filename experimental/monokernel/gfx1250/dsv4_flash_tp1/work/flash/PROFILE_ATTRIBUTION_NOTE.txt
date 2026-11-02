@@ -1,0 +1,15 @@
+Resumed audit: raw kernel-name averages/counts and decode window timing are
+measured directly and unaffected. The existing map_decode.py labels are a
+heuristic match to eager capture warmup. Identical kernel names for different
+GEMM shapes can be ambiguously assigned when shared/main streams overlap.
+A strict main-versus-auxiliary stream-role matcher was tested separately in
+parse_trace_stream_roles.py/map_decode_stream_roles.py. Its synthetic ambiguous
+case passes, but real graph replay moves kernels across stream roles: the C1
+baseline/candidate audits left260/317 kernels per step unmatched. Therefore the
+strict matcher is REJECTED for final operator attribution. Outputs are retained
+in *_stream_roles directories as an audit, not authoritative mappings.
+Use raw kernels.csv and summary.json for exact final comparisons. Treat mapped
+operators.csv subgroup durations as inferred when multiple shapes share a kernel
+name; do not present them as exact per-layer critical-path time. The fused MoE
+kernel has a distinct name/count and its 43 launches per C1 decode step are
+unambiguous. mHC FUSE_QUANT and quant-kernel count differences are also explicit.

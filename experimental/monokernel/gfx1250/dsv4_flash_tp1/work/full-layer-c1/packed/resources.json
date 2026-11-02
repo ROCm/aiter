@@ -1,0 +1,7 @@
+{
+  "blocks_per_cu": 3,
+  "n_regs": 261,
+  "n_spills": 0,
+  "shared": 2048,
+  "grid": 256
+}

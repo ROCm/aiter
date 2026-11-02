@@ -1,0 +1,10 @@
+[
+  {
+    "name": "128_32_True_8_128_1_True_True_.ca_True_False_1_1_1_128_0",
+    "error": "{'relative_rms': 0.004313747398555279, 'max_abs': 0.06016421318054199, 'exact': False, 'finite': True}"
+  },
+  {
+    "name": "128_32_True_8_128_1_True_True_.ca_True_False_1_1_4_128_0",
+    "error": "{'relative_rms': 0.00228741648606956, 'max_abs': 0.027391642332077026, 'exact': False, 'finite': True}"
+  }
+]

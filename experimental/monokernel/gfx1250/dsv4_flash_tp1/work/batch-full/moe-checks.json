@@ -1,0 +1,82 @@
+[
+  {
+    "m": 1,
+    "collision": false,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 1,
+    "collision": true,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 2,
+    "collision": false,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 2,
+    "collision": true,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "collision": false,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "collision": true,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "collision": false,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "collision": true,
+    "equal": true,
+    "relative_rms": 0.0,
+    "health": 0,
+    "vgpr": 114,
+    "lds": 65824,
+    "spills": 0
+  }
+]

@@ -1,0 +1,41 @@
+[
+  {
+    "mode": "unfused",
+    "count": 17,
+    "names": [
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "quant",
+      "project_fused",
+      "qa_reduce",
+      "qa_norm",
+      "quant",
+      "qb_stage",
+      "norm_only",
+      "norm_rope",
+      "norm_rope",
+      "cache_store",
+      "attention_partials",
+      "attention_reduce"
+    ]
+  },
+  {
+    "mode": "three_regions",
+    "count": 3,
+    "names": [
+      "mhc_region",
+      "complete",
+      "attention_kernel"
+    ]
+  },
+  {
+    "mode": "fused",
+    "count": 1,
+    "names": [
+      "full_prefix"
+    ]
+  }
+]

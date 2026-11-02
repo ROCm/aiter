@@ -1,0 +1,30 @@
+{
+  "aiter_s1": {
+    "buffer_stores": 12,
+    "all_buffer_stores_scope_dev": true,
+    "tdm_instructions": 12,
+    "wmma_instructions": 96,
+    "prefetch_instructions": 2
+  },
+  "aiter_s4": {
+    "buffer_stores": 52,
+    "all_buffer_stores_scope_dev": true,
+    "tdm_instructions": 15,
+    "wmma_instructions": 96,
+    "prefetch_instructions": 2
+  },
+  "qkv_attention_fused_s1": {
+    "buffer_stores": 56,
+    "all_buffer_stores_scope_dev": true,
+    "tdm_instructions": 24,
+    "wmma_instructions": 168,
+    "prefetch_instructions": 10
+  },
+  "qkv_attention_fused_s4": {
+    "buffer_stores": 96,
+    "all_buffer_stores_scope_dev": true,
+    "tdm_instructions": 27,
+    "wmma_instructions": 168,
+    "prefetch_instructions": 10
+  }
+}

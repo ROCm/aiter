@@ -1,0 +1,78 @@
+[
+  {
+    "m": 1,
+    "q_relative_rms": 0.0,
+    "kv_relative_rms": 0.0,
+    "qa_equal": true,
+    "qr_equal": true,
+    "qb_equal": true,
+    "cache_contract_cases": [
+      "valid",
+      "negative_position",
+      "inactive",
+      "negative_destination",
+      "past_end"
+    ],
+    "health": 0,
+    "vgpr": 152,
+    "lds": 115152,
+    "spills": 0
+  },
+  {
+    "m": 2,
+    "q_relative_rms": 0.0,
+    "kv_relative_rms": 0.0,
+    "qa_equal": true,
+    "qr_equal": true,
+    "qb_equal": true,
+    "cache_contract_cases": [
+      "valid",
+      "negative_position",
+      "inactive",
+      "negative_destination",
+      "past_end"
+    ],
+    "health": 0,
+    "vgpr": 152,
+    "lds": 115152,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "q_relative_rms": 0.0,
+    "kv_relative_rms": 0.0,
+    "qa_equal": true,
+    "qr_equal": true,
+    "qb_equal": true,
+    "cache_contract_cases": [
+      "valid",
+      "negative_position",
+      "inactive",
+      "negative_destination",
+      "past_end"
+    ],
+    "health": 0,
+    "vgpr": 152,
+    "lds": 115152,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "q_relative_rms": 0.0,
+    "kv_relative_rms": 0.0,
+    "qa_equal": true,
+    "qr_equal": true,
+    "qb_equal": true,
+    "cache_contract_cases": [
+      "valid",
+      "negative_position",
+      "inactive",
+      "negative_destination",
+      "past_end"
+    ],
+    "health": 0,
+    "vgpr": 152,
+    "lds": 115152,
+    "spills": 0
+  }
+]

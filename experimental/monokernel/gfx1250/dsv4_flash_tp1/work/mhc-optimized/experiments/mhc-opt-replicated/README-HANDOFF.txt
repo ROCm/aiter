@@ -1,0 +1,1 @@
+Experimental snapshot, not the selected implementation. See ../../REPORT.md for accepted numerical and performance results. Fixture symlinks point to the common parent files. Python scripts retain their original measurement filenames. Reassociated-RMS variants fail the strong full-prefix gate and are not accepted.

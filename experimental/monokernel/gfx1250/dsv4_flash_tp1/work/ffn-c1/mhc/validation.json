@@ -1,0 +1,466 @@
+[
+  {
+    "case": 0,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 1,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 2,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 3,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 4,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 5,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 6,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 7,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 8,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 9,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 10,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 11,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 12,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 13,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 14,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  },
+  {
+    "case": 15,
+    "outputs": [
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": 0.0
+      },
+      {
+        "bitwise": true,
+        "rms": null
+      }
+    ]
+  }
+]

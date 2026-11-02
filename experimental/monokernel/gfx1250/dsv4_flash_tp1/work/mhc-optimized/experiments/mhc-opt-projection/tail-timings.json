@@ -1,0 +1,232 @@
+[
+  {
+    "round": 1,
+    "results": {
+      "bk128_bn16_g256": {
+        "us": 6.847745971754193,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 13008
+        },
+        "health": 0
+      },
+      "bk128_bn32_g128": {
+        "us": 6.5875116270035505,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk128_bn32_g256": {
+        "us": 7.003445411100984,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk256_bn16_g128": {
+        "us": 6.755413953214884,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn16_g256": {
+        "us": 7.083718664944172,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn32_g64": {
+        "us": 6.8975037429481745,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      },
+      "bk256_bn32_g256": {
+        "us": 7.572890724986792,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      },
+      "bk512_bn16_g64": {
+        "us": 7.136929547414184,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 311,
+          "spills": 0,
+          "lds": 52176
+        },
+        "health": 0
+      },
+      "bk512_bn16_g256": {
+        "us": 7.771937642246485,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 311,
+          "spills": 0,
+          "lds": 52176
+        },
+        "health": 0
+      },
+      "bk512_bn32_g32": {
+        "us": 7.365710800513625,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 358,
+          "spills": 0,
+          "lds": 86992
+        },
+        "health": 0
+      },
+      "bk512_bn32_g256": {
+        "us": 8.308679331094027,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 358,
+          "spills": 0,
+          "lds": 86992
+        },
+        "health": 0
+      }
+    }
+  },
+  {
+    "round": 2,
+    "results": {
+      "bk128_bn16_g256": {
+        "us": 6.871687481179833,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 13008
+        },
+        "health": 0
+      },
+      "bk128_bn32_g128": {
+        "us": 6.616148399189115,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk128_bn32_g256": {
+        "us": 7.076519541442394,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 21712
+        },
+        "health": 0
+      },
+      "bk256_bn16_g128": {
+        "us": 6.7809217143803835,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn16_g256": {
+        "us": 7.206089794635773,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 26064
+        },
+        "health": 0
+      },
+      "bk256_bn32_g64": {
+        "us": 6.902663968503475,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      },
+      "bk256_bn32_g256": {
+        "us": 7.592449197545648,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 272,
+          "spills": 0,
+          "lds": 43472
+        },
+        "health": 0
+      },
+      "bk512_bn16_g64": {
+        "us": 7.158207008615136,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 311,
+          "spills": 0,
+          "lds": 52176
+        },
+        "health": 0
+      },
+      "bk512_bn16_g256": {
+        "us": 7.77021492831409,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 311,
+          "spills": 0,
+          "lds": 52176
+        },
+        "health": 0
+      },
+      "bk512_bn32_g32": {
+        "us": 7.372281048446894,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 358,
+          "spills": 0,
+          "lds": 86992
+        },
+        "health": 0
+      },
+      "bk512_bn32_g256": {
+        "us": 8.295218925923109,
+        "err": 0.0,
+        "resources": {
+          "vgpr": 358,
+          "spills": 0,
+          "lds": 86992
+        },
+        "health": 0
+      }
+    }
+  }
+]

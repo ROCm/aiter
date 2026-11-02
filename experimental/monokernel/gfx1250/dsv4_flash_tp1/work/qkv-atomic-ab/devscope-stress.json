@@ -1,0 +1,22 @@
+[
+  {
+    "variant": "B_atomic_fused_norm",
+    "replays": 1000,
+    "max_checked_rms_vs_A": 7.2941506168433534e-09
+  },
+  {
+    "variant": "D_scratch_fused_norm",
+    "replays": 1000,
+    "max_checked_rms_vs_A": 7.2941506168433534e-09
+  },
+  {
+    "variant": "E_atomic_devscope_norm",
+    "replays": 1000,
+    "max_checked_rms_vs_A": 7.2941506168433534e-09
+  },
+  {
+    "variant": "F_scratch_devscope_norm",
+    "replays": 1000,
+    "max_checked_rms_vs_A": 7.2941506168433534e-09
+  }
+]

@@ -1,0 +1,252 @@
+[
+  {
+    "input_tokens": 1,
+    "native": {
+      "id": "cmpl-7ff2d6586fe24f39a57149b312ac479f",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\uff0c",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+        "ttft_s": 0.1718,
+        "tpot_s": 0.0,
+        "latency_s": 0.172
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-9f4581e5294241a8a3ed36ebd0430689",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\uff0c",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+        "ttft_s": 0.1676,
+        "tpot_s": 0.0,
+        "latency_s": 0.1678
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "first_token_equal": true
+  },
+  {
+    "input_tokens": 2,
+    "native": {
+      "id": "cmpl-47aeb85f9df4403e8f3ad30ca274cdca",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+        "ttft_s": 0.1583,
+        "tpot_s": 0.0,
+        "latency_s": 0.1584
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-01817429073340f69f5b8307471977df",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+        "ttft_s": 0.1589,
+        "tpot_s": 0.0,
+        "latency_s": 0.159
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "first_token_equal": true
+  },
+  {
+    "input_tokens": 4,
+    "native": {
+      "id": "cmpl-9ca0e2d2bed847559f45cb23bbe20f25",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 1,
+        "total_tokens": 5,
+        "ttft_s": 0.1588,
+        "tpot_s": 0.0,
+        "latency_s": 0.1589
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-ebc5f1c2ec964930be3e246078b7fed6",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 1,
+        "total_tokens": 5,
+        "ttft_s": 0.1605,
+        "tpot_s": 0.0,
+        "latency_s": 0.1607
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "first_token_equal": true
+  },
+  {
+    "input_tokens": 8,
+    "native": {
+      "id": "cmpl-acff7caccf41481a86b634653cb3f396",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 8,
+        "completion_tokens": 1,
+        "total_tokens": 9,
+        "ttft_s": 0.1572,
+        "tpot_s": 0.0,
+        "latency_s": 0.1573
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-910b0e2a5bdb4b1c9fa59b9c14ed9b20",
+      "object": "text_completion",
+      "created": 1792612665,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 8,
+        "completion_tokens": 1,
+        "total_tokens": 9,
+        "ttft_s": 0.1605,
+        "tpot_s": 0.0,
+        "latency_s": 0.1607
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "first_token_equal": true
+  },
+  {
+    "input_tokens": 1024,
+    "native": {
+      "id": "cmpl-2b4d01e83acb4396a5257f861be2fbd3",
+      "object": "text_completion",
+      "created": 1792612666,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 1,
+        "total_tokens": 1025,
+        "ttft_s": 0.1528,
+        "tpot_s": 0.0,
+        "latency_s": 0.1529
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "fixed": {
+      "id": "cmpl-63ca3f6b44934b60b8b18b42b6d8ea8a",
+      "object": "text_completion",
+      "created": 1792612666,
+      "model": "/data/DeepSeek-V4-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 1,
+        "total_tokens": 1025,
+        "ttft_s": 0.142,
+        "tpot_s": 0.0,
+        "latency_s": 0.1422
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    },
+    "first_token_equal": true
+  }
+]

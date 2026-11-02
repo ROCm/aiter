@@ -1,0 +1,14 @@
+{
+  "blocks_per_cu": 3,
+  "n_regs": 261,
+  "n_spills": 0,
+  "shared": 2048,
+  "grid": 256,
+  "sgpr_count": 88,
+  "sgpr_spill_count": 0,
+  "vgpr_count": 261,
+  "vgpr_spill_count": 0,
+  "private_segment_fixed_size": 0,
+  "global_wb": 0,
+  "global_inv": 0
+}

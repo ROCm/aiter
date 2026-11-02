@@ -1,0 +1,3002 @@
+{
+  "1": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1876,
+        "tpot_s": 0.1948,
+        "latency_s": 6.6683
+      }
+    }
+  ],
+  "8": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.3166,
+        "tpot_s": 0.2227,
+        "latency_s": 6.4379
+      }
+    },
+    {
+      "index": 1,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9596,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4358
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 * 23 = 437. \nExplanation: 19 * 23 = (20 - 1)",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9591,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4359
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9584,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4357
+      }
+    },
+    {
+      "index": 4,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9571,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4346
+      }
+    },
+    {
+      "index": 5,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9564,
+        "tpot_s": 0.1946,
+        "latency_s": 6.434
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 * 23 = 529. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9556,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4334
+      }
+    },
+    {
+      "index": 7,
+      "text": " 552\nExplanation: 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.9554,
+        "tpot_s": 0.1946,
+        "latency_s": 6.4333
+      }
+    }
+  ],
+  "16": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. Explanation: 17 * 23 = 391. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.07,
+        "tpot_s": 0.6105,
+        "latency_s": 16.1121
+      }
+    },
+    {
+      "index": 1,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5115,
+        "tpot_s": 0.2,
+        "latency_s": 16.1115
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. \nExplanation: 19 * 23 = 19 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5118,
+        "tpot_s": 0.2,
+        "latency_s": 16.1117
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5093,
+        "tpot_s": 0.2,
+        "latency_s": 16.1094
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 483. \nThis is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5095,
+        "tpot_s": 0.2,
+        "latency_s": 16.1095
+      }
+    },
+    {
+      "index": 5,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5081,
+        "tpot_s": 0.2,
+        "latency_s": 16.1082
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. 20 times 23 is 460, 3 times 23 is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5088,
+        "tpot_s": 0.2,
+        "latency_s": 16.1089
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5071,
+        "tpot_s": 0.2,
+        "latency_s": 16.1072
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 * 23 = 391\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5065,
+        "tpot_s": 0.2,
+        "latency_s": 16.1066
+      }
+    },
+    {
+      "index": 9,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5054,
+        "tpot_s": 0.2,
+        "latency_s": 16.1056
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. \nExplanation: 19 * 23 = 19 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5047,
+        "tpot_s": 0.2,
+        "latency_s": 16.1048
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5038,
+        "tpot_s": 0.2,
+        "latency_s": 16.1039
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 483. \nThis is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5032,
+        "tpot_s": 0.2,
+        "latency_s": 16.1034
+      }
+    },
+    {
+      "index": 13,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5025,
+        "tpot_s": 0.2,
+        "latency_s": 16.1027
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. 20 times 23 is 460, 3 times 23 is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5018,
+        "tpot_s": 0.2,
+        "latency_s": 16.102
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 11.5016,
+        "tpot_s": 0.2,
+        "latency_s": 16.1018
+      }
+    }
+  ],
+  "32": [
+    {
+      "index": 0,
+      "text": " 17 * 23 = 391\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 3.9098,
+        "tpot_s": 0.545,
+        "latency_s": 16.4442
+      }
+    },
+    {
+      "index": 1,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 3.9105,
+        "tpot_s": 0.545,
+        "latency_s": 16.4447
+      }
+    },
+    {
+      "index": 2,
+      "text": " 437\nExplanation: 19 times 23 is 437. 19 times 23 is 437. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 3.9091,
+        "tpot_s": 0.545,
+        "latency_s": 16.4436
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 3.9098,
+        "tpot_s": 0.545,
+        "latency_s": 16.4442
+      }
+    },
+    {
+      "index": 4,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0299,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4418
+      }
+    },
+    {
+      "index": 5,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0307,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4426
+      }
+    },
+    {
+      "index": 6,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.028,
+        "tpot_s": 0.1918,
+        "latency_s": 16.44
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0291,
+        "tpot_s": 0.1918,
+        "latency_s": 16.441
+      }
+    },
+    {
+      "index": 8,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.027,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4391
+      }
+    },
+    {
+      "index": 9,
+      "text": " 414\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0254,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4375
+      }
+    },
+    {
+      "index": 10,
+      "text": " 437\nExplanation: 19 times 23 is 19 * 23 = 437. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0264,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4385
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0247,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4368
+      }
+    },
+    {
+      "index": 12,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0241,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4362
+      }
+    },
+    {
+      "index": 13,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0236,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4357
+      }
+    },
+    {
+      "index": 14,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.023,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4352
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0223,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4345
+      }
+    },
+    {
+      "index": 16,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0217,
+        "tpot_s": 0.1918,
+        "latency_s": 16.434
+      }
+    },
+    {
+      "index": 17,
+      "text": " 414\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0204,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4328
+      }
+    },
+    {
+      "index": 18,
+      "text": " 437\nExplanation: 19 times 23 is 19 * 23 = 437. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0198,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4323
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0194,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4318
+      }
+    },
+    {
+      "index": 20,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0186,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4311
+      }
+    },
+    {
+      "index": 21,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.018,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4305
+      }
+    },
+    {
+      "index": 22,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0169,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4296
+      }
+    },
+    {
+      "index": 23,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0155,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4283
+      }
+    },
+    {
+      "index": 24,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0177,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4302
+      }
+    },
+    {
+      "index": 25,
+      "text": " 414\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0162,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4289
+      }
+    },
+    {
+      "index": 26,
+      "text": " 437\nExplanation: 19 times 23 is 19 * 23 = 437. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0149,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4277
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.014,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4268
+      }
+    },
+    {
+      "index": 28,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0128,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4257
+      }
+    },
+    {
+      "index": 29,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0134,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4263
+      }
+    },
+    {
+      "index": 30,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0124,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4253
+      }
+    },
+    {
+      "index": 31,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 12.0118,
+        "tpot_s": 0.1918,
+        "latency_s": 16.4248
+      }
+    }
+  ],
+  "64": [
+    {
+      "index": 0,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 5.4776,
+        "tpot_s": 0.5995,
+        "latency_s": 19.267
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. Explanation: 18 times 23 is 414. Explanation: 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4211,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2659
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4207,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2655
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4209,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2657
+      }
+    },
+    {
+      "index": 4,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4176,
+        "tpot_s": 0.2106,
+        "latency_s": 19.263
+      }
+    },
+    {
+      "index": 5,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4193,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2643
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4185,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2639
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4171,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2627
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 * 23 = 391\nExplanation: \n17 * 23 = 17 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4158,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2614
+      }
+    },
+    {
+      "index": 9,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4165,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2621
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. \nExplanation: To multiply 19 by 23, you can use the",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4152,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2614
+      }
+    },
+    {
+      "index": 11,
+      "text": " 460\nExplanation: 20 times 23 is 20 * 23 = 460. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4145,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2607
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4132,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2595
+      }
+    },
+    {
+      "index": 13,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4125,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2588
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. \nExplanation: 23 times 23 is 23 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4138,
+        "tpot_s": 0.2106,
+        "latency_s": 19.26
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 * 23 = 24 * (20 + 3) = 24 * 20 + 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4116,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2579
+      }
+    },
+    {
+      "index": 16,
+      "text": " 391\nExplanation: 17 * 23 = 17 * (20 + 3) = 17 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.411,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2573
+      }
+    },
+    {
+      "index": 17,
+      "text": " 18 * 23 = 414\nExplanation: \n18 * 23 = 18 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4102,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2566
+      }
+    },
+    {
+      "index": 18,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = (20 - 1) *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4096,
+        "tpot_s": 0.2106,
+        "latency_s": 19.256
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4091,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2554
+      }
+    },
+    {
+      "index": 20,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4086,
+        "tpot_s": 0.2106,
+        "latency_s": 19.255
+      }
+    },
+    {
+      "index": 21,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4082,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2546
+      }
+    },
+    {
+      "index": 22,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4074,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2539
+      }
+    },
+    {
+      "index": 23,
+      "text": " 552\nExplanation: 24 times 23 is 24 * 23 = 552. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4067,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2532
+      }
+    },
+    {
+      "index": 24,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4054,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2519
+      }
+    },
+    {
+      "index": 25,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4062,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2527
+      }
+    },
+    {
+      "index": 26,
+      "text": " 437\nExplanation: 19 * 23 = 19 * (20 + 3) = 19 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.405,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2517
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4042,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2509
+      }
+    },
+    {
+      "index": 28,
+      "text": " 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4026,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2494
+      }
+    },
+    {
+      "index": 29,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.403,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2497
+      }
+    },
+    {
+      "index": 30,
+      "text": " 23 times 23 is 529. \n23*23 = 529. \n23*23 = (20",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.402,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2489
+      }
+    },
+    {
+      "index": 31,
+      "text": " 24 times 23 is 552. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4015,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2484
+      }
+    },
+    {
+      "index": 32,
+      "text": " 17 * 23 = 391. \nExplanation: 17 * 20 = 340, 17 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.401,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2481
+      }
+    },
+    {
+      "index": 33,
+      "text": " 18 * 23 = 414. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.4001,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2472
+      }
+    },
+    {
+      "index": 34,
+      "text": " 19 * 23 = 437\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3988,
+        "tpot_s": 0.2106,
+        "latency_s": 19.246
+      }
+    },
+    {
+      "index": 35,
+      "text": " 460\nExplanation: 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3996,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2467
+      }
+    },
+    {
+      "index": 36,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3977,
+        "tpot_s": 0.2106,
+        "latency_s": 19.245
+      }
+    },
+    {
+      "index": 37,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3983,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2455
+      }
+    },
+    {
+      "index": 38,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3972,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2444
+      }
+    },
+    {
+      "index": 39,
+      "text": " 24 times 23 is 552. \nExplanation: 24 times 23 is 24 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3965,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2438
+      }
+    },
+    {
+      "index": 40,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3962,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2435
+      }
+    },
+    {
+      "index": 41,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3954,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2427
+      }
+    },
+    {
+      "index": 42,
+      "text": " 19 times 23 is 437. \nExplanation: 19 * 23 = 19 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3951,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2424
+      }
+    },
+    {
+      "index": 43,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3944,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2417
+      }
+    },
+    {
+      "index": 44,
+      "text": " 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3939,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2412
+      }
+    },
+    {
+      "index": 45,
+      "text": " 506\nExplanation: 22 times 23 is like 22 times 20 plus 22 times 3,",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3934,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2411
+      }
+    },
+    {
+      "index": 46,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 20 is 460, and ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3925,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2403
+      }
+    },
+    {
+      "index": 47,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3921,
+        "tpot_s": 0.2106,
+        "latency_s": 19.24
+      }
+    },
+    {
+      "index": 48,
+      "text": " 17 * 23 = 391\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3915,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2394
+      }
+    },
+    {
+      "index": 49,
+      "text": " 18 * 23 = 414. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3908,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2387
+      }
+    },
+    {
+      "index": 50,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3903,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2382
+      }
+    },
+    {
+      "index": 51,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3898,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2377
+      }
+    },
+    {
+      "index": 52,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3892,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2371
+      }
+    },
+    {
+      "index": 53,
+      "text": " 506\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3879,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2359
+      }
+    },
+    {
+      "index": 54,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3888,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2367
+      }
+    },
+    {
+      "index": 55,
+      "text": " 552\nExplanation: 24 * 23 = 24 * (20 + 3) = 24*",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3874,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2354
+      }
+    },
+    {
+      "index": 56,
+      "text": " 17 * 23 = 391\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3868,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2348
+      }
+    },
+    {
+      "index": 57,
+      "text": " 414\nExplanation: 18 times 23 is 18 * 23 = 414. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3858,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2339
+      }
+    },
+    {
+      "index": 58,
+      "text": " 19 * 23 = 437\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3861,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2342
+      }
+    },
+    {
+      "index": 59,
+      "text": " 460\nExplanation: 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3854,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2336
+      }
+    },
+    {
+      "index": 60,
+      "text": " 483\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3851,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2333
+      }
+    },
+    {
+      "index": 61,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3667,
+        "tpot_s": 0.2106,
+        "latency_s": 19.215
+      }
+    },
+    {
+      "index": 62,
+      "text": " 23 times 23 is 529. This is because 23 squared (23^2) is 529.",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3657,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2144
+      }
+    },
+    {
+      "index": 63,
+      "text": " 552\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 14.3661,
+        "tpot_s": 0.2106,
+        "latency_s": 19.2144
+      }
+    }
+  ],
+  "128": [
+    {
+      "index": 0,
+      "text": " 17 * 23 = 391\nExplanation: \n17 * 23 = 17 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.597,
+        "tpot_s": 0.49,
+        "latency_s": 11.8671
+      }
+    },
+    {
+      "index": 1,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.4239,
+        "tpot_s": 0.4976,
+        "latency_s": 11.8689
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = (20 - 1) *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5969,
+        "tpot_s": 0.49,
+        "latency_s": 11.8669
+      }
+    },
+    {
+      "index": 3,
+      "text": " 460\nExplanation: 20 times 23 is 20 * 23 = 460. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5952,
+        "tpot_s": 0.49,
+        "latency_s": 11.8653
+      }
+    },
+    {
+      "index": 4,
+      "text": " 483\nExplanation: 21 * 23 = 21 * (20 + 3) = 21 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.596,
+        "tpot_s": 0.49,
+        "latency_s": 11.8661
+      }
+    },
+    {
+      "index": 5,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5944,
+        "tpot_s": 0.49,
+        "latency_s": 11.8646
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. Explanation: 23 squared (23^2) is 529. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5935,
+        "tpot_s": 0.49,
+        "latency_s": 11.8637
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5929,
+        "tpot_s": 0.49,
+        "latency_s": 11.8631
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5916,
+        "tpot_s": 0.49,
+        "latency_s": 11.8618
+      }
+    },
+    {
+      "index": 9,
+      "text": " 18 times 23 is 414. This is because 18 times 23 is the same as 18 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5904,
+        "tpot_s": 0.49,
+        "latency_s": 11.8608
+      }
+    },
+    {
+      "index": 10,
+      "text": " 437\nExplanation: 19 times 23 is 19 * 23 = 437. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5922,
+        "tpot_s": 0.49,
+        "latency_s": 11.8625
+      }
+    },
+    {
+      "index": 11,
+      "text": " 460\nExplanation: 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5911,
+        "tpot_s": 0.49,
+        "latency_s": 11.8615
+      }
+    },
+    {
+      "index": 12,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5898,
+        "tpot_s": 0.49,
+        "latency_s": 11.8602
+      }
+    },
+    {
+      "index": 13,
+      "text": " 506\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5894,
+        "tpot_s": 0.49,
+        "latency_s": 11.8599
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. Explanation: 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5883,
+        "tpot_s": 0.49,
+        "latency_s": 11.8587
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. \nExplanation: To multiply 24 by 23, you can use the",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5876,
+        "tpot_s": 0.49,
+        "latency_s": 11.8581
+      }
+    },
+    {
+      "index": 16,
+      "text": " 17 * 23 = 391\nExplanation: \n17 * 23 = 17 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5857,
+        "tpot_s": 0.49,
+        "latency_s": 11.8562
+      }
+    },
+    {
+      "index": 17,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5872,
+        "tpot_s": 0.49,
+        "latency_s": 11.8577
+      }
+    },
+    {
+      "index": 18,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5864,
+        "tpot_s": 0.49,
+        "latency_s": 11.8569
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. This is because 20 times 20 is 400, and 20",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5853,
+        "tpot_s": 0.49,
+        "latency_s": 11.8559
+      }
+    },
+    {
+      "index": 20,
+      "text": " 21 times 23 is 483. \nExplanation: To multiply 21 by 23, we can use the",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5844,
+        "tpot_s": 0.49,
+        "latency_s": 11.8552
+      }
+    },
+    {
+      "index": 21,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5848,
+        "tpot_s": 0.49,
+        "latency_s": 11.8554
+      }
+    },
+    {
+      "index": 22,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5823,
+        "tpot_s": 0.49,
+        "latency_s": 11.8532
+      }
+    },
+    {
+      "index": 23,
+      "text": " 552\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5834,
+        "tpot_s": 0.49,
+        "latency_s": 11.8542
+      }
+    },
+    {
+      "index": 24,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.583,
+        "tpot_s": 0.49,
+        "latency_s": 11.8538
+      }
+    },
+    {
+      "index": 25,
+      "text": " 18 times 23 is 414. This is because 18 times 23 is the same as 18 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5811,
+        "tpot_s": 0.49,
+        "latency_s": 11.852
+      }
+    },
+    {
+      "index": 26,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5808,
+        "tpot_s": 0.49,
+        "latency_s": 11.8517
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is 20 times 20 plus",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5819,
+        "tpot_s": 0.49,
+        "latency_s": 11.8527
+      }
+    },
+    {
+      "index": 28,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 21 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.58,
+        "tpot_s": 0.49,
+        "latency_s": 11.851
+      }
+    },
+    {
+      "index": 29,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5794,
+        "tpot_s": 0.49,
+        "latency_s": 11.8503
+      }
+    },
+    {
+      "index": 30,
+      "text": " 23 times 23 is 529. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5787,
+        "tpot_s": 0.49,
+        "latency_s": 11.8496
+      }
+    },
+    {
+      "index": 31,
+      "text": " 552\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.578,
+        "tpot_s": 0.49,
+        "latency_s": 11.8489
+      }
+    },
+    {
+      "index": 32,
+      "text": " 17 * 23 = 391\nExplanation: 17 * 23 = 17 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5776,
+        "tpot_s": 0.49,
+        "latency_s": 11.8486
+      }
+    },
+    {
+      "index": 33,
+      "text": " 414\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5768,
+        "tpot_s": 0.49,
+        "latency_s": 11.8478
+      }
+    },
+    {
+      "index": 34,
+      "text": " 19 * 23 = 437\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5763,
+        "tpot_s": 0.49,
+        "latency_s": 11.8473
+      }
+    },
+    {
+      "index": 35,
+      "text": " 460\nExplanation: 20 times 23 is 20 * 23 = 460. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5759,
+        "tpot_s": 0.49,
+        "latency_s": 11.8469
+      }
+    },
+    {
+      "index": 36,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5754,
+        "tpot_s": 0.49,
+        "latency_s": 11.8464
+      }
+    },
+    {
+      "index": 37,
+      "text": " 506\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5747,
+        "tpot_s": 0.49,
+        "latency_s": 11.8457
+      }
+    },
+    {
+      "index": 38,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.574,
+        "tpot_s": 0.49,
+        "latency_s": 11.8451
+      }
+    },
+    {
+      "index": 39,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5731,
+        "tpot_s": 0.49,
+        "latency_s": 11.8442
+      }
+    },
+    {
+      "index": 40,
+      "text": " 17 * 23 = 391\nExplanation: \n17 * 23 = 17 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5735,
+        "tpot_s": 0.49,
+        "latency_s": 11.8446
+      }
+    },
+    {
+      "index": 41,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5724,
+        "tpot_s": 0.49,
+        "latency_s": 11.8435
+      }
+    },
+    {
+      "index": 42,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5715,
+        "tpot_s": 0.49,
+        "latency_s": 11.8427
+      }
+    },
+    {
+      "index": 43,
+      "text": " 20 times 23 is 460. This is because 20 times 20 is 400, and 20",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5718,
+        "tpot_s": 0.49,
+        "latency_s": 11.843
+      }
+    },
+    {
+      "index": 44,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5695,
+        "tpot_s": 0.49,
+        "latency_s": 11.8407
+      }
+    },
+    {
+      "index": 45,
+      "text": " 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5709,
+        "tpot_s": 0.49,
+        "latency_s": 11.842
+      }
+    },
+    {
+      "index": 46,
+      "text": " 23 times 23 is 529. This is because 23 times 23 is the same as 23 squared",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5687,
+        "tpot_s": 0.49,
+        "latency_s": 11.8399
+      }
+    },
+    {
+      "index": 47,
+      "text": " 24 times 23 is 552. This is because 24 multiplied by 23 equals 552. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5691,
+        "tpot_s": 0.49,
+        "latency_s": 11.8403
+      }
+    },
+    {
+      "index": 48,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5679,
+        "tpot_s": 0.49,
+        "latency_s": 11.8392
+      }
+    },
+    {
+      "index": 49,
+      "text": " 18 times 23 is 414. This is because 18 times 23 is the same as 18 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5676,
+        "tpot_s": 0.49,
+        "latency_s": 11.8388
+      }
+    },
+    {
+      "index": 50,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.567,
+        "tpot_s": 0.49,
+        "latency_s": 11.8383
+      }
+    },
+    {
+      "index": 51,
+      "text": " 460\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5667,
+        "tpot_s": 0.49,
+        "latency_s": 11.838
+      }
+    },
+    {
+      "index": 52,
+      "text": " 483\nExplanation: To multiply 21 by 23, we can use the distributive property: 21 * ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5655,
+        "tpot_s": 0.49,
+        "latency_s": 11.8371
+      }
+    },
+    {
+      "index": 53,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5651,
+        "tpot_s": 0.49,
+        "latency_s": 11.8367
+      }
+    },
+    {
+      "index": 54,
+      "text": " 23 times 23 is 529. Explanation: 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5648,
+        "tpot_s": 0.49,
+        "latency_s": 11.8363
+      }
+    },
+    {
+      "index": 55,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5643,
+        "tpot_s": 0.49,
+        "latency_s": 11.8359
+      }
+    },
+    {
+      "index": 56,
+      "text": " 17 times 23 is 391. \nExplanation: \nTo calculate 17 times 23, we can break",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5627,
+        "tpot_s": 0.49,
+        "latency_s": 11.8347
+      }
+    },
+    {
+      "index": 57,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5635,
+        "tpot_s": 0.49,
+        "latency_s": 11.8351
+      }
+    },
+    {
+      "index": 58,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5619,
+        "tpot_s": 0.49,
+        "latency_s": 11.8339
+      }
+    },
+    {
+      "index": 59,
+      "text": " 460\nExplanation: 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5624,
+        "tpot_s": 0.49,
+        "latency_s": 11.8344
+      }
+    },
+    {
+      "index": 60,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5608,
+        "tpot_s": 0.49,
+        "latency_s": 11.8329
+      }
+    },
+    {
+      "index": 61,
+      "text": " 506\nExplanation: 22 times 23 is 506. 22 times 23 is 506. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5614,
+        "tpot_s": 0.49,
+        "latency_s": 11.8335
+      }
+    },
+    {
+      "index": 62,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5601,
+        "tpot_s": 0.49,
+        "latency_s": 11.8322
+      }
+    },
+    {
+      "index": 63,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5606,
+        "tpot_s": 0.49,
+        "latency_s": 11.8327
+      }
+    },
+    {
+      "index": 64,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5593,
+        "tpot_s": 0.49,
+        "latency_s": 11.8314
+      }
+    },
+    {
+      "index": 65,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5599,
+        "tpot_s": 0.49,
+        "latency_s": 11.832
+      }
+    },
+    {
+      "index": 66,
+      "text": " 19 * 23 = 437\nExplanation: \n19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.559,
+        "tpot_s": 0.49,
+        "latency_s": 11.8311
+      }
+    },
+    {
+      "index": 67,
+      "text": " 460\nExplanation: 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5585,
+        "tpot_s": 0.49,
+        "latency_s": 11.8307
+      }
+    },
+    {
+      "index": 68,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5581,
+        "tpot_s": 0.49,
+        "latency_s": 11.8303
+      }
+    },
+    {
+      "index": 69,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.557,
+        "tpot_s": 0.49,
+        "latency_s": 11.8292
+      }
+    },
+    {
+      "index": 70,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5575,
+        "tpot_s": 0.49,
+        "latency_s": 11.8297
+      }
+    },
+    {
+      "index": 71,
+      "text": " 552\nExplanation: To multiply 24 by 23, we can use the standard multiplication method. First, multiply",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.556,
+        "tpot_s": 0.49,
+        "latency_s": 11.8287
+      }
+    },
+    {
+      "index": 72,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9796,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8284
+      }
+    },
+    {
+      "index": 73,
+      "text": " 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9791,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8279
+      }
+    },
+    {
+      "index": 74,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9784,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8272
+      }
+    },
+    {
+      "index": 75,
+      "text": " 460\nExplanation: 20 times 23 is 20 * 23 = 460. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9778,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8266
+      }
+    },
+    {
+      "index": 76,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 21 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9771,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8259
+      }
+    },
+    {
+      "index": 77,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9767,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8255
+      }
+    },
+    {
+      "index": 78,
+      "text": " 23 times 23 is 529. Explanation: 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9763,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8251
+      }
+    },
+    {
+      "index": 79,
+      "text": " 24 times 23 is 552. \nExplanation: 24 * 23 = 24 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9754,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8243
+      }
+    },
+    {
+      "index": 80,
+      "text": " 17 * 23 = 391. \nExplanation: 17 * 20 = 340, 17 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9758,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8247
+      }
+    },
+    {
+      "index": 81,
+      "text": " 414\nExplanation: 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9746,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8235
+      }
+    },
+    {
+      "index": 82,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = (20 - 1) *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9742,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8231
+      }
+    },
+    {
+      "index": 83,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9738,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8227
+      }
+    },
+    {
+      "index": 84,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9734,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8223
+      }
+    },
+    {
+      "index": 85,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9722,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8211
+      }
+    },
+    {
+      "index": 86,
+      "text": " 23 times 23 is 529. \nExplanation: 23 times 23 is 23 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9719,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8208
+      }
+    },
+    {
+      "index": 87,
+      "text": " 552\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9715,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8204
+      }
+    },
+    {
+      "index": 88,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9707,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8196
+      }
+    },
+    {
+      "index": 89,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9703,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8192
+      }
+    },
+    {
+      "index": 90,
+      "text": " 437\nExplanation: 19 times 23 is 19 * 23 = 437. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9698,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8188
+      }
+    },
+    {
+      "index": 91,
+      "text": " 460\nExplanation: This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9691,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8181
+      }
+    },
+    {
+      "index": 92,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9687,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8177
+      }
+    },
+    {
+      "index": 93,
+      "text": " 22 times 23 is 506. This is because 22 multiplied by 23 equals 506. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9682,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8172
+      }
+    },
+    {
+      "index": 94,
+      "text": " 23 * 23 = 529.\nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9677,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8168
+      }
+    },
+    {
+      "index": 95,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9673,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8163
+      }
+    },
+    {
+      "index": 96,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9664,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8154
+      }
+    },
+    {
+      "index": 97,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9671,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8161
+      }
+    },
+    {
+      "index": 98,
+      "text": " 19 * 23 = 437. \nExplanation: 19 * 23 = 19 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9657,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8148
+      }
+    },
+    {
+      "index": 99,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is 20 times 20 plus",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9654,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8144
+      }
+    },
+    {
+      "index": 100,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 483. \nThis is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9646,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8137
+      }
+    },
+    {
+      "index": 101,
+      "text": " 506\nExplanation: 22 times 23 is like having 22 groups of 23, or 23 groups",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.964,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8135
+      }
+    },
+    {
+      "index": 102,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 23 equals 529. This is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9634,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8129
+      }
+    },
+    {
+      "index": 103,
+      "text": " 552\nExplanation: 24 times 23 is 552. 24 times 23 is 552. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9629,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8124
+      }
+    },
+    {
+      "index": 104,
+      "text": " 17 * 23 = 391. \nThis is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9617,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8113
+      }
+    },
+    {
+      "index": 105,
+      "text": " 414\nExplanation: 18 times 23 is 414. 18 times 23 is 414. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9625,
+        "tpot_s": 0.1672,
+        "latency_s": 11.812
+      }
+    },
+    {
+      "index": 106,
+      "text": " 19 * 23 = 437\nExplanation: 19 * 23 = 19 * (20 + ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9614,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8109
+      }
+    },
+    {
+      "index": 107,
+      "text": " 20 times 23 is 460. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9607,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8103
+      }
+    },
+    {
+      "index": 108,
+      "text": " 21 times 23 is 483. \nExplanation: 21 times 23 is 21 * 23 =",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9603,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8098
+      }
+    },
+    {
+      "index": 109,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9597,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8092
+      }
+    },
+    {
+      "index": 110,
+      "text": " 23 times 23 is 529. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9593,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8089
+      }
+    },
+    {
+      "index": 111,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9588,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8083
+      }
+    },
+    {
+      "index": 112,
+      "text": " 391\nExplanation: 17 * 23 = 391. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9583,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8079
+      }
+    },
+    {
+      "index": 113,
+      "text": " 18 times 23 is 414. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9578,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8074
+      }
+    },
+    {
+      "index": 114,
+      "text": " 437\nExplanation: 19 * 23 = 19 * (20 + 3) = 19 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9573,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8069
+      }
+    },
+    {
+      "index": 115,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9566,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8063
+      }
+    },
+    {
+      "index": 116,
+      "text": " 483\nExplanation: 21 times 23 is 483. 21 times 23 is 483. ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9563,
+        "tpot_s": 0.1672,
+        "latency_s": 11.806
+      }
+    },
+    {
+      "index": 117,
+      "text": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9557,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8053
+      }
+    },
+    {
+      "index": 118,
+      "text": " 23 times 23 is 529. This is because 23 multiplied by 20 is 460, and ",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9553,
+        "tpot_s": 0.1672,
+        "latency_s": 11.805
+      }
+    },
+    {
+      "index": 119,
+      "text": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.955,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8046
+      }
+    },
+    {
+      "index": 120,
+      "text": " 17 * 23 = 391. \nExplanation: 17 * 23 = 17 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9537,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8034
+      }
+    },
+    {
+      "index": 121,
+      "text": " 414\nExplanation: 18 times 23 is 18 * 23 = 414. \nThis is a",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9542,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8039
+      }
+    },
+    {
+      "index": 122,
+      "text": " 19 * 23 = 437\nLet's think step by step: 19 * 20 = 380",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.953,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8032
+      }
+    },
+    {
+      "index": 123,
+      "text": " 460\nExplanation: 20 times 23 is 460 because 20 * 23 = 460. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9528,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8029
+      }
+    },
+    {
+      "index": 124,
+      "text": " 483\nExplanation: 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.952,
+        "tpot_s": 0.1672,
+        "latency_s": 11.8022
+      }
+    },
+    {
+      "index": 125,
+      "text": " 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.947,
+        "tpot_s": 0.1672,
+        "latency_s": 11.7972
+      }
+    },
+    {
+      "index": 126,
+      "text": " 529\nExplanation: 23 times 23 is 23 * 23 = 529. This is a simple",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9462,
+        "tpot_s": 0.1672,
+        "latency_s": 11.7964
+      }
+    },
+    {
+      "index": 127,
+      "text": " 24 times 23 is 552. \nExplanation: 24 times 23 is 552. \nThis is",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 7.9466,
+        "tpot_s": 0.1672,
+        "latency_s": 11.7967
+      }
+    }
+  ]
+}

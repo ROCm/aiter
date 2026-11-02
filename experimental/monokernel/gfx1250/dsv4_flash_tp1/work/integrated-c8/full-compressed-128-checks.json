@@ -1,0 +1,51 @@
+[
+  {
+    "m": 8,
+    "checks": {
+      "norm": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "q": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kv": {
+        "exact": true,
+        "rms": 0.0,
+        "max_abs": 0.0
+      },
+      "attention": {
+        "exact": false,
+        "rms": 0.0006896351696923375,
+        "max_abs": 0.0009765625
+      },
+      "output": {
+        "exact": false,
+        "rms": 0.010687734000384808,
+        "max_abs": 0.001220703125
+      },
+      "mhc_post": {
+        "exact": false,
+        "rms": 0.0009722663671709597,
+        "max_abs": 0.015625
+      },
+      "compressor_state": true,
+      "final": {
+        "exact": false,
+        "rms": 0.0047430479899048805,
+        "max_abs": 0.125
+      },
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 432,
+    "lds": 157156,
+    "spills": 0
+  }
+]

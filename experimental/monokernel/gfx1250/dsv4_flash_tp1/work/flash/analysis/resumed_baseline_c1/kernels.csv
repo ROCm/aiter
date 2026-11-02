@@ -1,0 +1,43 @@
+kernel,bucket,count,mean_us,median_us,sum_us,min_us,max_us,streams
+gemm_a8w8_mx128_t16x1024x128_mw1_nw4_nb2_sk1_cm1_cn1,decode[bs=1 tok=1 d=1],9650,46.59658880829016,27.0995,449657.082,12.658,116.575,"0,33,34,35"
+gemm_a8w8_mx128_t16x512x256_mw1_nw4_nb2_sk1_cm1_cn1,decode[bs=1 tok=1 d=1],2150,25.339631627906975,24.956,54480.208,23.955,32.368,"0,33,34,35"
+_moe_gemm_a8w4_decode_BLOCK_M_16_BLOCK_N_64_BLOCK_K_512_SWIZZLE_MX_SCALE_GFX1250_SCALE_APPLY_SWIGLU_1_num_warps_4_NUM_BUFFERS_3_HAS_MX_OUT_1_EP_SCATTER_0,decode[bs=1 tok=1 d=1],2150,9.83957488372093,9.614,21155.086,9.253,16.984,0
+_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii,decode[bs=1 tok=1 d=1],8600,2.334792906976744,2.322,20079.219,1.442,6.409,"0,33,34,35"
+_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_16_BLOCK_N_16_BLOCK_K_512_NUM_BUFFERS_3_LAYOUT_TN_USE_ACTIVATION_0_ADD_BIAS_0,decode[bs=1 tok=1 d=1],4200,4.4216814285714285,4.365,18571.061999999998,3.604,8.692,"0,33,34,35"
+_pa_decode_sparse_reduce_BLOCK_H_1_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128,decode[bs=1 tok=1 d=1],2150,7.568880465116279,7.21,16273.093,6.528,17.265,0
+_mhc_post_pre_gemm_sqrsum_gfx1250_kernel_C_4096_BLOCK_M_16_K_LOOP_1_SPLIT_K_64_NUM_STAGES_2_RES_SHUFFLED_1_W_PRESHUFFLED_1,decode[bs=1 tok=1 d=1],4250,3.263711529411765,3.324,13870.774,2.323,7.691,0
+_mhc_pre_reduce_apply_gfx1250_kernel_C_4096_ROWS_1_CHUNK_1024_N_CHUNKS_4_S_64_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0,decode[bs=1 tok=1 d=1],4250,3.1522023529411767,3.124,13396.86,2.803,7.25,0
+batched_gemm_a8w8_mx128_t32x32x1024_mw2_nw2_nb4_sk1_cm1_cn1_mbn,decode[bs=1 tok=1 d=1],2150,5.241713953488372,5.167,11269.685,4.766,9.132,0
+_moe_gemm_a8w4_decode_BLOCK_M_16_BLOCK_N_64_BLOCK_K_512_SWIZZLE_MX_SCALE_GFX1250_SCALE_APPLY_SWIGLU_0_num_warps_4_NUM_BUFFERS_3_HAS_MX_OUT_0_EP_SCATTER_0,decode[bs=1 tok=1 d=1],2150,5.191810697674419,5.126,11162.393,4.646,9.293,0
+_combined_routing_fused_BLOCK_M_1_EVEN_M_1_N_EXPTS_ACT_6_N_EXPTS_ACT_PAD_8_N_EXPTS_TOT_256_N_BLKS_BITMATRIX_8_tile_dim_log2_4_BLOCK_A_256_EQUAL_A_1_USE_TDM_1,decode[bs=1 tok=1 d=1],2150,5.014596279069767,4.966,10781.382,3.604,10.174,0
+_pa_decode_sparse_BLOCK_H_16_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128,decode[bs=1 tok=1 d=1],2150,4.559119534883721,4.406,9802.107,3.645,9.373,0
+_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,decode[bs=1 tok=1 d=1],1050,7.442871428571428,7.41,7815.015,6.769,11.055,0
+qk_norm_rope_H64_D512_RD64_kvw_r4_w32_flydsl,decode[bs=1 tok=1 d=1],2150,3.6075948837209304,3.565,7756.329,2.563,7.691,"0,33,34,35"
+_update_compressor_states_kernel,decode[bs=1 tok=1 d=1],3100,2.1994409677419355,2.202,6818.267,1.481,7.33,"0,33,34,35"
+reduce_grouped_gluon,decode[bs=1 tok=1 d=1],2150,2.9353897674418605,3.124,6311.088,2.042,6.809,0
+_topk_BLOCK_M_1_BLOCK_N_128_BLOCK_S_128_BLOCK_SP_128_N_EXPTS_PAD_256_N_EXPTS_ACT_6_N_EXPTS_ACT_PAD_8_SCORE_MODE_SQRTSOFTPLUS_APPLY_SOFTMAX_0_HAS_BIAS_1_APPLY_RENORM_1_WRITE_POP_0,decode[bs=1 tok=1 d=1],2000,2.9736685,2.963,5947.337,2.683,5.968,0
+_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb,decode[bs=1 tok=1 d=1],2150,2.4281893023255816,2.403,5220.607,1.962,6.448,"0,33,34,35"
+_ZN5aiter18act_and_mul_kernelIDF16bDF16bTnPFfRKT_EXadL_ZNS_11silu_kernelIDF16bEEfS3_EELi8ELb1ELi3EEEvPT0_PS2_if,decode[bs=1 tok=1 d=1],2150,2.1987944186046513,2.163,4727.408,1.561,4.526,"0,33,34,35"
+"void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",decode[bs=1 tok=1 d=1],2150,2.170332093023256,2.163,4666.214,1.201,6.249,0
+_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_16_BLOCK_N_16_BLOCK_K_256_NUM_BUFFERS_6_LAYOUT_TN_USE_ACTIVATION_0_ADD_BIAS_0,decode[bs=1 tok=1 d=1],1050,4.23112,4.165,4442.676,3.845,8.131,0
+_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii,decode[bs=1 tok=1 d=1],2150,2.0639920930232556,2.042,4437.583,1.842,5.928,0
+_gemm_a16w16_gfx1250_compute_bound_kernel_BLOCK_M_16_BLOCK_N_16_BLOCK_K_512_NUM_BUFFERS_4_LAYOUT_TN_USE_ACTIVATION_0_ADD_BIAS_0,decode[bs=1 tok=1 d=1],1050,3.7274219047619046,3.685,3913.793,3.324,7.771,0
+_downcast_to_mxfp_BLOCK_SIZE_OUT_DIM_128_BLOCK_SIZE_QUANT_DIM_32_DEQUANT_SCALE_ROUNDING_MODE_0_POW2_SCALE_0,decode[bs=1 tok=1 d=1],2150,1.7710418604651164,1.721,3807.74,1.481,5.687,0
+fused_compress_attn_w32_D512_RD64_R4_OVL_SS8_KB64_KS4_rmsbf16_flydsl,decode[bs=1 tok=1 d=1],1050,2.786427619047619,1.681,2925.749,1.2,9.893,0
+_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_16_BLOCK_N_128_BLOCK_K_128_NUM_BUFFERS_4_LAYOUT_TN_USE_ACTIVATION_0_ADD_BIAS_0,decode[bs=1 tok=1 d=1],50,58.00938,57.0045,2900.469,56.764,70.024,0
+_csa_translate_pack_kernel,decode[bs=1 tok=1 d=1],1050,2.532505714285714,2.523,2659.131,2.202,4.005,0
+fused_compress_attn_w32_D128_RD64_R4_OVL_SS8_KB64_KS4_Q_ue8m0_rmsbf16_flydsl,decode[bs=1 tok=1 d=1],1050,2.055707619047619,1.441,2158.493,1.24,4.967,"0,33,34,35"
+_ZN5aiter47rope_hadamard_rotate_activation_fp8quant_kernelIDF16bLb0ELi128ELi16EEEvPDB8_PKT_S5_S5_PKlPfiiiiii,decode[bs=1 tok=1 d=1],1050,1.9447819047619046,1.922,2042.021,1.721,2.242,0
+radix_topk_one_block_decode_mixed_k512_b1024_w32_v0_s0,decode[bs=1 tok=1 d=1],1050,1.8588285714285713,1.882,1951.77,1.401,2.322,0
+hca_compress_forward_w32_D512_R128_NW16_SL32_S128_flydsl,decode[bs=1 tok=1 d=1],1000,1.675378,1.721,1675.378,1.361,4.245,0
+_scale_indexer_weights_kernel,decode[bs=1 tok=1 d=1],1050,1.37472,1.361,1443.456,1.201,1.842,0
+_topk_BLOCK_M_1_BLOCK_N_128_BLOCK_S_128_BLOCK_SP_128_N_EXPTS_PAD_256_N_EXPTS_ACT_6_N_EXPTS_ACT_PAD_8_SCORE_MODE_SQRTSOFTPLUS_APPLY_SOFTMAX_0_HAS_BIAS_0_APPLY_RENORM_1_WRITE_POP_0,decode[bs=1 tok=1 d=1],150,2.78556,2.763,417.834,2.562,3.324,0
+mhc_res_unshuffle_h4096_hc4_ks64_b2,decode[bs=1 tok=1 d=1],100,2.59369,2.603,259.36899999999997,2.363,3.004,0
+"void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 9, 4, 1, 4096, 1024, 1024, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",decode[bs=1 tok=1 d=1],50,4.50828,4.4855,225.414,4.206,4.887,0
+"void aiter::mhc_pre_big_fuse_kernel<std::bfloat16_t, 5, 4, 2, 256, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, int, int, int, int, float, float, float, float, int, int, int, int)",decode[bs=1 tok=1 d=1],50,3.97684,3.965,198.84199999999998,3.724,4.245,0
+"void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, false>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",decode[bs=1 tok=1 d=1],50,2.88814,2.803,144.40699999999998,2.683,3.845,0
+"void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",decode[bs=1 tok=1 d=1],50,2.73116,2.683,136.558,2.563,4.766,0
+"void aiter::add_rmsnorm_quant_kernel<std::bfloat16_t, std::bfloat16_t, 256, 16, false, false, true, 1, false>(std::bfloat16_t*, std::bfloat16_t*, float*, std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, double, bool, int, int, int, int, int, int, int, bool, bool)",decode[bs=1 tok=1 d=1],50,2.39224,2.362,119.612,2.042,2.844,0
+mhc_res_repeat_h4096_hc4_ks64_b2,decode[bs=1 tok=1 d=1],50,2.38162,2.3825000000000003,119.081,2.202,2.563,0
+"void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",decode[bs=1 tok=1 d=1],50,2.12216,2.122,106.10799999999999,1.962,2.402,0
+triton_poi_fused_embedding_0,decode[bs=1 tok=1 d=1],50,1.70804,1.7215,85.402,1.481,2.482,0

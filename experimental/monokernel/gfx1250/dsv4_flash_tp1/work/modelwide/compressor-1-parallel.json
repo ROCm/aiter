@@ -1,0 +1,68 @@
+{
+  "case": 1,
+  "ratio": 128,
+  "head_dim": 512,
+  "quant": false,
+  "validation": [
+    {
+      "position": 127,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1023,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1024,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1151,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 1535,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    },
+    {
+      "position": 2047,
+      "cache_max_abs": 0.0,
+      "cache_mismatch": 0,
+      "scale_equal": true,
+      "kv_state_equal": true,
+      "score_state_equal": true
+    }
+  ],
+  "timings": [
+    {
+      "native_us": 7.453031139448285,
+      "fused_us": 71.02625072002411
+    },
+    {
+      "native_us": 7.438624976202846,
+      "fused_us": 71.00309431552887
+    }
+  ],
+  "registers": 266,
+  "shared": 36864
+}

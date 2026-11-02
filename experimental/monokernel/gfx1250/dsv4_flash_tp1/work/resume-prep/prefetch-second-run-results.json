@@ -1,0 +1,32 @@
+{
+  "resumed-native": {
+    "completed": 64,
+    "median_ttft_ms": 292.1992300000511,
+    "median_tpot_ms": 13.69157354740962,
+    "total_token_throughput": 1129.948767022025
+  },
+  "resumed-native-control-stress": {
+    "completed": 64,
+    "median_ttft_ms": 295.60367600015525,
+    "median_tpot_ms": 13.755246096285344,
+    "total_token_throughput": 1126.8213674599972
+  },
+  "resumed-no-prefetch-stress": {
+    "completed": 64,
+    "median_ttft_ms": 299.1582989998278,
+    "median_tpot_ms": 12.987541355327451,
+    "total_token_throughput": 1186.5464441450738
+  },
+  "resumed-masked-prefetch": {
+    "completed": 64,
+    "median_ttft_ms": 292.3861485000998,
+    "median_tpot_ms": 12.86200343255136,
+    "total_token_throughput": 1218.4495093696644
+  },
+  "resumed-bounded-tdm-prefetch": {
+    "completed": 64,
+    "median_ttft_ms": 295.4370459997335,
+    "median_tpot_ms": 12.86419342424231,
+    "total_token_throughput": 1215.6051774635605
+  }
+}

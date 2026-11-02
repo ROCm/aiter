@@ -1,0 +1,22 @@
+{
+  "fused": {
+    "vgpr": 419,
+    "spills": 0,
+    "lds": 131584
+  },
+  "l2": {
+    "vgpr": 419,
+    "spills": 0,
+    "lds": 131584
+  },
+  "early": {
+    "vgpr": 419,
+    "spills": 0,
+    "lds": 131584
+  },
+  "both": {
+    "vgpr": 419,
+    "spills": 0,
+    "lds": 131584
+  }
+}

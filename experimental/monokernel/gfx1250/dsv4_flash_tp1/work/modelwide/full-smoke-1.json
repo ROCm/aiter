@@ -1,0 +1,14 @@
+{
+  "case": 1,
+  "ratio": 4,
+  "finite": true,
+  "health": {
+    "attention": true,
+    "ffn": 0,
+    "moe": 0
+  },
+  "vgpr": 492,
+  "lds": 133088,
+  "spills": 0,
+  "scope": "compile and synchronization smoke test; mixed layer-zero and synthetic compressed weights, NOT model validation"
+}

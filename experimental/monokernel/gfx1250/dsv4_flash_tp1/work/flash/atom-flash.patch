@@ -1,0 +1,245 @@
+--- a/atom/model_ops/dsv4_hybrid.py
++++ b/atom/model_ops/dsv4_hybrid.py
+@@ -6,6 +6,8 @@
+ 
+ _CHECK = os.environ.get("ATOM_DSV4_HYBRID_CHECK", "0") == "1"
+ _checked = 0
++_HC_CHECK_LIMIT = int(os.environ.get("ATOM_DSV4_HYBRID_HC_CHECK_LIMIT", "16"))
++_hc_checks = {}
+ _MAX_TOKENS = min(128, int(os.environ.get("ATOM_DSV4_HYBRID_MAX_TOKENS", "128")))
+ 
+ 
+@@ -105,7 +107,11 @@
+         res_preshuffle=res_preshuffle,
+     )
+     global _checked
+-    if _CHECK and _checked < 16 and not torch.cuda.is_current_stream_capturing():
++    if (
++        _CHECK
++        and _checked < _HC_CHECK_LIMIT
++        and not torch.cuda.is_current_stream_capturing()
++    ):
+         import aiter
+         from aiter.ops.quant import per_group_quant_hip
+ 
+@@ -144,6 +150,14 @@
+             result[5].view(torch.uint8), qs.view(torch.uint8), rtol=0, atol=0
+         )
+         _checked += 1
++        hc_key = f"{x.shape[0]},{x.shape[1]}"
++        _hc_checks[hc_key] = _hc_checks.get(hc_key, 0) + 1
++        hc_count = _hc_checks[hc_key]
++        if _HC_CHECK_LIMIT > 16 and (hc_count == 2 or hc_count % 128 == 0):
++            print(
++                f"DSV4 hybrid mHC {hc_key}: {hc_count} exact live checks passed",
++                flush=True,
++            )
+         if _checked == 16:
+             print("DSV4 hybrid mHC: 16 exact live checks passed", flush=True)
+     return result
+@@ -222,7 +236,9 @@
+     """
+     if not _ATTN or mxscale_shuffle or dtype != torch.bfloat16:
+         return None
+-    if not prefix.endswith((".attn.wq_b", ".attn.indexer.wq_b", ".attn.wo_b")):
++    if not prefix.endswith(
++        (".attn.wqkv_a", ".attn.wq_b", ".attn.indexer.wq_b", ".attn.wo_b")
++    ):
+         return None
+     if x.ndim != 2 or x.dtype != torch.float8_e4m3fn:
+         return None
+@@ -241,7 +257,12 @@
+         from aiter.ops.triton.utils.config_utils import load_config_json
+ 
+         _attention_configs = load_config_json(
+-            Path(__file__).with_name("dsv4_attention_configs.json")
++            Path(
++                os.environ.get(
++                    "ATOM_DSV4_HYBRID_ATTN_CONFIG",
++                    str(Path(__file__).with_name("dsv4_attention_configs.json")),
++                )
++            )
+         )
+     key = f"{x.shape[0]},{weight.shape[0]},{weight.shape[1]}"
+     config = _attention_configs.get(key)
+--- /dev/null
++++ b/atom/model_ops/dsv4_flash_attention_configs.json
+@@ -0,0 +1,178 @@
++{
++  "1,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,8192,1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 4,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "64,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "64,32768,1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "128,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  }
++}

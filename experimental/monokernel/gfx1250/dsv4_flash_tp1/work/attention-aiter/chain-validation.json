@@ -1,0 +1,514 @@
+[
+  {
+    "fused": false,
+    "case": 0,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.7483298456209013e-06,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 1,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.3304902899544686e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 2,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5625349988113157e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 3,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 7.528154583269497e-06,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 4,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.0199863027082756e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 5,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 8.84926976141287e-06,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 6,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.3193427548685577e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 7,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.0202066732745152e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 8,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 6.21681465418078e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 9,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.7483298456209013e-06,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 10,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.3304902899544686e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 11,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5625349988113157e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 12,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.5027975425473414e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 13,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4298383575805929e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 14,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.4944098186097108e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 15,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4977212231315207e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 16,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.2629443265032023e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 17,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.6657011656207033e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 18,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4174596799421124e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 19,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.7745289369486272e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 20,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5197367247310467e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 21,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.8545257262303494e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 22,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.0385230274987407e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 23,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.967357275134418e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 24,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 0.0002675998257473111,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 25,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.538115793664474e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 26,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.048859096248634e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 27,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.0987763491575606e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 28,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.6284888008376583e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 29,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.1416795132390689e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 30,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.319969644304365e-05,
+    "health": true
+  },
+  {
+    "fused": false,
+    "case": 31,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.1883763110963628e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 0,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.7483298456209013e-06,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 1,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.3304902899544686e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 2,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5625349988113157e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 3,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 7.528154583269497e-06,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 4,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.0199863027082756e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 5,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 8.84926976141287e-06,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 6,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.3193427548685577e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 7,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.0202066732745152e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 8,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 6.21681465418078e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 9,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.7483298456209013e-06,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 10,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.3304902899544686e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 11,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5625349988113157e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 12,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.5027975425473414e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 13,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4298383575805929e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 14,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.4944098186097108e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 15,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4977212231315207e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 16,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.2629443265032023e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 17,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.6657011656207033e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 18,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.4174596799421124e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 19,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.7745289369486272e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 20,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.5197367247310467e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 21,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.8545257262303494e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 22,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 3.0385230274987407e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 23,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.967357275134418e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 24,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 0.0002675998257473111,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 25,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.538115793664474e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 26,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.048859096248634e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 27,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.0987763491575606e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 28,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.6284888008376583e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 29,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 1.1416795132390689e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 30,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.319969644304365e-05,
+    "health": true
+  },
+  {
+    "fused": true,
+    "case": 31,
+    "q_error": 0.0,
+    "kv_error": 0.0,
+    "attention_error": 2.1883763110963628e-05,
+    "health": true
+  }
+]

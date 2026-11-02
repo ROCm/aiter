@@ -1,0 +1,11 @@
+{
+  "baseline_A": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "wmma": 4,
+    "barriers": 6,
+    "ds_load": 36,
+    "ds_store": 10
+  }
+}

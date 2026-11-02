@@ -1,0 +1,66 @@
+[
+  {
+    "seed": 0,
+    "collision": false,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 0,
+    "collision": true,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 1,
+    "collision": false,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 1,
+    "collision": true,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 2,
+    "collision": false,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 2,
+    "collision": true,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 3,
+    "collision": false,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  },
+  {
+    "seed": 3,
+    "collision": true,
+    "finite": true,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "health": 0
+  }
+]

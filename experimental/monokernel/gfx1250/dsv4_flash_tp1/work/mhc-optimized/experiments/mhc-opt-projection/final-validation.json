@@ -1,0 +1,11 @@
+{
+  "cases": 64,
+  "checks": 960,
+  "max_errors": {
+    "original": 4.146891114942264e-06,
+    "prefetch": 4.146891114942264e-06,
+    "localprefetch": 4.146891114942264e-06,
+    "packed": 4.146891114942264e-06,
+    "packedprefetch": 4.146891114942264e-06
+  }
+}

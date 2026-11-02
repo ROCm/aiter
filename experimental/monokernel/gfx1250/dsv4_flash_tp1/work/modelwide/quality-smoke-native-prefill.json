@@ -1,0 +1,72 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "baseline": {
+      "index": 0,
+      "text": " Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " Paris. * Je * French * You = background(che1, >  *  &  )' [' T ( )' * *  * * * * and en- em, maybe, 's' ( )",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "2 + 2 =",
+    "baseline": {
+      "index": 0,
+      "text": " 4, 4 + 2 = 6, 6 + 2 = 8, 8 + 2 = 10, 10 + 2 = 12, 12 + 2 = 14,",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " 4. + 1 = 2^{2 + 2)  1 = 2_   2 =  2 _   2 =  2 2_    2 =",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "Write a Python function that adds two numbers.\n",
+    "baseline": {
+      "index": 0,
+      "text": "    The function should be named 'add' and take two parameters.\n    It should return the sum of the two numbers.\n    \"\"\"\n    return a + b\n\n# Test the function\nresult = add(5, 3)\nprint",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": "    I    C/RT= <J\u00a06  (21) h6  2.2  2.2  3.  2.  2.  3.  4. ",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "The opposite of hot is",
+    "baseline": {
+      "index": 0,
+      "text": " cold. The opposite of cold is hot. The opposite of wet is dry. The opposite of dry is wet. The opposite of light is dark. There is no opposite of opposite. The opposite of opposite is same. The opposite of same",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " cold. something R . . The opposite $-1, and the same some (0) and the same 0, the same 0, and the same 0, and the same 0, and the same 0,",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "A triangle has three",
+    "baseline": {
+      "index": 0,
+      "text": " sides and three angles. The sum of the angles of a triangle is always 180 degrees. In a right triangle, the side opposite the right angle is called the hypotenuse, and the other two sides are called legs. An equilateral triangle",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " sides: 0, the base of G, the triangle joining  natching:  the two  and 0,  the 0, the 2, the 1, the 1, the 1.  .",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  }
+]

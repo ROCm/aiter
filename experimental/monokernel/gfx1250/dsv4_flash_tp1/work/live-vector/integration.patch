@@ -1,0 +1,87 @@
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -4193,6 +4193,10 @@
+                 self.hybrid_max_tokens,
+             )
+ 
++        if os.environ.get("ATOM_VECTOR_UNFUSED", "0") == "1" and self.layer_id in (0, 1):
++            from atom.models.dsv4_vector.runtime import register
++            register(self)
++
+     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
+     HC_POST_MULT = 2.0
+ 
+@@ -4440,7 +4444,7 @@
+             res_preshuffle=hc_state.res_preshuffle,
+         )
+ 
+-    def forward(
++    def _vector_original_forward(
+         self,
+         hc_state: HCState,
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+@@ -4492,6 +4496,13 @@
+             )  # [num_tokens, dim]  (input_ids from forward_context for hash MoE)
+         hc_state.x_prev = x
+         return hc_state
++
++
++    def forward(self, hc_state, positions):
++        if os.environ.get("ATOM_VECTOR_UNFUSED", "0") == "1" and self.layer_id in (0, 1):
++            from atom.models.dsv4_vector.runtime import forward
++            return forward(self, hc_state, positions)
++        return self._vector_original_forward(hc_state, positions)
+ 
+ 
+ class ParallelHead(ParallelLMHead):
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -1943,21 +1943,33 @@
+                     routing,
+                 )
+ 
+-                routing_data, gather_idx, scatter_idx = routing(
+-                    router_logits,
+-                    n_expts_act,
+-                    score_mode=scoring_func,
+-                    bias=(
+-                        e_score_correction_bias.to(torch.float32)
+-                        if e_score_correction_bias is not None
+-                        else None
+-                    ),
+-                    renorm=renormalize,
+-                    routed_scaling_factor=layer.routed_scaling_factor,
+-                    use_grouped_topk=use_grouped_topk,
+-                    num_expert_group=num_expert_group,
+-                    topk_group=topk_group,
+-                )
++                hash_owner = getattr(custom_routing_function, "__self__", None)
++                if hash_owner is not None and getattr(hash_owner, "is_hash_layer", False):
++                    from aiter.ops.triton.moe.moe_routing.routing import routing_from_hash
++                    tokens_per_expert = max(1, router_logits.shape[0] * n_expts_act // router_logits.shape[1])
++                    block_m = max(16, min(1 << (tokens_per_expert - 1).bit_length(), 128))
++                    routing_data, gather_idx, scatter_idx = routing_from_hash(
++                        router_logits, hash_owner.gate.tid2eid,
++                        get_forward_context().context.input_ids, n_expts_act, block_m,
++                        score_mode=scoring_func, renorm=renormalize,
++                        routed_scaling_factor=layer.routed_scaling_factor,
++                    )
++                else:
++                    routing_data, gather_idx, scatter_idx = routing(
++                        router_logits,
++                        n_expts_act,
++                        score_mode=scoring_func,
++                        bias=(
++                            e_score_correction_bias.to(torch.float32)
++                            if e_score_correction_bias is not None
++                            else None
++                        ),
++                        renorm=renormalize,
++                        routed_scaling_factor=layer.routed_scaling_factor,
++                        use_grouped_topk=use_grouped_topk,
++                        num_expert_group=num_expert_group,
++                        topk_group=topk_group,
++                    )
+                 # Routed-only gate count (no shared-expert widening).
+                 n_expts_act = routing_data.n_expts_act
+ 

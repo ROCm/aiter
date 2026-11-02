@@ -1,0 +1,9 @@
+{
+  "vgpr": 30,
+  "lds": 1584,
+  "spills": 0,
+  "graph_nodes": {
+    "native": 384,
+    "fused": 128
+  }
+}

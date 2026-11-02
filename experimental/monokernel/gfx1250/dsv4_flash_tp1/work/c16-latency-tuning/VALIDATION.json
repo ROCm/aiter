@@ -1,0 +1,11 @@
+{
+  "date": "2026-10-22T00:03:13.294307+00:00",
+  "region_rows": 16,
+  "full_layer_variants": 3,
+  "full_layer_intermediate_checks": 39,
+  "full_layer_checks_exact": true,
+  "all_full_layer_spills_zero": true,
+  "all_health_flags_zero": true,
+  "serving_test": false,
+  "selected_configuration": "selected.env"
+}

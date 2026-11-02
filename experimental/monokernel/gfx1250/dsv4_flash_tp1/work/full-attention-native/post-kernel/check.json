@@ -1,0 +1,14 @@
+{
+  "True": {
+    "max_abs": 0.015625,
+    "unequal": 29,
+    "vgpr": 29,
+    "spills": 0
+  },
+  "False": {
+    "max_abs": 0.0078125,
+    "unequal": 29,
+    "vgpr": 28,
+    "spills": 0
+  }
+}

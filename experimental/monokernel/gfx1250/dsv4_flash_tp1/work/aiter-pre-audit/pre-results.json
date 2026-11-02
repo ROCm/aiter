@@ -1,0 +1,206 @@
+[
+  {
+    "m": 1,
+    "new_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.492710286603142e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 4.470348358154297e-08,
+        "relative_rms": 1.0479605805358005e-07
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.492710286603142e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 2.9802322387695312e-08,
+        "relative_rms": 9.622637264783407e-08
+      }
+    },
+    "new_vs_old": {
+      "exact": true,
+      "max_abs": 0.0,
+      "relative_rms": 0.0
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "new_us": 5.811698424878142,
+    "old_us": 7.296227278193768
+  },
+  {
+    "m": 2,
+    "new_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 4.9376907895748445e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 5.960464477539063e-08,
+        "relative_rms": 1.1817416378789858e-07
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 4.9376907895748445e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 5.960464477539063e-08,
+        "relative_rms": 1.0105120651360266e-07
+      }
+    },
+    "new_vs_old": {
+      "exact": true,
+      "max_abs": 0.0,
+      "relative_rms": 0.0
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "new_us": 5.769376432898647,
+    "old_us": 7.1266867131391995
+  },
+  {
+    "m": 4,
+    "new_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 2.9356581165984608e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 7.450580596923828e-08,
+        "relative_rms": 1.2351210898486897e-07
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 8.940696716308594e-08,
+        "relative_rms": 1.199925208084096e-07
+      }
+    },
+    "new_vs_old": {
+      "exact": true,
+      "max_abs": 0.0,
+      "relative_rms": 0.0
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "new_us": 7.143436138950055,
+    "old_us": 8.89473468085156
+  },
+  {
+    "m": 8,
+    "new_vs_native": {
+      "norm": {
+        "exact": false,
+        "max_abs": 0.000244140625,
+        "relative_rms": 1.3488134982253541e-06
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 2.3743004007314994e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 5.960464477539063e-08,
+        "relative_rms": 1.0387979898496269e-07
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": false,
+        "max_abs": 9.5367431640625e-07,
+        "relative_rms": 5.268762315324693e-09
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 4.865867708758742e-08
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 5.960464477539063e-08,
+        "relative_rms": 1.0059785893190565e-07
+      }
+    },
+    "new_vs_old": {
+      "exact": false,
+      "max_abs": 0.000244140625,
+      "relative_rms": 1.3488031527231215e-06
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 98,
+    "lds": 44004,
+    "spills": 0,
+    "new_us": 6.820222639403824,
+    "old_us": 8.487551689351161
+  }
+]

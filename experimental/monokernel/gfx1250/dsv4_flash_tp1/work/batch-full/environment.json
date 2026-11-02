@@ -1,0 +1,13 @@
+{
+  "repos": {
+    "/app/ATOM": "f19778df4054e94d64d6f6bf6dd68f5681bd5945",
+    "/app/aiter": "7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe",
+    "/app/triton-mi450": "9551a57b95fff2aa2fc0e24ff70cc1158676f601"
+  },
+  "packages": {
+    "torch": "2.11.0+rocm10.1.0a20260811.bkc.20260820",
+    "triton": "3.8.0.dev20260903+git9551a57b"
+  },
+  "image_base": "rocm/fw-bringup-mlperf:gfx1250-atom-20261015",
+  "host_mount": "/home/vigokhal/dsv4-monokernel -> /work"
+}

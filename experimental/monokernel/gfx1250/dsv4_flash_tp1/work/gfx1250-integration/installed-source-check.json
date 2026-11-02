@@ -1,0 +1,16 @@
+{
+  "atom/models/deepseek_v4_mono/__init__.py": true,
+  "atom/models/deepseek_v4_mono/config.py": true,
+  "atom/models/deepseek_v4_mono/configs/flash_tp1.json": true,
+  "atom/models/deepseek_v4_mono/configs/pro_tp4.json": true,
+  "atom/models/deepseek_v4_mono/dispatch.py": true,
+  "atom/models/deepseek_v4_mono/kernels/__init__.py": true,
+  "atom/models/deepseek_v4_mono/kernels/ops.py": true,
+  "atom/models/deepseek_v4_mono/linear.py": true,
+  "atom/models/deepseek_v4_mono/runner.py": true,
+  "atom/models/deepseek_v4.py": true,
+  "atom/model_engine/model_runner.py": true,
+  "atom/utils/envs.py": true,
+  "pyproject.toml": true,
+  "scripts/serve_dsv4_mono_gfx1250.sh": true
+}

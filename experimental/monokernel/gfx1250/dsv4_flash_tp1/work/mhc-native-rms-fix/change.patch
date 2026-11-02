@@ -1,0 +1,20 @@
+--- before/tdm_tail.py
++++ after/tdm_tail.py
+@@ -44,13 +44,15 @@
+         p2=1./(1.+gl.exp(-(gl.sum(dev_load(Temp,si*24+2),0)*rs*dev_load(S,0)+dev_load(B,2))))+1.e-6
+         p3=1./(1.+gl.exp(-(gl.sum(dev_load(Temp,si*24+3),0)*rs*dev_load(S,0)+dev_load(B,3))))+1.e-6
+         if pid==0:
+-            y=(((r0*p0+r1*p1)+r2*p2)+r3*p3).to(gl.bfloat16).to(gl.float32)
++            mixture=((r0*p0+r1*p1)+r2*p2)+r3*p3
++            # ATOM computes RMS from FP32 mixture, but normalizes its BF16-rounded value.
++            y=mixture.to(gl.bfloat16).to(gl.float32)
+             dev_store(y.to(gl.bfloat16),Raw,i)
+             if EARLY:
+                 av=abuf.load(gl.BlockedLayout([1,1],[1,32],[1,4],[1,0]))
+                 an=gl.convert_layout(gl.sum(av.to(gl.float32),0),L)
+             else:an=dev_load(AN,i).to(gl.float32)
+-            x=y*gl.rsqrt(gl.sum(y*y,0)/4096+1.e-6)*an
++            x=y*gl.rsqrt(gl.sum(mixture*mixture,0)/4096+1.e-6)*an
+             dev_store(x.to(gl.bfloat16),X,i)
+         if pid==MODE:
+             dev_store(p0,M,0);dev_store(p1,M,1);dev_store(p2,M,2);dev_store(p3,M,3)

@@ -1,0 +1,86 @@
+[
+  {
+    "token": 0,
+    "vector": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": false,
+        "max_abs": 0.125,
+        "rms_relative": 0.0007240153499878943,
+        "nonfinite": 0
+      }
+    },
+    "wmma": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": true,
+        "max_abs": 0.0,
+        "rms_relative": 0.0,
+        "nonfinite": 0
+      }
+    }
+  },
+  {
+    "token": 1,
+    "vector": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": false,
+        "max_abs": 1.9073486328125e-06,
+        "rms_relative": 2.0999157968049076e-08,
+        "nonfinite": 0
+      }
+    },
+    "wmma": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": true,
+        "max_abs": 0.0,
+        "rms_relative": 0.0,
+        "nonfinite": 0
+      }
+    }
+  },
+  {
+    "token": 7,
+    "vector": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": true,
+        "max_abs": 0.0,
+        "rms_relative": 0.0,
+        "nonfinite": 0
+      }
+    },
+    "wmma": {
+      "passes_original_gate": false,
+      "output": {
+        "exact": false,
+        "max_abs": 0.005859375,
+        "rms_relative": 0.0035678273998200893,
+        "nonfinite": 0
+      }
+    }
+  },
+  {
+    "token": 43,
+    "vector": {
+      "passes_original_gate": false,
+      "output": {
+        "exact": false,
+        "max_abs": 0.00390625,
+        "rms_relative": 0.006895372178405523,
+        "nonfinite": 0
+      }
+    },
+    "wmma": {
+      "passes_original_gate": true,
+      "output": {
+        "exact": false,
+        "max_abs": 1.9073486328125e-06,
+        "rms_relative": 1.846085098122785e-07,
+        "nonfinite": 0
+      }
+    }
+  }
+]

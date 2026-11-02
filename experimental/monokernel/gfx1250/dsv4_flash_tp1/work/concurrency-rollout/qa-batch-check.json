@@ -1,0 +1,32 @@
+[
+  {
+    "m": 2,
+    "finite": true,
+    "health": 0,
+    "quant_neq": 0,
+    "kv_rms": 0.0,
+    "vgpr": 147,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "finite": true,
+    "health": 0,
+    "quant_neq": 0,
+    "kv_rms": 0.0,
+    "vgpr": 147,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "finite": true,
+    "health": 0,
+    "quant_neq": 0,
+    "kv_rms": 0.0,
+    "vgpr": 147,
+    "lds": 41440,
+    "spills": 0
+  }
+]

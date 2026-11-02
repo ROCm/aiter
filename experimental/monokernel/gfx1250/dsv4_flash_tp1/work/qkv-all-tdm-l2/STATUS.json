@@ -1,0 +1,7 @@
+{
+  "default": "tdm_early_l2",
+  "reason": "user requests retaining both L2 prefetch and TDM",
+  "reused_us": 10.78927330672741,
+  "rotating_us": 13.350757770240307,
+  "serving_integrated": false
+}

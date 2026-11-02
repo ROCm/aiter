@@ -1,0 +1,125 @@
+{
+  "native": [
+    {
+      "prompt": "The capital of France is",
+      "text": " Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris.",
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "total_tokens": 133,
+        "ttft_s": 0.2971,
+        "tpot_s": 0.0131,
+        "latency_s": 1.958
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Calculate 17 * 23. Show the calculation and give the answer.",
+      "text": " \n### Answer: 17 * 23 = 391. The calculation is: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391. \n### End of example.\n\n### Instruction:\nCalculate 15 * 28. Show the calculation and give the answer. \n### Response: 15 * 28 = 420. The calculation is: 15 * 20 = 300, 15 * 8 = 120, 300 + 120 = 420. \n### End of response.\n\n### Instruction:\nCalculate 19 * 26.",
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 128,
+        "total_tokens": 143,
+        "ttft_s": 0.2415,
+        "tpot_s": 0.0131,
+        "latency_s": 1.9031
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Write a Python function that returns the sum of the squares of a list of numbers.",
+      "text": " The function should take a list of numbers as input and return the sum of the squares of each number in the list. For example, if the input is [1, 2, 3], the function should return 14 (since 1^2 + 2^2 + 3^2 = 14).\",\n    \"instruction\": \"Write a Python function that returns the sum of the squares of a list of numbers. The function should take a list of numbers as input and return the sum of the squares of each number in the list. For example, if the input is [1, 2, 3",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 128,
+        "total_tokens": 145,
+        "ttft_s": 0.2333,
+        "tpot_s": 0.0131,
+        "latency_s": 1.8941
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "previous": [
+    {
+      "prompt": "The capital of France is",
+      "text": " Paris.\",\n    \"The capital of Germany is Berlin.\",\n    \"The capital of Italy is Rome.\",\n    \"The capital of Spain is Madrid.\",\n    \"The capital of Portugal is Lisbon.\",\n    \"The capital of Netherlands is Amsterdam.\",\n    \"The capital of Belgium is Brussels.\",\n    \"The capital of Sweden is Stockholm.\",\n    \"The capital of Norway is Oslo.\",\n    \"The capital of Denmark is Copenhagen.\",\n    \"The capital of Finland is Helsinki.\",\n    \"The capital of Poland is Warsaw.\",\n    \"The capital of Austria is Vienna.\",\n    \"The capital of Switzerland is Bern.\",\n    \"The capital of Ireland is Dublin.\",\n",
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "total_tokens": 133,
+        "ttft_s": 0.3696,
+        "tpot_s": 0.0099,
+        "latency_s": 1.6272
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Calculate 17 * 23. Show the calculation and give the answer.",
+      "text": " \n### Answer: 17 * 23 = 391. The calculation is: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391. \n### End of example.\n\n### Instruction:\nCalculate 17 * 23. Show the calculation and give the answer. \n### Response:\n17 * 23 = 391. The calculation is: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391. \n### End\n\n### Instruction:\nCalculate 17 * 23. Show the calculation",
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 128,
+        "total_tokens": 143,
+        "ttft_s": 0.2361,
+        "tpot_s": 0.0099,
+        "latency_s": 1.4955
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Write a Python function that returns the sum of the squares of a list of numbers.",
+      "text": " The function should take a list of numbers as input and return the sum of the squares of each number. For example, given [1, 2, 3], the function should return 14 (since 1^2 + 2^2 + 3^2 = 14).\",\n \t\"instruction\": \"Write a Python function that returns the sum of the squares of a list of numbers. The function should take a list of numbers as input and return the sum of the squares of each number. For example, given [1, 2, 3], the function should return 14 (since 1",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 128,
+        "total_tokens": 145,
+        "ttft_s": 0.2342,
+        "tpot_s": 0.0099,
+        "latency_s": 1.4926
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "selected": [
+    {
+      "prompt": "The capital of France is",
+      "text": " Paris.\",\n    \"The capital of Germany is Berlin.\",\n    \"The capital of Italy is Rome.\",\n    \"The capital of Spain is Madrid.\",\n    \"The capital of Portugal is Lisbon.\",\n    \"The capital of Netherlands is Amsterdam.\",\n    \"The capital of Belgium is Brussels.\",\n    \"The capital of Sweden is Stockholm.\",\n    \"The capital of Norway is Oslo.\",\n    \"The capital of Denmark is Copenhagen.\",\n    \"The capital of Finland is Helsinki.\",\n    \"The capital of Poland is Warsaw.\",\n    \"The capital of Austria is Vienna.\",\n    \"The capital of Switzerland is Bern.\",\n    \"The capital of Ireland is Dublin.\",\n",
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "total_tokens": 133,
+        "ttft_s": 0.3826,
+        "tpot_s": 0.0096,
+        "latency_s": 1.6028
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Calculate 17 * 23. Show the calculation and give the answer.",
+      "text": " \n### Answer: 17 * 23 = 391. The calculation is: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391. \n### End of example.\n\n### Instruction:\nCalculate 17 * 23. Show the calculation and give the answer. \n### Response:\n17 * 23 = 391. The calculation is: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391. \n### End\n\n### Instruction:\nCalculate 17 * 23. Show the calculation",
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 128,
+        "total_tokens": 143,
+        "ttft_s": 0.2546,
+        "tpot_s": 0.0096,
+        "latency_s": 1.4743
+      },
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Write a Python function that returns the sum of the squares of a list of numbers.",
+      "text": " The function should take a list of numbers as input and return the sum of the squares of each number. For example, given [1, 2, 3], the function should return 14 (since 1^2 + 2^2 + 3^2 = 14).\",\n \t\"instruction\": \"Write a Python function that returns the sum of the squares of a list of numbers. The function should take a list of numbers as input and return the sum of the squares of each number. For example, given [1, 2, 3], the function should return 14 (since 1",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 128,
+        "total_tokens": 145,
+        "ttft_s": 0.2414,
+        "tpot_s": 0.0096,
+        "latency_s": 1.4616
+      },
+      "finish_reason": "length"
+    }
+  ]
+}

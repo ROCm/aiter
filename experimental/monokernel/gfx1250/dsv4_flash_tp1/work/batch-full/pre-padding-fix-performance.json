@@ -1,0 +1,51 @@
+{
+  "status": "accuracy-unqualified; supersede after padding fix",
+  "client_round": 2,
+  "rows": [
+    {
+      "concurrency": 2,
+      "baseline": {
+        "completed": 16,
+        "median_ttft_ms": 288.62494350005363,
+        "median_tpot_ms": 13.328740921798259,
+        "total_token_throughput": 288.2001847433194
+      },
+      "full": {
+        "completed": 16,
+        "median_ttft_ms": 317.38302599933377,
+        "median_tpot_ms": 11.607514648582738,
+        "total_token_throughput": 324.65694694621186
+      }
+    },
+    {
+      "concurrency": 4,
+      "baseline": {
+        "completed": 32,
+        "median_ttft_ms": 288.4931709995726,
+        "median_tpot_ms": 13.270467035679575,
+        "total_token_throughput": 590.8319245430275
+      },
+      "full": {
+        "completed": 32,
+        "median_ttft_ms": 308.9268305002406,
+        "median_tpot_ms": 13.111302822581301,
+        "total_token_throughput": 597.6734009224598
+      }
+    },
+    {
+      "concurrency": 8,
+      "baseline": {
+        "completed": 64,
+        "median_ttft_ms": 286.57259499868815,
+        "median_tpot_ms": 13.55116439638391,
+        "total_token_throughput": 1158.5622961759452
+      },
+      "full": {
+        "completed": 64,
+        "median_ttft_ms": 312.05727650012705,
+        "median_tpot_ms": 15.848420866080865,
+        "total_token_throughput": 992.4270691548362
+      }
+    }
+  ]
+}

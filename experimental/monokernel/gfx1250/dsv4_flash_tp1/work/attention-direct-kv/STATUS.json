@@ -1,0 +1,8 @@
+{
+  "complete": true,
+  "serving_integrated": false,
+  "default_direct": true,
+  "stress_checks": 61440,
+  "edge_cases": 120,
+  "reported_round": 2
+}

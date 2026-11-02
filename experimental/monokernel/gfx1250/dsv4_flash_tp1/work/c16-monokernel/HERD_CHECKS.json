@@ -1,0 +1,1218 @@
+[
+  {
+    "m": 8,
+    "seed": 0,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 0,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 1,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 1,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 2,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 2,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 3,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 3,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 4,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 4,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 5,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 5,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 6,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 6,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 7,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 7,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 8,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 8,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 9,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 9,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 10,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 10,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 11,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 11,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 12,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 12,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 13,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 13,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 14,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 14,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 15,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 8,
+    "seed": 15,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 0,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 0,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 1,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 1,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 2,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 2,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 3,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 3,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 4,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 4,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 5,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 5,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 6,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 6,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 7,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 7,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 8,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 8,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 9,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 9,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 10,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 10,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 11,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 11,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 12,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 12,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 13,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 13,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 14,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 14,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 15,
+    "bias": false,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  },
+  {
+    "m": 16,
+    "seed": 15,
+    "bias": true,
+    "first": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    },
+    "replay": {
+      "hist": true,
+      "gather": true,
+      "scatter": true,
+      "scales": true,
+      "health": 0
+    }
+  }
+]

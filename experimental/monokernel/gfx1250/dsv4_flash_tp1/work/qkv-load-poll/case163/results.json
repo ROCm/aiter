@@ -1,0 +1,47 @@
+[
+  {
+    "name": "two_launch",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "grid_atomic",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "grid_load_rt",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "grid_load_ht",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "qready_atomic",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "qready_load_rt",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "qready_load_ht",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "grid_vector_load",
+    "max_error": 0.0,
+    "failures": []
+  },
+  {
+    "name": "qready_vector_load",
+    "max_error": 0.0,
+    "failures": []
+  }
+]

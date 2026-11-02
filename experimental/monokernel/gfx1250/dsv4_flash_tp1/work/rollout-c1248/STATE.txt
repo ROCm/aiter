@@ -1,0 +1,30 @@
+COMPLETED 2026-10-21T17:55:25.840317-05:00
+
+Results: REPORT.md / E2E.json. TTFT investigation: TTFT_FINDINGS.md. Validation limits: VALIDATION.md.
+Final selected recipe: C1/C2 TILE128 OVERLAP0; C4/C8 TILE192 OVERLAP2; EDGE_MASK0 throughout.
+Run /work/rollout-c1248/run-selected.sh fused. Native prefill unchanged, 43 full decode-layer monokernels including attention and MoE. Per-concurrency overrides added to integrated-c8/runtime_batch.py; all generic defaults remain off.
+All four concurrencies benchmarked against native ATOM and previous monokernel. One server startup per config, two client runs per concurrency, second results reported. Selected replica on fourth GPU.
+Native → updated (TTFT ms / TPOT ms / total tok/s):
+C1: 160.62 / 13.060 / 151.47 → 155.23 / 9.798 / 201.18
+C2: 298.67 / 13.322 / 294.10 → 292.89 / 9.663 / 403.74
+C4: 295.54 / 13.316 / 588.36 → 283.71 / 10.669 / 732.42
+C8: 290.43 / 13.627 / 1151.24 → 282.58 / 11.638 / 1343.48
+TTFT regression not reproduced; same 1888-kernel prefill sequence, same compiled backbone. Deferred first-token output and prefill batch formation affect client TTFT. Historical exact delta cannot be uniquely attributed from old logs.
+12 final synthetic layer fixtures passed 13-checkpoint exact comparisons plus replay/health; no spills. C1 CSA micro regressed 4.1%; some isolated stages also regressed. Full table preserved.
+Controlled fixed-batch text matches previous monokernel at all C. Diverse mixed-batch text parity is unresolved, and native-model accuracy remains unqualified; no new GSM8K. Keep opt-in.
+All experiment servers stopped. Temporary ATOM model_runner prefill-audit decorator and benchmark save-detailed default restored exactly to their backups. Benchmark/profiler raw artifacts and audit copies retained.
+Full archive: /home/vigokhal/monokernel-c1248-rollout-20261021.tgz (with .tgz.json SHA256 sidecar). No image or Git push requested/performed in this pass.
+
+----- Work log -----
+In-progress 2026-10-21: apply existing improvements C1/2/4/8 and diagnose TTFT.
+Four micro workers completed short full-layer and group A/B checks with exact outputs.
+QKV first wrapper duplicated cosine loads in baseline; fixed regions.py, discard initial QKV group timing until rerun.
+Longer paired full-layer repeats exposed C2 CSA selected (TILE192 OVERLAP2) barrier timeouts. Original previous control repeated passed. Classic HIP graph flag did not eliminate all failures. C1 5-variant stress also failed; cannot identify which variant from that run. C1 original two-variant debug passed.
+Do not treat short-check speedups as qualified serving results. No E2E clients started yet.
+Servers/client controllers are waiting for /work/rollout-c1248/micro-approved, NOT created yet. All four GPUs used for micro investigations.
+Temporary opt-in prefill timing decorator inserted into /app/ATOM/atom/model_engine/model_runner.py; backup model_runner.before.py. Enabled only via ATOM_MK_PREFILL_AUDIT. Restore after experiment. Does not change model tensors/dispatch. Auditor records GPU-event model-forward time, CPU enqueue time and ensures zero monokernel calls in prefill; trace trigger supported.
+
+Final policy: C1/C2 TILE128 OVERLAP0; C4/C8 TILE192 OVERLAP2. Full numerical/replay checks passed for all 12 C/type combinations. Individual timings not uniformly improved: C1 CSA full-layer +4%; isolated OA/OB early loads mildly slower. Current run evaluates E2E effect honestly.
+Servers started once each native GPU0:8260, previous GPU1:8270, selected GPU2:8280, selected replica GPU3:8290. Clients wait until all four ready; then C1/2/4/8 twice sequentially, second result only. Diagnostics follow after all measured clients finish.
+
+Temporary benchmark_serving.py --save-detailed default enabled after C1 clients started so subsequent processes preserve per-request TTFT/ITL. Only post-run result serialization changes; original backup benchmark_serving.before.py. Restore with model_runner.py after completion.

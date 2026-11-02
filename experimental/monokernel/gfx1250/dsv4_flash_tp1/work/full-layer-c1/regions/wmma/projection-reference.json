@@ -1,0 +1,17 @@
+{
+  "QA": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  },
+  "KV": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  },
+  "QB": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  }
+}

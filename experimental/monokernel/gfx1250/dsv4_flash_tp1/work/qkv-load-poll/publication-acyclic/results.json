@@ -1,0 +1,20 @@
+[
+  {
+    "style": 0,
+    "publications": 10240,
+    "consumer_payload_checks": 1336934400,
+    "health": 0
+  },
+  {
+    "style": 1,
+    "publications": 10240,
+    "consumer_payload_checks": 1336934400,
+    "health": 0
+  },
+  {
+    "style": 3,
+    "publications": 10240,
+    "consumer_payload_checks": 1336934400,
+    "health": 0
+  }
+]

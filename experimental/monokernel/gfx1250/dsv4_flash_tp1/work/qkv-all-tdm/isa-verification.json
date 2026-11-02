@@ -1,0 +1,20 @@
+{
+  "global_control": {
+    "qa_direct_weight_load_source_present": true,
+    "qb_direct_weight_load_source_present": true,
+    "tensor_load_instructions": 0,
+    "tensor_wait_instructions": 0
+  },
+  "tdm_late": {
+    "qa_direct_weight_load_source_present": false,
+    "qb_direct_weight_load_source_present": false,
+    "tensor_load_instructions": 10,
+    "tensor_wait_instructions": 11
+  },
+  "tdm_early": {
+    "qa_direct_weight_load_source_present": false,
+    "qb_direct_weight_load_source_present": false,
+    "tensor_load_instructions": 12,
+    "tensor_wait_instructions": 13
+  }
+}

@@ -1,0 +1,79 @@
+Flash hybrid reproduction
+=========================
+Image: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Model: /data/DeepSeek-V4-Flash, single visible GPU, TP1, no expert parallelism.
+ATOM source base: f19778df4054e94d64d6f6bf6dd68f5681bd5945.
+AITER source base: 7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe.
+The /home/vigokhal/dsv4-monokernel directory is mounted at /work in the
+experiment container vigokhal_dsv4_tp4 (the name is historical; Flash runs TP1).
+
+Apply atom-combined.patch in /app/ATOM and aiter-hybrid.patch in /app/aiter to
+the original image files. Both patches passed reverse-apply checks against the
+installed implementation. atom-flash.patch is incremental on the completed Pro
+round-two patch. The separate experimental stage kernels are NOT installed.
+
+Launch /work/flash/serve.sh with HIP_VISIBLE_DEVICES=0, FAKE_EPLB=0,
+TRITON_CACHE_DIR=/work/flash/triton-cache, TRACE=1, and a distinct TRACE_DIR
+for each arm. The launcher preserves the supplied TP1 script's BF16 KV and FP8
+index cache, uses actual expert routing, max128sequences and graph buckets
+[1,2,4,8,16,32,64,128]. It corrects the supplied script's inverted FAKE_EPLB test.
+The original script is retained as serve_tp1.original.sh.
+
+Baseline environment:
+ATOM_DSV4_HYBRID=0
+ATOM_DSV4_HYBRID_GEMM=0
+ATOM_DSV4_HYBRID_ATTN=0
+ATOM_DSV4_HYBRID_CHECK=0
+TRACE_DIR=/work/flash/traces
+Then run: bash /work/flash/run_baseline.sh
+
+Hybrid environment:
+ATOM_DSV4_HYBRID=1
+ATOM_DSV4_HYBRID_GEMM=0
+ATOM_DSV4_HYBRID_ATTN=1
+ATOM_DSV4_HYBRID_ATTN_CONFIG=/app/ATOM/atom/model_ops/dsv4_flash_attention_configs.json
+ATOM_DSV4_HYBRID_CHECK=1
+TRACE_DIR=/work/flash/traces/candidate
+TORCHINDUCTOR_CACHE_DIR=/work/flash/inductor-candidate
+Then run: bash /work/flash/run_candidate.sh
+
+IMPORTANT CACHE SEPARATION: after stopping the baseline server, preserve/move
+/root/.cache/atom to an arm-specific saved directory before launching the
+hybrid. This ATOM version hardcodes that cache root and can load a stale
+four-output baseline subgraph into the six-output hybrid call site. The first
+hybrid startup exposed an IndexError before benchmarks; its log is preserved.
+Our successful hybrid used a fresh ATOM cache and separate Inductor cache.
+Do not move caches while a server is active. The baseline, Pro, and candidate
+cache trees are preserved in the experiment container.
+
+run_bench.sh uses1024input/1024output tokens,4*Crequests,seed0,ignoreEOS,
+saturated request rate and concurrency1/8/16/32/64/128. Each full client runs
+twice; only *_run2_* is reported. Profiles are separate clients with50output
+tokens and Crequests, collected at1/16/128. A per-client initial single-prompt
+warmup is additional to the discarded first full client. Profiler is off during
+metric clients. Total tok/s counts input plus output; output tok/s is also saved.
+
+Analysis:
+python /work/flash/analyze_profiles.py baseline
+python /work/flash/analyze_profiles.py candidate
+python /work/flash/summarize.py
+The analyzer walks backward from trace end to the last prefill, then averages
+all kernels in the final decode suffix. Per-kernel/operator CSVs are packaged.
+
+Validation (not timed): after stopping the timed server, launch
+serve_validation.sh with the hybrid environment, TRACE=0, plus
+ATOM_DSV4_HYBRID_HC_CHECK_LIMIT=100000
+ATOM_DSV4_HYBRID_ATTN_CHECK_LIMIT=100000
+Then run python /work/flash/validate_real_batches.py eager_validation.
+This compares changed operations directly against the original operations on
+real uncaptured decode inputs at all six concurrency levels.
+
+Isolated experiments (server stopped, GPU idle, HIP_VISIBLE_DEVICES=0):
+python /work/flash/test_mhc_stage.py
+python /work/flash/test_mhc_relaxed_poll.py
+python /work/flash/test_mhc_device_scope.py
+python /work/flash/tune_attention.py --phase screen
+python /work/flash/tune_attention.py --phase tune
+python /work/flash/bench_finalists.py
+Use the saved JSONs/configs to reproduce the selected candidates. Tuning errors
+and failed initial integration attempts are retained, not counted as successes.

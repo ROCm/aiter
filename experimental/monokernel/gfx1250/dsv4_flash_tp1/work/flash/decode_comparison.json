@@ -1,0 +1,740 @@
+{
+  "1": {
+    "baseline": {
+      "kernels_per_step": 1546.0,
+      "separate_group_quant_calls_per_step": 172.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 49.0,
+          "summed_us_per_step": 169.13326
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 1.8794399999999998
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.30642
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 101.19035999999998
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 158.4792
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 512.1951999999998
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 309.74324
+        },
+        "layers.*.attn.wo_b[M=1,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 2658.4762599999985
+        },
+        "layers.*.attn.wq_b[M=1,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 1154.9619
+        },
+        "layers.*.attn.wqkv_a[M=1,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 1173.4548400000006
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 90.37111999999999
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 258.0,
+          "summed_us_per_step": 1169.7231199999997
+        },
+        "layers.*.ffn.gate[M=1,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 176.5981199999999
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=1,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 2155.2679400000006
+        },
+        "layers.*.ffn.shared_experts.w2[M=1,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 2042.106020000001
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 170.0,
+          "summed_us_per_step": 524.32454
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 9.77966
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 89.43558000000003
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 90.50052
+        },
+        "layers.*.attn.compressor.wkv_gate[M=1,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 86.78895999999999
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 48.05198
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 225.32004000000003
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 41.58758000000001
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 45.24184
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=1,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 89.5751
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 31.221859999999992
+        },
+        "layers.*.attn.indexer.weights_proj[M=1,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 79.26744000000001
+        },
+        "layers.*.attn.indexer.wq_b[M=1,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 1135.1977
+        },
+        "layers.*.attn.compressor.wkv_gate[M=1,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 82.40627999999998
+        }
+      }
+    },
+    "candidate": {
+      "kernels_per_step": 1590.0,
+      "separate_group_quant_calls_per_step": 130.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 133.0,
+          "summed_us_per_step": 426.46208
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.07328
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.29044
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 100.78312
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 153.19246
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 491.24355999999983
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 307.85206000000005
+        },
+        "layers.*.attn.wo_b[M=1,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 131.0,
+          "summed_us_per_step": 454.31074000000007
+        },
+        "layers.*.attn.wq_b[M=1,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 45.0,
+          "summed_us_per_step": 292.32102
+        },
+        "layers.*.attn.wqkv_a[M=1,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 87.0,
+          "summed_us_per_step": 230.95633999999998
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 88.45729999999999
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 258.0,
+          "summed_us_per_step": 1167.22188
+        },
+        "layers.*.ffn.gate[M=1,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 179.71977999999996
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=1,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 83.0,
+          "summed_us_per_step": 2168.59502
+        },
+        "layers.*.ffn.shared_experts.w2[M=1,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 83.0,
+          "summed_us_per_step": 1243.4292800000005
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 248.09103999999996
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 9.91898
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 89.56646000000002
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 88.86280000000002
+        },
+        "layers.*.attn.compressor.wkv_gate[M=1,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 92.73708000000002
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 49.653319999999994
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 233.06072
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 42.9758
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 44.2052
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=1,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 91.37745999999997
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 28.17232
+        },
+        "layers.*.attn.indexer.weights_proj[M=1,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 78.99046000000003
+        },
+        "layers.*.attn.indexer.wq_b[M=1,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 23.0,
+          "summed_us_per_step": 150.44952
+        },
+        "layers.*.attn.compressor.wkv_gate[M=1,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 83.67005999999999
+        }
+      }
+    }
+  },
+  "16": {
+    "baseline": {
+      "kernels_per_step": 1632.0,
+      "separate_group_quant_calls_per_step": 172.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 49.0,
+          "summed_us_per_step": 187.67767999999995
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.2792
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.64532
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 112.50285999999997
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 160.95870000000002
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 586.2374400000001
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 322.26549999999986
+        },
+        "layers.*.attn.wo_b[M=16,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 404.6028599999999
+        },
+        "layers.*.attn.wq_b[M=16,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 187.11904
+        },
+        "layers.*.attn.wqkv_a[M=16,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 302.92331999999993
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 98.12132000000001
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 344.0,
+          "summed_us_per_step": 2789.6878600000014
+        },
+        "layers.*.ffn.gate[M=16,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 185.01532
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=16,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 310.9952599999999
+        },
+        "layers.*.ffn.shared_experts.w2[M=16,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 300.4096199999999
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 170.0,
+          "summed_us_per_step": 518.98576
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 10.37732
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 96.1782
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 104.87176000000004
+        },
+        "layers.*.attn.compressor.wkv_gate[M=16,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 110.56044
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 48.00686
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 253.28142
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 44.641040000000004
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 56.71067999999998
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=16,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 99.64828
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 29.361160000000005
+        },
+        "layers.*.attn.indexer.weights_proj[M=16,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 101.86133999999997
+        },
+        "layers.*.attn.indexer.wq_b[M=16,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 74.01844
+        },
+        "layers.*.attn.compressor.wkv_gate[M=16,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 86.67373999999998
+        }
+      }
+    },
+    "candidate": {
+      "kernels_per_step": 1590.0,
+      "separate_group_quant_calls_per_step": 130.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 133.0,
+          "summed_us_per_step": 458.46234000000004
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.15504
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.70858
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 112.01938
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 163.45392
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 592.8674
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 337.39128
+        },
+        "layers.*.attn.wo_b[M=16,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 410.7903399999999
+        },
+        "layers.*.attn.wq_b[M=16,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 190.88876
+        },
+        "layers.*.attn.wqkv_a[M=16,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 44.0,
+          "summed_us_per_step": 202.06302000000002
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 98.27122
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 344.0,
+          "summed_us_per_step": 2824.140639999999
+        },
+        "layers.*.ffn.gate[M=16,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 185.2018
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=16,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 320.7754000000001
+        },
+        "layers.*.ffn.shared_experts.w2[M=16,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 301.7985400000001
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 268.7377599999999
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 10.45256
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 96.198
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 106.4128
+        },
+        "layers.*.attn.compressor.wkv_gate[M=16,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 110.27571999999998
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 49.71236
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 253.69289999999998
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 46.607440000000004
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 61.13762
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=16,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 103.30367999999997
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 31.150479999999995
+        },
+        "layers.*.attn.indexer.weights_proj[M=16,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 104.99998000000001
+        },
+        "layers.*.attn.indexer.wq_b[M=16,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 79.72894000000001
+        },
+        "layers.*.attn.compressor.wkv_gate[M=16,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 87.06394
+        }
+      }
+    }
+  },
+  "128": {
+    "baseline": {
+      "kernels_per_step": 1632.0,
+      "separate_group_quant_calls_per_step": 172.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 49.0,
+          "summed_us_per_step": 239.81164
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.15186
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 3.90242
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 122.88230000000001
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 219.1415
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 807.4458400000002
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 520.7783000000001
+        },
+        "layers.*.attn.wo_b[M=128,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 552.1676400000001
+        },
+        "layers.*.attn.wq_b[M=128,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 230.02305999999996
+        },
+        "layers.*.attn.wqkv_a[M=128,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 413.14454000000006
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 105.87078000000001
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 344.0,
+          "summed_us_per_step": 5578.727420000003
+        },
+        "layers.*.ffn.gate[M=128,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 188.80210000000002
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=128,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 408.25856
+        },
+        "layers.*.ffn.shared_experts.w2[M=128,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 369.71268
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 170.0,
+          "summed_us_per_step": 617.2934
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 11.333979999999999
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 119.53997999999996
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 115.28806
+        },
+        "layers.*.attn.compressor.wkv_gate[M=128,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 160.50910000000002
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 58.196839999999995
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 303.6116999999999
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 48.47709999999999
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 65.63840000000002
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=128,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 172.23232
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 35.28506000000001
+        },
+        "layers.*.attn.indexer.weights_proj[M=128,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 84.27593999999999
+        },
+        "layers.*.attn.indexer.wq_b[M=128,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 81.01655999999998
+        },
+        "layers.*.attn.compressor.wkv_gate[M=128,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 111.50076000000001
+        }
+      }
+    },
+    "candidate": {
+      "kernels_per_step": 1590.0,
+      "separate_group_quant_calls_per_step": 130.0,
+      "operators": {
+        "<no gpu tag>": {
+          "calls_per_step": 173.0,
+          "summed_us_per_step": 699.9889199999999
+        },
+        "embed": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.22554
+        },
+        "forward": {
+          "calls_per_step": 1.0,
+          "summed_us_per_step": 2.61496
+        },
+        "layers.*.attn.q_norm": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 123.08867999999998
+        },
+        "layers.*.attn.qk_norm_rope_maybe_quant": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 214.78162000000003
+        },
+        "layers.*.attn.sparse_attn_decode": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 801.8756599999999
+        },
+        "layers.*.attn.wo_a": {
+          "calls_per_step": 86.0,
+          "summed_us_per_step": 526.22556
+        },
+        "layers.*.attn.wo_b[M=128,N=4096,K=8192,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 81.0,
+          "summed_us_per_step": 545.00022
+        },
+        "layers.*.attn.wq_b[M=128,N=32768,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 231.70538
+        },
+        "layers.*.attn.wqkv_a[M=128,N=1536,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 44.0,
+          "summed_us_per_step": 390.37654
+        },
+        "layers.*.ffn.combine_outputs": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 103.79460000000003
+        },
+        "layers.*.ffn.experts.fused_moe": {
+          "calls_per_step": 344.0,
+          "summed_us_per_step": 5537.642620000003
+        },
+        "layers.*.ffn.gate[M=128,N=256,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 43.0,
+          "summed_us_per_step": 190.65754
+        },
+        "layers.*.ffn.shared_experts.gate_up_proj[M=128,N=4096,K=4096,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 81.0,
+          "summed_us_per_step": 399.14498000000015
+        },
+        "layers.*.ffn.shared_experts.w2[M=128,N=4096,K=2048,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 80.0,
+          "summed_us_per_step": 363.82305999999994
+        },
+        "layers.*.mhc_fused_post_pre": {
+          "calls_per_step": 62.0,
+          "summed_us_per_step": 230.56576
+        },
+        "layers.*.mhc_post_pre": {
+          "calls_per_step": 3.0,
+          "summed_us_per_step": 11.55346
+        },
+        "layers.*.attn.compressor.fused_compress_attn": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 113.79294
+        },
+        "layers.*.attn.compressor.update_compressor_states": {
+          "calls_per_step": 41.0,
+          "summed_us_per_step": 119.35786
+        },
+        "layers.*.attn.compressor.wkv_gate[M=128,N=2048,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 158.48534
+        },
+        "layers.*.attn.csa_translate_pack": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 59.6348
+        },
+        "layers.*.attn.indexer": {
+          "calls_per_step": 63.0,
+          "summed_us_per_step": 306.95559999999995
+        },
+        "layers.*.attn.indexer.compressor.fused_compress_attn": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 51.55904
+        },
+        "layers.*.attn.indexer.compressor.update_compressor_states": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 64.88288000000003
+        },
+        "layers.*.attn.indexer.compressor.wkv_gate[M=128,N=512,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 169.77067999999997
+        },
+        "layers.*.attn.indexer.scale_indexer_weights": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 35.268
+        },
+        "layers.*.attn.indexer.weights_proj[M=128,N=64,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 85.376
+        },
+        "layers.*.attn.indexer.wq_b[M=128,N=8192,K=1024,a=torch.float8_e4m3fn,w=torch.float8_e4m3fn,o=torch.bfloat16]": {
+          "calls_per_step": 21.0,
+          "summed_us_per_step": 79.91311999999999
+        },
+        "layers.*.attn.compressor.wkv_gate[M=128,N=1024,K=4096,a=torch.bfloat16,w=torch.bfloat16,o=torch.bfloat16]": {
+          "calls_per_step": 20.0,
+          "summed_us_per_step": 113.19498
+        }
+      }
+    }
+  }
+}

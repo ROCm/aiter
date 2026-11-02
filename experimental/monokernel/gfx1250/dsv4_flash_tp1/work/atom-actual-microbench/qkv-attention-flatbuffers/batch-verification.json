@@ -1,0 +1,14 @@
+{
+  "actual_atom_qkv_attention": {
+    "kernel_count": 0,
+    "kernel_total_us": 0,
+    "kernel_names": []
+  },
+  "fused_qkv_attention": {
+    "kernel_count": 128,
+    "kernel_total_us": 2629.745,
+    "kernel_names": [
+      "qkv_attention"
+    ]
+  }
+}

@@ -1,0 +1,62 @@
+[
+  {
+    "concurrency": 1,
+    "path": "native",
+    "scope": "native",
+    "completed": 8,
+    "median_ttft_ms": 156.09027900063666,
+    "median_tpot_ms": 12.800338909580372,
+    "total_token_throughput": 152.30641031045636,
+    "output_throughput": 76.15320515522818
+  },
+  {
+    "concurrency": 1,
+    "path": "candidate",
+    "scope": "full layer",
+    "completed": 8,
+    "median_ttft_ms": 172.5488249976479,
+    "median_tpot_ms": 9.701086408597625,
+    "total_token_throughput": 199.22980200036113,
+    "output_throughput": 99.61490100018057
+  },
+  {
+    "concurrency": 2,
+    "path": "native",
+    "scope": "native",
+    "completed": 16,
+    "median_ttft_ms": 295.13120900446665,
+    "median_tpot_ms": 13.272830618282596,
+    "total_token_throughput": 287.5263761803124,
+    "output_throughput": 143.7631880901562
+  },
+  {
+    "concurrency": 2,
+    "path": "candidate",
+    "scope": "QKV region only",
+    "completed": 16,
+    "median_ttft_ms": 310.26692450177507,
+    "median_tpot_ms": 12.43924788367402,
+    "total_token_throughput": 301.148441462768,
+    "output_throughput": 150.574220731384
+  },
+  {
+    "concurrency": 4,
+    "path": "native",
+    "scope": "native",
+    "completed": 32,
+    "median_ttft_ms": 286.0817889995815,
+    "median_tpot_ms": 13.34141853372093,
+    "total_token_throughput": 581.0757424305762,
+    "output_throughput": 290.5378712152881
+  },
+  {
+    "concurrency": 8,
+    "path": "native",
+    "scope": "native",
+    "completed": 64,
+    "median_ttft_ms": 280.7807449971733,
+    "median_tpot_ms": 13.603057511729814,
+    "total_token_throughput": 1154.126411403032,
+    "output_throughput": 577.063205701516
+  }
+]

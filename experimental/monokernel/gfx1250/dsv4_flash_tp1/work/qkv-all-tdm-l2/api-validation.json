@@ -1,0 +1,47 @@
+[
+  {
+    "mode": "global_control",
+    "early": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "early": false,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  },
+  {
+    "mode": "single",
+    "early": true,
+    "q": {
+      "relative_rms": 2.6985380827682093e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    },
+    "kv": {
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "finite": true
+    },
+    "health": 0
+  }
+]

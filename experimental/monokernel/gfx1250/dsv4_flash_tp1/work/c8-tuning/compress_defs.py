@@ -1,0 +1,27 @@
+import sys,torch,json
+sys.path[:0]=['/work/c8-tuning','/work/batch-full','/work/modelwide','/work/full-attention-native/prefix']
+from triton.experimental import gluon as g
+from triton.experimental.gluon import language as gl
+from project_batch import project_body
+from project_compress import project_body as single_project
+from compressor_batch import compressor_body,pool_partial
+from compressor import compressor_body as single_compress
+from combined import sync
+@g.jit
+def batch(X,W,Y,C,COUNTER,HEALTH,META:gl.constexpr,N:gl.constexpr,M:gl.constexpr,Work=None):
+ p=gl.program_id(0)
+ project_body(X,W,Y,N,M)
+ if p<N//16:sync(COUNTER,HEALTH,N//16,3)
+ if Work is not None:
+  pool_partial(C[8],C[9],C[4],C[6],Work,META[4],META[5],META[6],META[7])
+  if p<N//16:sync(COUNTER,HEALTH,N//16,3)
+ if p<M:
+  CR=C[:4]+(C[4]+p*4,C[5]+p*4,C[6]+p,C[7]+p)+C[8:12]+(C[12]+p*16,)
+  compressor_body(Y+p*N,Y+p*N+N//2,*CR,*META,OWNER=p,PARALLEL_POOL=False,Partial=None if Work is None else Work+p*6144)
+@g.jit
+def single(X,W,Y,C,COUNTER,HEALTH,META:gl.constexpr,N:gl.constexpr):
+ single_project(X,W,Y,N)
+ sync(COUNTER,HEALTH,256,3)
+ single_compress(Y,Y+N//2,*C,*META)
+def rand(*s):return torch.randn(*s,device='cuda')
+def iz(*s):return torch.zeros(*s,device='cuda',dtype=torch.int32)

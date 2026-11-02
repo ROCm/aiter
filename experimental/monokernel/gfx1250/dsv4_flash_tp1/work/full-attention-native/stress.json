@@ -1,0 +1,199 @@
+{
+  "invocations": 4096,
+  "changing_inputs": 32,
+  "graph_kernel_nodes": 128,
+  "rows": [
+    {
+      "case": 0,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 1,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 2,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 3,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 4,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 5,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 6,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 7,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 8,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 9,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 10,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 11,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 12,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 13,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 14,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 15,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 16,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 17,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 18,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 19,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 20,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 21,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 22,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 23,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 24,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 25,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 26,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 27,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 28,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 29,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 30,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    },
+    {
+      "case": 31,
+      "exact_staged": true,
+      "finite": true,
+      "health": true
+    }
+  ]
+}

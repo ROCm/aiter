@@ -1,0 +1,4 @@
+C8 QKV dependency ablations. 256 CTAs x 128 threads.
+LOCAL removes B1 using redundant per-producer BF16 TDM quantization. PRE moves bounded QB prefetch before B2. SEM replaces B3 with 8 QA producer arrivals and per-CTA monotonic epochs (Ready[257] int32, initialized once, reused in sequential graph launches). B2/B4 retain global counter. QA scratch: [splits,8,1536] FP32, separate writers. Atomic path clears [8,1536] before a separate initialization barrier, then GPU FP32 atomic adds; B2 ensures completion before norms.
+S16 BN128:192 projection CTAs; S8 BN64:192; S4 BN32:192. Also test S8/4 BN128 (96/48 CTAs). Bounds and FP8 rounding preserved. No serving changes.
+Resource gate: zero spills, LDS <=320KiB, resident256 grid on256CUs. Inspect actual compiled assembly before launch.

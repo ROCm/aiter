@@ -1,0 +1,251 @@
+{
+  "scope": "C8 isolated group5 input quant through Q norm/RoPE; 1k/1k decode shape; not end-to-end",
+  "method": "Median across four GPU-specific second-round medians. Each GPU alternates all variants in one sweep; flat HIP graphs with32 repetitions,5warmups,40samples per round; two rounds. No serving runs.",
+  "timings": {
+    "native": {
+      "median_us": 27.539382223039865,
+      "per_gpu_us": [
+        27.622593566775322,
+        27.49620284885168,
+        27.558733709156513,
+        27.520030736923218
+      ],
+      "min_us": 27.49620284885168,
+      "max_us": 27.622593566775322
+    },
+    "old": {
+      "median_us": 20.523508079349995,
+      "per_gpu_us": [
+        20.414906553924084,
+        20.68476565182209,
+        20.632109604775906,
+        20.377453416585922
+      ],
+      "min_us": 20.377453416585922,
+      "max_us": 20.68476565182209
+    },
+    "local": {
+      "median_us": 18.532476387917995,
+      "per_gpu_us": [
+        18.40818766504526,
+        18.59098393470049,
+        18.673562444746494,
+        18.473968841135502
+      ],
+      "min_us": 18.40818766504526,
+      "max_us": 18.673562444746494
+    },
+    "early": {
+      "median_us": 18.241984769701958,
+      "per_gpu_us": [
+        18.257328309118748,
+        18.642953597009182,
+        18.226641230285168,
+        18.159749917685986
+      ],
+      "min_us": 18.159749917685986,
+      "max_us": 18.642953597009182
+    },
+    "sem": {
+      "median_us": 18.538367468863726,
+      "per_gpu_us": [
+        18.406297080218792,
+        19.656953401863575,
+        18.67043785750866,
+        18.381327390670776
+      ],
+      "min_us": 18.381327390670776,
+      "max_us": 19.656953401863575
+    },
+    "s8n128": {
+      "median_us": 18.994702957570553,
+      "per_gpu_us": [
+        18.925203010439873,
+        19.238843582570553,
+        18.9846558496356,
+        19.004750065505505
+      ],
+      "min_us": 18.925203010439873,
+      "max_us": 19.238843582570553
+    },
+    "s8n64": {
+      "median_us": 18.78220308572054,
+      "per_gpu_us": [
+        18.60096864402294,
+        20.448781549930573,
+        18.657281063497066,
+        18.90712510794401
+      ],
+      "min_us": 18.60096864402294,
+      "max_us": 20.448781549930573
+    },
+    "s4n128": {
+      "median_us": 21.039312705397606,
+      "per_gpu_us": [
+        21.16543799638748,
+        21.000844426453114,
+        21.0777809843421,
+        20.98085917532444
+      ],
+      "min_us": 20.98085917532444,
+      "max_us": 21.16543799638748
+    },
+    "s4n32": {
+      "median_us": 21.313461009413004,
+      "per_gpu_us": [
+        21.395156159996986,
+        21.457796916365623,
+        21.23176585882902,
+        21.09665609896183
+      ],
+      "min_us": 21.09665609896183,
+      "max_us": 21.457796916365623
+    },
+    "atomic16": {
+      "median_us": 26.07937529683113,
+      "per_gpu_us": [
+        27.421031147241592,
+        25.071953423321247,
+        27.086797170341015,
+        24.585625156760216
+      ],
+      "min_us": 24.585625156760216,
+      "max_us": 27.421031147241592
+    },
+    "atomic8": {
+      "median_us": 22.235804703086615,
+      "per_gpu_us": [
+        22.338422015309334,
+        22.133187390863895,
+        22.65828102827072,
+        21.874703466892242
+      ],
+      "min_us": 21.874703466892242,
+      "max_us": 22.65828102827072
+    },
+    "atomic4": {
+      "median_us": 23.083632811903954,
+      "per_gpu_us": [
+        23.066390305757523,
+        23.100875318050385,
+        23.167171515524387,
+        22.85992167890072
+      ],
+      "min_us": 22.85992167890072,
+      "max_us": 23.167171515524387
+    }
+  },
+  "resources": {
+    "local": {
+      "regs": 149,
+      "spills": 0,
+      "lds": 121344
+    },
+    "early": {
+      "regs": 149,
+      "spills": 0,
+      "lds": 121344
+    },
+    "sem": {
+      "regs": 150,
+      "spills": 0,
+      "lds": 121344
+    },
+    "s8n128": {
+      "regs": 149,
+      "spills": 0,
+      "lds": 166912
+    },
+    "s8n64": {
+      "regs": 125,
+      "spills": 0,
+      "lds": 130048
+    },
+    "s4n128": {
+      "regs": 161,
+      "spills": 0,
+      "lds": 258048
+    },
+    "s4n32": {
+      "regs": 137,
+      "spills": 0,
+      "lds": 147456
+    },
+    "atomic16": {
+      "regs": 127,
+      "spills": 0,
+      "lds": 121344
+    },
+    "atomic8": {
+      "regs": 125,
+      "spills": 0,
+      "lds": 130048
+    },
+    "atomic4": {
+      "regs": 137,
+      "spills": 0,
+      "lds": 147456
+    }
+  },
+  "validation": {
+    "stress-early": {
+      "variant": "early",
+      "cases": 64,
+      "replays": 2048,
+      "max_q_rms": 0.0,
+      "max_q_native_rms": 2.022334774665069e-05,
+      "max_kv_rms": 0.0,
+      "all_fp8_equal": true,
+      "all_q_exact": true
+    },
+    "stress-s4": {
+      "variant": "s4",
+      "cases": 64,
+      "replays": 2048,
+      "max_q_rms": 0.0,
+      "max_q_native_rms": 2.022334774665069e-05,
+      "max_kv_rms": 0.0,
+      "all_fp8_equal": true,
+      "all_q_exact": true
+    },
+    "stress-s8": {
+      "variant": "s8",
+      "cases": 64,
+      "replays": 2048,
+      "max_q_rms": 0.0,
+      "max_q_native_rms": 2.022334774665069e-05,
+      "max_kv_rms": 0.0,
+      "all_fp8_equal": true,
+      "all_q_exact": true
+    },
+    "stress-atomic": {
+      "variant": "atomic",
+      "cases": 64,
+      "replays": 2048,
+      "max_q_rms": 0.0,
+      "max_q_native_rms": 2.022334774665069e-05,
+      "max_kv_rms": 0.0,
+      "all_fp8_equal": true,
+      "all_q_exact": true
+    },
+    "stress-sem": {
+      "variant": "sem",
+      "cases": 64,
+      "replays": 2048,
+      "max_q_rms": 0.0,
+      "max_q_native_rms": 2.022334774665069e-05,
+      "max_kv_rms": 0.0,
+      "all_fp8_equal": true,
+      "all_q_exact": true
+    }
+  },
+  "selected": {
+    "SPLITS": 16,
+    "BN": 128,
+    "LOCAL": true,
+    "PRE": true,
+    "SEM": false,
+    "ATOMIC": false
+  },
+  "not_integrated": true
+}

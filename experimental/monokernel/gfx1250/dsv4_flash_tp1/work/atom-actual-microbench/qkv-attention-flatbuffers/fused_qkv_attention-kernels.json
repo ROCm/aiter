@@ -1,0 +1,22 @@
+[
+  {
+    "name": "qkv_attention",
+    "us": 53.039,
+    "args": {
+      "device": 5,
+      "stream": 0,
+      "correlation": 61,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        256,
+        1,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  }
+]

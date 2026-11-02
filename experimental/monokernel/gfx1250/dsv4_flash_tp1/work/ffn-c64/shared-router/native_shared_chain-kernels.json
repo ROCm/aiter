@@ -1,0 +1,22 @@
+[
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 2.483
+  },
+  {
+    "name": "gemm_a8w8_mx128_t64x32x512_mw4_nw1_nb4_sk1_cm1_cn1",
+    "us": 5.567
+  },
+  {
+    "name": "_ZN5aiter18act_and_mul_kernelIDF16bDF16bTnPFfRKT_EXadL_ZNS_11silu_kernelIDF16bEEfS3_EELi8ELb1ELi3EEEvPT0_PS2_if",
+    "us": 2.643
+  },
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 3.364
+  },
+  {
+    "name": "gemm_a8w8_mx128_t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1",
+    "us": 4.045
+  }
+]

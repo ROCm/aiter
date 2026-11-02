@@ -1,0 +1,72 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "baseline": {
+      "index": 0,
+      "text": " Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " Paris, France Sput. the 51. and the 2.  ( 1.   2.   *   2.   )        .   ",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "2 + 2 =",
+    "baseline": {
+      "index": 0,
+      "text": " 4, 4 + 2 = 6, 6 + 2 = 8, 8 + 2 = 10, 10 + 2 = 12, 12 + 2 = 14,",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " 4,  5 = 0'    [   1   }   | 2   |  2  3   )   (       )",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "Write a Python function that adds two numbers.\n",
+    "baseline": {
+      "index": 0,
+      "text": "    The function should be named 'add' and take two parameters.\n    It should return the sum of the two numbers.\n    \"\"\"\n    return a + b\n\n# Test the function\nresult = add(5, 3)\nprint",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": "\"\"\"\n\nThe number and and the intended dat1, the code's points, and the statements, and the first, the second, and the third, and the fourth, and the fifth, and the sixth, and the seventh, and the",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "The opposite of hot is",
+    "baseline": {
+      "index": 0,
+      "text": " cold. The opposite of cold is hot. The opposite of wet is dry. The opposite of dry is wet. The opposite of light is dark. There is no opposite of opposite. The opposite of opposite is same. The opposite of same",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " cold, exactly something, * how carp, sing ss\nExactly \" 10  hot and the long_  the \"    \"  ;   \"   ;\" * ( .  \"  ; ) ; ;",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  },
+  {
+    "prompt": "A triangle has three",
+    "baseline": {
+      "index": 0,
+      "text": " sides and three angles. The sum of the angles of a triangle is always 180 degrees. In a right triangle, the side opposite the right angle is called the hypotenuse, and the other two sides are called legs. An equilateral triangle",
+      "finish_reason": "length"
+    },
+    "fused": {
+      "index": 0,
+      "text": " sides, 3.  We [] []  We  \\[]  We [][\u00a0]] We [[ #] * ~~P_ J:\\\\[ *][]  J #  &  w   J",
+      "finish_reason": "length"
+    },
+    "text_equal": false
+  }
+]

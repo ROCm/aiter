@@ -1,0 +1,122 @@
+[
+  {
+    "m": 1,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 4.77225831717499,
+    "one_launch_us": 5.858650029143574,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 1,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 4.80022577936434,
+    "one_launch_us": 5.649472355921485,
+    "shared": 119488,
+    "n_regs": 153,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 8,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.220734280517661,
+    "one_launch_us": 6.52532436637903,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 8,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.235723239742466,
+    "one_launch_us": 27.704133365794853,
+    "shared": 119488,
+    "n_regs": 154,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 16,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.393691344123563,
+    "one_launch_us": 6.63931386454122,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 16,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.378350812637389,
+    "one_launch_us": 53.937371036360126,
+    "shared": 119488,
+    "n_regs": 154,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 32,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.630727486732678,
+    "one_launch_us": 7.074977133675608,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      2,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 32,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.5699301066834845,
+    "one_launch_us": 103.97403177790616,
+    "shared": 119488,
+    "n_regs": 154,
+    "n_spills": 0,
+    "grid": [
+      2,
+      64
+    ],
+    "exact": true
+  }
+]

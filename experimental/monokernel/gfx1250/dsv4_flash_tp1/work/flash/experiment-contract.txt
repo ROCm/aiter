@@ -1,0 +1,19 @@
+DSV4 Flash phase (after Pro validation completes)
+Image: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Checkpoint: /data/DeepSeek-V4-Flash
+Single visible GPU; no tensor/expert parallel communication.
+Hidden4096,43layers,64attention heads,QLoRA1024,head512,hc_mult4,
+256routed experts,top6,MoE intermediate2048,FP4experts,FP8dense weights.
+Use the supplied TP1 script as the baseline, preserving BF16KV and FP8indexcache.
+The original TP1 script's FAKE_EPLB conditional is inverted: it enables fake
+routing when FAKE_EPLB=0. Normalize this in the saved experiment launcher so
+FAKE_EPLB=0 consistently means actual routing, and document the correction.
+Preserve compile caches; do not execute its unconditional rm -r cache deletion.
+Benchmark1/8/16/32/64/128 concurrency,1024input/1024output,4*Crequests,seed0.
+For every reported measurement, run the full client twice and use only run2.
+Run profiler separately; walk backward to the last prefill, average all decode
+kernels. Start from a full-layer stage/dependency/ownership design for low rows;
+prototype and validate before deciding splits. Use measured hybrid boundaries
+at higher rows, preserving baseline MoE stream overlap and numerical contracts.
+No claim of a full monokernel unless the actual full-stage fused launch is built
+and measured. Every fallback or rejected fusion must be identified explicitly.

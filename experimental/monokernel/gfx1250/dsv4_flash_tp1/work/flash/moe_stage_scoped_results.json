@@ -1,0 +1,46 @@
+[
+  {
+    "buffers": 3,
+    "health": 0,
+    "lds": 65824,
+    "registers": 107,
+    "spills": 0,
+    "baseline_us": 8.347315050677796,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 9.606333864529454
+  },
+  {
+    "buffers": 4,
+    "health": 0,
+    "lds": 87776,
+    "registers": 107,
+    "spills": 0,
+    "baseline_us": 10.007476204320005,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 9.359156069349126
+  },
+  {
+    "buffers": 5,
+    "health": 0,
+    "lds": 109728,
+    "registers": 111,
+    "spills": 0,
+    "baseline_us": 8.852431072000547,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 9.395482838153837
+  },
+  {
+    "buffers": 8,
+    "health": 0,
+    "lds": 175584,
+    "registers": 122,
+    "spills": 0,
+    "baseline_us": 9.921753168356782,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 10.046683068094964
+  }
+]

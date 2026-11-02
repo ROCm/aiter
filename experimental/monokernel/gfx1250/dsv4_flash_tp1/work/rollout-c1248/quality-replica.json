@@ -1,0 +1,105 @@
+[
+  {
+    "c": 1,
+    "response": {
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd</s></s></s></s>GET</s>POST</s>PUT</s>DELETE</s>HEAD</s>OPTIONS</s>PATCH</s>CONNECT</s>TRACE</s>HTTP/1.1</s>HTTP/2</s>HTTP/3</s>Host:</s>User-Agent:</s>Accept:</s>Content-Type:</s>Authorization:</s>Bearer</s>Basic</s>Cookie:</s>Set-Cookie:</s>Cache-Control:</s>Content-Length:</",
+          "finish_reason": "length"
+        }
+      ]
+    }
+  },
+  {
+    "c": 2,
+    "response": {
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd</s></s></s></s>GET</s>POST</s>PUT</s>DELETE</s>HEAD</s>OPTIONS</s>PATCH</s>CONNECT</s>TRACE</s>HTTP/1.1</s>HTTP/2</s>HTTP/3</s>Host:</s>User-Agent:</s>Accept:</s>Content-Type:</s>Authorization:</s>Bearer</s>Basic</s>Cookie:</s>Set-Cookie:</s>Cache-Control:</s>Content-Length:</",
+          "finish_reason": "length"
+        },
+        {
+          "index": 1,
+          "text": "\ufffd\u02cb\u030c\u034d\u038e\u040f\u0490\u04d1\u0492\u04d3\u0514\u0555\u0596\u05d7\u0618\u0659\u069a\u06db\u071c\u075d\u079e\u07df\u18a1\u48a2\u48e3\u4924\u4965\u49a6\u49e7\u4a28\u4a69\u4aaa\u4aeb\u4b2c\u4b6d\u4bae\u4bef\u4c30\u4c71\u4cb2\u4cf3\u4d34\u4d75\u4db6\u4df7\u4e38\u4e79\u4eba\u4efb\u4f3c\ufffd",
+          "finish_reason": "length"
+        }
+      ]
+    }
+  },
+  {
+    "c": 4,
+    "response": {
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd</s></s></s></s>GET</s>POST</s>PUT</s>DELETE</s>HEAD</s>OPTIONS</s>PATCH</s>CONNECT</s>TRACE</s>HTTP/1.1</s>HTTP/2</s>HTTP/3</s>Host:</s>User-Agent:</s>Accept:</s>Content-Type:</s>Authorization:</s>Bearer</s>Basic</s>Cookie:</s>Set-Cookie:</s>Cache-Control:</s>Content-Length:</",
+          "finish_reason": "length"
+        },
+        {
+          "index": 1,
+          "text": "\ufffd\u02cb\u030c\u034d\u040e\u0450\u0492\u04d3\u0514\u0555\u0596\u05d7\u0618\u0659\u069a\u06db\u071c\u075d\u079e\u07df\u18a1\u48a2\u48e3\u4924\u4965\u49a6\u49e7\u4a28\u4a69\u4aaa\u4aeb\u4b2c\u4b6d\u4bae\u4bef\u4c30\u4c71\u4cb2\u4cf3\u4d34\u4d75\u4db6\u4df7\u4e38\u4e79\u4eba\u4efb\u4f3d\u4f7e\ufffd",
+          "finish_reason": "length"
+        },
+        {
+          "index": 2,
+          "text": "\ufffd\u05f0\u05f1\u05f2\u05f3\u05f4\u05f5\u05f6\u05f7\u05f8\u05f9\u05fa\u05fb\u05fc\u05fd\u05fe\u05ff\u0600\u0601\u0602\u0603\u0604\u0605\u0606\u0607\u0608\u0609\u060a\u060b\u060c\u060d\u060e\u060f\u0610\u0611\u0612\u0613\u0614\u0615\u0616\u0617\u0618\u0619\u061a\u061b\u061c\u061d\u061e\u061f\u0620\u0621\u0622\u0623\u0624\u0625\u0626\u0627\u0628\u0629\u062a\u062b\u062c\u062d\u062e\u062f",
+          "finish_reason": "length"
+        },
+        {
+          "index": 3,
+          "text": "\ufffd\ufffd\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464",
+          "finish_reason": "length"
+        }
+      ]
+    }
+  },
+  {
+    "c": 8,
+    "response": {
+      "choices": [
+        {
+          "index": 0,
+          "text": "\ufffd\ufffd\ufffd                                                                                                                           ",
+          "finish_reason": "length"
+        },
+        {
+          "index": 1,
+          "text": "\ufffd\u02cb\u030c\u034d\u040e\u0450\u0492\u04d3\u0514\u0555\u0596\u05d7\u0618\u0659\u069a\u06db\u071c\u075d\u079e\u07df\u18a1\u48a2\u48e3\u4924\u4965\u49a6\u49e7\u4a28\u4a69\u4aaa\u4aeb\u4b2c\u4b6d\u4bae\u4bef\u4c30\u4c71\u4cb2\u4cf3\u4d34\u4d75\u4db6\u4df7\u4e38\u4e79\u4eba\u4efb\u4f3d\u4f7e\ufffd",
+          "finish_reason": "length"
+        },
+        {
+          "index": 2,
+          "text": "\ufffd\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\u05d1\u05d0\ufffd",
+          "finish_reason": "length"
+        },
+        {
+          "index": 3,
+          "text": "\ufffd\ufffd\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464\u4464",
+          "finish_reason": "length"
+        },
+        {
+          "index": 4,
+          "text": "\ufffd\ufffd\ufffd\ud850\udc01\ud850\udc02\ud850\udc03\ud850\udc04\ud850\udc05\ud850\udc06\ud850\udc07\ud850\udc08\ud850\udc09\ud850\udc0a\ud850\udc0b\ud850\udc0c\ud850\udc0d\ud850\udc0e\ud850\udc0f\ud850\udc10\ud850\udc11\ud850\udc12\ud850\udc13\ud850\udc14\ud850\udc15\ud850\udc16\ud850\udc17\ud850\udc18\ud850\udc19\ud850\udc1a\ud850\udc1b\ud850\udc1c\ud850\udc1d\ud850\udc1e\ud850\udc1f\ufffd",
+          "finish_reason": "length"
+        },
+        {
+          "index": 5,
+          "text": "[thinking about the future of artificial intelligence]p[The following is a message from the Chief Information Officer of the company to all employees regarding the new AI assistant system]p[The following is a message from the Chief Information Officer of the company to all employees regarding the new AI assistant system]p[The following is a message from the Chief Information Officer of the company to all employees regarding the new AI assistant system]p[The following is a message from the Chief Information Officer of the company to all employees regarding the new AI assistant system]p[The following is a message from the Chief Information Officer of the company to",
+          "finish_reason": "length"
+        },
+        {
+          "index": 6,
+          "text": "\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f \u007f\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0\u00a1\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00ba\u00bb\u00bc\u00bd\u00be\u00bf\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u00c7\u00c8",
+          "finish_reason": "length"
+        },
+        {
+          "index": 7,
+          "text": "\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f \u007f\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\ufffd\u00a0\u00a1\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4\u00b5\u00b6\u00b7\u00b8\u00b9\u00ba\u00bb\u00bc\u00bd\u00be\u00bf\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u00d0\u00d1\u00d2\u00d3\u00d4\u00d5",
+          "finish_reason": "length"
+        }
+      ]
+    }
+  }
+]

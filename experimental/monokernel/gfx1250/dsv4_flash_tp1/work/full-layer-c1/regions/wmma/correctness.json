@@ -1,0 +1,32 @@
+{
+  "QL": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  },
+  "KV": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  },
+  "QLQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  },
+  "Q": {
+    "relative_rms": 2.248596956633264e-06,
+    "max_abs": 0.0004068538546562195,
+    "exact": false
+  },
+  "QRot": {
+    "relative_rms": 2.698536491152481e-06,
+    "max_abs": 0.00048828125,
+    "exact": false
+  },
+  "KVRot": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true
+  }
+}

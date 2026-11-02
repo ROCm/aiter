@@ -1,0 +1,65 @@
+[
+  {
+    "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+    "us": 2.963,
+    "args": {
+      "External id": 1538,
+      "device": 2,
+      "stream": 0,
+      "correlation": 70,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        4,
+        1
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+    "us": 2.883,
+    "args": {
+      "External id": 1545,
+      "device": 2,
+      "stream": 0,
+      "correlation": 71,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        2,
+        128
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 9, 4, 1, 4096, 1024, 1024, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+    "us": 4.285,
+    "args": {
+      "External id": 1549,
+      "device": 2,
+      "stream": 0,
+      "correlation": 72,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "block": [
+        288,
+        1,
+        1
+      ]
+    }
+  }
+]

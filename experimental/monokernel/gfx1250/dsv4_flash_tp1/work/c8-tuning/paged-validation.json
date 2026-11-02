@@ -1,0 +1,98 @@
+[
+  {
+    "finite": true,
+    "relative_rms": 0.0008647844661027193,
+    "max_abs": 0.001953125,
+    "seed": 0,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.001451502670533955,
+    "max_abs": 0.001953125,
+    "seed": 1,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.00080898217856884,
+    "max_abs": 0.001953125,
+    "seed": 2,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.0014479535166174173,
+    "max_abs": 0.001953125,
+    "seed": 3,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.0009256339981220663,
+    "max_abs": 0.001953125,
+    "seed": 4,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 2.67495124717243e-06,
+      "max_abs": 0.0001220703125
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.0014856420457363129,
+    "max_abs": 0.001953125,
+    "seed": 5,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 5.071889290775289e-07,
+      "max_abs": 1.52587890625e-05
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.0008217156282626092,
+    "max_abs": 0.0009765625,
+    "seed": 6,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 9.886362931865733e-06,
+      "max_abs": 0.00048828125
+    }
+  },
+  {
+    "finite": true,
+    "relative_rms": 0.0014552315697073936,
+    "max_abs": 0.001953125,
+    "seed": 7,
+    "health": 0,
+    "native_same_splits": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    }
+  }
+]

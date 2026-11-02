@@ -1,0 +1,23 @@
+{
+  "fused": {
+    "atomic_add": 10,
+    "tdm": true,
+    "wmma": true,
+    "prefetch": true,
+    "rcp": true
+  },
+  "opt": {
+    "atomic_add": 7,
+    "tdm": true,
+    "wmma": true,
+    "prefetch": true,
+    "rcp": true
+  },
+  "opt_both": {
+    "atomic_add": 7,
+    "tdm": true,
+    "wmma": true,
+    "prefetch": true,
+    "rcp": true
+  }
+}

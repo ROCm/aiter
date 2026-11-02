@@ -1,0 +1,39 @@
+{
+  "baseline": {
+    "strict": 31,
+    "n": 32,
+    "format_differences": []
+  },
+  "baseline-c2": {
+    "strict": 31,
+    "n": 32,
+    "format_differences": []
+  },
+  "baseline-c4": {
+    "strict": 30,
+    "n": 32,
+    "format_differences": []
+  },
+  "fixed-c2": {
+    "strict": 31,
+    "n": 32,
+    "format_differences": []
+  },
+  "fixed-c4": {
+    "strict": 30,
+    "n": 32,
+    "format_differences": []
+  },
+  "fixed-c8": {
+    "strict": 30,
+    "n": 32,
+    "format_differences": [
+      {
+        "doc_id": 27,
+        "predicted": "16.00",
+        "expected": "16",
+        "numerically_equal": true
+      }
+    ]
+  }
+}

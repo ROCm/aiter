@@ -1,0 +1,3 @@
+# Keep L2 prefetch and all-weight TDM enabled
+
+User-selected development default: all-weight TDM plus non-speculative device-scope L2 QB prefetch before RMSNorm/polling. Exact previously validated mechanisms, newly combined. Preserve all-weight TDM without prefetch and global control as ablations. Validate combined configuration and report round two only. Historical31.842/33.589us numbers are vector-prototype region5..10 summed profiler GPU durations, excluding input quant. Current kernel includes input quant and uses event-based batched graph latency; report scope/method difference rather than claiming controlled speedup.

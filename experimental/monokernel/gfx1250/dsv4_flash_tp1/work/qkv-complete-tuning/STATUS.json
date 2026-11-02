@@ -1,0 +1,7 @@
+{
+  "status": "complete",
+  "saved_utc": "2026-10-20T17:47:15.218751+00:00",
+  "recommended": "QKVRegion mode=two: QA split16/unroll1; QB N128/unroll4",
+  "baseline_preserved": "/home/vigokhal/dsv4-monokernel/qkv-complete-ablation",
+  "serving_integration": false
+}

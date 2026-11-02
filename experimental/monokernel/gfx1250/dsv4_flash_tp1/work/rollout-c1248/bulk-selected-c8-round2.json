@@ -1,0 +1,19 @@
+{
+  "configuration": "selected",
+  "round": 2,
+  "requests": 8,
+  "completions_per_request": 8,
+  "input_tokens_per_completion": 1024,
+  "output_tokens_per_completion": 1,
+  "median_response_ms": 139.3256655010191,
+  "samples_ms": [
+    152.81788399806828,
+    149.03912999943714,
+    139.20712899926002,
+    149.13268099917332,
+    139.28914999996778,
+    139.15044800160103,
+    139.0230960023473,
+    139.36218100207043
+  ]
+}

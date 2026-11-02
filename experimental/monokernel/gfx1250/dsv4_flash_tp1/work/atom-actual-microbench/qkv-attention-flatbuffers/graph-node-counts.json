@@ -1,0 +1,20 @@
+{
+  "actual_atom_qkv_attention": {
+    "kernel_count": 896,
+    "original_types": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "fused_qkv_attention": {
+    "kernel_count": 128,
+    "original_types": [
+      0
+    ]
+  }
+}

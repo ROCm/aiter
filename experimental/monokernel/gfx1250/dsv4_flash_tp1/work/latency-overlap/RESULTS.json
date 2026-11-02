@@ -1,0 +1,55 @@
+{
+  "date_utc": "2026-10-21T21:34:54.921308+00:00",
+  "workload": "Flash TP1, all43decode layers, C8,1024input/1024output,64requests",
+  "method": "One server start per configuration, client twice, second client only. Configurations assigned separate GPUs.",
+  "selected_env": {
+    "ATOM_DSV4_EDGE_MASK": 0,
+    "ATOM_DSV4_TILE_MASK": 192,
+    "ATOM_DSV4_OVERLAP": 2
+  },
+  "e2e": {
+    "native": {
+      "completed": 64,
+      "duration": 114.4145426340001,
+      "median_ttft_ms": 287.84728499886114,
+      "median_tpot_ms": 13.699308987782432,
+      "total_token_throughput": 1145.5886374452007,
+      "output_throughput": 572.7943187226003
+    },
+    "previous": {
+      "completed": 64,
+      "duration": 100.02709711699936,
+      "median_ttft_ms": 284.01299550023396,
+      "median_tpot_ms": 12.02909980254192,
+      "total_token_throughput": 1310.3649288821023,
+      "output_throughput": 655.1824644410511
+    },
+    "selected": {
+      "completed": 64,
+      "duration": 97.92398673899879,
+      "median_ttft_ms": 300.0679839988152,
+      "median_tpot_ms": 11.69637000097876,
+      "total_token_throughput": 1338.5075951753486,
+      "output_throughput": 669.2537975876743
+    }
+  },
+  "matched_text_to_previous": {
+    "native": [
+      false,
+      false,
+      false
+    ],
+    "previous": [
+      true,
+      true,
+      true
+    ],
+    "selected": [
+      true,
+      true,
+      true
+    ]
+  },
+  "accuracy_note": "Three greedy128-token prompt smoke checks only; no new GSM8K run.",
+  "new_defaults": false
+}

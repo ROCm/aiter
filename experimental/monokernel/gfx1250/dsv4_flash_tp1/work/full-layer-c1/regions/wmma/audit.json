@@ -1,0 +1,23 @@
+{
+  "isa_instructions": [
+    "v_wmma_f32_16x16x32_bf16"
+  ],
+  "resources": {
+    "n_regs": 228,
+    "n_spills": 0,
+    "shared": 32768,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ]
+  },
+  "scratch_bytes": [
+    "0"
+  ],
+  "trace_replays": 30,
+  "kernels_per_replay": 1,
+  "original_threshold_passed": true,
+  "worst_reference_relative_rms": 8.095925295492634e-06
+}

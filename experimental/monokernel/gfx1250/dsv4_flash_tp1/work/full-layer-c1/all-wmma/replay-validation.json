@@ -1,0 +1,7 @@
+{
+  "replays": 1000,
+  "changing_payload": true,
+  "counter_wrap": true,
+  "exact_against_regions": true,
+  "health": 0
+}

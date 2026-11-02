@@ -1,0 +1,12 @@
+CORRECTNESS UPDATE — 2026-10-19 upstream integration validation
+A later real Pro C8 decode input differed by one BF16 element in the split-K
+QKV projection (rank3,1/16384 elements,absolute difference0.00390625).
+The timings below are historical measurements of that earlier configuration;
+they are not performance measurements of the corrected unsplit implementation.
+The new upstream-style integration is in /home/vigokhal/ATOM-gfx1250-integration.
+Its Pro profile uses NUM_KSPLIT=1 and passed full live regional validation.
+The published old TP4 image is unchanged. To avoid its split-K QKV path, set
+ATOM_DSV4_HYBRID_GEMM=0 when using its existing launcher. The mHC/quant fusion
+and other projection tuning are independent flags. Do not infer universal
+exactness from the older sampled exact checks.
+

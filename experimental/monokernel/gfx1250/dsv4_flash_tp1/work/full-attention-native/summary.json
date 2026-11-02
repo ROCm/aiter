@@ -1,0 +1,19 @@
+{
+  "round": 2,
+  "latency_us": {
+    "actual_atom_extracted_boundary": 169.98980194330215,
+    "fused_single_launch": 63.69832530617714,
+    "staged_prototype_control": 60.49400381743908
+  },
+  "resources": {
+    "vgpr": 410,
+    "lds": 131584,
+    "spills": 0
+  },
+  "numerically_accepted": false,
+  "native_failures": 122,
+  "cases": 411,
+  "max_residual_rms": 0.008220567367970943,
+  "staged_bitwise_all": true,
+  "stress_calls": 4096
+}

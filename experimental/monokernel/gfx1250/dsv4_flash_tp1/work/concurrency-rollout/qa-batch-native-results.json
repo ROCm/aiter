@@ -1,0 +1,632 @@
+[
+  {
+    "m": 2,
+    "checks": [
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_qa_norm_only": 16.767470820420453,
+        "fused_qa_norm_plus_kv_rope": 8.800331521149419
+      },
+      {
+        "native_qa_norm_only": 16.705069541931152,
+        "fused_qa_norm_plus_kv_rope": 8.732600919976344
+      }
+    ],
+    "vgpr": 148,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 4,
+    "checks": [
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_qa_norm_only": 16.67102922860543,
+        "fused_qa_norm_plus_kv_rope": 8.853258405412946
+      },
+      {
+        "native_qa_norm_only": 16.715813035448196,
+        "fused_qa_norm_plus_kv_rope": 8.721595384273293
+      }
+    ],
+    "vgpr": 148,
+    "lds": 41440,
+    "spills": 0
+  },
+  {
+    "m": 8,
+    "checks": [
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      },
+      {
+        "qa_neq": 0,
+        "quant_neq": 0,
+        "scale_neq": 0,
+        "health": 0
+      }
+    ],
+    "timings": [
+      {
+        "native_qa_norm_only": 16.97271882932132,
+        "fused_qa_norm_plus_kv_rope": 9.090186862712178
+      },
+      {
+        "native_qa_norm_only": 16.985704830094424,
+        "fused_qa_norm_plus_kv_rope": 8.914124539311182
+      }
+    ],
+    "vgpr": 148,
+    "lds": 41440,
+    "spills": 0
+  }
+]

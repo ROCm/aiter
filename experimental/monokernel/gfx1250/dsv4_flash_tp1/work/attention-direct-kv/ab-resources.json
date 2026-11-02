@@ -1,0 +1,122 @@
+{
+  "t128_s1_attention_directFalse": {
+    "vgpr": 410,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t128_s1_attention_directTrue": {
+    "vgpr": 414,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t128_s1_two_directFalse": {
+    "vgpr": 410,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t128_s1_two_directTrue": {
+    "vgpr": 414,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t128_s1_fused_directFalse": {
+    "vgpr": 370,
+    "lds": 73856,
+    "spills": 0
+  },
+  "t128_s1_fused_directTrue": {
+    "vgpr": 380,
+    "lds": 73856,
+    "spills": 0
+  },
+  "t128_s4_attention_directFalse": {
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_s4_attention_directTrue": {
+    "vgpr": 416,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_s4_two_directFalse": {
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_s4_two_directTrue": {
+    "vgpr": 416,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_s4_fused_directFalse": {
+    "vgpr": 372,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t128_s4_fused_directTrue": {
+    "vgpr": 383,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s1_attention_directFalse": {
+    "vgpr": 410,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t1024_s1_attention_directTrue": {
+    "vgpr": 413,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t1024_s1_two_directFalse": {
+    "vgpr": 410,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t1024_s1_two_directTrue": {
+    "vgpr": 413,
+    "lds": 66800,
+    "spills": 0
+  },
+  "t1024_s1_fused_directFalse": {
+    "vgpr": 370,
+    "lds": 73856,
+    "spills": 0
+  },
+  "t1024_s1_fused_directTrue": {
+    "vgpr": 380,
+    "lds": 73856,
+    "spills": 0
+  },
+  "t1024_s4_attention_directFalse": {
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s4_attention_directTrue": {
+    "vgpr": 416,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s4_two_directFalse": {
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s4_two_directTrue": {
+    "vgpr": 416,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s4_fused_directFalse": {
+    "vgpr": 372,
+    "lds": 131584,
+    "spills": 0
+  },
+  "t1024_s4_fused_directTrue": {
+    "vgpr": 383,
+    "lds": 131584,
+    "spills": 0
+  }
+}

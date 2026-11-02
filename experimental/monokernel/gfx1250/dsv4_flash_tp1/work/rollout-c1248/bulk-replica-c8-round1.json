@@ -1,0 +1,19 @@
+{
+  "configuration": "replica",
+  "round": 1,
+  "requests": 8,
+  "completions_per_request": 8,
+  "input_tokens_per_completion": 1024,
+  "output_tokens_per_completion": 1,
+  "median_response_ms": 141.82572099707613,
+  "samples_ms": [
+    160.79537900077412,
+    145.44122900042566,
+    142.1683810003742,
+    139.5538930009934,
+    140.01555999857374,
+    140.39048600170645,
+    141.55140199727612,
+    142.10003999687615
+  ]
+}

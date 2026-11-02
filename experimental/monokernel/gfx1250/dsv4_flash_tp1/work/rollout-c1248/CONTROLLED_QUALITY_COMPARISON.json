@@ -1,0 +1,113 @@
+{
+  "native": [
+    {
+      "c": 1,
+      "same_text": [
+        false
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        false,
+        false
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  ],
+  "selected": [
+    {
+      "c": 1,
+      "same_text": [
+        true
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        true,
+        true
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  ],
+  "replica": [
+    {
+      "c": 1,
+      "same_text": [
+        true
+      ]
+    },
+    {
+      "c": 2,
+      "same_text": [
+        true,
+        true
+      ]
+    },
+    {
+      "c": 4,
+      "same_text": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "c": 8,
+      "same_text": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "baseline": {
+    "completed": 4,
+    "total_token_throughput": 151.91866165827207,
+    "output_throughput": 75.95933082913604,
+    "mean_ttft_ms": 147.6960562495151,
+    "mean_tpot_ms": 13.032948550586966
+  },
+  "hash_baseline": {
+    "completed": 4,
+    "total_token_throughput": 150.66152287759186,
+    "output_throughput": 75.33076143879593,
+    "mean_ttft_ms": 153.10219999992114,
+    "mean_tpot_ms": 13.137658720429593
+  },
+  "candidate": {
+    "completed": 4,
+    "total_token_throughput": 147.83186721783756,
+    "output_throughput": 73.91593360891878,
+    "mean_ttft_ms": 155.66342300098768,
+    "mean_tpot_ms": 13.389477844573745
+  }
+}

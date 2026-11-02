@@ -1,0 +1,31 @@
+{
+  "atom_class": "Block",
+  "source": "/app/ATOM/atom/models/deepseek_v4.py",
+  "method_line": 4215,
+  "packed_dtype": "torch.int32",
+  "input_shape": [
+    1,
+    4,
+    4096
+  ],
+  "weight_shape": [
+    24,
+    16384
+  ],
+  "norm_weight_shape": [
+    4096
+  ],
+  "norm_fused": true,
+  "round_to_report": 2,
+  "graph_repetitions": 128,
+  "allocation_policy": "single captured call, kernelnodes flat-cloned128 times, stable addresses",
+  "samples_per_round": 40,
+  "checkpoint": "/data/DeepSeek-V4-Flash",
+  "scope": "layer0 attention mHC pre + norm; no preceding mHC post; independent of context length",
+  "residual_preshuffle": true,
+  "native_launches": 3,
+  "fused_core_launches": 1,
+  "fused_matched_input_launches": 2,
+  "atom_commit": "f19778df4054e94d64d6f6bf6dd68f5681bd5945",
+  "aiter_commit": "7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe"
+}

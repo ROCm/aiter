@@ -1,0 +1,49 @@
+[
+  {
+    "m": 8,
+    "ratio": 0,
+    "checks": {
+      "1": {
+        "final": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "norm": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        },
+        "q": {
+          "exact": true,
+          "max_abs": 0.0,
+          "relative_rms": 0.0
+        }
+      }
+    },
+    "resources": [
+      {
+        "mode": 0,
+        "vgpr": 424,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          256.604532400767,
+          257.0438345273336
+        ],
+        "second_us": 257.0438345273336
+      },
+      {
+        "mode": 1,
+        "vgpr": 424,
+        "spills": 0,
+        "lds": 157156,
+        "rounds_us": [
+          264.02093172073364,
+          264.78476723035175
+        ],
+        "second_us": 264.78476723035175
+      }
+    ]
+  }
+]

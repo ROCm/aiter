@@ -1,0 +1,87 @@
+{
+  "updated_utc": "2026-10-21T17:42:35.501234+00:00",
+  "task": "True multirow full-layer Flash monokernel following C1; C1/C2/C4/C8",
+  "directory": "/home/vigokhal/dsv4-monokernel/batch-full",
+  "validated": [
+    "mHC pre/post",
+    "QKV",
+    "split-KV attention",
+    "OA/OB output",
+    "router/shared expert",
+    "routed MoE including eight-token same-expert collision",
+    "full FFN",
+    "compressor state",
+    "full uncompressed layer",
+    "full ratio4 compressed layer",
+    "full ratio128 layer",
+    "all 43 layers captured at C1/C2/C4/C8"
+  ],
+  "comparison": "bit exact to corrected C1 per row; synthetic distinct-row full-layer fixture; routed MoE separately checkpoint weights",
+  "pending": [],
+  "fixes": [
+    "explicit QB BF16 rounding independent of scratch dtype",
+    "bounded TDM QA/QB prefetch; masked inline prefetch failed in larger fused kernel",
+    "Bounded TDM cache prefetch replaces inline cache prefetch; ratio128 stall eliminated"
+  ],
+  "resource": "full C8 ratio4:679 VGPR,133088 LDS bytes,0 spills",
+  "integration": "ATOM_DSV4_BATCH_FULL=1 imports runtime_batch.ServingLayer; installed opt-in; original C1 adapter unchanged",
+  "commands": [
+    "docker exec vigokhal_dsv4_tp4 python /work/batch-full/install.py",
+    "HIP_VISIBLE_DEVICES=N HTTP_PORT=11500 PORT=11501 CONCURRENCY=8 bash /work/batch-full/run.sh baseline|fused",
+    "HTTP_PORT=11500 bash /work/batch-full/run.sh client TAG CONCURRENCY"
+  ],
+  "benchmark_rule": "server once, client twice, report round2 only",
+  "running_baseline": "GPU1 HTTP11500 PORT11501",
+  "running_microbench": null,
+  "report_files": [
+    "mhc-checks.json",
+    "compressor-checks.json",
+    "ffn-checks.json",
+    "full-checks.json",
+    "attention-checks.json",
+    "full-compressed-4-checks.json",
+    "ffn-group-checks.json",
+    "output-checks.json",
+    "moe-checks.json"
+  ],
+  "baseline_gsm8k": "31/32, three-shot, max512 output, C8",
+  "serving_probes": "All leading arithmetic answers correct; full32token native text13/15 equal; batch-vs-C1 text12/14 equal. Not full numerical qualification.",
+  "running_servers": {
+    "GPU0": "corrected full HTTP11700 idle after C8",
+    "GPU1": "native HTTP11500 idle",
+    "GPU2": "corrected full HTTP11800 idle after C4",
+    "GPU3": "corrected full HTTP11600 idle after C2"
+  },
+  "accuracy_before_fix": {
+    "native_c8": 31,
+    "full_c1": 31,
+    "full_c2": 29,
+    "full_c4": 24,
+    "full_c8": 28,
+    "denominator": 32
+  },
+  "padding_bug": "ATOM pads positions and state slots with 0, uses batch_id_per_q_token=-1 for invalid rows. Reconstructed compressor write plans ignored invalid rows and could corrupt slot0. Fixed plans and cache writes use BatchIds validity.",
+  "padding_tests": "M2/4/8 with one padding row bit-exact valid outputs and compressor/indexer states vs separate C1",
+  "performance_status": "Recorded initial C2/C4/C8 second-run results are pre-padding-fix and accuracy-unqualified",
+  "padding_negative_control": "Without BatchIds mask: corrupt compressor and indexer state and incorrect valid-token final output. With mask: bit-exact valid outputs/state for M2/4/8, ratios4 and128.",
+  "native_gsm8k_by_concurrency": {
+    "2": 31,
+    "4": 30,
+    "8": 31,
+    "denominator": 32
+  },
+  "status": "Batched full layer implemented; padding bug fixed; matched-concurrency subset accuracy and second-client benchmarks completed",
+  "results": "/home/vigokhal/dsv4-monokernel/batch-full/RESULTS.json",
+  "next_work": [
+    "Optimize C8 full-layer performance; it currently trails native",
+    "Broaden accuracy validation beyond32 GSM8K examples; C4 equal scores have different failed examples",
+    "Consider isolated routed-MoE scheduling/occupancy ablations within the full kernel"
+  ],
+  "accuracy_fixed": {
+    "C2": 31,
+    "C4": 30,
+    "C8": 30,
+    "denominator": 32,
+    "C8_extra_failure": "16.00 vs16; numerically correct"
+  }
+}

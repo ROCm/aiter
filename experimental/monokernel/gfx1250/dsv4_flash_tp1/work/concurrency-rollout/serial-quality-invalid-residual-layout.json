@@ -1,0 +1,105 @@
+[
+  {
+    "concurrency": 2,
+    "candidate": [
+      {
+        "id": "cmpl-9e7a6ae4b7ea44088668206509d726aa",
+        "object": "text_completion",
+        "created": 1792546636,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H econ\u00f3m",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 1.3131,
+          "tpot_s": 4.4482,
+          "latency_s": 68.0361
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-433087e6c1b145b6baa3ed2419d1480c",
+        "object": "text_completion",
+        "created": 1792546636,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "I econ\u00f3m",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 67.7085,
+          "tpot_s": 0.0218,
+          "latency_s": 68.0353
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-88a33861cb1d47429691e6a70851e660",
+        "object": "text_completion",
+        "created": 1792546637,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1505,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3473
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-722d5b8efa924721b9b9d609603024fb",
+        "object": "text_completion",
+        "created": 1792546637,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1413,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3384
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      false,
+      false
+    ]
+  }
+]

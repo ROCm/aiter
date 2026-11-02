@@ -1,0 +1,23 @@
+from pathlib import Path
+import json,re
+r=Path('/home/vigokhal/dsv4-monokernel');out=r/'prefill-dispatch-fix'
+results={}
+for tag in ['native','wrapped','fused']:
+ p=r/'concurrency-rollout'/f'prefillfix-{tag}-c8-round2.json'
+ if p.exists():
+  d=json.loads(p.read_text());results[tag]={k:d[k] for k in ['completed','median_ttft_ms','median_tpot_ms','total_token_throughput','output_throughput']};results[tag]['path']=str(p)
+gsm={}
+for p in (r/'batch-full/gsm8k-prefillfix-fused-c8').rglob('results_*.json'):gsm=json.loads(p.read_text())['results']
+tiny=[]
+if (out/'tiny-prefill-checks.json').exists():tiny=[{k:d[k] for k in ['input_tokens','text_equal']} for d in json.loads((out/'tiny-prefill-checks.json').read_text())]
+s=(out/'fixed-server.log').read_text();compiled={m:len(set(re.findall(r'OPTIMIZED FULL MONOKERNEL layer=(\d+) batch='+str(m)+r' ',s))) for m in [1,2,4,8]}
+first=json.loads((out/'first-token-checks.json').read_text())
+first=[{k:d[k] for k in ['input_tokens','first_token_equal']} for d in first]
+audit=json.loads((out/'graph-audit.json').read_text())
+report=dict(model='DeepSeek-V4-Flash',tp=1,ep=False,concurrency=8,input_len=1024,output_len=1024,num_prompts=64,method='One server start per config; two clients; report second only. Median TTFT/TPOT. Total throughput=input+output. Native GPU0, wrapped GPU1, fixed GPU3.',results=results,graph_audit=audit,compiled_layers=compiled,tiny_prefill_checks=tiny,first_token_text_checks=first,gsm8k=gsm,change='Outer ForCausalLM mode dispatch before torch.compile; native backbone disables per-layer experimental wrapper under decode-only dispatch. Eligible decode executes existing monokernel via GPU-graph-captured eager orchestration. Prefill including tiny/chunked stays on native compiled backbone. Monokernel math unchanged.',limitations=['One of five eight-token continuations differs. First-token decoded text matches in all five; server did not return token IDs/logprobs, so this is not token-ID equality proof.','Residual TTFT gap of7.49ms vs native remains unexplained.','32-example GSM8K smoke test only, not complete accuracy qualification.','No new C1/C2/C4 performance results; compiled and exercised shapes, C8 throughput measured.','No image/branch push requested or performed.'])
+(out/'RESULTS.json').write_text(json.dumps(report,indent=2))
+lines=['# Decode-only dispatch / native prefill — 2026-10-21','','The mode branch now runs outside ATOM\'s compiled backbone. The backbone uses native layers for all prefill sizes and no longer enters the monokernel custom-op fallback or its four output clones/layer. Eligible decode calls the unchanged full monokernel through eager orchestration recorded in ATOM\'s full GPU graphs.','','## Second-client C8 performance','','1k input / 1k output,64requests, one server start per configuration. Median TTFT/TPOT; total throughput includes input+output.','','|Configuration|TTFT ms|TPOT ms|Total tok/s|Output tok/s|','|---|---:|---:|---:|---:|']
+for n,d in results.items():lines.append(f"|{n}|{d['median_ttft_ms']:.3f}|{d['median_tpot_ms']:.3f}|{d['total_token_throughput']:.3f}|{d['output_throughput']:.3f}|")
+lines+=['','## Graph evidence','','Native and fixed use the same compiled-backbone cache key and byte-identical computation_graph.py: SHA256 '+audit['fixed']['sha256']+'. Both have zero monokernel custom-op call sites. Wrapped control has43 calls; its clones execute inside those opaque callbacks and therefore are not graph-level clone nodes. Full graph snapshots and audit stored here.','','## Validation','','Serving logs confirm all43 monokernel layers captured for each batch1/2/4/8. Tiny-prefill comparisons: '+json.dumps(tiny)+'.','','Single-token decoded-text checks: '+json.dumps(first)+'. Server did not return token IDs/logprobs; matching text (including replacement characters) does not prove token-ID equality. One of five longer continuations differs; decode numerical differences remain.','','GSM8K32examples,3-shot,max512 generated tokens: '+json.dumps(gsm)+'. Limited smoke test.','','## Run','','Existing integrated-c8/run.sh now defaults ATOM_DSV4_DECODE_ONLY_DISPATCH=1. Set it to0 only for the old wrapped control. prefill-dispatch-fix/run.sh explicitly selects1. install.py applies the outer dispatch and native-backbone branch to /app/ATOM/atom/models/deepseek_v4.py; decode_forward.py must be available in /work/integrated-c8. Model and matching ROCm/Triton/AITER environment required.','','ASCII designs are in ATTENTION_DESIGNS.txt. The monokernel implementations and their prior numerical qualifications are in ../integrated-c8. This patch changes orchestration, not kernel math.']
+(out/'RESULTS.md').write_text('\n'.join(lines)+'\n')
+print(json.dumps(results,indent=2));print('tiny',tiny,'gsm',gsm)

@@ -1,0 +1,32 @@
+{
+  "QL": {
+    "relative_rms": 0.0005746446549892426,
+    "max_abs": 0.00026197731494903564,
+    "exact": false
+  },
+  "KV": {
+    "relative_rms": 0.00044909390271641314,
+    "max_abs": 0.0035811662673950195,
+    "exact": false
+  },
+  "QLQ": {
+    "relative_rms": 0.0007106892298907042,
+    "max_abs": 0.00048828125,
+    "exact": false
+  },
+  "Q": {
+    "relative_rms": 0.001426582457497716,
+    "max_abs": 0.04591083526611328,
+    "exact": false
+  },
+  "QRot": {
+    "relative_rms": 0.001726557151414454,
+    "max_abs": 0.0625,
+    "exact": false
+  },
+  "KVRot": {
+    "relative_rms": 0.000734715664293617,
+    "max_abs": 0.0078125,
+    "exact": false
+  }
+}

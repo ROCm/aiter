@@ -1,0 +1,17 @@
+{
+  "QA": {
+    "relative_rms": 0.0005913905333727598,
+    "max_abs": 0.00048828125,
+    "exact": false
+  },
+  "KV": {
+    "relative_rms": 0.0004727618070319295,
+    "max_abs": 0.00048828125,
+    "exact": false
+  },
+  "QB": {
+    "relative_rms": 0.0005832052556797862,
+    "max_abs": 0.001953125,
+    "exact": false
+  }
+}

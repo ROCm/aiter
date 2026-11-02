@@ -1,0 +1,47 @@
+2026-10-21 whole-monokernel latency-overlap / tile-readiness experiments.
+
+Selected candidate (not yet a new serving default):
+ATOM_DSV4_EDGE_MASK=0 ATOM_DSV4_TILE_MASK=192 ATOM_DSV4_OVERLAP=2
+Run /work/latency-overlap/run-selected.sh fused inside vigokhal_dsv4_tp4.
+All new environment knobs default off in runtime_batch.py. Existing AITER-pre default stays on.
+
+TILE_MASK bits:
+1 attention split reduction; 2 output projection stages; 4 routed MoE;
+8 shared expert schedule (requires EDGE_MASK&8); 16 QA vs KV branch release;
+32 QKV/attention/output/compressor per-row boundaries; 64 input-layout fusion;
+128 output-layout fusion.
+EDGE_MASK bits: 1 mHC; 2 QA/QB; 4 compressor; 8 FFN schedule; 16 QB head readiness.
+OVERLAP bits: 1 broad extra L2 prefetch (FAILED/STALLED; do not enable);
+2 early OA/OB TDM; 4 QB scalar-scale hoist; 8 compressor Norm/APE TDM.
+Existing bounded QB L2/TDM prefetch and replicated input quant remain in selected path.
+
+Validation:
+validate-{swa,csa,hca}.json: C1/2/4/8 full-layer A/B, all 13 saved checkpoints exact,
+health zero, no spills, repeated graph runs (rep20, two rounds, second reported),
+state restored before comparisons and after benchmark to check replay output.
+These are synthetic layer fixtures, not native unfused ATOM microbenchmarks or E2E.
+SWA uses128 cache entries; CSA/HCA use representative compressed lengths around position1024.
+
+Finer semaphore candidates are NOT selected. Individual short checks often pass;
+longer pure-load replay fails. Atomic polling control passed full combined SWA/HCA
+but was slower than the previous monokernel. Neither coherent-load scope alone nor
+adding a device acquire invalidation resolved every failure. Root cause remains unproven.
+Global-load, buffer-load and scalar-load trials retained in logs. No claims that cache
+coherence is broken. Current helper uses explicit global_load with device scope and
+an acquire fence; still experimental. Counter resets occur at existing entry barrier.
+
+Fixed output TDM queue ordering: initial operations now W0,X0,W1,X1, matching wait(2).
+The previous W0,W1,X0,X1 ordering could consume X0 before it completed. Both A/B paths
+include the fix. Old identical-control repeats occasionally differed at output projection.
+
+Source hashes were verified unchanged during completed E2E runs. Completed runs used native GPU0 HTTP8230, previous monokernel
+GPU1 HTTP8240, selected GPU2 HTTP8250. Each server starts once; clients run twice.
+Client results /work/concurrency-rollout/latency-overlap-{native,previous,selected}-c8-round{1,2}.json.
+E2E complete; see RESULTS.json/RESULTS.txt. All experiment servers stopped after text checks.
+No new image or Git push performed this turn.
+
+References for diagnostic acquire sequence:
+https://llvm.org/docs/AMDGPUUsage.html#amdhsa-memory-model-code-sequences-gfx125x
+Device-scope load acquire uses a scoped load, completion wait, global_inv and another
+completion wait. This reference guided a diagnostic; it is not evidence our failed
+protocol is correct. See edge_sync_* snapshots for earlier variants.

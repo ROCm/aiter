@@ -1,0 +1,580 @@
+[
+  {
+    "region": "Attention mHC pre + RMSNorm",
+    "id": "mhc_pre",
+    "C8": {
+      "native": 8.51712515577674,
+      "fused": 6.949140457436442
+    },
+    "C8_checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 6.16900734939918e-08,
+        "max_abs": 2.384185791015625e-07
+      },
+      "residual_exact": true,
+      "post": {
+        "finite": true,
+        "relative_rms": 3.5678380250203645e-09,
+        "max_abs": 1.6298145055770874e-09
+      },
+      "comb": {
+        "finite": true,
+        "relative_rms": 5.501357591697342e-08,
+        "max_abs": 1.1920928955078125e-07
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/mhc_pre.json",
+    "C16": {
+      "native": 8.6172497831285,
+      "fused": 7.188249845057726
+    },
+    "C16_checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 8.830060323816724e-06,
+        "max_abs": 6.103515625e-05
+      },
+      "residual_exact": true,
+      "post": {
+        "finite": true,
+        "relative_rms": 2.535262000336047e-09,
+        "max_abs": 1.6298145055770874e-09
+      },
+      "comb": {
+        "finite": true,
+        "relative_rms": 6.606330771319335e-08,
+        "max_abs": 1.7881393432617188e-07
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/mhc_pre.json",
+    "C16_fused_delta_percent": -16.58301632231408
+  },
+  {
+    "region": "CSA compressor: projection + pool/norm/RoPE + state/cache write",
+    "id": "compress_case0_pos1023",
+    "C8": {
+      "native": 10.370546486228704,
+      "fused": 9.803453460335732
+    },
+    "C8_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 2.0787172161362832e-06,
+        "max_abs": 0.0001220703125
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/compress_case0_pos1023.json",
+    "C16": {
+      "native": 10.490109212696552,
+      "fused": 9.894844144582748
+    },
+    "C16_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 1.6727857428122661e-06,
+        "max_abs": 0.0001220703125
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/compress_case0_pos1023.json",
+    "C16_fused_delta_percent": -5.674536423256049
+  },
+  {
+    "region": "CSA indexer compressor: projection + pool/norm/RoPE/quant + state/cache write",
+    "id": "compress_case2_pos1023",
+    "C8": {
+      "native": 7.214562501758337,
+      "fused": 7.993234321475029
+    },
+    "C8_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/compress_case2_pos1023.json",
+    "C16": {
+      "native": 7.388593629002571,
+      "fused": 8.560343645513058
+    },
+    "C16_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/compress_case2_pos1023.json",
+    "C16_fused_delta_percent": 15.85890462172661
+  },
+  {
+    "region": "CSA identity top-k + index packing (256 compressed tokens)",
+    "id": "identity_csa_256",
+    "C8": {
+      "native": 2.5663437554612756,
+      "fused": 1.3507812400348485
+    },
+    "C8_checks": {
+      "topk_equal": true,
+      "indices_equal": true,
+      "health": 0
+    },
+    "C8_source": "native-c8/identity_csa_256.json",
+    "C16": {
+      "native": 2.6333124842494726,
+      "fused": 1.3582968967966735
+    },
+    "C16_checks": {
+      "topk_equal": true,
+      "indices_equal": true,
+      "health": 0
+    },
+    "C16_source": "native-c16/identity_csa_256.json",
+    "C16_fused_delta_percent": -48.41869679648728
+  },
+  {
+    "region": "HCA compressor: projection + pool/norm/RoPE + state/cache write",
+    "id": "compress_case1_pos1023",
+    "C8": {
+      "native": 11.1999218352139,
+      "fused": 15.922640450298786
+    },
+    "C8_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 2.3871752574677885e-08,
+        "max_abs": 4.76837158203125e-07
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/compress_case1_pos1023.json",
+    "C16": {
+      "native": 10.89132810011506,
+      "fused": 15.589625108987093
+    },
+    "C16_checks": {
+      "projection": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "state": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 1.7077717018310068e-08,
+        "max_abs": 4.76837158203125e-07
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/compress_case1_pos1023.json",
+    "C16_fused_delta_percent": 43.13796229150783
+  },
+  {
+    "region": "Input quant + QKVA + norms/RoPE + QB + KV-cache write",
+    "id": "qkv_cache",
+    "C8": {
+      "native": 27.715218253433704,
+      "fused": 18.353719264268875
+    },
+    "C8_checks": {
+      "q": {
+        "finite": true,
+        "relative_rms": 1.4909526058204392e-08,
+        "max_abs": 7.62939453125e-06
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      }
+    },
+    "C8_source": "native-c8/qkv_cache.json",
+    "C16": {
+      "native": 13.075843919068575,
+      "fused": 18.381280824542046
+    },
+    "C16_checks": {
+      "q": {
+        "finite": true,
+        "relative_rms": 4.346853543779616e-08,
+        "max_abs": 3.0517578125e-05
+      },
+      "cache": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      }
+    },
+    "C16_source": "native-c16/qkv_cache.json",
+    "C16_fused_delta_percent": 40.574336450563806
+  },
+  {
+    "region": "SWA attention + split-KV reduction (128 KV)",
+    "id": "attention_128",
+    "C8": {
+      "native": 7.494952995330095,
+      "fused": 8.081468753516674
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "C8_source": "native-c8/attention_128.json",
+    "C16": {
+      "native": 10.948906652629375,
+      "fused": 10.443140752613544
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.0016612785402685404,
+      "max_abs": 0.000244140625
+    },
+    "C16_source": "native-c16/attention_128_s4.json",
+    "C16_fused_delta_percent": -4.61932790242916
+  },
+  {
+    "region": "CSA attention + split-KV reduction (384 KV)",
+    "id": "attention_384",
+    "C8": {
+      "native": 9.556812234222889,
+      "fused": 9.397812653332949
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0019167328719049692,
+      "max_abs": 0.0001220703125
+    },
+    "C8_source": "native-c8/attention_384.json",
+    "C16": {
+      "native": 12.530656531453133,
+      "fused": 13.021375052630901
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.001982874935492873,
+      "max_abs": 0.0001220703125
+    },
+    "C16_source": "native-c16/attention_384_s4.json",
+    "C16_fused_delta_percent": 3.916143738726041
+  },
+  {
+    "region": "HCA attention + split-KV reduction (136 KV)",
+    "id": "attention_136",
+    "C8": {
+      "native": 7.930594030767679,
+      "fused": 8.288015611469746
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0016387284267693758,
+      "max_abs": 0.000244140625
+    },
+    "C8_source": "native-c8/attention_136.json",
+    "C16": {
+      "native": 11.46906241774559,
+      "fused": 10.79554669559002
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.0018596833106130362,
+      "max_abs": 0.000244140625
+    },
+    "C16_source": "native-c16/attention_136_s4.json",
+    "C16_fused_delta_percent": -5.872456680621674
+  },
+  {
+    "region": "Inverse RoPE + quant + OA/OB projections",
+    "id": "output_projection",
+    "C8": {
+      "native": 63.68400156497955,
+      "fused": 24.126093834638596
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "C8_source": "native-c8/output_projection.json",
+    "C16": {
+      "native": 15.773609280586243,
+      "fused": 29.408358968794346
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "C16_source": "native-c16/output_projection.json",
+    "C16_fused_delta_percent": 86.44026516486247
+  },
+  {
+    "region": "Attention mHC post + FFN mHC pre/RMSNorm",
+    "id": "mhc_post_pre",
+    "C8": {
+      "native": 5.3123123943805695,
+      "fused": 6.69001555070281
+    },
+    "C8_checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 1.1255546269239858e-05,
+        "max_abs": 6.103515625e-05
+      },
+      "residual": {
+        "finite": true,
+        "relative_rms": 2.345130667436024e-07,
+        "max_abs": 3.814697265625e-06
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/mhc_post_pre.json",
+    "C16": {
+      "native": 5.458187311887741,
+      "fused": 6.741953082382679
+    },
+    "C16_checks": {
+      "norm": {
+        "finite": true,
+        "relative_rms": 3.8518832297995687e-05,
+        "max_abs": 0.000244140625
+      },
+      "residual": {
+        "finite": true,
+        "relative_rms": 1.258293468708871e-05,
+        "max_abs": 0.000244140625
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/mhc_post_pre.json",
+    "C16_fused_delta_percent": 23.52000210214371
+  },
+  {
+    "region": "Router GEMM + shared expert (up/activation/quant/down)",
+    "id": "shared_router",
+    "C8": {
+      "native": 51.4182485640049,
+      "fused": 17.732812091708183
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "C8_source": "native-c8/shared_router.json",
+    "C16": {
+      "native": 17.019858583807945,
+      "fused": 18.649186939001083
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0
+    },
+    "C16_source": "native-c16/shared_router.json",
+    "C16_fused_delta_percent": 9.57310160463507
+  },
+  {
+    "region": "Expert selection + routing metadata",
+    "id": "routing",
+    "C8": {
+      "native": 7.860531099140644,
+      "fused": 6.325093796476722
+    },
+    "C8_checks": {
+      "hist_equal": true,
+      "gather_equal": true,
+      "scatter_equal": true,
+      "scales": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "native HERD enabled at C16; excludes router GEMM"
+    },
+    "C8_source": "native-c8/routing.json",
+    "C16": {
+      "native": 9.738359600305557,
+      "fused": 9.846624918282032
+    },
+    "C16_checks": {
+      "hist_equal": true,
+      "gather_equal": true,
+      "scatter_equal": true,
+      "scales": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "native HERD enabled at C16; excludes router GEMM"
+    },
+    "C16_source": "native-c16/routing.json",
+    "C16_fused_delta_percent": 1.1117408107734983
+  },
+  {
+    "region": "Routed MoE: input quant + up/SwiGLU/quant + down/reduce",
+    "id": "routed_moe",
+    "C8": {
+      "native": 48.90335910022259,
+      "fused": 56.23184330761433
+    },
+    "C8_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "health": 0,
+      "note": "routing metadata prepared outside both timings; input MXFP8 quantization included in both"
+    },
+    "C8_source": "native-c8/routed_moe.json",
+    "C16": {
+      "native": 80.09201288223267,
+      "fused": 89.64134380221367
+    },
+    "C16_checks": {
+      "finite": true,
+      "relative_rms": 0.0,
+      "max_abs": 0.0,
+      "health": 0,
+      "note": "routing metadata prepared outside both timings; input MXFP8 quantization included in both"
+    },
+    "C16_source": "native-c16/routed_moe.json",
+    "C16_fused_delta_percent": 11.922950337160753
+  },
+  {
+    "region": "Shared+routed sum + final mHC post",
+    "id": "sum_final_mhc_post",
+    "C8": {
+      "native": 4.9611718859523535,
+      "fused": 3.2442499650642276
+    },
+    "C8_checks": {
+      "raw": {
+        "finite": true,
+        "relative_rms": 1.4133925437927246,
+        "max_abs": 1.33984375
+      },
+      "plain": {
+        "finite": true,
+        "relative_rms": 2.179950024583377e-05,
+        "max_abs": 0.0009765625
+      },
+      "health": 0
+    },
+    "C8_source": "native-c8/sum_final_mhc_post.json",
+    "C16": {
+      "native": 5.054437555372715,
+      "fused": 4.283281276002526
+    },
+    "C16_checks": {
+      "raw": {
+        "finite": true,
+        "relative_rms": 1.4157850742340088,
+        "max_abs": 1.365234375
+      },
+      "plain": {
+        "finite": true,
+        "relative_rms": 1.5991114196367562e-05,
+        "max_abs": 0.0009765625
+      },
+      "health": 0
+    },
+    "C16_source": "native-c16/sum_final_mhc_post.json",
+    "C16_fused_delta_percent": -15.257014671206548
+  },
+  {
+    "region": "Whole FFN region (overlaps previous four rows)",
+    "id": "whole_ffn",
+    "C8": {
+      "native": 153.6673605442047,
+      "fused": 82.30406045913696
+    },
+    "C8_checks": {
+      "final": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "same checkpoint experts and inputs; learned router/HERD at C16, final layout differs natively"
+    },
+    "C8_source": "native-c8/whole_ffn.json",
+    "C16": {
+      "native": 111.63243651390076,
+      "fused": 123.38320165872574
+    },
+    "C16_checks": {
+      "final": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "health": 0,
+      "note": "same checkpoint experts and inputs; learned router/HERD at C16, final layout differs natively"
+    },
+    "C16_source": "native-c16/whole_ffn.json",
+    "C16_fused_delta_percent": 10.52629998213983
+  }
+]

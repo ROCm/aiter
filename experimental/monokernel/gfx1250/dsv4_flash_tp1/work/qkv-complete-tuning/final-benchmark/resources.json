@@ -1,0 +1,74 @@
+{
+  "prior": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 86,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qb_unroll2": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 142,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qb_unroll4": {
+    "qa": {
+      "vgpr": 112,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 273,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qa2_qb_unroll8": {
+    "qa": {
+      "vgpr": 145,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 827,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

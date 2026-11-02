@@ -1,0 +1,19 @@
+{
+  "configuration": "native",
+  "round": 1,
+  "requests": 8,
+  "completions_per_request": 8,
+  "input_tokens_per_completion": 1024,
+  "output_tokens_per_completion": 1,
+  "median_response_ms": 141.28566850013158,
+  "samples_ms": [
+    161.97072599970852,
+    150.78627600087202,
+    140.33221499994397,
+    140.22129400109407,
+    140.32879400110687,
+    139.99639000030584,
+    150.1227660010045,
+    142.23912200031918
+  ]
+}

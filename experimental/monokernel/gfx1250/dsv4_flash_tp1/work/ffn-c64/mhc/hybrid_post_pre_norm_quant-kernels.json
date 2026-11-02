@@ -1,0 +1,44 @@
+[
+  {
+    "name": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel_C_4096_BLOCK_M_16_K_LOOP_1_SPLIT_K_64_NUM_STAGES_2_RES_SHUFFLED_1_W_PRESHUFFLED_1",
+    "us": 3.044,
+    "args": {
+      "External id": 1025,
+      "device": 3,
+      "stream": 0,
+      "correlation": 54,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        4,
+        64,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_4096_ROWS_1_CHUNK_1024_N_CHUNKS_4_S_64_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "us": 4.085,
+    "args": {
+      "External id": 1025,
+      "device": 3,
+      "stream": 0,
+      "correlation": 66,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        64,
+        1,
+        1
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ]
+    }
+  }
+]

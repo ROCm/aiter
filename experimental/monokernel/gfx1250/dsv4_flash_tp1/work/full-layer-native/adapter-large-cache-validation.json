@@ -1,0 +1,41 @@
+[
+  {
+    "position": 1024,
+    "equal": true,
+    "cache_equal": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "vgpr": 492,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "position": 1536,
+    "equal": true,
+    "cache_equal": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "vgpr": 492,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "position": 2047,
+    "equal": true,
+    "cache_equal": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    },
+    "vgpr": 492,
+    "lds": 133088,
+    "spills": 0
+  }
+]

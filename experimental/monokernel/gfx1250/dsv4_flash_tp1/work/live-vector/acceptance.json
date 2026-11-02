@@ -1,0 +1,9 @@
+{
+  "serving_eligible": false,
+  "scope": "Flash single GPU concurrency 1; layers 0 and 1 only, other 41 layers and prefill native",
+  "native_relative_rms": 0.01983959786593914,
+  "independent_relative_rms": 0.01009,
+  "gate": 0.001,
+  "benchmark_status": "Diagnostic only; numerical acceptance failed",
+  "native_hash_routing_fixed": true
+}

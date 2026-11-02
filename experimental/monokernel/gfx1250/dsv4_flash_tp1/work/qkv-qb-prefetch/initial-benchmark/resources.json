@@ -1,0 +1,74 @@
+{
+  "baseline": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "l2": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "tdm": {
+    "qa": {
+      "vgpr": 305,
+      "spills": 0,
+      "lds": 26624,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 305,
+      "spills": 0,
+      "lds": 26624,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "l2_tdm": {
+    "qa": {
+      "vgpr": 305,
+      "spills": 0,
+      "lds": 26624,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 305,
+      "spills": 0,
+      "lds": 26624,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

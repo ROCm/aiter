@@ -1,0 +1,302 @@
+[
+  {
+    "concurrency": 2,
+    "candidate": [
+      {
+        "id": "cmpl-deb7895f02814f66bdc546592edce3f5",
+        "object": "text_completion",
+        "created": 1792546854,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n 0\n;\n\n;\n\"\"\n;\n\"\"\n",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.8278,
+          "tpot_s": 4.52,
+          "latency_s": 68.6284
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-f8cc44a85dc947eda424feab64162a91",
+        "object": "text_completion",
+        "created": 1792546854,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "I}\n",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 68.2884,
+          "tpot_s": 0.0226,
+          "latency_s": 68.6274
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-52fa355de3ce4a0d8318e9f6ef6951f8",
+        "object": "text_completion",
+        "created": 1792546854,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1523,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3491
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-1d04347045694ae682bd95c25468e955",
+        "object": "text_completion",
+        "created": 1792546854,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1385,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3352
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      false,
+      false
+    ]
+  },
+  {
+    "concurrency": 4,
+    "candidate": [
+      {
+        "id": "cmpl-d51d594c80f94f8d84c29302cf5947d9",
+        "object": "text_completion",
+        "created": 1792546921,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n 0\n;\n\n;\n\"\"\n;\n\"\"\n",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.7191,
+          "tpot_s": 4.4167,
+          "latency_s": 66.9696
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-288bb2a49d7d47888a595af0b8a3eb56",
+        "object": "text_completion",
+        "created": 1792546921,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 66.2312,
+          "tpot_s": 0.0492,
+          "latency_s": 66.969
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-5f0cb4d590f94486ac6b98bbc3bcaa7f",
+        "object": "text_completion",
+        "created": 1792546921,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "J",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 66.2302,
+          "tpot_s": 0.0492,
+          "latency_s": 66.968
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-a519838ac39d42cc88abd0e18a4c2b46",
+        "object": "text_completion",
+        "created": 1792546921,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\",",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 66.2307,
+          "tpot_s": 0.0492,
+          "latency_s": 66.9684
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-113feea218f341f48f22750ecfe504b0",
+        "object": "text_completion",
+        "created": 1792546922,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1529,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3496
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-426dcebc80ab4aee879c46817af2d4fe",
+        "object": "text_completion",
+        "created": 1792546922,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1434,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3402
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-6407b9d02c4d4850b3d79e3ba468e698",
+        "object": "text_completion",
+        "created": 1792546922,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "JJJJJJJJJJJJJJJJ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1376,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3346
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-f07ea6337d144cf2a0a356f1dcbdd78c",
+        "object": "text_completion",
+        "created": 1792546923,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"key\": \"K\" }],\n    [{ \"value\": \"K",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.1389,
+          "tpot_s": 0.0131,
+          "latency_s": 0.3356
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      false,
+      false,
+      false,
+      false
+    ]
+  }
+]

@@ -1,0 +1,128 @@
+{
+  "two_scratch_fp32": {
+    "qa": {
+      "vgpr": 143,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 273,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "two_scratch_fp64": {
+    "qa": {
+      "vgpr": 269,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 273,
+      "spills": 0,
+      "lds": 2048,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_scratch_fp32": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_scratch_fp64": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_scratch_fp32": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "qready_scratch_fp64": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  },
+  "grid_scratch_rt_fp32": {
+    "qa": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    },
+    "qb": {
+      "vgpr": 289,
+      "spills": 0,
+      "lds": 8192,
+      "private": [
+        "0"
+      ]
+    }
+  }
+}

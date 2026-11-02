@@ -1,0 +1,1794 @@
+[
+  {
+    "tokens": 128,
+    "case": 0,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 6.939825107110664e-05,
+    "mhc_projection_reference_error": 2.469675166594243e-07
+  },
+  {
+    "tokens": 128,
+    "case": 1,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.983714330184739e-05,
+    "mhc_projection_reference_error": 1.0964239294253275e-07
+  },
+  {
+    "tokens": 128,
+    "case": 2,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.032240834319964e-05,
+    "mhc_projection_reference_error": 1.7857986733815778e-07
+  },
+  {
+    "tokens": 128,
+    "case": 3,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.486974269937491e-05,
+    "mhc_projection_reference_error": 1.5179271883880574e-07
+  },
+  {
+    "tokens": 128,
+    "case": 4,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.4276569092762657e-05,
+    "mhc_projection_reference_error": 1.875383759397664e-07
+  },
+  {
+    "tokens": 128,
+    "case": 5,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.1209164767933544e-05,
+    "mhc_projection_reference_error": 6.087820025868496e-08
+  },
+  {
+    "tokens": 128,
+    "case": 6,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 5.861074441781966e-06,
+    "mhc_projection_reference_error": 1.4466226616605127e-07
+  },
+  {
+    "tokens": 128,
+    "case": 7,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.2486824743973557e-05,
+    "mhc_projection_reference_error": 2.8059153578396945e-07
+  },
+  {
+    "tokens": 128,
+    "case": 8,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.430610518582398e-05,
+    "mhc_projection_reference_error": 2.6104410721927707e-07
+  },
+  {
+    "tokens": 128,
+    "case": 9,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.8137146980734542e-05,
+    "mhc_projection_reference_error": 1.263060767087154e-07
+  },
+  {
+    "tokens": 128,
+    "case": 10,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.0441117158043198e-05,
+    "mhc_projection_reference_error": 2.5432726147300855e-07
+  },
+  {
+    "tokens": 128,
+    "case": 11,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.8503034880268387e-05,
+    "mhc_projection_reference_error": 4.374184641164902e-07
+  },
+  {
+    "tokens": 128,
+    "case": 12,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.0846935512963682e-05,
+    "mhc_projection_reference_error": 1.8643719101874012e-07
+  },
+  {
+    "tokens": 128,
+    "case": 13,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.882983087853063e-05,
+    "mhc_projection_reference_error": 4.231792729569861e-07
+  },
+  {
+    "tokens": 128,
+    "case": 14,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.4988870134402532e-05,
+    "mhc_projection_reference_error": 3.0565598763132584e-07
+  },
+  {
+    "tokens": 128,
+    "case": 15,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.08311714939191e-05,
+    "mhc_projection_reference_error": 9.762537445112685e-08
+  },
+  {
+    "tokens": 128,
+    "case": 16,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.2415484636439942e-05,
+    "mhc_projection_reference_error": 3.757812692128937e-07
+  },
+  {
+    "tokens": 128,
+    "case": 17,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.1491119696293026e-05,
+    "mhc_projection_reference_error": 1.8039085603049898e-07
+  },
+  {
+    "tokens": 128,
+    "case": 18,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.5308607291663066e-05,
+    "mhc_projection_reference_error": 3.584832768410706e-07
+  },
+  {
+    "tokens": 128,
+    "case": 19,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.996059472730849e-05,
+    "mhc_projection_reference_error": 2.5441681827942375e-07
+  },
+  {
+    "tokens": 128,
+    "case": 20,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.0717699296947103e-05,
+    "mhc_projection_reference_error": 1.2352880673915934e-07
+  },
+  {
+    "tokens": 128,
+    "case": 21,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.086580752802547e-05,
+    "mhc_projection_reference_error": 3.2382021686316875e-07
+  },
+  {
+    "tokens": 128,
+    "case": 22,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.7436350137577392e-05,
+    "mhc_projection_reference_error": 2.223140143087221e-07
+  },
+  {
+    "tokens": 128,
+    "case": 23,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.48394710777211e-05,
+    "mhc_projection_reference_error": 3.035024462860747e-07
+  },
+  {
+    "tokens": 128,
+    "case": 24,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.310608579136897e-05,
+    "mhc_projection_reference_error": 3.825129795131943e-07
+  },
+  {
+    "tokens": 128,
+    "case": 25,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.6085625247796997e-05,
+    "mhc_projection_reference_error": 2.46604173526066e-07
+  },
+  {
+    "tokens": 128,
+    "case": 26,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.3000238797976635e-05,
+    "mhc_projection_reference_error": 1.3655366615239473e-07
+  },
+  {
+    "tokens": 128,
+    "case": 27,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.5023152627691161e-05,
+    "mhc_projection_reference_error": 3.0409302098632907e-07
+  },
+  {
+    "tokens": 128,
+    "case": 28,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.1940406440990046e-05,
+    "mhc_projection_reference_error": 1.6472647246246197e-07
+  },
+  {
+    "tokens": 128,
+    "case": 29,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.5129720850382e-05,
+    "mhc_projection_reference_error": 2.791121573864075e-07
+  },
+  {
+    "tokens": 128,
+    "case": 30,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.7372407455695793e-05,
+    "mhc_projection_reference_error": 3.7533993690885836e-07
+  },
+  {
+    "tokens": 128,
+    "case": 31,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.3225125258031767e-05,
+    "mhc_projection_reference_error": 2.443656228479085e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 0,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 7.410996204271214e-06,
+    "mhc_projection_reference_error": 2.469675166594243e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 1,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.0500694770598784e-05,
+    "mhc_projection_reference_error": 1.0964239294253275e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 2,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.1670963431242853e-05,
+    "mhc_projection_reference_error": 1.7857986733815778e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 3,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 0.00011608856584643945,
+    "mhc_projection_reference_error": 1.5179271883880574e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 4,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 5.9079507082060445e-06,
+    "mhc_projection_reference_error": 1.875383759397664e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 5,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 9.223494998877868e-06,
+    "mhc_projection_reference_error": 6.087820025868496e-08
+  },
+  {
+    "tokens": 1024,
+    "case": 6,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 4.365096629044274e-06,
+    "mhc_projection_reference_error": 1.4466226616605127e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 7,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 6.203314569575014e-06,
+    "mhc_projection_reference_error": 2.8059153578396945e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 8,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 6.778589067835128e-06,
+    "mhc_projection_reference_error": 2.6104410721927707e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 9,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.1631714844261296e-05,
+    "mhc_projection_reference_error": 1.263060767087154e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 10,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.7695998394628987e-05,
+    "mhc_projection_reference_error": 2.5432726147300855e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 11,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 7.868665306887124e-06,
+    "mhc_projection_reference_error": 4.374184641164902e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 12,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.5973721019690856e-05,
+    "mhc_projection_reference_error": 1.8643719101874012e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 13,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.0310830223024823e-05,
+    "mhc_projection_reference_error": 4.231792729569861e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 14,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.5878796805045567e-05,
+    "mhc_projection_reference_error": 3.0565598763132584e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 15,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.4864516742818523e-05,
+    "mhc_projection_reference_error": 9.762537445112685e-08
+  },
+  {
+    "tokens": 1024,
+    "case": 16,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.1321977581246756e-05,
+    "mhc_projection_reference_error": 3.757812692128937e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 17,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 9.618159310775809e-06,
+    "mhc_projection_reference_error": 1.8039085603049898e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 18,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.5938401702442206e-05,
+    "mhc_projection_reference_error": 3.584832768410706e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 19,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 8.215530215238687e-06,
+    "mhc_projection_reference_error": 2.5441681827942375e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 20,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 8.406668712268583e-06,
+    "mhc_projection_reference_error": 1.2352880673915934e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 21,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.6102823792607524e-05,
+    "mhc_projection_reference_error": 3.2382021686316875e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 22,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.2521900316642132e-05,
+    "mhc_projection_reference_error": 2.223140143087221e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 23,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.1027109394490253e-05,
+    "mhc_projection_reference_error": 3.035024462860747e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 24,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.8966858735657297e-05,
+    "mhc_projection_reference_error": 3.825129795131943e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 25,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.4622562048316468e-05,
+    "mhc_projection_reference_error": 2.46604173526066e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 26,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.1707049452525098e-05,
+    "mhc_projection_reference_error": 1.3655366615239473e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 27,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.483691630710382e-05,
+    "mhc_projection_reference_error": 3.0409302098632907e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 28,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.0452185961185023e-05,
+    "mhc_projection_reference_error": 1.6472647246246197e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 29,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 7.328657829930307e-06,
+    "mhc_projection_reference_error": 2.791121573864075e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 30,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 2.1471671061590314e-05,
+    "mhc_projection_reference_error": 3.7533993690885836e-07
+  },
+  {
+    "tokens": 1024,
+    "case": 31,
+    "errors": {
+      "fused": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      },
+      "three_regions": {
+        "mix": 0.0,
+        "raw": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "qp": 0.0,
+        "q": 0.0,
+        "kv": 0.0,
+        "out": 0.0
+      }
+    },
+    "attention_reference_error": 1.884389166662004e-05,
+    "mhc_projection_reference_error": 2.443656228479085e-07
+  }
+]

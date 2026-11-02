@@ -1,0 +1,86 @@
+[
+  {
+    "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+    "us": 4.125
+  },
+  {
+    "name": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 16, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+    "us": 3.484
+  },
+  {
+    "name": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 9, 4, 1, 4096, 1024, 1024, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+    "us": 5.368
+  },
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 2.803
+  },
+  {
+    "name": "gemm_a8w8_mx128_t16x512x256_mw1_nw4_nb2_sk1_cm1_cn1",
+    "us": 28.762
+  },
+  {
+    "name": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+    "us": 3.724
+  },
+  {
+    "name": "gemm_a8w8_mx128_t16x1024x128_mw1_nw4_nb2_sk1_cm1_cn1",
+    "us": 18.587
+  },
+  {
+    "name": "qk_norm_rope_H64_D512_RD64_kvw_r4_w32_flydsl",
+    "us": 4.365
+  },
+  {
+    "name": "_pa_decode_sparse_BLOCK_H_16_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128",
+    "us": 8.772
+  },
+  {
+    "name": "_pa_decode_sparse_reduce_BLOCK_H_1_BLOCK_D_512_BLOCK_K_16_H_64_D_512_KV_SPLITS_128",
+    "us": 9.693
+  },
+  {
+    "name": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+    "us": 2.964
+  },
+  {
+    "name": "batched_gemm_a8w8_mx128_t32x32x1024_mw2_nw2_nb4_sk1_cm1_cn1_mbn",
+    "us": 8.692
+  },
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 3.284
+  },
+  {
+    "name": "gemm_a8w8_mx128_t16x1024x128_mw1_nw4_nb2_sk1_cm1_cn1",
+    "us": 112.287
+  },
+  {
+    "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+    "us": 2.283
+  },
+  {
+    "name": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+    "us": 2.042
+  },
+  {
+    "name": "full_attention",
+    "us": 111.126
+  },
+  {
+    "name": "unshuffle_kernel",
+    "us": 0.961
+  },
+  {
+    "name": "optimized_prefix",
+    "us": 76.513
+  },
+  {
+    "name": "output_kernel",
+    "us": 22.954
+  },
+  {
+    "name": "post",
+    "us": 2.763
+  }
+]

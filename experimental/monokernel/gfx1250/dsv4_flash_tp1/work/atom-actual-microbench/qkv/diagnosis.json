@@ -1,0 +1,58 @@
+[
+  {
+    "input": 0,
+    "input_fp8_equal": true,
+    "input_scales_equal": true,
+    "qa_raw_rms": 0.0004738633579108864,
+    "kv_raw_rms": 0.0004510759317781776,
+    "latent_fp8_mismatch_count": 6,
+    "latent_scales_equal": true,
+    "norm_on_same_qa_fp8_mismatch_count": 0,
+    "norm_on_same_qa_scales_equal": true,
+    "qb_rms": 0.0007144050905480981,
+    "q": 0.0009431062499061227,
+    "kv": 0.0007181787514127791
+  },
+  {
+    "input": 2,
+    "input_fp8_equal": true,
+    "input_scales_equal": true,
+    "qa_raw_rms": 0.0007034092559479177,
+    "kv_raw_rms": 0.0003259782097302377,
+    "latent_fp8_mismatch_count": 8,
+    "latent_scales_equal": true,
+    "norm_on_same_qa_fp8_mismatch_count": 0,
+    "norm_on_same_qa_scales_equal": true,
+    "qb_rms": 0.0013411268591880798,
+    "q": 0.0016291048377752304,
+    "kv": 0.00042933798977173865
+  },
+  {
+    "input": 3,
+    "input_fp8_equal": true,
+    "input_scales_equal": true,
+    "qa_raw_rms": 0.0009702014504000545,
+    "kv_raw_rms": 0.0004097591736353934,
+    "latent_fp8_mismatch_count": 12,
+    "latent_scales_equal": true,
+    "norm_on_same_qa_fp8_mismatch_count": 0,
+    "norm_on_same_qa_scales_equal": true,
+    "qb_rms": 0.006387501489371061,
+    "q": 0.006762650795280933,
+    "kv": 0.00038753458647988737
+  },
+  {
+    "input": 35,
+    "input_fp8_equal": true,
+    "input_scales_equal": true,
+    "qa_raw_rms": 0.0007886569364927709,
+    "kv_raw_rms": 0.0008375539910048246,
+    "latent_fp8_mismatch_count": 12,
+    "latent_scales_equal": true,
+    "norm_on_same_qa_fp8_mismatch_count": 0,
+    "norm_on_same_qa_scales_equal": true,
+    "qb_rms": 0.0024959854781627655,
+    "q": 0.002779795788228512,
+    "kv": 0.0010499203344807029
+  }
+]

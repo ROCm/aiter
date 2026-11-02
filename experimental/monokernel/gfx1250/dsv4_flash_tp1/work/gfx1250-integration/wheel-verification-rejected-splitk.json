@@ -1,0 +1,16 @@
+{
+  "atom-0.1.1.dev1+g53e4fb524.d20261019-py3-none-any.whl": {
+    "sha256": "795875dd94744d9d01b78b7ae5f97faf84459bfc1133de2f442838c6304a85ac",
+    "integration_files": [
+      "atom/models/deepseek_v4_mono/__init__.py",
+      "atom/models/deepseek_v4_mono/config.py",
+      "atom/models/deepseek_v4_mono/dispatch.py",
+      "atom/models/deepseek_v4_mono/linear.py",
+      "atom/models/deepseek_v4_mono/runner.py",
+      "atom/models/deepseek_v4_mono/configs/flash_tp1.json",
+      "atom/models/deepseek_v4_mono/configs/pro_tp4.json",
+      "atom/models/deepseek_v4_mono/kernels/__init__.py",
+      "atom/models/deepseek_v4_mono/kernels/ops.py"
+    ]
+  }
+}

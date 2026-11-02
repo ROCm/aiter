@@ -1,0 +1,7 @@
+{
+  "task": "QB L2 prefetch and first-tile TDM in fully fused QKV region",
+  "implemented": true,
+  "default_enabled": false,
+  "reason": "rotating-weight regression",
+  "serving_integrated": false
+}

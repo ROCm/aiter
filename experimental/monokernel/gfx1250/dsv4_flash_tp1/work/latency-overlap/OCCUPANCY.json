@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-21",
+  "method": "Loaded existing HSACO and called hipModuleOccupancyMaxActiveBlocksPerMultiprocessor; no kernel launches",
+  "device": {
+    "arch": "gfx1250",
+    "multiprocessors": 256,
+    "registers_per_multiprocessor_dwords": 131072,
+    "lds_bytes_per_multiprocessor": 327680
+  },
+  "compiled": {
+    "requested_num_warps": 4,
+    "actual_num_warps": 8,
+    "threads_per_cta": 256,
+    "lds_bytes": 157156,
+    "previous_vgprs": 424,
+    "selected_vgprs": 418,
+    "vgpr_spills": 0,
+    "previous_cache": "Z7WEMGLAGOQZ3QPS7JOA4XHJHAIV5NBFKBNEBMYX34HXQYMX7OGA",
+    "selected_cache": "RWO7S3OAWRSWJWVJ5YQOW7RHBK5CJUVBE7RRQLRK7SUYJ4YHJC2A"
+  },
+  "hip_occupancy": {
+    "previous_max_active_ctas_per_multiprocessor": 1,
+    "selected_max_active_ctas_per_multiprocessor": 1
+  },
+  "notes": [
+    "mHC warp specialization expands four requested waves to eight compiled waves.",
+    "424*256=108544 register dwords before rounding, not 424/1024 utilization for the entire CTA.",
+    "Two CTAs fit raw LDS but not VGPR budget at the existing 256-thread block size.",
+    "Existing whole-grid barriers and fixed pid mappings prohibit simply doubling grid size."
+  ]
+}

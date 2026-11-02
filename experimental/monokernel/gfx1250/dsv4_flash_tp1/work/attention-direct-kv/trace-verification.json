@@ -1,0 +1,17 @@
+[
+  {
+    "fused": false,
+    "kernels": [
+      "complete",
+      "attention_kernel"
+    ],
+    "count": 2
+  },
+  {
+    "fused": true,
+    "kernels": [
+      "qkv_attention"
+    ],
+    "count": 1
+  }
+]

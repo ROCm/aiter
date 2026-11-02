@@ -1,0 +1,169 @@
+{
+  "updated_utc": "2026-10-21T17:35:11.871625+00:00",
+  "bug": "Graph-padding rows overwrote compressor/indexer state in slot0",
+  "native_contract": "positions=0 and state_slot_in/out=0 are legal padding fillers; batch_id_per_q_token=-1 marks invalid tokens",
+  "fix": [
+    "Runtime passes batch_id_per_q_token to full kernel",
+    "Invalid rows get compress position=-1 and write position=-1",
+    "Identity index generation and final KV writes skip invalid rows"
+  ],
+  "regression_test": "check_padding.py: one invalid row in M2/M4/M8; both compressor ratios; compare all valid outputs and full state tensors to separate C1 calls",
+  "negative_control": [
+    {
+      "expected_invalid_control": true,
+      "m": 2,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": false,
+        "output": false,
+        "mhc_post": false,
+        "compressor_state": false,
+        "indexer_state": false,
+        "final": false,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 678,
+      "lds": 133088,
+      "spills": 0
+    }
+  ],
+  "masked_ratio4": [
+    {
+      "m": 2,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "indexer_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 678,
+      "lds": 133088,
+      "spills": 0
+    },
+    {
+      "m": 4,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "indexer_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 678,
+      "lds": 133088,
+      "spills": 0
+    },
+    {
+      "m": 8,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "indexer_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 679,
+      "lds": 133088,
+      "spills": 0
+    }
+  ],
+  "masked_ratio128": [
+    {
+      "m": 2,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 678,
+      "lds": 133088,
+      "spills": 0
+    },
+    {
+      "m": 4,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 678,
+      "lds": 133088,
+      "spills": 0
+    },
+    {
+      "m": 8,
+      "checks": {
+        "norm": true,
+        "q": true,
+        "kv": true,
+        "attention": true,
+        "output": true,
+        "mhc_post": true,
+        "compressor_state": true,
+        "final": true,
+        "finite": true
+      },
+      "health": [
+        0,
+        0
+      ],
+      "vgpr": 679,
+      "lds": 133088,
+      "spills": 0
+    }
+  ]
+}

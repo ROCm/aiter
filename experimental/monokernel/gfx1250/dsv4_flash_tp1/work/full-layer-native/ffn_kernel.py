@@ -1,0 +1,104 @@
+from triton.experimental import gluon as g
+from triton.experimental.gluon import language as gl
+from combined import sync
+from tdm_tail import candidate_body as mhc_body
+from post import post_body
+from moe_multitoken_prototype import fused as moe_body
+from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import _gemm_mxfp8_preshuffle_bandwidth_bound_kernel as _shared_gemm
+shared_gemm = _shared_gemm.fn
+from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import _gemm_a16w16_bandwidth_bound_kernel as router_gemm
+
+@g.jit
+def quant_body(X,Q,S,N:gl.constexpr,GROUP:gl.constexpr,STRIDE:gl.constexpr=1):
+ p=gl.program_id(0)
+ if p<N//GROUP:
+  SL:gl.constexpr=gl.PaddedSharedLayout.with_identity_for([[32,8]],[1,GROUP],[1,0])
+  sm=gl.allocate_shared_memory(gl.bfloat16,[1,GROUP],SL)
+  desc=gl.amd.gfx1250.tdm.make_tensor_descriptor(X,[1,N],[N,1],[1,GROUP],SL)
+  gl.amd.gfx1250.tdm.async_load(desc,[0,p*GROUP],sm);gl.amd.gfx1250.tdm.async_wait(0)
+  L:gl.constexpr=gl.BlockedLayout([1],[32],[4],[0])
+  x=gl.convert_layout(gl.sum(sm.load(gl.BlockedLayout([1,1],[1,32],[1,4],[1,0])).to(gl.float32),0),L)
+  v=gl.max(gl.abs(x),0)/448.
+  e=((v.to(gl.uint32,bitcast=True)+0x7fffff)&0x7f800000)
+  scale=e.to(gl.float32,bitcast=True)
+  q=x*gl.where(scale==0,0.,1./scale)
+  i=gl.arange(0,GROUP,layout=L)
+  gl.store(Q+p*GROUP+i,q.to(gl.float8e4nv));gl.store(S+p*STRIDE,(e>>23).to(gl.uint8))
+
+@g.jit
+def router_body(X,W,Y):
+ if gl.program_id(0)<16:
+  SA:gl.constexpr=gl.PaddedSharedLayout.with_identity_for([[512,8]],[16,512],[1,0])
+  SB:gl.constexpr=gl.PaddedSharedLayout.with_identity_for([[512,8]],[16,512],[1,0])
+  ML:gl.constexpr=gl.amd.AMDWMMALayout(version=3,transposed=True,warp_bases=((0,1),(1,0)),instr_shape=[16,16,32])
+  router_gemm(X,W,Y,None,1,256,4096,4096,1,1,4096,256,1,16,16,512,4,'TN',SA,SB,ML,gl.DotOperandLayout(0,ML,8),gl.DotOperandLayout(1,ML,8),'',False,False)
+
+@g.jit
+def route_body(Logits,Hist,Offs,Pad,Map,Gather,Scatter,Gamma):
+ if gl.program_id(0)==0:
+  L:gl.constexpr=gl.BlockedLayout([1],[32],[4],[0]);i=gl.arange(0,256,layout=L)
+  x=gl.load(Logits+i).to(gl.float32)
+  scores=gl.sqrt(gl.maximum(x,0.)+gl.log(1.+gl.exp(-gl.abs(x)))).to(gl.bfloat16).to(gl.float32)
+  # Stock C1 top-k: ties prefer larger expert id, then outputs sort by expert id.
+  remain=scores;chosen=gl.full((256,),0,gl.int32,L)
+  for j in gl.static_range(6):
+   best=gl.max(remain,0);idx=gl.max(gl.where(remain==best,i,-1),0)
+   chosen=gl.where(i==idx,1,chosen);remain=gl.where(i==idx,float('-inf'),remain)
+  rank=gl.associative_scan(chosen,0,_add)-chosen
+  total=gl.sum(gl.where(chosen!=0,scores,0.),0)
+  gamma=(scores/(total+1.e-20)*1.5).to(gl.bfloat16)
+  gl.store(Hist+i,chosen);gl.store(Offs+i,rank)
+  gl.store(Map+rank,i,chosen!=0)
+  gl.store(Gamma+rank,gamma,chosen!=0)
+  gl.store(Gather+rank,rank,chosen!=0);gl.store(Scatter+rank,rank,chosen!=0)
+  gl.store(Pad,6)
+
+@g.jit
+def _add(a,b):return a+b
+
+@g.jit
+def shared_body(X,XS,W,WS,Y,K:gl.constexpr,BN:gl.constexpr):
+ if gl.program_id(0)<4096//BN:
+  shared_gemm(X,W,Y,XS,WS,1,4096,K,K,1,K*16,1,0,4096,1,1,8,K//128,1,
+   32,BN,256,1,128,True,1,K,True,4,((0,1),(1,0)),None,3,1,True,1,1,1,1)
+
+@g.jit
+def activation_quant(GU,A,AQ,AS):
+ p=gl.program_id(0)
+ if p<16:
+  SL:gl.constexpr=gl.PaddedSharedLayout.with_identity_for([[128,8]],[1,128],[1,0])
+  sm=gl.allocate_shared_memory(gl.bfloat16,[2,1,128],SL)
+  d=gl.amd.gfx1250.tdm.make_tensor_descriptor(GU,[1,4096],[4096,1],[1,128],SL)
+  gl.amd.gfx1250.tdm.async_load(d,[0,p*128],sm.index(0));gl.amd.gfx1250.tdm.async_load(d,[0,2048+p*128],sm.index(1));gl.amd.gfx1250.tdm.async_wait(0)
+  LL:gl.constexpr=gl.BlockedLayout([1,1],[1,32],[1,4],[1,0]);L:gl.constexpr=gl.BlockedLayout([1],[32],[4],[0])
+  gate=gl.convert_layout(gl.sum(sm.index(0).load(LL).to(gl.float32),0),L);up=gl.convert_layout(gl.sum(sm.index(1).load(LL).to(gl.float32),0),L)
+  gate=gl.minimum(gate,10.);up=gl.minimum(gl.maximum(up,-10.),10.)
+  v=(gate/(1.+gl.exp(-gate))*up).to(gl.bfloat16).to(gl.float32)
+  bits=gl.maximum(gl.max(gl.abs(v),0),1.e-10)/448.;e=((bits.to(gl.uint32,bitcast=True)+0x7fffff)&0x7f800000)
+  q=v/e.to(gl.float32,bitcast=True);i=gl.arange(0,128,layout=L)
+  gl.store(A+p*128+i,v);gl.store(AQ+p*128+i,q);gl.store(AS+p*8,(e>>23).to(gl.uint8))
+
+@g.jit
+def ffn_body(R,Out,HFN,HFS,HFB,FN,Mix,Temp,Raw,X,XQ,XS,MX,MS,GU,ACT,AQ,AS,SO,Gate,Logits,
+ SW1,SS1,SW2,SS2,W1,S1,W2,S2,I,IS,Y,Hist,Offs,Pad,Map,Gather,Scatter,Gamma,Count,Z,Sum,Counter,Health,
+ W1S:gl.constexpr,S1S:gl.constexpr,W2S:gl.constexpr,S2S:gl.constexpr,DO_PRE:gl.constexpr=True,POST_SHUFFLED:gl.constexpr=False):
+ if DO_PRE:
+  mhc_body(R,HFN,HFS,HFB,FN,Mix,Temp,Raw,X,Counter,Health)
+  sync(Counter,Health,256,3)
+ quant_body(X,XQ,XS,4096,128,8)
+ quant_body(X,MX,MS,4096,32)
+ router_body(X,Gate,Logits)
+ sync(Counter,Health,256,3)
+ route_body(Logits,Hist,Offs,Pad,Map,Gather,Scatter,Gamma)
+ shared_body(XQ,XS,SW1,SS1,GU,4096,64)
+ sync(Counter,Health,256,3)
+ activation_quant(GU,ACT,AQ,AS)
+ sync(Counter,Health,256,3)
+ shared_body(AQ,AS,SW2,SS2,SO,2048,32)
+ moe_body(MX,MS,W1,S1,W2,S2,I,IS,Y,Gather,Hist,Offs,Pad,Map,Gamma,Count,Health,Z,Scatter,W1S,S1S,W2S,S2S,10.,1,256,3)
+ sync(Counter,Health,256,3)
+ if gl.program_id(0)<32:
+  i=gl.program_id(0)*128+gl.arange(0,128,layout=gl.BlockedLayout([1],[32],[4],[0]))
+  gl.store(Sum+i,(gl.load(SO+i).to(gl.float32)+gl.load(Z+i).to(gl.float32)).to(gl.bfloat16))
+ sync(Counter,Health,256,3)
+ post_body(R,Sum,Mix,Out,128,POST_SHUFFLED,2)

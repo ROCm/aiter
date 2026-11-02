@@ -1,0 +1,39 @@
+{
+  "actual_atom": {
+    "finite": true,
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "kernel_count": 1280,
+    "node_types": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "fused_with_input_adapter": {
+    "finite": true,
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "kernel_count": 256,
+    "node_types": [
+      0,
+      0
+    ]
+  },
+  "fused_core_plain_input": {
+    "finite": true,
+    "bitwise_equal": true,
+    "max_abs": 0.0,
+    "kernel_count": 128,
+    "node_types": [
+      0
+    ]
+  }
+}

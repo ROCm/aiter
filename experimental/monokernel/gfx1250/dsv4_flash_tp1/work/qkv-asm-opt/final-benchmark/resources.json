@@ -1,0 +1,72 @@
+{
+  "original_2launch": {
+    "vgpr": 128,
+    "spills": 0,
+    "lds": 8192,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ],
+    "private_segment": [
+      "0"
+    ]
+  },
+  "original_fused_G": {
+    "vgpr": 130,
+    "spills": 0,
+    "lds": 8192,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ],
+    "private_segment": [
+      "0"
+    ]
+  },
+  "optimized_2launch": {
+    "vgpr": 221,
+    "spills": 0,
+    "lds": 0,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ],
+    "private_segment": [
+      "0"
+    ]
+  },
+  "accepted_split16": {
+    "vgpr": 214,
+    "spills": 0,
+    "lds": 8192,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ],
+    "private_segment": [
+      "0"
+    ]
+  },
+  "accepted_split32": {
+    "vgpr": 118,
+    "spills": 0,
+    "lds": 8192,
+    "sgpr_spills": [
+      "0"
+    ],
+    "vgpr_spills": [
+      "0"
+    ],
+    "private_segment": [
+      "0"
+    ]
+  }
+}

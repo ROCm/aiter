@@ -1,0 +1,32 @@
+{
+  "vector": {
+    "vgpr": 178,
+    "lds": 2048,
+    "spills": 0
+  },
+  "aiter_s1": {
+    "vgpr": 410,
+    "lds": 66800,
+    "spills": 0
+  },
+  "aiter_s2": {
+    "vgpr": 413,
+    "lds": 66800,
+    "spills": 0
+  },
+  "aiter_s4": {
+    "vgpr": 413,
+    "lds": 131584,
+    "spills": 0
+  },
+  "qkv_attention_fused_s1": {
+    "vgpr": 370,
+    "lds": 73856,
+    "spills": 0
+  },
+  "qkv_attention_fused_s4": {
+    "vgpr": 372,
+    "lds": 131584,
+    "spills": 0
+  }
+}

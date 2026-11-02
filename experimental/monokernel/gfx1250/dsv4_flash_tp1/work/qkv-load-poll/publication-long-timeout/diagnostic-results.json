@@ -1,0 +1,56 @@
+[
+  {
+    "style": 0,
+    "run": 0,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  },
+  {
+    "style": 0,
+    "run": 1,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  },
+  {
+    "style": 0,
+    "run": 2,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  },
+  {
+    "style": 1,
+    "run": 0,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  },
+  {
+    "style": 1,
+    "run": 1,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  },
+  {
+    "style": 1,
+    "run": 2,
+    "health": 0,
+    "ready": 128,
+    "ack": 32640,
+    "payload_checks": 16711680,
+    "timeouts": []
+  }
+]

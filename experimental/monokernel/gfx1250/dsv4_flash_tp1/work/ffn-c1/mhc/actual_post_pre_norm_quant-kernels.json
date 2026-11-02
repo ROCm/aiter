@@ -1,0 +1,65 @@
+[
+  {
+    "name": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel_C_4096_BLOCK_M_16_K_LOOP_1_SPLIT_K_64_NUM_STAGES_2_RES_SHUFFLED_1_W_PRESHUFFLED_1",
+    "us": 2.763,
+    "args": {
+      "External id": 513,
+      "device": 2,
+      "stream": 0,
+      "correlation": 31,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        64,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_4096_ROWS_1_CHUNK_1024_N_CHUNKS_4_S_64_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "us": 3.404,
+    "args": {
+      "External id": 513,
+      "device": 2,
+      "stream": 0,
+      "correlation": 41,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+    "us": 3.284,
+    "args": {
+      "External id": 537,
+      "device": 2,
+      "stream": 0,
+      "correlation": 42,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        2,
+        1,
+        1
+      ],
+      "block": [
+        64,
+        1,
+        1
+      ]
+    }
+  }
+]

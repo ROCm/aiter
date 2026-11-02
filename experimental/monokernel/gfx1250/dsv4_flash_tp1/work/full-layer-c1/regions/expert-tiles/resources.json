@@ -1,0 +1,44 @@
+[
+  {
+    "name": "attention_input_mhc",
+    "n_regs": 164,
+    "n_spills": 0,
+    "shared": 16
+  },
+  {
+    "name": "qkv_projections_norm_rope",
+    "n_regs": 130,
+    "n_spills": 0,
+    "shared": 16
+  },
+  {
+    "name": "cache_and_attention",
+    "n_regs": 178,
+    "n_spills": 0,
+    "shared": 2048
+  },
+  {
+    "name": "attention_output_projections",
+    "n_regs": 54,
+    "n_spills": 0,
+    "shared": 16
+  },
+  {
+    "name": "attention_post_ffn_pre",
+    "n_regs": 162,
+    "n_spills": 0,
+    "shared": 16
+  },
+  {
+    "name": "router_shared_routed_moe",
+    "n_regs": 121,
+    "n_spills": 0,
+    "shared": 16
+  },
+  {
+    "name": "expert_sum_final_mhc",
+    "n_regs": 32,
+    "n_spills": 0,
+    "shared": 4
+  }
+]

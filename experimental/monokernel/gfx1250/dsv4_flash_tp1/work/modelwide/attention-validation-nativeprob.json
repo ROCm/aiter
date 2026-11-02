@@ -1,0 +1,100 @@
+[
+  {
+    "length": 1,
+    "rms": 0.00014304619980975986,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 31,
+    "rms": 0.0020314331632107496,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 32,
+    "rms": 0.0021393185015767813,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 33,
+    "rms": 0.0020216936245560646,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 65,
+    "rms": 0.0020278068259358406,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 127,
+    "rms": 0.002094070427119732,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 128,
+    "rms": 0.002120028482750058,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 129,
+    "rms": 0.00216395384632051,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 136,
+    "rms": 0.002209068275988102,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 144,
+    "rms": 0.0020945279393345118,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 257,
+    "rms": 0.0021957834251224995,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 384,
+    "rms": 0.0022306458558887243,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 513,
+    "rms": 0.0022966251708567142,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  },
+  {
+    "length": 640,
+    "rms": 0.0022529661655426025,
+    "finite": true,
+    "health": 0,
+    "counts_zero": true
+  }
+]

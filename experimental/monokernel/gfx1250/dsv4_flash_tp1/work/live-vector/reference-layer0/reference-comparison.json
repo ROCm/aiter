@@ -1,0 +1,212 @@
+{
+  "X": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "MixA": {
+    "exact": false,
+    "max_abs": 5.960464477539063e-08,
+    "rms_relative": 3.337546061743524e-08,
+    "nonfinite": 0
+  },
+  "XQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "QL": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "KV": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "QLQ": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Q": {
+    "exact": false,
+    "max_abs": 0.0005795657634735107,
+    "rms_relative": 3.2035513868322596e-06,
+    "nonfinite": 0
+  },
+  "QRot": {
+    "exact": false,
+    "max_abs": 0.00048828125,
+    "rms_relative": 2.69932343144319e-06,
+    "nonfinite": 0
+  },
+  "KVRot": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "AO": {
+    "exact": false,
+    "max_abs": 0.00390625,
+    "rms_relative": 4.746341073769145e-05,
+    "nonfinite": 0
+  },
+  "AR": {
+    "exact": false,
+    "max_abs": 0.003692626953125,
+    "rms_relative": 4.7450830606976524e-05,
+    "nonfinite": 0
+  },
+  "AQ": {
+    "exact": false,
+    "max_abs": 0.0078125,
+    "rms_relative": 0.00010546403791522607,
+    "nonfinite": 0
+  },
+  "OL": {
+    "exact": false,
+    "max_abs": 0.0078125,
+    "rms_relative": 0.000557668216060847,
+    "nonfinite": 0
+  },
+  "OLQ": {
+    "exact": false,
+    "max_abs": 0.0625,
+    "rms_relative": 0.0017221616581082344,
+    "nonfinite": 0
+  },
+  "Attn": {
+    "exact": false,
+    "max_abs": 0.03125,
+    "rms_relative": 0.0020069144666194916,
+    "nonfinite": 0
+  },
+  "R2": {
+    "exact": false,
+    "max_abs": 0.001953125,
+    "rms_relative": 0.0011687910882756114,
+    "nonfinite": 0
+  },
+  "FF": {
+    "exact": false,
+    "max_abs": 0.00390625,
+    "rms_relative": 0.001990161370486021,
+    "nonfinite": 0
+  },
+  "MixF": {
+    "exact": false,
+    "max_abs": 0.0001685619354248047,
+    "rms_relative": 0.00017348543042317033,
+    "nonfinite": 0
+  },
+  "FFQ": {
+    "exact": false,
+    "max_abs": 0.03125,
+    "rms_relative": 0.006363839376717806,
+    "nonfinite": 0
+  },
+  "FFMX": {
+    "exact": false,
+    "max_abs": 0.03125,
+    "rms_relative": 0.006363839376717806,
+    "nonfinite": 0
+  },
+  "Logits": {
+    "exact": false,
+    "max_abs": 0.0078125,
+    "rms_relative": 0.0013834689743816853,
+    "nonfinite": 0
+  },
+  "Ids": {
+    "exact": true,
+    "max_abs": 0.0,
+    "rms_relative": 0.0,
+    "nonfinite": 0
+  },
+  "Gamma": {
+    "exact": false,
+    "max_abs": 2.9802322387695312e-08,
+    "rms_relative": 6.736882340874217e-08,
+    "nonfinite": 0
+  },
+  "SG": {
+    "exact": false,
+    "max_abs": 0.015625,
+    "rms_relative": 0.0024009502958506346,
+    "nonfinite": 0
+  },
+  "SU": {
+    "exact": false,
+    "max_abs": 0.015625,
+    "rms_relative": 0.004126886837184429,
+    "nonfinite": 0
+  },
+  "SA": {
+    "exact": false,
+    "max_abs": 0.015625,
+    "rms_relative": 0.005080537870526314,
+    "nonfinite": 0
+  },
+  "SAQ": {
+    "exact": false,
+    "max_abs": 0.125,
+    "rms_relative": 0.017562896013259888,
+    "nonfinite": 0
+  },
+  "SO": {
+    "exact": false,
+    "max_abs": 0.01953125,
+    "rms_relative": 0.011617574840784073,
+    "nonfinite": 0
+  },
+  "EG": {
+    "exact": false,
+    "max_abs": 0.010679364204406738,
+    "rms_relative": 0.005048493854701519,
+    "nonfinite": 0
+  },
+  "EU": {
+    "exact": false,
+    "max_abs": 0.009687960147857666,
+    "rms_relative": 0.005884392652660608,
+    "nonfinite": 0
+  },
+  "EA": {
+    "exact": false,
+    "max_abs": 0.010081052780151367,
+    "rms_relative": 0.006507459562271833,
+    "nonfinite": 0
+  },
+  "EAQ": {
+    "exact": false,
+    "max_abs": 0.125,
+    "rms_relative": 0.020505420863628387,
+    "nonfinite": 0
+  },
+  "EO": {
+    "exact": false,
+    "max_abs": 0.00433349609375,
+    "rms_relative": 0.0207409355789423,
+    "nonfinite": 0
+  },
+  "Sum": {
+    "exact": false,
+    "max_abs": 0.0234375,
+    "rms_relative": 0.011672193184494972,
+    "nonfinite": 0
+  },
+  "Out": {
+    "exact": false,
+    "max_abs": 0.01171875,
+    "rms_relative": 0.010090049356222153,
+    "nonfinite": 0
+  }
+}

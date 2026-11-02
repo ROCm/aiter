@@ -1,0 +1,25 @@
+{
+  "native": {
+    "completed": 8,
+    "median_ttft_ms": 156.09027900063666,
+    "median_tpot_ms": 12.800338909580372,
+    "total_token_throughput": 152.30641031045636,
+    "output_throughput": 76.15320515522818
+  },
+  "corrected_full": {
+    "completed": 8,
+    "median_ttft_ms": 172.5488249976479,
+    "median_tpot_ms": 9.701086408597625,
+    "total_token_throughput": 199.22980200036113,
+    "output_throughput": 99.61490100018057
+  },
+  "gsm8k": {
+    "samples": 32,
+    "fewshot": 3,
+    "max_gen_tokens": 512,
+    "native_correct": 31,
+    "corrected_full_correct": 31,
+    "scope": "limited regression sample, not full GSM8K"
+  },
+  "graph_matches_eager_smoke": 5
+}

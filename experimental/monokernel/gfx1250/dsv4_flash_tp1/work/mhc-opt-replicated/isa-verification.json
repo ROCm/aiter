@@ -1,0 +1,12 @@
+{
+  "128": {
+    "tdm": true,
+    "wmma": true,
+    "l2_prefetch": true
+  },
+  "1024": {
+    "tdm": true,
+    "wmma": true,
+    "l2_prefetch": true
+  }
+}

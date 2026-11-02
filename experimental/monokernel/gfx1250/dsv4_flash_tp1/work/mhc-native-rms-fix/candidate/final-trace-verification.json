@@ -1,0 +1,46 @@
+[
+  {
+    "mode": "unfused",
+    "count": 17,
+    "names": [
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "mhc_stage",
+      "quant",
+      "project_fused",
+      "qa_reduce",
+      "qa_norm",
+      "quant",
+      "qb_stage",
+      "norm_only",
+      "norm_rope",
+      "norm_rope",
+      "cache_store",
+      "attention_partials",
+      "attention_reduce"
+    ]
+  },
+  {
+    "mode": "fused",
+    "count": 1,
+    "names": [
+      "full_prefix"
+    ]
+  },
+  {
+    "mode": "opt",
+    "count": 1,
+    "names": [
+      "optimized_prefix"
+    ]
+  },
+  {
+    "mode": "opt_both",
+    "count": 1,
+    "names": [
+      "optimized_prefix"
+    ]
+  }
+]

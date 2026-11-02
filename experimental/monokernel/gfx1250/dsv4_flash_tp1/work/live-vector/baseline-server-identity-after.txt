@@ -1,0 +1,12 @@
+    PID                  STARTED COMMAND
+      1 Mon Oct 19 22:39:47 2026 /bin/sleep infinity
+      7 Mon Oct 19 22:40:05 2026 bash /work/live-vector/baseline.sh
+     13 Mon Oct 19 22:40:05 2026 bash /work/flash/serve.sh
+     14 Mon Oct 19 22:40:05 2026 python -m atom.entrypoints.openai_server -tp 1 --model /data/DeepSeek-V4-Flash --kv_cache_dtype bf16 --index-cache-dtype fp8 --no-enable_prefix_caching --disable_uvicorn_access_log --max-num-seqs 128 --cudagraph-capture-sizes [1,2,4,8,16,32,64,128]
+     15 Mon Oct 19 22:40:05 2026 tee server.log
+    511 Mon Oct 19 22:40:10 2026 /usr/local/bin/python -c from multiprocessing.resource_tracker import main;main(23)
+    512 Mon Oct 19 22:40:10 2026 ATOM::EngineCore
+    763 Mon Oct 19 22:40:13 2026 ATOM::TP0
+   3239 Mon Oct 19 22:40:51 2026 /usr/local/bin/python /usr/local/lib/python3.12/dist-packages/torch/_inductor/compile_worker/__main__.py --pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler --kind=fork --workers=32 --parent=763 --read-fd=77 --write-fd=80 --torch-key=/EjYNqcnsePin0l+TKcDe73/G+YrNCdsUYTooBxyFQY=
+   3476 Mon Oct 19 22:41:17 2026 bash -lc cd /work/flash; ps -eo pid,lstart,args > /work/live-vector/baseline-server-identity-before.txt; bash run_bench.sh live_vector_baseline_run1 1 0 > /work/live-vector/baseline-client1.log 2>&1; bash run_bench.sh live_vector_baseline_run2 1 0 > /work/live-vector/baseline-client2.log 2>&1; ps -eo pid,lstart,args > /work/live-vector/baseline-server-identity-after.txt
+   4456 Mon Oct 19 22:43:39 2026 ps -eo pid,lstart,args

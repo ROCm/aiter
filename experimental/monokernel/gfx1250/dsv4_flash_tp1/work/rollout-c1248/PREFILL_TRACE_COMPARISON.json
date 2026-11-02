@@ -1,0 +1,1058 @@
+[
+  {
+    "file": "prefill-native-1792622966-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 25.338036,
+    "kernel_span_ms": 144.86399584960938,
+    "configuration": "native",
+    "profile_index": 0,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.6139510000000006,
+        "current_ms": 2.6139510000000006,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "_csa_translate_pack_kernel",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.06615900000000001,
+        "current_ms": 0.06615900000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.17237599999999997,
+        "current_ms": 0.17237599999999997,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x32x64x256_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.19647200000000004,
+        "current_ms": 0.19647200000000004,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "triton_poi_fused_embedding_mhc_res_repeat_0",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.004085,
+        "current_ms": 0.004085,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 2.563726999999999,
+        "current_ms": 2.563726999999999,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<int> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<int> const&)::{lambda(int, bool)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<int> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<int> const&)::{lambda(int, bool)#1})",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.065994,
+        "current_ms": 0.065994,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "moe_route",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.143373,
+        "current_ms": 0.143373,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void aiter::ob::radix_topk_one_block_kernel<float, int, 12, 1024, false, false, (aiter::ob::Phase)0, false>(float const*, int const*, long, int const*, int const*, int, float*, int*, bool, char*, int)",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.08598900000000001,
+        "current_ms": 0.08598900000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x192x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.7978700000000001,
+        "current_ms": 0.7978700000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::unrolled_elementwise_kernel<at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithoutCast, at::native::memory::StoreWithoutCast>(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithoutCast, at::native::memory::StoreWithoutCast)",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.002002,
+        "current_ms": 0.002002,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "_scale_indexer_weights_kernel",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.04972700000000001,
+        "current_ms": 0.04972700000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x64x64x256_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+        "native_count": 20,
+        "current_count": 20,
+        "native_ms": 0.21213599999999996,
+        "current_ms": 0.21213599999999996,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "moe_scatter_preshuffle_scale_b128_r4_k8_g",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.12950900000000004,
+        "current_ms": 0.12950900000000004,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_kernel<std::bfloat16_t, 5, 4, 2, 256, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, int, int, int, int, float, float, float, float, int, int, int, int)",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.010454000000000001,
+        "current_ms": 0.010454000000000001,
+        "delta_ms": 0.0
+      }
+    ]
+  },
+  {
+    "file": "prefill-native-1792622967-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 94.31349499999999,
+    "kernel_span_ms": 131.34139697265624,
+    "configuration": "native",
+    "profile_index": 1,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 17.99481099999999,
+        "current_ms": 17.99481099999999,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "_csa_translate_pack_kernel",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.143956,
+        "current_ms": 0.143956,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.6534580000000002,
+        "current_ms": 0.6534580000000002,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "radix_topk_one_block_prefill_short_k512_b256_w32_v0_s0",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.11038200000000001,
+        "current_ms": 0.11038200000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "triton_poi_fused_embedding_mhc_res_repeat_0",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.015141,
+        "current_ms": 0.015141,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+        "native_count": 41,
+        "current_count": 41,
+        "native_ms": 1.890631,
+        "current_ms": 1.890631,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 10.380749000000003,
+        "current_ms": 10.380749000000003,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<int> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<int> const&)::{lambda(int, bool)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<int> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<int> const&)::{lambda(int, bool)#1})",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.13229600000000002,
+        "current_ms": 0.13229600000000002,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "moe_route",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.41597799999999985,
+        "current_ms": 0.41597799999999985,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x192x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.111777,
+        "current_ms": 1.111777,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.002202,
+        "current_ms": 0.002202,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void at::native::unrolled_elementwise_kernel<at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithoutCast, at::native::memory::StoreWithoutCast>(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithoutCast, at::native::memory::StoreWithoutCast)",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.0032040000000000003,
+        "current_ms": 0.0032040000000000003,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "_scale_indexer_weights_kernel",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.042640000000000004,
+        "current_ms": 0.042640000000000004,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.4423210000000001,
+        "current_ms": 0.4423210000000001,
+        "delta_ms": 0.0
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_kernel<std::bfloat16_t, 5, 4, 2, 256, true>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, int, int, int, int, float, float, float, float, int, int, int, int)",
+        "native_count": 1,
+        "current_count": 1,
+        "native_ms": 0.044265,
+        "current_ms": 0.044265,
+        "delta_ms": 0.0
+      }
+    ]
+  },
+  {
+    "file": "prefill-previous-1792622966-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 26.278586999999998,
+    "kernel_span_ms": 141.24603588867188,
+    "configuration": "previous",
+    "profile_index": 0,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 5.321804,
+        "current_ms": 5.748894999999999,
+        "delta_ms": 0.42709099999999944
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.9237359999999994,
+        "current_ms": 3.02481,
+        "delta_ms": 0.10107400000000052
+      },
+      {
+        "kernel": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 32, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.5792200000000001,
+        "current_ms": 0.6371490000000002,
+        "delta_ms": 0.0579290000000002
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 2.563726999999999,
+        "current_ms": 2.608274999999999,
+        "delta_ms": 0.044547999999999775
+      },
+      {
+        "kernel": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.6341720000000002,
+        "current_ms": 0.674971,
+        "delta_ms": 0.04079899999999986
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.15258300000000005,
+        "current_ms": 0.18110799999999994,
+        "delta_ms": 0.02852499999999989
+      },
+      {
+        "kernel": "moe_contiguous_psum_remap",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.15231,
+        "current_ms": 0.17469999999999994,
+        "delta_ms": 0.02238999999999993
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.8071800000000002,
+        "current_ms": 1.8283440000000002,
+        "delta_ms": 0.02116399999999999
+      },
+      {
+        "kernel": "qk_norm_rope_tdm_H64_D512_RD64_k6_ct16_r8_h_fused_w32_flydsl",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.46885800000000005,
+        "current_ms": 0.4865259999999999,
+        "delta_ms": 0.017667999999999837
+      },
+      {
+        "kernel": "_gemm_a16w16_gfx1250_compute_bound_kernel_BLOCK_M_32_BLOCK_N_32_BLOCK_K_512_NUM_BUFFERS_3_LAYOUT_TN_USE_ACTIVATION_0_ADD_BIAS_0",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.2996470000000001,
+        "current_ms": 0.315829,
+        "delta_ms": 0.0161819999999999
+      },
+      {
+        "kernel": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.16451800000000005,
+        "current_ms": 0.179628,
+        "delta_ms": 0.015109999999999957
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 5, 4, 2, 4096, 512, 512, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.975409,
+        "current_ms": 0.98996,
+        "delta_ms": 0.01455099999999993
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi256ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 172,
+        "current_count": 172,
+        "native_ms": 0.6499629999999998,
+        "current_ms": 0.664224,
+        "delta_ms": 0.014261000000000195
+      },
+      {
+        "kernel": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi2ELNS_11ScaleLayoutE0ELNS_9TierOrderE8ELb0ELb1EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.380166,
+        "current_ms": 0.39202699999999985,
+        "delta_ms": 0.011860999999999877
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.17237599999999997,
+        "current_ms": 0.18363300000000002,
+        "delta_ms": 0.011257000000000033
+      }
+    ]
+  },
+  {
+    "file": "prefill-previous-1792622967-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 96.489436,
+    "kernel_span_ms": 131.32396411132814,
+    "configuration": "previous",
+    "profile_index": 1,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 15.455886999999999,
+        "current_ms": 15.909925000000003,
+        "delta_ms": 0.4540380000000041
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 8.300141000000004,
+        "current_ms": 8.588511999999998,
+        "delta_ms": 0.28837099999999555
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+        "native_count": 41,
+        "current_count": 41,
+        "native_ms": 1.890631,
+        "current_ms": 2.065895,
+        "delta_ms": 0.17526400000000011
+      },
+      {
+        "kernel": "batched_gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1_mbn_pre32",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.827065,
+        "current_ms": 5.000133000000001,
+        "delta_ms": 0.17306800000000022
+      },
+      {
+        "kernel": "qk_norm_rope_tdm_H64_D512_RD64_k2_ct16_r8_h_fused_w32_flydsl",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 3.3664340000000004,
+        "current_ms": 3.5373749999999995,
+        "delta_ms": 0.17094099999999934
+      },
+      {
+        "kernel": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, true>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 3.793992999999999,
+        "current_ms": 3.9489120000000004,
+        "delta_ms": 0.15491900000000122
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.6861789999999998,
+        "current_ms": 0.831844,
+        "delta_ms": 0.1456650000000003
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.6534580000000002,
+        "current_ms": 0.759376,
+        "delta_ms": 0.10591799999999989
+      },
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 17.99481099999999,
+        "current_ms": 18.100087,
+        "delta_ms": 0.10527600000000893
+      },
+      {
+        "kernel": "moe_gather_reduce_bf16_d4096_tk6_sk1_v4_wf32_frlds",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.4755659999999997,
+        "current_ms": 1.554241,
+        "delta_ms": 0.07867500000000018
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 10.380749000000003,
+        "current_ms": 10.458773000000004,
+        "delta_ms": 0.07802400000000125
+      },
+      {
+        "kernel": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 32, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 2.550735999999999,
+        "current_ms": 2.627614000000001,
+        "delta_ms": 0.07687800000000197
+      },
+      {
+        "kernel": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.4872870000000001,
+        "current_ms": 0.56252,
+        "delta_ms": 0.0752329999999999
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.362563999999998,
+        "current_ms": 4.417217000000002,
+        "delta_ms": 0.05465300000000298
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 5, 4, 2, 4096, 512, 512, true>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 4.391850000000001,
+        "current_ms": 4.445303,
+        "delta_ms": 0.05345299999999952
+      }
+    ]
+  },
+  {
+    "file": "prefill-selected-1792622966-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 25.226080999999997,
+    "kernel_span_ms": 146.022203125,
+    "configuration": "selected",
+    "profile_index": 0,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 5.321804,
+        "current_ms": 4.799255999999999,
+        "delta_ms": -0.5225480000000016
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.9237359999999994,
+        "current_ms": 2.764214000000001,
+        "delta_ms": -0.15952199999999858
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 2.563726999999999,
+        "current_ms": 2.6718499999999996,
+        "delta_ms": 0.10812300000000005
+      },
+      {
+        "kernel": "batched_gemm_a8w8_mx128_t128x256x128_mw1_nw4_nb4_sk1_cm1_cn1_mbn_pre32",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.996251,
+        "current_ms": 0.9070760000000001,
+        "delta_ms": -0.08917499999999984
+      },
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.6139510000000006,
+        "current_ms": 2.680206000000001,
+        "delta_ms": 0.06625500000000056
+      },
+      {
+        "kernel": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 32, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.5792200000000001,
+        "current_ms": 0.642193,
+        "delta_ms": 0.06297299999999996
+      },
+      {
+        "kernel": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.6341720000000002,
+        "current_ms": 0.6884180000000003,
+        "delta_ms": 0.05424600000000021
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.8071800000000002,
+        "current_ms": 1.849762999999999,
+        "delta_ms": 0.04258299999999872
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 5, 4, 2, 4096, 512, 512, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.975409,
+        "current_ms": 1.0106700000000004,
+        "delta_ms": 0.035261000000000306
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi256ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 172,
+        "current_count": 172,
+        "native_ms": 0.6499629999999998,
+        "current_ms": 0.6843329999999996,
+        "delta_ms": 0.034369999999999776
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.15258300000000005,
+        "current_ms": 0.182704,
+        "delta_ms": 0.030120999999999953
+      },
+      {
+        "kernel": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi2ELNS_11ScaleLayoutE0ELNS_9TierOrderE8ELb0ELb1EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.380166,
+        "current_ms": 0.403836,
+        "delta_ms": 0.02366999999999996
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.17237599999999997,
+        "current_ms": 0.19100199999999998,
+        "delta_ms": 0.018626000000000004
+      },
+      {
+        "kernel": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.16451800000000005,
+        "current_ms": 0.183034,
+        "delta_ms": 0.018515999999999935
+      },
+      {
+        "kernel": "_update_compressor_states_kernel",
+        "native_count": 62,
+        "current_count": 62,
+        "native_ms": 0.14552000000000007,
+        "current_ms": 0.1636189999999999,
+        "delta_ms": 0.018098999999999848
+      }
+    ]
+  },
+  {
+    "file": "prefill-selected-1792622967-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 91.063992,
+    "kernel_span_ms": 134.66838305664064,
+    "configuration": "selected",
+    "profile_index": 1,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 15.455886999999999,
+        "current_ms": 14.245625999999998,
+        "delta_ms": -1.2102610000000005
+      },
+      {
+        "kernel": "qk_norm_rope_tdm_H64_D512_RD64_k2_ct16_r8_h_fused_w32_flydsl",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 3.3664340000000004,
+        "current_ms": 2.710527,
+        "delta_ms": -0.6559070000000001
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 8.300141000000004,
+        "current_ms": 7.816091,
+        "delta_ms": -0.4840500000000029
+      },
+      {
+        "kernel": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi2ELNS_11ScaleLayoutE0ELNS_9TierOrderE8ELb0ELb1EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.49345,
+        "current_ms": 2.0228629999999996,
+        "delta_ms": -0.47058700000000064
+      },
+      {
+        "kernel": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, true>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 3.793992999999999,
+        "current_ms": 3.4192669999999987,
+        "delta_ms": -0.3747260000000001
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.6861789999999998,
+        "current_ms": 0.8474210000000002,
+        "delta_ms": 0.1612420000000004
+      },
+      {
+        "kernel": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.4872870000000001,
+        "current_ms": 0.6269729999999999,
+        "delta_ms": 0.13968599999999975
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.362563999999998,
+        "current_ms": 4.232731,
+        "delta_ms": -0.1298329999999978
+      },
+      {
+        "kernel": "batched_gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1_mbn_pre32",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.827065,
+        "current_ms": 4.7162560000000004,
+        "delta_ms": -0.1108090000000002
+      },
+      {
+        "kernel": "moe_gather_reduce_bf16_d4096_tk6_sk1_v4_wf32_frlds",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.4755659999999997,
+        "current_ms": 1.374295,
+        "delta_ms": -0.10127099999999974
+      },
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 17.99481099999999,
+        "current_ms": 18.095706,
+        "delta_ms": 0.10089500000000771
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb1ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 129,
+        "current_count": 129,
+        "native_ms": 2.1945899999999994,
+        "current_ms": 2.094037000000001,
+        "delta_ms": -0.10055299999999806
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 10.380749000000003,
+        "current_ms": 10.477292999999996,
+        "delta_ms": 0.0965439999999926
+      },
+      {
+        "kernel": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 32, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 2.550735999999999,
+        "current_ms": 2.468767999999999,
+        "delta_ms": -0.08196799999999985
+      },
+      {
+        "kernel": "moe_token_multidest_quant_fusepre_k6_fd4096_r4_fp4_pk8_hidtdm4_quant",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.7051340000000001,
+        "current_ms": 0.6242119999999999,
+        "delta_ms": -0.08092200000000026
+      }
+    ]
+  },
+  {
+    "file": "prefill-replica-1792622966-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 25.83936,
+    "kernel_span_ms": 146.09126611328125,
+    "configuration": "replica",
+    "profile_index": 0,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "void aiter::mhc_pre_gemm_sqrsum_kernel<std::bfloat16_t, 4, 64, 32, 64, true, true>(float*, float*, std::bfloat16_t*, float*, int, int, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.5792200000000001,
+        "current_ms": 0.6535740000000001,
+        "delta_ms": 0.07435400000000005
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 2.563726999999999,
+        "current_ms": 2.612496,
+        "delta_ms": 0.04876900000000069
+      },
+      {
+        "kernel": "void aiter::mhc_post_kernel<std::bfloat16_t, 4, 4, 1024, false>(std::bfloat16_t*, std::bfloat16_t*, std::bfloat16_t*, float*, float*, int, int, int, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.6341720000000002,
+        "current_ms": 0.6813770000000001,
+        "delta_ms": 0.04720499999999993
+      },
+      {
+        "kernel": "moe_contiguous_psum_remap",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.15231,
+        "current_ms": 0.19688999999999995,
+        "delta_ms": 0.04457999999999995
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi256ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 172,
+        "current_count": 172,
+        "native_ms": 0.6499629999999998,
+        "current_ms": 0.6892259999999999,
+        "delta_ms": 0.039263000000000034
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 5, 4, 2, 4096, 512, 512, false>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.975409,
+        "current_ms": 1.01316,
+        "delta_ms": 0.03775099999999998
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 0.15258300000000005,
+        "current_ms": 0.1894059999999999,
+        "delta_ms": 0.03682299999999986
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 1.8071800000000002,
+        "current_ms": 1.8362350000000003,
+        "delta_ms": 0.029055000000000063
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.9237359999999994,
+        "current_ms": 2.8950580000000006,
+        "delta_ms": -0.028677999999998975
+      },
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.6139510000000006,
+        "current_ms": 2.636512,
+        "delta_ms": 0.022560999999999696
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 5.321804,
+        "current_ms": 5.303353,
+        "delta_ms": -0.018451000000000023
+      },
+      {
+        "kernel": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi2ELNS_11ScaleLayoutE0ELNS_9TierOrderE8ELb0ELb1EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.380166,
+        "current_ms": 0.3971100000000001,
+        "delta_ms": 0.016944000000000074
+      },
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.357396,
+        "current_ms": 0.37117700000000003,
+        "delta_ms": 0.013781000000000005
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x192x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.7978700000000001,
+        "current_ms": 0.8110560000000001,
+        "delta_ms": 0.013186000000000036
+      },
+      {
+        "kernel": "_update_compressor_states_kernel",
+        "native_count": 62,
+        "current_count": 62,
+        "native_ms": 0.14552000000000007,
+        "current_ms": 0.15796800000000005,
+        "delta_ms": 0.01244799999999998
+      }
+    ]
+  },
+  {
+    "file": "prefill-replica-1792622967-prefill-trace.json",
+    "kernels": 1888,
+    "kernel_sum_ms": 94.04929700000001,
+    "kernel_span_ms": 134.89289697265625,
+    "configuration": "replica",
+    "profile_index": 1,
+    "same_sequence_as_native": true,
+    "same_kernel_multiset_as_native": true,
+    "largest_differences": [
+      {
+        "kernel": "opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.6861789999999998,
+        "current_ms": 0.8278019999999998,
+        "delta_ms": 0.14162300000000005
+      },
+      {
+        "kernel": "_pa_prefill_sparse_BLOCK_H_64_BLOCK_D_512_BLOCK_K_32_H_64_D_512",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 17.99481099999999,
+        "current_ms": 17.901772,
+        "delta_ms": -0.09303899999998975
+      },
+      {
+        "kernel": "qk_norm_rope_tdm_H64_D512_RD64_k2_ct16_r8_h_fused_w32_flydsl",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 3.3664340000000004,
+        "current_ms": 3.277878,
+        "delta_ms": -0.0885560000000005
+      },
+      {
+        "kernel": "moe_token_multidest_quant_fusepre_k6_fd4096_r4_fp4_pk8_hidtdm4_quant",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.7051340000000001,
+        "current_ms": 0.6283770000000001,
+        "delta_ms": -0.07675700000000006
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K4096_e256_act1_q1r4_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 15.455886999999999,
+        "current_ms": 15.381395000000003,
+        "delta_ms": -0.07449199999999655
+      },
+      {
+        "kernel": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDB8_Li128ELi8ELb0ELb1ELb1ELi1ELb0EEEvPT0_PT_PfS5_S5_S5_dbiiiiiiibb",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.4872870000000001,
+        "current_ms": 0.5552289999999999,
+        "delta_ms": 0.06794199999999972
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi256ELb1ELb0ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 0.23939699999999992,
+        "current_ms": 0.29351599999999994,
+        "delta_ms": 0.054119000000000056
+      },
+      {
+        "kernel": "_ZN5aiter31inverse_rope_group_quant_kernelIDF16bDF16bLi512ELi64ELi128ELi32ELi2ELNS_11ScaleLayoutE0ELNS_9TierOrderE8ELb0ELb1EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 2.49345,
+        "current_ms": 2.44042,
+        "delta_ms": -0.0530300000000002
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.362563999999998,
+        "current_ms": 4.312431999999999,
+        "delta_ms": -0.0501319999999987
+      },
+      {
+        "kernel": "void aiter::mhc_pre_big_fuse_rmsnorm_kernel<std::bfloat16_t, 5, 4, 2, 4096, 512, 512, true>(float*, float*, std::bfloat16_t*, float*, float*, float*, float*, std::bfloat16_t*, std::bfloat16_t*, int, int, int, int, float, float, float, float, float, int, int)",
+        "native_count": 86,
+        "current_count": 86,
+        "native_ms": 4.391850000000001,
+        "current_ms": 4.437573000000001,
+        "delta_ms": 0.04572300000000087
+      },
+      {
+        "kernel": "a8w4_tdm_fp4_t64x256x256_w1x4_b3_K2048_e256_mg10",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 8.300141000000004,
+        "current_ms": 8.255222,
+        "delta_ms": -0.044919000000003505
+      },
+      {
+        "kernel": "batched_gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1_mbn_pre32",
+        "native_count": 43,
+        "current_count": 43,
+        "native_ms": 4.827065,
+        "current_ms": 4.870867999999999,
+        "delta_ms": 0.043802999999998066
+      },
+      {
+        "kernel": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb1ELb1ELi0ELb0ELb0ELb0ELb0ELb0EEEvPT0_PfPKT_PKfliilPKii",
+        "native_count": 129,
+        "current_count": 129,
+        "native_ms": 2.1945899999999994,
+        "current_ms": 2.1565089999999985,
+        "delta_ms": -0.03808100000000059
+      },
+      {
+        "kernel": "gemm_a8w8_mx128_t256x256x128_mw2_nw2_nb4_sk1_cm1_cn1",
+        "native_count": 150,
+        "current_count": 150,
+        "native_ms": 10.380749000000003,
+        "current_ms": 10.347503,
+        "delta_ms": -0.03324600000000464
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::where_kernel_impl(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(bool, int, int)#1}, std::array<char*, 4ul> >(int, at::native::(anonymous namespace)::where_kernel_impl(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(bool, int, int)#1}, std::array<char*, 4ul>)",
+        "native_count": 21,
+        "current_count": 21,
+        "native_ms": 0.128811,
+        "current_ms": 0.096365,
+        "delta_ms": -0.032445999999999996
+      }
+    ]
+  }
+]

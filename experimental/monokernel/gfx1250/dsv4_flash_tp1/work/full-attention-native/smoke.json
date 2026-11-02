@@ -1,0 +1,11 @@
+{
+  "native_rms": 0.005666424985975027,
+  "staged_rms": 0.0,
+  "staged_bitwise": true,
+  "health": true,
+  "resources": {
+    "vgpr": 410,
+    "lds": 131584,
+    "spills": 0
+  }
+}

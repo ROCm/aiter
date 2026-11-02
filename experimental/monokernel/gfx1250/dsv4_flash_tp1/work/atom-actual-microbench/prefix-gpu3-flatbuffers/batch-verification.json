@@ -1,0 +1,22 @@
+{
+  "actual_atom": {
+    "kernel_count": 0,
+    "kernel_total_us": 0,
+    "kernel_names": []
+  },
+  "fused_with_input_adapter": {
+    "kernel_count": 256,
+    "kernel_total_us": 4126.932,
+    "kernel_names": [
+      "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+      "optimized_prefix"
+    ]
+  },
+  "fused_core_plain_input": {
+    "kernel_count": 128,
+    "kernel_total_us": 3582.488,
+    "kernel_names": [
+      "optimized_prefix"
+    ]
+  }
+}

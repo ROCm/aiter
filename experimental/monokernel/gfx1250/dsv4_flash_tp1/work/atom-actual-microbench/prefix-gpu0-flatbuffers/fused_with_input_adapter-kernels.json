@@ -1,0 +1,43 @@
+[
+  {
+    "name": "mhc_res_unshuffle_h4096_hc4_ks64_b2",
+    "us": 4.606,
+    "args": {
+      "External id": 513,
+      "device": 2,
+      "stream": 0,
+      "correlation": 34,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        1,
+        4,
+        1
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ]
+    }
+  },
+  {
+    "name": "optimized_prefix",
+    "us": 45.267,
+    "args": {
+      "device": 2,
+      "stream": 0,
+      "correlation": 73,
+      "kind": "Dispatch Kernel",
+      "grid": [
+        256,
+        1,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ]
+    }
+  }
+]

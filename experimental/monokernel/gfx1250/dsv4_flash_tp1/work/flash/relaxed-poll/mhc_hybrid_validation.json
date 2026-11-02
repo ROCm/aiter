@@ -1,0 +1,34 @@
+[
+  {
+    "m": 1,
+    "exact": true
+  },
+  {
+    "m": 2,
+    "exact": true
+  },
+  {
+    "m": 7,
+    "exact": true
+  },
+  {
+    "m": 8,
+    "exact": true
+  },
+  {
+    "m": 16,
+    "exact": true
+  },
+  {
+    "m": 32,
+    "exact": true
+  },
+  {
+    "m": 64,
+    "exact": true
+  },
+  {
+    "m": 128,
+    "exact": true
+  }
+]

@@ -1,0 +1,242 @@
+[
+  {
+    "case": 0,
+    "m": 1,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 0,
+    "m": 2,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 0,
+    "m": 4,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 0,
+    "m": 8,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 1,
+    "m": 1,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 176,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 1,
+    "m": 2,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 176,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 1,
+    "m": 4,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 176,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 1,
+    "m": 8,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 176,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 2,
+    "m": 1,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 2,
+    "m": 2,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 2,
+    "m": 4,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 2,
+    "m": 8,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 3,
+    "m": 1,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 3,
+    "m": 2,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 3,
+    "m": 4,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  },
+  {
+    "case": 3,
+    "m": 8,
+    "checks": {
+      "projection": true,
+      "kv_state": true,
+      "score_state": true,
+      "cache": true,
+      "scale": true
+    },
+    "health": 0,
+    "vgpr": 175,
+    "lds": 133088,
+    "spills": 0
+  }
+]

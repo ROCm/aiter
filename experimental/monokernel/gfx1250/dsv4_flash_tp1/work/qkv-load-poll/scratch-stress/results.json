@@ -1,0 +1,72 @@
+[
+  {
+    "mode": "two_scratch_fp32",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "two_scratch_fp64",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "grid_scratch_fp32",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "grid_scratch_fp64",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "qready_scratch_fp64",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  }
+]

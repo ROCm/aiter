@@ -1,0 +1,108 @@
+{
+  "updated_utc": "2026-10-21T17:42:35.498207+00:00",
+  "status": "complete",
+  "model": "DSV4 Flash",
+  "parallelism": "single GPU TP1, no EP",
+  "scope": "one fused decode kernel per full layer including attention and routed/shared MoE; all43 layers",
+  "benchmark": "1024 input /1024 output, server once per candidate configuration, two clients per concurrency, use round2 only",
+  "ttft_tpot_statistic": "median",
+  "total_tok_s": "input plus generated output tokens per second",
+  "rows": [
+    {
+      "concurrency": 2,
+      "native": {
+        "ttft_ms": 288.62494350005363,
+        "tpot_ms": 13.328740921798259,
+        "total_tokens_per_second": 288.2001847433194,
+        "output_tokens_per_second": 144.1000923716597,
+        "completed": 16,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-native-c2-round2.json"
+      },
+      "full": {
+        "ttft_ms": 330.3365539995866,
+        "tpot_ms": 11.675179587976238,
+        "total_tokens_per_second": 334.17421086154457,
+        "output_tokens_per_second": 167.08710543077228,
+        "completed": 16,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-fixed-c2-round2.json"
+      },
+      "throughput_change_pct": 15.95211542253907
+    },
+    {
+      "concurrency": 4,
+      "native": {
+        "ttft_ms": 288.4931709995726,
+        "tpot_ms": 13.270467035679575,
+        "total_tokens_per_second": 590.8319245430275,
+        "output_tokens_per_second": 295.41596227151376,
+        "completed": 32,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-native-c4-round2.json"
+      },
+      "full": {
+        "ttft_ms": 318.10108500030765,
+        "tpot_ms": 13.141792380743707,
+        "total_tokens_per_second": 596.0343228396579,
+        "output_tokens_per_second": 298.01716141982894,
+        "completed": 32,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-fixed-c4-round2.json"
+      },
+      "throughput_change_pct": 0.880520852127975
+    },
+    {
+      "concurrency": 8,
+      "native": {
+        "ttft_ms": 286.57259499868815,
+        "tpot_ms": 13.55116439638391,
+        "total_tokens_per_second": 1158.5622961759452,
+        "output_tokens_per_second": 579.2811480879726,
+        "completed": 64,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-native-c8-round2.json"
+      },
+      "full": {
+        "ttft_ms": 328.28336649890844,
+        "tpot_ms": 15.768634236070962,
+        "total_tokens_per_second": 996.8104272404208,
+        "output_tokens_per_second": 498.4052136202104,
+        "completed": 64,
+        "source": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/batch-full-fixed-c8-round2.json"
+      },
+      "throughput_change_pct": -13.961430427126542
+    }
+  ],
+  "accuracy": {
+    "baseline-c2": {
+      "correct": 31,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-baseline-c2/__data__DeepSeek-V4-Flash/results_2026-10-21T17-32-12.610057.json"
+    },
+    "baseline-c4": {
+      "correct": 30,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-baseline-c4/__data__DeepSeek-V4-Flash/results_2026-10-21T17-32-35.376034.json"
+    },
+    "baseline": {
+      "correct": 31,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-baseline/__data__DeepSeek-V4-Flash/results_2026-10-21T17-05-12.704241.json"
+    },
+    "fixed-c2": {
+      "correct": 31,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-fixed-c2/__data__DeepSeek-V4-Flash/results_2026-10-21T17-35-42.039383.json"
+    },
+    "fixed-c4": {
+      "correct": 30,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-fixed-c4/__data__DeepSeek-V4-Flash/results_2026-10-21T17-35-38.631608.json"
+    },
+    "fixed-c8": {
+      "correct": 30,
+      "n": 32,
+      "source": "/home/vigokhal/dsv4-monokernel/batch-full/gsm8k-fixed-c8/__data__DeepSeek-V4-Flash/results_2026-10-21T17-35-36.763680.json"
+    }
+  },
+  "accuracy_limit": "32-example GSM8K subset, 3-shot, max512 generated tokens; not full validation. C8 strict score30/32 includes numerically correct16.00 vs16 formatting failure. C4 native/full both30/32 but different failed examples.",
+  "padding_fix": "Ignore graph padding via batch_id_per_q_token for compressor plans, identity indices, KV writes; mask regression tests and unmasked negative control saved.",
+  "prefetch": "Bounded nonspeculative TDM prefetch for QA/QB/cache; early TDM weight loads retained.",
+  "pending": []
+}

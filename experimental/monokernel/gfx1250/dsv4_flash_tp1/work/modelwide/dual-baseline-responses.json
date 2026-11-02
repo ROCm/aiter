@@ -1,0 +1,71 @@
+[
+  {
+    "id": "cmpl-e4c2bb8c48c94739ab608c7cede18de1",
+    "object": "text_completion",
+    "created": 1792545302,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": " Paris. The capital of France is Paris",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 8,
+      "total_tokens": 13,
+      "ttft_s": 0.1742,
+      "tpot_s": 0.0133,
+      "latency_s": 0.2677
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  },
+  {
+    "id": "cmpl-8e7088f1f1914e1c8a99b632b9d00ffb",
+    "object": "text_completion",
+    "created": 1792545302,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": "H\"\n    );\n    assert_eq!",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1024,
+      "completion_tokens": 8,
+      "total_tokens": 1032,
+      "ttft_s": 0.1421,
+      "tpot_s": 0.0135,
+      "latency_s": 0.2364
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  },
+  {
+    "id": "cmpl-b569a051768a4e0f80824063501f659c",
+    "object": "text_completion",
+    "created": 1792545302,
+    "model": "/data/DeepSeek-V4-Flash",
+    "choices": [
+      {
+        "index": 0,
+        "text": "HHHH",
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1151,
+      "completion_tokens": 4,
+      "total_tokens": 1155,
+      "ttft_s": 0.1596,
+      "tpot_s": 0.0143,
+      "latency_s": 0.2025
+    },
+    "kv_transfer_params": null,
+    "prompt_token_ids": null
+  }
+]

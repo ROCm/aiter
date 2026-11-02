@@ -1,0 +1,6 @@
+{
+  "implemented": "TDM for all QA/KV/QB GEMM weight tiles",
+  "default": "tdm_early",
+  "global_control": "comparison only",
+  "serving_integrated": false
+}

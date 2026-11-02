@@ -1,0 +1,68 @@
+[
+  {
+    "mode": "two_launch",
+    "checked_invocations": 704,
+    "failures": 1,
+    "max_q_relative_rms": 0.004022694192826748,
+    "max_kv_relative_rms": 6.753583147656173e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    },
+    "diagnostics": [
+      {
+        "index": 0,
+        "replay": 21,
+        "lp_matches_y": true,
+        "ls_matches_y": true,
+        "changed_latent_channels": 1,
+        "error_vs_own_latent": {
+          "relative_rms": 6.589767065356966e-10,
+          "max_abs": 1.1920928955078125e-07,
+          "finite": true
+        },
+        "y_error": {
+          "relative_rms": 1.2714474905806128e-05,
+          "max_abs": 0.00018341094255447388,
+          "finite": true
+        }
+      }
+    ]
+  },
+  {
+    "mode": "grid_vector_load",
+    "checked_invocations": 544,
+    "failures": 1,
+    "max_q_relative_rms": 0.004022694192826748,
+    "max_kv_relative_rms": 7.543759465988842e-07,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    },
+    "diagnostics": [
+      {
+        "index": 0,
+        "replay": 16,
+        "lp_matches_y": true,
+        "ls_matches_y": true,
+        "changed_latent_channels": 1,
+        "error_vs_own_latent": {
+          "relative_rms": 6.589767065356966e-10,
+          "max_abs": 1.1920928955078125e-07,
+          "finite": true
+        },
+        "y_error": {
+          "relative_rms": 1.2714474905806128e-05,
+          "max_abs": 0.00018341094255447388,
+          "finite": true
+        }
+      }
+    ]
+  }
+]

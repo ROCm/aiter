@@ -1,0 +1,30 @@
+{
+  "actual_atom": {
+    "kernel_count": 1280,
+    "original_types": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "fused_with_input_adapter": {
+    "kernel_count": 256,
+    "original_types": [
+      0,
+      0
+    ]
+  },
+  "fused_core_plain_input": {
+    "kernel_count": 128,
+    "original_types": [
+      0
+    ]
+  }
+}

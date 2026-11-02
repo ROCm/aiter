@@ -1,0 +1,36 @@
+Low-concurrency FP4 routed MoE stage-fusion experiment (not a full-layer kernel)
+
+Start with C1, six selected experts, H=4096, intermediate=2048, FP8 activation
+and shuffled FP4 weights. Retain baseline routing and input quantization first.
+Reuse AITER's gfx1250 decode GEMM stage math including SwiGLU and MXFP8 output.
+For each expert: 32 CTAs own 128 gate/up columns each, producing 64 intermediate
+columns and two scales per real row. The same 32 CTAs then own 128 down columns.
+Grid=192 CTAs, below 256 CUs; require resource inspection to establish residency.
+Target LDS <=160 KiB, no VGPR spills. Two stages should reuse LDS allocations.
+The shared expert remains on its existing stream during this first experiment.
+Preserve BF16 rounding of route-weighted down outputs before baseline reduction.
+
+Ownership: first stage writes disjoint intermediate FP8 and scale column tiles.
+Second stage reads all 2048 intermediate columns for its expert. Per-expert
+uint32 completion counter has 32 producers. Drain TDM output, CTA barrier,
+release atomic increment at GPU scope; acquire polling to next multiple of32.
+Stream ordering prevents reuse until every CTA returns. uint32 wrap is defined.
+Bound polling; set a health flag and skip dependent stage after timeout.
+Counter is persistent across graph replay, never host-reset between launches.
+No peer-GPU scope is required for Flash. Keep baseline kernels above eligible
+bucket and for unsupported routing/shapes. Later extend resident task looping
+for C8/C16 only if C1 resource and correctness checks pass.
+
+Resumed experimental extension (NOT installed in serving): C8/C16 uses a
+power-of-two resident grid128/256 and loops over all routing-block/N tasks.
+All CTAs complete stage1, drain DEV-scoped payloads, enter bounded phase1;
+all loop stage2 then enter independent phase2 before ordered reduction.
+Two uint32 counters round to GRID (power2 for defined wrap). Scratch sized
+M*6 by widths2048/4096. Inactive routing blocks skipped by AITER sentinel.
+No oversubscribed waiting grid. Compare both 128/256 resident CTAs, retain
+library path unless measured total latency improves. Shared-stream overlap
+is a separate serving acceptance check; microbenchmark gains are insufficient.
+
+Further staged opportunity (not implemented): move stage2 weight prefetch before the activation-ready poll. Reordering TDM operations requires re-deriving async wait counts; do not mechanically move only the loads and retain old wait arithmetic. Stage1/2 LDS overlap must fit hardware and preserve shared-expert side-stream residency. Input quant remains separate; a BF16-load plus per-32 MXFP8 quant in stage1 could remove that boundary only if exact exponent/rounding matches downcast_to_mxfp.
+
+Selected C1 b4 ISA audit:107VGPR,107SGPR,12SGPR spills,0VGPR spills,private scratch0. Runtime LDS87776B. SGPR spill metadata must be reported; do not call this entirely spill-free.

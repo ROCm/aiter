@@ -1,0 +1,114 @@
+diff --git a/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py b/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
+index b9fe46d873..a51f8d42a8 100644
+--- a/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
+@@ -524,7 +524,16 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
+ 
+ _mhc_pre_reduce_apply_repr = make_kernel_repr(
+     "_mhc_pre_reduce_apply_gfx1250_kernel",
+-    ["C", "ROWS", "CHUNK", "N_CHUNKS", "S", "FUSE_RMSNORM", "RES_SHUFFLED"],
++    [
++        "C",
++        "ROWS",
++        "CHUNK",
++        "N_CHUNKS",
++        "S",
++        "FUSE_RMSNORM",
++        "RES_SHUFFLED",
++        "FUSE_QUANT",
++    ],
+ )
+ 
+ 
+@@ -731,6 +740,7 @@ class _RAConfig:
+     SMEM_MIX: gl.constexpr
+     SMEM_RES: gl.constexpr
+     RES_KS: gl.constexpr
++    FUSE_QUANT: gl.constexpr
+ 
+     @gluon.constexpr_function
+     def __init__(
+@@ -753,6 +763,7 @@ class _RAConfig:
+         SMEM_MIX,
+         SMEM_RES,
+         RES_KS=32,
++        FUSE_QUANT=False,
+     ):
+         self.C = gl.constexpr(C)
+         self.HC = gl.constexpr(HC)
+@@ -772,6 +783,7 @@ class _RAConfig:
+         self.SMEM_MIX = gl.constexpr(SMEM_MIX)
+         self.SMEM_RES = gl.constexpr(SMEM_RES)
+         self.RES_KS = gl.constexpr(RES_KS)
++        self.FUSE_QUANT = gl.constexpr(FUSE_QUANT)
+ 
+ 
+ @gluon.constexpr_function
+@@ -791,6 +803,8 @@ def _reduce_apply_main(
+     base_ptr,  # (N_OUT,) fp32
+     res_ptr,  # residual (M, HC, C) bf16, or shuffled [C/32][HC][M][32]
+     norm_w_ptr,  # (C,) bf16, read only with FUSE_RMSNORM
++    quant_ptr,
++    quant_scale_ptr,
+     M,
+     gemm_stride,
+     rms_eps,
+@@ -1020,6 +1034,31 @@ def _reduce_apply_main(
+                 ok = li_ok
+             out = li.to(dt).to(gl.float32) * w.to(gl.float32) * nrms3
+             gl.store(li_ptr + li_rows * C + cc + li_c, out.to(dt), mask=ok)
++            if K.FUSE_QUANT:
++                # Match HIP per-128 RoundUp scales after the BF16 rounding point.
++                v = gl.reshape(
++                    gl.where(ok, out.to(dt).to(gl.float32), 0.0),
++                    [ROWS, CHUNK // 128, 128],
++                )
++                amax = gl.maximum(gl.max(gl.abs(v), 2), 1e-10)
++                bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
++                exponent = gl.minimum(((bits & 0x7FFFFFFF) + 0x7FFFFF) >> 23, 254)
++                scales, _ = gl.broadcast(exponent[:, :, None], v)
++                scales = gl.max(gl.reshape(scales, [ROWS, CHUNK // 32, 32]), 2).to(gl.uint8)
++                q = gl.amd.cdna5.scaled_downcast(
++                    gl.reshape(v, [ROWS, CHUNK]), scales, "e4m3", axis=1
++                )
++                q = gl.convert_layout(gl.reshape(q, [ROWS, CHUNK // 32, 32]), LI_L)
++                gl.store(quant_ptr + li_rows * C + cc + li_c, q, mask=ok)
++                qr = row0 + gl.arange(0, ROWS, layout=gl.SliceLayout(1, exponent.type.layout))
++                qg = cc // 128 + gl.arange(
++                    0, CHUNK // 128, layout=gl.SliceLayout(0, exponent.type.layout)
++                )
++                gl.store(
++                    quant_scale_ptr + qg[None, :] * M + qr[:, None],
++                    exponent.to(gl.uint8),
++                    (qr[:, None] < M) & (qg[None, :] < C // 128),
++                )
+     else:
+         gl.amd.gfx1250.tdm.async_wait(0)
+         gl.barrier()
+@@ -1152,6 +1191,9 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
+     SMEM_MIX: gl.constexpr,
+     SMEM_RES: gl.constexpr,
+     RES_KS: gl.constexpr = 32,
++    quant_ptr=None,
++    quant_scale_ptr=None,
++    FUSE_QUANT: gl.constexpr = False,
+ ):
+     WS: gl.constexpr = FUSE_RMSNORM  # whole rows per CTA, one K-block
+     main_args = (
+@@ -1164,6 +1206,8 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
+         base_ptr,
+         res_ptr,
+         norm_w_ptr,
++        quant_ptr if FUSE_QUANT else li_ptr,
++        quant_scale_ptr if FUSE_QUANT else li_ptr,
+         M,
+         gemm_stride,
+         rms_eps,
+@@ -1191,6 +1235,7 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
+         SMEM_MIX,
+         SMEM_RES,
+         RES_KS,
++        FUSE_QUANT,
+     )
+     if WS:
+         gl.warp_specialize(

@@ -1,0 +1,13 @@
+[
+  "atom/model_ops/fused_moe_triton.py",
+  "atom/model_ops/linear.py",
+  "atom/models/deepseek_v4.py",
+  "atom/model_ops/dsv4_attention_configs.json",
+  "atom/model_ops/dsv4_flash_attention_configs.json",
+  "atom/model_ops/dsv4_flash_final_configs.json",
+  "atom/model_ops/dsv4_flash_moe.py",
+  "atom/model_ops/dsv4_flash_moe_kernel.py",
+  "atom/model_ops/dsv4_flash_moe_stage.py",
+  "atom/model_ops/dsv4_full_layer.py",
+  "atom/model_ops/dsv4_hybrid.py"
+]

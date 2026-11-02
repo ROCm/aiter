@@ -1,0 +1,5 @@
+Container: vigokhal_dsv4_tp4
+Image: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Image ID: sha256:d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a
+Host /home/vigokhal/dsv4-monokernel mounted at /work
+Selected experiments use HIP_VISIBLE_DEVICES=0 (independent experiments used1,2,3).

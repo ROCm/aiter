@@ -1,0 +1,14 @@
+{
+  "checks": 10240,
+  "max_errors": {
+    "mix": 9.05263064510109e-08,
+    "raw": 0,
+    "x": 0,
+    "q": 0,
+    "kv": 0,
+    "out": 0,
+    "cache": 0
+  },
+  "health": 0,
+  "cache_exact": true
+}

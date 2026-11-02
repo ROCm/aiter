@@ -1,0 +1,63 @@
+Flash C1 full uncompressed layer: reproduce isolated experiment
+
+Runtime: existing vigokhal_dsv4_tp4 container based on original gfx1250 image;
+/home/vigokhal/dsv4-monokernel is mounted /work; /data holds checkpoint weights.
+This experiment imports torch, Triton/Gluon and safetensors, not ATOM's server.
+No checkpoint weights are copied into the handoff archive.
+
+Check that GPU0 has no other users before any run. Do not run concurrently with
+another server or persistent kernel. Container startup must only start its sleep
+entrypoint. Disable core dumps. Source and results remain under /work.
+
+1. Original acquire/release variant:
+ docker exec -e HIP_VISIBLE_DEVICES=0 \
+  -e TRITON_CACHE_DIR=/work/full-layer-c1/triton-cache vigokhal_dsv4_tp4 \
+  bash -lc 'ulimit -c 0; cd /work/full-layer-c1; python test_sync.py 256 && python run.py --grid 256'
+
+2. Explicit coherent-L2 / semaphore variant:
+ docker exec -e HIP_VISIBLE_DEVICES=0 \
+  -e TRITON_CACHE_DIR=/work/full-layer-c1/triton-cache vigokhal_dsv4_tp4 \
+  bash -lc 'ulimit -c 0; cd /work/full-layer-c1/buffer-scoped; python test_sync.py 256 && python run.py --grid 256'
+
+Save old result JSON/logs before rerunning: the harness writes fixed names.
+run.py compiles the full kernel, records ISA/resources, executes the layer,
+compares independent torch equations, compares every intermediate exactly with
+its same-arithmetic 33-launch control, tests graph replay and counter wrap,
+runs two isolated timing rounds (report ONLY round2), and profiles one full call.
+These rounds are microbenchmark rounds, NOT two serving clients. There is no
+TPOT/TTFT/total token throughput result for this prototype.
+
+Inputs: layer0 checkpoint tensors (FP8/FP4/E8M0 packed weights preserved), token42
+embedding repeated over four mHC streams, controlled synthetic 128-row KV window
+and controlled rotary angles. This is not a live prompt/decode cache snapshot.
+The returned full residual materializes the final mHC post operation. ATOM's
+native HCState delays that operation across layer boundaries; integration must
+explicitly reconcile this and shuffled residual layouts.
+
+Validation limitations:
+- independent reference is approximate (FP32 reduction order / FP8 thresholds),
+  not an exact ATOM comparison or a task-quality result;
+- supports one complete uncompressed/hash-routed Flash layer, no compression or
+  indexer, no learned top-k routing for later layers, no TP4;
+- direct packed matvec uses vector arithmetic, not optimized WMMA;
+- fixed C1/window ABI does not implement ATOM paged indices / state slots;
+- no end-to-end serving run, no GSM8K, no edits to the pushed ATOM branch.
+
+Next implementation work: capture live ATOM intermediates; port measured WMMA
+stage math into this one-launch structure with exact BF16/FP8 boundaries; add
+ratio4/ratio128 compression plus indexer and non-hash routing; bind actual paged
+cache metadata, residual ABI and epoch workspace; validate numerical/quality
+behavior before server benchmarks. One server per arm, two full clients, report
+only client2 when that path is ready. Do not label the current prototype an
+end-to-end Flash serving result.
+
+Revision1-extra-rounding preserves the initial extra-rounding prototype.
+scoped/ uses generic .cg modifiers, which compiled to non-temporal hints rather
+than explicit device scope; its passing tests do not prove the desired memory
+contract. buffer-scoped/ uses the gfx1250 buffer API and scope-proof.json checks.
+No new GPU image or Git branch has been published for this isolated experiment.
+
+Additional directories: packed/ tests on-demand pointer tables; local-glue/
+tests greater local fusion. Both are rejected for latency. all-variants.json
+records second-round values. resources-audited.json distinguishes SGPR from
+VGPR spills; n_spills from the Python kernel handle alone was insufficient.

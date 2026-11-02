@@ -1,0 +1,62 @@
+[
+  {
+    "m": 1,
+    "checks": {
+      "mix": true,
+      "partials": true,
+      "raw": true,
+      "norm": true,
+      "post": true,
+      "post32": true
+    },
+    "health": 0,
+    "vgpr": 188,
+    "spills": 0,
+    "lds": 78288
+  },
+  {
+    "m": 2,
+    "checks": {
+      "mix": true,
+      "partials": true,
+      "raw": true,
+      "norm": true,
+      "post": true,
+      "post32": true
+    },
+    "health": 0,
+    "vgpr": 188,
+    "spills": 0,
+    "lds": 78288
+  },
+  {
+    "m": 4,
+    "checks": {
+      "mix": true,
+      "partials": true,
+      "raw": true,
+      "norm": true,
+      "post": true,
+      "post32": true
+    },
+    "health": 0,
+    "vgpr": 188,
+    "spills": 0,
+    "lds": 78288
+  },
+  {
+    "m": 8,
+    "checks": {
+      "mix": true,
+      "partials": true,
+      "raw": true,
+      "norm": true,
+      "post": true,
+      "post32": true
+    },
+    "health": 0,
+    "vgpr": 188,
+    "spills": 0,
+    "lds": 78288
+  }
+]

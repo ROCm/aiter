@@ -1,0 +1,12 @@
+{
+  "integrated": true,
+  "scope": "Flash C1 uncompressed BF16 QKV + cache update + attention",
+  "single_launch_verified": true,
+  "tdm": true,
+  "l2_prefetch": true,
+  "serving_integrated": false,
+  "default_fused": true,
+  "fastest_measured_chain": "two regions",
+  "second_round_chain_reused_us": 20.025409758090973,
+  "second_round_chain_rotating_us": 21.64518367499113
+}

@@ -1,0 +1,6 @@
+{
+  "gpu": "AMD Radeon Graphics",
+  "properties": "_CudaDeviceProperties(name='AMD Radeon Graphics', major=12, minor=5, gcnArchName='gfx1250', total_memory=442368MB, multi_processor_count=256, uuid=39663366-3338-3133-3436-363736353831, pci_bus_id=1, pci_device_id=0, pci_domain_id=1, L2_cache_size=4MB)",
+  "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+  "triton": "3.8.0"
+}

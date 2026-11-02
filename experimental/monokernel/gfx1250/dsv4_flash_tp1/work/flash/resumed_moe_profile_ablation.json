@@ -1,0 +1,20 @@
+{
+  "resumed_no_moe": {
+    "wall_us": 6095.26306640625,
+    "sum_us": 6216.44428,
+    "busy_union_us": 5224.190278320312,
+    "overlap_us": 992.2540016796875,
+    "idle_us": 871.0727880859375,
+    "moe_sum_us": 745.80348,
+    "kernels_per_step": 1504.0
+  },
+  "resumed_final": {
+    "wall_us": 5911.903642578125,
+    "sum_us": 6061.85982,
+    "busy_union_us": 5076.811665039062,
+    "overlap_us": 985.0481549609375,
+    "idle_us": 835.0919775390626,
+    "moe_sum_us": 625.2167,
+    "kernels_per_step": 1418.0
+  }
+}

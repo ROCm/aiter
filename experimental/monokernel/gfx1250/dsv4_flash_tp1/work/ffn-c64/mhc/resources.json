@@ -1,0 +1,20 @@
+[
+  {
+    "name": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel_C_4096_BLOCK_M_16_K_LOOP_1_SPLIT_K_64_NUM_STAGES_2_RES_SHUFFLED_1_W_PRESHUFFLED_1",
+    "vgpr": 150,
+    "shared": 119488,
+    "scratch": 0
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_4096_ROWS_1_CHUNK_1024_N_CHUNKS_4_S_64_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "vgpr": 90,
+    "shared": 32868,
+    "scratch": 0
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_4096_ROWS_1_CHUNK_1024_N_CHUNKS_4_S_64_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "vgpr": 90,
+    "shared": 32868,
+    "scratch": 0
+  }
+]

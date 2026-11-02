@@ -1,0 +1,52 @@
+{
+  "original": {
+    "wmma": 8,
+    "tensor_load": 4,
+    "explicit_dev_prefetch": 0,
+    "resources": {
+      "vgpr": 186,
+      "spills": 0,
+      "lds": 56496
+    }
+  },
+  "prefetch": {
+    "wmma": 8,
+    "tensor_load": 4,
+    "explicit_dev_prefetch": 1,
+    "resources": {
+      "vgpr": 186,
+      "spills": 0,
+      "lds": 56496
+    }
+  },
+  "localprefetch": {
+    "wmma": 8,
+    "tensor_load": 4,
+    "explicit_dev_prefetch": 1,
+    "resources": {
+      "vgpr": 186,
+      "spills": 0,
+      "lds": 56496
+    }
+  },
+  "packed": {
+    "wmma": 8,
+    "tensor_load": 5,
+    "explicit_dev_prefetch": 0,
+    "resources": {
+      "vgpr": 186,
+      "spills": 0,
+      "lds": 56496
+    }
+  },
+  "packedprefetch": {
+    "wmma": 8,
+    "tensor_load": 5,
+    "explicit_dev_prefetch": 1,
+    "resources": {
+      "vgpr": 186,
+      "spills": 0,
+      "lds": 56496
+    }
+  }
+}

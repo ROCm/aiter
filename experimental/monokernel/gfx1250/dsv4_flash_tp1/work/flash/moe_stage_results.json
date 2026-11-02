@@ -1,0 +1,24 @@
+[
+  {
+    "buffers": 2,
+    "health": 0,
+    "lds": 43872,
+    "registers": 108,
+    "spills": 0,
+    "baseline_us": 9.29792102797207,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 18.803290580811716
+  },
+  {
+    "buffers": 3,
+    "health": 0,
+    "lds": 65824,
+    "registers": 108,
+    "spills": 0,
+    "baseline_us": 9.297771473046039,
+    "changing_replays": 1000,
+    "counter_wrap_passed": true,
+    "us": 17.450665247665917
+  }
+]

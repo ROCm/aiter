@@ -1,0 +1,8 @@
+{
+  "ctas": 256,
+  "threads_per_cta": 128,
+  "hints_per_thread": 4,
+  "unique_lines": 131072,
+  "cache_line_bytes": 256,
+  "bytes_covered": 33554432
+}

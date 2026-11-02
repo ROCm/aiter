@@ -1,0 +1,26 @@
+{
+  "1": {
+    "steps": 50,
+    "kernels_per_step": 1418.0,
+    "mean_wall_us": 5911.903642578125,
+    "mean_busy_union_us": 5076.811665039062,
+    "mean_sum_us": 6061.85982,
+    "fused_moe_calls_per_step": 43.0
+  },
+  "16": {
+    "steps": 50,
+    "kernels_per_step": 1590.0,
+    "mean_wall_us": 7530.380092773437,
+    "mean_busy_union_us": 6595.868901367187,
+    "mean_sum_us": 7472.15724,
+    "fused_moe_calls_per_step": 0.0
+  },
+  "128": {
+    "steps": 50,
+    "kernels_per_step": 1632.0,
+    "mean_wall_us": 11782.911674804687,
+    "mean_busy_union_us": 10793.2744921875,
+    "mean_sum_us": 11946.02322,
+    "fused_moe_calls_per_step": 0.0
+  }
+}

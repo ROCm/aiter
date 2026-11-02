@@ -1,0 +1,22 @@
+{
+  "b128_shuffleTrue_grid256": {
+    "vgpr": 27,
+    "spills": 0,
+    "lds": 1328
+  },
+  "b256_shuffleTrue_grid256": {
+    "vgpr": 30,
+    "spills": 0,
+    "lds": 2688
+  },
+  "b128_shuffleFalse_grid256": {
+    "vgpr": 27,
+    "spills": 0,
+    "lds": 1328
+  },
+  "b128_shuffleTrue_grid32": {
+    "vgpr": 27,
+    "spills": 0,
+    "lds": 1328
+  }
+}

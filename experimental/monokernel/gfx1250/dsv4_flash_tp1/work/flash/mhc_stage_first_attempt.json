@@ -1,0 +1,131 @@
+[
+  {
+    "m": 1,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "error": "cannot pickle '_thread.RLock' object"
+  },
+  {
+    "m": 1,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 4.691407708006204,
+    "one_launch_us": 5.959534848589531,
+    "shared": 119488,
+    "n_regs": 154,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 8,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.210019546805076,
+    "one_launch_us": 6.934177852036996,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 8,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.219931050435009,
+    "one_launch_us": 26.24487573843831,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 16,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.357863021223513,
+    "one_launch_us": 7.1857396163526115,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 16,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.379803500958343,
+    "one_launch_us": 50.106494331844374,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      1,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 32,
+    "last_producer": false,
+    "fuse_qkv": false,
+    "baseline_us": 5.609583194693067,
+    "one_launch_us": 7.745228842865648,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      2,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 32,
+    "last_producer": true,
+    "fuse_qkv": false,
+    "baseline_us": 5.57680134625398,
+    "one_launch_us": 97.60295212870896,
+    "shared": 119488,
+    "n_regs": 155,
+    "n_spills": 0,
+    "grid": [
+      2,
+      64
+    ],
+    "exact": true
+  },
+  {
+    "m": 1,
+    "last_producer": false,
+    "fuse_qkv": true,
+    "error": "at 324:12:\n        ticket2 = gl.atomic_add(counter_ptr + 1, 1, sem=\"acq_rel\", scope=\"gpu\")\n        target2 = ((ticket2 // GRID) + 1) * GRID\n        seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n        spins2 = 0\n        while (seen2 != target2) & (spins2 < 100000):\n            seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n            spins2 += 1\n        if seen2 != target2:\n            gl.atomic_xchg(health_ptr, 2, sem=\"relaxed\", scope=\"gpu\")\n        task = pid_m * SPLIT_K + pid_k\n        if (seen2 == target2) & (task < ((M + 15) // 16) * 24):\n            _qkv_stage(quant_ptr.to(gl.pointer_type(gl.uint8)), qkv_w_ptr.to(gl.pointer_type(gl.uint8)),\n            ^\nNameError(\"Cannot access global variable _qkv_stage from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")"
+  },
+  {
+    "m": 8,
+    "last_producer": false,
+    "fuse_qkv": true,
+    "error": "at 324:12:\n        ticket2 = gl.atomic_add(counter_ptr + 1, 1, sem=\"acq_rel\", scope=\"gpu\")\n        target2 = ((ticket2 // GRID) + 1) * GRID\n        seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n        spins2 = 0\n        while (seen2 != target2) & (spins2 < 100000):\n            seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n            spins2 += 1\n        if seen2 != target2:\n            gl.atomic_xchg(health_ptr, 2, sem=\"relaxed\", scope=\"gpu\")\n        task = pid_m * SPLIT_K + pid_k\n        if (seen2 == target2) & (task < ((M + 15) // 16) * 24):\n            _qkv_stage(quant_ptr.to(gl.pointer_type(gl.uint8)), qkv_w_ptr.to(gl.pointer_type(gl.uint8)),\n            ^\nNameError(\"Cannot access global variable _qkv_stage from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")"
+  },
+  {
+    "m": 16,
+    "last_producer": false,
+    "fuse_qkv": true,
+    "error": "at 324:12:\n        ticket2 = gl.atomic_add(counter_ptr + 1, 1, sem=\"acq_rel\", scope=\"gpu\")\n        target2 = ((ticket2 // GRID) + 1) * GRID\n        seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n        spins2 = 0\n        while (seen2 != target2) & (spins2 < 100000):\n            seen2 = gl.atomic_add(counter_ptr + 1, 0, sem=\"acquire\", scope=\"gpu\")\n            spins2 += 1\n        if seen2 != target2:\n            gl.atomic_xchg(health_ptr, 2, sem=\"relaxed\", scope=\"gpu\")\n        task = pid_m * SPLIT_K + pid_k\n        if (seen2 == target2) & (task < ((M + 15) // 16) * 24):\n            _qkv_stage(quant_ptr.to(gl.pointer_type(gl.uint8)), qkv_w_ptr.to(gl.pointer_type(gl.uint8)),\n            ^\nNameError(\"Cannot access global variable _qkv_stage from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")"
+  }
+]

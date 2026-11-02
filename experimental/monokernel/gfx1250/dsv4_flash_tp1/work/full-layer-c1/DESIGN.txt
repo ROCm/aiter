@@ -1,0 +1,33 @@
+Flash C1 full-layer prototype — uncompressed layer, checkpoint-backed harness
+
+Objective: one GPU launch containing both mHC sublayers, attention projections,
+Q/K norm+RoPE, window-cache write+attention (including sink), inverse RoPE,
+grouped output LoRA, output projection, router, shared and routed FP4 experts,
+and final mHC residual. First target layer0 (ratio0, hash routing), TP1.
+This is an isolated full-layer experiment, NOT yet whole-model serving.
+Compression/indexer layers are subsequent work; no end-to-end claim until those
+are implemented and a trace verifies one launch for every eligible full layer.
+
+First implementation favors inspectable arithmetic and correctness. Canonical
+checkpoint FP8/FP4 weights and E8M0 scales remain packed. It uses vectorized
+matvec reductions, not optimized preshuffled WMMA. Consequently its performance
+must not be substituted for the optimized hybrid or attributed to fusion alone.
+Input residual uses a real embedding; initial KV window is synthetic controlled
+state. An independent torch reference uses the same checkpoint and quantization.
+ATOM exact intermediate checks and captured live-state replay remain required
+before integration. One successful synthetic-state test is insufficient.
+
+Stage walk: <=64 CTAs, 4 warps/CTA; every stage assigns tiles by CTA ID, followed
+by a device-scoped acquire/release barrier. Each output element has one writer.
+Scratch is caller-owned and preallocated, never allocated inside graph replay.
+All inter-stage buffers are written before publication; scalar readiness counts
+advance monotonically, with modular signed comparisons and sequential reuse.
+Barrier clocks have a hardware-time timeout plus a diagnostic iteration bound.
+Health status is checked by host; no failed run contributes a timing result.
+Weight/activation layouts and stage arithmetic validated before serving.
+
+Resource gate: inspect compiler VGPR/LDS/spills before launch. Grid cannot exceed
+reported CU count and must fit at least one block/CU. No concurrent GPU process.
+Start with correctness, then packed-WMMA adoption, producer-consumer overlap,
+prefetch and profiling. Do not reject the full-layer design based solely on a
+slow naive matvec prototype. Preserve all failed checks and performance results.

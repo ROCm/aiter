@@ -1,0 +1,59 @@
+{
+  "real_checkpoint_weights": true,
+  "checks": [
+    {
+      "position": 1023,
+      "projection_max_abs": 0.0,
+      "projection_rms": 0.0,
+      "cache_max_abs": 0.0,
+      "state_max_abs": 0.0,
+      "health": 0
+    },
+    {
+      "position": 1024,
+      "projection_max_abs": 0.0,
+      "projection_rms": 0.0,
+      "cache_max_abs": 0.0,
+      "state_max_abs": 0.0,
+      "health": 0
+    },
+    {
+      "position": 1151,
+      "projection_max_abs": 0.0,
+      "projection_rms": 0.0,
+      "cache_max_abs": 0.0,
+      "state_max_abs": 0.0,
+      "health": 0
+    },
+    {
+      "position": 1535,
+      "projection_max_abs": 0.0,
+      "projection_rms": 0.0,
+      "cache_max_abs": 0.0,
+      "state_max_abs": 0.0,
+      "health": 0
+    },
+    {
+      "position": 2047,
+      "projection_max_abs": 0.0,
+      "projection_rms": 0.0,
+      "cache_max_abs": 0.0,
+      "state_max_abs": 0.0,
+      "health": 0
+    }
+  ],
+  "timings": [
+    {
+      "native": 10.644687339663506,
+      "fused": 18.392562866210938
+    },
+    {
+      "native": 10.614624712616205,
+      "fused": 18.43506284058094
+    }
+  ],
+  "vgpr": 176,
+  "lds": 133088,
+  "spills": 0,
+  "health": 0
+}

@@ -1,0 +1,35 @@
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -4212,6 +4212,22 @@
+             # Replace storage on the existing Parameter: retain no FP32 copy.
+             fn.data = aiter.mhc_shuffle_fn(fn.data.contiguous().float())
+ 
++        # Experimental C1 uncompressed full-layer kernel; native remains default.
++        if (
++            self.layer_id == 0
++            and os.environ.get("ATOM_DSV4_FULL_LAYER_EXPERIMENTAL", "0") == "1"
++            and get_gfx_runtime() == "gfx1250"
++            and self.attn_norm.weight.numel() == 4096
++            and self.hc_mult == 4
++            and self.attn.n_local_heads == 64
++            and self.attn.head_dim == 512
++            and self.attn.compress_ratio == 0
++            and self.norm_eps == 1e-6
++        ):
++            from atom.model_ops.dsv4_full_layer import prepare
++            self._experimental_full_layer = prepare()
++            self._experimental_full_layer.bind(self)
++
+     def hc_pre(
+         self,
+         residual: torch.Tensor,  # [num_tokens, hc, dim]  mHC-widened residual
+@@ -4445,6 +4461,9 @@
+         hc_state: HCState,
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+     ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
++        full_layer = getattr(self, "_experimental_full_layer", None)
++        if full_layer is not None and hc_state.x_prev is None and hc_state.res_preshuffle:
++            return full_layer(self, hc_state, positions)
+         # ----- Attention sub-layer with mHC mixing -----
+         x_quant = x_scale = None
+         if self.hybrid_hc and hc_state.x_prev is not None:

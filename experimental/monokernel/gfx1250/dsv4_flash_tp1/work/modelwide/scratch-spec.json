@@ -1,0 +1,641 @@
+{
+  "a": [
+    {
+      "shape": [
+        1,
+        4,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        4,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        4,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        24,
+        16384
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        3
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        128,
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        8
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        1536,
+        4096
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        12,
+        32
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        16,
+        1536
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        1536
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        1536
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        129
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        1536
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        1024
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        8
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        32
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        32
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        512
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        32768,
+        1024
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        256,
+        8
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        32768
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        64
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        64,
+        512
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        128,
+        512
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        128
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        2
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        64
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4,
+        64,
+        512
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        64,
+        512
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        4
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        8192,
+        4096
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        64,
+        32
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        32768
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        256
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        4,
+        8192
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        8192
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        8192
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        64
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        8,
+        4096
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    }
+  ],
+  "f": [
+    {
+      "shape": [
+        1,
+        4,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        4,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        24,
+        16384
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        3
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        128,
+        24
+      ],
+      "dtype": "torch.float32"
+    },
+    {
+      "shape": [
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        32,
+        8
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        2048
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        2048
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        16,
+        8
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        256,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        256
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        4096,
+        4096
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        32,
+        32
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        4096,
+        2048
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        32,
+        16
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        256,
+        256,
+        32768
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        256,
+        128,
+        4096
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        256,
+        256,
+        16384
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        256,
+        128,
+        2048
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        6,
+        2048
+      ],
+      "dtype": "torch.float8_e4m3fn"
+    },
+    {
+      "shape": [
+        6,
+        64
+      ],
+      "dtype": "torch.uint8"
+    },
+    {
+      "shape": [
+        6,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        256
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        256
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        6
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        6
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        6
+      ],
+      "dtype": "torch.int32"
+    },
+    {
+      "shape": [
+        6
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        2
+      ],
+      "dtype": "torch.uint32"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1,
+        4096
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.uint32"
+    },
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.int32"
+    }
+  ]
+}

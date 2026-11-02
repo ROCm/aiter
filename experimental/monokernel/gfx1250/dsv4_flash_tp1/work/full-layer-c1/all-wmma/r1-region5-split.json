@@ -1,0 +1,3686 @@
+
+  {
+    "schemaVersion": 1,
+    "deviceProperties": [
+    {
+      "id": 0, "name": "AMD Radeon Graphics", "totalGlobalMem": 463856467968,
+      "computeMajor": 12, "computeMinor": 5,
+      "maxThreadsPerBlock": 1024, "maxThreadsPerMultiprocessor": 2048,
+      "regsPerBlock": 131072, "warpSize": 32,
+      "sharedMemPerBlock": 327680, "numSms": 256
+    , "maxSharedMemoryPerMultiProcessor": 327680
+    }
+    ],
+      "trace_id": "46B12B89964C4925A2D6623C64EC1E94",
+      "hip_driver_version": 71626315,
+      "hip_runtime_version": 71626315,
+      "roctracer_version": 4.1,
+  "displayTimeUnit": "ms",
+  "baseTimeNanoseconds": 1790857026000000000,
+  "traceEvents": [
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822724.669, "dur": 0.500,
+    "args": {
+            "cid": 290, "correlation": 946
+    }
+  },
+  {
+    "ph": "f", "id": 946, "pid": 706, "tid": 706, "ts": 1591713822724.669,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822726.209, "dur": 7.691,
+    "args": {
+            "cid": 215, "correlation": 947
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 706, "tid": 706, "ts": 1591713822726.209,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822734.729, "dur": 0.080,
+    "args": {
+            "cid": 290, "correlation": 948
+    }
+  },
+  {
+    "ph": "f", "id": 948, "pid": 706, "tid": 706, "ts": 1591713822734.729,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822735.109, "dur": 4.441,
+    "args": {
+            "cid": 215, "correlation": 949
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 706, "tid": 706, "ts": 1591713822735.109,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822740.240, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 950
+    }
+  },
+  {
+    "ph": "f", "id": 950, "pid": 706, "tid": 706, "ts": 1591713822740.240,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822740.490, "dur": 4.230,
+    "args": {
+            "cid": 215, "correlation": 951
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 706, "tid": 706, "ts": 1591713822740.490,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822745.460, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 952
+    }
+  },
+  {
+    "ph": "f", "id": 952, "pid": 706, "tid": 706, "ts": 1591713822745.460,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822745.660, "dur": 4.480,
+    "args": {
+            "cid": 215, "correlation": 953
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 706, "tid": 706, "ts": 1591713822745.660,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822750.760, "dur": 0.070,
+    "args": {
+            "cid": 290, "correlation": 954
+    }
+  },
+  {
+    "ph": "f", "id": 954, "pid": 706, "tid": 706, "ts": 1591713822750.760,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822750.990, "dur": 3.940,
+    "args": {
+            "cid": 215, "correlation": 955
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 706, "tid": 706, "ts": 1591713822750.990,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822755.600, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 956
+    }
+  },
+  {
+    "ph": "f", "id": 956, "pid": 706, "tid": 706, "ts": 1591713822755.600,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822755.820, "dur": 4.040,
+    "args": {
+            "cid": 215, "correlation": 957
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 706, "tid": 706, "ts": 1591713822755.820,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822760.470, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 958
+    }
+  },
+  {
+    "ph": "f", "id": 958, "pid": 706, "tid": 706, "ts": 1591713822760.470,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822760.670, "dur": 3.420,
+    "args": {
+            "cid": 215, "correlation": 959
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 706, "tid": 706, "ts": 1591713822760.670,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822764.710, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 960
+    }
+  },
+  {
+    "ph": "f", "id": 960, "pid": 706, "tid": 706, "ts": 1591713822764.710,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822764.940, "dur": 3.900,
+    "args": {
+            "cid": 215, "correlation": 961
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 706, "tid": 706, "ts": 1591713822764.940,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822769.420, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 962
+    }
+  },
+  {
+    "ph": "f", "id": 962, "pid": 706, "tid": 706, "ts": 1591713822769.420,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822769.650, "dur": 3.330,
+    "args": {
+            "cid": 215, "correlation": 963
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 706, "tid": 706, "ts": 1591713822769.650,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822773.580, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 964
+    }
+  },
+  {
+    "ph": "f", "id": 964, "pid": 706, "tid": 706, "ts": 1591713822773.580,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822773.770, "dur": 3.440,
+    "args": {
+            "cid": 215, "correlation": 965
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 706, "tid": 706, "ts": 1591713822773.770,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822777.790, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 966
+    }
+  },
+  {
+    "ph": "f", "id": 966, "pid": 706, "tid": 706, "ts": 1591713822777.790,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822778.000, "dur": 3.400,
+    "args": {
+            "cid": 215, "correlation": 967
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 706, "tid": 706, "ts": 1591713822778.000,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822782.020, "dur": 0.070,
+    "args": {
+            "cid": 290, "correlation": 968
+    }
+  },
+  {
+    "ph": "f", "id": 968, "pid": 706, "tid": 706, "ts": 1591713822782.020,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822782.250, "dur": 3.360,
+    "args": {
+            "cid": 215, "correlation": 969
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 706, "tid": 706, "ts": 1591713822782.250,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822786.230, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 970
+    }
+  },
+  {
+    "ph": "f", "id": 970, "pid": 706, "tid": 706, "ts": 1591713822786.230,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822786.450, "dur": 3.440,
+    "args": {
+            "cid": 215, "correlation": 971
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 706, "tid": 706, "ts": 1591713822786.450,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822790.460, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 972
+    }
+  },
+  {
+    "ph": "f", "id": 972, "pid": 706, "tid": 706, "ts": 1591713822790.460,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822790.680, "dur": 3.800,
+    "args": {
+            "cid": 215, "correlation": 973
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 706, "tid": 706, "ts": 1591713822790.680,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822795.080, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 974
+    }
+  },
+  {
+    "ph": "f", "id": 974, "pid": 706, "tid": 706, "ts": 1591713822795.080,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822795.280, "dur": 3.610,
+    "args": {
+            "cid": 215, "correlation": 975
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 706, "tid": 706, "ts": 1591713822795.280,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822799.421, "dur": 0.049,
+    "args": {
+            "cid": 290, "correlation": 976
+    }
+  },
+  {
+    "ph": "f", "id": 976, "pid": 706, "tid": 706, "ts": 1591713822799.421,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822799.621, "dur": 3.700,
+    "args": {
+            "cid": 215, "correlation": 977
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 706, "tid": 706, "ts": 1591713822799.621,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822803.910, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 978
+    }
+  },
+  {
+    "ph": "f", "id": 978, "pid": 706, "tid": 706, "ts": 1591713822803.910,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822804.170, "dur": 4.280,
+    "args": {
+            "cid": 215, "correlation": 979
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 706, "tid": 706, "ts": 1591713822804.170,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822809.010, "dur": 0.051,
+    "args": {
+            "cid": 290, "correlation": 980
+    }
+  },
+  {
+    "ph": "f", "id": 980, "pid": 706, "tid": 706, "ts": 1591713822809.010,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822809.230, "dur": 4.401,
+    "args": {
+            "cid": 215, "correlation": 981
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 706, "tid": 706, "ts": 1591713822809.230,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822814.321, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 982
+    }
+  },
+  {
+    "ph": "f", "id": 982, "pid": 706, "tid": 706, "ts": 1591713822814.321,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822814.521, "dur": 3.800,
+    "args": {
+            "cid": 215, "correlation": 983
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 706, "tid": 706, "ts": 1591713822814.521,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822818.911, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 984
+    }
+  },
+  {
+    "ph": "f", "id": 984, "pid": 706, "tid": 706, "ts": 1591713822818.911,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822819.111, "dur": 3.610,
+    "args": {
+            "cid": 215, "correlation": 985
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 706, "tid": 706, "ts": 1591713822819.111,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822823.321, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 986
+    }
+  },
+  {
+    "ph": "f", "id": 986, "pid": 706, "tid": 706, "ts": 1591713822823.321,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822823.551, "dur": 3.370,
+    "args": {
+            "cid": 215, "correlation": 987
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 706, "tid": 706, "ts": 1591713822823.551,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822827.571, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 988
+    }
+  },
+  {
+    "ph": "f", "id": 988, "pid": 706, "tid": 706, "ts": 1591713822827.571,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822827.741, "dur": 3.750,
+    "args": {
+            "cid": 215, "correlation": 989
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 706, "tid": 706, "ts": 1591713822827.741,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822832.101, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 990
+    }
+  },
+  {
+    "ph": "f", "id": 990, "pid": 706, "tid": 706, "ts": 1591713822832.101,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822832.311, "dur": 3.440,
+    "args": {
+            "cid": 215, "correlation": 991
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 706, "tid": 706, "ts": 1591713822832.311,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822836.331, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 992
+    }
+  },
+  {
+    "ph": "f", "id": 992, "pid": 706, "tid": 706, "ts": 1591713822836.331,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822836.551, "dur": 3.930,
+    "args": {
+            "cid": 215, "correlation": 993
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 706, "tid": 706, "ts": 1591713822836.551,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822841.071, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 994
+    }
+  },
+  {
+    "ph": "f", "id": 994, "pid": 706, "tid": 706, "ts": 1591713822841.071,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822841.281, "dur": 4.220,
+    "args": {
+            "cid": 215, "correlation": 995
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 706, "tid": 706, "ts": 1591713822841.281,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822846.071, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 996
+    }
+  },
+  {
+    "ph": "f", "id": 996, "pid": 706, "tid": 706, "ts": 1591713822846.071,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822846.271, "dur": 4.020,
+    "args": {
+            "cid": 215, "correlation": 997
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 706, "tid": 706, "ts": 1591713822846.271,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822850.891, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 998
+    }
+  },
+  {
+    "ph": "f", "id": 998, "pid": 706, "tid": 706, "ts": 1591713822850.891,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822851.091, "dur": 3.940,
+    "args": {
+            "cid": 215, "correlation": 999
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 706, "tid": 706, "ts": 1591713822851.091,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822855.641, "dur": 0.060,
+    "args": {
+            "cid": 290, "correlation": 1000
+    }
+  },
+  {
+    "ph": "f", "id": 1000, "pid": 706, "tid": 706, "ts": 1591713822855.641,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822855.851, "dur": 3.570,
+    "args": {
+            "cid": 215, "correlation": 1001
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 706, "tid": 706, "ts": 1591713822855.851,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822859.991, "dur": 0.070,
+    "args": {
+            "cid": 290, "correlation": 1002
+    }
+  },
+  {
+    "ph": "f", "id": 1002, "pid": 706, "tid": 706, "ts": 1591713822859.991,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822860.211, "dur": 4.020,
+    "args": {
+            "cid": 215, "correlation": 1003
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 706, "tid": 706, "ts": 1591713822860.211,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipStreamIsCapturing", "pid": 706, "tid": 706,
+    "ts": 1591713822864.821, "dur": 0.050,
+    "args": {
+            "cid": 290, "correlation": 1004
+    }
+  },
+  {
+    "ph": "f", "id": 1004, "pid": 706, "tid": 706, "ts": 1591713822864.821,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipGraphLaunch", "pid": 706, "tid": 706,
+    "ts": 1591713822865.041, "dur": 4.161,
+    "args": {
+            "cid": 215, "correlation": 1005
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 706, "tid": 706, "ts": 1591713822865.041,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822734.606, "dur": 10.254,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822734.606,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822745.702, "dur": 14.701,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822745.702,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822761.165, "dur": 1.562,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822761.165,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822763.529, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822763.529,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822766.053, "dur": 76.673,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822766.053,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822843.529, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822843.529,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822846.533, "dur": 2.363,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822846.533,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822849.778, "dur": 46.749,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 947, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 947, "pid": 2, "tid": 0, "ts": 1591713822849.778,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822899.332, "dur": 8.732,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713822899.332,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822908.826, "dur": 14.821,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713822908.826,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822924.490, "dur": 1.922,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713822924.490,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822927.174, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713822927.174,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713822929.738, "dur": 75.832,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713822929.738,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823006.813, "dur": 1.762,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713823006.813,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823009.457, "dur": 2.523,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713823009.457,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823012.702, "dur": 47.310,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 949, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 949, "pid": 2, "tid": 0, "ts": 1591713823012.702,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823062.817, "dur": 9.052,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823062.817,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823072.631, "dur": 14.741,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823072.631,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823088.095, "dur": 1.641,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823088.095,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823090.538, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823090.538,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823093.423, "dur": 76.233,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823093.423,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823170.498, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823170.498,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823172.942, "dur": 2.442,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823172.942,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823176.186, "dur": 47.150,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 951, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 951, "pid": 2, "tid": 0, "ts": 1591713823176.186,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823226.101, "dur": 8.852,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823226.101,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823235.756, "dur": 14.540,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823235.756,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823251.259, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823251.259,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823254.023, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823254.023,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823256.467, "dur": 75.832,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823256.467,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823333.061, "dur": 1.802,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823333.061,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823335.705, "dur": 2.363,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823335.705,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823338.790, "dur": 47.550,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 953, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 953, "pid": 2, "tid": 0, "ts": 1591713823338.790,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823389.185, "dur": 8.772,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823389.185,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823398.800, "dur": 14.901,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823398.800,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823414.944, "dur": 1.561,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823414.944,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823417.227, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823417.227,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823419.791, "dur": 75.792,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823419.791,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823496.506, "dur": 1.721,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823496.506,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823499.110, "dur": 2.362,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823499.110,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823502.314, "dur": 47.190,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 955, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 955, "pid": 2, "tid": 0, "ts": 1591713823502.314,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823552.469, "dur": 8.813,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823552.469,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823562.685, "dur": 14.941,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823562.685,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823578.549, "dur": 1.561,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823578.549,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823580.952, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823580.952,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823583.356, "dur": 75.952,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823583.356,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823660.030, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823660.030,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823662.554, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823662.554,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823665.599, "dur": 47.069,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 957, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 957, "pid": 2, "tid": 0, "ts": 1591713823665.599,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823715.954, "dur": 9.213,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823715.954,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823725.969, "dur": 14.621,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823725.969,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823741.352, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823741.352,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823743.636, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823743.636,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823745.999, "dur": 75.953,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823745.999,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823822.674, "dur": 1.802,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823822.674,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823825.198, "dur": 2.322,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823825.198,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823828.322, "dur": 47.350,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 959, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 959, "pid": 2, "tid": 0, "ts": 1591713823828.322,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823878.958, "dur": 8.772,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823878.958,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823888.492, "dur": 15.022,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823888.492,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823904.276, "dur": 1.641,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823904.276,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823906.639, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823906.639,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823909.083, "dur": 75.873,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823909.083,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823985.718, "dur": 1.761,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823985.718,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823988.242, "dur": 2.242,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823988.242,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713823991.887, "dur": 47.110,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 961, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 961, "pid": 2, "tid": 0, "ts": 1591713823991.887,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824041.802, "dur": 8.972,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824041.802,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824051.496, "dur": 14.541,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824051.496,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824066.959, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824066.959,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824069.363, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824069.363,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824071.727, "dur": 76.393,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824071.727,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824148.962, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824148.962,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824151.846, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824151.846,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824154.891, "dur": 46.949,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 963, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 963, "pid": 2, "tid": 0, "ts": 1591713824154.891,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824204.605, "dur": 9.133,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824204.605,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824214.540, "dur": 14.942,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824214.540,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824230.244, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824230.244,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824232.567, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824232.567,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824235.011, "dur": 76.233,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824235.011,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824312.487, "dur": 1.641,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824312.487,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824314.930, "dur": 2.403,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824314.930,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824318.135, "dur": 46.629,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 965, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 965, "pid": 2, "tid": 0, "ts": 1591713824318.135,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824367.569, "dur": 8.692,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824367.569,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824377.023, "dur": 14.581,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824377.023,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824392.406, "dur": 1.562,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824392.406,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824394.810, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824394.810,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824397.654, "dur": 75.993,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824397.654,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824474.409, "dur": 1.762,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824474.409,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824476.893, "dur": 2.322,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824476.893,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824479.977, "dur": 47.150,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 967, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 967, "pid": 2, "tid": 0, "ts": 1591713824479.977,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824529.892, "dur": 8.732,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824529.892,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824539.386, "dur": 14.781,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824539.386,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824554.970, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824554.970,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824557.694, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824557.694,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824560.017, "dur": 75.993,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824560.017,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824636.732, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824636.732,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824639.176, "dur": 2.482,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824639.176,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824642.461, "dur": 47.510,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 969, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 969, "pid": 2, "tid": 0, "ts": 1591713824642.461,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824692.816, "dur": 8.772,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824692.816,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824702.350, "dur": 14.861,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824702.350,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824718.414, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824718.414,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824720.938, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824720.938,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824723.342, "dur": 76.673,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824723.342,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824800.978, "dur": 1.561,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824800.978,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824803.261, "dur": 2.243,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824803.261,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824806.226, "dur": 47.870,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 971, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 971, "pid": 2, "tid": 0, "ts": 1591713824806.226,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824856.982, "dur": 8.892,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824856.982,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824867.117, "dur": 14.741,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824867.117,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824882.620, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824882.620,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824884.943, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824884.943,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824887.507, "dur": 76.594,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824887.507,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824964.863, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824964.863,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824967.267, "dur": 2.362,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824967.267,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713824970.391, "dur": 47.951,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 973, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 973, "pid": 2, "tid": 0, "ts": 1591713824970.391,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825021.788, "dur": 9.053,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825021.788,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825031.603, "dur": 14.661,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825031.603,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825047.026, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825047.026,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825049.269, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825049.269,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825051.593, "dur": 76.033,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825051.593,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825128.388, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825128.388,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825130.831, "dur": 2.363,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825130.831,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825133.956, "dur": 47.150,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 975, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 975, "pid": 2, "tid": 0, "ts": 1591713825133.956,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825184.311, "dur": 8.933,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825184.311,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825194.006, "dur": 14.981,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825194.006,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825209.709, "dur": 1.922,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825209.709,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825212.393, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825212.393,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825214.717, "dur": 76.353,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825214.717,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825291.952, "dur": 1.802,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825291.952,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825294.516, "dur": 2.323,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825294.516,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825298.002, "dur": 47.229,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 977, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 977, "pid": 2, "tid": 0, "ts": 1591713825298.002,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825348.157, "dur": 8.852,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825348.157,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825357.771, "dur": 14.821,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825357.771,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825373.354, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825373.354,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825375.678, "dur": 1.641,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825375.678,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825378.041, "dur": 75.753,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825378.041,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825454.556, "dur": 1.761,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825454.556,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825457.560, "dur": 2.243,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825457.560,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825460.525, "dur": 47.029,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 979, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 979, "pid": 2, "tid": 0, "ts": 1591713825460.525,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825510.319, "dur": 8.973,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825510.319,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825520.094, "dur": 14.861,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825520.094,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825535.717, "dur": 1.522,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825535.717,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825538.081, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825538.081,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825540.524, "dur": 76.033,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825540.524,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825617.880, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825617.880,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825620.284, "dur": 2.322,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825620.284,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825623.449, "dur": 46.588,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 981, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 981, "pid": 2, "tid": 0, "ts": 1591713825623.449,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825672.802, "dur": 9.013,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825672.802,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825682.577, "dur": 14.661,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825682.577,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825698.080, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825698.080,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825700.444, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825700.444,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825703.328, "dur": 76.273,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825703.328,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825780.403, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825780.403,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825782.927, "dur": 2.323,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825782.927,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825785.972, "dur": 46.709,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 983, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 983, "pid": 2, "tid": 0, "ts": 1591713825785.972,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825835.526, "dur": 8.852,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825835.526,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825845.180, "dur": 14.661,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825845.180,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825860.603, "dur": 1.482,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825860.603,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825863.408, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825863.408,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825865.971, "dur": 75.793,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825865.971,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825942.606, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825942.606,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825945.050, "dur": 2.402,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825945.050,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825948.215, "dur": 46.588,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 985, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 985, "pid": 2, "tid": 0, "ts": 1591713825948.215,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713825997.649, "dur": 8.892,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713825997.649,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826007.343, "dur": 14.741,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826007.343,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826023.367, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826023.367,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826025.931, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826025.931,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826028.415, "dur": 76.072,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826028.415,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826105.209, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826105.209,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826107.613, "dur": 2.323,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826107.613,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826110.698, "dur": 47.269,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 987, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 987, "pid": 2, "tid": 0, "ts": 1591713826110.698,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826160.773, "dur": 9.132,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826160.773,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826171.148, "dur": 14.661,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826171.148,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826186.531, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826186.531,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826188.935, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826188.935,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826191.338, "dur": 76.073,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826191.338,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826268.173, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826268.173,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826270.617, "dur": 2.282,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826270.617,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826273.621, "dur": 47.070,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 989, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 989, "pid": 2, "tid": 0, "ts": 1591713826273.621,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826323.937, "dur": 8.972,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826323.937,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826333.671, "dur": 14.781,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826333.671,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826349.215, "dur": 1.561,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826349.215,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826351.738, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826351.738,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826354.102, "dur": 75.913,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826354.102,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826430.737, "dur": 1.881,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826430.737,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826433.381, "dur": 2.282,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826433.381,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826436.425, "dur": 47.390,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 991, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 991, "pid": 2, "tid": 0, "ts": 1591713826436.425,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826487.141, "dur": 8.772,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826487.141,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826496.876, "dur": 15.101,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826496.876,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826512.739, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826512.739,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826515.143, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826515.143,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826517.547, "dur": 76.914,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826517.547,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826595.223, "dur": 1.721,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826595.223,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826597.666, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826597.666,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826601.152, "dur": 47.309,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 993, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 993, "pid": 2, "tid": 0, "ts": 1591713826601.152,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826651.307, "dur": 8.892,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826651.307,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826661.041, "dur": 14.861,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826661.041,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826676.825, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826676.825,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826679.269, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826679.269,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826681.632, "dur": 77.235,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826681.632,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826759.709, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826759.709,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826762.593, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826762.593,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826765.638, "dur": 47.630,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 995, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 995, "pid": 2, "tid": 0, "ts": 1591713826765.638,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826816.033, "dur": 8.973,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826816.033,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826825.768, "dur": 14.741,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826825.768,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826841.271, "dur": 1.521,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826841.271,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826843.554, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826843.554,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826845.998, "dur": 75.953,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826845.998,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826923.194, "dur": 1.801,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826923.194,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826925.757, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826925.757,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826928.762, "dur": 48.912,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 997, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 997, "pid": 2, "tid": 0, "ts": 1591713826928.762,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826980.680, "dur": 8.812,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713826980.680,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713826990.294, "dur": 14.421,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713826990.294,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827005.437, "dur": 1.681,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827005.437,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827007.880, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827007.880,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827010.684, "dur": 76.594,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827010.684,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827088.040, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827088.040,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827090.484, "dur": 2.362,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827090.484,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 706, "tid": 706,
+    "ts": 1591713822876.002, "dur": 4758.228,
+    "args": {
+            "cid": 48, "correlation": 1006
+    }
+  },
+  {
+    "ph": "f", "id": 1006, "pid": 706, "tid": 706, "ts": 1591713822876.002,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 706, "tid": 706,
+    "ts": 1591713827639.580, "dur": 0.200,
+    "args": {
+            "cid": 48, "correlation": 1007
+    }
+  },
+  {
+    "ph": "f", "id": 1007, "pid": 706, "tid": 706, "ts": 1591713827639.580,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827093.568, "dur": 47.230,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 999, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 999, "pid": 2, "tid": 0, "ts": 1591713827093.568,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827143.643, "dur": 8.773,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827143.643,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827153.138, "dur": 14.701,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827153.138,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827168.561, "dur": 1.641,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827168.561,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827171.365, "dur": 1.601,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827171.365,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827173.728, "dur": 75.593,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827173.728,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827250.083, "dur": 1.761,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827250.083,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827252.566, "dur": 2.283,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827252.566,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827255.611, "dur": 47.310,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1001, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1001, "pid": 2, "tid": 0, "ts": 1591713827255.611,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827305.726, "dur": 8.972,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827305.726,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827315.541, "dur": 14.821,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827315.541,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827331.565, "dur": 1.561,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827331.565,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827334.048, "dur": 1.682,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827334.048,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827336.452, "dur": 76.674,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827336.452,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827413.888, "dur": 1.802,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827413.888,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827416.412, "dur": 2.362,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827416.412,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827419.536, "dur": 46.709,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1003, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1003, "pid": 2, "tid": 0, "ts": 1591713827419.536,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827469.050, "dur": 8.772,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827469.050,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827478.985, "dur": 14.741,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827478.985,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827494.488, "dur": 1.602,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827494.488,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827497.052, "dur": 1.642,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827497.052,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827499.416, "dur": 75.832,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827499.416,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827576.050, "dur": 1.722,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827576.050,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827578.494, "dur": 2.363,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827578.494,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "split_stage", "pid": 2, "tid": 0,
+    "ts": 1591713827581.579, "dur": 46.789,
+    "args": {
+            "device": 2, "stream": 0,      "correlation": 1005, "kind": "Dispatch Task"
+    }
+  },
+  {
+    "ph": "f", "id": 1005, "pid": 2, "tid": 0, "ts": 1591713827581.579,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 706, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 706, "tid": 0,
+    "args": {
+      "labels": "CPU"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 706, "tid": 0,
+    "args": {
+      "sort_index": 706
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 0, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 0, "tid": 0,
+    "args": {
+      "labels": "GPU 0"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 0, "tid": 0,
+    "args": {
+      "sort_index": 5000000
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 1, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 1, "tid": 0,
+    "args": {
+      "labels": "GPU 1"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 1, "tid": 0,
+    "args": {
+      "sort_index": 5000001
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 2, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 2, "tid": 0,
+    "args": {
+      "labels": "GPU 2"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 2, "tid": 0,
+    "args": {
+      "sort_index": 5000002
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 3, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 3, "tid": 0,
+    "args": {
+      "labels": "GPU 3"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 3, "tid": 0,
+    "args": {
+      "sort_index": 5000003
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 4, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 4, "tid": 0,
+    "args": {
+      "labels": "GPU 4"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 4, "tid": 0,
+    "args": {
+      "sort_index": 5000004
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 5, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 5, "tid": 0,
+    "args": {
+      "labels": "GPU 5"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 5, "tid": 0,
+    "args": {
+      "sort_index": 5000005
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 6, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 6, "tid": 0,
+    "args": {
+      "labels": "GPU 6"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 6, "tid": 0,
+    "args": {
+      "sort_index": 5000006
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 7, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 7, "tid": 0,
+    "args": {
+      "labels": "GPU 7"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 7, "tid": 0,
+    "args": {
+      "sort_index": 5000007
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 8, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 8, "tid": 0,
+    "args": {
+      "labels": "GPU 8"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 8, "tid": 0,
+    "args": {
+      "sort_index": 5000008
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 9, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 9, "tid": 0,
+    "args": {
+      "labels": "GPU 9"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 9, "tid": 0,
+    "args": {
+      "sort_index": 5000009
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 10, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 10, "tid": 0,
+    "args": {
+      "labels": "GPU 10"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 10, "tid": 0,
+    "args": {
+      "sort_index": 5000010
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 11, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 11, "tid": 0,
+    "args": {
+      "labels": "GPU 11"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 11, "tid": 0,
+    "args": {
+      "sort_index": 5000011
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 12, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 12, "tid": 0,
+    "args": {
+      "labels": "GPU 12"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 12, "tid": 0,
+    "args": {
+      "sort_index": 5000012
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 13, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 13, "tid": 0,
+    "args": {
+      "labels": "GPU 13"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 13, "tid": 0,
+    "args": {
+      "sort_index": 5000013
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 14, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 14, "tid": 0,
+    "args": {
+      "labels": "GPU 14"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 14, "tid": 0,
+    "args": {
+      "sort_index": 5000014
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 1591713822716.078, "pid": 15, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 1591713822716.078, "pid": 15, "tid": 0,
+    "args": {
+      "labels": "GPU 15"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 15, "tid": 0,
+    "args": {
+      "sort_index": 5000015
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 1591713822716.078, "pid": 2, "tid": 0,
+    "args": {
+      "name": "stream 0 "
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 1591713822716.078, "pid": 2, "tid": 0,
+    "args": {
+      "sort_index": 0
+    }
+  },
+  {
+    "ph": "X", "cat": "Trace", "ts": 1591713822674.698, "dur": 4967.801,
+    "pid": "Spans", "tid": "PyTorch Profiler",
+    "name": "PyTorch Profiler (0)",
+    "args": {
+      "Op count": 0
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 1591713822674.698,
+    "pid": "Spans", "tid": 0,
+    "args": {
+      "sort_index": 536870912
+    }
+  },
+  {
+    "name": "Iteration Start: PyTorch Profiler", "ph": "i", "s": "g",
+    "pid": "Traces", "tid": "Trace PyTorch Profiler", "ts": 1591713822674.698
+  },
+  {
+    "name": "Record Window End", "ph": "i", "s": "g",
+    "pid": "", "tid": "", "ts": 1591713827729.810
+  }
+  ],
+  "traceName": "/work/full-layer-c1/all-wmma/r1-region5-split.json"
+}

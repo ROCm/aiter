@@ -1,0 +1,38 @@
+{
+  "actual_atom_extracted_boundary": {
+    "kernel_nodes": 2048,
+    "inner_node_types": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "fused_single_launch": {
+    "kernel_nodes": 128,
+    "inner_node_types": [
+      0
+    ]
+  },
+  "staged_prototype_control": {
+    "kernel_nodes": 512,
+    "inner_node_types": [
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

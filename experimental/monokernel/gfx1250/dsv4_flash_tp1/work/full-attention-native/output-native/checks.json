@@ -1,0 +1,31 @@
+{
+  "OA_reference_error": 0.0009102206095121801,
+  "OB_reference_error": 0.0009018252603709698,
+  "post_reference_error": 4.510420481551591e-09,
+  "post_maxabs": 9.5367431640625e-07,
+  "finite": true,
+  "metadata": {
+    "OA_fp8": true,
+    "OA_preshuffle": true,
+    "OAshape": [
+      8,
+      1024,
+      4096
+    ],
+    "OAscale": [
+      8,
+      8,
+      32
+    ],
+    "OBshape": [
+      4096,
+      8192
+    ],
+    "OBscale": [
+      32,
+      64
+    ],
+    "OBmxscale_shuffle": false,
+    "OBpreshuffle": true
+  }
+}

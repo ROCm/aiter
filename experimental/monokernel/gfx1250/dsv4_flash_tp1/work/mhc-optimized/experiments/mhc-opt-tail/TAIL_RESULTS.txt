@@ -1,0 +1,54 @@
+GPU1 exclusive experiment: mHC tail synchronization elimination
+
+Baseline copied from mhc-through-attention, source mhc.py unchanged.
+Projection unchanged: 256 CTAs, WMMA hi/lo BF16 decomposition of FP32 weights,
+TDM weight/input tiles, 128 split-K partials for each of 24 outputs.
+
+optimized.py: one projection publication barrier; CTA0 reduces only 4 pre
+coefficients, mixes full 4x4096 residual and rounds BF16, computes RMSNorm
+from rounded values, applies AN and writes BF16 X. CTA1 reduces all 24
+coefficients, stores pre/post gates, performs 20 Sinkhorn iterations and
+stores16 residual-combination coefficients. All24 Mix values preserved.
+Small norm/coefficient work replicated between two CTAs to eliminate
+three cross-CTA tail barriers. No barrier needed at mHC exit when standalone;
+full-prefix caller must keep existing barrier before QKV consumers.
+
+optimized_rcp.py additionally uses AITER's v_rcp_f32 multiply in19Sinkhorn
+iterations; initial two divisions unchanged. Same BF16 arithmetic boundaries.
+Both expose jit-callable optimized(R,W,S,B,AN,M,Temp,Raw,X,Counter,Health,MODE=1).
+MODE0 runs bothbranchesinCTA0; MODE1 branches concurrentlyCTA0/CTA1.
+
+Second rounds, matched128calls/graphtiming40alternatingmeasurements:
+original experiment: split12.727512us oldfused15.062102us singleCTA7.338648us
+parallelCTA6.672508us.
+rcp experiment: split12.768195us oldfused15.074464us singleCTA6.878902us
+parallelCTA6.221980us.
+
+32 changing cases for each candidate; output Mix, Raw, X threshold relativeRMS
+0.001 unchanged. Allpassed. MODE1 uses274VGPR,0spills,13008LDS.
+Originaltail stress10240changinginvocations with NaNworkspacepoisoning passed,
+maxrelativeRMS3.5981e-8. rcpstressseparate tail-rcp-stress.json.
+
+Tail residual vector loads remain direct in these isolated candidates.
+Agent mhc_replicated evaluates early-TDM R/AN integration separately.
+No nativeATOMserving metrics, no deployment/push. Timing control is current
+WMMA/TDMimplementation, not nativeATOM/AITERpipeline.
+
+Native AITER diagnostic (bench_native.py/native-timings.json):
+2kernel aiter.mhc_pre(norm_weight=AN,hc_post_mult_value=2) secondround5.616383us;
+our parallelrcptail in same timingpass6.375336us.
+32cases nativefusednorm maxposterror7.04e-7, comb1.61e-7, X6.45e-4.
+Native norm computes denominator from unrounded FP32 mixture; our accepted
+boundary is BF16-rounded mixture. Thus not bitwise arithmetic matched; no
+full-prefix native accuracy claim. NativeHIPpurepre+ourroundednorm path3kernels
+8.095879us but unexpectedly fails .001 on post(.0072),comb(.0030),X(.0056).
+Keep this failed diagnostic visible and do not use as correctness baseline.
+AITER source snapshots and MITlicense in upstream-mhc/, commit.txt pins checkout.
+
+IMPORTANT LATER CORRECTION: optimized.py/optimized_rcp.py use4x4096residualRMS
+sum ratherthanoriginal16x1024orderedreduction. Rootfullprefixvalidationfound
+case132FP8thresholdamplification (despitestand-alonemHCerrorpassing). These
+fastversionsareNOTacceptedendtoendkernels. optimized_exact.py restoresexact
+16x1024orderedRMS.512seed71100casesconfirmfirst4Mix,Raw,Xbitwiseequal tooriginal
+(all512). FullMixmaxerror1.467e-7 dueSinkhornreciprocal/reduction. Rootisapplying
+samefix toearlyTDMtailandvalidatingfullprefix. Neverrelax.001accuracygate.

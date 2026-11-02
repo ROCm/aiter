@@ -1,0 +1,11 @@
+RESUMED FLASH WORK COMPLETE — 2026-10-19
+Fresh baseline and experimental hybrid: all6 concurrency buckets completed;
+only second full clients reported. Live exact validation43 MoE layers/249requests.
+C1/C8 serving TPOT improved56.31%/54.45%; higher concurrency no reliable win.
+C1 MoE-disabled ablation is1.64% faster than fused MoE; recommend resumed_no_moe.
+C8/C16 resident-task prototype passed all12 exact/stress cases but was slower;
+not integrated. No full-layer monokernel has been implemented.
+Read RESUMED_REPORT.txt, RESUMED_REPRODUCE.txt, MOE_MULTITOKEN_REPORT.txt.
+No pending benchmark or background watcher. Experiment container stopped at completion.
+Portable refreshed host artifacts: monokernel-handoff/all-artifacts-resumed.tar.
+Original docker-images.tar remains valid: serving source was unchanged on resume.

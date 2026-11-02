@@ -1,0 +1,11 @@
+{
+  "candidate/dsv4_flash_moe_kernel.py": "0288b345429fa92eb8f20ef883b4a3daf800dcb512fe24ae98967e1aa060e46a",
+  "candidate/dsv4_hybrid.reviewed.py": "95a34b29a30e7c82ef64273d58bd5b74400ebf3ff5c4290d6f1e4ea4a1275ade",
+  "candidate/dsv4_flash_final_configs.json": "bb34452544c20e713ba7c1286b37ed735698f2f947d5adf8649a440e5c168fb0",
+  "candidate/fused_moe_triton.py": "01c331ba8c9feb7df6b57a94011cc6e78be9c26077a37f72c2284fe1ee6aa2e6",
+  "candidate/dsv4_flash_attention_configs.json": "a40473d2d9c23bc8d94792e283936327722f3a23fad1188f6d6a560c35de997a",
+  "candidate/dsv4_hybrid.py": "8c22b278e6306d25485eb6927dab7fc22a7587ba55db8d027ca4b91aa83be99a",
+  "candidate/dsv4_flash_attention_low_configs.json": "21042400a16ca6c06562e2a0261e8b879c74b39e743e2588cd85c16c678f25c9",
+  "candidate/dsv4_flash_moe.py": "a4862a7dfb83534a325b37320a9137b0ce68a5b5659138c57ec94f96a664be4d",
+  "candidate/dsv4_flash_moe_stage.py": "7f6fd66948f9b7cd4abe266a407cc358bc322ab937c3d3d4d77d40d928b0f17c"
+}

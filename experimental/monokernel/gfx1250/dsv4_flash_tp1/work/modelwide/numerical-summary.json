@@ -1,0 +1,244 @@
+{
+  "original": {
+    "observations": 172,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ],
+    "metrics": {
+      "output": {
+        "max_rms": 0.16671983897686005,
+        "exact_count": 0
+      },
+      "attn_input": {
+        "max_rms": 0.00012499403965193778,
+        "exact_count": 131
+      },
+      "ffn_input": {
+        "max_rms": 0.022469542920589447,
+        "exact_count": 0
+      },
+      "logits": {
+        "max_rms": 0.011939755640923977,
+        "exact_count": 0
+      },
+      "_sparse_attention": {
+        "max_rms": 0.005410573445260525,
+        "exact_count": 0
+      },
+      "_attn_post": {
+        "max_rms": 0.04277610033750534,
+        "exact_count": 0
+      },
+      "query": {
+        "max_rms": 0.008281917311251163,
+        "exact_count": 0
+      }
+    }
+  },
+  "-scaled": {
+    "observations": 172,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ],
+    "metrics": {
+      "output": {
+        "max_rms": 0.2320847064256668,
+        "exact_count": 0
+      },
+      "same_input_ffn": {
+        "max_rms": 0.0,
+        "exact_count": 172
+      },
+      "attn_input": {
+        "max_rms": 0.00012499403965193778,
+        "exact_count": 131
+      },
+      "ffn_input": {
+        "max_rms": 0.0194245558232069,
+        "exact_count": 0
+      },
+      "logits": {
+        "max_rms": 0.014410405419766903,
+        "exact_count": 0
+      },
+      "_sparse_attention": {
+        "max_rms": 0.0028817409183830023,
+        "exact_count": 0
+      },
+      "_attn_post": {
+        "max_rms": 0.034833118319511414,
+        "exact_count": 0
+      },
+      "query": {
+        "max_rms": 0.0012731351889669895,
+        "exact_count": 155
+      }
+    }
+  },
+  "-matched": {
+    "observations": 172,
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ],
+    "metrics": {
+      "output": {
+        "max_rms": 0.01779031753540039,
+        "exact_count": 0
+      },
+      "same_input_ffn": {
+        "max_rms": 0.0,
+        "exact_count": 172
+      },
+      "attn_input": {
+        "max_rms": 0.00012499403965193778,
+        "exact_count": 131
+      },
+      "ffn_input": {
+        "max_rms": 0.006852801889181137,
+        "exact_count": 3
+      },
+      "logits": {
+        "max_rms": 0.002678480464965105,
+        "exact_count": 20
+      },
+      "_sparse_attention": {
+        "max_rms": 0.0018232316942885518,
+        "exact_count": 161
+      },
+      "_attn_post": {
+        "max_rms": 0.02483605034649372,
+        "exact_count": 165
+      },
+      "query": {
+        "max_rms": 0.0012731351889669895,
+        "exact_count": 155
+      }
+    }
+  }
+}

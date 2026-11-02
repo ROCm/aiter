@@ -1,0 +1,9 @@
+{
+  "container": "vigokhal_dsv4_tp4",
+  "image": "rocm/fw-bringup-mlperf:gfx1250-atom-20261015",
+  "image_id": "sha256:d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a",
+  "atom_commit": "f19778df4054e94d64d6f6bf6dd68f5681bd5945",
+  "aiter_commit": "7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe",
+  "model": "/data/DeepSeek-V4-Flash",
+  "mount": "/home/vigokhal/dsv4-monokernel:/work"
+}

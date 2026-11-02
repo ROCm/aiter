@@ -1,0 +1,687 @@
+[
+  {
+    "concurrency": 2,
+    "candidate": [
+      {
+        "id": "cmpl-30d19334a5454d8a9ba95705adb5e207",
+        "object": "text_completion",
+        "created": 1792547427,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6947,
+          "tpot_s": 0.203,
+          "latency_s": 3.7392
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-2d5860d7f60c474da1523ab1ce1aa7fe",
+        "object": "text_completion",
+        "created": 1792547427,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 1.7279,
+          "tpot_s": 0.134,
+          "latency_s": 3.7386
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-7e564f8a25c840aab3651a8c2cb34538",
+        "object": "text_completion",
+        "created": 1792547428,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.287,
+          "tpot_s": 0.0136,
+          "latency_s": 0.4909
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-e24cc0aec7554dd58190f55d70461aad",
+        "object": "text_completion",
+        "created": 1792547428,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.288,
+          "tpot_s": 0.0135,
+          "latency_s": 0.4903
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      true,
+      true
+    ]
+  },
+  {
+    "concurrency": 4,
+    "candidate": [
+      {
+        "id": "cmpl-64b09b1121234c1189ec6da77dbb71a1",
+        "object": "text_completion",
+        "created": 1792547430,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "HHHHH\", \"title\": \"H\", \"width\": ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.7211,
+          "tpot_s": 0.1341,
+          "latency_s": 2.7328
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-e89cab8de1b84f4296d27f3e662d5070",
+        "object": "text_completion",
+        "created": 1792547430,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.7206,
+          "tpot_s": 0.1341,
+          "latency_s": 2.7323
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-7e72f234dde943e2be89762264c2fef3",
+        "object": "text_completion",
+        "created": 1792547430,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "JJJJJJJJJJJJJJJJ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.5696,
+          "tpot_s": 0.1442,
+          "latency_s": 2.7333
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-3444f13f20fb4414a0726a80e7048fd3",
+        "object": "text_completion",
+        "created": 1792547430,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"key\": \"K\" } \n{ \"value\": \"K\",",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.7202,
+          "tpot_s": 0.1341,
+          "latency_s": 2.7319
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-2503d20c592341c4976d77cec4bd9c28",
+        "object": "text_completion",
+        "created": 1792547431,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "H\"\n    );\n    assert_eq!(\n        decode_hex(\"H\").",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.2764,
+          "tpot_s": 0.0136,
+          "latency_s": 0.4812
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-98aae9023fd14b01a7f58b5fb7b73336",
+        "object": "text_completion",
+        "created": 1792547431,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.2763,
+          "tpot_s": 0.0135,
+          "latency_s": 0.4795
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-5a50314584544e5ea88f0617ca8fab86",
+        "object": "text_completion",
+        "created": 1792547431,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "JJJJJJJJJJJJJJJJ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.2766,
+          "tpot_s": 0.0135,
+          "latency_s": 0.4798
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-e23c7a9cd80642c1a12319899ab5c535",
+        "object": "text_completion",
+        "created": 1792547431,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"key\": \"K\" } \n{ \"value\": \"K\",",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.2774,
+          "tpot_s": 0.0135,
+          "latency_s": 0.4806
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  {
+    "concurrency": 8,
+    "candidate": [
+      {
+        "id": "cmpl-c8f43d7e1a114cd190a0fa3fee840c36",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "HHHHHHHHHHHHHHHH",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6315,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6369
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-c9dd5da053da4400a7e29bef2f9adb2f",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIIIDI0iIiIiIiIiIiIiIi",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4714,
+          "tpot_s": 0.1444,
+          "latency_s": 2.6376
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-dc45c4141f88408493748ed710bfad09",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "JJJJJJJJJJJJJJJJ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6309,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6364
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-e2dc74bfc05048698341e3a59268c3ed",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"key\": \"K\" } \n```\n\n##  2. ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6312,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6366
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-b461aacaeccf4cbe83ac91bdaf5b7bc6",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\nL\nL\nL\nL\nL\nL\nL\nL",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6303,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6358
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-5ee3f4c487784883a6ae5cb9c6713086",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"alpha\": 2, \"constraints\": null}, \"score\":",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6304,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6358
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-17b03f06c27a4744a01b67f9305f9cba",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "NNNNNNNNNNNNNNNN",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6299,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6354
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-8d154d7d77d9490688a801cb54c2da85",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "OOOOOOOOOOOOOOOO",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.6301,
+          "tpot_s": 0.1337,
+          "latency_s": 2.6356
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "native": [
+      {
+        "id": "cmpl-73df5636faf740f197c47cff7fe69cd4",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "HHHHHHHHHHHHHHHH",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4588,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6668
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-734a04c291c940b18abdb787ac3b5514",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "IIIIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4588,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6668
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-e6f514b4a56f4751aa4f0d59250ea0a0",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "JJJJJJJJJJJJJJJJ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4583,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6663
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-4bf7ecc787334ed4ae3352df1e6832e6",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"key\": \"K\" } \n```\n\n##  2. ",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4589,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6669
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-eeb81a564cc843a8bf2f8f3e05dfb4fd",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\nL\nL\nL\nL\nL\nL\nL\nL",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.457,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6651
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-1ac692f19aa04d24b89c7b35b640450d",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "\", \"alpha\": 2, \"constraints\": null}, \"score\":",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4565,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6646
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-42ea83fc4d9549d8a10b167f86bf9827",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "NNNNNNNNNNNNNNNN",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4575,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6656
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-432b5368e153474c8349a30839b9c84b",
+        "object": "text_completion",
+        "created": 1792547434,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": "OOOOOOOOOOOOOOOO",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 16,
+          "total_tokens": 1040,
+          "ttft_s": 0.4563,
+          "tpot_s": 0.0139,
+          "latency_s": 0.6645
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "exact": [
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  }
+]

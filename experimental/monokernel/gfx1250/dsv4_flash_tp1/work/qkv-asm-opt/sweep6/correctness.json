@@ -1,0 +1,2738 @@
+[
+  {
+    "name": "baseline_A",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_A",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 7,
+    "relative_rms": 6.528838802921655e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "baseline_G",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "optimized_2launch",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_4_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_8_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_16_True_1_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 1.0795147886710765e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 6.626914128560202e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "16_32_True_1_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "32_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_2_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 7.2941506168433534e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 9.265973233141267e-08,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 1.0384911064420521e-07,
+    "max_abs": 4.76837158203125e-07,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_2_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 6.839594224317125e-09,
+    "max_abs": 1.4901161193847656e-08,
+    "exact": false,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "64_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_4_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_8_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_16_True_4_256_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 0,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 1,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 2,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 3,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 4,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 5,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 6,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 7,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  {
+    "name": "128_32_True_4_128_1_True_True_.ca_True_False_1",
+    "case": 8,
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  }
+]

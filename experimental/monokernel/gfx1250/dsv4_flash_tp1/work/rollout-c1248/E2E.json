@@ -1,0 +1,146 @@
+[
+  {
+    "c": 1,
+    "configuration": "native",
+    "ttft_ms": 160.61557499961054,
+    "tpot_ms": 13.059929942327322,
+    "total_toks": 151.46597244224117,
+    "output_toks": 75.73298622112058,
+    "completed": 8
+  },
+  {
+    "c": 1,
+    "configuration": "previous",
+    "ttft_ms": 160.82000799906382,
+    "tpot_ms": 9.993063183772273,
+    "total_toks": 196.9651768518167,
+    "output_toks": 98.48258842590835,
+    "completed": 8
+  },
+  {
+    "c": 1,
+    "configuration": "selected",
+    "ttft_ms": 155.234053499953,
+    "tpot_ms": 9.797733536170192,
+    "total_toks": 201.18067635365287,
+    "output_toks": 100.59033817682644,
+    "completed": 8
+  },
+  {
+    "c": 1,
+    "configuration": "replica",
+    "ttft_ms": 168.45837849905365,
+    "tpot_ms": 9.836696822579444,
+    "total_toks": 200.26802398433696,
+    "output_toks": 100.13401199216848,
+    "completed": 8
+  },
+  {
+    "c": 2,
+    "configuration": "native",
+    "ttft_ms": 298.66918150037236,
+    "tpot_ms": 13.32220071261066,
+    "total_toks": 294.0996967909898,
+    "output_toks": 147.0498483954949,
+    "completed": 16
+  },
+  {
+    "c": 2,
+    "configuration": "previous",
+    "ttft_ms": 297.3570939993806,
+    "tpot_ms": 9.904851478004648,
+    "total_toks": 392.55301202217794,
+    "output_toks": 196.27650601108897,
+    "completed": 16
+  },
+  {
+    "c": 2,
+    "configuration": "selected",
+    "ttft_ms": 292.8855139998632,
+    "tpot_ms": 9.662830700391032,
+    "total_toks": 403.7386270296881,
+    "output_toks": 201.86931351484404,
+    "completed": 16
+  },
+  {
+    "c": 2,
+    "configuration": "replica",
+    "ttft_ms": 304.44782599988685,
+    "tpot_ms": 9.651629202833243,
+    "total_toks": 402.3285758198965,
+    "output_toks": 201.16428790994826,
+    "completed": 16
+  },
+  {
+    "c": 4,
+    "configuration": "native",
+    "ttft_ms": 295.54342849951354,
+    "tpot_ms": 13.316354304984937,
+    "total_toks": 588.3613209697976,
+    "output_toks": 294.1806604848988,
+    "completed": 32
+  },
+  {
+    "c": 4,
+    "configuration": "previous",
+    "ttft_ms": 284.6907840012136,
+    "tpot_ms": 10.899706956500687,
+    "total_toks": 715.9497027617086,
+    "output_toks": 357.9748513808543,
+    "completed": 32
+  },
+  {
+    "c": 4,
+    "configuration": "selected",
+    "ttft_ms": 283.71226499984914,
+    "tpot_ms": 10.668717929619723,
+    "total_toks": 732.4181888174427,
+    "output_toks": 366.20909440872134,
+    "completed": 32
+  },
+  {
+    "c": 4,
+    "configuration": "replica",
+    "ttft_ms": 301.233186499303,
+    "tpot_ms": 10.588494284457541,
+    "total_toks": 735.7769923490401,
+    "output_toks": 367.88849617452007,
+    "completed": 32
+  },
+  {
+    "c": 8,
+    "configuration": "native",
+    "ttft_ms": 290.43076900052256,
+    "tpot_ms": 13.626888626588979,
+    "total_toks": 1151.2399170719207,
+    "output_toks": 575.6199585359603,
+    "completed": 64
+  },
+  {
+    "c": 8,
+    "configuration": "previous",
+    "ttft_ms": 290.0327784991532,
+    "tpot_ms": 11.917155514176027,
+    "total_toks": 1312.7640561689514,
+    "output_toks": 656.3820280844757,
+    "completed": 64
+  },
+  {
+    "c": 8,
+    "configuration": "selected",
+    "ttft_ms": 282.57877999931225,
+    "tpot_ms": 11.63843565053825,
+    "total_toks": 1343.4757285372023,
+    "output_toks": 671.7378642686011,
+    "completed": 64
+  },
+  {
+    "c": 8,
+    "configuration": "replica",
+    "ttft_ms": 290.1440990008268,
+    "tpot_ms": 11.619506979959382,
+    "total_toks": 1343.4766745436848,
+    "output_toks": 671.7383372718424,
+    "completed": 64
+  }
+]

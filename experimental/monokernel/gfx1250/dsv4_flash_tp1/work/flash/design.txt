@@ -1,0 +1,74 @@
+Flash stage-walk design, before implementation
+=============================================
+Source: ATOM atom/models/deepseek_v4.py at f19778df, with opt-in Pro patches.
+Single gfx1250, TP1. No rank-to-rank edges, peer mailboxes or all-reduce.
+M = active decode rows, tested 1/8/16/32/64/128. H=4096, HC=4.
+
+Layer graph and required state:
+1. Previous MoE output [M,H] BF16 + widened residual [M,4,H] BF16
+   -> mHC post mixing, FP32 squared sum and 24 mixing projections.
+   Split partials -> reduction, sigmoid, 20 Sinkhorn iterations, pre mixing,
+   RMSNorm -> [M,H] BF16; retain next residual and post/comb coefficients.
+2. Input quantization FP8/E8M0 per128 -> QKV-A [M,1536] BF16.
+   QLoRA [M,1024] -> RMSNorm+quant -> Q-B [M,32768] BF16.
+   KV [M,512] and Q -> QK norm/RoPE -> paged sliding-window cache write.
+3. Compressor branch on the existing auxiliary stream: BF16 learned projections,
+   gated pooling/RMSNorm/RoPE, compressed-cache writes, ring-state update.
+   Ratio0 skips this; ratio4 has overlap plus indexer compressor and sparse
+   index selection; ratio128 has HCA without learned index selection.
+   Indexer Q projection [M,8192], weights [M,64], FP8 index cache.
+4. Join compressor -> paged sparse/sliding attention -> [M,64,512].
+   Inverse RoPE + grouped FP8 quant -> 8 grouped output-LoRA projections,
+   each 4096->1024 -> output projection 8192->4096 BF16. No TP reduction.
+5. mHC post/next-pre + FFN RMSNorm; gate4096->256 BF16;
+   first3 layers hash routing via token IDs, remaining layers sqrtsoftplus
+   with selection bias. Top6 routed experts plus shared expert.
+6. FP4 expert gate/up4096->4096; clamp/SwiGLU -> down2048->4096;
+   expert-weighted reduction + shared contribution -> delayed mHC state.
+
+Ownership and synchronization contract for a full layer:
+- Row/K-split mHC producers own disjoint residual columns and FP32 partials.
+  A row reducer consumes all its splits; producer release, consumer acquire,
+  device scope; workspace unique to captured graph/layer, same-stream reuse.
+- Quant producer owns each row/group128; GEMM consumers read activation and
+  E8M0 scales only after publication. Preserve BF16 rounding before quant.
+- Projection tile owners publish disjoint output columns. Norm consumers need
+  all columns of their row, then publish normalized row/scale to Q consumers.
+- Cache writers own (sequence slot, absolute position), including compression
+  plan boundaries. Readers wait for this step's write; ring-state update must
+  follow reads of previous state. Never use row index as a sequence-slot ID.
+- Attention owners write head tiles; output LoRA waits for all inputs of group.
+- Router owns selection and normalized weights per row; expert task ownership
+  follows actual routing, not fake balanced experts. Gate/up and down consumers
+  preserve padded expert/token layouts and shared-expert accumulation semantics.
+- Final writer publishes residual/H C state only after all expert contributions.
+All polling must be bounded with health output; no grid may assume simultaneous
+residency without compiler resource records and a conservative resident bound.
+Monotonic counters may wrap only with a proved modular comparison/reuse rule.
+
+Incremental implementation plan:
+First test one-launch mHC post/pre/norm/quant, retaining existing arithmetic and
+split-K decomposition, with a device-scoped grid barrier and per-row consumers.
+This tests a stage boundary needed by the full monokernel; it is NOT a full-layer
+monokernel. Compare exact intermediates, two forwards, changing-payload replay,
+wraparound, resources and timing before attempting more stages. Keep two-launch
+mHC as fallback. A full-layer implementation additionally needs all the above
+attention/cache/compressor/MoE stages; none can be silently omitted and called
+full-layer fusion. High-row hybrids preserve existing MoE/compressor overlap.
+
+Baseline profiling and serving measurements precede decisions on more fusion.
+Record every failed or slower rung, and report only the second full client run.
+
+Measured baseline decode (50 final decode steps, zero unmatched kernels):
+C1: attention wo_b2658us, QKV-A1173us, mainQ1155us, indexerQ1135us summed
+kernel time per step. Shared expert gate/up2155us and down2042us are part of
+baseline MoE and retained. mHC524us over85calls/two launches each.
+C16: routed MoE2790us, sparse attention586us,
+mHC519us, wo_b405us. C128: routed MoE5579us, sparse attention807us,
+mHC617us, wo_b552us. Kernel sums include overlap; use serving for final speed.
+The full-layer design remains a design; prototypes cover mHC and mHC->QKV.
+Dense-projection dispatch must be tuned separately before attributing wins to
+fusion. One-launch mHC uses split64 producers and per-row consumers; the
+last-producer alternative serializes row epilogues and is expected to lose at
+larger M. A second independently owned counter publishes quantized activations
+to the QKV stage; reusing the first counter could race with its slow waiters.

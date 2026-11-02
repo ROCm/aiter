@@ -1,0 +1,25 @@
+[
+  {
+    "expected_invalid_control": true,
+    "m": 2,
+    "checks": {
+      "norm": true,
+      "q": true,
+      "kv": true,
+      "attention": false,
+      "output": false,
+      "mhc_post": false,
+      "compressor_state": false,
+      "indexer_state": false,
+      "final": false,
+      "finite": true
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 678,
+    "lds": 133088,
+    "spills": 0
+  }
+]

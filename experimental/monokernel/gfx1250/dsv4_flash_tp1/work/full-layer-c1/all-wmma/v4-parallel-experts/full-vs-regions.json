@@ -1,0 +1,218 @@
+{
+  "MixA": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "MixF": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "R2": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "X": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "XQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "QL": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "QLQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Q": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "KV": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "QRot": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "KVRot": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "AO": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "AR": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "AQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "OL": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "OLQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Attn": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "FF": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "FFQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "FFMX": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "SG": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "SU": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "SA": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "SAQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "SO": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Logits": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Ids": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Gamma": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "EG": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "EU": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "EA": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "EAQ": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "EO": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Sum": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Out": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  },
+  "Cache": {
+    "relative_rms": 0.0,
+    "max_abs": 0.0,
+    "exact": true,
+    "finite": true
+  }
+}

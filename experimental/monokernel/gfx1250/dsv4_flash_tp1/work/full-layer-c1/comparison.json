@@ -1,0 +1,63 @@
+[
+  {
+    "variant": "Acquire/release, 256 CTAs",
+    "run": 2,
+    "split_us": 345.6452178955078,
+    "full_us": 442.63511657714844,
+    "reported": true,
+    "overhead_percent": 28.060535387173125,
+    "reference_output": {
+      "exact": false,
+      "max_abs": 0.00390625,
+      "rms_relative": 0.0003623928932938725,
+      "nonfinite": 0
+    },
+    "resources": {
+      "n_regs": 195,
+      "n_spills": 0,
+      "shared": 2048,
+      "grid": 256
+    },
+    "launch_proof": {
+      "kernel_count": 1,
+      "kernels": [
+        "full_layer"
+      ],
+      "same_math_split_launches": 33
+    },
+    "scope": null
+  },
+  {
+    "variant": "Device-scope buffers + semaphore, 256 CTAs",
+    "run": 2,
+    "split_us": 353.80504608154297,
+    "full_us": 382.5552749633789,
+    "reported": true,
+    "overhead_percent": 8.12600871588749,
+    "reference_output": {
+      "exact": false,
+      "max_abs": 0.00390625,
+      "rms_relative": 0.0003623928932938725,
+      "nonfinite": 0
+    },
+    "resources": {
+      "n_regs": 207,
+      "n_spills": 0,
+      "shared": 2048,
+      "grid": 256
+    },
+    "launch_proof": {
+      "kernel_count": 1,
+      "kernels": [
+        "full_layer"
+      ],
+      "same_math_split_launches": 33
+    },
+    "scope": {
+      "global_inv": 0,
+      "global_wb": 0,
+      "payload_instructions": 693,
+      "payload_without_device_scope": 0
+    }
+  }
+]

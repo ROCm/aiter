@@ -1,0 +1,10 @@
+[
+  {
+    "name": "32_8_False_4_128_1",
+    "error": "at 14:17:\n    DA:gl.constexpr=gl.DotOperandLayout(0,ML,8)\n    DB:gl.constexpr=gl.DotOperandLayout(1,ML,8)\n    AL:gl.constexpr=gl.to_linear_layout(DA,[16,BK]) if DIRECT else gl.BlockedLayout([1,4],[1,32],[WAVES,1],[1,0])\n    BL:gl.constexpr=gl.to_linear_layout(DB,[BK,BN]) if DIRECT else gl.BlockedLayout([4,1],[32,1],[1,WAVES],[0,1])\n    rm=gl.arange(0,16,layout=gl.SliceLayout(1,AL))\n    ka=gl.arange(0,BK,layout=gl.SliceLayout(0,AL))\n    kb=gl.arange(0,BK,layout=gl.SliceLayout(1,BL))\n    rn=gl.arange(0,BN,layout=gl.SliceLayout(0,BL))\n    tile=gl.program_id(0)//SPLIT;ks=gl.program_id(0)%SPLIT\n    ns=tile*BN+rn\n    acc=gl.full((16,BN),0,gl.float32,ML)\n    for block in gl.range(ks*(4096//SPLIT//BK),(ks+1)*(4096//SPLIT//BK),loop_unroll_factor=UNROLL):\n                 ^\nAttributeError(\"module 'triton.experimental.gluon.language' has no attribute 'range'\")"
+  },
+  {
+    "name": "32_8_True_4_128_1",
+    "error": "at 14:17:\n    DA:gl.constexpr=gl.DotOperandLayout(0,ML,8)\n    DB:gl.constexpr=gl.DotOperandLayout(1,ML,8)\n    AL:gl.constexpr=gl.to_linear_layout(DA,[16,BK]) if DIRECT else gl.BlockedLayout([1,4],[1,32],[WAVES,1],[1,0])\n    BL:gl.constexpr=gl.to_linear_layout(DB,[BK,BN]) if DIRECT else gl.BlockedLayout([4,1],[32,1],[1,WAVES],[0,1])\n    rm=gl.arange(0,16,layout=gl.SliceLayout(1,AL))\n    ka=gl.arange(0,BK,layout=gl.SliceLayout(0,AL))\n    kb=gl.arange(0,BK,layout=gl.SliceLayout(1,BL))\n    rn=gl.arange(0,BN,layout=gl.SliceLayout(0,BL))\n    tile=gl.program_id(0)//SPLIT;ks=gl.program_id(0)%SPLIT\n    ns=tile*BN+rn\n    acc=gl.full((16,BN),0,gl.float32,ML)\n    for block in gl.range(ks*(4096//SPLIT//BK),(ks+1)*(4096//SPLIT//BK),loop_unroll_factor=UNROLL):\n                 ^\nAttributeError(\"module 'triton.experimental.gluon.language' has no attribute 'range'\")"
+  }
+]

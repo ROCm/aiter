@@ -1,0 +1,246 @@
+[
+  {
+    "m": 1,
+    "new_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 7.039398042252287e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 7.263882650931919e-08
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 7.039398042252287e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 6.49801492613733e-08
+      }
+    },
+    "new_vs_old": {
+      "exact": true,
+      "max_abs": 0.0,
+      "relative_rms": 0.0
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "rounds": [
+      {
+        "new_us": 5.78692492519665,
+        "old_us": 7.365987736298815
+      },
+      {
+        "new_us": 5.972403094226273,
+        "old_us": 7.274225146355248
+      }
+    ],
+    "new_us": 5.972403094226273,
+    "old_us": 7.274225146355248
+  },
+  {
+    "m": 2,
+    "new_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 3.880419683355285e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.95481388643293e-08
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 3.880419683355285e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.48915615183887e-08
+      }
+    },
+    "new_vs_old": {
+      "exact": true,
+      "max_abs": 0.0,
+      "relative_rms": 0.0
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "rounds": [
+      {
+        "new_us": 5.792838520805386,
+        "old_us": 7.011075432666054
+      },
+      {
+        "new_us": 5.872561264598796,
+        "old_us": 7.037643953796886
+      }
+    ],
+    "new_us": 5.872561264598796,
+    "old_us": 7.037643953796886
+  },
+  {
+    "m": 4,
+    "new_vs_native": {
+      "norm": {
+        "exact": false,
+        "max_abs": 0.000244140625,
+        "relative_rms": 6.37151679256931e-05
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 2.944943275906553e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 6.228670201835484e-08
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 2.262368070660159e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.8151304216380595e-08
+      }
+    },
+    "new_vs_old": {
+      "exact": false,
+      "max_abs": 0.000244140625,
+      "relative_rms": 6.37151679256931e-05
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 96,
+    "lds": 44004,
+    "spills": 0,
+    "rounds": [
+      {
+        "new_us": 5.915599824356719,
+        "old_us": 8.615254823445742
+      },
+      {
+        "new_us": 5.926882977145907,
+        "old_us": 8.621146547570527
+      }
+    ],
+    "new_us": 5.926882977145907,
+    "old_us": 8.621146547570527
+  },
+  {
+    "m": 8,
+    "new_vs_native": {
+      "norm": {
+        "exact": false,
+        "max_abs": 0.000244140625,
+        "relative_rms": 4.499552960623987e-05
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 2.6772184469336935e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.7881393432617188e-07,
+        "relative_rms": 7.973212490242076e-08
+      }
+    },
+    "old_vs_native": {
+      "norm": {
+        "exact": true,
+        "max_abs": 0.0,
+        "relative_rms": 0.0
+      },
+      "post": {
+        "exact": false,
+        "max_abs": 2.2351741790771484e-08,
+        "relative_rms": 2.2892690765274892e-07
+      },
+      "comb": {
+        "exact": false,
+        "max_abs": 1.1920928955078125e-07,
+        "relative_rms": 5.646838019401912e-08
+      }
+    },
+    "new_vs_old": {
+      "exact": false,
+      "max_abs": 0.000244140625,
+      "relative_rms": 4.499552960623987e-05
+    },
+    "health": [
+      0,
+      0
+    ],
+    "vgpr": 98,
+    "lds": 44004,
+    "spills": 0,
+    "rounds": [
+      {
+        "new_us": 6.751143843047181,
+        "old_us": 8.535783195940612
+      },
+      {
+        "new_us": 6.76490506619832,
+        "old_us": 8.52222161531668
+      }
+    ],
+    "new_us": 6.76490506619832,
+    "old_us": 8.52222161531668
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "atom/models/deepseek_v4_mono/__init__.py": "fd4f8539027c13663ba10fde75199c6ab88537c0f522871ddb99ebd89ee0d17b",
+  "atom/models/deepseek_v4_mono/config.py": "db68b596ce3117f7c10ba60e33a24b07e98f3d2fd43b1a353526771cf1f252fa",
+  "atom/models/deepseek_v4_mono/configs/flash_tp1.json": "bb34452544c20e713ba7c1286b37ed735698f2f947d5adf8649a440e5c168fb0",
+  "atom/models/deepseek_v4_mono/configs/pro_tp4.json": "a1bb36f43550749e65a4053c0ea242b9d37487c2d0c25bc2a8b60f550b92a791",
+  "atom/models/deepseek_v4_mono/dispatch.py": "0def8511334d37c9f68a3a2fc9d84236571bf71f3d4ea0c1a355ac2a55435d9a",
+  "atom/models/deepseek_v4_mono/kernels/__init__.py": "67169dda715a7c64a002f8579165d177cc76ff2a52b0ee84497196a8cfd2840f",
+  "atom/models/deepseek_v4_mono/kernels/ops.py": "4e25369d667b11fb121c1426b152039ac99fa5c6554eb1b491e106b99333ea91",
+  "atom/models/deepseek_v4_mono/linear.py": "a7c993c59ece47a7da8bf76c32e55aa08945e2dc712236724d282ec9e0237abc",
+  "atom/models/deepseek_v4_mono/runner.py": "724ca49e89e8ed7de618e92c65bb97b010087e8c790b9d073825dc8219a53102",
+  "atom/models/deepseek_v4.py": "9d0cb6c02daeaaf8b4143c8a6e9b5f09841301fb45a099b4729b230b21825391",
+  "atom/model_engine/model_runner.py": "770beb48403f01030d4d4bfad43e0d70e0294d2077be1eb2137c9ef67e4dbb22",
+  "atom/utils/envs.py": "27ee306f51f169b9cfcc439f73023ee10e2fb1b1c95612e0a0ae73b96021d4cf",
+  "pyproject.toml": "8b2f38304845d7b6cfb59452bf3131580491ac66d3d32dd63aad98f36160959c",
+  "scripts/serve_dsv4_mono_gfx1250.sh": "ec7e362184cd4be93a8376dacf0d54c447980061fa5acd5c6c9fd4414a904534"
+}

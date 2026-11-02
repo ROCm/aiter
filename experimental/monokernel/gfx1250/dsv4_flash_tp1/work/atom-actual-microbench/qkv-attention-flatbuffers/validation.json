@@ -1,0 +1,7 @@
+{
+  "attention_output_rel_rms": 0.0020298759918659925,
+  "health": true,
+  "threshold": 0.001,
+  "note": "Native and candidate begin same BF16 input; both include QKV, cachewrite and attentionreduce. Native cached indices capacity16384, true128. Different native arithmetic may fail gate; timing is not correctness acceptance.",
+  "health_after_timing": true
+}

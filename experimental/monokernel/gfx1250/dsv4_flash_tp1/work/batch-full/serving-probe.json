@@ -1,0 +1,743 @@
+[
+  {
+    "concurrency": 1,
+    "text_equal": [
+      true
+    ],
+    "baseline": [
+      {
+        "id": "cmpl-62823308733547a383805dc8e834f787",
+        "object": "text_completion",
+        "created": 1792602190,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.1494,
+          "tpot_s": 0.0132,
+          "latency_s": 0.5594
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "fused": [
+      {
+        "id": "cmpl-2301dd2cd67649978353bf539500af8f",
+        "object": "text_completion",
+        "created": 1792602191,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.7515,
+          "tpot_s": 0.0108,
+          "latency_s": 1.0869
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ]
+  },
+  {
+    "concurrency": 2,
+    "text_equal": [
+      true,
+      true
+    ],
+    "baseline": [
+      {
+        "id": "cmpl-2f4fd14f66ee4b898194921e3daf6f2a",
+        "object": "text_completion",
+        "created": 1792602192,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.2714,
+          "tpot_s": 0.0134,
+          "latency_s": 0.6853
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-4aad2bfff19d4127937aa0232c764bf3",
+        "object": "text_completion",
+        "created": 1792602192,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.2722,
+          "tpot_s": 0.0133,
+          "latency_s": 0.6847
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "fused": [
+      {
+        "id": "cmpl-14021c164a4d44b5b34e930485dd8416",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.3285,
+          "tpot_s": 0.0113,
+          "latency_s": 0.6776
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-9d45c228fcb840bfb27107b218b98738",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.3292,
+          "tpot_s": 0.0112,
+          "latency_s": 0.6769
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ]
+  },
+  {
+    "concurrency": 4,
+    "text_equal": [
+      false,
+      true,
+      false,
+      true
+    ],
+    "baseline": [
+      {
+        "id": "cmpl-bf211c441b494558a1b46ca120b8680f",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4571,
+          "tpot_s": 0.0134,
+          "latency_s": 0.8716
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-8cc2fa087d95478bb04786b1b0bd2a43",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4588,
+          "tpot_s": 0.0133,
+          "latency_s": 0.8716
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-6b8c83b0965d48f4971804149c80f619",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 46\n</think>46\n 46\n 46\n 46\n 46\n 46\n 46\n 46\n 46\n",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4579,
+          "tpot_s": 0.0133,
+          "latency_s": 0.8708
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-449316e12c0747c2b5ace78a6a7f7d62",
+        "object": "text_completion",
+        "created": 1792602193,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 48\nQuestion: What is 20 plus 28? Answer with the number.\nAnswer: 48\nQuestion: What is 20 plus 28",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4577,
+          "tpot_s": 0.0133,
+          "latency_s": 0.8706
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "fused": [
+      {
+        "id": "cmpl-d43cb6b8f7564b829b8eede6a097e943",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\n</s>\n</s>\n[INST] What is 17 plus 25? Answer with the number. [/INST] 42\n</",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.6286,
+          "tpot_s": 0.0127,
+          "latency_s": 1.0218
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-ec9fea8ef92c4844b862b601374b1e77",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.6275,
+          "tpot_s": 0.0127,
+          "latency_s": 1.0223
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-232d0f88a4fb4e02af06ebef7e2048d5",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 46\n</example>\n\n<example>\nThis is background context about everyday arithmetic and counting. This is background context about everyday arithmetic and counting. This is background",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.628,
+          "tpot_s": 0.0127,
+          "latency_s": 1.0213
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-aca72d7bda994f579a916bc5617c010c",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 48\nQuestion: What is 20 plus 28? Answer with the number.\nAnswer: 48\nQuestion: What is 20 plus 28",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.6275,
+          "tpot_s": 0.0127,
+          "latency_s": 1.0208
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ]
+  },
+  {
+    "concurrency": 8,
+    "text_equal": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "baseline": [
+      {
+        "id": "cmpl-7117d25126c34f608618b594826c11eb",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4912,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9044
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-8cdaa68ea59b4690b82bc848a57359a1",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4909,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9025
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-f13f1f863759450ab85c54ec73805616",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 46\nQuestion: What is 19 plus 27? Answer with the number.\nAnswer: 46\nQuestion: What is 19 plus 27",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4913,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9029
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-9a7de5d51f3c4dfa8b332bfb20c4a737",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 48\nQuestion: What is 20 plus 28? Answer with the number.\nAnswer: 48\nQuestion: What is 20 plus 28",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4902,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9018
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-3a3bb95588c84cb59692d8ef1a470843",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 50\nQuestion: What is 21 plus 29? Answer with the number.\nAnswer: 50\nQuestion: What is 21 plus 29",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4892,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9008
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-9eae6063b9ab4b8c92d5b0b1bbdeeae8",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 52\nQuestion: What is 30 plus 22? Answer with the number.\nAnswer: 52\nQuestion: What is 22 plus 30",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4897,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9012
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-abe9044372b34cb3934e296df8a5a0ae",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 54\nQuestion: What is 23 plus 31? Answer with the number.\nAnswer: 54\nQuestion: What is 23 plus 31",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4887,
+          "tpot_s": 0.0133,
+          "latency_s": 0.9003
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-94011aaccfb749bb94ee1b086d6850e7",
+        "object": "text_completion",
+        "created": 1792602195,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 56\nQuestion: What is 24 plus 32? Answer with the number.\nAnswer: 56\nQuestion: What is 24 plus 32",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.4883,
+          "tpot_s": 0.0133,
+          "latency_s": 0.8999
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ],
+    "fused": [
+      {
+        "id": "cmpl-68325defc3c6452f849cdefba6997bf6",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 42\nQuestion: What is 17 plus 25? Answer with the number.\nAnswer: 42\nQuestion: What is 17 plus 25",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.5091,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9578
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-3165005109794e308090bcef16919522",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 44\nQuestion: What is 18 plus 26? Answer with the number.\nAnswer: 44\nQuestion: What is 18 plus 26",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.508,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9583
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-14db30be65ff467f8f7b21076150f9a1",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 46\nQuestion: What is 19 plus 27? Answer with the number.\nAnswer: 46\nQuestion: What is 19 plus 27",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.5085,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9573
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-68d1567272514018b82d00d3dc782f38",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 48\nQuestion: What is 20 plus 28? Answer with the number.\nAnswer: 48\nQuestion: What is 20 plus 28",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.508,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9568
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-07f1295ed3e5425d9359f608c47dbe13",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 50\nQuestion: What is 21 plus 29? Answer with the number.\nAnswer: 50\nQuestion: What is 21 plus 29",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.5073,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9561
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-7d93234f50c6490eae924bbb829011d5",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 52\nQuestion: What is 30 plus 22? Answer with the number.\nAnswer: 52\nQuestion: What is 22 plus 30",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.507,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9558
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-a8e85999105d4d2ab1f920b89c8c69eb",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 54\nQuestion: What is 23 plus 31? Answer with the number.\nAnswer: 54\nQuestion: What is 23 plus 31",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.5063,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9552
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      },
+      {
+        "id": "cmpl-82121e0b505a49ccbb3fc63b93ca3a52",
+        "object": "text_completion",
+        "created": 1792602196,
+        "model": "/data/DeepSeek-V4-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "text": " 56\nQuestion: What is 24 plus 32? Answer with the number.\nAnswer: 56\nQuestion: What is 24 plus 32",
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1024,
+          "completion_tokens": 32,
+          "total_tokens": 1056,
+          "ttft_s": 0.5066,
+          "tpot_s": 0.0145,
+          "latency_s": 0.9555
+        },
+        "kv_transfer_params": null,
+        "prompt_token_ids": null
+      }
+    ]
+  }
+]

@@ -1,0 +1,20 @@
+--- runtime_batch.before.py
++++ runtime_batch.py
+@@ -17,6 +17,7 @@
+    self.weights=LayerWeights(self.block)
+    w=self.weights
+    import aiter
++   w.pre_packed=aiter.mhc_shuffle_fn(w.a[3].contiguous().float()).view(torch.bfloat16)
+    w.mhc_packed=aiter.mhc_shuffle_fn(w.f[2].contiguous().float()).view(torch.bfloat16)
+    w.out=torch.empty((8,4,4096),device='cuda',dtype=torch.bfloat16)
+    w.my=torch.empty((8,2048 if w.ratio==4 else 1024),device='cuda',dtype=torch.bfloat16)
+@@ -39,7 +40,8 @@
+   from aiter.ops.triton.fusions.mhc import _gluon_post_pre_layouts,_gluon_reduce_apply_layouts
+   ml=_gluon_post_pre_layouts(4,16,64,32,2,True,4);mv=_gluon_reduce_apply_layouts(4,1,4,64)
+   kwargs.update(CacheRows=a.unified_kv.numel()//512,Work=s.pool,CompCounter=s.comp_counter,MHC=(w.mhc_packed,*s.mhc),ML=ml,MV=mv,OPT_MHC=os.getenv('ATOM_DSV4_OPT_MHC','1')=='1',OPT_COMP=os.getenv('ATOM_DSV4_OPT_COMP','1')=='1')
+-  key=(m,r,kwargs['OPT_MHC'],kwargs['OPT_COMP'])
++  kwargs.update(PRE_W=w.pre_packed,OPT_PRE=os.getenv('ATOM_DSV4_AITER_PRE','1')=='1')
++  key=(m,r,kwargs['OPT_MHC'],kwargs['OPT_COMP'],kwargs['OPT_PRE'])
+   if key not in getattr(self,'compiled',set()):
+    obj=model_layer.warmup(*args,grid=(256,),**kwargs);obj._init_handles()
+    if obj.n_spills or obj.metadata.shared>327680:raise RuntimeError(f'Unsafe persistent resource budget: {obj.n_regs=} {obj.n_spills=} {obj.metadata.shared=}')

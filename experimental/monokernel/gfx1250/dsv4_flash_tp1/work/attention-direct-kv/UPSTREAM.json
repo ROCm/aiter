@@ -1,0 +1,8 @@
+{
+  "url": "https://github.com/ROCm/aiter/blob/main/aiter/ops/triton/_gluon_kernels/gfx1250/attention/pa_decode_sparse.py",
+  "snapshot_sha256": "8b9482d2b356d5a6255c83389d2382701c5a91604622abf32b340617debd696e",
+  "license": "MIT",
+  "license_file": "upstream/LICENSE",
+  "local_container_aiter_commit": "7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe",
+  "note": "Adapted remote source snapshot, not assumed identical to the installed checkout."
+}

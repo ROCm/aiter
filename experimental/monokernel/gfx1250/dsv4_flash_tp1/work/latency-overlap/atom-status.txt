@@ -1,0 +1,20 @@
+ M atom/model_ops/fused_moe_triton.py
+ M atom/model_ops/linear.py
+ M atom/models/deepseek_v4.py
+?? .claude/450_ci.md
+?? atom/entrypoints/openai/protocol.py.bak_prompt_tokens_20261014
+?? atom/model_engine/engine_core.py.orig
+?? atom/model_engine/scheduler.py.orig
+?? atom/model_ops/dsv4_attention_configs.json
+?? atom/model_ops/dsv4_flash_attention_configs.json
+?? atom/model_ops/dsv4_flash_final_configs.json
+?? atom/model_ops/dsv4_flash_moe.py
+?? atom/model_ops/dsv4_flash_moe_kernel.py
+?? atom/model_ops/dsv4_flash_moe_stage.py
+?? atom/model_ops/dsv4_full_layer.py
+?? atom/model_ops/dsv4_hybrid.py
+?? atom/utils/__init__.py.orig
+?? sampler_gfx1250.patch
+?? scheduler_import_os.patch
+?? scripts/performance/benchmark.xlsx
+?? scripts/performance/result.txt

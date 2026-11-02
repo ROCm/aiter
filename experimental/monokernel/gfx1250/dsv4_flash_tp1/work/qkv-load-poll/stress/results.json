@@ -1,0 +1,44 @@
+[
+  {
+    "mode": "grid_load_rt",
+    "checked_invocations": 10240,
+    "failures": 14,
+    "max_q_relative_rms": 0.004022694192826748,
+    "max_kv_relative_rms": 6.859730638097972e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "grid_vector_load",
+    "checked_invocations": 10240,
+    "failures": 34,
+    "max_q_relative_rms": 0.004022694192826748,
+    "max_kv_relative_rms": 6.753583147656173e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  },
+  {
+    "mode": "qready_vector_load",
+    "checked_invocations": 10240,
+    "failures": 19,
+    "max_q_relative_rms": 0.004022694192826748,
+    "max_kv_relative_rms": 6.753583147656173e-05,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0,
+      "epoch_consistent": true
+    }
+  }
+]

@@ -1,0 +1,46 @@
+{
+  "M": 1,
+  "weights": "checkpoint layers.0 all256experts",
+  "input": "synthetic BF16normal seed6764",
+  "routing": "checkpointlayer0router projection ofsyntheticinput, actualHERDsqrtsoftplus top6 renorm scale1.5",
+  "block_m": 16,
+  "health": 0,
+  "relative_rms": 0.0,
+  "neq": 0,
+  "native_configs": [
+    {
+      "block_m": 16,
+      "block_n": 64,
+      "block_k": 512,
+      "num_warps": 4,
+      "num_buffers": 3,
+      "xcd_swizzle": 1,
+      "split_k": 1,
+      "w_cache_modifier": ".cg",
+      "waves_per_eu": 0,
+      "persistent_iters": 1,
+      "num_ctas": 1,
+      "ctas_per_cga": [
+        1,
+        1
+      ]
+    },
+    {
+      "block_m": 16,
+      "block_n": 64,
+      "block_k": 512,
+      "num_warps": 4,
+      "num_buffers": 3,
+      "xcd_swizzle": 1,
+      "split_k": 1,
+      "w_cache_modifier": ".cg",
+      "waves_per_eu": 0,
+      "persistent_iters": 1,
+      "num_ctas": 1,
+      "ctas_per_cga": [
+        1,
+        1
+      ]
+    }
+  ]
+}

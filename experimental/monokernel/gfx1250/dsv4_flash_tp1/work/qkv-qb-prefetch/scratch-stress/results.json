@@ -1,0 +1,80 @@
+[
+  {
+    "mode": "baseline",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "l2",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "tdm",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "l2_tdm",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "l2_nonspec",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  },
+  {
+    "mode": "l2_nonspec_tdm",
+    "checked_invocations": 10240,
+    "failures": 0,
+    "max_q_relative_rms": 4.828352393815294e-05,
+    "max_kv_relative_rms": 0.0,
+    "state": {
+      "acc_zero": true,
+      "count_zero": true,
+      "qb_count_zero": true,
+      "health": 0
+    }
+  }
+]

@@ -1,0 +1,125 @@
+{
+  "model": "DeepSeek-V4-Flash",
+  "tp": 1,
+  "ep": false,
+  "concurrency": 8,
+  "input_len": 1024,
+  "output_len": 1024,
+  "num_prompts": 64,
+  "method": "One server start per config; two clients; report second only. Median TTFT/TPOT. Total throughput=input+output. Native GPU0, wrapped GPU1, fixed GPU3.",
+  "results": {
+    "native": {
+      "completed": 64,
+      "median_ttft_ms": 270.84530250067473,
+      "median_tpot_ms": 13.731469981427079,
+      "total_token_throughput": 1144.4055560842476,
+      "output_throughput": 572.2027780421238,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/prefillfix-native-c8-round2.json"
+    },
+    "wrapped": {
+      "completed": 64,
+      "median_ttft_ms": 309.87122300030023,
+      "median_tpot_ms": 12.249577585045392,
+      "total_token_throughput": 1272.7168276417349,
+      "output_throughput": 636.3584138208674,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/prefillfix-wrapped-c8-round2.json"
+    },
+    "fused": {
+      "completed": 64,
+      "median_ttft_ms": 278.33579300022393,
+      "median_tpot_ms": 12.251172475073552,
+      "total_token_throughput": 1276.8939193666486,
+      "output_throughput": 638.4469596833243,
+      "path": "/home/vigokhal/dsv4-monokernel/concurrency-rollout/prefillfix-fused-c8-round2.json"
+    }
+  },
+  "graph_audit": {
+    "native": {
+      "cache_dir": "/root/.cache/atom/torch_compile_cache/530db60e73/rank_0/backbone",
+      "sha256": "81c8e27ebacb2f4a5616cab05edff50874e98f4923f2d8138713d35014d775dd",
+      "custom_op_calls": 0,
+      "clone_lines": 0
+    },
+    "fixed": {
+      "cache_dir": "/root/.cache/atom/torch_compile_cache/530db60e73/rank_0/backbone",
+      "sha256": "81c8e27ebacb2f4a5616cab05edff50874e98f4923f2d8138713d35014d775dd",
+      "custom_op_calls": 0,
+      "clone_lines": 0
+    },
+    "wrapped": {
+      "cache_dir": "/root/.cache/atom/torch_compile_cache/c81069c363/rank_0/backbone",
+      "sha256": "d977725c267bd9ed50caae02510cf00d6bcb8da60dc261ab5def6adebc48487a",
+      "custom_op_calls": 43,
+      "clone_lines": 0
+    }
+  },
+  "compiled_layers": {
+    "1": 43,
+    "2": 43,
+    "4": 43,
+    "8": 43
+  },
+  "tiny_prefill_checks": [
+    {
+      "input_tokens": 1,
+      "text_equal": true
+    },
+    {
+      "input_tokens": 2,
+      "text_equal": false
+    },
+    {
+      "input_tokens": 4,
+      "text_equal": true
+    },
+    {
+      "input_tokens": 8,
+      "text_equal": true
+    },
+    {
+      "input_tokens": 1024,
+      "text_equal": true
+    }
+  ],
+  "first_token_text_checks": [
+    {
+      "input_tokens": 1,
+      "first_token_equal": true
+    },
+    {
+      "input_tokens": 2,
+      "first_token_equal": true
+    },
+    {
+      "input_tokens": 4,
+      "first_token_equal": true
+    },
+    {
+      "input_tokens": 8,
+      "first_token_equal": true
+    },
+    {
+      "input_tokens": 1024,
+      "first_token_equal": true
+    }
+  ],
+  "gsm8k": {
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 32,
+      "exact_match,strict-match": 0.96875,
+      "exact_match_stderr,strict-match": 0.03125,
+      "exact_match,flexible-extract": 0.96875,
+      "exact_match_stderr,flexible-extract": 0.03125
+    }
+  },
+  "change": "Outer ForCausalLM mode dispatch before torch.compile; native backbone disables per-layer experimental wrapper under decode-only dispatch. Eligible decode executes existing monokernel via GPU-graph-captured eager orchestration. Prefill including tiny/chunked stays on native compiled backbone. Monokernel math unchanged.",
+  "limitations": [
+    "One of five eight-token continuations differs. First-token decoded text matches in all five; server did not return token IDs/logprobs, so this is not token-ID equality proof.",
+    "Residual TTFT gap of7.49ms vs native remains unexplained.",
+    "32-example GSM8K smoke test only, not complete accuracy qualification.",
+    "No new C1/C2/C4 performance results; compiled and exercised shapes, C8 throughput measured.",
+    "No image/branch push requested or performed."
+  ]
+}

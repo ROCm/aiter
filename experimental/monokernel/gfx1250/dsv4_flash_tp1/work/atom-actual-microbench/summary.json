@@ -1,0 +1,46 @@
+{
+  "report_round": 2,
+  "rows": [
+    {
+      "region": "mHC + input RMSNorm",
+      "prototype": "unshuffle + candidate",
+      "native_us": 7.366667967289686,
+      "prototype_us": 7.661949377506971,
+      "gpu": "1",
+      "launches": "3 / 2"
+    },
+    {
+      "region": "Input quant + QA/KV + norm/quant + QB + Q/KV norm/RoPE + cache write",
+      "prototype": "complete + cache_store",
+      "native_us": 26.720289140939713,
+      "prototype_us": 12.571308296173811,
+      "gpu": "2",
+      "launches": "5 / 2"
+    },
+    {
+      "region": "Attention + split-KV reduction (see boundary note)",
+      "prototype": "attention_kernel including cache write",
+      "native_us": 11.127789039164782,
+      "prototype_us": 8.528574369847775,
+      "gpu": "3",
+      "launches": "2 / 1"
+    },
+    {
+      "region": "QKV through attention reduction, matched combined boundary",
+      "prototype": "qkv_attention",
+      "native_us": 43.90614852309227,
+      "prototype_us": 20.234163850545883,
+      "gpu": "3",
+      "launches": "7 / 1"
+    },
+    {
+      "region": "Full layer-0 start through attention reduction",
+      "prototype": "unshuffle + optimized_prefix",
+      "native_us": 54.563215002417564,
+      "prototype_us": 32.12613798677921,
+      "gpu": "0",
+      "launches": "10 / 2"
+    }
+  ],
+  "numerically_accepted": false
+}

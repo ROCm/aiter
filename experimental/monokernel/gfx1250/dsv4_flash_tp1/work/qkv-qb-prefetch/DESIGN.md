@@ -1,0 +1,3 @@
+# QB prefetch experiment
+
+Extend the validated fixed-order FP32 split-K single-launch QKV region. Preserve arithmetic and device-scope vector-load barrier. Four ablations: baseline, distributed L2 hints, first-tile TDM, both. Each CTA owns 128 QB rows (128 KiB), each thread one 1024-byte row and four 256-byte spaced prefetch hints. Producer CTAs issue staging after publishing their partials and receiving the group arrival ticket, before last-arriver RMSNorm. Idle CTAs stage before polling. TDM copies the first 128x128 FP8 tile (16 KiB payload) per CTA into LDS; wait only at QB consumption. Scope DEV prefetch is a hint, not completion or guaranteed residency. Validate generated ISA, expanded inputs and graph stress before reporting round-two microbench results.

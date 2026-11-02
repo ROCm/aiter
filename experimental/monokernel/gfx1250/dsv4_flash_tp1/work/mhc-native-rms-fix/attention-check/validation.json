@@ -1,0 +1,44 @@
+{
+  "128": {
+    "rel_rms_native_vs_fused": 0.002131090499460697,
+    "native_vs_fp32_rel_rms": 0.002027888549491763,
+    "fused_vs_fp32_rel_rms": 0.0016680089756846428,
+    "health": true
+  },
+  "136": {
+    "rel_rms_native_vs_fused": 0.00220850738696754,
+    "native_vs_fp32_rel_rms": 0.002102992031723261,
+    "fused_vs_fp32_rel_rms": 0.0016746965702623129,
+    "health": true
+  },
+  "140": {
+    "rel_rms_native_vs_fused": 0.0021614697761833668,
+    "native_vs_fp32_rel_rms": 0.0020517255179584026,
+    "fused_vs_fp32_rel_rms": 0.0016668293392285705,
+    "health": true
+  },
+  "143": {
+    "rel_rms_native_vs_fused": 0.002120805671438575,
+    "native_vs_fp32_rel_rms": 0.0020215921103954315,
+    "fused_vs_fp32_rel_rms": 0.0016401993343606591,
+    "health": true
+  },
+  "384": {
+    "rel_rms_native_vs_fused": 0.0021559710148721933,
+    "native_vs_fp32_rel_rms": 0.0020703303162008524,
+    "fused_vs_fp32_rel_rms": 0.0016853332053869963,
+    "health": true
+  },
+  "512": {
+    "rel_rms_native_vs_fused": 0.002159688388928771,
+    "native_vs_fp32_rel_rms": 0.0020505243446677923,
+    "fused_vs_fp32_rel_rms": 0.0016561188967898488,
+    "health": true
+  },
+  "639": {
+    "rel_rms_native_vs_fused": 0.002096346113830805,
+    "native_vs_fp32_rel_rms": 0.002030561678111553,
+    "fused_vs_fp32_rel_rms": 0.001655359286814928,
+    "health": true
+  }
+}

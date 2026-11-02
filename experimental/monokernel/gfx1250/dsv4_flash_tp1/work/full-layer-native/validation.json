@@ -1,0 +1,614 @@
+[
+  {
+    "position": 1024,
+    "case": 0,
+    "native_rms": 0.011706002056598663,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 1,
+    "native_rms": 0.006388130597770214,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 2,
+    "native_rms": 0.0022890251129865646,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 3,
+    "native_rms": 0.01791752502322197,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 4,
+    "native_rms": 0.10082954913377762,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 5,
+    "native_rms": 0.023107586428523064,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 6,
+    "native_rms": 0.012555008754134178,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 7,
+    "native_rms": 0.020620878785848618,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 8,
+    "native_rms": 0.01356526929885149,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 9,
+    "native_rms": 0.03220461308956146,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 10,
+    "native_rms": 0.03001766838133335,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 11,
+    "native_rms": 0.02480253577232361,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 12,
+    "native_rms": 0.03369265794754028,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 13,
+    "native_rms": 0.0349976122379303,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 14,
+    "native_rms": 0.031825724989175797,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 15,
+    "native_rms": 0.03146497905254364,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1024,
+    "case": 16,
+    "native_rms": 0.035585857927799225,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 0,
+    "native_rms": 0.021488217636942863,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 1,
+    "native_rms": 0.0030628840904682875,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 2,
+    "native_rms": 0.002185115357860923,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 3,
+    "native_rms": 0.017586354166269302,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 4,
+    "native_rms": 0.01979105733335018,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 5,
+    "native_rms": 0.021060911938548088,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 6,
+    "native_rms": 0.010936870239675045,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 7,
+    "native_rms": 0.01728164218366146,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 8,
+    "native_rms": 0.0173814594745636,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 9,
+    "native_rms": 0.03579976409673691,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 10,
+    "native_rms": 0.029110604897141457,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 11,
+    "native_rms": 0.027849577367305756,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 12,
+    "native_rms": 0.03243498131632805,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 13,
+    "native_rms": 0.030343802645802498,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 14,
+    "native_rms": 0.03026006743311882,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 15,
+    "native_rms": 0.035421863198280334,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 1536,
+    "case": 16,
+    "native_rms": 0.035704586654901505,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 0,
+    "native_rms": 0.0980086401104927,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 1,
+    "native_rms": 0.0034755875822156668,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 2,
+    "native_rms": 0.0021537994034588337,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 3,
+    "native_rms": 0.017339197918772697,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 4,
+    "native_rms": 0.016063570976257324,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 5,
+    "native_rms": 0.023058241233229637,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 6,
+    "native_rms": 0.013884599320590496,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 7,
+    "native_rms": 0.017967019230127335,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 8,
+    "native_rms": 0.013775968924164772,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 9,
+    "native_rms": 0.04104456678032875,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 10,
+    "native_rms": 0.030928712338209152,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 11,
+    "native_rms": 0.025548413395881653,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 12,
+    "native_rms": 0.03039720095694065,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 13,
+    "native_rms": 0.3574734330177307,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 14,
+    "native_rms": 0.028218664228916168,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 15,
+    "native_rms": 0.033529940992593765,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  },
+  {
+    "position": 2047,
+    "case": 16,
+    "native_rms": 0.03139451518654823,
+    "staged_exact": true,
+    "finite": true,
+    "health": {
+      "attention": true,
+      "ffn": 0,
+      "moe": 0
+    }
+  }
+]

@@ -1,0 +1,21 @@
+from pathlib import Path
+r=Path(__file__).parent
+s=(r/'mhc_stage_relaxed_poll.py').read_text()
+# All cross-CTA residual traffic goes through explicit device-scoped TDM.
+s=s.replace('nres_smem.index(slot),\n            )','nres_smem.index(slot), cache_modifier=".cg",\n            )')
+s=s.replace('res_tdm.index(j)\n            )','res_tdm.index(j), cache_modifier=".cg"\n            )')
+s=s.replace('res_smem.index(j)\n            )','res_smem.index(j), cache_modifier=".cg"\n            )')
+s=s.replace('gl.store(o_ptr, out, mask=gl.expand_dims(om < M, 1))','gl.amd.cdna3.buffer_store(out, out_ptr, (pid_k * M * out_stride + gl.expand_dims(om, 1) * out_stride + gl.expand_dims(on, 0)).to(gl.int32), mask=gl.expand_dims(om < M, 1), cache=".cg")')
+s=s.replace('gl.store(sqrsum_ptr + pid_k * M + sm, sq_r, mask=sm < M)','gl.amd.cdna3.buffer_store(sq_r, sqrsum_ptr, (pid_k * M + sm).to(gl.int32), mask=sm < M, cache=".cg")')
+s=s.replace('gl.load(gemm_ptr + (sc3 * M + r3) * gemm_stride + col0 + n3)','gl.amd.cdna3.buffer_load(gemm_ptr, ((sc3 * M + r3) * gemm_stride + col0 + n3).to(gl.int32), cache=".cg")')
+s=s.replace('gl.load(sq_ptr + gl.minimum(s2, S - 1) * M + r2)','gl.amd.cdna3.buffer_load(sq_ptr, (gl.minimum(s2, S - 1) * M + r2).to(gl.int32), cache=".cg")')
+s=s.replace('gl.load(\n                gemm_ptr + ((sb + s3) * M + r3) * gemm_stride + col0 + n3,','gl.amd.cdna3.buffer_load(\n                gemm_ptr, (((sb + s3) * M + r3) * gemm_stride + col0 + n3).to(gl.int32), cache=".cg",')
+s=s.replace('gl.load(\n                    sq_ptr + (sb + s2) * M + r2, mask=', 'gl.amd.cdna3.buffer_load(\n                    sq_ptr, ((sb + s2) * M + r2).to(gl.int32), cache=".cg", mask=')
+s=s.replace('    ticket = gl.atomic_add(counter_ptr, 1, sem="release", scope="gpu")','''    gl.static_assert(not FUSE_QKV, "Device-scoped probe covers only mHC payloads")
+    gl.inline_asm_elementwise("s_wait_storecnt 0\\n s_mov_b32 $0, 0", constraints="=s,s,~{memory}", args=[pid_m], dtype=gl.int32, is_pure=False, pack=1)
+    gl.barrier()
+    ticket = gl.atomic_add(counter_ptr, 1, sem="relaxed", scope="gpu")''')
+s=s.replace('gl.atomic_add(counter_ptr, 0, sem="acquire", scope="gpu")','gl.atomic_add(counter_ptr, 0, sem="relaxed", scope="gpu")')
+(r/'mhc_stage_device_scope.py').write_text(s)
+s=(r/'test_mhc_relaxed_poll.py').read_text().replace('from mhc_stage_relaxed_poll import','from mhc_stage_device_scope import').replace('/work/flash/relaxed-poll','/work/flash/device-scope').replace('+[(m,False,True) for m in (1,8,16)]','')
+(r/'test_mhc_device_scope.py').write_text(s)

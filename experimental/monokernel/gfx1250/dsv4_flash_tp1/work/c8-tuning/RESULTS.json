@@ -1,0 +1,2030 @@
+{
+  "date": "2026-10-21",
+  "concurrency": 8,
+  "shape": "Flash TP1 1024input/1024output decode shape envelope",
+  "status": "selected isolated single-launch regions; NOT installed in /work/batch-full or ATOM; NOT a newly validated full-layer/e2e result",
+  "method": "4 GPUs in parallel; paired native/fused flat HIP graphs; 32 repetitions; 40 alternating samples; second round median only",
+  "rows": [
+    {
+      "group": "SWA attention + reduce, 128 KV",
+      "native_us": 7.568203145638108,
+      "before_fused_us": 39.78337347507477,
+      "after_fused_us": 8.187874685972929,
+      "vs_native_pct": 8.18782911095568,
+      "speedup_vs_old": 4.858815626871979,
+      "result": "final/attention_paged_128.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "HCA attention + reduce, 136 KV",
+      "native_us": 8.041421882808208,
+      "before_fused_us": 38.97590562701225,
+      "after_fused_us": 8.266124874353409,
+      "vs_native_pct": 2.7943191492737496,
+      "speedup_vs_old": 4.715136320761307,
+      "result": "final/attention_paged_136.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.00016165281704161316,
+        "max_abs": 0.001953125
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "HCA attention + reduce, 144 KV",
+      "native_us": 7.946906611323357,
+      "before_fused_us": 39.35273550450802,
+      "after_fused_us": 8.408828172832727,
+      "vs_native_pct": 5.8125958200035965,
+      "speedup_vs_old": 4.679930983921039,
+      "result": "final/attention_paged_144.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.00020315972506068647,
+        "max_abs": 0.00390625
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "CSA attention + reduce, 384 KV",
+      "native_us": 9.73081262782216,
+      "before_fused_us": 36.45901568233967,
+      "after_fused_us": 9.47981234639883,
+      "vs_native_pct": -2.5794380286973673,
+      "speedup_vs_old": 3.8459638598426094,
+      "result": "final/attention_paged_384.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.00016442104242742062,
+        "max_abs": 0.00390625
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "CSA attention + reduce, 512 KV",
+      "native_us": 10.90382831171155,
+      "before_fused_us": 35.01373343169689,
+      "after_fused_us": 10.11765655130148,
+      "vs_native_pct": -7.210052634134579,
+      "speedup_vs_old": 3.460656452821866,
+      "result": "final/attention_paged_512.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.00018883790471591055,
+        "max_abs": 0.00390625
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "CSA attention + reduce, 640 KV",
+      "native_us": 9.708906058222055,
+      "before_fused_us": 34.703874960541725,
+      "after_fused_us": 10.680984240025282,
+      "vs_native_pct": 10.012231820700501,
+      "speedup_vs_old": 3.2491270636365606,
+      "result": "final/attention_paged_640.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.00014323621871881187,
+        "max_abs": 0.001953125
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "mHC post + FFN pre/RMSNorm",
+      "native_us": 4.993718815967441,
+      "before_fused_us": 11.648062616586685,
+      "after_fused_us": 5.275406176224351,
+      "vs_native_pct": 5.640833427709491,
+      "speedup_vs_old": 2.207993513197745,
+      "result": "final/mhc_native_region.json",
+      "validation": {
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "Top6 routing + metadata",
+      "native_us": 7.597625022754073,
+      "before_fused_us": 12.05371879041195,
+      "after_fused_us": 6.414593895897269,
+      "vs_native_pct": -15.57106494876691,
+      "speedup_vs_old": 1.879108636654524,
+      "result": "final/routing.json",
+      "validation": {
+        "hist_equal": true,
+        "health": 0,
+        "note": "learned top6 sqrtsoftplus routing, no bias; excludes router GEMM"
+      },
+      "kernel_count": {
+        "native": 2,
+        "fused": 1
+      }
+    },
+    {
+      "group": "Routed MoE including input quant",
+      "native_us": 49.65817183256149,
+      "before_fused_us": 76.79209113121033,
+      "after_fused_us": 57.22014047205448,
+      "vs_native_pct": 15.22804477174593,
+      "speedup_vs_old": 1.3420465328762083,
+      "result": "final/routed_moe.json",
+      "validation": {
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0,
+        "note": "routing metadata prepared outside both timings; input MXFP8 quantization included in both"
+      },
+      "kernel_count": {
+        "native": 4,
+        "fused": 1
+      }
+    },
+    {
+      "group": "HCA compressor non-boundary",
+      "native_us": 7.171406177803874,
+      "before_fused_us": 6.6881561651825905,
+      "after_fused_us": 6.871562451124191,
+      "vs_native_pct": -4.181100878203292,
+      "speedup_vs_old": 0.9733093765433806,
+      "result": "final/compress_case1_pos1024.json",
+      "validation": {
+        "projection": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "state": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "cache": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      "kernel_count": {
+        "native": 4,
+        "fused": 1
+      }
+    },
+    {
+      "group": "HCA compressor boundary",
+      "native_us": 10.16400009393692,
+      "before_fused_us": 19.901078194379807,
+      "after_fused_us": 14.034812338650227,
+      "vs_native_pct": 38.083551839224626,
+      "speedup_vs_old": 1.417979643345467,
+      "result": "final/compress_case1_pos1535.json",
+      "validation": {
+        "projection": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "state": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "cache": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      "kernel_count": {
+        "native": 3,
+        "fused": 1
+      }
+    },
+    {
+      "group": "Indexer compressor non-boundary",
+      "native_us": 5.81559375859797,
+      "before_fused_us": 6.554812425747514,
+      "after_fused_us": 5.855031311511993,
+      "vs_native_pct": 0.6781345903970282,
+      "speedup_vs_old": 1.1195179115198977,
+      "result": "final/compress_case2_pos1024.json",
+      "validation": {
+        "projection": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "state": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "cache": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      "kernel_count": {
+        "native": 3,
+        "fused": 1
+      }
+    },
+    {
+      "group": "Indexer compressor boundary",
+      "native_us": 7.284062448889017,
+      "before_fused_us": 8.76685930415988,
+      "after_fused_us": 8.033312391489744,
+      "vs_native_pct": 10.286154846393503,
+      "speedup_vs_old": 1.0913131317347042,
+      "result": "final/compress_case2_pos1535.json",
+      "validation": {
+        "projection": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "state": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "cache": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      "kernel_count": {
+        "native": 3,
+        "fused": 1
+      }
+    }
+  ],
+  "validation": {
+    "routing-validation": [
+      {
+        "m": 1,
+        "seed": 0,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 0,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 1,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 1,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 2,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 2,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 3,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 3,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 4,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 4,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 5,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 5,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 6,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 6,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 7,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 1,
+        "seed": 7,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 0,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 0,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 1,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 1,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 2,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 2,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 3,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 3,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 4,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 4,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 5,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 5,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 6,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 6,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 7,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 2,
+        "seed": 7,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 0,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 0,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 1,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 1,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 2,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 2,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 3,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 3,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 4,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 4,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 5,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 5,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 6,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 6,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 7,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 4,
+        "seed": 7,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 0,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 0,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 1,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 1,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 2,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 2,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 3,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 3,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 4,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 4,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 5,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 5,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 6,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 6,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 7,
+        "bias": false,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      },
+      {
+        "m": 8,
+        "seed": 7,
+        "bias": true,
+        "equal": true,
+        "fields": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "health": 0
+      }
+    ],
+    "paged-validation": [
+      {
+        "finite": true,
+        "relative_rms": 0.0008647844661027193,
+        "max_abs": 0.001953125,
+        "seed": 0,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.001451502670533955,
+        "max_abs": 0.001953125,
+        "seed": 1,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.00080898217856884,
+        "max_abs": 0.001953125,
+        "seed": 2,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.0014479535166174173,
+        "max_abs": 0.001953125,
+        "seed": 3,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.0009256339981220663,
+        "max_abs": 0.001953125,
+        "seed": 4,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 2.67495124717243e-06,
+          "max_abs": 0.0001220703125
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.0014856420457363129,
+        "max_abs": 0.001953125,
+        "seed": 5,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 5.071889290775289e-07,
+          "max_abs": 1.52587890625e-05
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.0008217156282626092,
+        "max_abs": 0.0009765625,
+        "seed": 6,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 9.886362931865733e-06,
+          "max_abs": 0.00048828125
+        }
+      },
+      {
+        "finite": true,
+        "relative_rms": 0.0014552315697073936,
+        "max_abs": 0.001953125,
+        "seed": 7,
+        "health": 0,
+        "native_same_splits": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        }
+      }
+    ],
+    "moe-validation": [
+      {
+        "seed": 0,
+        "collision": false,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 0,
+        "collision": true,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 1,
+        "collision": false,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 1,
+        "collision": true,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 2,
+        "collision": false,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 2,
+        "collision": true,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 3,
+        "collision": false,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      },
+      {
+        "seed": 3,
+        "collision": true,
+        "finite": true,
+        "relative_rms": 0.0,
+        "max_abs": 0.0,
+        "health": 0
+      }
+    ],
+    "mhc-validation": [
+      {
+        "seed": 0,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 1,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 2,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 3,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 4,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 5,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 6,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 7,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 8,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 9,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 10,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 11,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 12,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 13,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 14,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      },
+      {
+        "seed": 15,
+        "norm": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "post": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "comb": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "residual": {
+          "finite": true,
+          "relative_rms": 0.0,
+          "max_abs": 0.0
+        },
+        "health": 0
+      }
+    ]
+  },
+  "limitations": [
+    "Before column is previous fixed-fixture ablation at corresponding shapes; newly paired native/after columns are the current controlled comparison. Attention new cache is scattered/paged, old cache was compact.",
+    "8 splits changes the attention reduction grouping versus native default32. Ragged stress max relative RMS 0.001486 versus default32, <=0.000009887 versus AITER same8 splits. No modelwide accuracy claim.",
+    "Native mHC warp-specialized reducer is retained; full-layer embedding can change thread/register/LDS requirements.",
+    "HCA compressor subgroup uses a dedicated counter and extra 8x4x3x512 FP32 pooling scratch, only STATE128/R128 boundary alignment tested. Do not share this counter with a 256-CTA barrier.",
+    "Routing is learned top6 with optional bias, not hash routing; 64 metadata comparisons passed.",
+    "MoE selected BN256/BK512/two TDM buffers, 256 resident CTAs, 297 VGPR/157152B LDS/0 spills; all8 random/collision fixtures bitwise match native.",
+    "No new end-to-end TTFT/TPOT/tokens/s run in this task. Existing serving path remains the previous saved version."
+  ]
+}
