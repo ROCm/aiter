@@ -23,6 +23,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from aiter.dist.device_communicators.rocm_version import get_rocm_version
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gpu_model as get_gpu_model_for_device
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
     direct,
     megakernel,
@@ -96,38 +97,7 @@ _CONFIG_FAMILIES = {
 }
 _CONFIG_FAMILY_NAMES = {value: key for key, value in _CONFIG_FAMILIES.items()}
 _DERIVED_CONFIG_FIELDS = {"shape", "m", "gather_output"}
-_GPU_MODEL_PATTERN = re.compile(r"\bmi\d+[a-z0-9]*\b", re.IGNORECASE)
-_PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
-_GPU_MODELS_BY_PCI_ID = {
-    0x75A0: "mi350x",
-    0x75A3: "mi355x",
-    0x75A8: "mi350p",
-}
-
-
-def _gpu_model_from_pci(properties) -> str | None:
-    try:
-        bdf = (
-            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
-            f"{properties.pci_device_id:02x}.0"
-        )
-        device_path = _PCI_DEVICES_ROOT / bdf
-        # Prefer the subsystem product ID: virtual functions may expose a VF
-        # device ID while retaining the physical product in subsystem_device.
-        product_ids = (
-            int((device_path / "subsystem_device").read_text(encoding="utf-8"), 0),
-            int((device_path / "device").read_text(encoding="utf-8"), 0),
-        )
-    except (AttributeError, OSError, ValueError):
-        return None
-    return next(
-        (
-            model
-            for product_id in product_ids
-            if (model := _GPU_MODELS_BY_PCI_ID.get(product_id)) is not None
-        ),
-        None,
-    )
+_GPU_MODEL_PATTERN = re.compile(r"mi\d+[a-z0-9]*")
 
 
 @cache
@@ -135,11 +105,11 @@ def get_gpu_model() -> str | None:
     """Return the canonical product name used by comm-fused winner rows."""
 
     try:
-        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        model = get_gpu_model_for_device(torch.cuda.current_device())
     except (AssertionError, AttributeError, RuntimeError):
         return None
-    match = _GPU_MODEL_PATTERN.search(properties.name)
-    return match.group(0).lower() if match else _gpu_model_from_pci(properties)
+    # chip_info falls back to a name slug or "unknown", which no row is keyed on.
+    return model if _GPU_MODEL_PATTERN.fullmatch(model) else None
 
 
 def _window_mxfp8_fallback_enabled() -> bool:

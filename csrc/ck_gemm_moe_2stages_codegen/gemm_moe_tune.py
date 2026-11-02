@@ -6665,6 +6665,7 @@ class GroupedFmoeTuner(FmoeTuner):
         "lds_soa_load_interleave": 0,
         "rolled_drain": 0,
         "persistent_workers2": 0,
+        "a_preshuffle": 0,
     }
     _NUMBER: ClassVar[re.Pattern[str]] = re.compile(
         r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?"
