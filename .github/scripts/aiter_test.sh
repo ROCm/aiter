@@ -105,6 +105,12 @@ for file in "${sharded_files[@]}"; do
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_mla_v4_nm.py)
+            # The script entry point is a full perf sweep (10 batches x 6 kv
+            # lengths, ref / asm kernel / asm total at 50 iters each), not a
+            # CI check. Run the file's pytest regression suite instead.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
