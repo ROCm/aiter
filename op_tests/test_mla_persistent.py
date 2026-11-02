@@ -458,6 +458,8 @@ def torch_mla_extend(
     os = []
     lses = []
     for i in range(bs):
+        if qs[i].shape[0] == 0:
+            continue
         cur_num_page = kvs[i].shape[0]
         real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
         kvc = kvs[i].flatten(0, 1)[:real_kv_seq_len,]
@@ -667,6 +669,8 @@ def torch_mla_extend_split_kv(
         partial_qo_loc = row[1].item()
         qo_start = row[2].item()
         qo_end = row[3].item()
+        if qo_start == qo_end:
+            continue
         kv_start = row[4].item()
         # kv_end = row[5].item()
         kv_offset = row[6].item()
@@ -1188,6 +1192,7 @@ def test_mla(
     causal,
     metadata_mode=None,
     kv_granularity=None,
+    pad_batches=0,
 ):
     ret = {}
 
@@ -1223,6 +1228,12 @@ def test_mla(
             kv_last_page_lens.fill_(page_size)
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
+
+    # Trailing CUDA-graph padding rows: no queries and no KV.
+    num_real = batch_size - pad_batches
+    seq_lens_kv[num_real:] = 0
+    kv_block_nums[num_real:] = 0
+    kv_last_page_lens[num_real:] = page_size
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
@@ -1268,6 +1279,7 @@ def test_mla(
     # if nhead == 16 and decode_qlen != 1:
     #     return
     seq_lens_qo.fill_(decode_qlen)
+    seq_lens_qo[num_real:] = 0
 
     max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -1322,7 +1334,7 @@ def test_mla(
         kvtype,
         page_size,
         max_seqlen_qo,
-        decode_qlen,
+        decode_qlen if pad_batches == 0 else -1,
         max_split_per_batch,
         causal=causal,
         metadata_mode=metadata_mode,
@@ -2336,6 +2348,16 @@ parser.add_argument(
     e.g.: --no-causal""",
 )
 parser.add_argument(
+    "-pad",
+    "--pad_batches",
+    type=int,
+    nargs="*",
+    default=[0],
+    help="""trailing CUDA-graph padding rows (no queries, no KV) per batch.
+    Non-zero runs the planner with uni_seqlen_qo=-1. Default: 0.
+    e.g.: -pad 0 1""",
+)
+parser.add_argument(
     "--softmax-underflow",
     action="store_true",
     help="Run gfx950 FP8 persistent/LSE/CP uniform/long-tail checks (KV=2048, split=1).",
@@ -2383,14 +2405,16 @@ def main():
             ctx_len,
             batch_size,
             max_split_per_batch,
+            pad_batches,
         ) in itertools.product(
             args.dtype,
             args.kv_dtype,
             args.ctxLen,
             args.batchSize,
             args.max_split_per_batch,
+            args.pad_batches,
         ):
-            if check_support(dtype, kvtype, nhead):
+            if check_support(dtype, kvtype, nhead) and pad_batches < batch_size:
                 ret = test_mla(
                     ctx_len,
                     batch_size,
@@ -2412,6 +2436,7 @@ def main():
                     causal=args.causal,
                     metadata_mode=args.metadata_mode
                     or ("v1_0" if args.non_persistent_mode else "fast"),
+                    pad_batches=pad_batches,
                 )
                 df.append(ret)
         df = pd.DataFrame(df)
