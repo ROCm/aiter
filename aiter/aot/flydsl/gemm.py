@@ -58,6 +58,12 @@ AOT_ARCH_DEFAULT = "gfx950"
 # Archs whose GEMMs pick kernels non-monotonically in M: cluster_m is fitted to
 # the number of M tiles, and a ragged last tile is a variant of its own.
 SCAN_ARCHS = ("gfx1250",)
+# The runtime's own limits at an M inside a row's range (``replay.py``): for
+# some untuned M, gemm_a8w8_blockscale_abpreshuffle has no FlyDSL kernel that
+# fits.
+REFUSALS = (
+    r"^RuntimeError: gemm_a8w8_blockscale_abpreshuffle: no FlyDSL config for M=",
+)
 # Tables without a cu_num column were tuned on a full part of their gfx.
 _DEFAULT_CU_NUM = 256
 

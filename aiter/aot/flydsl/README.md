@@ -145,6 +145,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   A call the runtime hands to another backend (Triton, asm, CK) compiles no
   FlyDSL kernel; a row that never reaches FlyDSL is reported as
   `[UNREACHED]`. Reaching the GPU runtime from host code fails the build.
+- At a size inside a row's range the runtime may meet a limit of its own,
+  which the module names in `REFUSALS` (`gemm.py`: for some untuned M,
+  `gemm_a8w8_blockscale_abpreshuffle` has no FlyDSL kernel that fits). A size
+  that fails with one is reported as `[REFUSED]`; any other error there fails
+  the build, as it does at the row itself.
 - Each module runs one process per arch its jobs compile for, with
   `GPU_ARCHS` pinned and `AITER_AOT_REPLAY=1`, as `moe.py` does. `--csv` points
   the runtime's tuned-config lookups of those processes at the given tables.
