@@ -87,14 +87,13 @@ def _idle_failures(cards, max_idle_vram):
     return failures
 
 
-def _guard_idle_gpus(output_dir):
+def _guard_idle_gpus(output_dir, max_idle_vram):
     """Both nodes' GPUs must be idle before any rank allocates; Gloo only.
 
     Local rank 0 of each node samples rocm-smi up to three times (startup
-    activity gets two seconds to settle); MEGAMOE_PREFLIGHT_MAX_IDLE_VRAM sets
-    the VRAM an idle card may hold (default 2 GiB).
+    activity gets two seconds to settle); ``max_idle_vram`` (bytes) is the VRAM
+    an idle card may hold.
     """
-    max_idle_vram = int(os.environ.get("MEGAMOE_PREFLIGHT_MAX_IDLE_VRAM", 2 << 30))
     local = None
     if int(os.environ["LOCAL_RANK"]) == 0:
         observations = []
@@ -129,7 +128,7 @@ def _guard_idle_gpus(output_dir):
                            f"{[(r['rank'], r['failures'][:2]) for r in nodes]}")
 
 
-def setup_dist(preflight_dir):
+def setup_dist(preflight_dir, max_idle_vram=2 << 30):
     """Gloo for coordination (CPU tensors only) and the MORI shmem bootstrap.
 
     MORI owns the GPU/IB transport, so no NCCL/RCCL fabric is created: it may
@@ -142,7 +141,7 @@ def setup_dist(preflight_dir):
     local_rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group("gloo")
     try:
-        _guard_idle_gpus(preflight_dir)
+        _guard_idle_gpus(preflight_dir, max_idle_vram)
     except Exception:
         dist.destroy_process_group()
         raise
