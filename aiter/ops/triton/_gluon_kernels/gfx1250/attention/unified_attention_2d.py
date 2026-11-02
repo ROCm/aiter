@@ -713,6 +713,7 @@ class AttentionProgram:
     tile_start: gl.tensor
     tile_end: gl.tensor
     safe_tile_end: gl.tensor
+    seq_len: gl.tensor
     query_mask_qk: gl.tensor
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
@@ -729,6 +730,7 @@ class AttentionProgram:
         tile_start,
         tile_end,
         safe_tile_end,
+        seq_len,
         query_mask_qk,
         context_len_q_pos_qk,
         QK_scale,
@@ -742,6 +744,7 @@ class AttentionProgram:
         self.tile_start = tile_start
         self.tile_end = tile_end
         self.safe_tile_end = safe_tile_end
+        self.seq_len = seq_len
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
@@ -845,6 +848,7 @@ class AttentionProgram:
             tile_start,
             tile_end,
             safe_tile_end,
+            context_len + cur_batch_query_len,
             query_mask_qk,
             context_len_q_pos_qk,
             QK_scale,
@@ -877,6 +881,18 @@ class AttentionProgram:
         full_mask = seq_mask
         S = gl.where(full_mask, S, float("-inf"))
         return S
+
+    @gluon.jit
+    def mask_v(self, v, j):
+        # Zero V rows at or past the sequence length: their P is 0, but 0 * a
+        # stale NaN/Inf in a slot the sequence does not own (the tail of its
+        # last page, or a tile past its end) is NaN. A plain select: a branch
+        # around it changes how the softmax around it is contracted (FMA), so
+        # clean outputs would no longer be bitwise the same.
+        seq_offset = j * self.cfg.TILE_SIZE + gl.arange(
+            0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(1, v.type.layout)
+        )
+        return gl.where((seq_offset < self.seq_len)[:, None], v, gl.zeros_like(v))
 
     @gluon.jit
     def softmax_part0(self, S, M):
@@ -1260,6 +1276,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     v = kv_loader.load_v_from_shared(
         wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id
     )
+    v = pgm.mask_v(v, pgm.tile_end - 1)
     acc = pgm.compute_pv(p, v, acc)
 
     return M, L, acc
@@ -1406,6 +1423,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, tile_end - 3)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
     if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -1430,6 +1448,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, epilogue_t_2)
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, epilogue_t_3)
     if SPLIT_SOFTMAX0_EPI:
@@ -1443,6 +1462,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, epilogue_t_3)
 
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
@@ -1647,6 +1667,7 @@ def attention_loop_tensor_subtile_split(
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, tile_end - 3)
 
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
     qk1 = pgm.compute_qk_subtile(k1_s)
@@ -1694,6 +1715,7 @@ def attention_loop_tensor_subtile_split(
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, epilogue_t_2)
 
     k0_s, k1_s = pgm.split_subtile(k)
 
@@ -1733,6 +1755,7 @@ def attention_loop_tensor_subtile_split(
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    v = pgm.mask_v(v, epilogue_t_3)
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
