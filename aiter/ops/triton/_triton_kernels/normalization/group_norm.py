@@ -15,7 +15,9 @@ def _group_norm_load(
     x = tl.load(x_ptr + base + idx, mask=mask, other=0.0).to(tl.float32)
     if HAS_TEMB:
         c = g * CPG + idx // HW
-        x += tl.load(t_ptr + n * C + c, mask=mask, other=0.0).to(tl.float32)
+        x += tl.load(t_ptr + n.to(tl.int64) * C + c, mask=mask, other=0.0).to(
+            tl.float32
+        )
     return x
 
 
@@ -25,7 +27,7 @@ def _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB: tl.constexpr):
     mean does not cost precision."""
     ref = tl.load(x_ptr + base).to(tl.float32)
     if HAS_TEMB:
-        ref += tl.load(t_ptr + n * C + g * CPG).to(tl.float32)
+        ref += tl.load(t_ptr + n.to(tl.int64) * C + g * CPG).to(tl.float32)
     return ref
 
 
@@ -111,7 +113,7 @@ def _group_norm_stats_kernel(
     n = pid // G
     g = (pid % G).to(tl.int64)
     base = n.to(tl.int64) * C * HW + g * CPG * HW
-    start = s * CHUNK
+    start = s.to(tl.int64) * CHUNK
     end = tl.minimum(start + CHUNK, GS)
     ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB)
     mean, m2, count = _group_norm_chunk_stats(
@@ -194,8 +196,13 @@ def _group_norm_apply_kernel(
         mean, m2, count = tl.reduce((means, m2s, counts), 0, _welford_merge)
     rstd = tl.rsqrt(m2 / count + eps)
 
-    start = s * CHUNK
-    end = tl.minimum(start + CHUNK, GS)
+    if INLINE_STATS:
+        # The grid has one program in s, so the chunk is the full group.
+        start = 0
+        end = GS
+    else:
+        start = s.to(tl.int64) * CHUNK
+        end = tl.minimum(start + CHUNK, GS)
     for off in tl.range(start, end, BLOCK):
         idx = off + tl.arange(0, BLOCK)
         mask = idx < end
