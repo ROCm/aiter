@@ -442,6 +442,14 @@ def _check_output(output, reference):
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
 
 
+def _can_use(pa, output, arguments, options):
+    """can_use_flydsl_pa_decode on a pa_decode call: same arguments, no scale."""
+    query, key, value, context, table, _scale, query_length = arguments
+    return pa.can_use_flydsl_pa_decode(
+        output, query, key, value, context, table, query_length, **options
+    )
+
+
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
     query, key, value, *rest = arguments
     invalid = case["invalid_input"]
@@ -463,6 +471,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         pytest.fail("invalid BF16 inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    arguments = (query, key, value, *rest)
+    assert not _can_use(pa, torch.empty_like(query), arguments, options)
     with pytest.raises(case["error"], match=case["match"]):
         pa.pa_decode(
             torch.empty_like(query),
@@ -473,6 +483,32 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
             work_plan=plan,
             **options,
         )
+
+
+def test_pa_decode_bf16_query_group_past_lds(device):
+    """One query position's GQA rows past 64 KiB of LDS: the predicate
+    declines and pa_decode raises the same ValueError, before codegen."""
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        pytest.skip("the 64 KiB BF16 limit applies to gfx942/gfx950")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    dim, group, page, pages, vector = 1024, 32, 16, 4, 8
+    bf16 = torch.bfloat16
+    query = torch.zeros((1, group, dim), dtype=bf16, device=device)
+    key = torch.zeros(
+        (pages, 1, dim // vector, page, vector), dtype=bf16, device=device
+    )
+    value = torch.zeros(
+        (pages, 1, page // vector, dim, vector), dtype=bf16, device=device
+    )
+    context = torch.tensor([page * pages], dtype=torch.int32, device=device)
+    table = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+    arguments = (query, key, value, context, table, dim**-0.5, 1)
+    options = {"compute_type": bf16}
+    output = torch.empty_like(query)
+    assert not _can_use(pa, output, arguments, options)
+    plan = pa.plan_pa_decode(context, 1, query_length=1)
+    with pytest.raises(ValueError, match="exceeds the 64 KiB LDS limit"):
+        pa.pa_decode(output, *arguments, work_plan=plan, **options)
 
 
 def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
@@ -701,6 +737,7 @@ def test_pa_decode(case, device, monkeypatch):
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
     output = torch.full_like(query, float("nan"))
+    assert _can_use(pa, output, arguments, options)
     workspace = {}
     if case["capture"]:
         scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
