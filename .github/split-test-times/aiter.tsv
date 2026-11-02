@@ -13,7 +13,7 @@ op_tests/test_batched_gemm_bf16.py	125
 op_tests/test_build_targets_architecture.py	4
 op_tests/test_causal_conv1d_prefill_split_qkv.py	21
 op_tests/test_causal_conv1d_update.py	40
-op_tests/test_concat_cache_mla.py	529
+op_tests/test_concat_cache_mla.py	624
 op_tests/test_concat_cache_mla_seg.py	4
 op_tests/test_cpp_extension_rocm_headers.py	1
 op_tests/test_deepgemm.py	17
@@ -73,7 +73,7 @@ op_tests/test_gemm_a4w4.py	8
 op_tests/test_gemm_a4w6.py	8
 op_tests/test_gemm_a6w4.py	5
 op_tests/test_gemm_a6w6.py	12
-op_tests/test_gemm_a8w8.py	271
+op_tests/test_gemm_a8w8.py	1880
 op_tests/test_gemm_a8w8_blockscale.py	115
 op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py	4
 op_tests/test_gemm_a8w8_blockscale_fallback.py	4
@@ -182,7 +182,7 @@ op_tests/test_sampling.py	31
 op_tests/test_situv2_and_mul_quant.py	9
 op_tests/test_smoothquant.py	9
 op_tests/test_split_gdr_update.py	4
-op_tests/test_topk_per_row.py	966
+op_tests/test_topk_per_row.py	2205
 op_tests/test_topk_per_row_stable.py	69
 op_tests/test_topk_plain.py	65
 op_tests/test_topk_row_prefill.py	5
