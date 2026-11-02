@@ -1,6 +1,8 @@
-# FlyDSL all-reduce kernels
+# FlyDSL all-reduce and all-to-all kernels
 
-This directory contains the FlyDSL all-reduce kernels for gfx942 and gfx950.
+This directory contains the FlyDSL all-reduce and all-to-all kernels for gfx942
+and gfx950. Most of this document is about the all-reduce; the all-to-all has
+its own section, [All-to-all](#all-to-all).
 The kernels support bf16 payloads and world sizes (TP) of 2, 4 and 8 in one
 node.
 
@@ -18,6 +20,8 @@ node.
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 | `protocol.py` | The flag protocol and the LDS fanout built on `transport.py`: the publish and the wait (multi-peer, and single-peer for the ring), the colour sequence, and the striped or contiguous fanout. The mesh and the ring use them. |
 | `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
+| `quick_alltoall_mesh.py` | The equal-split **mesh** all-to-all kernel. |
+| `quick_alltoall_ring.py` | The equal-split **shifted-pairwise** all-to-all kernel. |
 
 The host classes are in `aiter/ops/flydsl/`:
 
@@ -27,6 +31,8 @@ The host classes are in `aiter/ops/flydsl/`:
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+| `quick_alltoall.py` | `FlyQuickAllToAll`, the host class for the all-to-all kernels. |
+| `alltoall_policy.py` | The all-to-all limits, tuning ladders and dispatch policy. |
 
 The dispatchers are in `aiter/dist/device_communicators/`:
 
@@ -35,6 +41,7 @@ The dispatchers are in `aiter/dist/device_communicators/`:
 | `custom_all_reduce.py` | `CustomAllreduce`. It owns the exact one-shot, plain and fused. |
 | `quick_all_reduce.py` | `QuickAllReduce`. It owns the quantized mesh and ring, plain and fused. |
 | `flydsl_backends.py` | `FlyDSLAllReduceRMSNorm`, the fused backend. `CustomAllreduce` and `QuickAllReduce` each own one instance. |
+| `quick_all_to_all.py` | `QuickAllToAll`, the FlyDSL all-to-all slot of `CudaCommunicator.all_to_all`. |
 
 ## Kernels
 
@@ -418,6 +425,7 @@ what a test does:
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
 | `op_tests/multigpu_tests/test_flydsl_quick_allreduce.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+| `op_tests/multigpu_tests/test_flydsl_quick_alltoall.py` | All-to-all mesh and ring | `rccl` (PyNccl) and `rccl_c10d` (`all_to_all_single`) |
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
@@ -456,6 +464,39 @@ process. Each candidate is a CUDA graph of 10 back-to-back calls. The test
 times the replays in rounds and rotates the order of the candidates in each
 round. `op_tests/multigpu_tests/flydsl_allreduce_bench.py` describes the method
 and how it prevents bias in the comparison.
+
+## All-to-all
+
+`FlyQuickAllToAll` is an equal-split all-to-all: the semantics of
+`torch.distributed.all_to_all_single` without split sizes. Rank `r`'s output
+chunk `i` is rank `i`'s input chunk `r`. It reuses the all-reduce's tile
+geometry, inbox policy, codecs and flag protocol (`transport.py`,
+`quick_allreduce_codec.py`, `protocol.py`). There is one phase, so the inbox
+is double-buffered on the colour's parity.
+
+- The **mesh** pushes each tile's share to all `N-1` peers at once.
+- The **ring** is shifted pairwise: `N-1` steps, each to a single peer, as one
+  contiguous run. Nothing is forwarded, so the wire volume is the minimal
+  `(N-1)/N` of the payload.
+
+The wire formats are `none` (register-direct, byte-exact for any dtype),
+`int4` and `int6` (bf16 only, lossy), and `fp16` (lossless, LDS-staged; it
+isolates the transport from the codec in tests).
+
+`CudaCommunicator.all_to_all` tries FlyDSL first, then PyNccl, then c10d. The
+FlyDSL slot is opt-in:
+
+| Variable | Effect |
+|---|---|
+| `AITER_FLY_A2A=1` | Enable. Anything else leaves every all-to-all on RCCL. |
+| `AITER_FLY_A2A_CODEC` | `none` (default), `int4` or `int6`. |
+| `AITER_FLY_A2A_ALGORITHM` | `auto` (default: the mesh, and the ring from `RING_FROM_BYTES`), `mesh` or `ring`. |
+| `AITER_FLY_A2A_MIN_BYTES`, `AITER_FLY_A2A_MAX_BYTES` | The payload window per rank; outside it the call falls through to RCCL. |
+| `AITER_FLY_A2A_RING_MIN_BYTES` | Under `auto`, where the ring takes over from the mesh. |
+
+Like the all-reduce backends, `QuickAllToAll` votes on every rank's plan before
+any engine collective, so a rank whose settings differ disables the slot on
+every rank instead of leaving its peers waiting.
 
 ## Notes
 

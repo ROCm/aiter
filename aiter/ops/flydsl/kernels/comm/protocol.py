@@ -3,11 +3,13 @@
 
 """Flag protocol and fanout helpers that the flag-based collectives share.
 
-The mesh and ring kernels stage a packet in LDS, store it to one or more peer
-inboxes, colour a flag behind it, and spin on the flags their peers colour in
-their own inbox. This module holds those steps: the fanout from LDS, the
-publish, the wait and the colour sequence. The primitives under them, and the
-cache policy that decides their fences, are in ``transport``.
+The mesh and ring kernels, all-reduce and all-to-all, stage a packet in LDS
+(or keep it in registers), store it to one or more peer inboxes, colour a flag
+behind it, and spin on the flags their peers colour in their own inbox. This
+module holds those steps: the fanout, the publish, the wait and the colour
+sequence, and the slot and chunk addressing the all-to-alls add. The primitives
+under them, and the cache policy that decides their fences, are in
+``transport``.
 
 The helpers that branch or spin on traced values are ``@flyc.jit``: a kernel
 body gets the AST rewrite, but the functions it calls do not. Inside a trace,
@@ -25,6 +27,7 @@ from .transport import (
     _acquire_inbox,
     _i32_to_bytes,
     _load_flag,
+    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
@@ -72,6 +75,35 @@ def next_color(color, *, parity_safe: bool = False):
     if color == fx.Int32(0):
         color = fx.Int32(2 if parity_safe else 1)
     return color
+
+
+def parity_slot_i32(parity, bid, src, *, grid: int, n_src: int, wire_tile_i32: int):
+    """i32 offset of the double-buffered wire slot ``[parity][bid][src]``.
+
+    Plain arithmetic rather than ``crd2idx`` on a 3-D layout: at ``grid == 1``
+    the middle mode is unit and gets coalesced away, after which a
+    three-coordinate lookup silently returns a wrong (negative) index.
+    """
+    return (
+        parity * fx.Int32(grid * n_src * wire_tile_i32)
+        + bid * fx.Int32(n_src * wire_tile_i32)
+        + fx.Int32(src) * fx.Int32(wire_tile_i32)
+    )
+
+
+def chunk_payload_io(
+    inp_ptr, out_ptr, chunk_bytes, chunk, num_tiles, atoms, block, tid, **codec
+):
+    """``_payload_io`` over chunk *chunk* of an equal-split buffer.
+
+    Both tensors are rebased to ``chunk * chunk_bytes`` and bounded by
+    *chunk_bytes*, so a partial last tile reads 0 and drops its stores rather
+    than spilling into the neighbouring chunk.
+    """
+    off = fx.Int64(chunk) * chunk_bytes
+    return _payload_io(
+        inp_ptr + off, out_ptr + off, chunk_bytes, num_tiles, atoms, block, tid, **codec
+    )
 
 
 @flyc.jit
@@ -203,6 +235,18 @@ def fanout_contiguous(
             )
             byte_off = _i32_to_bytes(slot_i32() + flat)
             _store_v4i32_peer(dest_base + byte_off, v4, payload_policy)
+
+
+def fanout_registers(stores, payload_policy):
+    """Register-direct fanout: ``stores`` is ``[(byte address, i32x4)]``, issued
+    in list order.
+
+    No LDS: when a thread's 16 B lands at the same offset in every destination,
+    it can go straight from registers. The caller's list order is the fabric
+    knob (one destination at a time, or interleaved).
+    """
+    for addr, vec in stores:
+        _store_v4i32_peer(addr, vec, payload_policy)
 
 
 def _drain_and_release(release_scope):

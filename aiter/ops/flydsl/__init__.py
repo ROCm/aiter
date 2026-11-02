@@ -36,6 +36,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
+    "FlyQuickAllToAll": (".quick_alltoall", "FlyQuickAllToAll"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "PreshuffledA16WFP4Weight": (
@@ -182,6 +183,7 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "DenseGemmConfig",
     "FlyQuickAllReduce",
+    "FlyQuickAllToAll",
     "Fp4MqaPlan",
     "GateMode",
     "OneShotAllReduce",

@@ -410,7 +410,8 @@ def test_reuse_flag_disagreement_asserts():
 # *different* coordinator is still reducing over.
 # --------------------------------------------------------------------------- #
 class _RecordingComm:
-    """Stands in for qr_comm/ca_comm, counting close() so destroy can be graded."""
+    """Stands in for qr_comm/ca_comm/fly_a2a_comm, counting close() so destroy can
+    be graded."""
 
     def __init__(self):
         self.closed = 0
@@ -422,7 +423,7 @@ class _RecordingComm:
 def _run_real_destroy(owns: bool):
     """Drive the real ``CudaCommunicator.destroy`` over recording comms.
 
-    ``__new__`` plus the four attributes destroy() touches, rather than a real
+    ``__new__`` plus the five attributes destroy() touches, rather than a real
     construction: the behaviour under test is the ownership branch, and building
     a genuine communicator would need a process group and two GPUs to reach it.
     """
@@ -432,12 +433,13 @@ def _run_real_destroy(owns: bool):
     comm.pynccl_comm = None
     comm.qr_comm = _RecordingComm()
     comm.ca_comm = _RecordingComm()
+    comm.fly_a2a_comm = _RecordingComm()
     comm._owns_comms = owns
     comm._all2all_manager = None
 
-    qr, ca = comm.qr_comm, comm.ca_comm
+    qr, ca, a2a = comm.qr_comm, comm.ca_comm, comm.fly_a2a_comm
     CudaCommunicator.destroy(comm)
-    return comm, qr, ca
+    return comm, qr, ca, a2a
 
 
 def test_destroy_closes_owned_allreduce_comms():
@@ -447,9 +449,10 @@ def test_destroy_closes_owned_allreduce_comms():
     collection, which can land after the process group is gone -- both slots can
     hold inboxes opened against every peer.
     """
-    comm, qr, ca = _run_real_destroy(owns=True)
-    assert (qr.closed, ca.closed) == (1, 1)
+    comm, qr, ca, a2a = _run_real_destroy(owns=True)
+    assert (qr.closed, ca.closed, a2a.closed) == (1, 1, 1)
     assert comm.qr_comm is None and comm.ca_comm is None
+    assert comm.fly_a2a_comm is None
 
 
 def test_destroy_leaves_borrowed_allreduce_comms_open():
@@ -458,10 +461,11 @@ def test_destroy_leaves_borrowed_allreduce_comms_open():
     Under reuse the two coordinators share one pair of communicators, so closing
     here would pull the inboxes out from under the group that built them.
     """
-    comm, qr, ca = _run_real_destroy(owns=False)
-    assert (qr.closed, ca.closed) == (0, 0)
+    comm, qr, ca, a2a = _run_real_destroy(owns=False)
+    assert (qr.closed, ca.closed, a2a.closed) == (0, 0, 0)
     # Still cleared: the borrower must not keep a live handle either.
     assert comm.qr_comm is None and comm.ca_comm is None
+    assert comm.fly_a2a_comm is None
 
 
 def test_destroy_is_idempotent():
@@ -470,9 +474,9 @@ def test_destroy_is_idempotent():
     second hipIpcCloseMemHandle over the same peers."""
     from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
 
-    comm, qr, ca = _run_real_destroy(owns=True)
+    comm, qr, ca, a2a = _run_real_destroy(owns=True)
     CudaCommunicator.destroy(comm)
-    assert (qr.closed, ca.closed) == (1, 1)
+    assert (qr.closed, ca.closed, a2a.closed) == (1, 1, 1)
 
 
 # --------------------------------------------------------------------------- #
