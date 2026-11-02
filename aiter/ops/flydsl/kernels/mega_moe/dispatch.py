@@ -249,12 +249,14 @@ def _configure_payload_geometry(
     fz_total_experts,
     payload_chunk_rows,
     dispatch_blocks,
+    num_waves=1,
 ):
     local_hist = ptr_buf_tensor(addr_local_hist, fx.Int32)
     chunk_counts = ptr_buf_tensor(addr_chunk_counts, fx.Int32)
     block_counts = ptr_buf_tensor(addr_block_counts, fx.Int32)
     max_blocks = fx.Int32(dispatch_blocks // fz_npes)
-    for destination in range_constexpr(fz_npes):
+
+    def configure_destination(destination, chunk_counts, block_counts):
         max_source_count = fx.Int32(0)
         for local_expert in range(lane, fz_epr, 64):
             ge = fx.Int32(destination * fz_epr) + local_expert
@@ -279,6 +281,14 @@ def _configure_payload_geometry(
             # Tasks are flattened as chunk x expert. Even one chunk contains
             # enough independent expert tasks to keep every producer useful.
             block_counts[fx.Int32(destination)] = max_blocks
+
+    if const_expr(num_waves > 1):
+        warp = fx.thread_idx.x >> fx.Int32(6)
+        for destination in range(warp, fx.Int32(fz_npes), fx.Int32(num_waves)):
+            configure_destination(destination, chunk_counts, block_counts)
+    else:
+        for destination in range_constexpr(fz_npes):
+            configure_destination(fx.Int32(destination), chunk_counts, block_counts)
 
 
 @flyc.jit
@@ -806,6 +816,7 @@ def _derive_next_fanout_pairs(
     parity,
     lane,
     *,
+    num_waves=1,
     npes,
     epr,
     total_experts,
@@ -821,7 +832,7 @@ def _derive_next_fanout_pairs(
     counts = ptr_buf_tensor(addr_count_matrix, fx.Int32)
     next_parity = parity ^ fx.Int32(1)
     score_stride = fx.Int32(epr + 1)
-    for destination in range_constexpr(npes):
+    def derive_destination(destination):
         (
             current_mask,
             current_pair_a,
@@ -955,6 +966,13 @@ def _derive_next_fanout_pairs(
                 next_parity * fx.Int32(npes) + fx.Int32(destination),
                 packed,
             )
+    if const_expr(num_waves > 1):
+        warp = fx.thread_idx.x >> fx.Int32(6)
+        for destination in range(warp, fx.Int32(npes), fx.Int32(num_waves)):
+            derive_destination(destination)
+    else:
+        for destination in range_constexpr(npes):
+            derive_destination(fx.Int32(destination))
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     comm_ops.fence_agent_release()
 
@@ -965,6 +983,8 @@ def emit_dispatch_plan(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
     i32_cur_tok, addr_in_idx, parity, expected,
     dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
+    parallel_fanout=False,
+    defer_fanout_to_quant=False,
 ):
 # fmt: on
     """Build a destination-owned compact plan in one producer-only CTA."""
@@ -1043,7 +1063,8 @@ def emit_dispatch_plan(
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
 
-    if warp == fx.Int32(0):
+    geometry_waves = num_waves if parallel_fanout else 1
+    if warp < fx.Int32(geometry_waves):
         _configure_payload_geometry(
             a_lh,
             a_payload_chunks_per_destination,
@@ -1054,6 +1075,7 @@ def emit_dispatch_plan(
             fz_total_experts=fz_total_experts,
             payload_chunk_rows=payload_chunk_rows,
             dispatch_blocks=dispatch_blocks,
+            num_waves=geometry_waves,
         )
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
@@ -1089,17 +1111,34 @@ def emit_dispatch_plan(
             )
         comm_ops.fence_system_acquire()
 
+        if const_expr(not parallel_fanout):
+            _derive_next_fanout_pairs(
+                a_bc, addr_pair_config, parity, lane, npes=fz_npes,
+                epr=fz_epr, total_experts=fz_total_experts,
+                total_segments=total_segments,
+            )
+
+    # COUNT_DONE is observed by wave 0, but all waves read the gathered
+    # histogram below. Converge before each wave's system acquire, then
+    # distribute independent destination reductions instead of serializing
+    # every next-launch fanout choice on the planner wave.
+    if const_expr(parallel_fanout and not defer_fanout_to_quant):
+        fx.barrier()
+        comm_ops.fence_system_acquire()
         _derive_next_fanout_pairs(
             a_bc,
             addr_pair_config,
             parity,
             lane,
+            num_waves=num_waves,
             npes=fz_npes,
             epr=fz_epr,
             total_experts=fz_total_experts,
             total_segments=total_segments,
         )
+        fx.barrier()
 
+    if warp == fx.Int32(0):
         num_valid_buffer = ptr_buf_tensor(a_nv, fx.Int32)
         row_carry = fx.Int32(0)
         max_expert_tiles = fx.Int32(0)
