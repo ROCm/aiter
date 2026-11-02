@@ -186,7 +186,6 @@ def test_stage2_scratch_never_shares_live_memory(monkeypatch):
     and scale) or streams, and must not be handed to a graph being captured."""
     import aiter.fused_moe as fm
 
-    monkeypatch.delenv("AITER_FLYDSL_STAGE2_WORKSPACE", raising=False)
     monkeypatch.setattr(fm, "_STAGE2_SCRATCH", {})
     dev = torch.device("cuda", torch.cuda.current_device())
     target = fm._stage2_scratch("target", (64, 64), torch.uint8, dev)

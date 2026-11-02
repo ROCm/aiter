@@ -3222,10 +3222,7 @@ def _stage2_scratch(slot, shape, dtype, device):
     """Reusable scatter/reduce target: it is consumed before the wrapper returns,
     and allocating it per call (~2 GiB at 16K tokens for DeepSeek-R1) can OOM a
     fragmented, capped caching allocator. Graph capture allocates as before."""
-    if (
-        os.environ.get("AITER_FLYDSL_STAGE2_WORKSPACE", "1") == "0"
-        or torch.cuda.is_current_stream_capturing()
-    ):
+    if torch.cuda.is_current_stream_capturing():
         return torch.empty(shape, dtype=dtype, device=device)
     nbytes = math.prod(shape) * dtype.itemsize
     key = (device, torch.cuda.current_stream(device).cuda_stream, slot)
