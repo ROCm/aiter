@@ -2,6 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
+import logging
 import os
 from dataclasses import replace
 
@@ -27,6 +28,8 @@ from .quant import per_1x32_mx_quant
 
 __all__ = ["MegaMoEV2"]
 
+logger = logging.getLogger(__name__)
+
 
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
@@ -39,8 +42,13 @@ class MegaMoEV2:
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", stage2_p2p_quant: str = "auto",
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
-        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+        stage2_sdma: bool | None = None):
     # fmt: on
+        """``stage2_sdma``: run Stage2 + combine through the SDMA copy engines
+        (``stage2_sdma.MegaMoESdmaStage2``); None reads AITER_MEGA_STAGE2_SDMA. An
+        unsupported configuration, or a mori without SDMA queues, keeps the default
+        Stage2 with a warning."""
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
@@ -113,6 +121,9 @@ class MegaMoEV2:
         self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
+        self._sdma_stage2 = None
+        if envs.AITER_MEGA_STAGE2_SDMA if stage2_sdma is None else stage2_sdma:
+            self._build_sdma_stage2()
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
@@ -502,6 +513,33 @@ class MegaMoEV2:
             out_dtype=self._a_dtype,
         )
 
+    def _build_sdma_stage2(self):
+        from .stage2_sdma import MegaMoESdmaStage2, sdma_stage2_unsupported_reason
+
+        reason = sdma_stage2_unsupported_reason(self)
+        if reason is None:
+            try:
+                self._sdma_stage2 = MegaMoESdmaStage2(
+                    self,
+                    chunk_tiles=envs.AITER_MEGA_SDMA_CHUNK_TILES,
+                    row_slack=envs.AITER_MEGA_SDMA_ROW_SLACK,
+                )
+            except RuntimeError as exc:
+                reason = str(exc)
+        if reason is not None:
+            logger.warning("MegaMoEV2: SDMA Stage2 unavailable (%s); using the default Stage2", reason)
+
+    @property
+    def stage2_sdma(self) -> bool:
+        """Whether Stage2 + combine run through the SDMA copy engines."""
+        return self._sdma_stage2 is not None
+
+    def close(self):
+        """Release the SDMA Stage2's communicator (after the peers have read its data)."""
+        if self._sdma_stage2 is not None:
+            self._sdma_stage2.close()
+            self._sdma_stage2 = None
+
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         entry = self._bundle_plan.entry_for_tokens(tokens)
         config = entry.config
@@ -748,6 +786,14 @@ class MegaMoEV2:
         self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
     ):
         """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
+        if self._sdma_stage2 is not None:
+            # A -1 slot is never dispatched, so it has no row and adds nothing: the SDMA
+            # combine needs no ids.
+            out = self._sdma_stage2.run(
+                run_tokens, config, torch.cuda.current_stream() if stream is None else stream
+            )
+            self._g2_active_block_m = self._sdma_stage2.block_m
+            return out[:run_tokens] if slice_output else out
         if config.stage2.aligned_pair:
             return self._run_aligned_pair_stage2(
                 run_tokens, config, stream, slice_output, combine_ids
