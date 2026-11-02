@@ -31,6 +31,14 @@ struct opus_mla_v4_prefill_kargs
     float softmax_scale;
 };
 
+// gfx950 is JIT compiled and can address O independently of Q. Keep the base
+// layout unchanged for the prebuilt gfx1250 code objects.
+struct opus_mla_v4_prefill_kargs_gfx950 : opus_mla_v4_prefill_kargs
+{
+    int stride_o_n;
+    int stride_o_h;
+};
+
 // Kernel arguments for the split-precision (NoPE fp8 / RoPE bf16) DSA prefill.
 struct opus_mla_v4_prefill_fp8_kargs
 {

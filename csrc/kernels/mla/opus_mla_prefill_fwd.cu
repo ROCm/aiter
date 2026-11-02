@@ -101,7 +101,7 @@ static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& spl
 }
 
 // The bf16/fp16 kernels' shared validation and arguments (`kargs.N` 0: nothing to run).
-static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t* q,
+static opus_mla_v4_prefill_kargs_gfx950 opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t* q,
                                                                   aiter_tensor_t* unified_kv,
                                                                   aiter_tensor_t* kv_indices_prefix,
                                                                   aiter_tensor_t* kv_indptr_prefix,
@@ -165,7 +165,7 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     const int total_tokens = static_cast<int>(kv->size(0));
 
     // ---- Build kernel args -----------------------------------------------
-    opus_mla_v4_prefill_kargs kargs{};
+    opus_mla_v4_prefill_kargs_gfx950 kargs{};
     kargs.q_ptr             = q->data_ptr();
     kargs.unified_kv_ptr    = unified_kv->data_ptr();
     kargs.kv_ptr            = kv->data_ptr();
@@ -184,6 +184,8 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     // head dim contiguous; we already enforced stride(D) == 1 above.
     kargs.stride_qo_n       = static_cast<int>(q->stride(0));
     kargs.stride_qo_h       = static_cast<int>(q->stride(1));
+    kargs.stride_o_n        = static_cast<int>(out->stride(0));
+    kargs.stride_o_h        = static_cast<int>(out->stride(1));
     kargs.stride_kv_page    = static_cast<int>(unified_kv->stride(0));
     AITER_CHECK(kargs.stride_kv_page == static_cast<int>(kv->stride(0)),
                 "unified_kv and kv must share row stride along the D dim");
@@ -212,7 +214,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_indptr_extend, attn_sink, out, softmax_scale, num_splits, partial_o, partial_max,
      partial_sum, stream))
 {
-    const opus_mla_v4_prefill_kargs kargs = opus_mla_v4_prefill_a16w16_kargs(
+    const opus_mla_v4_prefill_kargs_gfx950 kargs = opus_mla_v4_prefill_a16w16_kargs(
         q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
         kv_indptr_extend, attn_sink, out, softmax_scale);
     const int N = kargs.N;
@@ -226,13 +228,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     if(num_splits > 1)
     {
-        const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs> split_kargs{kargs, split};
+        const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs_gfx950> split_kargs{kargs, split};
         auto launch = [&](auto dtype_tag, auto out_tag) {
             using D_ATTN = decltype(dtype_tag);
             if(H <= 32)
             {
                 using Traits =
-                    opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, D_ATTN, true>;
+                    opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, D_ATTN, true, true>;
                 dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
                 opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<Traits>
                     <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
@@ -240,7 +242,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             else
             {
                 using Traits =
-                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, D_ATTN, true>;
+                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, D_ATTN, true, true>;
                 dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
                 opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<Traits>
                     <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
@@ -259,7 +261,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 #define LAUNCH_OPUS_MLA_V4_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)               \
     do {                                                                             \
         auto launch = [&](auto dtype_tag) {                                          \
-            using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag)>; \
+            using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag), false, true>; \
             const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M); \
             dim3 grid(N, num_h_blocks, 1);                                           \
             dim3 block(Traits::BLOCK_SIZE);                                          \
@@ -746,6 +748,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         return;
 
     // ---- Build kernel args -----------------------------------------------
+    AITER_CHECK(num_splits > 1 ||
+                    (q->stride(0) == out->stride(0) && q->stride(1) == out->stride(1)),
+                "the gfx1250 bf16 code object requires matching Q/O strides without split-K");
     opus_mla_v4_prefill_kargs args{};
     args.q_ptr             = q->data_ptr();
     args.unified_kv_ptr    = unified_kv->data_ptr();

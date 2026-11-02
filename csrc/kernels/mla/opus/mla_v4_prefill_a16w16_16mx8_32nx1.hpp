@@ -1044,7 +1044,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::kargs_type args) {
-    const opus_mla_v4_prefill_kargs kargs = opus_mla_prefill_base(args);
+    const auto kargs = opus_mla_prefill_base(args);
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
@@ -1159,12 +1159,20 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    int stride_o_n = kargs.stride_qo_n;
+    int stride_o_h = kargs.stride_qo_h;
+    if constexpr(T::SEPARATE_OUT_STRIDES)
+    {
+        stride_o_n = kargs.stride_o_n;
+        stride_o_h = kargs.stride_o_h;
+    }
+    const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * stride_o_n + static_cast<int64_t>(h_block_start) * stride_o_h;
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * stride_o_h * sizeof(D_ATTN));
     // Recompute lane/warp decomposition to prevent CSE with Q-load layout
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
+    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, stride_o_h);
     auto v_o_attn = cast<D_ATTN>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
