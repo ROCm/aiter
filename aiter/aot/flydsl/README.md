@@ -13,6 +13,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
+| `pa_decode_plan.py` | — | Standalone, not part of the AOT build: every PA decode planner kernel up to a `max_batch_size` (default 4096) |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 | `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
@@ -155,6 +156,20 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
+clipped to `max_batch_size` and the arch's LDS), block size (64 to 1024
+threads, from the plan's task capacity) and dense/windowed mode; batch,
+capacity, partition cap and window are passed at launch. The standalone
+`pa_decode_plan` script compiles the whole set for each arch; `run_aot` does
+not include it. Pass the `max_batch_size` the server plans with.
+
+```bash
+# every planner kernel up to the default max_batch_size (4096)
+python -m aiter.aot.flydsl.pa_decode_plan
+# a larger cap, one arch
+python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 32768 --arch gfx950
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
