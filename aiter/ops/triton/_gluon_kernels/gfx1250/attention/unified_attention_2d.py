@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
@@ -66,6 +68,14 @@ class AttentionConfig:
 
     Q_FP8: gl.constexpr
     KV_FP8: gl.constexpr
+    Q_NVFP4: gl.constexpr
+    KV_NVFP4: gl.constexpr
+    HEAD_SIZE_Q: gl.constexpr
+    SCALE_K_WIDTH: gl.constexpr
+    q_scales_layout: gl.constexpr
+    k_scales_layout: gl.constexpr
+    v_packed_layout: gl.constexpr
+    v_scales_layout: gl.constexpr
     FP8_DOT: gl.constexpr
     K_WIDTH_QK: gl.constexpr
     K_WIDTH_PV: gl.constexpr
@@ -118,6 +128,8 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        Q_NVFP4=False,
+        KV_NVFP4=False,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -203,6 +215,80 @@ class AttentionConfig:
         self.p_layout = gl.constexpr(
             gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH_PV)
         )
+
+        self.Q_NVFP4 = gl.constexpr(Q_NVFP4)
+        self.KV_NVFP4 = gl.constexpr(KV_NVFP4)
+        # Q elements per row in memory: packed e2m1 holds two per byte
+        self.HEAD_SIZE_Q = gl.constexpr(HEAD_SIZE // 2 if Q_NVFP4 else HEAD_SIZE)
+        if KV_NVFP4:
+            # A8W4 / A4W4 on an NVFP4 KV cache: e2m1 values with one e4m3 scale per 16, shuffled, 128-token pages.
+            # QK: scaled WMMA, K packed 16 bytes (32 values) per lane, S in the unpacked 16x16x128 layout.
+            # PV: BF16 16x16x32 WMMA on V upcast to bf16 and multiplied by its scales; P in bf16.
+            assert SHUFFLED_KV_CACHE and BLOCK_SIZE == 128 and TILE_SIZE == BLOCK_SIZE
+            assert Q_FP8 or Q_NVFP4
+            self.K_WIDTH_QK = gl.constexpr(16)
+            self.K_WIDTH_PV = gl.constexpr(16)
+            self.qk_layout = gl.constexpr(
+                gl.amd.AMDWMMALayout(
+                    version=3,
+                    transposed=True,
+                    instr_shape=[16, 16, 128],
+                    warp_bases=warp_bases,
+                )
+            )
+            qk_packed_layout = gl.amd.AMDWMMALayout(
+                version=3, transposed=True, instr_shape=[16, 16, 64], warp_bases=warp_bases
+            )
+            self.pv_layout = gl.constexpr(
+                gl.amd.AMDWMMALayout(
+                    version=3, transposed=True, instr_shape=[16, 16, 32], warp_bases=warp_bases
+                )
+            )
+            self.q_layout = gl.constexpr(
+                gl.DotOperandLayout(0, qk_packed_layout if Q_NVFP4 else self.qk_layout, 16)
+            )
+            self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_packed_layout, 16))
+            self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, 16))
+            self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, 16))
+            self.q_scales_layout = gl.constexpr(
+                gl.amd.gfx1250.get_wmma_scale_layout(
+                    self.q_layout, [BLOCK_M, HEAD_SIZE // 16], scale_factor=16
+                )
+            )
+            self.k_scales_layout = gl.constexpr(
+                gl.amd.gfx1250.get_wmma_scale_layout(
+                    self.k_layout, [BLOCK_SIZE, HEAD_SIZE // 16], scale_factor=16
+                )
+            )
+            # 8 packed bytes (16 e2m1) per lane: unpacks to the k_width-16 bf16 V operand
+            self.v_packed_layout = gl.constexpr(
+                gl.DotOperandLayout(
+                    1,
+                    gl.amd.AMDWMMALayout(
+                        version=3, transposed=True, instr_shape=[16, 16, 64], warp_bases=warp_bases
+                    ),
+                    8,
+                )
+            )
+            # V scales broadcast over the 16 values of their group, in the V operand's register order (key rows,
+            # then head-dim groups). Warps split M, so every warp holds all of V: zero warp bases.
+            self.v_scales_layout = gl.constexpr(
+                gl.DistributedLinearLayout(
+                    reg_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [32, 0, 0], [64, 0, 0]]
+                    + [[0, 2**v, 0] for v in range(int(math.log2(HEAD_SIZE // 16)))],
+                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [16, 0, 0]],
+                    warp_bases=[[0, 0, 0]] * int(math.log2(NUM_WARPS)),
+                    block_bases=[],
+                    shape=[BLOCK_SIZE, HEAD_SIZE // 16, 16],
+                )
+            )
+            self.SCALE_K_WIDTH = gl.constexpr(min(16, HEAD_SIZE // 16))
+        else:
+            self.q_scales_layout = gl.constexpr(None)
+            self.k_scales_layout = gl.constexpr(None)
+            self.v_packed_layout = gl.constexpr(None)
+            self.v_scales_layout = gl.constexpr(None)
+            self.SCALE_K_WIDTH = gl.constexpr(0)
 
         ELEMENT_SIZE = 8 if Q_FP8 else 16
         MAX_LOAD = 128
@@ -290,6 +376,11 @@ class TDMKVLoader:
     v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     kv_head_idx: gl.tensor
     block_table_stride: gl.tensor
+    # NVFP4 KV only (aliases of the K / V ones otherwise)
+    k_scales_shared: gl.shared_memory_descriptor
+    v_scales_shared: gl.shared_memory_descriptor
+    k_scales_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    v_scales_desc: gl.amd.gfx1250.tdm.tensor_descriptor
 
     @gluon.constexpr_function
     def __init__(
@@ -303,6 +394,10 @@ class TDMKVLoader:
         v_desc,
         kv_head_idx,
         block_table_stride,
+        k_scales_shared=None,
+        v_scales_shared=None,
+        k_scales_desc=None,
+        v_scales_desc=None,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -313,6 +408,10 @@ class TDMKVLoader:
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
         self.kv_head_idx = kv_head_idx
         self.block_table_stride = block_table_stride
+        self.k_scales_shared = k_scales_shared if k_scales_shared is not None else k_shared
+        self.v_scales_shared = v_scales_shared if v_scales_shared is not None else v_shared
+        self.k_scales_desc = k_scales_desc if k_scales_desc is not None else k_desc
+        self.v_scales_desc = v_scales_desc if v_scales_desc is not None else v_desc
 
     @gluon.jit
     def initialize(
@@ -325,60 +424,146 @@ class TDMKVLoader:
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
+        if cfg.KV_NVFP4:
+            return TDMKVLoader.initialize_nvfp4(
+                cfg,
+                kv_cfg,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr_shifted,
+                kv_head_idx,
+                block_table_stride,
+            )
+        else:
+            k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=key_cache_ptr,
+                shape=(
+                    (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    if cfg.SHUFFLED_KV_CACHE
+                    else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
+                ),
+                strides=(cfg.stride_k_cache_1, 1),
+                block_shape=(
+                    (1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    if cfg.SHUFFLED_KV_CACHE
+                    else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE)
+                ),
+                layout=kv_cfg.shared_k_layout,
+            )
+            v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=value_cache_ptr,
+                shape=(
+                    (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    if cfg.SHUFFLED_KV_CACHE
+                    else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
+                ),
+                strides=(cfg.stride_v_cache_1, 1),
+                block_shape=(
+                    (1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    if cfg.SHUFFLED_KV_CACHE
+                    else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE)
+                ),
+                layout=kv_cfg.shared_v_layout,
+            )
+
+            if cfg.SHUFFLED_KV_CACHE:
+                k_shared = gl.allocate_shared_memory(
+                    key_cache_ptr.type.element_ty,
+                    [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                    layout=kv_cfg.shared_k_layout,
+                )
+                v_shared = gl.allocate_shared_memory(
+                    value_cache_ptr.type.element_ty,
+                    [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                    layout=kv_cfg.shared_v_layout,
+                )
+            else:
+                k_shared = gl.allocate_shared_memory(
+                    key_cache_ptr.type.element_ty,
+                    [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
+                    layout=kv_cfg.shared_k_layout,
+                )
+                v_shared = gl.allocate_shared_memory(
+                    value_cache_ptr.type.element_ty,
+                    [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
+                    layout=kv_cfg.shared_v_layout,
+                )
+
+            return TDMKVLoader(
+                cfg,
+                kv_cfg,
+                block_tables_ptr_shifted,
+                k_shared,
+                v_shared,
+                k_desc,
+                v_desc,
+                kv_head_idx,
+                block_table_stride,
+            )
+
+    @gluon.jit
+    def initialize_nvfp4(
+        cfg,
+        kv_cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        block_table_stride,
+    ):
+        # A shuffled NVFP4 page row (one block, one KV head) is BLOCK_SIZE * HEAD_SIZE / 2 bytes of packed e2m1
+        # followed by BLOCK_SIZE * HEAD_SIZE / 16 e4m3 scales; each part gets its own descriptor and LDS buffer.
+        DATA: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2
+        SCALES: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 16
+        ROWS = cfg.num_blocks * cfg.NUM_KV_HEADS
         k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=key_cache_ptr,
-            shape=(
-                (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
-                if cfg.SHUFFLED_KV_CACHE
-                else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
-            ),
+            shape=(ROWS, DATA),
             strides=(cfg.stride_k_cache_1, 1),
-            block_shape=(
-                (1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
-                if cfg.SHUFFLED_KV_CACHE
-                else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE)
-            ),
+            block_shape=(1, DATA),
             layout=kv_cfg.shared_k_layout,
         )
         v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=value_cache_ptr,
-            shape=(
-                (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
-                if cfg.SHUFFLED_KV_CACHE
-                else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
-            ),
+            shape=(ROWS, DATA),
             strides=(cfg.stride_v_cache_1, 1),
-            block_shape=(
-                (1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
-                if cfg.SHUFFLED_KV_CACHE
-                else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE)
-            ),
+            block_shape=(1, DATA),
             layout=kv_cfg.shared_v_layout,
         )
-
-        if cfg.SHUFFLED_KV_CACHE:
-            k_shared = gl.allocate_shared_memory(
-                key_cache_ptr.type.element_ty,
-                [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
-                layout=kv_cfg.shared_k_layout,
-            )
-            v_shared = gl.allocate_shared_memory(
-                value_cache_ptr.type.element_ty,
-                [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
-                layout=kv_cfg.shared_v_layout,
-            )
-        else:
-            k_shared = gl.allocate_shared_memory(
-                key_cache_ptr.type.element_ty,
-                [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
-                layout=kv_cfg.shared_k_layout,
-            )
-            v_shared = gl.allocate_shared_memory(
-                value_cache_ptr.type.element_ty,
-                [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
-                layout=kv_cfg.shared_v_layout,
-            )
-
+        k_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=key_cache_ptr + DATA,
+            shape=(ROWS, SCALES),
+            strides=(cfg.stride_k_cache_1, 1),
+            block_shape=(1, SCALES),
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=value_cache_ptr + DATA,
+            shape=(ROWS, SCALES),
+            strides=(cfg.stride_v_cache_1, 1),
+            block_shape=(1, SCALES),
+            layout=kv_cfg.shared_v_layout,
+        )
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, 1, DATA],
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, 1, DATA],
+            layout=kv_cfg.shared_v_layout,
+        )
+        k_scales_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, 1, SCALES],
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_scales_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, 1, SCALES],
+            layout=kv_cfg.shared_v_layout,
+        )
         return TDMKVLoader(
             cfg,
             kv_cfg,
@@ -389,6 +574,10 @@ class TDMKVLoader:
             v_desc,
             kv_head_idx,
             block_table_stride,
+            k_scales_shared,
+            v_scales_shared,
+            k_scales_desc,
+            v_scales_desc,
         )
 
     @gluon.jit
@@ -406,6 +595,10 @@ class TDMKVLoader:
         gl.amd.gfx1250.tdm.async_load(
             self.k_desc, offsets, self.k_shared.index(buffer_id)
         )
+        if self.cfg.KV_NVFP4:
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_scales_desc, offsets, self.k_scales_shared.index(buffer_id)
+            )
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
@@ -422,40 +615,89 @@ class TDMKVLoader:
         gl.amd.gfx1250.tdm.async_load(
             self.v_desc, offsets, self.v_shared.index(buffer_id)
         )
+        if self.cfg.KV_NVFP4:
+            gl.amd.gfx1250.tdm.async_load(
+                self.v_scales_desc, offsets, self.v_scales_shared.index(buffer_id)
+            )
+
+    # NVFP4 KV: each page is two TDM loads (data, then scales) for K and for V, so a caller's wait count for
+    # "w later loads may stay in flight" counted in K/V loads becomes 2w + 1 for the data, 2w for the scales.
+
+    @gluon.jit
+    def load_k_scales_from_shared(self, wait_count, buffer_id=0):
+        if self.cfg.KV_NVFP4:
+            gl.amd.gfx1250.tdm.async_wait(2 * wait_count)
+            return (
+                self.lds_unshuffle_scales(self.k_scales_shared, buffer_id)
+                .load(layout=self.cfg.k_scales_layout)
+                .to(gl.float8e4nv, bitcast=True)
+            )
+        else:
+            return None
 
     @gluon.jit
     def load_k_from_shared(
         self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False
     ):
-        if not skip_wait:
-            gl.amd.gfx1250.tdm.async_wait(wait_count)
-        if self.cfg.SHUFFLED_KV_CACHE:
-            return (self.lds_unshuffle_k(buffer_id).load(layout=self.cfg.k_layout)).to(
-                target_dtype
-            )
+        if self.cfg.KV_NVFP4:
+            # packed e2m1, consumed as is by the scaled WMMA
+            gl.amd.gfx1250.tdm.async_wait(2 * wait_count + 1)
+            return self.lds_unshuffle_k(buffer_id).load(layout=self.cfg.k_layout)
         else:
-            return (
-                self.k_shared.index(buffer_id)
-                .permute([1, 0])
-                .load(layout=self.cfg.k_layout)
-            ).to(target_dtype)
+            if not skip_wait:
+                gl.amd.gfx1250.tdm.async_wait(wait_count)
+            if self.cfg.SHUFFLED_KV_CACHE:
+                return (self.lds_unshuffle_k(buffer_id).load(layout=self.cfg.k_layout)).to(
+                    target_dtype
+                )
+            else:
+                return (
+                    self.k_shared.index(buffer_id)
+                    .permute([1, 0])
+                    .load(layout=self.cfg.k_layout)
+                ).to(target_dtype)
 
     @gluon.jit
     def load_v_from_shared(
         self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False
     ):
-        if not skip_wait:
-            gl.amd.gfx1250.tdm.async_wait(wait_count)
-        if self.cfg.SHUFFLED_KV_CACHE:
-            return (self.lds_unshuffle_v(buffer_id).load(layout=self.cfg.v_layout)).to(
-                target_dtype
+        if self.cfg.KV_NVFP4:
+            # V in bf16 for the PV WMMA: e2m1 upcast (unit e8m0 scale), times its e4m3 group scales
+            gl.amd.gfx1250.tdm.async_wait(2 * wait_count + 1)
+            v = gl.amd.gfx1250.load_shared_fp4_repacked(
+                self.lds_unshuffle_v(buffer_id), layout=self.cfg.v_packed_layout
             )
+            gl.amd.gfx1250.tdm.async_wait(2 * wait_count)
+            v_scales = (
+                self.lds_unshuffle_scales(self.v_scales_shared, buffer_id)
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 1))
+                .load(layout=self.cfg.v_scales_layout)
+                .to(gl.float8e4nv, bitcast=True)
+            )
+            v_scales_unit = gl.full(
+                (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE),
+                127,
+                dtype=gl.uint8,
+                layout=self.cfg.v_layout,
+            )  # 1.0 in e8m0
+            v = gl.amd.gfx1250.scaled_upcast(v, v_scales_unit, gl.bfloat16, axis=0)
+            v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 16))
+            v = v * v_scales.to(gl.bfloat16)
+            v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
+            return gl.convert_layout(v, self.cfg.v_layout, assert_trivial=True)
         else:
-            return (
-                self.v_shared.index(buffer_id)
-                .load(layout=self.cfg.v_layout)
-                .to(target_dtype)
-            )
+            if not skip_wait:
+                gl.amd.gfx1250.tdm.async_wait(wait_count)
+            if self.cfg.SHUFFLED_KV_CACHE:
+                return (self.lds_unshuffle_v(buffer_id).load(layout=self.cfg.v_layout)).to(
+                    target_dtype
+                )
+            else:
+                return (
+                    self.v_shared.index(buffer_id)
+                    .load(layout=self.cfg.v_layout)
+                    .to(target_dtype)
+                )
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -467,38 +709,91 @@ class TDMKVLoader:
             return gl.load(self.block_tables_ptr_shifted + i)
 
     @gluon.jit
-    def lds_unshuffle_k(self, buffer_id):
+    def lds_unshuffle_scales(self, scales_shared, buffer_id):
+        # NVFP4 scales of one page: [BLOCK_SIZE, HEAD_SIZE // 16] e4m3 in the shuffle_scale layout
         return (
-            self.k_shared.index(buffer_id)
+            scales_shared.index(buffer_id)
             .reshape(
                 (
-                    self.cfg.NUM_KV_BLOCKS,
-                    self.cfg.HEAD_SIZE // self.cfg.K_WIDTH_QK,
-                    self.cfg.BLOCK_SIZE,
-                    self.cfg.K_WIDTH_QK,
+                    1,
+                    self.cfg.BLOCK_SIZE // 128,
+                    (self.cfg.HEAD_SIZE // 16) // self.cfg.SCALE_K_WIDTH,
+                    128 // 4,
+                    4,
+                    self.cfg.SCALE_K_WIDTH,
                 )
             )
-            .permute((0, 2, 1, 3))
-            .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
-            .permute((1, 0))
+            .permute((0, 1, 4, 3, 2, 5))
+            .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16))
         )
 
     @gluon.jit
-    def lds_unshuffle_v(self, buffer_id):
-        return (
-            self.v_shared.index(buffer_id)
-            .reshape(
-                (
-                    self.cfg.NUM_KV_BLOCKS,
-                    self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH_PV,
-                    self.cfg.HEAD_SIZE,
-                    self.cfg.K_WIDTH_PV,
+    def lds_unshuffle_k(self, buffer_id):
+        if self.cfg.KV_NVFP4:
+            # packed e2m1: [HEAD_SIZE // 2, BLOCK_SIZE] bytes
+            return (
+                self.k_shared.index(buffer_id)
+                .reshape(
+                    (
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.HEAD_SIZE // 2) // (2 * self.cfg.K_WIDTH_QK),
+                        2,
+                        16,
+                        self.cfg.K_WIDTH_QK,
+                    )
                 )
+                .permute((0, 3, 1, 2, 4))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 2))
+                .permute((1, 0))
             )
-            .permute((0, 1, 3, 2))
-            .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
-        )
+        else:
+            return (
+                self.k_shared.index(buffer_id)
+                .reshape(
+                    (
+                        self.cfg.NUM_KV_BLOCKS,
+                        self.cfg.HEAD_SIZE // self.cfg.K_WIDTH_QK,
+                        self.cfg.BLOCK_SIZE,
+                        self.cfg.K_WIDTH_QK,
+                    )
+                )
+                .permute((0, 2, 1, 3))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
+                .permute((1, 0))
+            )
 
+    @gluon.jit
+    def lds_unshuffle_v(self, buffer_id):
+        if self.cfg.KV_NVFP4:
+            # packed e2m1: [BLOCK_SIZE, HEAD_SIZE // 2] bytes
+            return (
+                self.v_shared.index(buffer_id)
+                .reshape(
+                    (
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.HEAD_SIZE // 2) // (2 * self.cfg.K_WIDTH_PV),
+                        2,
+                        16,
+                        self.cfg.K_WIDTH_PV,
+                    )
+                )
+                .permute((0, 3, 1, 2, 4))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 2))
+            )
+        else:
+            return (
+                self.v_shared.index(buffer_id)
+                .reshape(
+                    (
+                        self.cfg.NUM_KV_BLOCKS,
+                        self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH_PV,
+                        self.cfg.HEAD_SIZE,
+                        self.cfg.K_WIDTH_PV,
+                    )
+                )
+                .permute((0, 1, 3, 2))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
+            )
 
 @aggregate
 @strip_annotate
@@ -645,6 +940,10 @@ class TDMGatherKVLoader:
         ).to(target_dtype)
 
     @gluon.jit
+    def load_k_scales_from_shared(self, wait_count, buffer_id=0):
+        return None
+
+    @gluon.jit
     def load_block_ids(self, i):
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             offs = gl.arange(
@@ -705,6 +1004,7 @@ class AttentionProgram:
     cfg: AttentionConfig
 
     q: gl.tensor
+    q_scales: gl.tensor  # NVFP4 KV: the scaled QK WMMA's Q scales (an alias of q otherwise)
 
     key_cache_ptr: gl.tensor
     value_cache_ptr: gl.tensor
@@ -733,9 +1033,11 @@ class AttentionProgram:
         context_len_q_pos_qk,
         QK_scale,
         out_scale,
+        q_scales=None,
     ):
         self.cfg = cfg
         self.q = q
+        self.q_scales = q_scales if q_scales is not None else q
         self.key_cache_ptr = key_cache_ptr
         self.value_cache_ptr = value_cache_ptr
         self.output_ptr = output_ptr
@@ -770,6 +1072,7 @@ class AttentionProgram:
         output_stride_1,
         split_idx=0,
         NUM_SPLITS: gl.constexpr = 1,
+        q_scales=None,
     ):
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
@@ -849,16 +1152,28 @@ class AttentionProgram:
             context_len_q_pos_qk,
             QK_scale,
             out_scale,
+            q_scales,
         )
 
     @gluon.jit
-    def compute_qk(self, k):
+    def compute_qk(self, k, k_scales=None):
         S = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
             dtype=gl.float32,
             layout=self.cfg.qk_layout,
         )
-        return gl.amd.gfx1250.wmma(self.q, k, S)
+        if self.cfg.KV_NVFP4:
+            return gl.amd.gfx1250.wmma_scaled(
+                self.q,
+                self.q_scales,
+                "e2m1" if self.cfg.Q_NVFP4 else "e4m3",
+                k,
+                k_scales,
+                "e2m1",
+                S,
+            )
+        else:
+            return gl.amd.gfx1250.wmma(self.q, k, S)
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -932,10 +1247,11 @@ class AttentionProgram:
     def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
-        if target_dtype != gl.bfloat16:
+        if target_dtype != gl.bfloat16 and not self.cfg.KV_NVFP4:
             p = p.to(target_dtype)
         else:
-            p = p.to(target_dtype, fp_downcast_rounding="rtz")
+            # NVFP4 KV: the PV WMMA is BF16 whatever the Q dtype
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
         return p, L, acc
 
@@ -1211,10 +1527,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         k = kv_loader.load_k_from_shared(
             wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
         )
+        k_scales = kv_loader.load_k_scales_from_shared(
+            wait_count=1, buffer_id=buffer_id
+        )
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-        S = pgm.compute_qk(k)
+        S = pgm.compute_qk(k, k_scales)
         if pgm.cfg.SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
@@ -1234,10 +1553,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             k = kv_loader.load_k_from_shared(
                 wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
             )
+            k_scales = kv_loader.load_k_scales_from_shared(
+                wait_count=1, buffer_id=buffer_id
+            )
             kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
             kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-            S = pgm.compute_qk(k)
+            S = pgm.compute_qk(k, k_scales)
             S = pgm.apply_mask_qk(S, j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
@@ -1254,7 +1576,10 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     k = kv_loader.load_k_from_shared(
         wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
     )
-    S = pgm.compute_qk(k)
+    k_scales = kv_loader.load_k_scales_from_shared(
+        wait_count=1, buffer_id=buffer_id
+    )
+    S = pgm.compute_qk(k, k_scales)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
@@ -1778,7 +2103,7 @@ def load_q(
     if USE_TDM_LOAD and (
         cfg.ARCH_NAME == "gfx1250" or cfg.ARCH_NAME == "gfx1250-strict"
     ):
-        LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
+        LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE_Q
         q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
@@ -1801,7 +2126,7 @@ def load_q(
             q_smem,
         )
         gl.amd.gfx1250.tdm.async_wait(0)
-        q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE]).load(layout=cfg.q_layout)
+        q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE_Q]).load(layout=cfg.q_layout)
     else:
         q = gl.amd.cdna4.buffer_load(
             ptr=query_ptr,
@@ -1850,6 +2175,8 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
         "NUM_BUFFERS",
         "BLOCK_M",
         "LOOP_VARIANT",
+        "Q_NVFP4",
+        "KV_NVFP4",
         "num_warps",
         "waves_per_eu",
     ],
@@ -1919,6 +2246,12 @@ def _unified_attention_gluon_kernel_2d(
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
+    # NVFP4 (uint8: packed e2m1 + per-16 e4m3 scales). KV_NVFP4 with an fp8 Q is A8W4, with Q_NVFP4 A4W4.
+    Q_NVFP4: gl.constexpr = False,
+    KV_NVFP4: gl.constexpr = False,
+    query_scales_ptr=None,  # Q_NVFP4: [num_tokens, num_query_heads, head_size // 16]
+    query_scales_stride_0=0,
+    query_scales_stride_1=0,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -1961,7 +2294,14 @@ def _unified_attention_gluon_kernel_2d(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        Q_NVFP4,
+        KV_NVFP4,
     )
+    if KV_NVFP4:
+        gl.static_assert(
+            LOOP_VARIANT == 0 and TILE_SIZE == BLOCK_SIZE,
+            "NVFP4 KV runs loop variant 0 with one page per tile",
+        )
 
     if SPEC_DECODE:
         # Every seq holds SEQLEN_Q queries, so the launch has exactly
@@ -2004,7 +2344,7 @@ def _unified_attention_gluon_kernel_2d(
         cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
-    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
+    offs_d = gl.arange(0, cfg.HEAD_SIZE_Q, layout=gl.SliceLayout(0, cfg.q_layout))
     query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -2034,6 +2374,34 @@ def _unified_attention_gluon_kernel_2d(
         query_stride_0,
         USE_TDM_LOAD=USE_TDM_LOAD,
     )
+
+    if KV_NVFP4:
+        if Q_NVFP4:
+            # A4W4: Q's e4m3 group scales
+            offs_m_s = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_scales_layout))
+            offs_s = gl.arange(
+                0, HEAD_SIZE // 16, layout=gl.SliceLayout(0, cfg.q_scales_layout)
+            )
+            query_pos_s = q_block_local_idx * cfg.BLOCK_Q + offs_m_s // cfg.NUM_QUERIES_PER_KV
+            query_head_s = kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m_s % cfg.NUM_QUERIES_PER_KV
+            q_scales = gl.amd.cdna4.buffer_load(
+                ptr=query_scales_ptr,
+                offsets=(
+                    (cur_batch_in_all_start_index + query_pos_s)[:, None] * query_scales_stride_0
+                    + query_head_s[:, None] * query_scales_stride_1
+                    + offs_s[None, :]
+                ).to(gl.int32),
+                mask=(query_pos_s < cur_batch_query_len)[:, None]
+                & (query_head_s < NUM_QUERY_HEADS)[:, None],
+                other=0.0,
+            )
+        else:
+            # A8W4: unit Q scales
+            q_scales = gl.full(
+                (BLOCK_M, HEAD_SIZE // 16), 127, dtype=gl.uint8, layout=cfg.q_scales_layout
+            )  # 1.0 in e8m0
+    else:
+        q_scales = None
 
     seq_len = gl.load(seq_lens_ptr + seq_idx)
     context_len = seq_len - cur_batch_query_len
@@ -2071,6 +2439,7 @@ def _unified_attention_gluon_kernel_2d(
         output_stride_1,
         split_idx,
         NUM_SPLITS,
+        q_scales,
     )
 
     # This split owns no tiles (more splits than active tiles). The partial

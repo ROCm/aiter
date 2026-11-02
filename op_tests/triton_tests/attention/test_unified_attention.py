@@ -409,6 +409,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", [32768])
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("force_fp8_pv", [False, True])
 @torch.inference_mode()
 def test_triton_unified_attn_3d(
     seq_lens: list[tuple[int, int]],
@@ -423,6 +424,7 @@ def test_triton_unified_attn_3d(
     o_dtype: torch.dtype,
     shuffled_kv_cache: bool,
     use_out_scale: bool,
+    force_fp8_pv: bool,
 ) -> None:
     torch.cuda.empty_cache()
 
@@ -434,6 +436,8 @@ def test_triton_unified_attn_3d(
         # gfx950 -> Gluon
         pytest.skip(f"skip {DEVICE_ARCH}")
 
+    if force_fp8_pv and kv_dtype != torch.uint8:
+        pytest.skip("force_fp8_pv_on_fp4_kv_cache only applies to an NVFP4 KV cache")
     if kv_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):
             pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
@@ -517,6 +521,7 @@ def test_triton_unified_attn_3d(
         output_scale=output_scale,
         sinks=sinks,
         shuffled_kv_cache=shuffled_kv_cache,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv,
     )
 
     ref_output = ref_paged_attn(
