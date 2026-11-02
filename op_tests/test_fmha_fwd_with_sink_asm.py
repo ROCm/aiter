@@ -224,13 +224,14 @@ _PERF_SHAPES = [
 
 @benchmark()
 def test_fmha_fwd_with_sink_asm(
-    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init
+    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init, d64_sink=True
 ):
     torch.manual_seed(0)
     q, k, v = make_qkv_bshd(layout, sq, sk, batch, hq, hk, head_dim, init=init)
     scale = 1.0 / math.sqrt(head_dim)
-    # D64 -> non-zero sink (exercises ENABLE_SINK); D128 -> kernel ignores it.
-    sink = _d64_sink(hq) if head_dim == 64 else None
+    # D64 -> non-zero sink (exercises ENABLE_SINK), or none (the wrapper passes
+    # the kernel a -inf sink); D128 -> kernel ignores it.
+    sink = _d64_sink(hq) if head_dim == 64 and d64_sink else None
 
     ref_out, ref_lse = run_torch(q, k, v, is_causal=is_causal, sink=sink)
 
@@ -504,12 +505,14 @@ def main():
     summarize(
         "correctness",
         [
-            test_fmha_fwd_with_sink_asm(d, hq, hk, sq, sk, b, c, layout, init)
+            test_fmha_fwd_with_sink_asm(d, hq, hk, sq, sk, b, c, layout, init, s)
             for (d, hq, hk, sq, sk, b), c, layout, init in itertools.product(
                 _CORRECTNESS_SHAPES, causal_modes, args.layout, args.init
             )
             # non-causal (mask=0) D64 / D128 kernels need sk % 256 == 0
             if d in args.head_dim and (c or sk % 256 == 0 or d == 256)
+            # D64 also runs without a sink (the ops wrapper passes a -inf one)
+            for s in ((True, False) if d == 64 else (True,))
         ],
     )
     summarize(
