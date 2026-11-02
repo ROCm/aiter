@@ -39,6 +39,8 @@ from collections.abc import Iterable
 
 import torch
 
+from aiter.jit.utils.build_targets import canonical_gfx_arch
+
 logger = logging.getLogger("aiter.ops.opus._arch")
 
 GFX942 = "gfx942"
@@ -69,11 +71,11 @@ def _detect_arch(
         rocminfo arch, or ``None`` for "unknown / probe failed" otherwise).
         Never raises.
     """
-    supported_set = {a.lower() for a in supported}
+    supported_set = {canonical_gfx_arch(a) for a in supported}
 
     gpu_archs_env = os.getenv("GPU_ARCHS", "native").strip()
     explicit_archs = [
-        a.strip().lower()
+        canonical_gfx_arch(a)
         for a in gpu_archs_env.split(";")
         if a.strip() and a.strip() != "native"
     ]
@@ -90,7 +92,7 @@ def _detect_arch(
     try:
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        gfx = get_gfx_runtime().lower()
+        gfx = canonical_gfx_arch(get_gfx_runtime())
     except Exception as e:  # noqa: BLE001
         logger.debug(
             "opus: arch probe could not query rocminfo (%s). "
@@ -162,7 +164,7 @@ def _read_device_arch_and_cu(device: torch.device) -> tuple[str, int]:
         raise RuntimeError(f"OPUS GEMM requires a GPU tensor; got device {device}")
     props = torch.cuda.get_device_properties(device)
     raw_arch = str(props.gcnArchName).strip()
-    arch = raw_arch.split(":", 1)[0].lower()
+    arch = canonical_gfx_arch(raw_arch)
     if not arch.startswith("gfx"):
         try:
             from ...jit.utils.chip_info import get_gfx_runtime

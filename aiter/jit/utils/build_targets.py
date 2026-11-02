@@ -52,9 +52,23 @@ GFX_CU_NUM_MAP = {
 }
 
 
+def canonical_gfx_arch(arch: str) -> str:
+    """Map a runtime/compiler arch spelling to aiter's logical gfx family.
+
+    A0 gfx1250 stacks may report ``gfx1250-strict`` (ROCr strict-ISA spelling),
+    while aiter's kernel registry, tuned tables, JIT build targets and CO
+    images are keyed by the base family ``gfx1250``. Target-id features after
+    ``:`` are dropped as before. Using this helper at probe boundaries keeps
+    both spellings on one logical path instead of duplicating tables.
+    """
+    base = str(arch).strip().split(":", 1)[0].lower()
+    base = base.removesuffix("-strict")
+    return base
+
+
 def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
     """Return physical CUs from HIP's mode-dependent processor count."""
-    gfx = gfx.split(":", 1)[0].lower()
+    gfx = canonical_gfx_arch(gfx)
     rdna = gfx.startswith("gfx11") or gfx in ("gfx1200", "gfx1201")
     if rdna:
         wgp_mode = os.getenv("GPU_ENABLE_WGP_MODE", "1")
@@ -98,6 +112,7 @@ def get_build_targets_env() -> list[tuple[str, int]]:
         )
     targets = []
     for gfx in _parse_gpu_archs_env(gfx_env):
+        gfx = canonical_gfx_arch(gfx)
         if gfx not in GFX_CU_NUM_MAP:
             raise RuntimeError(
                 f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "

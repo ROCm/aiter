@@ -13,6 +13,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "aiter/jit/utils"))
+
+from build_targets import canonical_gfx_arch
 
 
 def load_chip_parsers(output):
@@ -36,6 +39,7 @@ def load_chip_parsers(output):
         "_GPU_INFO_TOOL": "rocminfo",
         "_gpu_info_output": lambda: output,
         "get_gfx_runtime": lambda: "gfx1250",
+        "canonical_gfx_arch": canonical_gfx_arch,
     }
     exec(  # noqa: S102 - trusted checkout AST, with injected CPU dependencies
         compile(tree, str(source), "exec"), namespace
@@ -86,6 +90,26 @@ Agent 3
             "device#0\ngcnArchName: gfx1250\nasicRevision: 0x1\n"
         )
         self.assertEqual(parsers["_hipinfo_gpu_agents"](), [("gfx1250", 1)])
+
+    def test_strict_runtime_ids_normalize_to_family(self):
+        output = """Agent 1
+  Name: gfx1250-strict
+  Device Type: GPU
+  ASIC Revision: 0x0
+Agent 2
+  Name: gfx1250-strict:sramecc+
+  Device Type: GPU
+  ASIC Revision: 0x1
+"""
+        parsers = load_chip_parsers(output)
+        self.assertEqual(
+            parsers["_rocminfo_gpu_agents"](), [("gfx1250", 0), ("gfx1250", 1)]
+        )
+        self.assertEqual(parsers["get_asic_revision"](), 0)
+        hipinfo = load_chip_parsers(
+            "device#0\ngcnArchName: gfx1250-strict\nasicRevision: 0x0\n"
+        )
+        self.assertEqual(hipinfo["_hipinfo_gpu_agents"](), [("gfx1250", 0)])
 
     def test_test_helpers_support_combined_and_direct_a0_leaves(self):
         source = ROOT / "op_tests/test_opus_co_integration.py"

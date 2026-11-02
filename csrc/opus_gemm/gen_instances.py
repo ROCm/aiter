@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    _canonical_gfx_arch,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -51,10 +52,10 @@ def _build_targets_standalone(explicit_targets=()):
         targets = []
         for value in explicit_targets:
             gfx, cu = value.split("/")
-            targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
+            targets.append((_canonical_gfx_arch(gfx), int(cu)))
         return sorted(set(targets))
     explicit_arches = [
-        gfx.strip().lower()
+        _canonical_gfx_arch(gfx)
         for gfx in os.getenv("GPU_ARCHS", "native").split(";")
         if gfx.strip() and gfx.strip().lower() != "native"
     ]

@@ -10,6 +10,7 @@ import sys
 from build_targets import (
     GFX_MAP,
     _parse_gpu_archs_env,
+    canonical_gfx_arch,
     filter_tune_df,
     get_build_targets_env,
     torch_processor_count_to_cu,
@@ -49,7 +50,7 @@ def _detect_native() -> list[str]:
         for line in _gpu_info_output().splitlines():
             match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
             if match:
-                return [match.group(1).lower()]
+                return [canonical_gfx_arch(match.group(1))]
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
     raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")
@@ -71,6 +72,7 @@ def get_gfx_custom_op_core() -> int:
         # last entry is a known limitation for build-time codegen callers.
         # For runtime dispatch, prefer get_gfx_runtime().
         gfx = gfx.split(";")[-1]
+    gfx = canonical_gfx_arch(gfx)
     try:
         return gfx_mapping[gfx]
     except KeyError:
@@ -103,7 +105,7 @@ _LDS_CAPACITY_BYTES = {
 
 def get_lds_capacity_bytes(gfx: str | None = None) -> int:
     """Return the architectural LDS capacity for one workgroup."""
-    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
+    arch = canonical_gfx_arch(gfx or get_gfx())
     try:
         return _LDS_CAPACITY_BYTES[arch]
     except KeyError as exc:
@@ -144,6 +146,7 @@ def get_gfx_runtime() -> str:
             gfx_arch = (
                 torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
             )
+    gfx_arch = canonical_gfx_arch(gfx_arch)
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -189,7 +192,7 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         elif key == "ASIC Revision":
             rev = _parse_asic_revision(value)
         if kind == "GPU" and name is not None and rev is not None:
-            agents.append((name.lower(), rev))
+            agents.append((canonical_gfx_arch(name), rev))
             name = kind = rev = None
     return agents
 
@@ -207,7 +210,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
             r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE
         )
         if name and rev:
-            agents.append((name.group(1).lower(), _parse_asic_revision(rev.group(1))))
+            agents.append(
+                (canonical_gfx_arch(name.group(1)), _parse_asic_revision(rev.group(1)))
+            )
     return agents
 
 
@@ -282,6 +287,7 @@ def get_gfx_list() -> list[str]:
             gfxs = ["cpu"]
     else:
         gfxs = _parse_gpu_archs_env(gfx_env)
+    gfxs = [canonical_gfx_arch(gfx) for gfx in gfxs]
     os.environ["AITER_GPU_ARCHS"] = ";".join(gfxs)
 
     return gfxs
@@ -308,7 +314,7 @@ def get_cu_num_custom_op() -> int:
             import torch
 
             props = torch.cuda.get_device_properties(0)
-            gfx = props.gcnArchName.split(":", 1)[0]
+            gfx = canonical_gfx_arch(props.gcnArchName)
             return torch_processor_count_to_cu(gfx, props.multi_processor_count)
         try:
             output = _gpu_info_output()

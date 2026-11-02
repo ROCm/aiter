@@ -2658,8 +2658,20 @@ _CO_DTYPE_BYTES = {
 }
 
 
+def _canonical_gfx_arch(arch) -> str:
+    """Map runtime/compiler spellings to the logical aiter gfx family.
+
+    A0 gfx1250 stacks may report ``gfx1250-strict`` while the OPUS registry,
+    tuned tables and CO images use ``gfx1250`` for both spellings.
+    """
+    base = str(arch).strip().split(":", 1)[0].lower()
+    base = base.removesuffix("-strict")
+    return base
+
+
 def _co_instance_from_json(arch, entry):
     """Convert one JSON record to the exact host/device CO configuration."""
+    arch = _canonical_gfx_arch(arch)
     tag = entry["tag"]
     bm, bn, bk = entry["tile"]
     cwm, cwn = entry["cluster"]
@@ -2925,7 +2937,7 @@ class KernelKey:
 
     def __post_init__(self):
         object.__setattr__(self, "family", self.family.strip().lower())
-        object.__setattr__(self, "gfx", self.gfx.split(":", 1)[0].strip().lower())
+        object.__setattr__(self, "gfx", _canonical_gfx_arch(self.gfx))
         if type(self.cu_num) is not int or self.cu_num <= 0:
             raise ValueError("kernel identity requires a positive integer cu_num")
         if type(self.kid) is not int or self.kid < 0:
@@ -2941,6 +2953,8 @@ class KernelKey:
 
 
 def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, object]:
+    family = family.strip().lower()
+    gfx = _canonical_gfx_arch(gfx)
     tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
     if not tables:
         return {}
@@ -2952,7 +2966,7 @@ def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, objec
 def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     """Select available kernels from the family/gfx/CU table."""
     family = family.strip().lower()
-    gfx = gfx.split(":", 1)[0].strip().lower()
+    gfx = _canonical_gfx_arch(gfx)
     records = _get_registry_records(family, gfx, cu_num)
     if family == "a16w16" and gfx == "gfx1250":
         return {
@@ -3131,7 +3145,10 @@ DEFAULT_COMPILED_KIDS_BY_NAMESPACE = {
 
 
 def default_compiled_kids_for_arch(arches, *, cu_num=None):
-    arches = set(arches or OPUS_KERNEL_TAGS_BY_ARCH_FAMILY)
+    arches = {
+        _canonical_gfx_arch(arch)
+        for arch in (arches or OPUS_KERNEL_TAGS_BY_ARCH_FAMILY)
+    }
     if cu_num is not None:
         return frozenset(
             (key.family, key.gfx, key.kid)
@@ -3265,7 +3282,7 @@ def get_kernel_instance(
     cu_num: int,
 ) -> OpusGemmInstance | None:
     """Return a kernel registered for ``(family, arch, cu_num, kid, Y.dtype)``."""
-    arch = str(arch).lower().split(":", 1)[0]
+    arch = _canonical_gfx_arch(arch)
     family = str(family).lower()
     family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
     if family_tags is None:

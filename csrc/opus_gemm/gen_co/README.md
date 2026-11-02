@@ -255,6 +255,26 @@ A0/B0 nodes do not use a node-wide minimum.
 is read without adding another subdirectory, but its ELF processor must match the detected
 stepping. Missing/wrong A0 images fail clearly rather than falling back to B0.
 
+### One logical family for `gfx1250` and `gfx1250-strict`
+
+During the strict-ISA reporting transition the same A0 device can be named
+`gfx1250` (`rocm_agent_enumerator`, used by current HIP builds and aiter CI) or
+`gfx1250-strict` (`rocminfo`/HIP device properties on stacks with native strict
+reporting). Both ids are aliases of one logical family, so aiter normalizes
+`-strict` (and `:feature` suffixes) to `gfx1250` in:
+
+- rocminfo/hipinfo/torch arch probes (`chip_info`, `get_gfx*`, `get_cu_num`);
+- `GPU_ARCHS`/`CU_NUM` and `gen_instances --targets` build resolution;
+- OPUS arch detection and registry lookups (`KernelKey`, `get_registry`,
+  `get_kernel_instance`);
+- the CO loader (`select_image`).
+
+One CO set therefore serves both runtime ids; which ELF profile loads is still
+decided per device from the ASIC Revision: `0` selects `gen_co/gfx1250-a0/`,
+`>= 1` selects `gen_co/gfx1250/`. Do not create per-runtime-id CO directories,
+and keep `build_co.py --offload-arch=gfx1250-strict` as the way A0-tuned images
+are produced.
+
 ```sh
 # Default automatic selection; do not set a stepping-specific root.
 python3 -m pytest -q op_tests/test_opus_co_integration.py
