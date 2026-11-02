@@ -24,6 +24,11 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
 using the 64-token pipeline.
 
+MXFP4 K/V (``kv_dtype="mxfp4"``, gfx950, head_dim 128, page 128, one query token a
+row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 K x
+e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
+tile and all dims, so the tile loop has no barrier; the waves merge once after it.
+
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
@@ -97,6 +102,7 @@ def _pa_decode_tile_kernel_name(
     sliding_window,
     query_splits,
     direct_output=False,
+    stage_pages=0,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -113,6 +119,8 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
+    if stage_pages:
+        name += f"_pages{stage_pages}"
     return name
 
 
@@ -165,6 +173,9 @@ def compile_pa_decode_tile(
     Planned gfx950 BF16 D128 output uses slot-rebased buffer stores when the
     slot's byte span fits signed i32, retaining the dtype's 2-byte alignment.
 
+    ``direct_output`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32 context
+    lengths -- one task per sequence, the output written directly with the query's
+    row/head strides (an empty row is zero-filled).
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
@@ -221,8 +232,8 @@ def compile_pa_decode_tile(
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
-    if direct_output:
-        raise NotImplementedError("direct_output requires gfx1250")
+    if direct_output and kv_dtype != "mxfp4":
+        raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
@@ -245,6 +256,7 @@ def compile_pa_decode_tile(
         sliding_window=sliding_window,
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
+        direct_output=direct_output,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
@@ -319,6 +331,8 @@ def compile_pa_decode_tile(
         trans_v=traits.trans_v,
         sliding_window=traits.sliding_window,
         query_splits=traits.query_splits,
+        direct_output=traits.DIRECT,
+        stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
@@ -373,14 +387,41 @@ def compile_pa_decode_tile(
         else:
             slot = fx.Int32(gpu.block_id("x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
-        task = fx.ptr_load(
-            fx.add_offset(work, slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
-        start = fx.Int32(task[1])
-        end = fx.Int32(task[2])
-        if start < end:
-            _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
+        if const_expr(traits.DIRECT):
+            # One task per sequence, no plan: ``work_info`` is the context lengths.
+            context = fx.Int32(fx.ptr_load(fx.add_offset(work, slot)))
+            tiles = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
+            # Tiles past the staged page window are dropped.
+            end = fx.min(
+                tiles,
+                fx.Int32(traits.stage_page_capacity * block_size // KV_COMPUTE_BLOCK),
+            )
+            if end > 0:
+                _run_task(slot, fx.Int32(0), end, context)
+            else:
+                # An empty row has no reduce kernel to zero-fill it.
+                tid = fx.Int32(gpu.thread_id("x"))
+                head = tid // (traits.head_dim // 8)
+                if head < traits.query_group_size:
+                    out = fx.recast_iter(traits.Q_DTYPE, pout_ptr)
+                    offset = (
+                        slot * stride_q_row
+                        + (fx.Int32(gpu.block_id("y")) * traits.query_group_size + head)
+                        * stride_q_head
+                        + tid % (traits.head_dim // 8) * 8
+                    )
+                    fx.ptr_store(
+                        fx.full(8, 0.0, traits.Q_DTYPE), fx.add_offset(out, offset)
+                    )
+        else:
+            task = fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            if start < end:
+                _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
 
     @flyc.jit
     def pa_decode_tile_launch(
