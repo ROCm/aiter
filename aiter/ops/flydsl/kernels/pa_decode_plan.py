@@ -10,6 +10,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
 from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 
 DEFAULT_MAX_BATCH_SIZE = 4096
@@ -18,23 +20,46 @@ _PLAN_SCAN_LDS_BYTES = 512
 
 
 @cache
-def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
-    """Allocate packed tasks with one block-wide scan, without GPU readback."""
-    threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
-    items = (batch + threads - 1) // threads
+def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_length):
+    """Compile a batch bucket; actual batch and task capacity are runtime values."""
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
     reduce_rows = fx.coop.BlockReduce[fx.Int32, threads]
 
     @fx.struct
     class TaskStorage:
-        ends: fx.Array[fx.Int32, batch, 16]
+        ends: fx.Array[fx.Int32, max_batch, 16]
+
+    def visible_tiles(ctx):
+        """Return the first visible tile and the visible tile count."""
+        length = fx.max(fx.Int64(ctx), fx.Int64(0))
+        first = fx.Int64(0)
+        if sliding_window > 0:
+            first = (
+                fx.max(length - (query_length - 1) - sliding_window, fx.Int64(0)) // 256
+            )
+        return first, (length + 255) // 256 - first
+
+    def split(tiles, lower, upper):
+        """Return a row's task count from its cumulative slot bounds."""
+        return fx.Int32(
+            fx.min(
+                fx.min(fx.Int64(tiles > 0) + upper - lower, tiles),
+                fx.Int64(max_parts),
+            )
+        )
+
+    # Lookup reaches rows below max_batch, so it needs one fewer level than
+    # max_batch.bit_length() at power-of-two buckets.
+    lookup_bits = (max_batch - 1).bit_length()
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
         lengths_ptr: fx.Pointer,
         work_ptr: fx.Pointer,
         reduce_ptr: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lengths = ptr_buf_tensor(lengths_ptr)
@@ -45,53 +70,74 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         count_storage = smem.allocate(scan_counts.SharedStorage).peek()
         row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
         task_ends = smem.allocate(TaskStorage).peek().ends
-        tiles = []
-        nonempty = []
-        # Consecutive per-thread items preserve sequence order in vector scans.
-        for item in fx.range_constexpr(items):
-            seq = tid * items + item
-            ctx = fx.Int32(0)
-            if seq < batch:
-                ctx = lengths[seq]
-            length = fx.max(fx.Int64(ctx), fx.Int64(0))
-            first = fx.Int64(0)
-            if fx.const_expr(sliding_window > 0):
-                first = (
-                    fx.max(length - (query_length - 1) - sliding_window, fx.Int64(0))
-                    // 256
-                )
-            count = (length + 255) // 256 - first
-            tiles.append(count)
-            nonempty.append(fx.Int32(count > 0))
+        # Each thread owns consecutive rows, so scans of per-thread totals
+        # preserve sequence order. Buckets that fit the block give each thread
+        # at most one row; larger ones walk rows with runtime bounds, so padding
+        # rows cost nothing and register use does not grow with the bucket.
+        single = max_batch <= threads
+        if fx.const_expr(single):
+            row = fx.Int32(tid)
+            row_ctx = fx.Int32(0)
+            if row < batch:
+                row_ctx = lengths[row]
+            _, thread_tiles = visible_tiles(row_ctx)
+            thread_rows = fx.Int32(thread_tiles > 0)
+        else:
+            rows = (batch + threads - 1) // threads
+            row_begin = fx.min(fx.Int32(tid) * rows, batch)
+            row_end = fx.min(row_begin + rows, batch)
+            thread_tiles = fx.Int64(0)
+            thread_rows = fx.Int32(0)
+            for seq in range(row_begin, row_end):
+                _, tiles = visible_tiles(lengths[seq])
+                thread_tiles = thread_tiles + tiles
+                thread_rows = thread_rows + fx.Int32(tiles > 0)
 
-        cumulative, total = scan_tiles.inclusive_with_aggregate(
-            fx.Vector.from_elements(tiles), fx.ReductionOp.ADD, storage=tile_storage
+        cumulative, total = scan_tiles.exclusive_with_aggregate(
+            thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
         )
         total = fx.max(total, fx.Int64(1))
-        remaining = capacity - reduce_rows(
-            fx.Vector.from_elements(nonempty), fx.ReductionOp.ADD, storage=row_storage
+        remaining = fx.Int64(
+            capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
-        counts = []
-        for item in fx.range_constexpr(items):
-            upper = cumulative[item] * fx.Int64(remaining) // total
-            lower = (cumulative[item] - tiles[item]) * fx.Int64(remaining) // total
-            count = fx.min(
-                fx.min(fx.Int64(nonempty[item]) + upper - lower, tiles[item]),
-                fx.Int64(max_parts),
-            )
-            counts.append(fx.Int32(count))
-        starts, total_tasks = scan_counts.exclusive_with_aggregate(
-            fx.Vector.from_elements(counts), fx.ReductionOp.ADD, storage=count_storage
+        if fx.const_expr(single):
+            # Empty and padding rows get no tasks; skip their Int64 divisions.
+            thread_tasks = fx.Int32(0)
+            if thread_tiles > 0:
+                thread_tasks = split(
+                    thread_tiles,
+                    cumulative * remaining // total,
+                    (cumulative + thread_tiles) * remaining // total,
+                )
+        else:
+            # Each row's lower bound is the previous row's upper bound.
+            lower = cumulative * remaining // total
+            thread_tasks = fx.Int32(0)
+            for seq in range(row_begin, row_end):
+                _, tiles = visible_tiles(lengths[seq])
+                cumulative = cumulative + tiles
+                upper = cumulative * remaining // total
+                count = split(tiles, lower, upper)
+                lower = upper
+                task_ends[seq] = count
+                thread_tasks = thread_tasks + count
+        row_start, total_tasks = scan_counts.exclusive_with_aggregate(
+            thread_tasks, fx.ReductionOp.ADD, storage=count_storage
         )
 
-        for item in fx.range_constexpr(items):
-            seq = tid * items + item
-            if seq < batch:
-                start = starts[item]
-                count = counts[item]
-                reduce_info[seq * 2] = start
+        if fx.const_expr(single):
+            if row < batch:
+                reduce_info[row * 2] = row_start
+                reduce_info[row * 2 + 1] = thread_tasks
+                task_ends[row] = row_start + thread_tasks
+        else:
+            # Rows are thread-private here; convert counts to ends in place.
+            for seq in range(row_begin, row_end):
+                count = task_ends[seq]
+                reduce_info[seq * 2] = row_start
                 reduce_info[seq * 2 + 1] = count
-                task_ends[seq] = start + count
+                row_start = row_start + count
+                task_ends[seq] = row_start
         fx.gpu.barrier()
 
         # Spread packed task writes across all threads, including small batches
@@ -100,7 +146,7 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         for slot in range(tid, capacity, threads):
             if slot < total_tasks:
                 seq = fx.Int32(-1)
-                for bit in fx.range_constexpr(batch.bit_length() - 1, -1, -1):
+                for bit in fx.range_constexpr(lookup_bits - 1, -1, -1):
                     candidate = seq + (1 << bit)
                     if candidate < batch:  # noqa: SIM102 -- guard the LDS read
                         if task_ends[candidate] <= slot:
@@ -111,16 +157,7 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
                     start = task_ends[seq - 1]
                 count = task_ends[seq] - start
                 ctx = lengths[seq]
-                length = fx.max(fx.Int64(ctx), fx.Int64(0))
-                first = fx.Int64(0)
-                if fx.const_expr(sliding_window > 0):
-                    first = (
-                        fx.max(
-                            length - (query_length - 1) - sliding_window, fx.Int64(0)
-                        )
-                        // 256
-                    )
-                num_tiles = (length + 255) // 256 - first
+                first, num_tiles = visible_tiles(ctx)
                 part = fx.Int64(slot - start)
                 work[slot * 4] = seq
                 work[slot * 4 + 1] = fx.Int32(first + part * num_tiles // count)
@@ -136,9 +173,11 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         lengths: fx.Pointer,
         work: fx.Pointer,
         reduce_info: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        pa_decode_plan_kernel(lengths, work, reduce_info).launch(
+        pa_decode_plan_kernel(lengths, work, reduce_info, batch, capacity).launch(
             grid=(1, 1, 1), block=(threads, 1, 1), stream=stream
         )
 
@@ -212,8 +251,10 @@ def plan_pa_decode(
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
-    Larger batches require four LDS bytes per sequence plus scan storage and
-    must fit the device's per-block shared-memory capacity.
+    Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to
+    ``max_batch_size`` and the device's LDS capacity. Each bucket requires four
+    LDS bytes per sequence plus scan storage. Actual batch and task capacity
+    are runtime values; capacity only specializes the block size (64--1024).
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
@@ -245,13 +286,19 @@ def plan_pa_decode(
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
     num_compute_units = properties.multi_processor_count
+    shared_memory_per_block = getattr(properties, "shared_memory_per_block", None)
+    if shared_memory_per_block is None:
+        shared_memory_per_block = get_lds_capacity_bytes(properties.gcnArchName)
     task_end_bytes = (batch * 4 + 15) // 16 * 16
-    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > properties.shared_memory_per_block:
+    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > shared_memory_per_block:
         raise ValueError(
             f"batch={batch} exceeds planner LDS capacity: requires up to "
             f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
-            f"{properties.shared_memory_per_block} bytes per block"
+            f"{shared_memory_per_block} bytes per block"
         )
+    # Clip the last bucket so rounding up cannot reject a batch that fits LDS.
+    lds_max_batch = (shared_memory_per_block - _PLAN_SCAN_LDS_BYTES) // 16 * 4
+    max_batch = min(max_batch_size, lds_max_batch, 1 << (batch - 1).bit_length())
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:
@@ -287,9 +334,10 @@ def plan_pa_decode(
             raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
+        threads = max(64, min(1024, 1 << (plan.capacity - 1).bit_length()))
         launch = compile_pa_decode_plan(
-            batch,
-            plan.capacity,
+            max_batch,
+            threads,
             plan.max_partitions,
             # Clamp windows to int32 lengths; dense plans share one specialization.
             min(sliding_window, 2**31 - 1),
@@ -300,6 +348,8 @@ def plan_pa_decode(
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(plan.work_info, fx.Int32),
             ptr_arg(plan.reduce_info, fx.Int32),
+            batch,
+            plan.capacity,
             torch.cuda.current_stream(dev),
         )
     return plan
