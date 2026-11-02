@@ -540,6 +540,22 @@ def test_decode_rejects_metadata_planned_for_the_other_cp_mode():
 
 
 @requires_gpu
+def test_decode_update_rejects_round_robin_cp_metadata():
+    # The incremental update grows every request's KV by one token and plans its
+    # heads without CP, so it would silently corrupt round-robin CP metadata.
+    bs, msq, n, qd = 2, 8, 96, dtypes.fp8
+    _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
+    qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
+    with pytest.raises(ValueError, match="is_cp_round_robin"):
+        decode_update_mla_metadata_v1(
+            *(qo, kv_indptr, last, n, 1, True, *meta),
+            max_seqlen_qo=msq,
+            dtype_q=qd,
+            dtype_kv=qd,
+        )
+
+
+@requires_gpu
 def test_decode_agreement():
     bad = []
     shapes = itertools.chain(

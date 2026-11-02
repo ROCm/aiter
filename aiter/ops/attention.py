@@ -2754,6 +2754,8 @@ def decode_update_mla_metadata_v1(
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
     Not for round-robin CP metadata: every request's KV grows by one token here.
+    Raises ValueError for metadata get_mla_metadata_v1 planned with
+    is_cp_round_robin=True.
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2762,6 +2764,14 @@ def decode_update_mla_metadata_v1(
     assert (
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
+    # The head plan below assumes no CP, so for 96 fp8 heads at qlen 7 and 8 it
+    # would also rewrite a native plan as the fold, which decode would not catch.
+    if getattr(work_metadata_ptrs, "_aiter_planned_cp_round_robin", False):
+        raise ValueError(
+            "decode_update_mla_metadata_v1 cannot update metadata planned with "
+            "is_cp_round_robin=True: a round-robin CP rank's local KV does not grow "
+            "by one token per request. Call get_mla_metadata_v1 again instead."
+        )
     head_plan = _mla_metadata_head_plan(
         num_heads_per_head_k,
         max_seqlen_qo,
