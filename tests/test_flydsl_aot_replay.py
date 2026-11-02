@@ -113,6 +113,17 @@ def test_the_dry_run_stops_a_triton_launch():
         driver.active.get_current_stream(0)
 
 
+def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    def no_gpu(_index):
+        raise RuntimeError("HIP error: no ROCm-capable device is detected")
+
+    monkeypatch.setattr(tensor_shim, "_get_current_raw_stream", no_gpu)
+    with dry_run("gfx950", 256):
+        assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
+
+
 def test_only_a_call_another_backend_takes_passes_without_a_kernel():
     for error in (TritonLaunchReached("launch"), AsmUnsupportedError("asm")):
         result, kernels = replay.replay_job(_raising(error), _JOB)

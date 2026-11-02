@@ -96,6 +96,17 @@ def _triton_driver_patches(arch: str) -> list:
     return [(driver, "_active", _TritonDriver(arch))]
 
 
+def _raw_stream_patches() -> list:
+    # FlyDSL launchers that pass the raw stream handle take torch's query for
+    # it as tensor_shim resolved it at import, not through torch.cuda; without
+    # that query they fall back to torch.cuda.current_stream().
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    if tensor_shim._get_current_raw_stream is None:
+        return []
+    return [(tensor_shim, "_get_current_raw_stream", lambda _index: 0)]
+
+
 def _torch_guard_modules() -> list:
     # jit/core.py imports torch_guard through its own sys.path entry, so the
     # module is loaded twice and each copy decorates its own ops.
@@ -240,6 +251,7 @@ def dry_run(
             # Rebuilding one for this arch would pull it from under replays of
             # other archs that share it.
             (jit_core, "_needs_arch_rebuild", lambda _md_name: False),
+            *_raw_stream_patches(),
             *_triton_driver_patches(arch),
         ):
             stack.enter_context(mock.patch.object(owner, attribute, value))
