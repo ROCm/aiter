@@ -5,6 +5,7 @@
 #include "aiter_tensor.h"
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace aiter {
 
@@ -26,7 +27,7 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                             const aiter_tensor_t& positions,
                                             int32_t rope_dim,
                                             int32_t group_size = 32,
-                                            bool shuffle_scale = true,
+                                            const std::string& scale_layout = "none",
                                             bool do_rotate_act = true,
                                             bool round_rope    = false);
 
