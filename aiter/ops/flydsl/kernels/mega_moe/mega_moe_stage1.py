@@ -27,7 +27,7 @@ from .dispatch import (
     emit_direct_fixed_slot_payload,
     emit_dispatch_payload,
 )
-from .gemm1 import _LdsF32View, build_fused_gemm1
+from .gemm1 import _LdsF32View, build_fused_gemm1, gemm1_a_lds_stages
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
     INDEXED_PAYLOAD_MIN_MTPR,
@@ -163,7 +163,6 @@ def compile_mega_moe_stage1(
     a_lds_i32 = a_lds_size // 4
     cs_tile_n = tile_n // 2
     cs_size = sort_block_m * cs_tile_n
-    lds_pool_bytes = max(2 * a_lds_size, cs_size * 4)
     n_scale_bytes = sort_block_m * (model_dim // 32)
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
@@ -185,6 +184,18 @@ def compile_mega_moe_stage1(
     indexed_payload = (
         not fixed_slot_dispatch and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
     )
+    # Tuned GEMM1 tile bodies (see build_fused_gemm1): compact route-major
+    # payload with FP8 activations and output.
+    TUNED_GEMM1 = (
+        compact_dispatch and not indexed_payload
+        and a_dtype == "fp8" and out_dtype == "fp8"
+    )
+    a_lds_stages = gemm1_a_lds_stages(
+        tuned=TUNED_GEMM1, sort_block_m=sort_block_m, pipe_weights=pipe_weights,
+        async_a_copy=async_a_copy, indexed_input=indexed_payload, a_dtype=a_dtype,
+        total_threads=TOTAL_THREADS,
+    )
+    lds_pool_bytes = max(a_lds_stages * a_lds_size, cs_size * 4)
     source_rows = fz_npes * fz_mtpr + 1 if indexed_payload else 0
     if indexed_payload and source_rows * model_dim >= _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError(
@@ -546,6 +557,7 @@ def compile_mega_moe_stage1(
             a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
+            tuned=TUNED_GEMM1,
         )
 
         if tid == fx.Int32(0):
@@ -618,10 +630,13 @@ def compile_mega_moe_stage1(
                         fx.barrier()
                     elif not use_ready_order:
                         # Ready-order waits for the tile in the scheduler block.
+                        # One system acquire, by the waiting thread: it
+                        # invalidates the CU's caches, and the barrier orders
+                        # every other wave's loads after it.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
+                            comm_ops.fence_system_acquire()
                         fx.barrier()
-                        comm_ops.fence_system_acquire()
                     _do_scheduled_tile(work)
 
         while consumer_active:
@@ -687,15 +702,13 @@ def compile_mega_moe_stage1(
                             ready_m_tile * fx.Int32(N_TILES) + first_n_tile
                         )
                         _wait_tile_payload(scheduled_first)
+                        comm_ops.fence_system_acquire()
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
                             sched_scratch,
                         )
                     fx.barrier()
             scheduled_first = Vec(sched_scratch_view.load())[0]
-            if const_expr(compact_dispatch):  # noqa: SIM102 - preserve DSL staging
-                if use_ready_order:
-                    comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)
             consumer_active = first_work < total_work
 

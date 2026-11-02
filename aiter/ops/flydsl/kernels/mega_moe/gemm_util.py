@@ -957,3 +957,381 @@ class SiluQuantEpilogue:
             byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
             self._out_scale_rsrc[byte_off] = e8m0_v.to(fx.Int8)
         wait_lds_barrier()
+
+
+# ---------------------------------------------------------------------------
+# Building blocks of the compact Stage1 GEMM1 tile bodies in gemm1.py
+# (FP8 A, FP8 out).  They change instruction selection and scheduling only;
+# every accumulator sums the same products in the same order.
+# ---------------------------------------------------------------------------
+
+
+def _ir_value(v):
+    from flydsl._mlir import ir as _ir
+
+    if isinstance(v, _ir.Value):
+        return v
+    if hasattr(v, "ir_value"):
+        return v.ir_value()
+    return v
+
+
+def make_lds_dma_scopes():
+    """Alias scopes for the A LDS-DMA and the A / A-scale ds_reads.
+
+    SIInsertWaitcnts must otherwise assume that every ds_read may alias an
+    in-flight buffer_load ... lds and inserts vmcnt(0) before the first A
+    ds_read after the async copy, which serializes the global->LDS copy with
+    the K step.  The DMA always writes the other ping-pong stage, which is
+    read only after an explicit vmcnt wait and a barrier.
+    """
+    from flydsl._mlir import ir as _ir
+
+    dom = '#llvm.alias_scope_domain<id = distinct[0]<>, description = "mm_lds">'
+    scopes = _ir.ArrayAttr(
+        _ir.Attribute.parse(
+            f'[#llvm.alias_scope<id = distinct[1]<>, domain = {dom}, description = "mm_dma">, '
+            f'#llvm.alias_scope<id = distinct[2]<>, domain = {dom}, description = "mm_rd">]'
+        )
+    )
+    return {"dma": _ir.ArrayAttr.get([scopes[0]]), "rd": _ir.ArrayAttr.get([scopes[1]])}
+
+
+def _lds_i32_addr(lds_fly_ptr):
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    p = _ir_value(fx.to_llvm_ptr(lds_fly_ptr))
+    return fx.Int32(_llvm.ptrtoint(_ir.IntegerType.get_signless(32), p))
+
+
+def _lds_ptr(addr_i32):
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    return _llvm.inttoptr(_ir.Type.parse("!llvm.ptr<3>"), _ir_value(fx.Int32(addr_i32)))
+
+
+def _scoped_lds_load_b128(base_addr_i32, byte_off_i32, scopes):
+    """ds_read_b128 (vector<4xi32>) marked as not aliasing the A LDS-DMA."""
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    ptr = _lds_ptr(base_addr_i32 + byte_off_i32)
+    vty = _ir.VectorType.get([4], _ir.IntegerType.get_signless(32))
+    v = _llvm.load(
+        vty, ptr, alignment=16, alias_scopes=scopes["rd"], noalias_scopes=scopes["dma"]
+    )
+    return Vec(v)
+
+
+def opaque_sgpr(value):
+    """Pass an i32 through a side-effecting SGPR inline asm.
+
+    Used for the constant ping-pong A-LDS offsets of the persistent loop: LLVM
+    otherwise hoists every address derived from them out of the work loop and
+    spills them at the 256-VGPR limit.
+    """
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    out = _llvm.inline_asm(
+        _ir.IntegerType.get_signless(32),
+        [_ir_value(value)],
+        "; opaque $0",
+        "=s,0",
+        has_side_effects=True,
+    )
+    return fx.Int32(out)
+
+
+class UniformATileLoader(ATileLoader):
+    """ATileLoader with a wave-uniform tile base.
+
+    The base goes through readfirstlane, so the LDS-DMA buffer descriptor is
+    in SGPRs (no waterfall loop around every buffer_load ... lds); the
+    K-step offset rides in soffset and the per-lane source offsets are
+    computed once per tile.
+    """
+
+    lds_scopes = None
+
+    def _direct_dma(self):
+        return (
+            self._async_copy
+            and not self._indexed_input
+            and self._k_step_bytes == 256
+            and (self._sort_block_m * 16) % self._total_threads == 0
+        )
+
+    def for_tile(self, tile_row_base_i32):
+        tile_row_base_i32 = fx.Int32(rocdl.readfirstlane(T.i32, tile_row_base_i32))
+        super().for_tile(tile_row_base_i32)
+        if const_expr(self._direct_dma()):
+            self._dma_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(self._tile_dma))
+            self._dma_voff = []
+            for round_base in range_constexpr(
+                0, self._sort_block_m * 16, self._total_threads
+            ):
+                physical = fx.Int32(round_base) + fx.Int32(self._tx)
+                row = physical // fx.Int32(16)
+                pchunk = physical % fx.Int32(16)
+                lchunk = pchunk ^ (row & fx.Int32(15)) if self._swizzle else pchunk
+                self._dma_voff.append(
+                    row * fx.Int32(self._row_bytes) + lchunk * fx.Int32(16)
+                )
+
+    def prefetch_to_lds(self, k_step_byte_off, lds_dst, base_i32=0):
+        if const_expr(not self._direct_dma()):
+            return super().prefetch_to_lds(k_step_byte_off, lds_dst, base_i32)
+        koff = fx.Int32(k_step_byte_off)
+        lds_base = _lds_i32_addr(lds_dst.ptr) + fx.Int32(base_i32) * fx.Int32(4)
+        wave = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(self._wave)))
+        kw = {}
+        if const_expr(self.lds_scopes is not None):
+            kw = {
+                "alias_scopes": self.lds_scopes["dma"],
+                "noalias_scopes": self.lds_scopes["rd"],
+            }
+        for i, round_base in enumerate(
+            range_constexpr(0, self._sort_block_m * 16, self._total_threads)
+        ):
+            dst = lds_base + (fx.Int32(round_base) + wave * fx.Int32(64)) * fx.Int32(16)
+            rocdl.raw_ptr_buffer_load_lds(
+                self._dma_rsrc, _lds_ptr(dst), 16, self._dma_voff[i], koff, 0, 0, **kw
+            )
+
+
+class ScopedAS2RLoader(AS2RLoader):
+    """AS2RLoader whose ds_read_b128 does not alias the A LDS-DMA."""
+
+    def __init__(self, *, lds_scopes=None, **kw):
+        super().__init__(**kw)
+        self._lds_scopes = lds_scopes
+
+    def _load_16b(self, lds_src, i32_off):
+        if const_expr(self._lds_scopes is None):
+            return super()._load_16b(lds_src, i32_off)
+        return _scoped_lds_load_b128(
+            _lds_i32_addr(lds_src.ptr), i32_off * fx.Int32(4), self._lds_scopes
+        )
+
+
+class ScopedAScaleLoader(AScaleLoader):
+    """AScaleLoader whose ds_read_u8 does not alias the A LDS-DMA."""
+
+    def __init__(self, *, lds_scopes=None, **kw):
+        super().__init__(**kw)
+        self._lds_scopes = lds_scopes
+
+    def _read_scale_lds(self, lds_ascale, row_i32, col_i32):
+        if const_expr(self._lds_scopes is None):
+            return super()._read_scale_lds(lds_ascale, row_i32, col_i32)
+        from flydsl._mlir import ir as _ir
+        from flydsl._mlir.dialects import arith as _arith
+        from flydsl._mlir.dialects import llvm as _llvm
+
+        off = row_i32 * fx.Int32(self._n_scale) + col_i32
+        ptr = _lds_ptr(_lds_i32_addr(lds_ascale.ptr) + off)
+        raw = _llvm.load(
+            _ir.IntegerType.get_signless(8),
+            ptr,
+            alignment=1,
+            alias_scopes=self._lds_scopes["rd"],
+            noalias_scopes=self._lds_scopes["dma"],
+        )
+        return fx.Int32(_arith.extui(_ir.IntegerType.get_signless(32), raw))
+
+
+class PackedAScaleLoader:
+    """A scales of a 128-row tile staged pre-packed for one ds_read_b128 per K step.
+
+    LDS layout [kstep][klane][lane_row][group] of i32 words holding the bytes
+    (r0,k0), (r1,k0), (r0,k1), (r1,k1) that AScaleLoader.load_step packs
+    from 16 ds_read_u8; the words and their use are unchanged.
+    """
+
+    def __init__(
+        self,
+        *,
+        scale_rsrc,
+        m_repeat,
+        model_dim,
+        sort_block_m,
+        total_threads,
+        indexed_input=False,
+        row_map_rsrc=None,
+        lds_scopes=None,
+    ):
+        self._lds_scopes = lds_scopes
+        self._rsrc = scale_rsrc
+        self._n_scale = model_dim // 32
+        assert self._n_scale % 16 == 0
+        self._chunks = self._n_scale // 16
+        assert m_repeat // _PACK == 4, "one b128 holds four pack groups"
+        assert sort_block_m == 128 and total_threads % 64 == 0
+        self._nwaves = total_threads // 64
+        self._indexed_input = bool(indexed_input)
+        self._row_map_rsrc = row_map_rsrc
+        self._tx = fx.thread_idx.x
+        self._lane = self._tx % 64
+
+    def stage(self, lds_ascale, tile_row_base_i32):
+        tx = fx.Int32(self._tx)
+        lane = tx & fx.Int32(63)
+        wave = tx >> fx.Int32(6)
+        g = lane >> fx.Int32(4)
+        lr = lane & fx.Int32(15)
+        r0 = g * fx.Int32(32) + lr
+        r1 = r0 + fx.Int32(16)
+        if const_expr(self._indexed_input):
+            src0 = self._row_map_rsrc[tile_row_base_i32 + r0] & fx.Int32(0xFFFFFF)
+            src1 = self._row_map_rsrc[tile_row_base_i32 + r1] & fx.Int32(0xFFFFFF)
+        else:
+            src0 = tile_row_base_i32 + r0
+            src1 = tile_row_base_i32 + r1
+        nch = self._chunks
+        base0 = src0 * fx.Int32(nch)
+        base1 = src1 * fx.Int32(nch)
+        lds_i32 = fx.recast_iter(fx.Int32, lds_ascale.ptr)
+        dst_lane = lr * fx.Int32(4) + g
+        m8 = fx.Int32(0xFF)
+        for c0 in range_constexpr(0, nch, self._nwaves):
+            c = wave + fx.Int32(c0)
+            if const_expr(c0 + self._nwaves > nch):
+                # Surplus waves rewrite the last chunk with identical bytes.
+                c = (c < fx.Int32(nch)).select(c, fx.Int32(nch - 1))
+            v0 = Vec(buf_copy_load(self._rsrc, base0 + c, fx.Int32, unit_elems=4))
+            v1 = Vec(buf_copy_load(self._rsrc, base1 + c, fx.Int32, unit_elems=4))
+            for q2 in range_constexpr(2):
+                wa = v0[2 * q2]
+                wb = v1[2 * q2]
+                wc = v0[2 * q2 + 1]
+                wd = v1[2 * q2 + 1]
+                ks = c * fx.Int32(2) + fx.Int32(q2)
+                for kl in range_constexpr(4):
+                    sh = fx.Int32(8 * kl)
+                    dw = (
+                        ((wa >> sh) & m8)
+                        | (((wb >> sh) & m8) << fx.Int32(8))
+                        | (((wc >> sh) & m8) << fx.Int32(16))
+                        | (((wd >> sh) & m8) << fx.Int32(24))
+                    )
+                    off = (ks * fx.Int32(4) + fx.Int32(kl)) * fx.Int32(64) + dst_lane
+                    fx.ptr_store(
+                        Vec.from_elements([dw], fx.Int32),
+                        fx.add_offset(lds_i32, fx.make_int_tuple(off)),
+                    )
+
+    def load_step(self, lds_ascale, kstep_i32):
+        byte_off = kstep_i32 * fx.Int32(1024) + fx.Int32(self._lane) * fx.Int32(16)
+        if const_expr(self._lds_scopes is not None):
+            v = _scoped_lds_load_b128(
+                _lds_i32_addr(lds_ascale.ptr), byte_off, self._lds_scopes
+            )
+            return [v[i] for i in range_constexpr(4)]
+        ptr_off = fx.add_offset(lds_ascale.ptr, fx.make_int_tuple(byte_off))
+        i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
+        v = Vec(fx.make_view(i8_iter, fx.make_layout(16, 1)).load()).bitcast(fx.Int32)
+        return [v[i] for i in range_constexpr(4)]
+
+
+class SwizzledQuantEpilogue(SiluQuantEpilogue):
+    """SiluQuantEpilogue for 128x512 FP8 tiles with an XOR-swizzled C shuffle.
+
+    The fp32 C tile is written with col ^= (row / 4 % 4) * 16 (plus a 4-float
+    swap between the two 64-column halves), which removes the 4-way LDS bank
+    conflicts of the row-major write; the store pass reads it back with the
+    same swizzle and quantizes 8 columns per lane as the evec=8 pass does.
+    """
+
+    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):
+        assert self._out_tensor is not None and self._always_valid
+        assert not self._is_fp4
+        combined = self._combine(acc)
+        n_per = len(combined) // self._m_repeat
+        sbm = self._sort_block_m
+        inter = self._inter_dim
+        tx = fx.thread_idx.x
+        wave = tx // fx.Int32(64)
+        lane = tx % fx.Int32(64)
+        cs_tile_n = self._tile_n // 2
+        assert cs_tile_n == 256
+        nwo = cs_tile_n // self._num_waves
+        cbase = wave * fx.Int32(nwo)
+        cptr = self._lds_out.ptr
+        out_rsrc = self._tile_out(tile_i32, fx.Int32, unit_elems=2)
+        l16 = lane % fx.Int32(16)
+        kq = lane // fx.Int32(16)
+        wbase = kq * fx.Int32(4 * cs_tile_n)
+        pcs = []
+        for nj in range_constexpr(n_per):
+            col = cbase + fx.Int32(nj * 16) + l16
+            pc = col ^ (kq << fx.Int32(4))
+            pc = pc ^ (((pc >> fx.Int32(6)) & fx.Int32(1)) << fx.Int32(2))
+            pcs.append(wbase + pc)
+        for mi in range_constexpr(self._m_repeat):
+            for nj in range_constexpr(n_per):
+                v4 = Vec(combined[mi * n_per + nj])
+                for ii in range_constexpr(4):
+                    idx = pcs[nj] + fx.Int32((mi * 16 + ii) * cs_tile_n)
+                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
+                    fx.ptr_store(Vec.from_elements([v4[ii]], fx.Float32), ptr)
+        gpu.barrier()
+
+        n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
+        NLANE = 32
+        EVEC = 8
+        rows_per_iter = self._num_waves * 64 // NLANE
+        mlane = tx // fx.Int32(NLANE)
+        nlane = tx % fx.Int32(NLANE)
+        m_reps = sbm // rows_per_iter
+        assert cs_tile_n == NLANE * EVEC and rows_per_iter % 4 == 0
+        col0 = nlane * fx.Int32(EVEC)
+        rq = (mlane >> fx.Int32(2)) & fx.Int32(3)
+        cp = col0 ^ (rq << fx.Int32(4))
+        hb = (cp >> fx.Int32(6)) & fx.Int32(1)
+        roff = mlane * fx.Int32(cs_tile_n) + cp
+        off_lo = roff + hb * fx.Int32(4)
+        off_hi = roff + (fx.Int32(1) - hb) * fx.Int32(4)
+        out_tile_base = n_tile_base_i32 // fx.Int32(2) - cbase
+        gcol = out_tile_base + col0
+        col_s = gcol >> fx.Int32(5)
+        is_writer = (nlane & fx.Int32(3)) == fx.Int32(0)
+        d3 = col_s >> fx.Int32(3)
+        d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
+        d5 = col_s & fx.Int32(3)
+        col_term = d3 * fx.Int32(256) + d5 * fx.Int32(64) + d4 * fx.Int32(2)
+        c64 = fx.Int32(64)
+
+        for mr in range_constexpr(m_reps):
+            row = fx.Int32(mr * rows_per_iter) + mlane
+            row_g = tile_i32 * fx.Int32(sbm) + row
+            rconst = fx.Int32(mr * rows_per_iter * cs_tile_n)
+            vals = []
+            for off in (off_lo, off_hi):
+                f32_iter = fx.recast_iter(
+                    fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(off + rconst))
+                )
+                frag = fx.make_view(f32_iter, fx.make_layout(4, 1)).load()
+                for j in range_constexpr(4):
+                    vals.append(frag[j])
+            e8m0_v, quant_scale = _e8m0_scale(_group_absmax(vals, (1, 2), c64))
+            sc = [v * quant_scale for v in vals]
+            p0 = rocdl.cvt_pk_fp8_f32(T.i32, sc[0], sc[1], fx.Int32(0), 0)
+            p0 = rocdl.cvt_pk_fp8_f32(T.i32, sc[2], sc[3], p0, 1)
+            p1 = rocdl.cvt_pk_fp8_f32(T.i32, sc[4], sc[5], fx.Int32(0), 0)
+            p1 = rocdl.cvt_pk_fp8_f32(T.i32, sc[6], sc[7], p1, 1)
+            pv = Vec.from_elements([fx.Int32(p0), fx.Int32(p1)], fx.Int32)
+            out_byte = row * fx.Int32(inter) + gcol
+            buf_copy_store(
+                out_rsrc, out_byte // fx.Int32(8), pv, fx.Int32, unit_elems=2
+            )
+
+            d0 = row_g >> fx.Int32(5)
+            d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
+            d2 = row_g & fx.Int32(15)
+            byte_off = d0 * n32 + col_term + d2 * fx.Int32(4) + d1
+            byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
+            self._out_scale_rsrc[byte_off] = e8m0_v.to(fx.Int8)
+        wait_lds_barrier()
