@@ -51,6 +51,7 @@ op_tests/triton_tests/fusions/test_fused_mul_add.py	6
 op_tests/triton_tests/fusions/test_fused_qk_concat.py	10
 op_tests/triton_tests/fusions/test_fused_qk_norm_rope_group_quant.py	1
 op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py	28
+op_tests/triton_tests/fusions/test_fused_rmsnorm_add.py	2
 op_tests/triton_tests/fusions/test_fused_rmsnorm_indexed_adaln.py	5
 op_tests/triton_tests/fusions/test_fused_sigmoid_mul.py	1
 op_tests/triton_tests/fusions/test_fused_silu_mul.py	2
@@ -108,7 +109,6 @@ op_tests/triton_tests/moe/test_moe_wgrad.py	1
 op_tests/triton_tests/moe/test_quant_moe.py	3
 op_tests/triton_tests/moe/test_sonicmoe.py	19
 op_tests/triton_tests/normalization/test_fused_add_rmsnorm_pad.py	7
-op_tests/triton_tests/normalization/test_fused_rmsnorm_add.py	2
 op_tests/triton_tests/normalization/test_fused_rmsnorm_add_rmsnorm.py	1
 op_tests/triton_tests/normalization/test_layernorm.py	86
 op_tests/triton_tests/normalization/test_rmsnorm.py	78

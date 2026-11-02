@@ -129,6 +129,7 @@ _BACKWARD_COMPAT_MAP = {
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
     "fused_qk_concat": "fusions.fused_qk_concat",
+    "fused_rmsnorm_add": "fusions.fused_rmsnorm_add",
     # MOE modules (moe/)
     "moe_op_gemm_a8w4": "moe.moe_op_gemm_a8w4",
     "moe_op_gemm_a8w8": "moe.moe_op_gemm_a8w8",
@@ -136,7 +137,6 @@ _BACKWARD_COMPAT_MAP = {
     "quant_moe": "moe.quant_moe",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
-    "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
     "fused_rmsnorm_add_rmsnorm": "normalization.fused_rmsnorm_add_rmsnorm",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
