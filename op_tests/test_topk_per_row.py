@@ -11,7 +11,12 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops import topk as T
 from aiter.ops import topk_select as S
-from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.flydsl.topk.topk_per_row import (
+    _FLYDSL_TOPK_ONE_BLOCK_ARCHES,
+)
+from aiter.ops.flydsl.topk.topk_per_row import (
+    flydsl_top_k_per_row_decode as _flydsl_decode_topk,
+)
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
 
@@ -994,6 +999,76 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
+def _f32_from_bits(pattern: int) -> float:
+    signed = pattern if pattern < 2**31 else pattern - 2**32
+    return torch.tensor([signed], dtype=torch.int32).view(torch.float32).item()
+
+
+def test_flydsl_decode_finite_only_drops_nonfinite():
+    """finite_only keeps torch.isfinite columns. NaN and +inf stay unselected.
+
+    The short row has one finite score, so the pack path writes that column
+    and pads with -1, including when k covers the whole row. The ranked row
+    has at least k finite scores, so the radix returns those and not the
+    nonfinites. finite_only=False still ranks NaN above +inf.
+    """
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[finite-only] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    pos_inf = float("inf")
+    neg_inf = float("-inf")
+    qnan = _f32_from_bits(0x7FC00000)
+    nnan = _f32_from_bits(0xFFC00000)
+    snan = _f32_from_bits(0x7F800001)
+
+    def run(row, k, finite_only):
+        logits = torch.tensor([row], dtype=torch.float32, device="cuda")
+        indices = torch.empty(1, k, dtype=torch.int32, device="cuda")
+        _flydsl_decode_topk(
+            logits,
+            1,
+            None,
+            indices,
+            1,
+            logits.stride(0),
+            1,
+            k,
+            finite_only=finite_only,
+        )
+        torch.cuda.synchronize()
+        return indices[0].tolist()
+
+    short = [pos_inf, qnan, 1.0, neg_inf, nnan, snan, neg_inf, neg_inf]
+    got = run(short, 2, True)
+    if got != [2, -1]:
+        raise AssertionError(f"short finite_only k=2: {got}")
+    got = run(short, 8, True)
+    if got != [2, -1, -1, -1, -1, -1, -1, -1]:
+        raise AssertionError(f"short finite_only k=8: {got}")
+
+    ranked = [pos_inf, 4.0, qnan, 3.0, nnan, 2.0, neg_inf, 1.0]
+    got = run(ranked, 2, True)
+    if got != [1, 3]:
+        raise AssertionError(f"ranked finite_only k=2: {got}")
+    got = run(ranked, 4, True)
+    if got != [1, 3, 5, 7]:
+        raise AssertionError(f"ranked finite_only k=4: {got}")
+
+    # k=1 so the winner is the single selected column. At k=2 both specials
+    # are above the cutoff and the scatter writes them in column order.
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, False)
+    if got != [1]:
+        raise AssertionError(f"default order, quiet NaN above +inf: {got}")
+    got = run([nnan, pos_inf, 1.0, neg_inf], 1, False)
+    if got != [0]:
+        raise AssertionError(f"default order, negative NaN above +inf: {got}")
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, True)
+    if got != [2]:
+        raise AssertionError(f"finite_only k=1 kept a nonfinite: {got}")
+    print("[finite-only] PASS")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1075,6 +1150,7 @@ parser.add_argument(
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
+    "finite-only": test_flydsl_decode_finite_only_drops_nonfinite,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,

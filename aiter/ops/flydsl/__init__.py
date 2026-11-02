@@ -186,6 +186,12 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "qsa_indexer_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
+    "flydsl_qsa_paged_gqa": (".qsa_paged", "flydsl_qsa_paged_gqa"),
+    "qsa_layer": (".qsa_paged", "qsa_layer"),
+    # One-release aliases. vLLM still calls the previous stage names.
+    "qsa_k1_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
+    "qsa_k2": (".qsa_paged", "flydsl_qsa_paged_gqa"),
 }
 
 __all__ = [
@@ -221,6 +227,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_qsa_paged_gqa",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
@@ -239,6 +246,10 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "qsa_indexer_block_ids",
+    "qsa_k1_block_ids",
+    "qsa_k2",
+    "qsa_layer",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
