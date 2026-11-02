@@ -42,9 +42,11 @@ here. Update this file in the same change as any behaviour change.
    The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
    kernel's explicit `bounds`, else the seed's `M_BOUNDS`, else `STANDARD_M_BOUNDS`.
    `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
-   above the largest bound are not tuned. Every installed file ships an `any`: a copy of
-   `DEFAULT.json`'s `any`, rewritten on every install (the one bucket copied from `DEFAULT.json`;
-   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32).
+   above the largest bound are not tuned. Every installed file ships an `any`, rewritten on every
+   install: a copy of the file's largest-bound bucket (`M_LEQ_8192` for the standard bounds), the
+   tile tuned at the largest M. A file without that bucket gets a copy of `DEFAULT.json`'s `any`
+   (the one bucket copied from `DEFAULT.json`). Never a smaller-M tile: a tuned small-M tile as
+   fallback breaks kernels such as MXFP4 preshuffle at M >= 32.
    `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is

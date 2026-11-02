@@ -101,7 +101,7 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
@@ -123,8 +123,8 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine fused --dispatch_backend flydsl \
-                        --stage1_fused 1 --layers 2 --acc_verify 1
+                        --stage1_fused false --stage2_fused true \
+                        --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
@@ -172,6 +172,31 @@ for file in "${sharded_files[@]}"; do
             test_cmd=(
                 timeout 60m
                 python3 "$file" -w 2 4 8 --heads 8 40
+            )
+            ;;
+        op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
+            {
+                echo "Running $file at its default group size, then at 6 ranks when available"
+            } | tee -a latest_test.log
+            # 6 ranks has no gather / scatter kernels (NCCL fallback) and a
+            # one-stage all-reduce whose 512 threads do not split evenly.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file"
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$ngpu" -lt 6 ]]; then
+                        echo "Skipping the 6-rank pass of $test_file: $ngpu GPUs"
+                        exit 0
+                    fi
+                    case "$test_file" in
+                        *test_custom_allreduce.py) exec python3 "$test_file" -t 6 --regression ;;
+                        *) exec python3 "$test_file" -t 6 ;;
+                    esac
+                '
+                _ "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
