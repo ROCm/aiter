@@ -36,6 +36,8 @@ import sys
 import time
 from dataclasses import dataclass
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 # Requested global shapes (B, S, H, D); S is padded up to a multiple of world * 32.
 _SHAPES = {
     "wan2.2": (1, 9419, 40, 128),
@@ -532,6 +534,12 @@ def main():
 
     if not torch.cuda.is_available():
         print("SKIP: attention A2A requires ROCm GPUs")
+        return 0
+    # Workers initialize distributed and MoRI before the op rejects gfx942's packed MX
+    # recipes, so gate here rather than failing inside the spawned processes.
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        print(f"SKIP: attention A2A benchmark requires gfx950, found {gfx}")
         return 0
     if torch.cuda.device_count() < args.world_size:
         print(
