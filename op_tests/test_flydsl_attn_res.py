@@ -563,22 +563,6 @@ def test_flydsl_attn_res_block_out_separate_buffer(
 
 
 @_skip_unsupported_gfx
-def test_flydsl_attn_res_block_out_accepts_interleaved_views():
-    """Slots of one buffer that share no memory pass even though their extents overlap."""
-    num_blocks = 3
-    inputs = _make_inputs(17, _D, num_blocks)
-    cap = torch.randn(17, 2 * (num_blocks + 1), _D, dtype=torch.bfloat16)
-    inputs.block_residual = cap[:, 1::2][:, :num_blocks]
-    expected = _expected_closed(inputs, ALL_ON)
-
-    out = _call(flydsl_attn_res, inputs, ALL_ON, block_out=cap[:, 0::2])
-    torch.cuda.synchronize()
-
-    assert torch.equal(cap[:, 0::2], expected[2])
-    _assert_bf16_close(out[0], expected[0], "interleaved views")
-
-
-@_skip_unsupported_gfx
 def test_flydsl_attn_res_block_out_empty():
     inputs, cap = _cap_inputs(0, _D, 2, 4)
     out = _call(flydsl_attn_res, inputs, ALL_ON, block_out=cap[:, :3])
@@ -601,6 +585,10 @@ def _block_out_overlap_call(case: str):
     elif case == "prefix_rows_inside_block_out_other_stride":
         inputs.block_residual = torch.randn(4, num_blocks, _D, dtype=torch.bfloat16)
         inputs.prefix = cap.reshape(-1, _D)[:4]
+    elif case == "interleaved_views":
+        cap = torch.randn(4, 2 * (num_blocks + 1), _D, dtype=torch.bfloat16)
+        inputs.block_residual = cap[:, 1::2][:, :num_blocks]
+        block_out = cap[:, 0::2]
     elif case == "block_out_rows_overlap":
         base = torch.randn((4 + num_blocks) * _D, dtype=torch.bfloat16)
         block_out = base.as_strided((4, num_blocks + 1, _D), (_D, _D, 1))
@@ -617,6 +605,7 @@ def _block_out_overlap_call(case: str):
         "row_b_is_prefix",
         "add_hidden_inside_block_out",
         "prefix_rows_inside_block_out_other_stride",
+        "interleaved_views",
         "block_out_rows_overlap",
     ),
 )

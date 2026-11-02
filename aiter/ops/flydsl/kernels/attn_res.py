@@ -874,69 +874,25 @@ def _check_row_layout(tensor: torch.Tensor, name: str) -> None:
 
 
 def _geometry(tensor: torch.Tensor) -> tuple:
-    return tensor.data_ptr(), tuple(tensor.shape), tensor.stride()
-
-
-def _byte_extent(geometry: tuple) -> tuple[int, int]:
-    ptr, shape, strides = geometry
-    last = sum((size - 1) * stride for size, stride in zip(shape, strides))
-    return ptr, ptr + (last + 1) * 2
-
-
-def _row_starts(geometry: tuple) -> torch.Tensor:
-    """Element address of every row's first element, as a flat CPU int64 tensor."""
-    ptr, shape, strides = geometry
-    starts = torch.full((1,), ptr // 2, device="cpu")
-    for size, stride in zip(shape[:-1], strides[:-1]):
-        steps = torch.arange(size, device="cpu") * stride
-        starts = (starts[:, None] + steps).reshape(-1)
-    return starts
-
-
-def _rows_overlap(a: tuple, b: tuple) -> bool:
-    """Whether any row of ``a`` shares an element with a row of ``b`` (BF16 geometry).
-
-    Rows are contiguous and ``D`` long, so two rows overlap iff their starts are
-    closer than ``D``. Strided views that interleave without sharing memory pass.
-    """
-    if 0 in a[1] or 0 in b[1]:
-        return False
-    (a_lo, a_hi), (b_lo, b_hi) = _byte_extent(a), _byte_extent(b)
-    if a_hi <= b_lo or b_hi <= a_lo:
-        return False
-    token_stride = a[2][0]
-    if (
-        len(a[1]) > 1
-        and len(b[1]) > 1
-        and a[1][0] == b[1][0]
-        and token_stride == b[2][0]
-    ):
-        # Same token layout: when each token's rows fit one token stride, rows of
-        # different tokens never meet and one token decides.
-        a_one, b_one = (a[0], a[1][1:], a[2][1:]), (b[0], b[1][1:], b[2][1:])
-        (a_lo, a_hi), (b_lo, b_hi) = _byte_extent(a_one), _byte_extent(b_one)
-        if max(a_hi, b_hi) - min(a_lo, b_lo) <= token_stride * 2:
-            return _rows_overlap(a_one, b_one)
-    row = a[1][-1]
-    a_starts, b_starts = _row_starts(a), _row_starts(b).sort().values
-    right = torch.searchsorted(b_starts, a_starts).clamp_max(b_starts.numel() - 1)
-    left = (right - 1).clamp_min(0)
-    near = (b_starts[right] - a_starts).abs() < row
-    return bool((near | ((b_starts[left] - a_starts).abs() < row)).any())
-
-
-def _same_rows(a: tuple, b: tuple) -> bool:
-    """Same shape, data pointer, and strides; the strides of size-1 dims never matter."""
     return (
-        a[1] == b[1]
-        and a[0] == b[0]
-        and all(sa == sb for size, sa, sb in zip(a[1], a[2], b[2]) if size > 1)
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tensor.stride(),
+        tensor.element_size(),
     )
 
 
-def _rows_self_disjoint(geometry: tuple) -> bool:
+def _byte_extent(
+    ptr: int, shape: tuple, strides: tuple, itemsize: int
+) -> tuple[int, int]:
+    if 0 in shape:
+        return 0, 0
+    last = sum((size - 1) * stride for size, stride in zip(shape, strides))
+    return ptr, ptr + (last + 1) * itemsize
+
+
+def _rows_self_disjoint(shape: tuple, strides: tuple) -> bool:
     """Sufficient, not necessary: some non-overlapping layouts return False."""
-    _, shape, strides = geometry
     span = 1
     for stride, size in sorted((st, sz) for sz, st in zip(shape, strides) if sz > 1):
         if stride < span:
@@ -947,27 +903,36 @@ def _rows_self_disjoint(geometry: tuple) -> bool:
 
 @lru_cache(maxsize=512)
 def _block_out_aliases(out: tuple, blocks: tuple, inputs: tuple) -> bool:
-    """Return whether ``out[:, :B]`` is ``blocks``; raise if ``out`` overlaps an input.
-
-    Overlap is a pure function of the geometries, so the result is cached: the
-    row-level test costs more than a small-token launch.
-    """
-    num_tokens, rows, hidden_size = out[1]
+    ptr, shape, strides, itemsize = out
+    num_tokens, rows, hidden_size = shape
     num_blocks = rows - 1
-    if not _rows_self_disjoint(out):
-        raise ValueError(f"block_out rows overlap each other, got strides {out[2]}")
-    alias = num_blocks > 0 and _same_rows(
-        (out[0], (num_tokens, num_blocks, hidden_size), out[2]), blocks
-    )
-    written = out
-    if alias:
-        written = (
-            out[0] + num_blocks * out[2][1] * 2,
-            (num_tokens, 1, hidden_size),
-            out[2],
+    if not _rows_self_disjoint(shape, strides):
+        raise ValueError(f"block_out rows overlap each other, got strides {strides}")
+    block_shape = (num_tokens, num_blocks, hidden_size)
+    alias = (
+        num_blocks > 0
+        and ptr == blocks[0]
+        and blocks[1] == block_shape
+        and all(
+            out_stride == block_stride
+            for size, out_stride, block_stride in zip(block_shape, strides, blocks[2])
+            if size > 1
         )
+    )
+    if alias:
+        written = _byte_extent(
+            ptr + num_blocks * strides[1] * itemsize,
+            (num_tokens, 1, hidden_size),
+            strides,
+            itemsize,
+        )
+    else:
+        written = _byte_extent(ptr, shape, strides, itemsize)
     for name, geometry in inputs:
-        if _rows_overlap(written, geometry):
+        if alias and name == "block_residual":
+            continue
+        lo, hi = _byte_extent(*geometry)
+        if lo < written[1] and written[0] < hi:
             raise ValueError(
                 f"block_out overlaps {name}; only block_out[..., :B, :] may be "
                 "block_residual itself"
@@ -1013,8 +978,9 @@ def flydsl_attn_res(
     ``cat([block_residual, prefix_out[..., None, :]], -2)`` and implies
     ``close_block``. When ``block_out[..., :B, :]`` is ``block_residual`` itself
     (same shape, data pointer, and strides) the ``B`` copies are skipped and only
-    row ``B`` is written. Any other overlap between ``block_out`` and an input
-    raises ``ValueError``.
+    row ``B`` is written. Otherwise the byte extent of ``block_out`` must not
+    meet the extent of any input, so views that interleave in one buffer raise
+    ``ValueError``.
 
     Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
     trailing stride, positive leading strides that are multiples of
