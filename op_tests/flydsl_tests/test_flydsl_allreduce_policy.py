@@ -313,7 +313,9 @@ def test_relay_tile_fraction():
 def test_relay_factory_rejects_unsupported_configs(kw):
     with pytest.raises(ValueError):
         make_quick_allreduce_mesh_kernel(
-            grid=128, relay=(1, 2), **{"inbox_memory": "uncached", "codec": "int4", **kw}
+            grid=128,
+            relay=(1, 2),
+            **{"inbox_memory": "uncached", "codec": "int4", **kw},
         )
 
 

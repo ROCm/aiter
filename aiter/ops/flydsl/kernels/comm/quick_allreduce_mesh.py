@@ -106,9 +106,9 @@ __all__ = [
     "latency_max_tiles",
     "make_quick_allreduce_mesh_kernel",
     "mxfp4_scale_shape",
-    "rmsnorm_hidden_supported",
     "relay_blocks",
     "relay_tile_fraction",
+    "rmsnorm_hidden_supported",
 ]
 
 PHASES = 2
@@ -687,7 +687,9 @@ def make_quick_allreduce_mesh_kernel(
                     src, k = atom // rank_atoms, atom % rank_atoms
                     if const_expr(src != self_rank):
                         ars.append(
-                            _recv_quantized(PHASE_ALL_GATHER, fx.Int32(src), sub, k, to_bounce)
+                            _recv_quantized(
+                                PHASE_ALL_GATHER, fx.Int32(src), sub, k, to_bounce
+                            )
                         )
                     elif const_expr(own is not None):
                         ars.append(own[k])
@@ -1035,6 +1037,7 @@ def make_quick_allreduce_mesh_kernel(
 
         def _run(to_bounce):
             """The whole schedule, specialized for relay or direct blocks."""
+
             def reused(i):
                 return (i > fx.Int32(0)) if to_bounce else None
 

@@ -1,7 +1,7 @@
 # TP2 relay for the mesh quick all-reduce
 
 Design notes and measurements behind the relay in `quick_allreduce_relay.py`,
-`quick_allreduce.py` and `kernels/quick_allreduce_mesh.py`. The code comments
+`quick_allreduce.py` and `kernels/comm/quick_allreduce_mesh.py`. The code comments
 describe what the code does; this file records why the defaults and cache
 policies are what they are, and what has been measured. Every measurement here
 is on gfx950 (MI355X, 8 GPUs on xGMI).

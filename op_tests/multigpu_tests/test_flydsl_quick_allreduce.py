@@ -146,7 +146,10 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import MESH_RELAY_DEFAULTS, clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
+    MESH_RELAY_DEFAULTS,
+    clamp_grid_cap,
+)
 from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
@@ -1036,7 +1039,10 @@ def _run_rank(
     direct = None
     if "relay_devices" in engine_kw:
         direct = _engine(
-            rank, tp, gloo, device,
+            rank,
+            tp,
+            gloo,
+            device,
             {k: v for k, v in engine_kw.items() if not k.startswith("relay_")},
         )
     production_cfgs = None
@@ -2593,7 +2599,6 @@ def main():
             _relay_key(tp, pair, fraction, codec, st, grid_cap, floor, block),
             _relay_case(tokens, hidden, codec, calls, graph),
         )
-
 
     _summarize(
         "flydsl quick allreduce TP2 relay",

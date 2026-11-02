@@ -55,6 +55,7 @@ from .allreduce_policy import (
     ring_st_ladder,
     select_rung,
 )
+from .ipc_heap import UncachedIpcHeap
 from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
@@ -82,13 +83,13 @@ from .kernels.comm.quick_allreduce_ring import (
     make_quick_allreduce_ring_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
-from .ipc_heap import UncachedIpcHeap
 from .quick_allreduce_relay import InGroupRelayProvider, RelayProvider
 
 logger = logging.getLogger("aiter")
 
-# Largest payload ``_check_payload`` accepts, rounded down to a 16 B multiple.
+# Largest payload ``check_payload`` accepts, rounded down to its alignment.
 _MAX_PAYLOAD = MAX_PAYLOAD_BYTES - MAX_PAYLOAD_BYTES % PAYLOAD_ALIGN_BYTES
+
 
 @dataclass(frozen=True)
 class _Algorithm:
