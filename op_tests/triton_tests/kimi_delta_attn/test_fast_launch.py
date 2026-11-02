@@ -17,6 +17,8 @@ that produces. So the tests here are about the key, not about speed:
   alignment is one of the things the compiler was told it could assume.
 """
 
+import importlib
+
 import pytest
 import torch
 
@@ -124,19 +126,19 @@ def test_a_second_shape_does_not_reuse_the_first_entry():
 
 def _wrapped():
     """Every fast_launch-wrapped kernel the pipeline can reach."""
-    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-        flash_kda_k1,
-        flash_kda_k2,
-    )
     from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as fk
 
-    candidates = (
+    candidates = [
         fk._prepare_fast,
         fk._segment_fast,
         fk._seg_scan_fast,
-        flash_kda_k1._k1_fast,
-        flash_kda_k2.k2_ab_fused_fast,
-    )
+        fk._seg_scan_prefetch_fast,
+    ]
+    if fk._GLUON_ARCH_OK:
+        pkg = f"aiter.ops.triton._gluon_kernels.{fk.DEVICE_ARCH}.kimi_delta_attn"
+        k1 = importlib.import_module(f"{pkg}.flash_kda_k1")
+        k2 = importlib.import_module(f"{pkg}.flash_kda_k2")
+        candidates += [k1._k1_fast, k2.k2_ab_fused_fast, getattr(k2, "k2_c_fast", None)]
     return [c for c in candidates if isinstance(c, fast_launch._FastLaunch)]
 
 

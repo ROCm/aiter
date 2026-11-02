@@ -44,8 +44,8 @@ def _flydsl_available(find_spec):
 def _dispatcher(name, *, available, flydsl=None, triton=None):
     imports = []
     flydsl_module = SimpleNamespace(
-        flydsl_flash_attn_batch_func=flydsl,
-        flydsl_flash_attn_varlen_func=flydsl,
+        flydsl_flash_attn_batch_fwd=flydsl,
+        flydsl_flash_attn_varlen_fwd=flydsl,
     )
     triton_module = SimpleNamespace(
         flash_attn_func=triton,

@@ -80,6 +80,11 @@ def get_cdna_version():
         return -1
 
 
+def pa_decode_gluon_supports_arch() -> bool:
+    """Whether the Gluon paged-decode backend supports the current GPU."""
+    return get_cdna_version() in (3, 4)
+
+
 def get_occupancy():
     return 2
 
