@@ -8,6 +8,7 @@ The rest of the package: ``recipe`` (what runs, at what shape), ``transport``
 (the dispatch and combine ``stages`` over one ``arena``) and ``mori_caps``.
 """
 
+import dataclasses
 import os
 import warnings
 
@@ -39,6 +40,7 @@ from .recipe import (
     _stage_classes,
     read_dispatch_wire_env,
 )
+from .s1f_ctl import read_s1f_mode
 from .stages.base import Routing, _ComputeTarget, _DispatchBatch
 from .stages.dispatch_compact import _MAX_COMPACT_TILE_M, _CompactDispatch
 from .transport import _arena_layout, _capabilities_for, _EpDispatcher
@@ -253,7 +255,9 @@ class MegaMoEGfx1250:
                 continue
             dispatch, combine = _stage_classes(recipe)
             dispatch_regions = (
-                _CompactDispatch.regions_for_tile(config, _MAX_COMPACT_TILE_M)
+                _CompactDispatch.regions_for_tile(
+                    config, _MAX_COMPACT_TILE_M, s1f=read_s1f_mode()
+                )
                 if stage1_fused
                 else dispatch.regions(config, caps)
             )
@@ -350,6 +354,23 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
+        step_kw = {}
+        s1f = False
+        hook = None
+        disp = ep._dispatch
+        if isinstance(disp, _CompactDispatch):
+            # The tile is fixed before the stage-1 verdict, which is per tile.
+            disp.prepare_step(recv_token_bound)
+            s1f = disp.fusion.eligible(bias1, bias2)
+            if s1f:
+                # No in-forward plan prefetch under S1F: without the dispatch
+                # tail, the next layer's plan must come after this rank's
+                # reduce. The next forward launches its plan in stream order.
+                next_topk_ids = None
+                hook = disp.fusion.gemm1
+            elif disp.fusion.should_probe():
+                hook = disp.fusion.probe
+            step_kw = {"begin_step": False, "s1f": s1f}
         batch = ep.dispatch(
             hidden_states,
             topk_weights,
@@ -357,8 +378,11 @@ class MegaMoEGfx1250:
             recv_token_bound=recv_token_bound,
             next_topk_ids=next_topk_ids,
             next_recv_token_bound=next_recv_token_bound,
+            **step_kw,
         )
         target = ep.prepare(batch, quant_bits)
+        if hook is not None and target.scatter is not None:
+            target.scatter = dataclasses.replace(target.scatter, stage1_gemm1=hook)
         expert_out = self._compute(
             batch,
             target,
@@ -371,6 +395,8 @@ class MegaMoEGfx1250:
             a1_scale=a1_scale,
             a2_scale=a2_scale,
         )
+        if isinstance(disp, _CompactDispatch):
+            disp.fusion.finish(s1f)
         return ep.combine(batch.routing, quant_bits, expert_out)
 
     __call__ = forward

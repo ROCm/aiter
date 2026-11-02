@@ -700,6 +700,7 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    _gemm2_m_align = 0
     if cluster_n2 is None:
         # The two stages want different cluster widths: gemm1 gains from the
         # multicast of its shared A operand, while gemm2 loses more than it
@@ -714,10 +715,12 @@ def _grouped_a8w4_tdm_moe(
         _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
         if _plan_align:
             tile_m = min(int(tile_m), _plan_align)
+            tile_m2 = min(int(tile_m2), _plan_align)
             # psum holds each expert's unpadded end, so a gemm2 tile narrower
-            # than the alignment can start in an expert's padding, map to the
-            # next expert, and scatter stale ep_rowmap rows into live slots.
-            tile_m2 = _plan_align
+            # than the alignment can start in an expert's padding; gemm2 must
+            # skip those or it scatters stale ep_rowmap rows into live slots.
+            if tile_m2 < _plan_align:
+                _gemm2_m_align = _plan_align
             if _plan_align % tile_m or _plan_align % tile_m2:
                 raise ValueError(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
@@ -968,6 +971,8 @@ def _grouped_a8w4_tdm_moe(
         if enable_ep_scatter
         else {}
     )
+    if _gemm2_m_align:
+        _ep_gemm2_kwargs["m_align"] = _gemm2_m_align
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -1159,8 +1164,12 @@ def _grouped_a8w4_tdm_moe(
         )
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
-        # quant_scale / arg_quant_scale).
-        flydsl_grouped_gemm_a8w4_masked(
+        # quant_scale / arg_quant_scale). Under S1F the compact context swaps
+        # in the fused dispatch + GEMM1 stage-1 kernel with the same signature.
+        _stage1_gemm1 = (
+            getattr(stage2_scatter, "stage1_gemm1", None) if _compact else None
+        )
+        (_stage1_gemm1 or flydsl_grouped_gemm_a8w4_masked)(
             a2_payload.view(torch.uint8),
             a1_payload,
             w1_u8,
