@@ -637,6 +637,7 @@ def _print_case_list():
             "d_v": c.get("d_v", DEFAULT_HDIM_V),
             "sq": c["sq"],
             "sk": c["sk"],
+            "page": c.get("page", ""),
             "causal": c.get("causal", False),
             "lse": c.get("lse", False),
             "window": str(tuple(c.get("window", (-1, -1)))),
