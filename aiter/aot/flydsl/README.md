@@ -11,7 +11,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, plus the opt-in small- and large-input kernels, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
@@ -93,6 +93,11 @@ variant of the profile's bundle plan.
   is tuned per GPU model.
 - `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
   fixed-slot `forward` and the per-stage benchmarks call it.
+- The MTPR 8192 jobs build the instance with `AITER_MEGA_SMALL_M=1` and
+  `AITER_MEGA_LARGE_M=1`. Where the runtime's eligibility checks accept the
+  profile (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` then also loads
+  the small-input kernel of every token bucket (MTPR 256 and 512) and the
+  large-input persistent kernel.
 - Like the MoE replay, it runs in a process of its own, started with
   `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
