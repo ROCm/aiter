@@ -636,7 +636,11 @@ def get_moe_stage_module(
         "module_moe_ck2stages",
         Adtype,
         Bdtype,
-        "preshuffle_on" if preshuffle_mode else "preshuffle_off",
+        (
+            "preshuffle_off"
+            if weight_dtype == dtypes.fp4x2 and not preshuffle_mode
+            else "preshuffle_on"
+        ),
         Cdtype,
         act,
         quant_type,
