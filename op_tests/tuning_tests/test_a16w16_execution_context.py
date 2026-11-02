@@ -171,13 +171,87 @@ class TestExecutionContext(unittest.TestCase):
             tuned, "_opus_launch", mock.Mock()
         ), mock.patch.object(
             tuned, "get_GEMM_A16W16_tuned_config", return_value=ordinary
+        ), mock.patch.object(
+            tuned, "_warned_execution_phase_gate_misses", set()
         ):
             config = tuned.get_GEMM_A16W16_config(**args, gfx="gfx950", cu_num=256)
             self.assertEqual((config["libtype"], config["solidx"]), ("opus", 138))
-            self.assertEqual(
-                tuned.get_GEMM_A16W16_config(**args, gfx="gfx950", cu_num=304),
-                ordinary,
+            with self.assertLogs("aiter", level="WARNING") as logs:
+                self.assertEqual(
+                    tuned.get_GEMM_A16W16_config(**args, gfx="gfx950", cu_num=304),
+                    ordinary,
+                )
+            self.assertIn("invariant family requires", "\n".join(logs.output))
+
+    def test_shadowed_tuned_row_is_logged_once(self):
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+        args = {
+            "M": 96,
+            "N": 4096,
+            "K": 1536,
+            "bias": False,
+            "dtype": "torch.bfloat16",
+            "otype": "torch.bfloat16",
+            "execution_role": "target",
+            "execution_phase": "prefill",
+            "gfx": "gfx950",
+            "cu_num": 256,
+        }
+        shadowed = {"libtype": "triton", "solidx": 0, "kernelName": "triton_row"}
+        with mock.patch.object(tuned, "AITER_LOG_TUNED_CONFIG", 1), mock.patch.object(
+            tuned, "_opus_launch", mock.Mock()
+        ), mock.patch.object(
+            tuned, "get_GEMM_A16W16_tuned_config", return_value=shadowed
+        ), self.assertLogs(
+            "aiter", level="INFO"
+        ) as logs:
+            for _ in range(2):
+                config = tuned.get_GEMM_A16W16_config(**args)
+        self.assertEqual((config["libtype"], config["solidx"]), ("opus", 138))
+        output = "\n".join(logs.output)
+        self.assertEqual(output.count("shadows tuned row"), 1, output)
+        self.assertIn("triton", output)
+        self.assertIn("execution_phase_invariant_family", output)
+
+    def test_gate_miss_warns_once(self):
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+        ordinary = {"libtype": "triton", "solidx": 0}
+        args = {
+            "N": 4096,
+            "K": 1536,
+            "bias": False,
+            "dtype": "torch.bfloat16",
+            "otype": "torch.bfloat16",
+            "execution_role": "target",
+            "execution_phase": "prefill",
+        }
+        with mock.patch.object(
+            tuned, "_warned_execution_phase_gate_misses", set()
+        ), mock.patch.object(
+            tuned, "get_GEMM_A16W16_tuned_config", return_value=ordinary
+        ), mock.patch.object(
+            tuned, "_opus_launch", mock.Mock()
+        ), self.assertLogs(
+            "aiter", level="WARNING"
+        ) as logs:
+            for m in (96, 97):
+                config = tuned.get_GEMM_A16W16_config(
+                    **args, M=m, gfx="gfx942", cu_num=304
+                )
+                self.assertEqual(config, ordinary)
+            supported = tuned.get_GEMM_A16W16_config(
+                **args, M=96, gfx="gfx950", cu_num=256
             )
+            with mock.patch.object(tuned, "_opus_launch", None):
+                asm = tuned.get_GEMM_A16W16_config(
+                    **args, M=98, gfx="gfx950", cu_num=256
+                )
+        self.assertEqual((supported["libtype"], supported["solidx"]), ("opus", 138))
+        self.assertEqual((asm["libtype"], asm["solidx"]), ("asm", 10))
+        warnings = [line for line in logs.output if "invariant family requires" in line]
+        self.assertEqual(len(warnings), 1, logs.output)
 
     def test_mono_tile_tuner_gate_accepts_supported_m_tails(self):
         import sys
