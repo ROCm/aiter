@@ -2614,6 +2614,17 @@ def _dummy_scale(dev):
 # that keep that assumption true, so a legal-looking call can never wrap an
 # offset and land where it does not belong.
 _MAX_I32 = 2**31 - 1
+# Read once, like the specialization switches: no second getenv on exact calls.
+# Set before module import. This diagnostic intentionally allocates/synchronizes.
+_QSA_PAD_INT32_GUARD = os.environ.get("QSA_PAD_INT32_GUARD", "0").strip() == "1"
+# Native bucket units are import-time specialization facts, not tensor facts.
+# Resolve once so PAD=1 adds only integer geometry/extent tests per launch.
+_QSA_PAD_BF16_R64 = _BF16_R64 and _BF16_K_LOAD != "raw" and _ACCESS == "raw"
+_QSA_PAD_BF16_R16_COLS = (R16_TDM_COLS if _resolve_bf16_k_load(16) == "tdm"
+                         and _ACCESS == "raw" else WMMA_COLS)
+_QSA_PAD_BF16_R32_COLS = (WMMA_COLS * TDM_PERSIST_CHUNKS
+                         if _resolve_bf16_k_load(32) == "tdm" and TDM_PERSIST
+                         and _ACCESS == "raw" else WMMA_COLS)
 
 
 def _check_plane(name, nbytes):
@@ -2646,6 +2657,209 @@ def _to_i32_checked(tensor, name):
     if lo < -(2**31) or hi > _MAX_I32:
         raise ValueError(f"{name} values [{lo}, {hi}] do not fit in int32")
     return tensor.to(torch.int32)
+
+
+def qsa_pad_plan(shape, dtype):
+    """CPU-only bucket map; no tensor allocation, compiler or device access.
+
+    ``shape`` is a mapping, or ``(rows, heads, columns, requests,
+    page_table_width, cache_pages[, regime])``. Dtype is ``bf16``/``fp8``
+    (torch dtype objects also work). The specialization is selected from the
+    TRUE shape before rounding: request padding must not downgrade prefill.
+    Environment overrides are the same ones used by the unpadded wrapper.
+    Zero-size planes are rejected, just like the default wrapper; no zero V#
+    is ever launched. This plan does not assert metadata uniformity or cache
+    alignment: the dispatcher retains the kernel's mixed/tail/raw fallback.
+    """
+    keys = ("rows", "heads", "columns", "requests", "page_table_width", "cache_pages")
+    if isinstance(shape, dict):
+        dims = {key: int(shape[key]) for key in keys}
+        regime = shape.get("regime")
+    else:
+        if len(shape) not in (6, 7):
+            raise ValueError("shape must contain six dimensions and optional regime")
+        dims = dict(zip(keys, (int(value) for value in shape[:6])))
+        regime = shape[6] if len(shape) == 7 else None
+    tag = str(dtype).replace("torch.", "")
+    tag = {"bfloat16": "bf16", "float8_e4m3fn": "fp8"}.get(tag, tag)
+    if tag not in ("bf16", "fp8"):
+        raise ValueError(f"padding supports bf16/fp8, got {dtype!r}")
+    if dims["heads"] != NUM_HEADS:
+        raise ValueError(f"padding requires {NUM_HEADS} heads")
+    if any(value < 1 for value in dims.values()):
+        raise ValueError("padding rejects zero/negative dimensions (no empty V# launch)")
+    rows, columns, requests = dims["rows"], dims["columns"], dims["requests"]
+    if rows > MAX_GRID_Y:
+        raise ValueError(f"rows must be <= {MAX_GRID_Y}")
+    if columns > PAGE_SIZE * dims["page_table_width"]:
+        raise ValueError("columns exceed the true page-table capacity; never truncate")
+    inferred = "prefill" if rows >= 32 * requests else ("decode" if rows >= 4 * requests else "draft")
+    regime = inferred if regime is None else str(regime)
+    if regime not in ("decode", "draft", "prefill"):
+        raise ValueError(f"unknown regime {regime!r}")
+    # Regime is descriptive only: geometry follows the champion shape router.
+    geometry = (wmma_bf16_rows_per_block(rows, requests) if tag == "bf16"
+                else wmma_rows_per_block(rows, requests))
+    mode = (_resolve_bf16_k_load(geometry) if tag == "bf16"
+            else _resolve_fp8_k_load(geometry))
+    if _ACCESS != "raw":
+        mode = "raw"  # copy-atom access never instantiates a TDM specialization
+    if (tag == "bf16" and geometry == 32 and mode == "tdm" and TDM_PERSIST
+            and _ACCESS == "raw" and columns >= WMMA_COLS * TDM_PERSIST_CHUNKS):
+        mode = "persist"
+    tile_cols = (WMMA_COLS * TDM_PERSIST_CHUNKS if mode == "persist" else
+                 R16_TDM_COLS if tag == "bf16" and geometry == 16 and mode == "tdm"
+                 else WMMA_COLS)
+    padded = dict(dims)
+    padded["rows"] = ((rows + geometry - 1) // geometry) * geometry
+    padded["columns"] = ((columns + tile_cols - 1) // tile_cols) * tile_cols
+    padded["requests"] = ((requests + 3) // 4) * 4
+    width_unit = tile_cols // PAGE_SIZE
+    padded["page_table_width"] = ((dims["page_table_width"] + width_unit - 1) // width_unit) * width_unit
+    # Python integers do not overflow; enforce exactly the same i32-address
+    # budget before allocating any padded plane. _plane_bytes remains i64.
+    for name, nbytes in (
+        ("padded_q", padded["rows"] * NUM_HEADS * HEAD_DIM * 2),
+        ("padded_logits", padded["rows"] * padded["columns"] * 4),
+        ("padded_page_table", padded["requests"] * padded["page_table_width"] * 4),
+        ("padded_row_metadata", padded["rows"] * 4),
+        ("padded_context_lens", padded["requests"] * 4),
+        ("compressed_k_cache", dims["cache_pages"] * PAGE_SIZE * HEAD_DIM * (2 if tag == "bf16" else 1)),
+        ("compressed_k_scale", dims["cache_pages"] * PAGE_SIZE * 4),
+    ):
+        _check_plane(name, nbytes)
+    return {"dtype": tag, "regime": regime, "true_shape": dims,
+            "padded_shape": padded, "rows_per_block": geometry,
+            "tile_cols": tile_cols, "k_load": mode,
+            "needs_padding": padded != dims,
+            "copy_back": (rows, columns), "env": "QSA_PAD_BUCKET=1"}
+
+
+def _qsa_pad_validate_buffers(inputs, outputs):
+    """Opt-in guard: output writes must not race input or other output reads.
+
+    Bounds cover strided metadata as well as contiguous planes. Disjoint views
+    of the same storage are permitted; overlapping views are rejected before
+    launch. The historical default-off acceptance contract is unchanged.
+    """
+    def interval(tensor):
+        lo = int(tensor.data_ptr())
+        extent = 1 + sum((int(n) - 1) * int(s)
+                         for n, s in zip(tensor.shape, tensor.stride()))
+        return lo, lo + extent * tensor.element_size()
+    named_inputs = [(name, tensor, interval(tensor)) for name, tensor in inputs]
+    named_outputs = [(name, tensor, interval(tensor)) for name, tensor in outputs]
+    for index, (name, tensor, (lo, hi)) in enumerate(named_outputs):
+        if not tensor.is_contiguous():
+            raise ValueError(f"padding requires contiguous {name}")
+        for other, value, (olo, ohi) in named_inputs + named_outputs[:index]:
+            if tensor.device == value.device and lo < ohi and olo < hi:
+                raise ValueError(f"padding output {name} overlaps {other}")
+
+
+def _qsa_pad_dispatch(plan, q, cache, scale, pt, t2r, qp, cl,
+                      logits, visible, starts, divisor, stream):
+    """Launch an existing bucket specialization with allocation-safe padding.
+
+    Only called after the unchanged wrapper has validated TRUE inputs. Cache
+    pages/scales are never padded or changed. TDM alignment fallback is identical
+    to the exact path (fp8 8B base allowed, 16/128B TDM constraint => raw).
+    Every padded allocation is checked again before constructing a descriptor.
+    """
+    true, pad = plan["true_shape"], plan["padded_shape"]
+    rows, columns, requests = true["rows"], true["columns"], true["requests"]
+    pr, pc, pn, pw = (pad[key] for key in ("rows", "columns", "requests", "page_table_width"))
+    dev = q.device
+    # pos+1 is i32 in the frozen kernel. Since ctx <= INT32_MAX, saturating
+    # this one endpoint preserves min((pos+1)//4, ctx//4) exactly and prevents
+    # overflow. All other positions (including negative values) are unchanged.
+    qp = qp.clamp(max=_MAX_I32 - 1)
+    if pr != rows:
+        pq = torch.zeros((pr, NUM_HEADS, HEAD_DIM), dtype=q.dtype, device=dev)
+        pq[:rows].copy_(q)
+        pqp = torch.zeros(pr, dtype=torch.int32, device=dev)
+        pqp[:rows].copy_(qp)
+    else:
+        pq, pqp = q, qp
+    # A previously invalid request must remain invalid after pn >= requests.
+    safe_t2r = torch.where((t2r >= 0) & (t2r < requests), t2r, -1)
+    pt2r = torch.full((pr,), -1, dtype=torch.int32, device=dev)
+    pt2r[:rows].copy_(safe_t2r)
+    if pn != requests or pw != true["page_table_width"]:
+        ppt = torch.full((pn, pw), -1, dtype=torch.int32, device=dev)
+        ppt[:requests, :true["page_table_width"]].copy_(pt)
+        pcl = torch.zeros(pn, dtype=torch.int32, device=dev)
+        pcl[:requests].copy_(cl)
+    else:
+        ppt, pcl = pt, cl
+    output_padding = pr != rows or pc != columns
+    plogits = (torch.full((pr, pc), _NEG_INF, dtype=torch.float32, device=dev)
+               if output_padding else logits)
+    pvis = torch.empty(pr, dtype=torch.int32, device=dev) if pr != rows else visible.view(-1)
+    prst = torch.empty(pr, dtype=torch.int32, device=dev) if pr != rows else starts.view(-1)
+    for name, tensor, alignment in (
+        ("padded_q", pq, 16), ("padded_page_table", ppt, 4),
+        ("padded_token_to_request", pt2r, 4), ("padded_query_positions", pqp, 4),
+        ("padded_context_lens", pcl, 4), ("padded_logits", plogits, 4),
+        ("padded_visible_groups", pvis, 4), ("padded_row_starts", prst, 4),
+    ):
+        _check_plane(name, tensor.numel() * tensor.element_size())
+        _check_align(tensor, name, alignment)
+    geometry, mode = plan["rows_per_block"], plan["k_load"]
+    kv_u8 = cache.view(torch.uint8).view(true["cache_pages"], -1)
+    if mode in ("tdm", "persist") and kv_u8.data_ptr() % 128:
+        geometry, mode = 16, "raw"
+    if plan["dtype"] == "bf16":
+        launch = _build_wmma_kernel(float(divisor), geometry, mode)
+        gx, gy = wmma_grid(pr, pc, geometry, launch.cols_per_block)
+        _run(launch, pq.view(torch.uint8).view(pr, -1), kv_u8, ppt, pt2r, pqp, pcl,
+             plogits, pvis, prst, gx, gy, pr, pc, true["cache_pages"], pn, pw, stream)
+    else:
+        launch = _build_wmma_fp8_kernel(float(divisor), geometry, mode)
+        gx, gy = wmma_grid(pr, pc, geometry)
+        _run(launch, pq.view(torch.uint8).view(pr, -1), kv_u8,
+             scale.view(true["cache_pages"], PAGE_SIZE, 1), ppt, pt2r, pqp, pcl,
+             plogits, pvis, prst, gx, gy, pr, pc, true["cache_pages"], pn, pw, stream)
+    # Padded columns can share the last valid page with true columns. Mask them
+    # after launch without changing true visible_groups or arithmetic order.
+    if pc != columns:
+        plogits[:, columns:].fill_(_NEG_INF)
+    if output_padding:
+        logits.copy_(plogits[:rows, :columns])
+    if pr != rows:
+        visible.view(-1).copy_(pvis[:rows])
+        starts.view(-1).copy_(prst[:rows])
+    return logits, visible.view(-1)
+
+
+def _qsa_pad_checked_dispatch(rows, columns, requests, width, pages, is_fp8,
+                              q, cache, scale, pt, t2r, qp, cl,
+                              logits, visible, starts, divisor, dev,
+                              raw_pt, raw_t2r, raw_qp, raw_cl):
+    """Slow opt-in path only; preserve the ROUND-PAD validation and plan."""
+    for name, tensor in (("compressed_k_cache", cache), ("page_table", raw_pt),
+                         ("token_to_request", raw_t2r), ("query_positions", raw_qp),
+                         ("context_lens", raw_cl)):
+        if tensor.device != dev:
+            raise ValueError(f"{name} must be on {dev}, got {tensor.device}")
+    if is_fp8 and scale.device != dev:
+        raise ValueError(f"compressed_k_scale must be on {dev}")
+    checked_inputs = [("q", q), ("compressed_k_cache", cache), ("page_table", raw_pt),
+                      ("token_to_request", raw_t2r), ("query_positions", raw_qp),
+                      ("context_lens", raw_cl)]
+    if is_fp8:
+        checked_inputs.append(("compressed_k_scale", scale))
+    _qsa_pad_validate_buffers(checked_inputs, [
+        ("logits", logits), ("visible_groups", visible), ("row_starts", starts)])
+    if ((not is_fp8 and _BF16_PATH == "wmma") or
+            (is_fp8 and _FP8_PATH == "wmma")):
+        plan = qsa_pad_plan((rows, NUM_HEADS, columns, requests, width, pages),
+                            "fp8" if is_fp8 else "bf16")
+        if plan["needs_padding"]:
+            return _qsa_pad_dispatch(plan, q, cache, scale, pt, t2r, qp, cl,
+                                     logits, visible, starts, divisor,
+                                     torch.cuda.current_stream(dev))
+    return None  # Scalar, or a candidate-exact shape after alignment fallback.
 
 
 def qsa_paged_mqa_logits_page4(
@@ -2813,6 +3027,39 @@ def qsa_paged_mqa_logits_page4(
     divisor = float(divisor)
     if not math.isfinite(divisor) or divisor <= 0.0:
         raise ValueError(f"divisor must be finite and > 0, got {divisor}")
+
+    # Native bucket routing is deliberately outside the original launch
+    # branches, which remain verbatim (including the stock CPU AST gates).
+    if os.environ.get("QSA_PAD_BUCKET", "0").strip() == "1":
+        if ((not is_fp8 and _BF16_PATH == "wmma") or
+                (is_fp8 and _FP8_PATH == "wmma")):
+            # Import-time units + true-shape integers only: no planner, tensor
+            # work, pointer/device/alias inspection, or extra helper calls.
+            pad_rows = (64 if not is_fp8 and _QSA_PAD_BF16_R64 and rows >= 64
+                        and rows >= 64 * num_requests else
+                        32 if rows >= 32 and rows >= 32 * num_requests else 16)
+            pad_cols = (WMMA_COLS if is_fp8 or pad_rows == 64 else
+                        _QSA_PAD_BF16_R16_COLS if pad_rows == 16 else
+                        _QSA_PAD_BF16_R32_COLS if columns >= _QSA_PAD_BF16_R32_COLS
+                        else WMMA_COLS)
+            # True request count need not be a multiple of4: native req1/2
+            # buckets use the original kernel's true request/metadata guards.
+            if rows % pad_rows or columns % pad_cols or width % (pad_cols // PAGE_SIZE):
+                padded = _qsa_pad_checked_dispatch(
+                    rows, columns, num_requests, width, num_pages, is_fp8,
+                    q, compressed_k_cache, compressed_k_scale, page_table_i32,
+                    t2r_i32, qp_i32, cl_i32, logits, visible_groups, row_starts, divisor, dev,
+                    page_table, token_to_request, query_positions, context_lens)
+                if padded is not None:
+                    return padded
+        else:  # Scalar opt-in keeps the previous validation/true-shape bypass.
+            _qsa_pad_checked_dispatch(
+                rows, columns, num_requests, width, num_pages, is_fp8,
+                q, compressed_k_cache, compressed_k_scale, page_table_i32,
+                t2r_i32, qp_i32, cl_i32, logits, visible_groups, row_starts, divisor, dev,
+                page_table, token_to_request, query_positions, context_lens)
+        if _QSA_PAD_INT32_GUARD and bool((qp_i32 == _MAX_I32).any()):
+            raise ValueError("QSA_PAD_BUCKET identity/scalar path cannot use query_positions=INT32_MAX")
 
     kv_u8 = compressed_k_cache.view(torch.uint8).view(num_pages, -1)
     q_u8 = q.view(torch.uint8).view(rows, -1)
