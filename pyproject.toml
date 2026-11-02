@@ -96,6 +96,9 @@ filterwarnings = [
 [tool.black]
 # Same reason as ruff's `.claude` exclude above: narrowing .gitignore made the bot's tooling
 # visible to the formatter for the first time, and reformatting it is not this change.
+# plugins/aiter/skills is a symlink to .claude/skills; black follows it and matches the
+# exclude against the link's path, so the same files must be excluded under that name too.
 extend-exclude = '''
 /\.claude/
+| /plugins/aiter/skills/
 '''
