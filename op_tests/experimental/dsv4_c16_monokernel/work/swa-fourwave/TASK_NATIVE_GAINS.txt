@@ -1,0 +1,47 @@
+Instrumented operation comparison,us. Gain=previous-current.
+Previous=TASK_NATIVE0,NATIVE_PARITY1;current=TASK_NATIVE1,NATIVE_PARITY1.
+
+Positive gain means faster;negative is regression.
+Prefix previous/current are separate runs; same probe methodology,not interleaved. Suffix uses same fixture with old/new bodies.
+Native column is prior native whole-kernel profiler duration,includes entry/exit;not directly comparable to fused body.
+Concurrent mHC roles and overlapping branches must not be summed. Prefix instrumentation changes graph time by0.2-4.6%.
+External native GU/GD unchanged; current profiled launch durations50.61/25.68us,previous47.31/23.11us;not body timers.
+No measured performance win for this native task parity recipe.
+
+stage operation                           previous current   gain  native-kernel
+ 1 mHC pre GEMM                              1.92    2.04   -0.12    2.80
+ 2 mHC reduce/apply/norm apply_norm          3.36    3.28   +0.08    4.57
+ 2 mHC reduce/apply/norm post_sinkhorn       3.28    3.20   +0.08    4.57
+ 3 input FP8 quant                           0.96    1.00   -0.04    2.40
+ 4 QA/KV                                     4.72    4.96   -0.24    4.13
+ 5 Q norm/quant                              1.36    1.76   -0.40    2.44
+ 6 QB                                        6.28    6.84   -0.56    4.08
+ 7 QK norm/RoPE/cache                        3.68    3.20   +0.48    3.16
+ 8 split attention                          11.04   27.72  -16.68    5.65
+ 9 attention reduce                          4.36    9.46   -5.10    6.93
+10 inverse RoPE/quant                        1.68    1.96   -0.28    2.44
+11 OA                                        8.48   12.12   -3.64    5.33
+12 OB input quant                            1.16    1.32   -0.16    2.48
+13 OB                                       10.16   15.08   -4.92    6.77
+14 post/pre mHC GEMM                         5.92    5.80   +0.12    2.88
+15 FFN mHC reduce/apply apply_norm           7.56    8.28   -0.72    3.44
+15 FFN mHC reduce/apply post_sinkhorn        5.92    5.92   +0.00    3.44
+16 shared input quant                        1.76    2.16   -0.40    2.44
+17 shared GU                                 9.04   10.80   -1.76    4.89
+18 shared SiLU                               4.52    4.48   +0.04    2.40
+19 shared hidden quant                       1.12    1.04   +0.08    2.44
+20 shared GD                                 6.96    7.48   -0.52    4.12
+21 router                                    8.94   10.64   -1.70    4.00
+22 HERD clear                                0.16    0.32   -0.16    1.48
+23 topk                                      5.84    6.08   -0.24    2.88
+24 keep6/renorm                              1.76    1.68   +0.08    2.04
+25 routing metadata                          5.40    5.68   -0.28    4.57
+26 routed input quant                        2.72    4.16   -1.44    2.36
+29 routed reduction                          1.88    2.96   -1.08    2.96
+30 output add                                0.64    0.92   -0.28    2.08
+
+Uninstrumented full-layer graph16 medians,us:
+position previous-split current-split native-sequential current-monolithic
+1024 225.52 263.15 169.26 313.95
+1535 226.90 264.49 170.79 323.37
+2047 225.99 263.66 169.74 314.16

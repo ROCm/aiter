@@ -1,0 +1,89 @@
+Task-level ATOM native audit -- GPU0,256 resident CTAs,128 threads/four wave32 waves.
+Scope: actual-checkpoint C16 TP1 SWA layer0,synthetic activations,128 BF16 KV keys,positions1024/1535/2047. This is not a full-serving TPOT/TTFT benchmark.
+Supersedes the grid-based exception classification in NATIVE_OPERATION_PARITY.txt. Larger native grids are logical tasks,not blanket exceptions.
+31 operations audited:1 eliminated copy,26 fitted/mapped fused operations,2 cooperative-body exceptions,2 exact external native MoE operations.
+Native-design match does not mean identical whole-parent ISA or identical performance. ABI,logical IDs,LDS placement,barrier scope,and role/task scheduling differ.
+
+ 0 residual unshuffle        native   64CTAs x8waves | fused tasks    0,threads   0,LDS 0B
+   Pure copy eliminated: first GEMM addresses shuffled residual directly.
+ 1 initial mHC GEMM          native  256CTAs x4waves | fused tasks  256,threads 128,LDS 26624B
+   Native HIP tile64/split128/sqrsum; shuffled input address transform fused; full CTA barriers.
+ 2 initial mHC apply/norm    native   16CTAs x9waves | fused tasks   32,threads 128,LDS 32784B
+   EXCEPTION: native HIP nine-wave body has eight cooperating apply/norm waves plus Sinkhorn. Block-wide sumsq and shared split sums cannot run unchanged with four waves. Four-wave native-equivalent apply/norm and separate coefficient CTAs retained.
+ 3 input FP8 quant           native   32CTAs x2waves | fused tasks   32,threads  64,LDS 16B
+   Native HIP quant body; two active waves, subgroup synchronization.
+ 4 QA/KV                     native   48CTAs x2waves | fused tasks   48,threads  64,LDS 200704B
+   Captured native FlyDSL LLVM:16x32x1024,4 buffers; unchanged task layout/pipeline.
+ 5 Q norm/quant              native   16CTAs x4waves | fused tasks   16,threads 128,LDS 16B
+   Native HIP norm/quant,full CTA barrier.
+ 6 QB                        native  256CTAs x4waves | fused tasks  256,threads 128,LDS 149504B
+   Captured native FlyDSL LLVM:16x128x512,2 buffers; unchanged task layout/pipeline.
+ 7 QK norm/RoPE/cache        native  260CTAs x4waves | fused tasks  260,threads 128,LDS 0B
+   Native task body:260 logical tasks,first4 owners execute a second task.
+ 8 split attention           native 1024CTAs x1waves | fused tasks  256,threads 128,LDS 134144B
+   CHANGED: native one-wave H16/K16/D512 tasks,16 splits; four independent native tasks per resident CTA,private LDS region per wave.1024 tasks mapped to256 CTAs.
+ 9 attention reduction       native 1024CTAs x4waves | fused tasks 1024,threads 128,LDS 32896B
+   CHANGED: native16-split,four-wave reducer;1024 logical head tasks,4 per resident CTA.
+10 inverse RoPE/quant        native  512CTAs x1waves | fused tasks  512,threads  32,LDS 2048B
+   Native one-wave task arithmetic;2 tasks per owner; early direct-to-LDS coefficient transfer retained.
+11 OA                        native  256CTAs x4waves | fused tasks  256,threads 128,LDS 266240B
+   Captured native FlyDSL LLVM:32x32x1024,4 buffers,8 groups.
+12 OB input quant            native   64CTAs x2waves | fused tasks   64,threads  64,LDS 0B
+   Native HIP quant body;2 active waves.
+13 OB                        native   64CTAs x4waves | fused tasks   64,threads 128,LDS 167936B
+   Captured native FlyDSL LLVM:16x64x512,4 buffers.
+14 post/pre mHC GEMM         native   64CTAs x4waves | fused tasks   64,threads 128,LDS 119488B
+   Native compiled Gluon projection;64 splits; FP contraction retained.
+15 FFN mHC apply/norm        native   16CTAs x8waves | fused tasks   32,threads 128,LDS 32784B
+   Native main4-wave and Sinkhorn1-wave partitions decomposed into16+16 CTA roles; no longer classified as a whole-op wave-count exception.
+16 shared input quant        native   32CTAs x2waves | fused tasks   32,threads  64,LDS 16B
+   Native HIP quant body;2 active waves.
+17 shared GU                 native  128CTAs x2waves | fused tasks  128,threads  64,LDS 200704B
+   Captured native FlyDSL LLVM:16x32x1024,4 buffers,2 waves.
+18 shared SiLU               native   16CTAs x8waves | fused tasks   16,threads 128,LDS 0B
+   CHANGED: native HIP vector8/clamp/SiLU/multiply body; two independent128-thread groups executed in one4-wave CTA. Unique symbol prevents link collision with unadapted native body.
+19 shared hidden quant       native   16CTAs x2waves | fused tasks   16,threads  64,LDS 16B
+   Native HIP quant body;2 active waves.
+20 shared GD                 native  128CTAs x2waves | fused tasks  128,threads  64,LDS 100352B
+   Captured native FlyDSL LLVM:16x32x1024,2 buffers,2 waves.
+21 router GEMM               native   16CTAs x4waves | fused tasks   16,threads 128,LDS 133088B
+   Native compiled Gluon16x16x512/4buffers; native FP contraction.
+22 HERD clear                native    1CTAs x8waves | fused tasks    1,threads 128,LDS 0B
+   Pointwise zero fill of Pop,Hist,Part retained. Native routing_minunique allocates one768-int zeroed backing buffer for all three. Folded4-wave clearing preserves those writes; these are NOT the separate top-k scratch arrays.
+23 top-k                     native   18CTAs x8waves | fused tasks   18,threads 128,LDS 256B
+   CHANGED: native8-wave compiled LLVM body with4 active waves. Upper4 duplicate inputs/LDS writes; output/atomic predicates select wave0. Native LDS layout and sort remain unchanged. All12 cases and150 stress replays passed.
+24 keep6/renorm              native   16CTAs x1waves | fused tasks   16,threads  32,LDS 0B
+   Native one-wave keep6/renorm compiled body; FP contraction preserved.
+25 routing metadata          native  257CTAs x1waves | fused tasks  257,threads  32,LDS 1024B
+   Native one-wave task body;257 logical tasks assigned to32 resident owners, strided32.
+26 routed input quant        native  128CTAs x8waves | fused tasks  128,threads 128,LDS 128B
+   EXCEPTION: native8-wave MXFP8 task redistributes scales through LDS. Native data row=(lane+32*wave)/2, while scale-output row=(lane+32*wave)%128; first4 waves consume scales from both halves. Whole-body folding cannot preserve this communication. Native-source4-wave specialization retained.
+27 routed GU                 native 3072CTAs x4waves | fused tasks 3072,threads 128,LDS 87264B
+   Exact native3072-task4-wave GU launch outside prefix. Task fits128threads/87264B LDS; external placement is the accepted split-MoE design, NOT a claim it cannot fit.
+28 routed GD                 native 3072CTAs x4waves | fused tasks 3072,threads 128,LDS 87264B
+   Exact native3072-task4-wave GD launch outside prefix. Task fits128threads/87264B LDS; external placement preserves native scheduling/concurrency.
+29 routed reduction          native   16CTAs x8waves | fused tasks   16,threads 128,LDS 49152B
+   CHANGED: native8-wave reducer explicitly has no cross-wave communication; two groups of4 waves execute native per-wave512-column TDM/reduction body,49152B LDS.
+30 output add                native   32CTAs x8waves | fused tasks   16,threads 128,LDS 0B
+   CHANGED: native TensorIterator vector8/2048-element task layout ported to Gluon;2 native tiles per row CTA,independent virtual threads folded. Source-level layout port,not exact compiled TensorIterator ISA.
+
+Exceptions refer to unchanged cooperative native bodies under the four-wave constraint,not a mathematical impossibility of a future multi-phase redesign. Initial mHC and routed quant keep correctness-validated four-wave implementations.
+Native MoE tasks fit but remain external per the previously chosen split at GU/GD. No new grid-count exemptions.
+
+Evidence:
+c16-native-reference/mhc/native_pre.cpp: block_reduce over pre_thread_num and shared split sums in initial mHC.
+swa-fourwave/source/mhc_native.py + mhc_roles.py: independent FFN main and Sinkhorn partitions.
+c16-native-reference/ffn/adapted-layer0-serving/capture/01_routing__topk.llir: masked wave-bit2 input/LDS ownership and wave0 output predicates.
+c16-native-reference/ffn/adapted-layer0-serving/capture/04_routed__downcast_to_mxfp.llir: data/scale row layout conversion through LDS.
+/app/aiter/aiter/ops/triton/moe/moe_routing/minunique.py: zeroed backing allocation for Pop/Hist/Part.
+native_compiled_gemms.py,NATIVE_COMPILED_GEMMS.json: six native LLVM task bodies with source hashes.
+
+Validation: TASK_NATIVE_FOLDED_RESULT.json; all12seed/position cases,bit-exact KV cache,150 graph16 stress replays,health0,no spills.
+Rejected clear-only experiment: removed Hist/Part writes incorrectly; failed changed-position case,restored. No performance claim for invalid candidate.
+Current recipe TASK_NATIVE=1(default),NATIVE_PARITY=1. Previous recipe TASK_NATIVE=0,NATIVE_PARITY=1; use separate processes because attention wave specialization is selected at import.
+
+Reproduce inside container c16-native-reference-inspect from /work/swa-fourwave:
+HIP_VISIBLE_DEVICES=0 python bench_task_folded.py
+HIP_VISIBLE_DEVICES=0 PROFILE_DIR=profiles-task-native python profile_split_bench.py
+PROFILE_DIR=profiles-task-native python profile_analyze.py
+HIP_VISIBLE_DEVICES=0 python profile_suffix_tasks.py

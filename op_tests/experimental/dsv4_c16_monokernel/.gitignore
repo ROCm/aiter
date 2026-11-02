@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.bc
+*.log
+*.npz
+*.pt
+work/swa-fourwave/generated/
+work/swa-fourwave/capture/
+work/swa-fourwave/profiles*/
+work/swa-fourwave/profile_clock
