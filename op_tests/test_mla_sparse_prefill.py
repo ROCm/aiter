@@ -19,7 +19,7 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
   ``opus``, ``asm``.
 * ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
-  (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+  (``mla_sparse_prefill_v41``): ``opus``.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
@@ -647,7 +647,7 @@ def run_mla_sparse_prefill(
         )
         kernel_inputs = data["kernel"]
         ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
-        if "opus" in wanted and _get_gpu_arch() == "gfx950":
+        if "opus" in wanted:
             candidates.append(
                 (
                     "opus",
@@ -886,7 +886,7 @@ parser.add_argument(
         "precision(s) to sweep (default: [bf16, v4, v41]).\n"
         "  bf16: single-tensor Q/K/V/O kernel      -> opus, triton\n"
         "  v4  : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
-        "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus (gfx950)"
+        "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus"
     ),
 )
 parser.add_argument(
