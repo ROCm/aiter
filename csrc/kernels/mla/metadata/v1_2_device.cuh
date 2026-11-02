@@ -333,9 +333,8 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
             const int32_t reduce_before      = p_lds_reduce_before[bid - chunk_lo];
             const int32_t partial_idx_before = p_lds_partial_before[bid - chunk_lo];
 
-            const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
-            const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
-            const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
+            const int32_t kv_begin = params.p_seqlens_kv_indptr[bid];
+            const int32_t kv_end   = params.p_seqlens_kv_indptr[bid + 1];
             const int32_t seqlen_kv =
                 Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
             const int32_t num_kv_blocks =
@@ -544,12 +543,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t curr_qo_tile_idx  = 0;
     int32_t curr_sub_head_idx = 0;
 
-    int32_t curr_kv_begin = 0;
-    // The size of 1st element equals to the end loc of the 1st element.
-    int32_t curr_kv_end    = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[0]
-                             : Traits::kIsSparse   ? min(params.p_seqlens_kv_indptr[1], params.topk)
-                                                   : params.p_seqlens_kv_indptr[1];
-    int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
+    // Sparse rows are laid out at a stride of topk from 0; dense ranges index kv_indices.
+    int32_t curr_kv_begin      = Traits::kIsSparse ? 0 : params.p_seqlens_kv_indptr[0];
+    const int32_t first_kv_len = params.p_seqlens_kv_indptr[1] - params.p_seqlens_kv_indptr[0];
+    int32_t curr_kv_seqlen     = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[0]
+                                 : Traits::kIsSparse   ? min(first_kv_len, params.topk)
+                                                       : first_kv_len;
+    int32_t curr_kv_end        = curr_kv_begin + curr_kv_seqlen;
 
     int32_t num_works          = 0;
     int32_t partial_idx        = 0;
@@ -939,7 +939,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         }
     };
     auto kv_begin_of = [&](const int32_t bid) -> int32_t {
-        return params.p_seqlens_kv_indptr[bid] - params.p_seqlens_kv_indptr[0];
+        return params.p_seqlens_kv_indptr[bid];
     };
     auto blocks_of = [&](const int32_t bid) -> int32_t {
         return integer_divide_ceil_power2(kv_len_of(bid), kv_gran, params.kv_granularity_log2);
