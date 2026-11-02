@@ -849,3 +849,118 @@ def gemm_a16w16(
         backend,
         persistent,
     )
+
+
+def gemm_a16w16_gated_interleave(w: torch.Tensor) -> torch.Tensor:
+    """[gate; up] (2I, K) rows -> [g0, u0, g1, u1, ...]: the B layout
+    ``gemm_a16w16_gated`` reads. Done once, at weight load."""
+    two_i, k = w.shape
+    half = two_i // 2
+    return torch.stack((w[:half], w[half:]), dim=1).reshape(two_i, k).contiguous()
+
+
+# Measured on MI455X for the Qwen3.5 shared expert (N = 2 x 512, K = 2048),
+# CUDA-graph replays: (max M, config); larger M takes the default config.
+_GATED_CONFIGS = (
+    (160, {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 4}),
+    (512, {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 4}),
+)
+# Plans and compiled kernels by launch key: eager prefill is host-bound.
+_GATED_PLANS: dict = {}
+_GATED_COMPILED: dict = {}
+
+
+def gemm_a16w16_gated(
+    x: torch.Tensor,
+    w_interleaved: torch.Tensor,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    kernel_type: str = "bandwidth_bound",
+) -> torch.Tensor:
+    """``silu(x @ gate.T) * (x @ up.T)`` in one gfx1250 gluon GEMM: the
+    SiLU-and-mul is the GEMM's epilogue. ``w_interleaved`` is
+    ``gemm_a16w16_gated_interleave([gate; up])``; returns [M, I]. The
+    accumulators round to ``dtype`` before the SiLU, as GEMM + act_and_mul do.
+    """
+    assert _is_gluon_available(), "gemm_a16w16_gated needs the gfx1250 gluon GEMM"
+    import triton.experimental.gluon.language as gl
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+
+    M, K = x.shape
+    N, _ = w_interleaved.shape
+    assert N % 2 == 0
+    w = w_interleaved.T
+    if config is None:
+        config = next((c for m, c in _GATED_CONFIGS if M <= m), None)
+    cfg_key = None if config is None else tuple(sorted(config.items()))
+    pkey = (cfg_key, None if config is not None else M, N, K, x.stride(), w.stride())
+    plan = _GATED_PLANS.get(pkey)
+    if plan is None:
+        kernel, _, meta, num_warps, waves_per_eu = _gluon_plan(
+            M,
+            N,
+            K,
+            x.stride(),
+            w.stride(),
+            x.element_size() * 8,
+            kernel_type,
+            dict(config) if config is not None else None,
+            create_shared_layouts,
+            create_wmma_layouts,
+        )
+        half = meta["BLOCK_N"] // 2
+        tn = min(32, half)
+        meta["EPI_LAYOUT"] = gl.BlockedLayout(
+            [1, 2], [32 // tn, tn], [num_warps, 1], [1, 0]
+        )
+        meta["OUT_LAYOUT"] = gl.BlockedLayout(
+            [1, 1], [32 // tn, tn], [num_warps, 1], [1, 0]
+        )
+        plan = (kernel, meta, num_warps, waves_per_eu)
+        _GATED_PLANS[pkey] = plan
+    kernel, meta, num_warps, waves_per_eu = plan
+    grid = (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), 1)
+    if y is None:
+        y = torch.empty((M, N // 2), dtype=dtype, device=x.device)
+    args = (
+        x,
+        w,
+        y,
+        None,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        y.stride(0),
+        y.stride(1),
+    )
+    # Launch the compiled kernel directly under a key at least as fine as
+    # Triton's specialization (int == 1 / % 16, 16-byte aligned pointers);
+    # anything else, and a first launch, takes the JIT path.
+    aligned = not (x.data_ptr() % 16 or w.data_ptr() % 16 or y.data_ptr() % 16)
+    ckey = (pkey, x.dtype, y.dtype) + tuple((v == 1, v % 16 == 0) for v in args[4:])
+    compiled = _GATED_COMPILED.get(ckey) if aligned else None
+    if compiled is not None:
+        compiled[(grid[0], 1, 1)](*args)
+        return y
+    compiled = kernel[grid](
+        *args,
+        **meta,
+        activation=None,
+        USE_ACTIVATION=False,
+        ADD_BIAS=False,
+        GATED=True,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+    if aligned and compiled is not None:
+        _GATED_COMPILED[ckey] = compiled
+    return y
