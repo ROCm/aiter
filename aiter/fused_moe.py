@@ -4416,8 +4416,10 @@ def get_2stage_cfgs(
             # gfx942 has 64 KiB of LDS, and the a16w-mix port needs 128 KiB at
             # BM=128 x TILE_K=256. Use the a16wi4 fallback's shape-safe tiles
             # (TILE_K=128, no waves_per_eu cap), with BM=32 from 1024 tokens.
+            # At BM=16 gemm2 streams its W loads (b_nt=2), as the BM=32 decode tier did.
             _tile_m = 16 if token < 1024 else 32 if token < 16384 else 64
-            _s1_tk, _s1_sfx, _s2_sfx = 128, "", ""
+            _s1_tk, _s1_sfx = 128, ""
+            _s2_sfx = "_bnt2" if _tile_m == 16 else ""
         elif token < 2048:
             _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:

@@ -176,7 +176,7 @@ def test_flydsl_a16wfp4_situv2_e2e(
 
 
 @_SKIP
-@pytest.mark.parametrize("token", [2048, 4096])
+@pytest.mark.parametrize("token", [512, 2048, 4096])
 def test_flydsl_a16wfp4_situv2_untuned_tiers(token):
     """3584/768 has no tuned row, so fused_moe takes the heuristic tiers.
 
