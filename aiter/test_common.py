@@ -46,15 +46,29 @@ def ensure_spawn_method():
         pass
 
 
+def _default_use_cuda_event():
+    """Whether perftest should time with cuda.Event instead of the profiler.
+
+    Tuners time candidates inside forked mp_tuner workers, where roctracer does
+    not survive the fork: the torch profiler records no CUDA events there and
+    every candidate scores 0 us. No tuner plumbs use_cuda_event down to
+    run_perftest, hence the env override.
+    """
+    return bool(int(os.environ.get("AITER_USE_CUDA_EVENT", "0")))
+
+
 def perftest(
     num_iters=101,
     num_warmup=2,
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,
-    use_cuda_event=False,
+    use_cuda_event=None,
     profile_warm_iters=1,
 ):
+    if use_cuda_event is None:
+        use_cuda_event = _default_use_cuda_event()
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
@@ -248,7 +262,7 @@ def run_perftest(
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,
-    use_cuda_event=False,
+    use_cuda_event=None,
     profile_warm_iters=1,
     **kwargs,
 ):
