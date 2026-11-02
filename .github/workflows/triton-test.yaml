@@ -279,12 +279,37 @@ jobs:
             exit 0
           fi
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
-          # test_mha_varlen deselected: real memory-pressure OOM on the DPX
-          # 128 GiB partition (see DPX_CLUSTER_VALIDATION_NOTE.md), not the
+          # Deselected below: real memory-pressure OOM on the DPX 128/144 GiB
+          # partitions (see DPX_CLUSTER_VALIDATION_NOTE.md), not the
           # allocator-desync bug -- needs process isolation / tiling, tracked
-          # separately.
+          # separately. test_mha_varlen is excluded entirely via -k; the rest
+          # are the specific large-shape params confirmed to OOM on both
+          # MI325X and MI350X.
           docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
             -k "not test_mha_varlen" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-True-64-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-True-64-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-True-128-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-True-128-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-33-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-33-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-64-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-64-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-128-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[triton-False-128-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-True-33-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-True-64-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-True-128-48-8-2048-2048-30]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-True-128-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-False-33-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-False-64-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha[gluon-False-128-48-8-2048-2048-50]" \
+            --deselect "op_tests/triton_tests/attention/test_mha.py::test_mha_int64_strides[triton]" \
+            --deselect "op_tests/triton_tests/attention/test_prefill_attention.py::test_op_fwd[False-False-True-2-16-15498-128]" \
+            --deselect "op_tests/triton_tests/attention/test_prefill_attention.py::test_op_fwd[False-False-False-2-16-15498-128]" \
+            --deselect "op_tests/triton_tests/attention/test_hstu_attn.py::test_hstu_attention[512-3072-0.366]" \
+            --deselect "op_tests/triton_tests/gemm/basic/test_gemm_a8wfp4.py::test_gemm_a8wfp4[128-57344-8192]" \
+            --deselect "op_tests/triton_tests/gemm/basic/test_gemm_a8wfp4.py::test_gemm_a8wfp4[2048-57344-8192]" \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
           if grep -q "Triton autotuning for function" test-reports/pytest.log; then
             echo "::error::runtime autotuning ran inside unit tests"
