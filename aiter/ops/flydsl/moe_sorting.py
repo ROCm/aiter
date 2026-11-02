@@ -16,6 +16,64 @@ import torch
 _workspace_cache = {}
 
 
+def flydsl_moe_sorting_herd(
+    ids,
+    values,
+    sorted_ids,
+    sorted_weights,
+    sorted_experts,
+    valid_ids,
+    moe_buf,
+    experts,
+    block_size,
+    routed_scaling_factor,
+):
+    from .kernels.moe_sorting_herd import build_moe_sorting_herd_module
+    from .kernels.tensor_shim import _run_compiled
+
+    tokens, width = ids.shape
+    if not (1 <= tokens <= 128 and 1 < width <= experts <= 1024):
+        raise ValueError("HERD sorting requires M<=128 and 1<=K<E<=1024")
+    if not (
+        ids.dtype == torch.int32
+        and values.dtype == torch.float32
+        and ids.shape == values.shape
+        and ids.is_contiguous()
+        and values.is_contiguous()
+        and ids.device == values.device
+    ):
+        raise ValueError("HERD requires contiguous int32 IDs/fp32 weights on one GPU")
+    kept_ids = torch.empty((tokens, width - 1), dtype=torch.int32, device=ids.device)
+    kept_weights = torch.empty_like(kept_ids, dtype=torch.float32)
+    buf = (
+        moe_buf.view(torch.int32)
+        if moe_buf.numel()
+        else torch.empty((0, 0), dtype=torch.int32, device=ids.device)
+    )
+    threads = max(128, 1 << (experts - 1).bit_length())
+    blocks = 1 + min(256, (buf.numel() + threads * 4 - 1) // (threads * 4))
+    launch = build_moe_sorting_herd_module(experts, width - 1, tokens, block_size)
+    _run_compiled(
+        launch,
+        ids,
+        values,
+        kept_ids,
+        kept_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        valid_ids,
+        buf,
+        tokens,
+        buf.numel(),
+        float(routed_scaling_factor),
+        blocks,
+        torch.cuda.current_stream(ids.device),
+        specialization_key=(buf.shape,),
+    )
+    return kept_ids, kept_weights
+
+
 def flydsl_moe_sorting_fwd(
     topk_ids,
     topk_weights,

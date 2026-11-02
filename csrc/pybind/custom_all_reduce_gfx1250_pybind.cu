@@ -63,6 +63,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("ptrs_out"));
     m.def("register_graph_buffers", &aiter::register_graph_buffers,
           py::arg("_fa"), py::arg("ptrs_per_rank"));
+    m.def("get_graph_buffer_ipc_meta", &aiter::get_graph_buffer_ipc_meta,
+          py::arg("_fa"), py::arg("handle_out"), py::arg("offset_out"));
+    m.def("register_graph_buffers_ipc", &aiter::register_graph_buffers_ipc,
+          py::arg("_fa"), py::arg("handle_ptrs"), py::arg("offset_ptrs"));
     m.def("start_sync_latency", &aiter::start_sync_latency,
           py::arg("_fa"), py::arg("blocks"));
     m.def("end_sync_latency", &aiter::end_sync_latency,
