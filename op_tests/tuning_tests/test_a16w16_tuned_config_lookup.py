@@ -489,6 +489,9 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 ((5381, 3072, 512), (320, 224, 2, 1, 4, 2, 4)),
                 ((543, 6288, 7168), (128, 128, 3, 1, 2, 2, 1)),
                 ((635, 6288, 7168), (128, 128, 3, 1, 4, 4, 1)),
+                # Wide hand-added tiles must not tighten the grid tile limit.
+                ((1, 163840, 256), (16, 64, 3, 1, 1, 2, 0)),
+                ((13, 163840, 256), (16, 64, 3, 1, 1, 2, 0)),
             ):
                 configs = policy.get_flydsl_a16w16_configs(
                     *shape,

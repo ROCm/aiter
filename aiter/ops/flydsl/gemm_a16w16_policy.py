@@ -98,10 +98,13 @@ class GemmConfigPruner:
             keep_ratio = min(keep_ratio, 0.90)
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
-        max_tiles = (
-            max(num_cus, min(self._tiles(config) for config in configs))
-            * self.max_tile_grid_ratio
-        )
+        # Hand-added tiles wider than the 256x256 grid must not tighten the limit.
+        grid_tiles = [
+            self._tiles(config)
+            for config in configs
+            if config["block_m"] <= 256 and config["block_n"] <= 256
+        ] or [self._tiles(config) for config in configs]
+        max_tiles = max(num_cus, min(grid_tiles)) * self.max_tile_grid_ratio
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
