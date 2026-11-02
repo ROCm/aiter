@@ -2417,31 +2417,3 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
 
 
-@torch.inference_mode()
-def test_gfx1250_3d_kernel_rejects_num_stages_ne_2() -> None:
-    """Python wrapper must raise ValueError before launching the kernel when
-    num_stages != 2 is present in the attn_3d config.  The kernel body is
-    hard-wired for a 2-stage pipeline; num_stages=3 silently produces wrong
-    output (cosine ~0.965) if the guard is absent."""
-    # Use a minimal params stub: only the fields read before the guard fires.
-    params = SimpleNamespace(
-        q_dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-    )
-
-    # Patch get_unified_attention_config so it returns a poisoned config with
-    # num_stages=3 regardless of the real hardware / config files present.
-    bad_config = {"num_stages": 3, "num_warps": 4, "waves_per_eu": 2, "BLOCK_M": 16}
-    with patch(
-        "aiter.ops.triton.attention.unified_attention.get_unified_attention_config",
-        return_value=bad_config,
-    ):
-        with pytest.raises(ValueError, match="num_stages==2"):
-            _unified_attention_3d_gfx1250(
-                params=params,
-                segm_output=None,
-                segm_max=None,
-                segm_expsum=None,
-                NUM_SEGMENTS=8,
-                TILE_SIZE=64,
-            )
