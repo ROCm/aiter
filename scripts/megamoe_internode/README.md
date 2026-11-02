@@ -1,15 +1,15 @@
 # MegaMoEInternode — EP16 两节点融合 MoE
 
 A4W4 MoE，EP16 跨两台 8 卡 MI355X (gfx950)。算子是
-`aiter.ops.flydsl.kernels.megamoe_tile.MegaMoEInternode`，测试是
-`op_tests/multigpu_tests/test_megamoe_tile_internode.py`。
+`aiter.ops.flydsl.kernels.megamoe_internode.MegaMoEInternode`，测试是
+`op_tests/multigpu_tests/test_megamoe_internode.py`。
 
 ## 接口
 
 和 `MegaMoEV2`（`aiter.ops.flydsl.kernels.mega_moe`）一致：
 
 ```python
-from aiter.ops.flydsl.kernels.megamoe_tile import MegaMoEInternode
+from aiter.ops.flydsl.kernels.megamoe_internode import MegaMoEInternode
 
 moe = MegaMoEInternode(rank=rank, world_size=16, model_dim=H, inter_dim=I,
                        experts=E, topk=K, quant="a4w4", w1=w1, w1_scale=w1s,
@@ -24,7 +24,8 @@ moe.close()
 与 MegaMoEV2 的差别：
 
 * 只支持 `quant="a4w4"`、`world_size=16`（2 节点 × 8 卡）；
-* 每次 forward 的行数必须等于 `max_tok_per_rank`；
+* 每次 forward 的行数必须等于 `max_tok_per_rank`（上限 16384）；pad 行的 topk id 填 `-1`
+  即可，`-1`（及越界 id）的 slot 不 dispatch、不算、combine 按 0 处理；
 * 多出四个关键字参数：`activation`（`silu` / `situv2`）、`comm_quant`
   （跨节点 rail 段的载荷格式，`fp8` 默认 / `none` 即 bf16）、`communicator`
   （调用方建的 `mori.cco` Communicator，不传则自建）、
@@ -39,7 +40,7 @@ forward 是同一条流上的 4 次发射，generation/parity 在 device 上推�
 | kernel | 名字前缀 | 做什么 |
 |---|---|---|
 | 输入量化 | `per_1x32_mx_quant_fp4_*_railrec_*` | MXFP4 量化，连同 ids/weights 直接写成窗口里的 rail record |
-| stage1 | `megamoe_tile_ep16_stage1_*` | InterNodeV1 dispatch 到 expert tile + GMM1 + 激活 + A4 量化 |
+| stage1 | `megamoe_stage1_*` | InterNodeV1 dispatch 到 expert tile + GMM1 + 激活 + A4 量化 |
 | stage2 kernel1 | `megamoe_k1_*` | GEMM2 + 加权 push 到 node 内代理 GPU 的 plane-slot inbox |
 | stage2 kernel2 | `megamoe_k2_*` | node 内归约 → rail 发往对端节点 → 跨节点归约 + unpermute |
 
@@ -48,6 +49,27 @@ kernel1 每写完一个 (token, topk slot) 行，由最后一个写它的 CTA �
 
 **tune 表的 key `token` = TPR × topk**（GEMM 行数），不是 TPR 本身。
 
+## 代码结构
+
+`aiter/ops/flydsl/kernels/megamoe_internode/`：
+
+| 文件 | 内容 |
+|---|---|
+| `mega_moe_internode.py` | host 侧 `MegaMoEInternode`：window 分配、编译、4 次发射 |
+| `mega_moe_internode_config.py` | stage1 / stage2 两张 tune 表的加载与查不到时的规则 |
+| `layout.py` | 两个 stage 共用的注册 window 布局（stage1 arena + 嵌入的 stage2 区） |
+| `quant.py` | 输入量化 kernel（写成 rail record） |
+| `stage1.py` | stage1 kernel：dispatch + GMM1 |
+| `stage2.py` | stage2 kernel1（GEMM2 + push）与 kernel2（node 归约 + rail + combine） |
+| `gemm.py` | GMM1 / GMM2 的 kernel 体 |
+| `communication.py` + `gda_rail.cpp` | device 侧通信原语与 rail GDA extern |
+| `common.py` | 与 `mxfp4_gemm_common` 不同的几个 GEMM helper |
+
+mtpr > 4096 时（h1 / k1 push 平面 / k2 inbox 超过 2 GiB）GMM1、k1、k2 改为按行或按 plane
+建 64 位基址，`node_accumulator` / `remote_partial_rx` 按 rail 行宽分配以保证 NIC 注册前缀
+< 1 GiB；≤ 4096 的布局和 ISA 与之前逐字节一致。DSV4 在 16384 下用 bf16 rail 会超过 1 GiB，
+构造时直接拒绝。
+
 ## 跑一个用例
 
 两个节点各跑一次，node_rank 分别是 0 和 1，master 是 node0；同一个网络的所有
@@ -55,9 +77,9 @@ kernel1 每写完一个 (token, topk slot) 行，由最后一个写它的 CTA �
 
 ```bash
 # node0 / node1
-bash scripts/megamoe_tile/run_internode_test.sh 0 <master_ip> <port> <tag> -- \
+bash scripts/megamoe_internode/run_internode_test.sh 0 <master_ip> <port> <tag> -- \
   --network kimi_k3 --tpr-list 128,256,512,1024 --fixtures eplb,random
-bash scripts/megamoe_tile/run_internode_test.sh 1 <master_ip> <port> <tag> -- <同上>
+bash scripts/megamoe_internode/run_internode_test.sh 1 <master_ip> <port> <tag> -- <同上>
 ```
 
 每个 case 依次做：fused 的 eager 输出对 MORI A4W4 参照（同一份权重）的 relL2，
@@ -76,10 +98,10 @@ fused 的 stage1 / stage2 分段）。
 `trace_data/internode/<tag>/results.json`。
 
 配置不走环境变量：算子里写死的是实测最优配置，按 shape 变的参数查两张表
-（`aiter/configs/megamoe_tile_stage1_tuned.csv`：tile_group / split_local /
-fanout_shards；`megamoe_tile_stage2_tuned.csv`：return_chunk_tokens / gemm2_bn /
-gemm2_cu），查不到时按 `stage1_tune.py` / `stage2_tune.py` 里的规则推。扫参时把
-`AITER_CONFIG_MEGAMOE_TILE_STAGE1` / `AITER_CONFIG_MEGAMOE_TILE_STAGE2` 指向自己的表。
+（`aiter/configs/megamoe_internode_stage1_tuned.csv`：tile_group / split_local /
+fanout_shards；`megamoe_internode_stage2_tuned.csv`：return_chunk_tokens / gemm2_bn /
+gemm2_cu），查不到时按 `mega_moe_internode_config.py` 里的规则推。扫参时把
+`AITER_CONFIG_MEGAMOE_INTERNODE_STAGE1` / `AITER_CONFIG_MEGAMOE_INTERNODE_STAGE2` 指向自己的表。
 跨节点 rail 段的 fp8 通信量化是构造参数 `comm_quant`（测试用 `--comm-quant fp8|none`，
 默认 fp8）。kernel 名里的 `_tg` / `_fos` / `_slg` / `_qr8` 等后缀是实际配置的唯一可信证据。
 
@@ -107,10 +129,7 @@ profiler 偶尔丢事件，所以它不进总耗时。跨 harness 比较**必须
 
 ## 环境前提
 
-本仓的 `aiter/ops/flydsl/kernels/act.py` 调 `fx.max`,那是 **flydsl 0.3.2**
-才有的符号。容器里若装的是 0.3.1,任何走 a4w4 fused-moe 的路径都会报
-`AttributeError: module 'flydsl.expr' has no attribute 'max'`,与 megamoe_tile
-无关。升级 flydsl 到 >= 0.3.2,或用 PYTHONPATH 挂一份。
+aiter main 需要 **flydsl >= 0.4.1**（验证用的是 0.4.1 + triton 3.7）。
 
 ## CCO 用法
 
@@ -124,7 +143,7 @@ host 端和 device 端都直连 MORI 公开 API：
   host 侧清零 window、写 rail record 都是 `__cuda_array_interface__` 包出来的
   torch 视图（零拷贝，不需要 hipMemcpy 包装，也不需要清零 kernel）。
 
-唯一的例外是 `gda_rail.{cpp,py}`，只为两件 MORI 公开绑定表达不了的事存在：
+唯一的例外是 `gda_rail.cpp`（Python 侧在 `communication.py`），只为两件 MORI 公开绑定表达不了的事存在：
 
 1. **rail team** —— 它导出的每个 GDA 符号都取 `ccoTeamMode` 的默认值
    `CCO_TEAM_WORLD`（`cco_scale_out.hpp:212`），`peer` 被当作 world rank 解析；
@@ -161,4 +180,4 @@ bf16 六个点全部逐位一致,所以偏差 100% 来自 fp8。fp8 误差跨 32
 MORI dispatch + fused_moe,没有接本算子的钩子,所以两者无法直接叠加测量。
 
 13 个 Kimi shape 里当时只测了这 6 个。token 32768 曾撞 RDMA MR 注册上限(之后改成只注册
-RDMA 前缀);token 131072 超 `stage1_abi.py` 的 `MAX_FUSED_TOKENS_PER_RANK = 4096`。
+RDMA 前缀);当时 token 131072 超出 4096 的 TPR 上限,现在上限是 16384。
