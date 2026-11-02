@@ -1243,6 +1243,17 @@ def mla_decode_fwd(
             and (max_seqlen_q == 1 or kv_shuffled_flag)
         ):
             mgc = 64
+        # gfx950 bf16 gqa32 kernel (qh16_m16x4_n32x1) deals SUB_KV=32 tiles to splits
+        # round-robin and skips splits without a tile, so only the first
+        # cdiv(kv, 32) splits are written. gfx942's gqa32 kernel uses 16-token tiles.
+        if (
+            nhead == 32
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 32
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.

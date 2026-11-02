@@ -163,20 +163,30 @@ def _gfx950_gluon_supported(params: _UAParams):
 
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
-    if params.all_decode or params.max_seqlen_q * params.num_queries_per_kv <= 128:
+    q_rows = params.max_seqlen_q * params.num_queries_per_kv
+    if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
         return params
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    if q_rows <= 128:
+        block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
+
+
+_SW_SPLIT_MAX_Q = 16
 
 
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    if params.sliding_window > 0:
+    # the split carves only the window, so a full table splits like a trimmed one
+    if params.sliding_window > 0 and not (
+        params.max_seqlen_q <= _SW_SPLIT_MAX_Q
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    ):
         return False
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(
@@ -493,6 +503,8 @@ def unified_attention(
         if NUM_SEGMENTS == 1:
             return segm_output
         elif skip_reduce:
+            # with a sliding window the segments carve only the window's tiles
+            # (split_window_tiles), not [0, seq_len)
             return segm_output, segm_max, segm_expsum
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
@@ -777,6 +789,7 @@ def _reduce_segments_triton(
         query_start_len_ptr=params.cu_seqlens_q,
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        SLIDING_WINDOW=params.sliding_window,
         BLOCK_Q=None,
         **config,
         enable_fp_fusion=True,
@@ -924,6 +937,9 @@ def _unified_attention_3d_gfx1250(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
+    # its split carves [0, seq_len), unlike reduce_segments for a sliding window;
+    # use_2d_kernel keeps every sliding-window call on the 2d grid here
+    assert params.sliding_window <= 0, "gfx1250 split-KV has no sliding-window carve"
     NUM_BLOCKS_GATHER_PER_TILE = 1
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
@@ -1064,7 +1080,7 @@ def _unified_attention_gfx950(
     One kernel serves both grids: ALL_DECODE selects the decode program order
     and, when NUM_SEGMENTS > 1, a third grid axis over the KV split. A split
     launch writes fp32 partials instead of the output, which reduce_segments
-    then merges.
+    then merges. With a sliding window both carve only the window's tiles.
 
     With shuffled_kv_cache the caches must be in the layout shuffle_kv_cache
     produces (op_tests/triton_tests/attention/test_unified_attention.py):
