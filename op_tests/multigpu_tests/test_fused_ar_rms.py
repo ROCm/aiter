@@ -999,8 +999,200 @@ def _fused_ar_gemma_rmsnorm_quant_case(
     }
 
 
+def _ll_quant_worker(rank, world_size, init_method):
+    from unittest.mock import patch
+
+    torch.cuda.set_device(rank)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=world_size, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(world_size, 1)
+    tp = get_tp_group()
+    group = tp.device_group
+    dist.all_reduce(torch.zeros(1, device="cuda"), group=group)
+    assert tp.device_communicator.ca_comm is not None
+    assert not tp.device_communicator.ca_comm.disabled
+    rows = []
+    retained = []
+    try:
+        # LL threshold is 4 MiB: N6144 crosses it between M341 and M342.
+        for (m, n), dtype, gemma in itertools.product(
+            [(1, 6144), (12, 6144), (341, 6144), (342, 6144), (12, 6176), (12, 136)],
+            [torch.float16, torch.bfloat16],
+            [False, True],
+        ):
+            torch.manual_seed(2026)
+            residual = torch.randn((m, n), dtype=dtype, device="cuda")
+            weight = torch.randn(n, dtype=dtype, device="cuda") * 0.1
+            torch.manual_seed(4100 + rank)
+            x = torch.randn_like(residual) * 0.1
+            norm, want_res = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, residual, weight, 1e-6, gemma_norm=gemma
+            )
+            want_q, want_s = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+                norm, quant_dtype=dtypes.fp8
+            )
+            for emit in (False, True):
+
+                def fn(x=x, residual=residual, weight=weight, gemma=gemma, emit=emit):
+                    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x,
+                        residual,
+                        weight,
+                        1e-6,
+                        gemma_norm=gemma,
+                        emit_bf16=emit,
+                    )
+
+                with patch.object(
+                    aiter, "add_rmsnorm_quant", wraps=aiter.add_rmsnorm_quant
+                ) as launch:
+                    eager = fn()
+                    eligible = not emit and n % 32 == 0 and m * n * 2 <= 4 * 1024**2
+                    assert launch.called == eligible
+                graph = torch.cuda.CUDAGraph()
+                with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                    out = fn()
+                retained.append((graph, x, residual, out))
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = (
+                    (want_q, want_res, want_s, norm)
+                    if emit
+                    else (want_q, want_res, want_s)
+                )
+                for actual, want, eager_value in zip(out, expected, eager):
+                    bits = actual.view(torch.uint8)
+                    assert torch.equal(bits, want.view(torch.uint8))
+                    assert torch.equal(bits, eager_value.view(torch.uint8))
+                    peers = [torch.empty_like(bits) for _ in range(world_size)]
+                    dist.all_gather(peers, bits, group=group)
+                    assert all(torch.equal(bits, peer) for peer in peers)
+                # Replay with all-zero input; stale graph outputs must not pass.
+                x.zero_()
+                residual.zero_()
+                norm_zero, res_zero = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, weight, 1e-6, gemma_norm=gemma
+                )
+                q_zero, s_zero = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+                    norm_zero, quant_dtype=dtypes.fp8
+                )
+                graph.replay()
+                torch.cuda.synchronize()
+                expected_zero = (
+                    (q_zero, res_zero, s_zero, norm_zero)
+                    if emit
+                    else (q_zero, res_zero, s_zero)
+                )
+                for actual, want in zip(out, expected_zero):
+                    assert torch.equal(actual.view(torch.uint8), want.view(torch.uint8))
+                # Restore for the mirror case.
+                torch.manual_seed(2026)
+                residual.copy_(torch.randn((m, n), dtype=dtype, device="cuda"))
+                torch.manual_seed(4100 + rank)
+                x.copy_(torch.randn_like(residual) * 0.1)
+                tp.barrier()
+                rows.append(
+                    {
+                        "rank": rank,
+                        "shape": (m, n),
+                        "dtype": str(dtype),
+                        "gemma": gemma,
+                        "emit_bf16": emit,
+                        "exact": True,
+                    }
+                )
+        return rows
+    finally:
+        barrier_before_teardown()
+        del retained
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
 try:
     import pytest
+
+    @pytest.mark.parametrize(
+        "case,expected",
+        [
+            ("eligible", True),
+            ("mirror", False),
+            ("strided", False),
+            ("residual_strided", False),
+            ("tail", False),
+            ("large", False),
+            ("old_arch", False),
+            ("quick_reduce", False),
+            ("disabled", False),
+            ("fp32", False),
+            ("empty", False),
+        ],
+    )
+    def test_ll_quant_dispatch_guards(case, expected):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+        m, n = (342, 6144) if case == "large" else (2, 136 if case == "tail" else 6144)
+        if case == "empty":
+            m = 0
+        dtype = torch.float32 if case == "fp32" else torch.bfloat16
+        x = torch.zeros((m, n), dtype=dtype, device="cpu")
+        residual = torch.zeros_like(x)
+        if case == "strided":
+            x = torch.zeros((m, n * 2), dtype=dtype)[:, ::2]
+        if case == "residual_strided":
+            residual = torch.zeros((m, n * 2), dtype=dtype)[:, ::2]
+        weight = torch.ones(n, dtype=dtype, device="cpu")
+        # Mock only transport/capabilities: this is a CPU policy test, not a
+        # kernel test or evidence of execution on a different architecture.
+        ca = SimpleNamespace(
+            disabled=case == "disabled",
+            has_old_arch_fused_kernels=case == "old_arch",
+            can_fuse_ar_rms=lambda *args: True,
+            should_fuse_ar_rms=lambda *args: False,
+            should_custom_ar=lambda *args: case != "large",
+        )
+        comm = SimpleNamespace(
+            ca_comm=ca,
+            qr_comm=SimpleNamespace(disabled=case != "quick_reduce"),
+            _ar_quant_max_bytes=-1,
+            _ar_quant_no_prefill_max_bytes=-1,
+            all_reduce=Mock(return_value=x),
+            fused_allreduce_rmsnorm=Mock(return_value=(x, residual)),
+        )
+        quant = Mock(return_value=(torch.empty_like(x), torch.ones((m, 1))))
+        with patch("aiter.add_rmsnorm_quant") as fused, patch(
+            "aiter.dist.device_communicators.communicator_cuda.get_hip_quant",
+            return_value=quant,
+        ):
+            CudaCommunicator.fused_allreduce_rmsnorm_quant(
+                comm, x, residual, weight, 1e-6, emit_bf16=case == "mirror"
+            )
+            assert fused.called == expected
+            assert comm.all_reduce.called == expected
+            assert comm.fused_allreduce_rmsnorm.called == (not expected)
+
+    @pytest.mark.parametrize("world_size", [2, 4])
+    def test_ll_quant_epilogue(world_size):
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if torch.cuda.device_count() < world_size or get_gfx() != "gfx1250":
+            pytest.skip("requires gfx1250 peer GPUs")
+        init_method = get_distributed_init_method(get_ip(), get_open_port())
+        with Pool(processes=world_size) as pool:
+            jobs = [
+                pool.apply_async(_ll_quant_worker, (rank, world_size, init_method))
+                for rank in range(world_size)
+            ]
+            rows = [row for job in jobs for row in job.get()]
+        logger.info(
+            "LL quant exactness summary:\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
 
     @pytest.mark.parametrize(
         "x_pad_to_multiple,input_strided,residual_strided",

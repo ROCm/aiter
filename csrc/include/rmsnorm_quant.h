@@ -16,7 +16,8 @@ void add_rmsnorm_quant(aiter_tensor_t& out,
                        int group_size          = 0,
                        bool shuffle_scale      = false,
                        bool gemma_norm         = false,
-                       bool scale_layout_m32k4 = false);
+                       bool scale_layout_m32k4 = false,
+                       bool round_before_quant = false);
 
 void add_rmsnorm(aiter_tensor_t& out,
                  aiter_tensor_t& input,
