@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import os
 import subprocess
 import sys
 
@@ -3631,8 +3632,27 @@ parser.add_argument(
     block: prefill + chunk (page_size-1 per batch, K=0.001) + decode (last slot)""",
 )
 
+
+def _apply_ci_smoke(args):
+    """Narrow the sweep when AITER_CI_SMOKE is set, for per-PR CI runs.
+
+    aiter-test.yaml sets it for pull_request events only; the nightly
+    schedule, pushes to main and manual dispatches leave it unset and keep
+    the full sweep. Only dimensions that do not pick a kernel narrow.
+
+    Token count is the one swept dimension here that does not select a
+    kernel: the decode-fast-path vs general-path split that does depend on it
+    is covered by the hardcoded mixed prefill/decode block below, which this
+    leaves alone. Keep the shortest and longest.
+    """
+    if os.getenv("AITER_CI_SMOKE") == "1":
+        args.token = [3, 1257]
+        print(f"AITER_CI_SMOKE=1: narrowing --token to {args.token}", flush=True)
+    return args
+
+
 if __name__ == "__main__":
-    args = parser.parse_args()
+    args = _apply_ci_smoke(parser.parse_args())
     max_positions = args.max_positions
     df = []
     # rope
