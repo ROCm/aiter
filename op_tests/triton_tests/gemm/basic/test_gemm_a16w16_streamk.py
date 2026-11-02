@@ -39,7 +39,28 @@ def get_x_vals():
     x_vals += [(4096, 2880, 4096)]  # N not a multiple of the cluster tile
     x_vals += [(3000, 2048, 2048)]  # M not a multiple of the cluster tile
     x_vals += [(3000, 2880, 2048)]  # M and N both ragged
+    x_vals += get_remainder_x_vals()
     return x_vals
+
+
+def get_remainder_x_vals():
+    """Shapes that leave tiles over, so the StreamK remainder phase runs.
+
+    The remainder cuts each leftover tile into SPLIT_M x SPLIT_N sub-tiles and gives one
+    sub-tile to each cluster. Each shape here selects a different split, cluster and tile,
+    because the sub-tile size decides the layouts that the phase compiles.
+    """
+    return [
+        (512, 6144, 2048),  # split 2x1, cluster 2x2, tile 128x256
+        (256, 10240, 2048),  # split 2x2, cluster 2x2, tile 128x256
+        (1024, 1536, 2048),  # split 2x1, cluster 4x4, tile 256x256
+        (1536, 4096, 2048),  # split 2x1, cluster 4x4, tile 512x512
+        (2048, 2560, 2048),  # split 4x1, cluster 4x4, tile 512x512
+        (1536, 2880, 2048),  # split 4x2, cluster 4x4, tile 512x512, both axes
+        (3072, 7168, 2048),  # split 2x1, cluster 4x4, tile 1024x1024
+        (4096, 5120, 2048),  # split 4x1, cluster 4x4, tile 1024x1024
+        (3072, 6144, 2048),  # split 8x1, cluster 4x4, tile 1024x1024
+    ]
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
@@ -82,6 +103,43 @@ def test_gemm_a16w16_streamk_out_tensor(M: int, N: int, K: int):
 
     assert out.data_ptr() == y.data_ptr()
     torch.testing.assert_close(y, F.linear(x, w, bias=None), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M, N, K", get_remainder_x_vals())
+def test_gemm_a16w16_streamk_remainder_runs(M: int, N: int, K: int):
+    """Each remainder shape must really reach phase 2, and with a split above 1x1.
+
+    The result of a remainder shape is correct even when phase 2 does not run, because phase 1
+    computes every whole tile. A config change can therefore take the remainder out of the test
+    coverage and no other test fails. This test holds the coverage.
+    """
+    import triton
+
+    from aiter.ops.triton.gemm.basic.gemm_a16w16_streamk import _pick_split
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    config, _ = get_gemm_config("GEMM-A16W16-STREAMK", M, N, K, backend="gluon")
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    CTAS_M, CTAS_N = config["CTAS_M"], config["CTAS_N"]
+
+    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    num_cus = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = min(num_cus // (CTAS_M * CTAS_N), num_tiles)
+    streamk_tiles = 0 if num_tiles <= num_sms else num_tiles % num_sms
+    split_m, split_n = _pick_split(
+        streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
+    )
+
+    assert (
+        streamk_tiles > 0
+    ), f"{num_tiles} tiles on {num_sms} workers leave nothing over"
+    assert split_m * split_n > 1, "a 1x1 split keeps the tile on the phase-1 path"
+    # The sub-tiles must fit one wave; two half-size waves are slower than one partial wave.
+    assert streamk_tiles * split_m * split_n <= num_sms
+    # The N floor is a measured cliff, not a layout limit: a per-CTA N of 32 makes a bf16 row
+    # of 64 bytes, and that measured -11.2% against 64 at an equal area and sub-tile count.
+    assert BLOCK_N // split_n // CTAS_N >= 64, "the sub-tile is too narrow on N"
+    assert BLOCK_M // split_m // CTAS_M >= 32, "the sub-tile is too short on M"
 
 
 @pytest.mark.parametrize(
