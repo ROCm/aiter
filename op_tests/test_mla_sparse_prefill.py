@@ -787,6 +787,7 @@ _PYTEST_PRECS = ["bf16", "v4", "v41"]
 # most combinations would collapse onto the same whole-pool budget.
 _PYTEST_CASES = [
     # (N, H, total_pages, total_tokens, topk)
+    (32, 8, 256, 64, 160),
     (64, 16, 256, 256, 100),
     (128, 24, 512, 128, 64),
     (256, 32, 1024, 256, 192),

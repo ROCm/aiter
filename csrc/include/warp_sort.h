@@ -1868,4 +1868,29 @@ __device__ inline void warp_cumsum(data_t& thread_data, opus::number<warp_size> 
         thread_data      = reduce_op(thread_data, __builtin_bit_cast(data_t, v_remote_tmp));
     }
 }
+
+// A non-NaN float as an unsigned key in the same order, with -0 folded into
+// +0 since they compare equal.
+__device__ __forceinline__ uint32_t float_order_key(float v)
+{
+    const uint32_t bits = __builtin_bit_cast(uint32_t, v + 0.0f);
+    return (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
+}
+
+// How many of lanes [0, n) hold a larger key than this lane: with distinct
+// keys, the lane's position in descending order. Scalar broadcasts only, so
+// no LDS round trip per comparison.
+__device__ __forceinline__ int warp_rank_desc(uint64_t key, int n)
+{
+    const uint32_t hi = uint32_t(key >> 32), lo = uint32_t(key);
+    int rank = 0;
+#pragma unroll 8
+    for(int j = 0; j < n; ++j)
+    {
+        const uint64_t other = (uint64_t(uint32_t(__builtin_amdgcn_readlane(hi, j))) << 32) |
+                               uint32_t(__builtin_amdgcn_readlane(lo, j));
+        rank += other > key ? 1 : 0;
+    }
+    return rank;
+}
 } // namespace aiter

@@ -147,6 +147,27 @@ def torch_mla_reduce_v1(
                     final_lse[seq_idx, head_idx] = final_lse_val
 
 
+def torch_mla_reduce_uniform(
+    partial_output, partial_lse, num_splits, qo_len, out_dtype
+):
+    """Vectorized `torch_mla_reduce_v1` for build_reduce_problem layouts in which
+    every tile merges `num_splits` partials: partial row = (tile * num_splits +
+    split) * qo_len + local_seq. Fast enough for problems with thousands of
+    rows, which the element-wise reference cannot check in CI time."""
+    _, num_heads, head_dim = partial_output.shape
+    o = partial_output.view(-1, num_splits, qo_len, num_heads, head_dim)
+    lse = partial_lse.view(-1, num_splits, qo_len, num_heads)
+    max_lse = lse.max(dim=1, keepdim=True).values
+    scale = torch.exp(lse - max_lse)  # [T, splits, qo_len, h]
+    sum_scale = scale.sum(dim=1)
+    out = (scale.unsqueeze(-1) * o).sum(dim=1) / sum_scale.unsqueeze(-1)
+    final_lse = max_lse.squeeze(1) + torch.log(sum_scale)
+    return (
+        out.reshape(-1, num_heads, head_dim).to(out_dtype),
+        final_lse.reshape(-1, num_heads),
+    )
+
+
 def build_reduce_problem(
     splits_per_tile,  # list[int]: number of splits for each reduce tile
     num_heads,
@@ -216,24 +237,36 @@ def build_reduce_problem(
     }
 
 
-def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
+def run_case(
+    splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1, vectorized_ref=False
+):
     p = build_reduce_problem(
         splits_per_tile, num_heads, head_dim, out_dtype, qo_len=qo_len
     )
 
     # ---- Reference (pure torch) ----
-    ref_out = torch.empty_like(p["final_output"])
-    ref_lse = torch.empty_like(p["final_lse"])
-    torch_mla_reduce_v1(
-        p["partial_output"],
-        p["partial_lse"],
-        p["reduce_indptr"],
-        p["reduce_final_map"],
-        p["reduce_partial_map"],
-        p["max_seqlen_q"],
-        ref_out,
-        ref_lse,
-    )
+    if vectorized_ref:
+        assert len(set(splits_per_tile)) == 1, "vectorized_ref needs uniform splits"
+        ref_out, ref_lse = torch_mla_reduce_uniform(
+            p["partial_output"],
+            p["partial_lse"],
+            splits_per_tile[0],
+            qo_len,
+            out_dtype,
+        )
+    else:
+        ref_out = torch.empty_like(p["final_output"])
+        ref_lse = torch.empty_like(p["final_lse"])
+        torch_mla_reduce_v1(
+            p["partial_output"],
+            p["partial_lse"],
+            p["reduce_indptr"],
+            p["reduce_final_map"],
+            p["reduce_partial_map"],
+            p["max_seqlen_q"],
+            ref_out,
+            ref_lse,
+        )
 
     # ---- GPU kernel (timed) ----
     gpu_out = p["final_output"]
@@ -318,7 +351,14 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
 
 def main():
     parser = argparse.ArgumentParser(description="Test mla_reduce_v1 kernel")
-    parser.add_argument("-d", "--dtype", default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        nargs="+",
+        default=["bf16", "fp16"],
+        choices=["bf16", "fp16"],
+        help="output dtypes; each is its own reducer instance (default: bf16 fp16)",
+    )
     parser.add_argument(
         "--head_dim",
         type=lambda s: [int(x) for x in s.split(",") if x.strip()],
@@ -327,7 +367,7 @@ def main():
     )
     args = parser.parse_args()
 
-    out_dtype = dtypes.bf16 if args.dtype == "bf16" else dtypes.fp16
+    out_dtypes = [dtypes.bf16 if d == "bf16" else dtypes.fp16 for d in args.dtype]
     head_dims = args.head_dim
 
     # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the
@@ -338,7 +378,9 @@ def main():
     heads_for_dim = {
         # Kimi K3 TP2 uses the 48-head, 128-dimension reducer.
         # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
-        128: [1, 16, 48, 96, 128],
+        # Kimi K3 TP8 (96 query heads / 8 ranks) MLA prefill uses the 12-head,
+        # 128-dimension reducer (nh12_hd128).
+        128: [1, 12, 16, 48, 96, 128],
         512: [8, 16, 24, 128],
     }
 
@@ -357,20 +399,46 @@ def main():
         [6] * 40
     ]  # many tiles -> exercises persistent-grid path
 
+    # multi-row tiles (qo_len > 1), decode/prefill-style:
+    # (num_heads, splits, qo_len, vectorized_ref). A workgroup covers
+    # qo_len / NUM_WG_PER_BH rows; past num_cu * 16 workgroups the reducer
+    # switches to the persistent-grid kernel (4096 on a 256-CU gfx950).
+    multi_row_cases = {
+        128: [
+            (12, [3, 8], 3, False),  # 12 heads: simple + massive tiles
+            (16, [8, 4], 3, False),
+            # 64 tiles x 64 rows: 4 workgroups per head/tile on 256 CUs, so each
+            # massive-path workgroup reduces 16 rows back to back.
+            (12, [4] * 64, 64, True),
+            # 12 x 512 = 6144 workgroups: the persistent-grid kernel on 256 and
+            # 304 CUs, with 2 rows per work item.
+            (12, [4] * 512, 2, True),
+        ],
+        512: [(16, [8, 4], 3, False)],
+    }
+
     all_ok = True
     df = []
-    for head_dim in head_dims:
-        for num_heads in heads_for_dim[head_dim]:
-            for splits in split_configs:
-                ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
+    for out_dtype in out_dtypes:
+        for head_dim in head_dims:
+            for num_heads in heads_for_dim[head_dim]:
+                for splits in split_configs:
+                    ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
+                    all_ok &= ok
+                    df.append(ret)
+
+        for head_dim in head_dims:
+            for num_heads, splits, qo_len, vec_ref in multi_row_cases[head_dim]:
+                ok, ret = run_case(
+                    splits,
+                    num_heads,
+                    head_dim,
+                    out_dtype,
+                    qo_len=qo_len,
+                    vectorized_ref=vec_ref,
+                )
                 all_ok &= ok
                 df.append(ret)
-
-    # multi-row tiles (qo_len > 1), decode/prefill-style
-    for head_dim in head_dims:
-        ok, ret = run_case([8, 4], 16, head_dim, out_dtype, qo_len=3)
-        all_ok &= ok
-        df.append(ret)
 
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)

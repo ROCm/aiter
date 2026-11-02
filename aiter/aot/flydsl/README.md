@@ -183,6 +183,45 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
 ```
 
+### MXFP4 activation and stage2 settings
+
+MXFP4 AOT accepts `--swiglu-limit` for a positive finite SiLU/SwiGLU clamp
+limit. Omitted standalone callers read `AITER_MXFP4_TUNE_SWIGLU_LIMIT`; an
+unset or empty variable preserves SwiGLU limit 7 and unclamped SiLU/Situv2.
+Batch `run_aot` (including `PREBUILD_KERNELS` installs) ignores the variable
+and always compiles the default limits. Situv2 rejects an explicit limit and
+retains its existing `(beta, linear_beta)` variants `(1, 1)` and `(4, 25)`.
+
+Set the same output switches before tuning, AOT and production:
+`AITER_FLYDSL_STAGE2_FP8=1` selects FP8 route output for reduce, and
+`AITER_MXFP4_INTERMEDIATE=1` selects packed FP4 scatter output for BM128,
+BN128/BN256 without bias. With both enabled, reduce uses FP8 and scatter uses
+FP4. Bias scatter retains BF16. Each switch is enabled only by the value `1`.
+
+```bash
+# Standalone compilation of a separately tuned limit-5, both-switches CSV.
+AITER_FLYDSL_STAGE2_FP8=1 AITER_MXFP4_INTERMEDIATE=1 \
+  python -m aiter.aot.flydsl.mxfp4_moe \
+  --csv /path/to/limit5-both-winner.csv --swiglu-limit 5
+```
+
+The full default `run_aot` model corpus includes Situv2 rows, which reject a
+custom limit. Compile custom-limit kernels with the standalone command above,
+passing only CSVs compatible with that activation limit.
+
+Production receives `swiglu_limit=5` through its explicit API and the same
+stage2 environment. The caller associates each winner CSV with those settings:
+CSV shape keys and names do not encode the limit or switches. A limit-5 tuning
+run can silently skip a same-key default-limit row without `--all`, or replace
+that row with a valid retuned winner under `--all`; switch changes have the
+same collision. Use the intended configuration's separate winner file.
+
+Successful AOT compilation must be followed by exact named production replay
+with `FLYDSL_RUNTIME_RUN_ONLY=1` in the same FlyDSL cache. Scatter's final BF16
+reduction uses the existing C++ auxiliary module, whose build is separate from
+the FlyDSL cache. Compilation success by itself establishes neither numerical
+correctness nor precompiled replay acceptance.
+
 ### Environment variables
 
 | Variable | Purpose | Default |

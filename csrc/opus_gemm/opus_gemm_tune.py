@@ -57,21 +57,26 @@ _patch_flaky_hip_device_count()
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
-    BIAS_AWARE_KIDS,
     GFX942_BF16WS_EXACT_N,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
     GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
     GFX1250_SPLITK_FUSE_KIDS,
-    NON_SPLITK_KIDS,
-    SPLITK_KIDS,
     _opus_sidecar_path,
     a16w16_flatmm_prefetch_k_iter,
-    kernels_list,
+    get_registry,
+    group_kids,
 )
 
 from aiter import dtypes, logger
+from aiter.ops.opus._arch import _device_arch_and_cu
+
+_tune_arch, _tune_cu = _device_arch_and_cu(torch.cuda.current_device())
+kernels_list = get_registry("a16w16", _tune_arch, _tune_cu)
+SPLITK_KIDS = group_kids("SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
+NON_SPLITK_KIDS = group_kids("NON_SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
+BIAS_AWARE_KIDS = group_kids("BIAS_AWARE_KIDS", _tune_arch, cu_num=_tune_cu)
 from aiter.ops.opus import opus_bmm as _opus_bmm
 from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -581,7 +586,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         "a16w16_kbuf2v_bk128",
     ):
         # Non-splitK a16w16 family all share the same K-dbuf parity +
-        # MFMA layout constraints as a16w16 (10000).
+        # MFMA layout constraints as a16w16.
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
@@ -744,12 +749,12 @@ def kid_rejects_bias(k_inst, bias):
     """Reject candidates that cannot consume a non-empty bias.
 
     Bias support (mirrors opus_kid_supports_bias in opus_gemm.cu):
-      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16", kid 4..9 + mirrors)
-      * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
+      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16")
+      * gfx950 a16w16_flatmm_splitk
     Rejected:
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
-      * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
-      * gfx942 splitk family (kid 10200+): silently ignored bias
+      * gfx942 SB (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family: silently ignored bias
       * gfx942 P1 non-splitK variants: no bias path
     """
     if not bias:
@@ -820,13 +825,8 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     # {plain + top-N round-up-capable cluster dims}). Bias-bearing tuning retains
     # the two-stage kids but omits fused round-1 kids because their bf16 [N]-only
     # bias contract cannot be encoded by the tuned CSV's boolean bias key.
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        if get_gfx_runtime().lower() == "gfx1250":
-            return _gfx1250_select_candidates(M, N, K, cu_num, include_fused=not bias)
-    except Exception:  # noqa: BLE001,S110
-        pass
+    if _tune_arch == "gfx1250":
+        return _gfx1250_select_candidates(M, N, K, cu_num, include_fused=not bias)
 
     # Step 1: structural tile-align fallback for non-splitk pipelines.
     # K % 64 == 0 and (K // 64) % 2 == 0 required for non-splitk pipeline's
@@ -847,22 +847,6 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         else:
             cands = narrowed
 
-    # Step 5: arch post-filter.
-    try:
-        from opus_gemm_common import kernels_list as _klist
-
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        _run_arch = get_gfx_runtime().lower()
-        cands = frozenset(
-            kid
-            for kid in cands
-            if (getattr(_klist.get(kid), "arch_prefix", "") or "gfx950").lower()
-            == _run_arch
-        )
-    except Exception:  # noqa: BLE001,S110
-        pass  # unknown arch -> keep legacy multi-arch behaviour
-
     # Step 6: drop known-bad kids permanently.
     cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
@@ -881,7 +865,7 @@ def _ensure_kids_compiled(candidate_kids):
     ``candidate_kids`` (or in ``DEFAULT_COMPILED_KIDS``) is missing, or its
     receipt does not match the installed .so, this function:
 
-    1. Passes the new candidates as ``--extra_kids`` to codegen. The last
+    1. Passes the new candidates as ``--extra_kernel_keys`` to codegen. The last
        successful sidecar remains intact until the new binary is installed.
     2. Clears the aiter.jit.core in-process module caches and requests a
        synchronous rebuild, which removes the old .so and re-reads the
@@ -929,29 +913,17 @@ def _ensure_kids_compiled(candidate_kids):
         True if a rebuild was triggered, False if every
         required kid was already compiled.
     """
-    from opus_gemm_common import default_compiled_kids_for_arch
+    from opus_gemm_common import KERNEL_REGISTRY, KernelKey, default_compiled_keys
 
     from aiter.jit import core as _jit_core
+    from aiter.jit.utils.chip_info import get_build_targets
     from aiter.jit.utils.file_baton import FileBaton
     from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
-    # Restrict the default compile floor to the running GPU's arch.
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        _run_arch = get_gfx_runtime().lower()
-        _defaults = default_compiled_kids_for_arch({_run_arch})
-    except Exception:  # noqa: BLE001
-        # A runtime probe can fail in a prebuild environment with explicit
-        # targets. Do not require off-arch defaults in that case.
-        _target_arches = {
-            arch.strip().lower()
-            for arch in os.getenv("GPU_ARCHS", "native").split(";")
-            if arch.strip() and arch.strip().lower() != "native"
-        }
-        _defaults = default_compiled_kids_for_arch(_target_arches or None)
-    required = candidate_kids | _defaults
+    gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
+    requests = {KernelKey("a16w16", gfx, cu, kid) for kid in candidate_kids}
+    required = {key.encode() for key in requests | default_compiled_keys(gfx, cu)}
 
     def _read_sidecar(path):
         if not os.path.exists(path):
@@ -1040,14 +1012,37 @@ def _ensure_kids_compiled(candidate_kids):
             # unions them with the current canonical seed under the build lock.
             blob_gen_cmd = (
                 d_args["blob_gen_cmd"]
-                + " --extra_kids "
-                + " ".join(str(kid) for kid in sorted(candidate_kids))
+                + " --extra_kernel_keys "
+                + " ".join(key.encode() for key in sorted(requests))
             )
+            target_arches = {gfx} | {arch for arch, _cu in get_build_targets()}
+            targets = sorted(
+                (arch, count)
+                for arch in target_arches
+                for count in {
+                    cu
+                    for tables in KERNEL_REGISTRY.values()
+                    for cu in tables.get(arch, {})
+                }
+            )
+            blob_gen_cmd += " --targets " + " ".join(
+                f"{arch}/{count}" for arch, count in targets
+            )
+            flags_extra_hip = [*d_args["flags_extra_hip"], f"--offload-arch={gfx}"]
+            if "gfx1250" in target_arches:
+                flags_extra_hip += [
+                    "-mllvm -amdgpu-expert-scheduling-mode",
+                    "-mllvm -enable-post-misched=1",
+                ]
+                if _jit_core.parse(_jit_core.get_hip_version()) >= _jit_core.Version(
+                    "7.0.0"
+                ):
+                    flags_extra_hip.append("-DAITER_ENABLE_CLUSTER_LAUNCH")
             _jit_core.build_module(
                 md_name="module_deepgemm_opus",
                 srcs=d_args["srcs"],
                 flags_extra_cc=d_args["flags_extra_cc"],
-                flags_extra_hip=d_args["flags_extra_hip"],
+                flags_extra_hip=flags_extra_hip,
                 blob_gen_cmd=blob_gen_cmd,
                 extra_include=d_args["extra_include"],
                 extra_ldflags=d_args["extra_ldflags"],
@@ -1062,6 +1057,8 @@ def _ensure_kids_compiled(candidate_kids):
                 # kids. Waiting for it is not evidence that our request ran.
                 build_after_wait=True,
             )
+            if not compiled_kids_are_current(sidecar, artifact, required):
+                raise RuntimeError("Opus build does not cover all tuning candidates")
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")
             _build_succeeded = True
@@ -1140,9 +1137,7 @@ a16w16_all_kernels = {
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
 # non-empty implementation on the run...
 try:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    _run_arch = get_gfx_runtime().lower()
+    _run_arch = _tune_arch
     a16w16_kernel_ids = sorted(
         kid
         for kid, k in a16w16_all_kernels.items()
@@ -1266,7 +1261,7 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
 def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     """Launch one eager kid and reject excessive numerical error."""
     _quiet_aiter_logger_once()
-    _opus_bmm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
+    _opus_bmm(XQ, WQ, Y, family="a16w16", kid=kernelId, bias=bias, split_k=splitK)
     ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
@@ -1309,7 +1304,7 @@ _bench_max_delta_checked = set()  # module-level per-subprocess cache
 def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
     """Benchmark one kid with a capture-safe, once-per-task accuracy check."""
     _quiet_aiter_logger_once()
-    _opus_bmm(XQ, WQ, Y, kid=kernelId, bias=bias, split_k=splitK)
+    _opus_bmm(XQ, WQ, Y, family="a16w16", kid=kernelId, bias=bias, split_k=splitK)
 
     capturing = torch.cuda.is_current_stream_capturing()
 
@@ -1434,6 +1429,7 @@ def _install_opus_perftest_once():
 
 
 class OpusGemmA16W16Tuner(GemmCommonTuner):
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": OPUS_DEBUG_TUNED_CSV,
@@ -1446,6 +1442,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
     OUT_COLUMNS: ClassVar[list[Any]] = [
+        "gfx",
         "cu_num",
         "M",
         "N",
@@ -1602,7 +1599,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="Comma-separated kid id(s) to restrict the sweep to "
-            "(e.g. --kid 10201 or --kid 10200,10201). Kids must still pass "
+            "(e.g. --kid 5 or --kid 4,5). Kids must still pass "
             "the host-side shape / bias / outdtype filters; rejected kids "
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",
@@ -1646,6 +1643,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         ):
             # Build a one-row untunedf directly from CLI args.
             row = {
+                "gfx": self.get_gfx(),
                 "cu_num": self.get_cu_num(),
                 "M": int(args.shape_m),
                 "N": int(args.shape_n),
@@ -1673,6 +1671,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
+            self.untunedf["gfx"] = self.get_gfx()
             # Fill missing bias / dtype / outdtype columns with the CLI defaults so legacy CSVs (4-col key
             # without these) still tune.
             if "bias" not in self.untunedf.columns:
@@ -1702,8 +1701,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     cli_outdtype_str
                 )
 
-            self.untunedf = self.untunedf[list(self.keys)]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            self.untunedf = self.untunedf[self.keys]
 
             if len(self.tunedf) != 0:
                 # Dedup against the full 7-key.
@@ -1747,6 +1746,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         Callers outside tune() that pre-compute bpes (e.g. update_tflops_bw
         on a legacy 4/6-key CSV) can pass bpes=... explicitly to bypass.
         """
+        info, time, err = results
+        row_key = info[0]
+        gfx = row_key[7] if len(row_key) >= 8 else self.get_gfx()
         if bpes is None:
             info, _time, _err = results
             row_key = info[0]
@@ -1759,7 +1761,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             else:
                 dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
             bpes = self._bpes_from_dtype_strs(dtype_str, outdtype_str)
-        return super().calculate(results, bpes=bpes)
+        info = ((gfx, *row_key[:4]), *info[1:])
+        return super().calculate((info, time, err), bpes=bpes)
 
     def result_to_df(self, results):
         rows = []
@@ -1779,14 +1782,21 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "torch.bfloat16",
                     "torch.bfloat16",
                 )
+            gfx = keys[7] if len(keys) >= 8 else self.get_gfx()
+            instance = get_registry("a16w16", gfx, int(cu_num)).get(kernelId)
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME or time == self.INF_TIME
-                else (self.getKernelName(kernelId) if kernelName == "" else kernelName)
+                else (
+                    (instance.name if instance is not None else None)
+                    if kernelName == ""
+                    else kernelName
+                )
             )
             tflops, bw = self.calculate(el)
             rows.append(
                 {
+                    "gfx": gfx,
                     "cu_num": cu_num,
                     "M": M,
                     "N": N,
@@ -1828,7 +1838,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 if "outdtype" in df.columns
                 else "torch.bfloat16"
             )
-            keys_tuple = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            keys_tuple = (
+                cu_num,
+                M,
+                N,
+                K,
+                bias_v,
+                dtype_str,
+                outdtype_str,
+                self.get_gfx(),
+            )
             info = ((keys_tuple, df.loc[i, kid_col], df.loc[i, "splitK"], ""), us, 0)
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
@@ -1907,12 +1926,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         # gfx1250: the benchmark sweep is restricted per-shape to the candidate
         # filter (top-N tiles x {plain + top-N cluster dims}); other arches keep
         # the full per-kid reject flow.
-        try:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
-            _is_gfx1250 = get_gfx_runtime().lower() == "gfx1250"
-        except Exception:  # noqa: BLE001
-            _is_gfx1250 = False
+        _is_gfx1250 = _tune_arch == "gfx1250"
 
         # --kid filter (debug): parse the CSV list once.
         forced_kids: set[int] | None = None
@@ -1934,31 +1948,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             logger.info(
                 f"OpusGemmA16W16Tuner: --kid filter active, restricting "
                 f"sweep to {sorted(forced_kids)}"
-            )
-
-        # Subset-compile safety: collect every kid this debug tuner could touch (full a16w16 family
-        # minus host-side rejects per shape) an...
-        opus_candidate_kids: set[int] = set()
-        for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
-            bias_v = (
-                bool(untunedf.loc[i, "bias"])
-                if "bias" in untunedf.columns
-                else bool(args.bias)
-            )
-            shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
-            if forced_kids is not None:
-                # Make sure the requested kids are baked in even if the
-                # shape-driven candidate set would have excluded them.
-                shape_cands = shape_cands | forced_kids
-            opus_candidate_kids |= shape_cands
-        if opus_candidate_kids and _ensure_kids_compiled(opus_candidate_kids):
-            logger.info(
-                f"opus_gemm_tune: synchronously rebuilt the module to cover "
-                f"{len(opus_candidate_kids)} candidate kids; "
-                f"module_deepgemm_opus is ready for spawned workers."
             )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
@@ -2033,7 +2022,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             total_kernel_nums = 0
             # 7-tuple matches self.keys; result_to_df / calculate read
             # bias / dtype / outdtype from slots 4 / 5 / 6.
-            info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            info_keys = (
+                cu_num,
+                M,
+                N,
+                K,
+                bias_v,
+                dtype_str,
+                outdtype_str,
+                self.get_gfx(),
+            )
 
             for kid in a16w16_kernel_ids:
                 # --kid filter (debug): skip everything outside the explicit set.
@@ -2114,6 +2112,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
         ret = []
         if task:
+            opus_candidate_kids = {entry[0][1] for entry in task}
+            if _ensure_kids_compiled(opus_candidate_kids):
+                logger.info(
+                    f"opus_gemm_tune: synchronously rebuilt the module to cover "
+                    f"{len(opus_candidate_kids)} candidate kids; "
+                    f"module_deepgemm_opus is ready for spawned workers."
+                )
             # Silence per-task `avg: X us/iter with hipgraph` and `no valida data after post process!` spam
             # from aiter.test_common during the...
             prev_level = logger.level
@@ -2174,8 +2179,7 @@ if __name__ == "__main__":
         "==============================================================\n"
         "\n"
     )
-    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv.
-    key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype"]
+    key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "gfx"]
     resultList = [
         "scaleAB",
         "bpreshuffle",
