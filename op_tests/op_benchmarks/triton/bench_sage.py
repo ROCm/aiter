@@ -19,6 +19,7 @@ import triton
 
 import aiter
 from aiter.ops.mha import (
+    flash_attn_fp8_pertensor_func,
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
@@ -32,6 +33,7 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -40,13 +42,16 @@ from aiter.ops.mha_v4_quant import (
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
+    quantize_mxfp4_k_hd256,
     quantize_mxfp4_q,
+    quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -88,10 +93,24 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
+    # MXFP4 is the one recipe with an hd256 object; its producers are separate entry points
+    # rather than a head-dim argument, so pick the trio the same way mha_v4's raw path does.
+    if query.shape[-1] == MHA_V4_HD256:
+        quant_q, quant_k, quant_v = (
+            quantize_mxfp4_q_hd256,
+            quantize_mxfp4_k_hd256,
+            quantize_v_mxfp4_fp6_p_hd256,
+        )
+    else:
+        quant_q, quant_k, quant_v = (
+            quantize_mxfp4_q,
+            quantize_mxfp4_k,
+            quantize_v_mxfp4_fp6_p,
+        )
+    q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_raw, v_scale = quant_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -140,6 +159,8 @@ class KernelSpec:
     uses_hadamard: bool = False
     supports_causal: bool = True
     include_in_all: bool = False
+    # Output comes back in --layout; every other runner is handed BSHD and returns BSHD.
+    follows_layout: bool = False
 
 
 def _mha_v4_spec(
@@ -165,15 +186,20 @@ KERNEL_SPECS = {
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "sage_mxfp4": KernelSpec(
         (0.5, 0.5, 1.0),
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MXFP4 row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
@@ -953,11 +979,15 @@ def cancel_internal_qk_rotation(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
-    q_rotated = torch.empty_like(q)
-    k_rotated = torch.empty_like(k)
-    rotate_activation_hd128(q_rotated, q)
-    rotate_activation_hd128(k_rotated, k)
-    return q_rotated, k_rotated
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        # The hd256 producers rotate each 128-wide half as its own head, so cancel per half.
+        rows = x.reshape(*x.shape[:-2], -1, 128)
+        rotated = torch.empty_like(rows)
+        rotate_activation_hd128(rotated, rows)
+        return rotated.reshape(x.shape)
+
+    return rotate(q), rotate(k)
 
 
 def rotate_qk_blocks(
@@ -1297,6 +1327,41 @@ def make_kernel_runner(
             return_attn_probs=False,
         )
 
+    if args.kernel == "aiter_fp8":
+        # Plain per-tensor FP8, deliberately unrotated: xDiT's AITER_FP8 Hadamard-rotates Q/K,
+        # so these two are not the same preprocessing and their accuracy is not comparable.
+        def _fp8_v3(q, k, v):
+            q_fp8, q_descale = quantize_fp8(q)
+            k_fp8, k_descale = quantize_fp8(k)
+            v_fp8, v_descale = quantize_fp8(v)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=args.causal,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: _fp8_v3(q_bshd, k_bshd, v_bshd)
+
+        q_fp8, q_descale = quantize_fp8(q_bshd)
+        k_fp8, k_descale = quantize_fp8(k_bshd)
+        v_fp8, v_descale = quantize_fp8(v_bshd)
+        return lambda: flash_attn_fp8_pertensor_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=args.causal,
+            softmax_scale=softmax_scale,
+        )
+
     if args.kernel == "mha4_bf16":
         return lambda: launch_mha_v4(
             q_bshd,
@@ -1621,9 +1686,9 @@ def make_kernel_runner(
 
 def to_bshd_output_if_needed(
     out: torch.Tensor,
-    layout: Literal["bshd", "bhsd"],
+    args: argparse.Namespace,
 ) -> torch.Tensor:
-    if layout == "bhsd":
+    if args.layout == "bhsd" and KERNEL_SPECS[args.kernel].follows_layout:
         return out.permute(0, 2, 1, 3).contiguous()
     return out
 
@@ -1832,7 +1897,7 @@ def benchmark_single_case(
 
     if args.report_quality:
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         report_quality_against_reference(args, current_primary, ref_primary)
 
@@ -2656,7 +2721,7 @@ def benchmark_all_kernel_row(
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:
