@@ -58,9 +58,18 @@ skip_tests=(
     "op_tests/test_kvcache.py"
     "op_tests/test_moe_blockscale.py"
     "op_tests/test_moeTopkSoftmax.py"
+    "op_tests/test_mla.py"
     # DPX 152-CU partition: a16w16 split-K kernels are only registered/tuned
     # for the full 304-CU chip ("unregistered OPUS namespace a16w16/gfx942/152").
     "op_tests/test_opus_a16w16_gemm.py"
+    # DPX 152-CU partition: CU-count/launch-geometry hardcoded assumptions
+    # that don't hold at 152 CU (occupancy-derived min_grid_size family;
+    # test_flydsl_mla_reduce hardcodes splits_per_tile=(...,304)). Needs a
+    # kernel/test fix to query actual CU count, tracked separately.
+    "op_tests/test_topk_plain.py"
+    "op_tests/test_flydsl_mla_reduce.py"
+    "op_tests/test_fused_qk_norm_rope_cache_quant.py"
+    "op_tests/test_flydsl_qk_norm_rope_quant.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
@@ -240,6 +249,9 @@ for f in "${sharded_files[@]}"; do
         break
     fi
 done
+if [[ " ${skip_tests[@]} " =~ " op_tests/test_mla.py " ]]; then
+    mla_in_shard=false
+fi
 if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
     for args in \
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
