@@ -103,11 +103,11 @@ def _torch_guard_modules() -> list:
 
 
 def _register_stream_stub() -> None:
-    from flydsl.compiler.jit_argument import JitArgumentRegistry
-    from flydsl.expr.typing import Stream
+    import flydsl.expr as fx
+    from flydsl.compiler import JitArgumentRegistry
 
-    if _Stream not in JitArgumentRegistry.registry:
-        JitArgumentRegistry.register(_Stream)(Stream)
+    if JitArgumentRegistry.get(_Stream)[0] is None:
+        JitArgumentRegistry.register(_Stream)(fx.Stream)
 
 
 @contextmanager
@@ -206,6 +206,8 @@ def dry_run(
             stack.callback(function.cache_clear)
         for owner, attribute, value in (
             (torch.cuda, "_lazy_init", _forbid),
+            # Without a GPU an engine loads its kernels with nothing but a
+            # printed HIP error, so this is what makes the dry run fail.
             (CompiledArtifact, "_ensure_engine", _forbid),
             (torch.cuda, "current_stream", lambda *_a, **_k: stream),
             (torch.cuda, "Stream", _Stream),

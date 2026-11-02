@@ -1,9 +1,11 @@
-"""FlyDSL AOT replay: how it hooks into FlyDSL's launches, and which errors at a
-size inside a row's range it may report as the runtime refusing that size.
+"""FlyDSL AOT replay: how it hooks into FlyDSL's launches, which errors at a
+size inside a row's range it may report as the runtime refusing that size, and
+the command line its per-arch processes get.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
 
+import os
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -92,3 +94,20 @@ def test_a_probe_error_is_a_refusal_only_where_the_module_declares_it():
         result, kernels = replay.replay_job(module, _JOB, probe=probe)
         assert result["compile_time"] is None
         assert kernels is None
+
+
+def test_per_arch_replays_get_the_command_line(monkeypatch):
+    argv = ["--shape", "12:12:192:128", "--check"]
+    forwarded = []
+
+    def run(module_name, jobs, argv, env=None):
+        forwarded.append(argv)
+        return 0
+
+    monkeypatch.setattr(sys, "argv", ["fmha_fp8", *argv])
+    monkeypatch.setattr(replay, "run", run)
+    # main() sets FLYDSL_RUNTIME_RUN_ONLY for --check.
+    with mock.patch.dict(os.environ), pytest.raises(SystemExit) as exited:
+        replay.main("aiter.aot.flydsl.fmha_fp8", "FP8 FMHA AOT")
+    assert exited.value.code == 0
+    assert forwarded == [argv]

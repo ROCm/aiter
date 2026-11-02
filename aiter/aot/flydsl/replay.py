@@ -520,7 +520,8 @@ def main(module_name: str, description: str) -> None:
     """The command line of a replaying AOT module: ``--csv`` (tuned tables,
     default ``DEFAULT_CSVS``), ``--check`` (compile nothing; fail on any
     kernel the cache lacks), the module's own options (``configure(parser)``)
-    and the internal ``--arch`` a per-arch replay process runs with."""
+    and the internal ``--arch`` a per-arch replay process runs with. The
+    per-arch processes get the same command line, plus ``--arch``."""
     from aiter_worker_limits import adopt_legacy_max_jobs
 
     adopt_legacy_max_jobs()
@@ -544,7 +545,8 @@ def main(module_name: str, description: str) -> None:
     configure = getattr(module, "configure", None)
     if configure is not None:
         configure(parser)
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    args = parser.parse_args(argv)
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
     for csv_path in csv_paths:
@@ -574,9 +576,6 @@ def main(module_name: str, description: str) -> None:
     print(f"  Cache dir:    {cache_dir}")
     print("=" * 72, flush=True)
 
-    argv = (["--csv", *csv_paths] if csv_paths else []) + _forwarded(parser, args)
-    if args.check:
-        argv.append("--check")
     started = time.time()
     failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
     print(f"\n  Total time:   {time.time() - started:.1f}s")
@@ -585,25 +584,3 @@ def main(module_name: str, description: str) -> None:
         sys.exit(1)
     print("All replays succeeded. Cache is ready.")
     sys.exit(0)
-
-
-def _forwarded(parser: argparse.ArgumentParser, args: argparse.Namespace) -> list:
-    """The module's own options, as the per-arch processes must see them."""
-    argv = []
-    for action in parser._actions:
-        if action.dest in ("help", "csv", "check", "arch"):
-            continue
-        value = getattr(args, action.dest)
-        if value == action.default:
-            continue
-        flag = action.option_strings[0]
-        if isinstance(action, argparse._StoreTrueAction):
-            argv.append(flag)
-        elif isinstance(action, argparse._AppendAction):
-            for item in value:
-                argv += [flag, str(item)]
-        elif isinstance(value, list):
-            argv += [flag, *map(str, value)]
-        else:
-            argv += [flag, str(value)]
-    return argv
