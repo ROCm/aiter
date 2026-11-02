@@ -209,7 +209,7 @@ def test_deterministic_rejects_unsupported():
     E = 32
     p = _problem(8, 1024, 512, E, 4, bias=False)
 
-    def call(interleaved=True, in_dtype=dtypes.bf16, **kw):
+    def call(interleaved=True, in_dtype=dtypes.bf16, w2=None, **kw):
         args = {
             "activation": ActivationType.Swiglu,
             "deterministic": True,
@@ -219,7 +219,7 @@ def test_deterministic_rejects_unsupported():
         return fused_moe(
             p["inp"].to(in_dtype),
             shuffle_weight_a16w4(p["w1_qt"], 16, interleaved),
-            p["w2"],
+            p["w2"] if w2 is None else w2,
             p["topk_weights"],
             p["topk_ids"],
             w1_scale=shuffle_scale_a16w4(p["w1_scale"], E, interleaved),
@@ -248,6 +248,13 @@ def test_deterministic_rejects_unsupported():
         call(quant_dtype_a2=dtypes.fp4x2)
     with pytest.raises(NotImplementedError, match="hidden padding"):
         call(hidden_pad=256)
+    with pytest.raises(NotImplementedError, match="intermediate padding"):
+        call(
+            intermediate_pad=256,
+            bias2=torch.zeros((E, 1024), dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(NotImplementedError, match="not both preshuffled"):
+        call(w2=p["w2_qt"])
 
     q = _problem(8, 384, 512, E, 4, bias=False)
     with pytest.raises(NotImplementedError, match="hidden size 384"):

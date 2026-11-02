@@ -1558,7 +1558,10 @@ def _fused_moe_impl(
             activation=activation,
             gate_mode=gate_mode,
             gate_up_interleave=getattr(w1, "gate_up_interleave", None),
-            is_shuffled=isShuffled,
+            # isShuffled is true when either weight is preshuffled; the
+            # deterministic kernels need both.
+            is_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
             is_g1u1=isG1U1,
             doweight_stage1=doweight_stage1,
             expert_mask=expert_mask,
@@ -1569,6 +1572,8 @@ def _fused_moe_impl(
             tokens=M,
             model_dim=model_dim,
             hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            has_bias1=bias1 is not None,
             has_bias2=bias2 is not None,
         )
 
@@ -3424,6 +3429,8 @@ def _check_deterministic_supported(
     tokens,
     model_dim,
     hidden_pad,
+    intermediate_pad,
+    has_bias1,
     has_bias2,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
@@ -3468,9 +3475,10 @@ def _check_deterministic_supported(
                     "(gate/up-interleaved only)"
                 ),
             ),
+            (not is_shuffled, "w1 and w2 not both preshuffled"),
             (
-                not (is_shuffled and is_g1u1 and not doweight_stage1),
-                "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
+                not (is_g1u1 and not doweight_stage1),
+                "non-g1u1 weights or doweight_stage1=True",
             ),
             (expert_mask is not None, "expert-parallel masking"),
             (stage2_scatter is not None, "stage2_scatter"),
@@ -3497,6 +3505,12 @@ def _check_deterministic_supported(
                 # before the top-k reduction reads them.
                 hidden_pad > 0 and not has_bias2,
                 "hidden padding without a stage-2 bias",
+            ),
+            (
+                # Without a stage-1 bias stage 1 skips the padded intermediate
+                # columns, while stage 2 with a bias reads them.
+                intermediate_pad > 0 and has_bias2 and not has_bias1,
+                "intermediate padding with a stage-2 bias but no stage-1 bias",
             ),
             (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
         )
