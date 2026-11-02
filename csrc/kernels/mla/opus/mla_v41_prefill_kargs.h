@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Kernel argument ABI of the prebuilt MLA v4.1 sparse prefill code object; a field change
-// requires rebuilding it.
+// Kernel argument ABI of the prebuilt MLA v4.1 sparse prefill code objects; a field change
+// requires rebuilding the gfx950 and gfx1250 ones.
 
 #pragma once
 

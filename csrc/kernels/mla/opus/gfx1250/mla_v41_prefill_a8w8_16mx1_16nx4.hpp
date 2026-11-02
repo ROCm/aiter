@@ -446,7 +446,7 @@ __device__ __attribute__((always_inline)) void opus_mla_v41_prefill_a8w8_16mx1_1
         ext_len = rows.extend_len;
     }
     const kv_segment pre{kargs.unified_kv_ptr, kargs.unified_kv_scale_ptr, kargs.kv_indices_prefix + pre_begin + pre_off,
-                         kargs.stride_kv_page, kargs.stride_kv_scale_page, kargs.total_pages, pre_len};
+                         kargs.stride_unified_kv_page, kargs.stride_unified_kv_scale_page, kargs.total_pages, pre_len};
     const kv_segment ext{kargs.kv_ptr, kargs.kv_scale_ptr, kargs.kv_indices_extend + ext_begin + ext_off,
                          kargs.stride_kv_page, kargs.stride_kv_scale_page, kargs.total_tokens, ext_len};
 
