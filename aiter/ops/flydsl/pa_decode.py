@@ -9,6 +9,8 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+from dataclasses import dataclass
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -17,7 +19,17 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode.traits import (
+    BF16_LDS_LIMIT_BYTES,
+    Gfx1250Traits,
+    _bf16_lds_bytes,
+)
+from .kernels.pa_decode_kernel import (
+    GFX1250_LDS_LIMIT_BYTES,
+    KV_COMPUTE_BLOCK,
+    compile_pa_decode_tile,
+    gfx1250_default_query_splits,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -169,100 +181,73 @@ def launch_pa_decode_ps_reduce(
     )
 
 
-def pa_decode(
-    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
-    context_lengths: torch.Tensor,  # [num_seqs]
-    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
-    softmax_scale: float,
-    query_length: int,
+def _is_cuda(tensor: torch.Tensor) -> bool:
+    # A seam for host-only tests, which describe calls with CPU tensors.
+    return tensor.device.type == "cuda"
+
+
+def _materialize_scale(scale, view, dev):
+    """The [1] float32 tensor pa_decode passes for a None or host-scalar scale."""
+    if view is not None:
+        return view
+    if scale is None:
+        return torch.ones(1, dtype=torch.float32, device=dev)
+    return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+
+
+@dataclass(frozen=True)
+class _PaDecodeCall:
+    """Host-side facts about one pa_decode call, derived while validating it."""
+
+    arch: str
+    sliding_window: int
+    num_seqs: int
+    num_q_heads: int
+    head_dim: int
+    num_kv_heads: int
+    block_size: int
+    trans_v: bool
+    trans_k: bool
+    is_bf16_kv: bool
+    kv_dtype: str
+    query_dtype: str
+    query_group_size: int
+    max_blocks_per_seq: int
+    device: torch.device
+    key_scale: torch.Tensor | None
+    value_scale: torch.Tensor | None
+    per_token_kv: bool
+    stride_ks_block: int
+    stride_ks_head: int
+    schedule_context_length: int
+
+
+def _check_pa_decode_call(
+    output,
+    query,
+    key_cache,
+    value_cache,
+    context_lengths,
+    block_tables,
+    query_length,
     *,
-    context_partition_size: int = 256,
-    compute_type: torch.dtype | None = None,
-    query_scale: torch.Tensor = None,
-    key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
-    max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
-    alibi_slopes: torch.Tensor = None,
-    sinks: torch.Tensor = None,
-    sliding_window: int = 0,
-    work_plan: PADecodePlan,
-    max_context_length: int | None = None,
-    mask_unowned_kv: bool = True,
-) -> None:
-    """Decode FP8 or BF16 K/V using 256-token compute tiles.
+    context_partition_size,
+    compute_type,
+    query_scale,
+    key_scale,
+    value_scale,
+    alibi_slopes,
+    sinks,
+    sliding_window,
+    max_context_length,
+) -> _PaDecodeCall:
+    """Validate a pa_decode call on the host, raising what pa_decode raises.
 
-    Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
-    up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
-    K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
-    A non-transposed 4D key cache is not implemented.
-
-    The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
-    per-tensor or per-token scales, and sliding windows, with at most 32
-    query rows (query_length times the GQA group size).
-
-    ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
-    no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
-    and vectorized 5D BF16 caches. gfx1250 also supports FP16 queries and plain
-    BF16 V caches, with head dimensions 64 or multiples of 128 up to 1024.
-    BF16 Q/P operands stay
-    in BF16 and softmax statistics and MFMA accumulation stay in FP32.
-    gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
-    within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
-    splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
-    into separate query CTAs. Q/K and V/output
-    head dimensions must match.
-    ALiBi and externally quantized queries are unsupported.
-
-    MTP lengths include the query tokens and use dense causal masking.
-    Independently selected sparse queries need separate table rows and
-    query_length=1. Positive ``sliding_window`` includes each query's own
-    position; nonpositive values disable it.
-
-    ``work_plan`` is required and must be built with ``plan_pa_decode`` before
-    calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
-    FlyDSL autotune to select its budget before graph capture. A cache miss uses
-    the device CU count for the gfx950 head-256 pipe shapes and twice that
-    otherwise; ``tune=True`` forces a search during preparation.
-    Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
-    of one writes output directly when sinks are absent and query/output strides
-    match. Other plans use packed scratch and reduction.
-
-    ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
-    query device: unscaled zero-value logits shared across batch/MTP positions.
-    Each contributes once, independently of the window; -inf disables it and
-    +inf suppresses the head's output.
-
-    Refresh ``work_plan`` on the current stream after changing lengths. Its
-    max_partitions is bounded by device CUs. Match sliding_window and, for
-    windowed plans, query_length. Scratch is [KV heads, capacity, query rows
-    (, D)], with query rows = query_length * query_group_size.
-
-    ``max_context_length`` selects the scheduling bound, rounded up to
-    whole pages as in tuning. This keeps the selected specialization independent
-    of extra block-table padding. It is the caller's contract, including for
-    graph replay: every context length that will run must be at most
-    ``max_context_length``. A smaller value still covers the real context:
-    page ids outside the staged window are read from the block table.
-
-    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
-    K/V scales of tokens at or past each sequence's context length before PV,
-    so pinned block-0 pages and the unwritten tail of the last page may hold
-    any bytes, including NaN. False skips that masking (slightly faster on
-    tiny boundary-tile-only calls); the caller must then keep those bytes and
-    scales finite. gfx1250 ignores it and always requires finite bytes.
-
-    GPU lengths and table entries are not checked. Callers must ensure
-    0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
-    block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
+    Shared by ``pa_decode`` and ``can_use_flydsl_pa_decode`` so the two cannot
+    disagree. Allocates nothing and reads no GPU memory. Scale tensors in the
+    result are normalized views, or None where pa_decode materializes a [1]
+    float32 scale (None or a host scalar) or passes a null pointer (BF16 KV).
     """
-    if not isinstance(work_plan, PADecodePlan):
-        raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
             "pa_decode only supports context_partition_size=256, "
@@ -317,7 +302,7 @@ def pa_decode(
 
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
-    if query.device.type != "cuda":
+    if not _is_cuda(query):
         raise ValueError(f"query must be on a CUDA device, got {query.device}")
     if num_q_heads < 1:
         raise ValueError(f"query must contain at least one head, got {num_q_heads}")
@@ -502,10 +487,10 @@ def pa_decode(
             raise ValueError(f"{name} must be contiguous")
 
     def normalize_scale(scale, name):
-        if scale is None:
-            return torch.ones(1, dtype=torch.float32, device=dev)
+        # None and host scalars become [1] float32 tensors on the query device
+        # in pa_decode; they always pass the checks below, so stay None here.
         if not isinstance(scale, torch.Tensor):
-            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+            return None
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
@@ -539,8 +524,8 @@ def pa_decode(
             )
         key_scale_t = normalize_scale(key_scale, "key_scale")
         value_scale_t = normalize_scale(value_scale, "value_scale")
-        per_token_kv = key_scale_t.numel() > 1
-        if per_token_kv != (value_scale_t.numel() > 1):
+        per_token_kv = key_scale_t is not None and key_scale_t.numel() > 1
+        if per_token_kv != (value_scale_t is not None and value_scale_t.numel() > 1):
             raise ValueError(
                 "key_scale and value_scale must both be per-tensor or both be per-token"
             )
@@ -573,6 +558,8 @@ def pa_decode(
             stride_ks_block = 0
             stride_ks_head = 0
         for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
+            if scale is None:
+                continue
             if scale.dtype != torch.float32:
                 raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
             if scale.device != dev:
@@ -595,6 +582,276 @@ def pa_decode(
         schedule_context_length = (
             (max_context_length + block_size - 1) // block_size * block_size
         )
+    return _PaDecodeCall(
+        arch=arch,
+        sliding_window=sliding_window,
+        num_seqs=num_seqs,
+        num_q_heads=num_q_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        trans_v=trans_v,
+        trans_k=trans_k,
+        is_bf16_kv=is_bf16_kv,
+        kv_dtype=kv_dtype,
+        query_dtype=query_dtype,
+        query_group_size=query_group_size,
+        max_blocks_per_seq=max_blocks_per_seq,
+        device=dev,
+        key_scale=key_scale_t,
+        value_scale=value_scale_t,
+        per_token_kv=per_token_kv,
+        stride_ks_block=stride_ks_block,
+        stride_ks_head=stride_ks_head,
+        schedule_context_length=schedule_context_length,
+    )
+
+
+def _check_pa_decode_compile(call: _PaDecodeCall, query_length: int) -> None:
+    """Raise if compile_pa_decode_tile would reject the call's specialization.
+
+    These limits depend only on the call's shape, but the kernel builders
+    enforce them at compile time, after the host checks above.
+    """
+    if call.arch == "gfx1250":
+        query_splits = gfx1250_default_query_splits(
+            kv_dtype=call.kv_dtype,
+            head_dim=call.head_dim,
+            query_group_size=call.query_group_size,
+            query_length=query_length,
+            block_size=call.block_size,
+            trans_v=call.trans_v,
+            sliding_window=call.sliding_window,
+        )
+        # direct_output depends on the plan; it does not change the LDS layout.
+        traits = Gfx1250Traits(
+            call.head_dim,
+            call.query_group_size,
+            call.block_size,
+            1.0,
+            call.query_dtype,
+            call.per_token_kv,
+            query_length,
+            call.trans_v,
+            call.sliding_window,
+            call.kv_dtype,
+            False,
+            query_splits,
+        )
+        if traits.total_bytes > GFX1250_LDS_LIMIT_BYTES:
+            raise NotImplementedError(
+                "gfx1250 PA decode query/KV tiles exceed LDS capacity"
+            )
+    elif call.is_bf16_kv:
+        # The BF16 schedule splits query positions across CTAs down to one
+        # position per CTA; one position's GQA rows must still fit.
+        if (
+            _bf16_lds_bytes(call.head_dim, call.query_group_size, call.block_size)
+            > BF16_LDS_LIMIT_BYTES
+        ):
+            raise ValueError(
+                "BF16 PA query group exceeds the 64 KiB LDS limit, "
+                f"even with one query position per CTA: head_dim={call.head_dim}, "
+                f"query_group_size={call.query_group_size}"
+            )
+
+
+def can_use_flydsl_pa_decode(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_length: int,
+    *,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype | None = None,
+    query_scale: torch.Tensor = None,
+    key_scale: torch.Tensor = None,
+    value_scale: torch.Tensor = None,
+    alibi_slopes: torch.Tensor = None,
+    sinks: torch.Tensor = None,
+    sliding_window: int = 0,
+    max_context_length: int | None = None,
+) -> bool:
+    """Whether ``pa_decode`` accepts these arguments.
+
+    Takes the arguments ``pa_decode`` would get, minus the work plan and
+    scratch, and runs the same host checks pa_decode runs plus the shape
+    limits its kernel builders enforce at compile time (gfx1250 and BF16 LDS
+    capacity). True means pa_decode will not reject the call for its
+    arguments; the plan passed with it must still match (``plan_pa_decode``
+    batch and head count, sliding window). Host-only: allocates nothing,
+    compiles nothing and reads no GPU memory, so it is safe during graph
+    capture. GPU-side values (context lengths, block ids) are not checked,
+    as in pa_decode.
+    """
+    try:
+        call = _check_pa_decode_call(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            query_length,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            query_scale=query_scale,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            alibi_slopes=alibi_slopes,
+            sinks=sinks,
+            sliding_window=sliding_window,
+            max_context_length=max_context_length,
+        )
+        _check_pa_decode_compile(call, query_length)
+    except (NotImplementedError, TypeError, ValueError):
+        return False
+    return True
+
+
+def pa_decode(
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    context_lengths: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    softmax_scale: float,
+    query_length: int,
+    *,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype | None = None,
+    query_scale: torch.Tensor = None,
+    key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
+    value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
+    exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
+    max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
+    temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
+    alibi_slopes: torch.Tensor = None,
+    sinks: torch.Tensor = None,
+    sliding_window: int = 0,
+    work_plan: PADecodePlan,
+    max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
+) -> None:
+    """Decode FP8 or BF16 K/V using 256-token compute tiles.
+
+    ``can_use_flydsl_pa_decode`` answers, without launching, whether these
+    arguments are accepted.
+
+    Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
+    up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
+    K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    A non-transposed 4D key cache is not implemented.
+
+    The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
+    per-tensor or per-token scales, and sliding windows, with at most 32
+    query rows (query_length times the GQA group size).
+
+    ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
+    no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
+    and vectorized 5D BF16 caches. gfx1250 also supports FP16 queries and plain
+    BF16 V caches, with head dimensions 64 or multiples of 128 up to 1024.
+    BF16 Q/P operands stay
+    in BF16 and softmax statistics and MFMA accumulation stay in FP32.
+    gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
+    within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
+    splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
+    into separate query CTAs. Q/K and V/output
+    head dimensions must match.
+    ALiBi and externally quantized queries are unsupported.
+
+    MTP lengths include the query tokens and use dense causal masking.
+    Independently selected sparse queries need separate table rows and
+    query_length=1. Positive ``sliding_window`` includes each query's own
+    position; nonpositive values disable it.
+
+    ``work_plan`` is required and must be built with ``plan_pa_decode`` before
+    calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
+    FlyDSL autotune to select its budget before graph capture. A cache miss uses
+    the device CU count for the gfx950 head-256 pipe shapes and twice that
+    otherwise; ``tune=True`` forces a search during preparation.
+    Decode and graph replay use the explicit plan without accessing autotune. Set its
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
+    of one writes output directly when sinks are absent and query/output strides
+    match. Other plans use packed scratch and reduction.
+
+    ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
+    query device: unscaled zero-value logits shared across batch/MTP positions.
+    Each contributes once, independently of the window; -inf disables it and
+    +inf suppresses the head's output.
+
+    Refresh ``work_plan`` on the current stream after changing lengths. Its
+    max_partitions is bounded by device CUs. Match sliding_window and, for
+    windowed plans, query_length. Scratch is [KV heads, capacity, query rows
+    (, D)], with query rows = query_length * query_group_size.
+
+    ``max_context_length`` selects the scheduling bound, rounded up to
+    whole pages as in tuning. This keeps the selected specialization independent
+    of extra block-table padding. It is the caller's contract, including for
+    graph replay: every context length that will run must be at most
+    ``max_context_length``. A smaller value still covers the real context:
+    page ids outside the staged window are read from the block table.
+
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
+
+    GPU lengths and table entries are not checked. Callers must ensure
+    0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
+    block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
+    """
+    if not isinstance(work_plan, PADecodePlan):
+        raise TypeError("work_plan must be a PADecodePlan")
+    call = _check_pa_decode_call(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        query_length,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        max_context_length=max_context_length,
+    )
+    arch = call.arch
+    sliding_window = call.sliding_window
+    num_seqs = call.num_seqs
+    head_dim = call.head_dim
+    num_kv_heads = call.num_kv_heads
+    block_size = call.block_size
+    trans_v = call.trans_v
+    trans_k = call.trans_k
+    is_bf16_kv = call.is_bf16_kv
+    kv_dtype = call.kv_dtype
+    query_dtype = call.query_dtype
+    query_group_size = call.query_group_size
+    max_blocks_per_seq = call.max_blocks_per_seq
+    dev = call.device
+    per_token_kv = call.per_token_kv
+    stride_ks_block = call.stride_ks_block
+    stride_ks_head = call.stride_ks_head
+    schedule_context_length = call.schedule_context_length
+    if is_bf16_kv:
+        # The native BF16 specialization never dereferences scale pointers.
+        # Null pointers avoid allocating dummy scales during graph capture.
+        key_scale_t = value_scale_t = None
+    else:
+        key_scale_t = _materialize_scale(key_scale, call.key_scale, dev)
+        value_scale_t = _materialize_scale(value_scale, call.value_scale, dev)
     work_plan.validate(num_seqs, num_kv_heads, dev)
     if work_plan.sliding_window != sliding_window:
         raise ValueError("sliding_window must match work_plan.sliding_window")
