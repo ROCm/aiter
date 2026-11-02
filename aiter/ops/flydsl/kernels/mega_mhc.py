@@ -214,7 +214,7 @@ def ue8m0_quant(y_bf, with_grid: bool):
     scale = (ex << I32(23)).bitcast(F32)
     dw = []
     for d in range_constexpr(2):
-        pk = Vec.filled(2, 0, fx.Int16).ir_value()
+        pk = fx.full(2, 0, fx.Int16).ir_value()
         for half in range_constexpr(2):
             src = Vec.from_elements([yw[2 * d + half]], I32).bitcast(BF16)
             pk = rocdl.cvt_scalef32_pk_fp8_bf16(
@@ -531,7 +531,7 @@ def compile_mega_mhc(
         fx.memref_store_vec(b_bf16, fb)
         fx.memref_store_vec(acc, fc)
         fx.gemm(atom, fc, fa, fb, fc)
-        return Vec(fx.memref_load_vec(fc))
+        return fx.memref_load_vec(fc)
 
     def bf16x8(v_i32x4):
         return Vec(v_i32x4).bitcast(BF16)
@@ -788,7 +788,7 @@ def compile_mega_mhc(
                             fx.add_offset(xpose.ptr, xp_wr + s * WAVE * 4),
                         )
                 return [
-                    Vec(
+                    (
                         fx.ptr_load(
                             fx.add_offset(xpose.ptr, xp_rd + s * WAVE * 4),
                             T.vec(4, T.i32),
@@ -1014,7 +1014,7 @@ def compile_mega_mhc(
                                 )
                 return acc, sqr, sqx
 
-            acc0 = [Vec.filled(4, 0.0, F32) for _ in range_constexpr(2 * MT)]
+            acc0 = [fx.full(4, 0.0, F32) for _ in range_constexpr(2 * MT)]
             sq0 = [F32(0.0) for _ in range_constexpr(MT * NGT)]
             never_oob = I32(0) != I32(0)  # a "dead" flag that is always false
             tiles0 = load_tile(I32(0), never_oob)
@@ -1069,7 +1069,7 @@ def compile_mega_mhc(
 
             def fn_from_lds(buf):
                 return [
-                    Vec(
+                    (
                         fx.ptr_load(
                             fx.add_offset(
                                 fnbuf.ptr, (buf * NOPS + o) * (WAVE * 4) + lane * 4
@@ -1261,11 +1261,9 @@ def compile_mega_mhc(
                 xs, wv = [], []
                 for q in range_constexpr(X1L):
                     xs.append(
-                        Vec(
-                            fx.ptr_load(
-                                fx.add_offset(x1s.ptr, base + q * 256),
-                                T.vec(4, T.i32),
-                            )
+                        fx.ptr_load(
+                            fx.add_offset(x1s.ptr, base + q * 256),
+                            T.vec(4, T.i32),
                         )
                     )
                     if fx.const_expr(not SEG128):
@@ -1436,7 +1434,7 @@ def compile_mega_mhc(
                     tl = u // (PSLOT // 4)
                     q4 = u % (PSLOT // 4)
                     if g_id < I32(KGROUPS):
-                        acc4 = Vec.filled(4, 0.0, F32)
+                        acc4 = fx.full(4, 0.0, F32)
                         for k in range_constexpr(-(-KS // KGROUPS)):
                             kk = g_id + k * KGROUPS
                             live = kk < I32(KS)

@@ -416,7 +416,7 @@ _GFX942_AUTO_VARIANTS = {
     (65, 8192): "mfma_r1_w4",  # odd, below 2**21: steps down
     (254, 8192): "mfma_r2_w4",
     (256, 8192): "mfma_r4_w4",  # 2**21
-    (257, 8192): "mfma_r4_w4",  # odd, from 2**21 up: pads
+    (257, 8192): "mfma_r4_w4",  # odd, from 2**21 up: short tail tile
     (1024, 131072): "mfma_r4_w4",  # long-context indexer prefill
     (2048, 8192): "mfma_r4_w2",
 }
@@ -780,8 +780,8 @@ def main():
             # enough that most blocks end up owning an empty column range.
             (64, 2048),
             (64, 8192),
-            # gfx942 auto-selects r4 from 256*8192 == 2**21 up (pinned in
-            # _GFX942_AUTO_VARIANTS). 257 is odd, so the launcher pads it.
+            # gfx942 auto-selects r4 from 256*8192 == 2**21 up. 257 leaves a
+            # short last tile.
             (256, 8192),
             (257, 8192),
             # s_kv < s_q. A causal mask then puts cu_ends below zero on the

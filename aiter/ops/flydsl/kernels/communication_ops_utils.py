@@ -164,7 +164,7 @@ def load_i64_acquire(addr_i64):
 
 def load_i32_system(addr_i64, index):
     """Compatibility system-scope i32 load at ``addr_i64 + index * 4``."""
-    item_addr = fx.Int64(addr_i64) + fx.Int64(index) * fx.Int64(4)
+    item_addr = fx.Int64(addr_i64) + fx.Int64(index) * 4
     return fx.Int32(load_i32_acquire(item_addr))
 
 

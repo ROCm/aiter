@@ -3,6 +3,7 @@
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
+#include "quant_amax_floor.h"
 #include "iq2r.h"
 #include "mx_quant_utils.h"
 #include "opus/opus.hpp"
@@ -645,7 +646,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                 for(int atom=0;atom<4;++atom) up[atom]=__shfl_xor(values[atom],1);
                 if(lane_row%2==0)
                 {
-                    float activated[4];float abs_max=1.0e-10f;
+                    float activated[4];float abs_max=aiter::kAmaxFloor;
 #pragma unroll
                     for(int atom=0;atom<4;++atom)
                     {
@@ -817,7 +818,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
             __syncthreads();
             const int local_row=linear/(Waves*4),quad=(linear/4)%Waves,qlane=linear%4;
             const int row=begin+m*16+local_row;
-            float values[8];float abs_max=1.0e-10f;
+            float values[8];float abs_max=aiter::kAmaxFloor;
 #pragma unroll
             for(int element=0;element<8;++element)
             {
@@ -2050,7 +2051,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
                 for(int atom=0;atom<4;++atom) up[atom]=__shfl_xor(values[atom],1);
                 if(lane_row%2==0)
                 {
-                    float activated[4];float abs_max=1.0e-10f;
+                    float activated[4];float abs_max=aiter::kAmaxFloor;
 #pragma unroll
                     for(int atom=0;atom<4;++atom)
                     {
@@ -2228,7 +2229,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
                 for(int atom=0;atom<4;++atom) up[atom]=__shfl_xor(values[atom],1);
                 if(lane_row%2==0)
                 {
-                    float activated[4];float abs_max=1.0e-10f;
+                    float activated[4];float abs_max=aiter::kAmaxFloor;
 #pragma unroll
                     for(int atom=0;atom<4;++atom)
                     {

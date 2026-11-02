@@ -33,10 +33,10 @@ P2P_FP8_MIN_MTPR = 1024
 # 128; AITER_MEGA_FIXED_SLOT_MAX_MTPR extends it (see envs.py).
 FIXED_SLOT_MAX_MTPR = envs.AITER_MEGA_FIXED_SLOT_MAX_MTPR
 MAX_MTPR_CLASS = 32768
+# Source-indexed payload storage cuts the maximum-capacity activation buffer by
+# roughly ``topk``, so every rank at the max-capacity MTPR class uses it
+# regardless of sort_block_m; smaller MTPR classes keep the route-major layout.
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
-INDEXED_PAYLOAD_MIN_SBM = 128
-# Source-indexed payload storage cuts the maximum-capacity activation buffer
-# by roughly ``topk``.  Keep every smaller capacity on the historical layout.
 REFERENCE_EXPERTS_PER_RANK = 48
 R1_EXPERTS_PER_RANK = 32
 KIMI_K3_EXPERTS_PER_RANK = 112
@@ -769,6 +769,23 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     return config
 
 
+def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
+    on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
+    halves the decode padding and Stage2's tile with it."""
+    if ctx.bucket == 512:
+        config = _replace_config(
+            config, stage1={"sort_block_m": 32, "tile_n": 512, "num_waves": 8}
+        )
+    elif ctx.bucket == 16384:
+        config = _replace_config(
+            config,
+            stage1={"sort_block_m": 128, "tile_n": 512, "num_waves": 4},
+            stage2={"persist_cu": 256},
+        )
+    return config
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -804,6 +821,7 @@ _NETWORKS = (
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
     ),
+    NetworkProfile("v41_flash_ep2", 192, 5120, 2304, _tune_v41_flash_ep2),
 )
 
 
@@ -950,13 +968,16 @@ def select_mega_moe_config(
         config = profile.tuner(config, ctx)
     if (
         a_dtype == ACTIVATION_FP4
+        and not fixed_slot_dispatch
         and mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-        and config.stage1.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
     ):
-        # FP4 packs one K step into 8 16-byte chunks, so a 16-lane direct
-        # global-to-LDS atom spans two rows. Indexed payload gives every
-        # row an independent source key, which that atom cannot express.
-        config = _replace_config(config, stage1={"async_a_copy": False})
+        # Every rank here uses the source-indexed payload. The async A-copy
+        # (ATileLoader.prefetch_to_lds) resolves each row's source key per thread,
+        # so it serves indexed FP4 too -- the old "indexed FP4 must be sync" rule
+        # was conservative (validated: relL2 unchanged, no OOB). Keep async on: it
+        # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
+        # and it reclaims the small-bucket cost that forcing sync would add.
+        config = _replace_config(config, stage1={"async_a_copy": True})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.

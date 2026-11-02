@@ -42,7 +42,7 @@ import pytest
 import torch
 
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.opus import opus_bmm, policy
 from aiter.ops.opus.gemm_op_a8w8 import (
@@ -83,12 +83,12 @@ KIDS_BPRESHUFFLE = tuple(sorted(_preshuffled_kids()))
 # probe kid out of a one-element list raised StopIteration and failed the run
 # before any kernel ran.
 ALL_KIDS_BPRESHUFFLE = KIDS_BPRESHUFFLE
-KID_PLAIN = 8320  # same tile, row-major B, broadcast scale pack
+KID_PLAIN = 71  # same tile, row-major B, broadcast scale pack
 
 
 # Extra row-major kids to time alongside, e.g. whichever the tuner actually
-# ships for the shape under test (kid8158 is the large-M pick on many of them).
-KIDS_PLAIN_EXTRA = (8311, 8321, 8653, 8325, 8158)
+# ships for the shape under test (kid16 is the large-M pick on many of them).
+KIDS_PLAIN_EXTRA = (63, 72, 144, 76, 16)
 
 # Measured against the dequantized torch reference. The e8m0 quant floor on these
 # shapes is ~0.0014 and every kid, row-major and preshuffled alike, sits exactly
@@ -202,7 +202,7 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     W_mx, _, _, scale_for_sq, ref_sq = data_for(group)
     err_plain = None
     plain_exc = None
-    for cand in (kid_plain, kid_plain - KID_PLAIN + 8653):
+    for cand in (kid_plain, kid_plain - KID_PLAIN + 144):
         try:
             err_plain = _rel_err(_call(cand, W_mx, scale_for_sq), ref_sq)
         except (RuntimeError, ValueError) as e:
@@ -311,7 +311,8 @@ def _check_tables():
     """
     from aiter.jit.core import AITER_CONFIGS
 
-    gfx = get_gfx()
+    gfx, cu_num = get_gfx(), get_cu_num()
+    scope = {"gfx": gfx, "cu_num": cu_num}
     ok = True
     for b_preshuffled in (False, True):
         path = (
@@ -325,7 +326,7 @@ def _check_tables():
         kids = {
             int(row["kernelId"])
             for key, row in rows.items()
-            if key[0] == gfx and row.get("libtype") == "opus"
+            if key[:2] == (gfx, cu_num) and row.get("libtype") == "opus"
         }
         # The key's last field is the row's w_scale_block; a kid of the other
         # block would read the scales at the wrong stride.
@@ -333,19 +334,19 @@ def _check_tables():
             {
                 int(row["kernelId"])
                 for key, row in rows.items()
-                if key[0] == gfx
+                if key[:2] == (gfx, cu_num)
                 and row.get("libtype") == "opus"
-                and policy.mxscale_bmm_kid_group(int(row["kernelId"]))
-                != policy.mxscale_bmm_group_of_block(key[5])
+                and policy.mxscale_bmm_kid_group(int(row["kernelId"]), **scope)
+                != policy.mxscale_bmm_group_of_block(key[-1])
             }
         )
         bad_b = sorted(
             k
             for k in kids
-            if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled)
+            if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled, **scope)
         )
         bad_sf = sorted(
-            k for k in kids if not policy.mxscale_bmm_kid_takes_plain_scales(k)
+            k for k in kids if not policy.mxscale_bmm_kid_takes_plain_scales(k, **scope)
         )
         bad = bool(bad_b or bad_sf or bad_g)
         ok &= not bad
@@ -377,6 +378,9 @@ def _check_dispatch():
 
     import aiter.ops.batched_gemm_op_a8w8 as bg
     import aiter.ops.opus.gemm_op_a8w8 as bmm
+    from aiter.ops.opus import _arch
+
+    namespace = (get_gfx(), get_cu_num())
 
     g, m, n, k = 2, 128, 1024, 4096
     # kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)
@@ -433,8 +437,14 @@ def _check_dispatch():
         import aiter.ops.flydsl.batched_gemm_a8w8 as fly
 
         with patch.object(
+            _arch, "_device_arch_and_cu", lambda _: namespace
+        ), patch.object(bmm, "_device_arch_and_cu", lambda _: namespace), patch.object(
             bmm, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", _spy
-        ), patch.object(fly, "run_bmm_a8w8_mxfp8", _spy_flydsl), patch.object(
+        ), patch.object(
+            fly, "bmm_a8w8_mxfp8_supported", lambda _block: True
+        ), patch.object(
+            fly, "run_bmm_a8w8_mxfp8", _spy_flydsl
+        ), patch.object(
             policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row
         ):
             try:
@@ -656,6 +666,7 @@ def test_compact_mxscale_bmm(shape, dtype):
             x.transpose(0, 1),
             w,
             y.transpose(0, 1),
+            family="a8w8_mxscale_bmm",
             kid=kid,
             layout="mxscale_bmm",
             x_scale=xs.transpose(0, 1),
@@ -754,6 +765,7 @@ def test_rejects_square_scale_shape_on_1x32_kid():
             x.transpose(0, 1),
             w,
             torch.empty_like(ref).transpose(0, 1),
+            family="a8w8_mxscale_bmm",
             kid=kid,
             layout="mxscale_bmm",
             x_scale=xs.transpose(0, 1),

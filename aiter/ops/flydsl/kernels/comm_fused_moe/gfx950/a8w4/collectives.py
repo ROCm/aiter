@@ -157,10 +157,8 @@ def compile_epoch_barrier(tp_size: int):
             .epoch.peek()
             .view(fx.make_layout(1, 1))
         )
-        if tid == fx.Int32(0):
-            expected = fx.Int64(
-                comm_ops.load_i64_global(local_base + ready_offset)
-            ) + fx.Int64(1)
+        if tid == 0:
+            expected = fx.Int64(comm_ops.load_i64_global(local_base + ready_offset)) + 1
             epoch[0] = expected
             comm_ops.fence_system_release()
             comm_ops.store_i64_global_system(local_base + ready_offset, expected)
@@ -209,13 +207,19 @@ def compile_epoch_barrier_pair(tp_size: int):
             .epochs.peek()
             .view(fx.make_layout(2, 1))
         )
-        if tid == fx.Int32(0):
-            first_expected = fx.Int64(
-                comm_ops.load_i64_global(first_local_base + first_ready_offset)
-            ) + fx.Int64(1)
-            second_expected = fx.Int64(
-                comm_ops.load_i64_global(second_local_base + second_ready_offset)
-            ) + fx.Int64(1)
+        if tid == 0:
+            first_expected = (
+                fx.Int64(
+                    comm_ops.load_i64_global(first_local_base + first_ready_offset)
+                )
+                + 1
+            )
+            second_expected = (
+                fx.Int64(
+                    comm_ops.load_i64_global(second_local_base + second_ready_offset)
+                )
+                + 1
+            )
             epochs[0] = first_expected
             epochs[1] = second_expected
             comm_ops.fence_system_release()
@@ -385,7 +389,7 @@ def decode_scaled_fp8_f32(words, scale):
 
 
 def decode_fp8_words(e8m0, packed):
-    scale = (fx.Uint32(e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
+    scale = (fx.Uint32(e8m0) << 23).bitcast(fx.Float32)
     values = []
     for word in range_constexpr(len(packed)):
         for half in range_constexpr(2):
@@ -424,7 +428,7 @@ def load_fp8_words(
 
 def load_e8m0_scale(buffer, offset, cache_modifier):
     e8m0 = load_buffer(buffer, offset, fx.Int8, cache_modifier=cache_modifier)
-    return (fx.Uint32(fx.Uint8(e8m0)) << fx.Uint32(23)).bitcast(fx.Float32)
+    return (fx.Uint32(fx.Uint8(e8m0)) << 23).bitcast(fx.Float32)
 
 
 def store_fp8_words(buffer, byte_offset, packed, store_width, cache_modifier=0):
@@ -458,7 +462,7 @@ def _reduce_tp_partial_group(
 ):
     """Load and reduce one dynamic MXFP4/MXFP8 group from every TP rank."""
 
-    acc = fx.Vector.filled(32, 0.0, fx.Float32)
+    acc = fx.full(32, 0.0, fx.Float32)
     payload_row_bytes = payload_width * partial_payload_bits // 8
     for source_round in range_constexpr(tp):
         source = (rank + local_token + fx.Int32(source_round)) % fx.Int32(tp)
@@ -711,9 +715,7 @@ def emit_tp_all_gather(
                 fx.Int8,
                 cache_modifier=load_cache_modifier,
             )
-            scale = (fx.Uint32(fx.Uint8(scale_raw)) << fx.Uint32(23)).bitcast(
-                fx.Float32
-            )
+            scale = (fx.Uint32(fx.Uint8(scale_raw)) << 23).bitcast(fx.Float32)
             values = _unpack_mxfp4_32(packed, scale).to(fx.BFloat16)
         else:
             words = load_fp8_words(

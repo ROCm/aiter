@@ -80,9 +80,7 @@ class PaDecodeEpilogue:
                 o_scale = inv_l
             else:
                 o_scale = inv_l * (self.ctx.v_scale_f * inv_fp8)
-            o_scale_b = fx.Vector.from_elements(
-                [o_scale], dtype=fx.Float32
-            ).broadcast_to(self.traits.OP_ELEMS)
+            o_scale_b = fx.full(self.traits.OP_ELEMS, o_scale, fx.Float32)
 
             for vh in range_constexpr(self.traits.VHE_CHUNKS):
                 o_slot = self.traits.o_slot(m, vh)

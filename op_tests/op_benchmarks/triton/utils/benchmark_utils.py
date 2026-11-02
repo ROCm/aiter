@@ -1,12 +1,16 @@
 import inspect
 import json
+import math
 import os
+import random
 import re
 import sys
 import tempfile
 import time
 import warnings
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
@@ -378,3 +382,259 @@ def get_dtype_bytes(dtype):
 def get_caller_name_no_ext():
     caller_file = inspect.stack()[1].filename  # full path of caller
     return Path(caller_file).stem  # filename without extension
+
+
+def run_input_generator(
+    gen: Callable[[], tuple], fields: Sequence[str]
+) -> dict[str, Any]:
+    values = gen()
+    if len(values) != len(fields):
+        raise ValueError(
+            f"{gen!r} returned {len(values)} values, "
+            f"expected {len(fields)}: {fields}"
+        )
+    return {name: val for name, val in zip(fields, values) if name != "_"}
+
+
+def generate_rotating_buffers_pool(
+    gens: Sequence[Callable],
+    out_vals_keys: Sequence[Sequence[str]],
+    target_mb: int,
+    min_pool_len: int,
+    max_pool_len: int | None = None,
+    print_info: bool = False,
+):
+    per_set_bytes = 0
+    seen_storage_ptrs = set()
+    # Keep every generator's output alive for the whole sizing loop below: once
+    # a kwargs dict is dropped, its tensors' storages can be freed and the
+    # caching allocator can hand the same address to a later gen's unrelated
+    # tensor, which would then look like an already-counted alias and get
+    # skipped. Release these extra references once sizing is done, before
+    # building the real pool.
+    keepalive = []
+    for gen, fields in zip(gens, out_vals_keys):
+        kwargs = run_input_generator(gen, fields)
+        keepalive.append(kwargs)
+        for v in kwargs.values():
+            if not isinstance(v, torch.Tensor):
+                continue
+            storage = v.untyped_storage()
+            ptr = storage.data_ptr()
+            # Aliased views (e.g. a reshape of another returned tensor) share
+            # backing storage; count it once, by its real size, not once per
+            # view, or pool sizing undercounts/overcounts the true footprint.
+            if ptr in seen_storage_ptrs:
+                continue
+            seen_storage_ptrs.add(ptr)
+            per_set_bytes += storage.nbytes()
+    del keepalive
+
+    if per_set_bytes == 0:
+        raise ValueError(
+            "per_set_bytes=0, specify gens that generate tensors with size > 0"
+        )
+
+    del kwargs, v, storage
+
+    pool_len = max(min_pool_len, math.ceil(target_mb * 1024 * 1024 / per_set_bytes))
+
+    # max_pool_len is needed in case the size of input set is small, then covering
+    # target_mb might create pool_len in order of millions. This will require
+    # do_bench_aiter_triton to capture one kernel launch per pool entry i.e. a long
+    # graph capture. So, we need to bound this.
+    if max_pool_len is not None:
+        pool_len = min(pool_len, max(max_pool_len, min_pool_len))
+
+    pool = []
+    for _ in range(pool_len):
+        entry = {}
+        for gen, fields in zip(gens, out_vals_keys):
+            entry.update(run_input_generator(gen, fields))
+        pool.append(entry)
+
+    if print_info:
+        print(
+            f"Rotating Buffers, per_set_sz(MB):{round(per_set_bytes/(1024*1024),2)}"
+            + f" target_sz(MB):{target_mb} pool_len:{pool_len}"
+        )
+    return pool
+
+
+def _rotating_buffers_fns(
+    fn: Callable, rot_bufs: list[dict[str, torch.Tensor]], n: int
+):
+    """``n`` callables that rotate through ``rot_bufs`` in a shuffled order.
+
+    The shuffle keeps a full cycle hitting every pool entry once, but not in
+    the same fixed sequential order every capture -- useful when per-set
+    sizes are small relative to the overall pool target size.
+    """
+    pool_len = len(rot_bufs)
+    order = list(range(pool_len))
+    random.Random(0).shuffle(order)
+
+    def _make_fn(idx):
+        return lambda: fn(**(rot_bufs[order[idx % pool_len]]))
+
+    return [_make_fn(i) for i in range(n)]
+
+
+def do_bench_aiter_triton(
+    fn: Callable,
+    rot_bufs: list[dict[str, torch.Tensor]],
+    warmup_iters: int,
+    kernels_per_graph: int,
+    num_replays: int,
+    warmup_replays: int,
+) -> float:
+    """Rotating-buffer CUDA graph benchmark, single process.
+
+    Captures ``max(kernels_per_graph, len(rot_bufs))`` calls to ``fn`` into
+    one CUDA graph, rotating through ``rot_bufs`` so the whole pool is
+    covered -- a CUDA graph replays the exact calls captured, so a pool
+    bigger than ``kernels_per_graph`` would otherwise leave entries unused.
+    Returns the mean per-kernel latency in ms.
+    """
+
+    # warmup
+    for _ in range(warmup_iters):
+        fn(**(rot_bufs[0]))
+    torch.cuda.synchronize()
+
+    pool_len = len(rot_bufs)
+    actual_kernels_per_graph = max(kernels_per_graph, pool_len)
+    fns = _rotating_buffers_fns(fn, rot_bufs, actual_kernels_per_graph)
+
+    # capture graph
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for f in fns[: min(3, len(fns))]:
+            f()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            for f in fns:
+                f()
+    torch.cuda.synchronize()
+
+    # warmup replays
+    for _ in range(warmup_replays):
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Timed replays
+    start_events = []
+    end_events = []
+    for _ in range(num_replays):
+        se = torch.cuda.Event(enable_timing=True)
+        ee = torch.cuda.Event(enable_timing=True)
+        se.record()
+        g.replay()
+        ee.record()
+        start_events.append(se)
+        end_events.append(ee)
+    torch.cuda.synchronize()
+
+    times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
+    per_kernel_ms = [t / actual_kernels_per_graph for t in times_ms]
+
+    ms = sum(per_kernel_ms) / len(per_kernel_ms)
+
+    return ms
+
+
+def do_bench_aiter_triton_synced(
+    fn: Callable,
+    rot_bufs: list[dict[str, torch.Tensor]],
+    warmup_iters: int,
+    kernels_per_graph: int,
+    num_replays: int,
+    warmup_replays: int,
+    dist_group,
+) -> float:
+    """Rotating-buffer CUDA graph benchmark, synced across ranks.
+
+    Use this instead of :func:`do_bench_aiter_triton` when ``fn`` performs
+    real cross-rank communication (e.g. a combine/all-to-all step), so every
+    rank's capture and replay phases line up. ``dist_group`` is a
+    ``torch.distributed`` process group; it is only a barrier at each phase
+    boundary (warmup, capture, replay) -- unlike the old
+    ``do_bench_cudagraph_synced``, no cross-rank latency estimate needs to
+    be agreed on, because ``kernels_per_graph`` is a fixed constant and is
+    therefore already identical on every rank.
+
+    Ranks may still generate differently sized rotating buffer pools (e.g.
+    differing local shapes), so growing the per-graph call count from the
+    local pool size alone would desync ranks on replay. This function agrees
+    the call count across ranks itself with one extra all-reduce before
+    capture; callers do not need to pre-align pool sizes.
+
+    The returned latency is the local rank's own measurement; callers that
+    want one number across ranks must reduce it themselves (e.g.
+    ``dist.all_reduce(..., op=MAX)``).
+    """
+    import torch.distributed as dist
+
+    def _barrier():
+        dist.barrier(group=dist_group)
+
+    # warmup
+    _barrier()
+    for _ in range(warmup_iters):
+        fn(**(rot_bufs[0]))
+    torch.cuda.synchronize()
+
+    pool_len = len(rot_bufs)
+    actual_kernels_per_graph = max(kernels_per_graph, pool_len)
+
+    # Ranks can have differently sized pools; agree on one call count so
+    # every rank captures/replays the same number of fn() calls, or
+    # collectives inside fn would desync ranks whose pools differ.
+    # Keep on the CPU: the all-reduce uses the gloo (CPU) group.
+    agreed = torch.tensor([actual_kernels_per_graph], dtype=torch.int64, device="cpu")
+    dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=dist_group)
+    actual_kernels_per_graph = int(agreed[0])
+
+    fns = _rotating_buffers_fns(fn, rot_bufs, actual_kernels_per_graph)
+
+    # capture graph
+    _barrier()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for f in fns[: min(3, len(fns))]:
+            f()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            for f in fns:
+                f()
+    torch.cuda.synchronize()
+
+    # warmup replays
+    _barrier()
+    for _ in range(warmup_replays):
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Timed replays
+    start_events = []
+    end_events = []
+    for _ in range(num_replays):
+        se = torch.cuda.Event(enable_timing=True)
+        ee = torch.cuda.Event(enable_timing=True)
+        se.record()
+        g.replay()
+        ee.record()
+        start_events.append(se)
+        end_events.append(ee)
+    torch.cuda.synchronize()
+
+    times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
+    per_kernel_ms = [t / actual_kernels_per_graph for t in times_ms]
+
+    ms = sum(per_kernel_ms) / len(per_kernel_ms)
+
+    return ms
