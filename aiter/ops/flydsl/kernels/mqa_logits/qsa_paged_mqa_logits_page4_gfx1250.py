@@ -2668,6 +2668,36 @@ _MIN_I32 = -(2**31)
 _I32_BOUNDS: dict = {}
 
 
+# ROUND-LAUNCH: the launch stream as FlyDSL's raw-pointer form.  FlyDSL's
+# ``Stream`` C-ABI fill accepts an ``int`` (raw hipStream_t) directly, and
+# ``torch._C._cuda_getCurrentRawStream(index)`` returns exactly
+# ``torch.cuda.current_stream(index).cuda_stream`` without building a
+# ``torch.cuda.Stream`` object (lazy-init check + device-index parsing + Python
+# object construction).  Same stream, same compiled specialization (FlyDSL's
+# Stream cache signature is the type only).  If ``torch.cuda.current_stream``
+# has been replaced (CPU gates, tracing tools) the replacement is honoured.
+_TORCH_CURRENT_STREAM = torch.cuda.current_stream
+_RAW_CURRENT_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _launch_stream(dev):
+    """Current stream of ``dev``: raw pointer (fast) or the patched lookup."""
+    current = torch.cuda.current_stream
+    if (current is _TORCH_CURRENT_STREAM and _RAW_CURRENT_STREAM is not None
+            and dev.type == "cuda" and dev.index is not None):
+        return _RAW_CURRENT_STREAM(dev.index)
+    return current(dev)
+
+
+def _launch_stream_ptr(dev):
+    """Raw pointer of the current stream of a CUDA ``dev`` (cache keys)."""
+    current = torch.cuda.current_stream
+    if (current is _TORCH_CURRENT_STREAM and _RAW_CURRENT_STREAM is not None
+            and dev.index is not None):
+        return _RAW_CURRENT_STREAM(dev.index)
+    return current(dev).cuda_stream
+
+
 def _i32_bounds(device, hi):
     """0-d int64 clamp bounds, created once per (device, stream, hi).
 
@@ -2675,8 +2705,7 @@ def _i32_bounds(device, hi):
     on the stream that first consumes them, so every reader is stream-ordered
     after its own creation fill; steady-state calls allocate/launch nothing here.
     """
-    stream = (torch.cuda.current_stream(device).cuda_stream
-              if device.type == "cuda" else None)
+    stream = _launch_stream_ptr(device) if device.type == "cuda" else None
     key = (device, stream, hi)
     bounds = _I32_BOUNDS.get(key)
     if bounds is None:
@@ -3043,14 +3072,20 @@ def qsa_paged_mqa_logits_page4(
         logits = torch.empty((rows, columns), dtype=torch.float32, device=dev)
     elif logits.shape != (rows, columns) or logits.dtype != torch.float32 or not logits.is_contiguous():
         raise ValueError(f"logits must be contiguous fp32 {(rows, columns)}")
+    # ROUND-LAUNCH: wrapper-allocated outputs are already 1-D contiguous, so
+    # their ``.view(-1)`` is the identity; caller tensors keep the view.
     if visible_groups is None:
-        visible_groups = torch.empty(rows, dtype=torch.int32, device=dev)
+        visible_groups = vg_flat = torch.empty(rows, dtype=torch.int32, device=dev)
     elif visible_groups.numel() != rows or visible_groups.dtype != torch.int32:
         raise ValueError(f"visible_groups must be int32 [{rows}]")
+    else:
+        vg_flat = None
     if row_starts is None:
-        row_starts = torch.empty(rows, dtype=torch.int32, device=dev)
+        row_starts = rs_flat = torch.empty(rows, dtype=torch.int32, device=dev)
     elif row_starts.numel() != rows or row_starts.dtype != torch.int32:
         raise ValueError(f"row_starts must be int32 [{rows}]")
+    else:
+        rs_flat = None
     for name, t in (("logits", logits), ("visible_groups", visible_groups),
                     ("row_starts", row_starts)):
         if t.device != dev:
@@ -3102,9 +3137,15 @@ def qsa_paged_mqa_logits_page4(
         t2r_i32 = _to_i32_saturated(token_to_request)
         qp_i32 = _to_i32_saturated(query_positions, _MAX_I32 - 1)
         cl_i32 = _to_i32_saturated(context_lens)
-    t2r_i32 = t2r_i32.contiguous().view(-1)
-    qp_i32 = qp_i32.contiguous().view(-1)
-    cl_i32 = cl_i32.contiguous().view(-1)
+    # ROUND-LAUNCH: all three are validated 1-D above, so ``.view(-1)`` is an
+    # identity view when the stride is already 1 (same ptr/shape/stride reach
+    # FlyDSL); any other stride takes the historical path verbatim.
+    if t2r_i32.stride(0) != 1:
+        t2r_i32 = t2r_i32.contiguous().view(-1)
+    if qp_i32.stride(0) != 1:
+        qp_i32 = qp_i32.contiguous().view(-1)
+    if cl_i32.stride(0) != 1:
+        cl_i32 = cl_i32.contiguous().view(-1)
 
     if divisor is None:
         divisor = math.sqrt(HEAD_DIM)
@@ -3147,7 +3188,11 @@ def qsa_paged_mqa_logits_page4(
 
     kv_u8 = compressed_k_cache.view(torch.uint8).view(num_pages, -1)
     q_u8 = q.view(torch.uint8).view(rows, -1)
-    stream = torch.cuda.current_stream(dev)
+    stream = _launch_stream(dev)
+    if vg_flat is None:
+        vg_flat = visible_groups.view(-1)
+    if rs_flat is None:
+        rs_flat = row_starts.view(-1)
     if not is_fp8 and _BF16_PATH == "wmma":
         # bf16: WMMA kernel, one workgroup = 16 rows x 64 columns (see the
         # matrix-core block above).  It writes every logit itself (-inf outside
@@ -3179,8 +3224,8 @@ def qsa_paged_mqa_logits_page4(
             qp_i32,
             cl_i32,
             logits,
-            visible_groups.view(-1),
-            row_starts.view(-1),
+            vg_flat,
+            rs_flat,
             grid_x,
             grid_y,
             rows,
@@ -3190,7 +3235,7 @@ def qsa_paged_mqa_logits_page4(
             width,
             stream,
         )
-        return logits, visible_groups.view(-1)
+        return logits, vg_flat
     if is_fp8 and _FP8_PATH == "wmma":
         # fp8 (round G): the same WMMA geometry with E4M3 -> bf16 B fragments
         # and the per-token fp32 scale applied after the GEMM.  Same planes,
@@ -3211,8 +3256,8 @@ def qsa_paged_mqa_logits_page4(
             qp_i32,
             cl_i32,
             logits,
-            visible_groups.view(-1),
-            row_starts.view(-1),
+            vg_flat,
+            rs_flat,
             grid_x,
             grid_y,
             rows,
@@ -3222,7 +3267,7 @@ def qsa_paged_mqa_logits_page4(
             width,
             stream,
         )
-        return logits, visible_groups.view(-1)
+        return logits, vg_flat
 
     threads = THREADS
     grid_x = (columns + threads - 1) // threads
@@ -3239,8 +3284,8 @@ def qsa_paged_mqa_logits_page4(
         qp_i32,
         cl_i32,
         logits,
-        visible_groups.view(-1),
-        row_starts.view(-1),
+        vg_flat,
+        rs_flat,
         grid_x,
         rows,
         columns,
@@ -3249,4 +3294,4 @@ def qsa_paged_mqa_logits_page4(
         width,
         stream,
     )
-    return logits, visible_groups.view(-1)
+    return logits, vg_flat
