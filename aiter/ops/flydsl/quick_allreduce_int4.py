@@ -37,9 +37,10 @@ from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # The sum is restored in fp16 before the bf16 store, by scaling each group's
-# dequant scale (at least 2**-10) by the divisor; restored values reach
-# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
-# 480 * divisor < 65504.
+# dequant scale by the divisor. The bounds were derived for the E4M3 group
+# scale (dequant step >= 2**-10, max 480). The group scale is now E5M2 (bias
+# 12, [2**-12, 1.75 * 2**19]), which covers every fp16 extremum at divisor 1,
+# so the divisor is only an opt-in and the original bounds are kept.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
