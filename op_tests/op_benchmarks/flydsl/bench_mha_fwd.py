@@ -93,11 +93,15 @@ def _verify_dispatch(layout):
 
     # fmha_kernels imports the entries under aliases, and there are two families now
     # (a16w16 and the 8-bit a8w8 sibling), so watch whichever one this dtype routes to.
-    suffix = "varlen" if layout == "thd" else "batch"
-    names = [
-        f"flash_attn_{suffix}_a16w16_gfx1250",
-        f"flash_attn_{suffix}_a8w8_gfx1250",
-    ]
+    # paged has no a8w8 sibling yet, so only the a16w16 entry exists for it
+    if layout == "paged":
+        names = ["flash_attn_paged_a16w16_gfx1250"]
+    else:
+        suffix = "varlen" if layout == "thd" else "batch"
+        names = [
+            f"flash_attn_{suffix}_a16w16_gfx1250",
+            f"flash_attn_{suffix}_a8w8_gfx1250",
+        ]
     origs = {n: getattr(fk, n) for n in names}
     calls = {"n": 0}
 
@@ -265,8 +269,49 @@ def run_perf(case, warmup, repeat, fix_init=None):
                 sink_ptr=sink_t,
             )
 
+    elif layout == "paged":
+        from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
+
+        page = case["page"]
+        pages_per_seq = (sk + page - 1) // page
+        num_blocks = pages_per_seq * B + 8
+        q = _randn((B * sq, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((num_blocks, page, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((num_blocks, page, Hkv, d_v), dtype, device, fix_init)
+        # permuted, so a kernel that assumes sequential pages shows up here
+        page_ids = torch.randperm(num_blocks, device=device).int()[
+            : pages_per_seq * B
+        ].contiguous()
+        cu_q = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=device)
+        kv_indptr = torch.arange(
+            0, (B + 1) * pages_per_seq, pages_per_seq, dtype=torch.int32, device=device
+        )
+        last_lens = torch.full(
+            (B,), sk - (pages_per_seq - 1) * page, dtype=torch.int32, device=device
+        )
+
+        def _run():
+            return flydsl_flash_attn_paged_fwd(
+                q,
+                k,
+                v,
+                cu_q,
+                kv_indptr,
+                page_ids,
+                kv_last_page_lens=last_lens,
+                max_seqlen_q=sq,
+                max_seqlen_k=sk,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window,
+                return_lse=lse,
+                sink=sink_t,
+            )
+
     else:
-        raise ValueError(f"unknown layout {layout!r} (expected 'thd' or 'bshd')")
+        raise ValueError(
+            f"unknown layout {layout!r} (expected 'thd', 'bshd' or 'paged')"
+        )
 
     with _verify_dispatch(layout):
         avg_ms = _time_fn(_run, warmup, repeat)
@@ -280,9 +325,11 @@ def run_perf(case, warmup, repeat, fix_init=None):
     tflops = _tflops(flop, avg_ms)
     tbps = _tbps(nbytes, avg_ms)
 
+    _page = case.get("page")
     tag = (
         f"{layout} B={B} H={Hq}/{Hkv} d={d_qk}/{d_v} sq={sq} sk={sk} "
         f"causal={causal} lse={lse} window={window} sink={sink}"
+        + (f" page={_page}" if _page else "")
     )
     print(
         f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  "
@@ -300,6 +347,7 @@ def run_perf(case, warmup, repeat, fix_init=None):
         "sq": sq,
         "sk": sk,
         "dtype": dtype_name,
+        "page": case.get("page", ""),
         "causal": causal,
         "lse": lse,
         "window": str(window),
@@ -508,6 +556,28 @@ CASES = [
 # standing perf reference). Only the matched bf8+bf8 pair is listed; other dtypes
 # stay opt-in through -d.
 CASES += [dict(_c, dtype="bf8") for _c in CASES]
+
+# Paged KV, appended last so every id above keeps its number. a16w16 only (the gather
+# loader has no 8-bit sibling) and pow2 hdim only (192 would split K into two gather
+# segments against a single-segment V, so the halves disagree on tensorcnt).
+_PAGED_BASE = [
+    {"layout": "paged", "B": 1, "sq": 4096, "sk": 4096, "Hq": 8, "Hkv": 8,
+     "causal": True, "desc": "4k causal, single batch"},
+    {"layout": "paged", "B": 4, "sq": 4096, "sk": 4096, "Hq": 8, "Hkv": 8,
+     "causal": True, "desc": "4k causal, multi-batch (paged analogue of case 10)"},
+    {"layout": "paged", "B": 4, "sq": 4096, "sk": 4096, "Hq": 16, "Hkv": 2,
+     "causal": True, "desc": "4k causal, GQA 8x"},
+    {"layout": "paged", "B": 1, "sq": 897, "sk": 4097, "Hq": 8, "Hkv": 8,
+     "causal": True, "desc": "odd sq!=sk, causal (chunked-prefill-like)"},
+    {"layout": "paged", "B": 2, "sq": 2048, "sk": 2048, "Hq": 8, "Hkv": 8,
+     "causal": False, "desc": "2k non-causal"},
+]
+CASES += [
+    dict(_c, d_qk=_d, d_v=_d, page=_p)
+    for _p in (1, 16, 1024)
+    for _d in (128, 64)
+    for _c in _PAGED_BASE
+]
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
 
