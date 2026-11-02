@@ -464,7 +464,7 @@ parser.add_argument(
     default=[False],
     help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
     --b_preshuffle True). Odd M is padded to M+1 rows for A only.
-    Sweeps like --b_preshuffle.
+    Sweeps like --b_preshuffle; group32 CSV rows have no such candidate and are skipped.
     e.g.: --apre True
         or --apre True False""",
 )
@@ -576,6 +576,12 @@ if args.csv is not None or default_csv:
         shapes_df = shapes_df[shapes_df["use_flydsl"]]
     if default_csv and args.b_preshuffle is not None:
         shapes_df = shapes_df[shapes_df["b_preshuffle"].isin(args.b_preshuffle)]
+    if get_gfx() != "gfx950":
+        # Without B preshuffle, group32 runs through Triton, which needs gfx950.
+        shapes_df = shapes_df[
+            shapes_df["b_preshuffle"].ne(False)
+            | (shapes_df["w_scale_block"] == "128x128")
+        ]
     if shapes_df.empty:
         print("No matching CSV rows, nothing to run")
         sys.exit(0)
@@ -588,11 +594,16 @@ else:
             sys.exit(0)
         if args.b_preshuffle is None:
             l_preshuffle = [True]
+        if get_gfx() != "gfx950":
+            l_preshuffle = [p for p in l_preshuffle if p]
+        if not l_preshuffle:
+            print(f"Skipping group32 without B preshuffle: unsupported on {get_gfx()}")
+            sys.exit(0)
 
 for w_scale_block in set(scale_blocks):
     if w_scale_block not in SCALE_BLOCK_SHAPES:
         parser.error(f"unsupported w_scale_block {w_scale_block!r}")
-    if w_scale_block != "128x128" and any(l_apre):
+    if args.w_scale_block and w_scale_block != "128x128" and any(l_apre):
         parser.error("Group32 scales do not support --apre True")
 
 if args.csv is not None or default_csv:
@@ -606,6 +617,8 @@ if args.csv is not None or default_csv:
             for preshuffle in preshuffles:
                 for data_init, scale_init in init_pairs:
                     for apre in l_apre:
+                        if apre and row["w_scale_block"] != "128x128":
+                            continue  # group32 has no A-preshuffle candidate
                         ret = test_gemm(
                             dtype,
                             int(row["M"]),
