@@ -25,6 +25,9 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_flatten_mxfp8_quant,
     fused_rms_mxfp8_quant,
 )
+from aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4 import (
+    fused_quant_transpose_hadamard_mxfp4,
+)
 from aiter.ops.triton.quant.quant import (
     _mxfp4_quant_op,
     _mxfp8_quant_op,
@@ -74,6 +77,7 @@ __all__ = [
     "fused_flatten_fp8_group_quant",
     "fused_flatten_mxfp4_quant",
     "fused_flatten_mxfp8_quant",
+    "fused_quant_transpose_hadamard_mxfp4",
     "fused_reduce_act_mul_and_mxfp4_quant",
     "fused_reduce_act_mul_fp8_group_quant",
     "fused_reduce_rms_fp8_group_quant",
