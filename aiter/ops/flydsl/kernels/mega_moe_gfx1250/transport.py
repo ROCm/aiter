@@ -116,6 +116,11 @@ class _EpDispatcher:
         if self._closed:
             return
         self._closed = True
+        if self.decode_mega is not None:
+            try:
+                self.decode_mega.report()
+            except Exception:  # noqa: BLE001 - diagnostics only
+                pass
         try:
             # A launch still in flight (a graph replay, say) reads the window:
             # let it finish before anything it reads is freed.
