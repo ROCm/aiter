@@ -8,7 +8,7 @@ from aiter.ops.triton.fusions.fused_nhwc_to_nchw_add import fused_nhwc_to_nchw_a
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # Archs with a FUSED_NHWC_TO_NCHW_ADD config.
-SUPPORTED_ARCHS = ("gfx1150", "gfx1151")
+SUPPORTED_ARCHS = ("gfx1150", "gfx1151", "gfx1201")
 
 
 def torch_nhwc_to_nchw_add(x, residual, height, width):
