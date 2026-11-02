@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host side of the gfx1250 stage-1 kernel (``AITER_MEGA_S1F=1``).
+"""Host side of the gfx1250 stage-1 kernel (on by default, ``AITER_MEGA_S1F=0``
+turns it off).
 
-The compact dispatch owns one ``_Stage1Fusion``. When the env switch is on and
-the shape fits, the compact plan emits the run table the kernel gathers from,
-and GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1
-as separate launches.
+The compact dispatch owns one ``_Stage1Fusion``. When the switch is on and the
+shape fits, the compact plan emits the run table the kernel gathers from, and
+GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1 as
+separate launches.
 """
 
 from __future__ import annotations
@@ -63,26 +64,39 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 # waits out dispatch first. At or below this token count the next layer's plan
 # starts before dispatch returns and overlaps both.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
-#: AITER_S1F_MAX_RECV=N: a step whose receive bound exceeds N runs the whole
-#: S1F=0 path (see _Stage1Fusion.step_off), e.g. to fuse decode only. 0/unset =
-#: no limit.
-_S1F_MAX_RECV = int(os.environ.get("AITER_S1F_MAX_RECV", "0").strip() or "0")
-#: AITER_S1F_ANY_TILE=1: fuse whenever the tuned GEMM1's tile_m matches; the
-#: stage-1 kernel then runs its own 256x256 n/k tiles instead of the tuned
-#: GEMM1's (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
-_S1F_ANY_TILE = os.environ.get("AITER_S1F_ANY_TILE", "0") == "1"
+# The S1F defaults below (and S1F_BLOCK_RUNS in s1f_stage1.py, the compact
+# route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
+# Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off. Each env var only
+# overrides its default.
+#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
+#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
+#: AITER_S1F_MAX_RECV=N overrides it; 0 means no limit.
+_S1F_MAX_RECV_DEFAULT = 4096
+_S1F_MAX_RECV = int(
+    os.environ.get("AITER_S1F_MAX_RECV", "").strip() or _S1F_MAX_RECV_DEFAULT
+)
+#: Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel then runs
+#: its own 256x256 n/k tiles instead of the tuned GEMM1's (e.g. tpr 480's
+#: t64x256x128 GEMM1 can fuse). AITER_S1F_ANY_TILE=0 requires tile_m, tile_n
+#: and tile_k to all match.
+_S1F_ANY_TILE = os.environ.get("AITER_S1F_ANY_TILE", "").strip() != "0"
+
+
+def _s1f_env() -> str:
+    mode = os.environ.get("AITER_MEGA_S1F", "").strip()
+    if mode not in ("", "0", "1"):
+        raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
+    return mode
 
 
 def read_s1f_mode() -> bool:
-    """``AITER_MEGA_S1F=1``: dispatch and GEMM1 as one persistent stage-1 kernel.
+    """Dispatch and GEMM1 as one persistent stage-1 kernel; on by default.
 
-    Compact flydsl path on the fp4 wire only. Unset (or 0) keeps dispatch and
-    GEMM1 as separate launches.
+    Compact flydsl path on the fp4 wire only: a config or step that does not
+    fit keeps dispatch and GEMM1 as separate launches. ``AITER_MEGA_S1F=0``
+    turns it off.
     """
-    mode = os.environ.get("AITER_MEGA_S1F", "0").strip() or "0"
-    if mode not in ("0", "1"):
-        raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
-    return mode == "1"
+    return _s1f_env() != "0"
 
 
 def _s1f_cu_num() -> int:
@@ -97,9 +111,9 @@ def _fallback_warn(owner, reasons) -> None:
     if not reasons or getattr(owner, "_warned", False):
         return
     owner._warned = True
-    _log.warning(
-        "AITER_MEGA_S1F=1 falls back to dispatch + GEMM1: %s", "; ".join(reasons)
-    )
+    # S1F is on by default, so only an explicit AITER_MEGA_S1F=1 warns.
+    log = _log.warning if _s1f_env() == "1" else _log.info
+    log("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
 
 
 def tile_flag_nbytes(*, compact_rows: int, world_size: int) -> int:

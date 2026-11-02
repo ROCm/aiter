@@ -13,7 +13,12 @@ from aiter import dtypes, logger
 
 from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
-from ..config import _DISPATCH_COMPACT, _WAVE_SIZE
+from ..config import (
+    _COMPACT_ROUTE_SPEC,
+    _COMPACT_ROUTE_UPTO,
+    _DISPATCH_COMPACT,
+    _WAVE_SIZE,
+)
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..s1f_ctl import (
@@ -205,30 +210,35 @@ class _CompactDispatch(_Dispatch):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
-        # Optional overrides (unset = the default schedule):
+        # Overrides (see _COMPACT_ROUTE_UPTO for the default):
         #  AITER_TDM_COMPACT_ROUTE_PARALLEL=0|1 picks the walk for the
         #    BLOCKS/WARPS override (else token-major).
         #  AITER_TDM_COMPACT_ROUTE_UPTO=N keeps the route-parallel walk up to
-        #    N tokens/rank with AITER_TDM_COMPACT_ROUTE_SPEC=B,W blocks/warps
-        #    (DSV4.1-Flash DEP4 c512: 1024 and 384,16).
+        #    N tokens/rank with AITER_TDM_COMPACT_ROUTE_SPEC=B,W blocks/warps;
+        #    N=0 runs _DISPATCH_COMPACT unchanged.
         route_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_PARALLEL")
-        upto_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_UPTO")
+        upto = int(
+            os.environ.get("AITER_TDM_COMPACT_ROUTE_UPTO", "").strip()
+            or _COMPACT_ROUTE_UPTO
+        )
         if blocks_env is not None or warps_env is not None:
             spec = (None, int(blocks_env or "64"), int(warps_env or "8"))
             if route_env is not None:
                 spec = spec + (route_env == "1",)
             schedule = (spec,)
-        elif upto_env is not None:
+        elif upto > 0:
+            spec_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_SPEC", "").strip()
             rb, rw = (
-                int(v)
-                for v in os.environ.get("AITER_TDM_COMPACT_ROUTE_SPEC", "192,16").split(
-                    ","
-                )
+                tuple(int(v) for v in spec_env.split(","))
+                if spec_env
+                else _COMPACT_ROUTE_SPEC
             )
-            upto = int(upto_env)
-            schedule = tuple(
-                e for e in _DISPATCH_COMPACT if e[0] is not None and e[0] < 512
-            ) + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
+            head = tuple(
+                e
+                for e in _DISPATCH_COMPACT
+                if e[0] is not None and e[0] < min(upto, 512)
+            )
+            schedule = head + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
         else:
             schedule = _DISPATCH_COMPACT
         super().__init__(config, schedule)
@@ -685,12 +695,12 @@ class _CompactDispatch(_Dispatch):
     def _precompile_s1f_plans(self) -> None:
         """Compile every stage-1 plan variant before serving.
 
-        With ``AITER_MEGA_S1F=1`` the plan is keyed by (align_m, slot, waves,
+        With S1F on (the default) the plan is keyed by (align_m, slot, waves,
         blocks, tok_map, fused quant), and waves/blocks follow the step's token
         count, so eager steps (prefill, or any width the warmup never ran)
         reached the JIT inside the serving loop (the first ~100 s of a c512
         run had 250-470 ms prefill steps). This walks every recv bound a
-        fused step can have (<= AITER_S1F_MAX_RECV, else the arena's), takes
+        fused step can have (<= the S1F max recv, 4096 by default), takes
         the alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
         ``AITER_S1F_PRECOMPILE=0`` skips it.

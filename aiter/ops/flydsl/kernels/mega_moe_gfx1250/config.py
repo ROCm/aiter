@@ -58,6 +58,14 @@ _DISPATCH_COMPACT = (
     (512, 192, 16, True),
     (None, 192, 16, True),
 )
+# Default override of the schedule above: up to this many tokens per rank, the
+# steps past 256 walk routes with (block, warp) = _COMPACT_ROUTE_SPEC; above it
+# the tail entry applies. From DSV4.1-Flash DEP4 on MI455X, MLPerf Endpoints
+# agentic c512 (with the S1F defaults in s1f_ctl.py). Env overrides:
+# AITER_TDM_COMPACT_ROUTE_UPTO=N (0 keeps _DISPATCH_COMPACT as is) and
+# AITER_TDM_COMPACT_ROUTE_SPEC=B,W.
+_COMPACT_ROUTE_UPTO = 1024
+_COMPACT_ROUTE_SPEC = (384, 16)
 
 _DISPATCH_TDM_SCHEDULES = {
     (4, 7168, 8): _DISPATCH_EP4_TDM,
