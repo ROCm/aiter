@@ -343,7 +343,9 @@ def kernel_fits_shape(
     # mxfp8_32 32x32 weight scale (launch_gemm_a8w8's k_tail).
     if K % (ki.split_k * ki.tile_k) != 0 and (ki.split_k != 1 or not w_scale_32x32):
         return False
-    if _ceil_div(K // ki.split_k, ki.tile_k) < ki.num_buffers:
+    # Generic K=128 with two buffers needs no steady-loop iteration.
+    min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
+    if _ceil_div(K // ki.split_k, ki.tile_k) < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).

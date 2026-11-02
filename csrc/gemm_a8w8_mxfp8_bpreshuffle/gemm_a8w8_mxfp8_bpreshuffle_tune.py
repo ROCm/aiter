@@ -32,7 +32,8 @@ runner (``flydsl_mxfp8_128_...``; ``flydsl_mxfp8_32_...`` on the raw [N/32, K/32
 w_scale; the row's w_scale_block names the block, as for gfx950 and the batched
 table). 32x32 searches wmma_common.tuning_kernels, a per-shape space wider than
 kernels_list (tile_n follows N, more tile_m / warp / cluster choices, split-K of
-the compute kernel always fused); 128x128 keeps kernels_list.
+the compute kernel always fused), and its kernelId is "mxfp8"; 128x128 times the
+row-major-A kernels of kernels_list, and a row's kernelId is the kernel's id there.
 """
 
 from typing import Any, ClassVar
@@ -373,7 +374,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         gfx = self.get_gfx()
         if gfx not in ("gfx950", "gfx1250"):
             logger.warning(
-                f"gemm_a8w8_mxfp8_bpreshuffle tuner covers gfx950 / gfx1250 only, got {gfx}"
+                f"gemm_a8w8_mxfp8_bpreshuffle tuner covers gfx950 and gfx1250, got {gfx}"
             )
             return []
         cu_num = self.get_cu_num()
@@ -489,7 +490,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif getattr(self, "_mxscale_table", False):
+            elif getattr(self, "_mxscale_table", False) and (
+                keys[0] == "gfx950" or keys[-1] == "32x32"
+            ):
+                # gfx1250 128x128 rows keep their kernels_list id, as the table's do.
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
                     if kernelId >= KERNEL_ID_BASE_BMM

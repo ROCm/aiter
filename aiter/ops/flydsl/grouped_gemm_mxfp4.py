@@ -10,7 +10,7 @@ import os
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import _run_compiled, ptr_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
@@ -177,6 +177,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    m_align=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -208,7 +209,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = current_stream_arg()
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
@@ -311,6 +312,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers,
         rolled_drain,
         int(a_preshuffled),
+        int(m_align),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
