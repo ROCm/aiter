@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Correctness + performance test for gfx942 packed-varlen hd192 split-KV FMHA.
 
-Public API:  aiter.flash_attn_varlen_func  (the path vLLM / the ticket calls)
+Public API:  aiter.flash_attn_varlen_func
 Ops layer:   aiter.ops.mha.fmha_v3_varlen_fwd  (num_splits last; default 0)
 
 Built to the aiter op-test standard (see .claude/skills/aiter-op-test).
 
-num_splits (asm_mha_varlen_fwd.cu): 0 = auto, 1 = unsplit production kernel,
+num_splits (asm_mha_varlen_fwd.cu): 0 = auto, 1 = unsplit kernel,
 2-8 = forced split-KV.  Auto uses split-3 when the kernel contract matches,
 Sk >= 8192, and Q_tiles * heads <= 2 * CU.
 
-q/k/v are packed THD, batch 1, BF16, D_QK=192 / D_V=128, non-causal — the
-layout the model uses for this kernel. Split-KV also requires dense packed
-cu_seqlens_q = [0, q.size(0)] and cu_seqlens_k = [0, k.size(0)]; anything
-else stays on the unsplit kernel (or raises when num_splits is forced).
+q/k/v are packed THD, batch 1, BF16, D_QK=192 / D_V=128, non-causal.
+Split-KV also requires dense packed cu_seqlens_q = [0, q.size(0)] and
+cu_seqlens_k = [0, k.size(0)]; anything else stays on the unsplit kernel
+(or raises when num_splits is forced).
 """
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
@@ -42,13 +42,14 @@ HD_QK = 192
 HD_V = 128
 KV_TILE = 32
 
-# (sq, sk, hq) — packed batch-1.  Ticket shape is last.
+# (sq, sk, hq) — packed batch-1. Long-K target is last.
 _SHAPES = [
     (129, 511, 4),  # Q/KV tile tails
     (129, 2048, 4),  # split-count coverage
     (4096, 8191, 12),  # last length that stays unsplit
     (4096, 8192, 12),  # first auto split-3
-    (4096, 42700, 12),  # Kimi-K3 packed-varlen ticket
+    (8192, 8192, 12),  # auto stays unsplit: q_wgs > 2 * CU on MI325X
+    (4096, 42700, 12),  # long-context packed-varlen target
 ]
 
 # Shapes that already timed unsplit/public in this process (one pass per shape).
@@ -448,7 +449,7 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=_SHAPES,
-        help="shape(s) as sq,sk,hq (default: tails, auto-select bounds, ticket)",
+        help="shape(s) as sq,sk,hq (default: tails, auto-select bounds, long-K)",
     )
     parser.add_argument(
         "-ns",

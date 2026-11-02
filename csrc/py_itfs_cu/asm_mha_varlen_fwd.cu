@@ -491,17 +491,17 @@ fmha_v3_varlen_fwd(at::Tensor &q,      // [total_q, hq, d]
     // cu_seqlens_q = [0, q.size(0)] and cu_seqlens_k = [0, k.size(0)]. Any
     // other shape stays on the unsplit kernel (or TORCH_CHECKs when forced).
     const bool splitkv_compatible =
-        get_gpu_arch() == "gfx942" &&
-        q_dtype == torch::kBFloat16 && !is_mi308_device() &&
-        batch_size == 1 && max_seqlen_q == total_q && max_seqlen_k == k.size(0) &&
-        num_heads == num_heads_k &&
         head_size_q == 192 && head_size_v == 128 &&
+        q_dtype == torch::kBFloat16 && batch_size == 1 &&
+        max_seqlen_q == total_q && max_seqlen_k == k.size(0) &&
+        num_heads == num_heads_k &&
         !is_causal && window_size_left == -1 && window_size_right == -1 &&
         p_dropout == 0.0f && logits_soft_cap == 0.0f &&
         bias_type == bias_enum::no_bias && !paged_KV &&
         !q_descale_.has_value() && !return_dropout_randval &&
         !cu_seqlens_q_padded.has_value() && !cu_seqlens_k_padded.has_value() &&
-        how_v3_bf16_cvt == 1;
+        how_v3_bf16_cvt == 1 &&
+        get_gpu_arch() == "gfx942" && !is_mi308_device();
     TORCH_CHECK(!split_forced || splitkv_compatible,
                 "forced gfx942 hd192 split-KV request is incompatible with this input");
     num_splits = select_hd192_splitkv_num_splits(
