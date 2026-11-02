@@ -45,6 +45,7 @@ from typing_extensions import Self
 
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
+from ..tensor_shim import _run_compiled
 from .layout import (
     MAX_FUSED_TOKENS_PER_RANK,
     Stage1ArenaLayout,
@@ -593,9 +594,10 @@ class MegaMoEInternode:
         self._check_routing(x_bf16, wts, topk_ids)
         launch_stream = self._fx_stream(stream)
         # One launch quantizes x and packs it with ids/weights into the records.
-        self._record_quant(
+        _run_compiled(
+            self._record_quant,
             x_bf16.data_ptr(), topk_ids.data_ptr(), wts.data_ptr(), self._rec_q.data_ptr(),
-            self.mtpr, self._quant_grid, stream=launch_stream,
+            self.mtpr, self._quant_grid, launch_stream,
         )
         return self._run(wts, topk_ids, launch_stream, slice_output)
 
@@ -649,12 +651,13 @@ class MegaMoEInternode:
         window = runtime.window
         # x comes from the records; stage1 reads routing from the caller's
         # contiguous tensors.
-        self._stage1(
+        _run_compiled(
+            self._stage1,
             runtime.dev_comm.ptr, window.handle, window.local_ptr,
             self._rec_q.data_ptr(), self._rec_scale.data_ptr(),
             wts.data_ptr(), topk_ids.data_ptr(),
             self._w1.data_ptr(), self._w1_scale.data_ptr(), self.mtpr,
-            stream=stream,
+            stream,
         )
         run_mega_moe_stage2(**self._k1_ptrs, stream=stream, **self._k1_compile)
         run_stage2_node_combine(

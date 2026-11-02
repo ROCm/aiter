@@ -89,7 +89,7 @@ def _scalar_store(tiles, idx, value, numeric_cls):
     reg_lay = fx.make_layout(1, 1)
     r = fx.make_rmem_tensor(reg_lay, numeric_cls)
     r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
-    fx.copy_atom_call(atom, r, fx.slice(tiles, (None, idx)))
+    fx.copy(atom, r, fx.slice(tiles, (None, idx)))
 
 
 def _layout_idx(layout, *coords):
@@ -385,9 +385,7 @@ def _gemm1_body_sc2(
 
     def _lds_i32x4_load(tile_idx):
         r = fx.make_rmem_tensor(i32x4_reg_lay, fx.Int32)
-        fx.copy_atom_call(
-            i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r
-        )
+        fx.copy(i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r)
         return r.load()
 
     def issue_a_ds_read(slot):
@@ -574,7 +572,7 @@ def _gemm1_body_sc2(
     def _wait_lds_barrier(vmcnt):
         # 同 mega_moe/gemm_util.wait_lds_barrier:lgkmcnt(0) 等本 wave 的 ds_read 读完,
         # vmcnt(N) 等本步开头发出的 A DMA 落地(之后发的 N 条 B 预取继续飞),再 barrier。
-        rocdl.s_waitcnt((vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4))
+        fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=0)
         rocdl.s_barrier()
 
     # MegaMoEv2 do_tile 的同步写法(每步末尾一把 wait_lds_barrier),A 三级、DMA 提前两步:
@@ -668,11 +666,11 @@ def _gemm1_body_sc2(
     def acc_store(idx, value):
         r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
         r.store(fx.Vector.from_elements([fx.Float32(value)], fx.Float32))
-        fx.copy_atom_call(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
+        fx.copy(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
 
     def acc_load(idx):
         r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
-        fx.copy_atom_call(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
+        fx.copy(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
         return r.load()[0]
 
     for i in range_constexpr(kMChunks):

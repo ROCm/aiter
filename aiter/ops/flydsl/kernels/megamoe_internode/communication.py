@@ -35,7 +35,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _mlir_rocdl
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith
 
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
@@ -77,9 +76,8 @@ __all__ = [
 
 
 def _to_ptr_global(value):
-    return _llvm_d.IntToPtrOp(
-        _llvm_d.PointerType.get(address_space=1), arith.unwrap(value)
-    ).result
+    ptr_ty = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(value)))
 
 
 def load_i32_global_system(addr_i64):
@@ -177,7 +175,7 @@ def store_i64_global_relaxed(addr_i64, value):
     """Store a diagnostic timestamp without adding a system fence."""
 
     _llvm_d.StoreOp(
-        arith.unwrap(value),
+        value.ir_value(),
         _to_ptr_global(addr_i64),
         alignment=8,
     )
@@ -195,7 +193,7 @@ def store_i64_global_system_relaxed(addr_i64, value):
     the writeback.  The caller owns the ordering.
     """
     _llvm_d.StoreOp(
-        arith.unwrap(value),
+        value.ir_value(),
         _to_ptr_global(addr_i64),
         alignment=8,
         ordering=_llvm_d.AtomicOrdering.monotonic,
@@ -208,7 +206,7 @@ def atomic_add_system_acq_rel(addr_i64, value):
     return _llvm_d.AtomicRMWOp(
         _llvm_d.AtomicBinOp.add,
         _to_ptr_global(addr_i64),
-        arith.unwrap(value),
+        value.ir_value(),
         _llvm_d.AtomicOrdering.acq_rel,
         syncscope="one-as",
     ).res
@@ -220,7 +218,7 @@ def atomic_add_agent_acq_rel(addr_i64, value):
     return _llvm_d.AtomicRMWOp(
         _llvm_d.AtomicBinOp.add,
         _to_ptr_global(addr_i64),
-        arith.unwrap(value),
+        value.ir_value(),
         _llvm_d.AtomicOrdering.acq_rel,
         syncscope=fx.rocdl.SyncScope.Agent,
     ).res

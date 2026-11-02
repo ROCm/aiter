@@ -220,7 +220,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     # p2p_scatter_epilog is a plain Python function -- the AST rewriter
     # never sees its `if`s -- so the dynamic branches live in a nested
     # @flyc.jit, the same reason everything else here uses .select().
-    rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     for row_iter in range_constexpr(BM // 4):
         row = wave + fx.Int32(row_iter * 4)
         p = fx.ptr_load(
@@ -1043,7 +1043,7 @@ def compile_stage2_node_combine(
               # acq_rel 能看见其它 9 个 CTA 在各自 s_waitcnt(0) 之后的 release,
               # 也就保证了那 10 份 WQE 都已经写好。
               # --- 每 CTA 每 chunk 一次:这里才是排空点 ---
-              rocdl.s_waitcnt(0)
+              fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
               gpu.barrier()
               cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
               if wave == fx.Int32(0):
@@ -1086,7 +1086,7 @@ def compile_stage2_node_combine(
                               + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
                               fx.Int64(ck_tok) * fx.Int64(RECORD_BYTES),
                               aggregate=True)
-                          rocdl.s_waitcnt(0)
+                          fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                           if lane == fx.Int32(0):
                               comm.atomic_add_agent(
                                   arg_scratch
@@ -1216,7 +1216,7 @@ def compile_stage2_node_combine(
           # 每 CTA 每 chunk 一次。FINAL_DONE 是**本 GPU 内**的计数(CTA0 在
           # 收尾里读它),所以增量走 agent scope 就够 —— 系统可见性只在把信用
           # 发给对端那一刻才需要,那里本来就有一次 release。
-          rocdl.s_waitcnt(0)
+          fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
           gpu.barrier()
           if tx == fx.Int32(0):
               prev = fx.Int32(comm.atomic_add_agent_acq_rel(
@@ -1228,7 +1228,7 @@ def compile_stage2_node_combine(
                   comm.atomic_add_system_acq_rel(
                       arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4),
                       ck_tok)
-        rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         gpu.barrier()
 
 
