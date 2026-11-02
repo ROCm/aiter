@@ -29,6 +29,11 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 # Largest TDM pad interval the gfx1250 descriptor can encode for 1-byte
 # elements: log2(interval/4) - 1 must fit 3 bits, so interval <= 1024 B.
 _TDM_MAX_PAD_INTERVAL_BYTES = 1024
+# Callers that do not fuse the output quant omit arg_scale_out. A None default
+# is not a JitArgument, so AOT cannot derive a cache signature for those
+# kernels. This null pointer is only a signature placeholder; the bf16 path
+# launches with arg_c and never loads it.
+_NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
 
 
 @flyc.jit
@@ -64,7 +69,7 @@ def launch_gemm_a8w8(
     a_scale_preshuffled: Constexpr[bool] = False,
     b_scale_32x32: Constexpr[bool] = False,
     k_tail: Constexpr[bool] = False,
-    arg_scale_out: fx.Pointer = None,
+    arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
@@ -1040,7 +1045,7 @@ def launch_gemm_a8w8(
         stride_ascale_k,
         i32_lda,
         i32_ldc,
-        arg_scale_out if arg_scale_out is not None else arg_c,
+        arg_scale_out if fuse_quant_out else arg_c,
         value_attrs={
             "rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None
         },
