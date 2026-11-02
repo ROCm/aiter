@@ -2333,6 +2333,222 @@ def build_moe_token_multidest_quant_module(
     return launch_token_multidest
 
 
+def _emit_prequant_copy_multidest(c: SimpleNamespace) -> None:
+    """Load one prequantized row and its e8m0 row once, store them to every mapped row.
+
+    ``c.rows`` holds the token's ``topk`` grouped rows (scalar); a negative row is
+    a non-local or dropped route and gets no store.
+    """
+    i32 = c.i32
+    c0 = fx.Int32(0)
+    c4 = fx.Int32(4)
+    c16 = fx.Int32(16)
+    lane = c.lane
+    payload_bytes_per_row = c.payload_bytes_per_row
+    src_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        c.hidden_base + fx.Uint64(c.token) * payload_bytes_per_row,
+        num_records_bytes=payload_bytes_per_row,
+    )
+    src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        c.src_scale_base + fx.Uint64(c.token) * c.src_scale_bytes_per_row,
+        num_records_bytes=c.src_scale_bytes_per_row,
+    )
+    n_iter = (payload_bytes_per_row // 16 + 31) // 32
+    n_scale_dwords = c.mx_blocks_per_row // 4
+    c_n_scale_dwords = fx.Int32(n_scale_dwords)
+    n_sc_iter = (n_scale_dwords + 31) // 32
+
+    payload_chunks = []
+    for it in range_constexpr(n_iter):
+        chunk_idx = fx.Int32(it * 32) + lane
+        v = buffer_ops.buffer_load(
+            src_rsrc,
+            chunk_idx * c4,
+            vec_width=4,
+            dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
+        payload_chunks.append((chunk_idx, v))
+    scale_chunks = []
+    for it in range_constexpr(n_sc_iter):
+        g = fx.Int32(it * 32) + lane
+        src_dword = buffer_ops.buffer_load(
+            src_scale_rsrc,
+            g,
+            vec_width=1,
+            dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
+        scale_chunks.append((g, src_dword))
+
+    for row_raw in c.rows:
+
+        def _store_dest(row_raw=row_raw):
+            row = fx.Uint32(row_raw)
+            dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                c.payload_base + fx.Uint64(row) * payload_bytes_per_row,
+                num_records_bytes=payload_bytes_per_row,
+            )
+            for chunk_idx, v in payload_chunks:
+                buffer_ops.buffer_store(
+                    v,
+                    dst_rsrc,
+                    chunk_idx * c16,
+                    offset_is_bytes=True,
+                    cache_modifier=_PREQUANT_NT_STORE,
+                )
+            if const_expr(c.row_major_scale):
+                scale_base = fx.Int32(row) * c_n_scale_dwords
+                scale_stride = fx.Int32(1)
+            else:
+                scale_base = _token_multidest_scale_base(
+                    row, c.c_rows_per_tile, c.c_dst_scale_dwords_per_row, c16
+                )
+                scale_stride = fx.Int32(c.wmma_rep * 16)
+            for g, src_dword in scale_chunks:
+                dst_dword_idx = scale_base + g * scale_stride
+
+                def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
+                    c.scale_t_i32[dst_dword_idx] = fx.Int32(src_dword)
+
+                # Tail-lane guard: n_scale_dwords may not be a wave multiple.
+                @flyc.jit
+                def _dispatch_scale_dword(g=g, _store_scale_dword=_store_scale_dword):
+                    if fx.Uint32(g) < fx.Uint32(c_n_scale_dwords):
+                        _store_scale_dword()
+
+                _dispatch_scale_dword()
+
+        # The row is scalar, so the branch is wave-uniform.
+        @flyc.jit
+        def _dispatch_dest(row_raw=row_raw, _store_dest=_store_dest):
+            if row_raw >= c0:
+                _store_dest()
+
+        _dispatch_dest()
+
+
+def build_moe_token_multidest_prequant_module(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str = "fp4",
+    src_scale_bytes_per_row: int = 0,
+    row_major_scale: bool = False,
+):
+    """Copy each prequantized token once to its ``topk`` routed rows.
+
+    The prequantized route kernel uses one warp per route: a token's row is read
+    once per local route, and every non-local or dead-tail route still costs a
+    warp. This kernel uses one warp per token. It loads the MX payload and its
+    e8m0 row once, then stores them to each mapped grouped row.
+
+    ``num_valid_routes`` (received tokens * topk, may be null) skips the EP dead
+    tail without a host sync.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("token multidest prequant requires gfx1250 pk8")
+    if src_scale_bytes_per_row < L.mx_blocks_per_row:
+        raise ValueError(
+            f"src_scale_bytes_per_row={src_scale_bytes_per_row} is shorter than "
+            f"the {L.mx_blocks_per_row} e8m0 bytes of a row"
+        )
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+    module_name = (
+        f"moe_token_multidest_prequant_k{topk}_fd{feat_dim}_r{wmma_rep}"
+        f"_{quant_mode}_pq{src_scale_bytes_per_row}{'_rm' if row_major_scale else ''}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def token_multidest_prequant_kernel(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        src_scale: fx.Pointer,
+        token_num: Int32,
+    ):
+        i32 = T.i32
+        c0_i32 = fx.Int32(0)
+        c_wave = fx.Int32(wave_size)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
+        lane = tid - warp_in_block * c_wave
+        token = bid * fx.Int32(warps_per_block) + warp_in_block
+
+        valid_tokens = fx.Uint32(token_num)
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        if num_valid_routes_is_set:
+            valid_tokens = fx.Uint32(
+                ptr_buf_tensor(num_valid_routes)[c0_i32]
+            ) // fx.Uint32(topk)
+        if token < valid_tokens:
+            rows_t = ptr_buf_tensor(topids_to_rows)
+            route0 = token * fx.Int32(topk)
+            # Scalar loads keep each row, and the descriptor built from it, uniform.
+            rows = [
+                fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                for k in range_constexpr(topk)
+            ]
+            qc = SimpleNamespace(
+                i32=i32,
+                lane=lane,
+                token=token,
+                rows=rows,
+                hidden_base=fx.Int64(ptrtoint(hidden)),
+                payload_base=fx.Int64(ptrtoint(grouped_payload)),
+                payload_bytes_per_row=L.payload_bytes_per_row,
+                src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                src_scale_bytes_per_row=src_scale_bytes_per_row,
+                mx_blocks_per_row=L.mx_blocks_per_row,
+                scale_t_i32=ptr_buf_tensor(grouped_scale, fx.Int32),
+                c_rows_per_tile=fx.Int32(L.rows_per_tile),
+                c_dst_scale_dwords_per_row=fx.Int32(L.dst_scale_dwords_per_row),
+                wmma_rep=wmma_rep,
+                row_major_scale=row_major_scale,
+            )
+            _emit_prequant_copy_multidest(qc)
+
+    @flyc.jit
+    def launch_token_multidest_prequant(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        src_scale: fx.Pointer,
+        token_num: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        token_multidest_prequant_kernel(
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            num_valid_routes,
+            src_scale,
+            token_num,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_token_multidest_prequant.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_token_multidest_prequant
+
+
 def fused_quant_preshuffle_supported(
     feat_dim: int, wmma_rep: int, quant_mode: str
 ) -> bool:

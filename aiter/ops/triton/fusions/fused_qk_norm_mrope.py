@@ -40,6 +40,7 @@ def _launch(
     v_cache,
     slot_mapping,
     cache,
+    kv_scale=None,
 ):
     assert arch_info.get_arch() == "gfx1250"
     num_tokens = q.shape[0]
@@ -53,14 +54,20 @@ def _launch(
     assert sin.stride() == cos.stride()
     config = _get_config(num_tokens)
 
-    q_out = torch.empty((num_tokens, q.shape[1]), dtype=q.dtype, device=q.device)
+    fp8 = kv_scale is not None
+    q_out = torch.empty(
+        (num_tokens, q.shape[1]),
+        dtype=k_cache.dtype if fp8 else q.dtype,
+        device=q.device,
+    )
     k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
     _LOGGER.info(
-        "FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d cache=%s",
+        "FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d cache=%s fp8=%s",
         num_tokens,
         q_heads,
         k_heads,
         cache,
+        fp8,
     )
 
     # One row per wave. The rows of token t are its Q heads, then its K heads.
@@ -87,6 +94,7 @@ def _launch(
         slot_mapping.shape[0],
         k_cache,
         v_cache,
+        1.0 / kv_scale if fp8 else 1.0,
         EPS=eps,
         Q_HEADS=q_heads,
         K_HEADS=k_heads,
@@ -96,6 +104,8 @@ def _launch(
         CACHE=cache,
         BLOCK_SIZE=k_cache.shape[3] if cache else 1,
         X=k_cache.shape[4] if cache else 1,
+        FP8=fp8,
+        FP8_MAX=torch.finfo(k_cache.dtype).max if fp8 else 0.0,
         num_warps=block_m,
         **get_fused_qk_norm_mrope_layouts(block_m),
     )
@@ -164,6 +174,7 @@ def fused_qk_norm_mrope_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    kv_scale: float | None = None,
 ):
     """``fused_qk_norm_mrope``, and the K and V rows into the paged KV cache.
 
@@ -179,17 +190,24 @@ def fused_qk_norm_mrope_cache(
         v_cache: [blocks, Hk, block // x, 256, x], contiguous, dtype of q.
         slot_mapping: [S] int32 or int64. Token t < S goes to slot slot_mapping[t].
             Tokens with t >= S or a negative slot are padding: they are not written.
+        kv_scale: for an fp8 cache, its one per-tensor scale. K and V are stored as
+            value / kv_scale clamped to the fp8 range, as ``reshape_and_cache(kv_cache_dtype="fp8")``
+            stores them after the caller's clamp, and Q is returned in the cache dtype,
+            clamped, without a scale. None for a cache in the dtype of q.
 
     Returns:
-        q_out [T, Hq * 256] and k_out [T, Hk * 256], contiguous.
+        q_out [T, Hq * 256] (fp8 when kv_scale is given) and k_out [T, Hk * 256] in the
+        dtype of q, contiguous.
     """
     num_blocks, k_heads, _, block, x = k_cache.shape
     assert k_cache.shape == (num_blocks, k_heads, HEAD_DIM.value // x, block, x)
     assert v_cache.shape == (num_blocks, k_heads, block // x, HEAD_DIM.value, x)
     assert k_cache.is_contiguous() and v_cache.is_contiguous()
-    assert (
-        k_cache.dtype == v_cache.dtype == q.dtype and x * k_cache.element_size() == 16
-    )
+    assert k_cache.dtype == v_cache.dtype and x * k_cache.element_size() == 16
+    if kv_scale is None:
+        assert k_cache.dtype == q.dtype
+    else:
+        assert k_cache.element_size() == 1 and kv_scale > 0
     assert v.shape == k.shape and v.stride(1) == 1
     assert slot_mapping.dim() == 1
     return _launch(
@@ -207,4 +225,5 @@ def fused_qk_norm_mrope_cache(
         v_cache,
         slot_mapping,
         True,
+        kv_scale,
     )
