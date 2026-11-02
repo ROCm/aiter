@@ -20,23 +20,32 @@ from aiter.jit.utils.build_targets import (
 
 
 class TestBuildTargetArchitecture(unittest.TestCase):
-    def test_rdna_offline_build_target_defaults(self):
+    def test_rdna_offline_build_targets_cover_every_listed_cu_count(self):
         targets = {
-            "gfx1100": 96,
-            "gfx1101": 60,
-            "gfx1102": 32,
-            "gfx1103": 12,
-            "gfx1150": 16,
-            "gfx1151": 40,
-            "gfx1200": 32,
-            "gfx1201": 64,
+            "gfx1100": [96],
+            "gfx1101": [60],
+            "gfx1102": [32],
+            "gfx1103": [12],
+            "gfx1150": [16, 12],
+            "gfx1151": [40],
+            "gfx1200": [32, 28],
+            "gfx1201": [64],
         }
-        for gfx, cu_num in targets.items():
+        for gfx, cu_nums in targets.items():
             with (
                 self.subTest(gfx=gfx),
                 mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True),
             ):
-                self.assertEqual(get_build_targets_env(), [(gfx, cu_num)])
+                expected = [(gfx, cu_num) for cu_num in cu_nums]
+                self.assertEqual(get_build_targets_env(), expected)
+
+    def test_zero_cu_override_is_treated_as_unset(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": "gfx1200", "CU_NUM": "0"}, clear=True
+        ):
+            self.assertEqual(
+                get_build_targets_env(), [("gfx1200", 32), ("gfx1200", 28)]
+            )
 
     def test_multi_arch_and_cu_override(self):
         with mock.patch.dict(
