@@ -5,6 +5,7 @@
 #include "asm_fmoe_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <tuple>
@@ -367,7 +368,8 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                                  int smf                 = 0,
                                  std::string kernel_name = "",
                                  int block_size_M        = 32,
-                                 int model_dim           = 0)
+                                 int model_dim           = 0,
+                                 bool ps_only            = false)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -382,12 +384,20 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
 
     if(selectedKl.empty())
     {
+        // Only a persistent kernel takes the valid row count from num_valid_ids;
+        // keep to those when asked, unless none fits.
+        const bool only_ps =
+            ps_only && std::any_of(cfgs->begin(), cfgs->end(), [&](const auto& el) {
+                return el.first.find(arch_id) == 0 && el.second.ps == 1 &&
+                       kernel_fits(el.second, vskip, smf, block_size_M, inter_dim, model_dim);
+            });
         for(const auto& el : *cfgs)
         {
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
+            if((!only_ps || cfg.ps == 1) &&
+               kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
             {
                 tg_num = inter_dim / cfg.subGU_n *
                          sub_X_cnt; // how many thread_groups are needed to handle inter_dim
@@ -1115,7 +1125,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                         0,
                                         kernel_name_str,
                                         block_size_M,
-                                        down->size(1));
+                                        down->size(1),
+                                        true);
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
