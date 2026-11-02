@@ -306,7 +306,40 @@ KW_CASES = [
     ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
-    ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
+    # Tile must divide Ho/Wo and kg so split-K is not rejected by the tail gate
+    # (gfx950 and gfx1250 both refuse split-K with a masked tile edge).
+    (
+        "2d_splitk2",
+        2,
+        _X2,
+        _W2,
+        {
+            "padding": 1,
+            "splitk": 2,
+            "tile": (64, 32, 2, 1),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 1},
+        False,
+    ),
+    # 33x33 under a 2x2x2 filter with no padding gives Ho = Wo = 32, so
+    # npq = 3 * 32 * 32 is a multiple of tile_m and 32 divides by (4, 16).
+    (
+        "3d_splitk2",
+        3,
+        (1, 32, 4, 33, 33),
+        (64, 32, 2, 2, 2),
+        {
+            "padding": 0,
+            "splitk": 2,
+            "tile": (64, 64, 2, 2),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 0},
+        False,
+    ),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
     # Independent input/output layouts; torch has no such kwargs (ref_kw).
     (
@@ -367,12 +400,13 @@ KW_CASES = [
         True,
     ),
     # Pin wider tiles; KW shapes otherwise land on the narrowest _pick_tile.
+    # gfx1250 uses wave32 so (wave_m, wave_n) differ from gfx950's wave64 tiles.
     (
         "3d_tile_128",
         3,
         _X3,
         _W3,
-        {"padding": 1, "tile": (128, 128, 2, 4)},
+        {"padding": 1, "tile": (128, 128, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
     ),
@@ -381,7 +415,7 @@ KW_CASES = [
         2,
         _X2,
         _W2,
-        {"padding": 1, "tile": (256, 256, 2, 4)},
+        {"padding": 1, "tile": (256, 256, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
     ),
@@ -432,6 +466,16 @@ KW_CASES = [
         _W2,
         {"stride": 2, "padding": 1, **_KH8},
         {"stride": 2, "padding": 1},
+        True,
+    ),
+    # gfx1250: R/C tail + N tail with an oversize N tile.
+    (
+        "3d_tail_blocks",
+        3,
+        (1, 32, 3, 17, 19),
+        _W3,
+        {"padding": 1, "tile": (64, 64, 2, 2), "block_rows": 4},
+        {"padding": 1},
         True,
     ),
 ]
