@@ -1205,10 +1205,18 @@ class AttentionProgram:
         # Split-KV: carve the sequence as reduce_segments does, so every query
         # block of a sequence agrees on the split boundaries
         if NUM_SPLITS > 1:
-            split_len = NUM_SPLITS * cfg.TILE_SIZE
             seq_len = context_len + cur_batch_query_len
-            tiles_per_split = (seq_len + split_len - 1) // split_len
-            split_start = split_idx * tiles_per_split
+            if cfg.SLIDING_WINDOW > 0:
+                # only the window's tiles: no row sees a key before row 0's first
+                kv_lo = gl.maximum(context_len - cfg.SLIDING_WINDOW + 1, 0)
+                tile_lo = kv_lo // cfg.TILE_SIZE
+                seq_tiles = (seq_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
+                tiles_per_split = (seq_tiles - tile_lo + NUM_SPLITS - 1) // NUM_SPLITS
+                split_start = tile_lo + split_idx * tiles_per_split
+            else:
+                split_len = NUM_SPLITS * cfg.TILE_SIZE
+                tiles_per_split = (seq_len + split_len - 1) // split_len
+                split_start = split_idx * tiles_per_split
             tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
             tile_start = gl.maximum(split_start, tile_start)
 
@@ -1908,14 +1916,34 @@ def _unified_attention_gluon_kernel(
     )
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
-        # past this block's causal edge, but reduce_segments still reads it
+        # past this block's causal or window edge, but reduce_segments still
+        # reads it
         if pgm.tile_start * TILE_SIZE < seq_len:
-            empty = gl.zeros(
+            empty_m = gl.zeros(
                 [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
             )
+            empty_l = empty_m
+            if USE_SINKS:
+                offs_m_pv = gl.arange(
+                    0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
+                )
+                query_offset_1_pv = (
+                    kv_head_idx * cfg.NUM_QUERIES_PER_KV
+                    + offs_m_pv % cfg.NUM_QUERIES_PER_KV
+                )
+                empty_m = (
+                    gl.amd.cdna4.buffer_load(
+                        ptr=sink_ptr,
+                        offsets=query_offset_1_pv,
+                        mask=(query_offset_1_pv < NUM_QUERY_HEADS) & (split_idx == 0),
+                        other=float("-inf"),
+                    ).to(dtype=gl.float32)
+                    * cfg.RCP_LN2
+                )
+                empty_l = gl.where(empty_m > float("-inf"), 1.0, 0.0)
             pgm.store_partial(
-                empty,
-                empty,
+                empty_m,
+                empty_l,
                 gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
                 partial_m_ptr,
                 partial_l_ptr,
