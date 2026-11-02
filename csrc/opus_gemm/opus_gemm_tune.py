@@ -738,6 +738,10 @@ def kid_rejects_shape(k_inst, M, N, K):
         # tuner must not reject the same shapes the dispatcher selects.
         if N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
             return True
+        # The launcher also requires at least two K iterations
+        # (loops_ >= 2). K % B_K == 0 above makes the division exact.
+        if K < 2 * k_inst.B_K:
+            return True
         # N%16 vector-store guard (same root cause as a16w16 family);
         # already implied by N%B_N==0 with B_N % 64 == 0, but keep the
         # explicit check for symmetry.

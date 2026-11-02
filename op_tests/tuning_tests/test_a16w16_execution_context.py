@@ -211,6 +211,14 @@ class TestExecutionContext(unittest.TestCase):
                     self.assertFalse(
                         opus_gemm_tune.kid_rejects_shape(instance, m, 4096, 1536)
                     )
+            with self.subTest(kid=kid, m_align=1):
+                self.assertEqual(instance.m_align, 1)
+            with self.subTest(kid=kid, short_k=True):
+                self.assertTrue(opus_gemm_tune.kid_rejects_shape(instance, 1, 4096, 64))
+            with self.subTest(kid=kid, min_k=True):
+                self.assertFalse(
+                    opus_gemm_tune.kid_rejects_shape(instance, 1, 4096, 128)
+                )
             with self.subTest(kid=kid, misaligned_n=True):
                 self.assertTrue(
                     opus_gemm_tune.kid_rejects_shape(instance, 1, 4097, 1536)

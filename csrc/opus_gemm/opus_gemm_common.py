@@ -452,6 +452,10 @@ class OpusGemmInstance:
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
+        if self.kernel_tag == "a16w16_mono_tile":
+            # The mono_tile launcher only guards N/K; partial M tiles are
+            # bounded by the per-WG buffer resource, so M needs no alignment.
+            return 1
         mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
         if mult is not None:
             return self.B_M * mult if mult else 1
