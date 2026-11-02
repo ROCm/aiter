@@ -43,6 +43,9 @@ _MAX_BLOCK_THREADS = 1024
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
 _BUFFER_LIMIT_BYTES = 1 << 32
 _ALLOWED_GFX = ("gfx942", "gfx950")
+# 2 is the non-temporal cache policy; the BF16 and FP8 outputs are write-once
+# and never read back.
+_STORE_CACHE_MODIFIER = 2
 _SMALL_D_ROWS_PER_WG = 1
 # Extra block sources kept outstanding during consume_source. Value 3 means
 # sources i+1, i+2, i+3 are already issued when reducing source i. Prefix is
@@ -489,6 +492,14 @@ def _build_attn_res(spec: _AttnResSpec):
             )
             if width in tile_widths
         }
+        store_atoms = {
+            width: fx.make_copy_atom(copy_op(_STORE_CACHE_MODIFIER), fx.BFloat16)
+            for width, copy_op in (
+                (_VEC_WIDTH, fx.rocdl.BufferCopy128b),
+                (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy64b),
+            )
+            if width in tile_widths
+        }
         vector_layouts = {width: fx.make_layout(width, 1) for width in copy_atoms}
 
         def divide_row(row):
@@ -515,13 +526,13 @@ def _build_attn_res(spec: _AttnResSpec):
             register = fx.make_rmem_tensor(width, fx.BFloat16)
             fx.memref_store_vec(value, register)
             fx.copy(
-                copy_atoms[width],
+                store_atoms[width],
                 register,
                 fx.slice(divided[width], (None, vector_index_for(tile))),
             )
 
         fp8_atoms = {
-            width: fx.make_copy_atom(copy_op(), fx.Int8)
+            width: fx.make_copy_atom(copy_op(_STORE_CACHE_MODIFIER), fx.Int8)
             for width, copy_op in (
                 (_VEC_WIDTH, fx.rocdl.BufferCopy64b),
                 (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy32b),
