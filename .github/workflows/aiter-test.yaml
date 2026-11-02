@@ -878,6 +878,24 @@ jobs:
           )
           PY
 
+      - name: Install triton
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
+        run: |
+          # Ensure install_triton.sh is available even when the PR branch
+          # was created before the script was added to main (#2959).
+          # The workflow file always comes from the base branch, so we
+          # materialize the script from the base ref when missing.
+          if [ ! -f .github/scripts/install_triton.sh ]; then
+            mkdir -p .github/scripts
+            curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
+              -o .github/scripts/install_triton.sh
+            chmod +x .github/scripts/install_triton.sh
+          fi
+          docker exec -w /workspace aiter_test \
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
+
       - name: Run full MoE 2-stage matrix (scheduled/dispatch only)
         if: >-
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
@@ -895,6 +913,10 @@ jobs:
           else
               status="✅ Passed"
               failed=false
+          fi
+          if grep -q "accuracy check failed (non-strict)" full_matrix.log; then
+              status="❌ Failed (non-strict accuracy check reported errors)"
+              failed=true
           fi
           end_time_ns=$(date +%s%N)
           elapsed_s=$(awk "BEGIN{printf \"%.3f\", ($end_time_ns-$start_time_ns)/1000000000}")
@@ -918,24 +940,7 @@ jobs:
           name: moe-2stage-full-matrix-log
           path: full_matrix.log
           retention-days: 14
-
-      - name: Install triton
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
-        run: |
-          # Ensure install_triton.sh is available even when the PR branch
-          # was created before the script was added to main (#2959).
-          # The workflow file always comes from the base branch, so we
-          # materialize the script from the base ref when missing.
-          if [ ! -f .github/scripts/install_triton.sh ]; then
-            mkdir -p .github/scripts
-            curl -fsSL \
-              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
-              -o .github/scripts/install_triton.sh
-            chmod +x .github/scripts/install_triton.sh
-          fi
-          docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show triton"
+        continue-on-error: true
 
       - name: Show Aiter version
         run: |
