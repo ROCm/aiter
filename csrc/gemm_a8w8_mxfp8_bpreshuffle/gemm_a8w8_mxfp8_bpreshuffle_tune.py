@@ -159,8 +159,8 @@ def _opus_schedule_profile(pipeline, traits):
 
 
 @lru_cache(maxsize=65536)
-def _opus_effective_schedule(pipeline, traits, bm, bn, bk, wn, wg):
-    """Compare B prefetch distances by the queue depth the traits actually use."""
+def _opus_variant_profile(pipeline, traits, bm, bn, bk, wn, wg, group_n_active):
+    """Normalize effective B queues and inactive GroupN for variant comparison."""
     profile = list(_opus_schedule_profile(pipeline, traits))
     if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
         stages, distance = int(profile[2]), int(profile[3])
@@ -178,27 +178,11 @@ def _opus_effective_schedule(pipeline, traits, bm, bn, bk, wn, wg):
         ):
             ahead = 3
         profile[3] = f"ahead{min(distance * (bk // 128) * nr, ahead)}"
-    return tuple(profile)
-
-
-def _opus_variant_profile(instance, m, n):
-    entry = instance.bpreshuffle_entry
-    profile = _opus_effective_schedule(
-        entry["pipeline"],
-        entry["traits"],
-        instance.B_M,
-        instance.B_N,
-        instance.B_K,
-        instance.T_N,
-        instance.WG_PER_CU,
-    )
-    if entry["pipeline"] == "pingpong_lds" and (
-        int(profile[5]) > 0 or n // instance.B_N < 256 or m <= instance.B_M
-    ):
+    if pipeline == "pingpong_lds" and (int(profile[5]) > 0 or not group_n_active):
         # GroupM overwrites the N swizzle. Otherwise GroupN is used only in
         # the wide-N branch of the m-repeat pipeline's launch-order mapping.
-        profile = (*profile[:12], "inactive")
-    return profile
+        profile[12] = "inactive"
+    return tuple(profile)
 
 
 def _opus_jit_lds(instance, k):
@@ -217,37 +201,72 @@ def _opus_jit_lds(instance, k):
     return 2 * (2 * a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
 
 
-def _opus_schedule_modes(pipeline, profile):
-    """Cover all trait values and the pipelines' coupled scheduling choices."""
-    # A new trait value is covered automatically. Coupled groups additionally
-    # retain combinations affecting queue/resource limits or execution routes.
-    indices = [(index,) for index in range(len(profile))]
-    if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        # stage/ahead/WG, A/B cache, store/output, contiguous/pins, XCD/groupM
-        indices += [(2, 3, 8), (4, 9), (10, 11), (13, 14, 15), (5, 16)]
-        if pipeline == "prefetch_b_vgpr_overlap":
-            # Publication timing depends on the A ring and output route.
-            indices += [(2, 17), (11, 17)]
-    elif pipeline == "pingpong_lds":
-        # panel/fixedK, fixedK/fragments, cache/fragments/guard, launch groups
-        indices += [(2, 3), (3, 8), (6, 7, 8, 10), (5, 12), (5, 9)]
-    elif pipeline == "wave_interleave":
-        # groupM/XCD and A/B cache
-        indices += [(2, 3), (4, 5)]
-    return {
-        (positions, tuple(profile[index] for index in positions))
-        for positions in indices
-    }
+def _opus_select_variants(kids, registry, m, n, k, mode):
+    """Keep a baseline for every tile; expand primary or secondary modes.
 
-
-def _opus_representative_variants(kids, registry, m, n, k, *, secondary=False):
-    """Keep low-LDS and coupled scheduling modes; sample secondary publication."""
-    pipeline = registry[kids[0]].bpreshuffle_entry["pipeline"]
-    profiles = {}
+    Primary tiles add joint parameter routes and scheduling representatives.
+    Secondary tiles add representatives, sampling overlap publication timing.
+    """
+    footprints = {kid: _opus_jit_lds(registry[kid], k) for kid in kids}
+    selected = {min(kids, key=lambda kid: (footprints[kid], kid))}
+    if mode == "baseline":
+        return selected
+    instance = registry[kids[0]]
+    pipeline = instance.bpreshuffle_entry["pipeline"]
+    bm, bn, bk, wn = instance.B_M, instance.B_N, instance.B_K, instance.T_N
+    unique = {}
     for kid in sorted(kids):
-        profiles.setdefault(_opus_variant_profile(registry[kid], m, n), kid)
-    profiles = {kid: profile for profile, kid in profiles.items()}
-    if secondary and pipeline == "prefetch_b_vgpr_overlap":
+        profile = _opus_variant_profile(
+            pipeline,
+            registry[kid].bpreshuffle_entry["traits"],
+            bm,
+            bn,
+            bk,
+            wn,
+            registry[kid].WG_PER_CU,
+            n // bn >= 256 and m > bm,
+        )
+        unique.setdefault(profile, kid)
+    profiles = {kid: profile for profile, kid in unique.items()}
+    if mode == "primary":
+        routes = list(profiles)
+        if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            routes = [kid for kid in routes if profiles[kid][11] == "0"]
+            if routes:
+                aheads = {kid: int(profiles[kid][3][5:]) for kid in routes}
+                # Retain the queue level nearest to or above the full-A live set.
+                target = max((bk // 128) * (bm // 16) - 1, 1)
+                bound = min(
+                    (ahead for ahead in aheads.values() if ahead >= target),
+                    default=max(aheads.values()),
+                )
+                routes = [kid for kid in routes if aheads[kid] <= bound]
+        elif pipeline in ("pingpong_lds", "wave_interleave"):
+            if pipeline == "pingpong_lds":
+                em = bm // (instance.T_M * 16)
+                if not (instance.T_M * wn == 8 and 3 <= em <= 4):
+                    # Include each variant's scale panel in two-block residency.
+                    resident = {kid for kid in kids if footprints[kid] <= 80 * 1024}
+                    if resident:
+                        routes = [kid for kid in routes if kid in resident]
+                group_index = 5
+            else:
+                group_index = 2
+            smallest = min(
+                (
+                    int(profiles[kid][group_index])
+                    for kid in routes
+                    if int(profiles[kid][group_index]) > 0
+                ),
+                default=0,
+            )
+            routes = [
+                kid
+                for kid in routes
+                if int(profiles[kid][group_index]) in (0, smallest)
+            ]
+        selected.update(routes)
+    elif pipeline == "prefetch_b_vgpr_overlap":
         publications = sorted({int(profile[17]) for profile in profiles.values()})
         if len(publications) > 3:
             midpoint = (publications[0] + publications[-1]) / 2
@@ -258,20 +277,35 @@ def _opus_representative_variants(kids, registry, m, n, k, *, secondary=False):
                 for kid, profile in profiles.items()
                 if int(profile[17]) in retained
             }
-    footprints = {kid: _opus_jit_lds(registry[kid], k) for kid in profiles}
+
+    # Cover individual trait values and resource/execution-route combinations.
+    indices = [(index,) for index in range(len(next(iter(profiles.values()))))]
+    if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+        # stage/ahead/WG, A/B cache, store/output, contiguous/pins, XCD/groupM
+        indices += [(2, 3, 8), (4, 9), (10, 11), (13, 14, 15), (5, 16)]
+        if pipeline == "prefetch_b_vgpr_overlap":
+            indices += [(2, 17), (11, 17)]
+    elif pipeline == "pingpong_lds":
+        # panel/fixedK, fragments/cache/guard, launch groups
+        indices += [(2, 3), (3, 8), (6, 7, 8, 10), (5, 12), (5, 9)]
+    elif pipeline == "wave_interleave":
+        indices += [(2, 3), (4, 5)]
     modes = {
-        kid: _opus_schedule_modes(pipeline, profile)
+        kid: {
+            (positions, tuple(profile[index] for index in positions))
+            for positions in indices
+        }
         for kid, profile in profiles.items()
     }
     baseline = min(profiles, key=lambda kid: (footprints[kid], kid))
-    selected = [baseline]
+    selected.add(baseline)
     uncovered = set().union(*modes.values()) - modes.pop(baseline)
     while uncovered:
         kid = min(
             modes,
             key=lambda kid: (-len(modes[kid] & uncovered), footprints[kid], kid),
         )
-        selected.append(kid)
+        selected.add(kid)
         uncovered.difference_update(modes.pop(kid))
     return selected
 
@@ -300,57 +334,6 @@ def _opus_geometry_cost(geometry, m, n, cu_num):
         + 8 / bm
         + 8 / bn
     )
-
-
-def _opus_m_repeat_cost(geometry, m, n, k, cu_num):
-    """Estimate core-tile work, including the extra rolling A-fragment wait.
-
-    The coefficients are relative work weights, not measured GPU latencies.
-    A fixed startup cost competes with the K-dependent refill cost; M/N tile
-    padding and dispatch tails can keep either E_M=3 or E_M=4 in the range.
-    """
-    _, bm, bn, _, wm, wn = geometry
-    em, en = bm // (16 * wm), bn // (16 * wn)
-    mfma = em * en * 32 * wm * wn / 4
-    transfer = (bm + bn) * 128 / 512
-    refill = max(0, em - 3) * 64
-    body = (k / 128) * (mfma + transfer + refill) + 3072 + bm * bn * 2 / 512
-    tiles = math.ceil(m / bm) * math.ceil(n / bn)
-    occupancy = tiles / max(cu_num, 1)
-    tail = 1 + 0.1 * (math.ceil(occupancy) / occupancy - 1)
-    return tiles * body * tail / (m * n * k)
-
-
-def _opus_refine_geometry_range(primary, secondary, m, n, k, cu_num):
-    """Expand joint parameters near the computed costs and adequate CU supply."""
-    dropped = set()
-    core = [
-        g
-        for g in primary
-        if g[0] == "pingpong_lds" and g[4] * g[5] == 8 and g[1] // (g[4] * 16) >= 3
-    ]
-    if core:
-        costs = {g: _opus_m_repeat_cost(g, m, n, k, cu_num) for g in core}
-        best = min(costs.values())
-        dropped.update(g for g in core if costs[g] > 1.025 * best)
-    by_layout = defaultdict(list)
-    for geometry in primary:
-        if geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-            by_layout[(geometry[0], *geometry[3:])].append(geometry)
-    for geometries in by_layout.values():
-        costs = {g: _opus_geometry_cost(g, m, n, cu_num) for g in geometries}
-        best = min(costs.values())
-        # Two-wave blocks have more residency-dependent CU-fill choices.
-        margin = 4 / 3 if geometries[0][4] * geometries[0][5] < 4 else 1.1
-        dropped.update(g for g in geometries if costs[g] > margin * best)
-    # Below half a CU grid, retain resource-mode representatives rather than
-    # multiplying every parameter on a poorly supplied large tile.
-    dropped.update(
-        g
-        for g in primary
-        if math.ceil(m / g[1]) * math.ceil(n / g[2]) < max(cu_num, 1) / 2
-    )
-    return primary - dropped, (secondary | dropped) - (primary - dropped)
 
 
 def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
@@ -438,58 +421,35 @@ def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
         ):
             # A registry/shape may have no core or two-resident-block layout.
             secondary.update(_opus_best_geometries(tiles, m, n, cu_num))
-    return _opus_refine_geometry_range(primary, secondary, m, n, k, cu_num)
-
-
-def _opus_joint_routes(kids, registry, m, n, k):
-    """Expand joint parameters within panel, output, grouping and queue limits."""
-    instance = registry[kids[0]]
-    pipeline = instance.bpreshuffle_entry["pipeline"]
-    if pipeline == "pingpong_lds":
-        em = instance.B_M // (instance.T_M * 16)
-        if not (instance.T_M * instance.T_N == 8 and 3 <= em <= 4):
-            # A two-block geometry must also fit each variant's scale panel.
-            resident = [
-                kid for kid in kids if _opus_jit_lds(registry[kid], k) <= 80 * 1024
-            ]
-            kids = resident or kids
-    profiles = {
-        kid: _opus_schedule_profile(pipeline, registry[kid].bpreshuffle_entry["traits"])
-        for kid in kids
-    }
-    if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        kids = [kid for kid in kids if profiles[kid][11] == "0"]
-    elif pipeline == "pingpong_lds":
-        smallest = min(
-            (int(p[5]) for p in profiles.values() if int(p[5]) > 0), default=0
-        )
-        kids = [kid for kid in kids if int(profiles[kid][5]) in (0, smallest)]
-    # Merge only identical effective B queues and inactive GroupN policies.
-    unique = {}
-    for kid in sorted(kids):
-        unique.setdefault(_opus_variant_profile(registry[kid], m, n), kid)
-    routes = list(unique.values())
-    if not routes:
-        return routes
-    if pipeline == "wave_interleave":
-        smallest = min(
-            (int(profiles[kid][2]) for kid in routes if int(profiles[kid][2]) > 0),
-            default=0,
-        )
-        routes = [kid for kid in routes if int(profiles[kid][2]) in (0, smallest)]
-    elif pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        aheads = {
-            kid: int(_opus_variant_profile(registry[kid], m, n)[3][5:])
-            for kid in routes
-        }
-        # Keep the queue level nearest to, or just above, the full-A live set.
-        target = max((instance.B_K // 128) * (instance.B_M // 16) - 1, 1)
-        bound = min(
-            (ahead for ahead in aheads.values() if ahead >= target),
-            default=max(aheads.values()),
-        )
-        routes = [kid for kid in routes if aheads[kid] <= bound]
-    return routes
+    dropped, core_costs, by_layout = set(), {}, defaultdict(list)
+    for geometry in primary:
+        _, bm, bn, _, wm, wn = geometry
+        if geometry[0] == "pingpong_lds" and wm * wn == 8 and bm // (wm * 16) >= 3:
+            # Relative work weights include startup and rolling A-ring refill.
+            em, en = bm // (16 * wm), bn // (16 * wn)
+            mfma = em * en * 32 * wm * wn / 4
+            transfer = (bm + bn) * 128 / 512
+            refill = max(0, em - 3) * 64
+            body = (k / 128) * (mfma + transfer + refill) + 3072 + bm * bn * 2 / 512
+            tiles = math.ceil(m / bm) * math.ceil(n / bn)
+            occupancy = tiles / cu_num
+            tail = 1 + 0.1 * (math.ceil(occupancy) / occupancy - 1)
+            core_costs[geometry] = tiles * body * tail / (m * n * k)
+        elif geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            by_layout[(geometry[0], *geometry[3:])].append(geometry)
+        if math.ceil(m / bm) * math.ceil(n / bn) < cu_num / 2:
+            dropped.add(geometry)
+    if core_costs:
+        best = min(core_costs.values())
+        dropped.update(g for g in core_costs if core_costs[g] > 1.025 * best)
+    for geometries in by_layout.values():
+        costs = {g: _opus_geometry_cost(g, m, n, cu_num) for g in geometries}
+        best = min(costs.values())
+        # Two-wave blocks have more residency-dependent CU-fill choices.
+        margin = 4 / 3 if geometries[0][4] * geometries[0][5] < 4 else 1.1
+        dropped.update(g for g in geometries if costs[g] > margin * best)
+    primary -= dropped
+    return primary, (secondary | dropped) - primary
 
 
 def opus_candidates(m, n, k, *, cu_num):
@@ -509,16 +469,13 @@ def opus_candidates(m, n, k, *, cu_num):
     primary, secondary = _opus_calculate_geometry_range(
         groups, registry, m, n, k, cu_num
     )
-    for kids in groups.values():
-        selected.add(min(kids, key=lambda kid: (_opus_jit_lds(registry[kid], k), kid)))
-    for geometry in primary:
-        selected.update(_opus_joint_routes(groups[geometry], registry, m, n, k))
-    for geometry in sorted(primary | secondary):
-        selected.update(
-            _opus_representative_variants(
-                groups[geometry], registry, m, n, k, secondary=geometry in secondary
-            )
-        )
+    for geometry, kids in groups.items():
+        mode = "baseline"
+        if geometry in primary:
+            mode = "primary"
+        elif geometry in secondary:
+            mode = "secondary"
+        selected.update(_opus_select_variants(kids, registry, m, n, k, mode))
     print(
         f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
         f"primary={len(primary)} secondary={len(secondary)} "
