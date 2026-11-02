@@ -33,6 +33,27 @@ kernel was tuned for the GLM-5.2 o_proj decode shape (N=6144, K=2048):
     partials go to LDS as one 16-byte write per fragment and the padding
     columns of a 24-wide slab are never reduced; above that the partials use
     a row-major fp32 layout with a 4-element row pad against bank conflicts.
+
+Three low-level boundaries are kept deliberately rather than raised to the
+``fx`` builders, because the schedule is the point of this kernel:
+  * the global->LDS DMA is inline asm, and has to stay that way.
+    ``fx.rocdl.raw_ptr_buffer_load_lds(rsrc, lds_ptr, 16, voffset, soffset,
+    0, aux)`` emits the identical instruction, ``nt`` included (aux=2), but
+    it also tells the compiler that the DMA writes LDS, and the compiler
+    then puts an ``s_waitcnt vmcnt(0)`` in front of every ``ds_read`` of the
+    ring -- 24 of them, draining the pipeline this kernel exists to keep
+    full. Measured on MI355X: identical ds_read and MFMA counts, every
+    skinny shape slower, 1.20x geomean and 1.46x worst, while the untouched
+    kernels in the same run moved 0.997x. The asm form is opaque to the
+    compiler on purpose: ordering is this kernel's job, done by the
+    hand-counted ``s_waitcnt vmcnt(N)`` below;
+  * the MFMAs call ``rocdl.mfma_*`` directly: the operands are hand-swizzled
+    raw fragments read out of the LDS ring, with no tensor or partition form
+    for ``fx.make_mma_atom``/``fx.gemm`` to take;
+  * LDS addressing stays on ``buffer_ops`` -- a scalar base plus a per-thread
+    offset, again with no layout to hand to a copy atom.
+Everything else uses the typed ``fx`` API; ``.ir_value()`` appears only where
+one of these raw ops needs an unwrapped operand.
 """
 
 import functools
@@ -40,9 +61,8 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
@@ -53,7 +73,6 @@ from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     _run_compiled,
-    _to_raw,
     ptr_arg,
 )
 
@@ -164,6 +183,8 @@ def compile_gemm_a16w16_skinny_gfx950(
     KERNEL_NAME = f"hgemm_bf16_skinny_t{TA}x{TN}x{KC}x{ST}_w1x1x{K_WAVES}"
 
     def mfma(a_fr, b_fr, acc):
+        # raw intrinsic: the fragments come straight out of the swizzled LDS
+        # ring with no tensor/partition form for fx.make_mma_atom to take
         return rocdl.mfma_f32_16x16x32_bf16(T.f32x4, [a_fr, b_fr, acc, 0, 0, 0])
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -173,10 +194,9 @@ def compile_gemm_a16w16_skinny_gfx950(
         B: fx.Pointer,
         m: fx.Int32,
     ):
-        acc_init = arith.constant_vector(0.0, T.vec(4, T.f32))
-        m_idx = fx.Index(m)
-        a_bytes = arith.index_cast(T.i64, m_idx * fx.Index(k * 2))
-        c_bytes = arith.index_cast(T.i64, m_idx * fx.Index(n * 2))
+        acc_init = fx.Vector.filled(4, 0.0, fx.Float32)
+        a_bytes = fx.Int64(m) * (k * 2)
+        c_bytes = fx.Int64(m) * (n * 2)
         a_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(A)), num_records_bytes=a_bytes
         )
@@ -215,12 +235,11 @@ def compile_gemm_a16w16_skinny_gfx950(
 
         buf_i64 = fx.Int64(fx.ptrtoint(buf_ptr))
         wave_off = rocdl.readfirstlane(
-            T.i64,
-            arith.index_cast(
-                T.i64, fx.Index(wid) * arith.constant(WAVE_ELEMS * 2, index=True)
-            ),
+            T.i64, fx.Int64(wid * (WAVE_ELEMS * 2)).ir_value()
         )
-        wave_lds = buffer_ops.get_element_ptr(create_llvm_ptr(buf_i64, 3), wave_off)
+        wave_lds = buffer_ops.get_element_ptr(
+            create_llvm_ptr(buf_i64, fx.AddressSpace.Shared), wave_off
+        )
 
         # per-lane global byte offset of chunk 0, one per DMA instruction
         def chunk0_offset(i):
@@ -232,12 +251,10 @@ def compile_gemm_a16w16_skinny_gfx950(
             else:
                 # relative to b_rsrc, which is already based at slab n0
                 g = ((r - TA) * k + k0 + c * DMA_VEC) * 2
-            return arith.index_cast(T.i32, g)
+            return fx.Int32(g)
 
         vofs = [None] * IPC
-        chunk_soff = [
-            arith.constant(j * KC * 2, type=T.i32) for j in range_constexpr(CHUNKS)
-        ]
+        chunk_soff = [fx.Int32(j * KC * 2) for j in range_constexpr(CHUNKS)]
 
         def issue_chunk(j):
             stage = j % ST
@@ -254,10 +271,12 @@ def compile_gemm_a16w16_skinny_gfx950(
                     # address math from being hoisted in front of it
                     vofs[i] = chunk0_offset(i)
                 # the chunk's K offset goes in soffset: an instruction offset
-                # would also shift the LDS destination of the DMA
+                # would also shift the LDS destination of the DMA.
+                # llvm.inline_asm is a raw dialect op, so the typed operands
+                # have to be unwrapped here.
                 llvm.InlineAsmOp(
                     None,
-                    [lds_p, vofs[i], rsrc, chunk_soff[j]],
+                    [lds_p, vofs[i].ir_value(), rsrc, chunk_soff[j].ir_value()],
                     "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"
                     + cpol
                     + " lds",
@@ -347,18 +366,15 @@ def compile_gemm_a16w16_skinny_gfx950(
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         )
                         tot = v if const_expr(w == 0) else tot + v
-                    out_v = arith.truncf(T.vec(4, T.bf16), _to_raw(tot))
-                    c_off = arith.index_cast(T.i32, (mf_s * 16 + rr) * n + n0 + cg * 4)
+                    out_v = tot.to(fx.BFloat16)
+                    c_off = fx.Int32((mf_s * 16 + rr) * n + n0 + cg * 4)
                     buffer_ops.buffer_store(out_v, c_rsrc, c_off)
 
                 if const_expr(base + BLOCK_THREADS <= EPI_SLOTS):
                     reduce_store(mf_s, cg, rr)
                 else:
-                    in_sl = arith.cmpi(arith.CmpIPredicate.ult, sl, fx.Index(EPI_SLOTS))
-                    sl_if = scf.IfOp(in_sl, results_=[], has_else=False)
-                    with ir.InsertionPoint(sl_if.then_block):
+                    if sl < EPI_SLOTS:
                         reduce_store(mf_s, cg, rr)
-                        scf.YieldOp([])
             return
 
         # partials -> this wave's own LDS region, row-major fp32: red[w][row][col]
@@ -373,9 +389,7 @@ def compile_gemm_a16w16_skinny_gfx950(
                     )
         gpu.barrier()
 
-        is_out = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Index(OUT_VECS))
-        out_if = scf.IfOp(is_out, results_=[], has_else=False)
-        with ir.InsertionPoint(out_if.then_block):
+        if tid < OUT_VECS:
             r = tid // VEC_PER_ROW
             c = (tid % VEC_PER_ROW) * DMA_VEC
             rc_off = r * TNR + c
@@ -386,10 +400,9 @@ def compile_gemm_a16w16_skinny_gfx950(
                     result_type=fx.Vector.make_type(DMA_VEC, fx.Float32),
                 )
                 tot = v if const_expr(w == 0) else tot + v
-            out_v = arith.truncf(T.vec(DMA_VEC, T.bf16), _to_raw(tot))
-            c_off = arith.index_cast(T.i32, r * n + n0 + c)
+            out_v = tot.to(fx.BFloat16)
+            c_off = fx.Int32(r * n + n0 + c)
             buffer_ops.buffer_store(out_v, c_rsrc, c_off)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_skinny_kernel(
