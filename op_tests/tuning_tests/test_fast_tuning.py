@@ -649,6 +649,81 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(candidate["err1"], "1.1%")
         self.assertEqual(candidate["err2"], "1.1%")
 
+    def _run_ordinary_candidate(self, first_output, timed_output):
+        import torch
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = [
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+        ]
+        args = SimpleNamespace(fast_scan=False, errRatio=0.1, warmup=1, iters=10)
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+        }
+        candidate = self._candidate("pair")
+        candidate.update(block_m=16)
+        with (
+            mock.patch.object(
+                tuner, "_port_e2e", side_effect=[first_output, timed_output]
+            ),
+            mock.patch.object(tuner, "_torch_ref", return_value=torch.ones(4, 8)),
+            mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
+            mock.patch(
+                "aiter.test_common.run_perftest",
+                side_effect=lambda operation, *inputs, **kwargs: (
+                    operation(*inputs),
+                    5.0,
+                ),
+            ),
+        ):
+            tuner._run_candidate(row, candidate, args, data=self._pipeline_data())
+        return candidate
+
+    def test_ordinary_search_rejects_unstable_timed_output(self):
+        import torch
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        # The launch before timing matches the reference; only the timed one
+        # does not.
+        for name, timed_output in (
+            ("non-finite", torch.full((4, 8), float("nan"))),
+            # cosine diff of 0.5 * ref against ref: 1 - 1 / 1.25 = 0.2.
+            ("inaccurate", torch.full((4, 8), 0.5)),
+        ):
+            with (
+                self.subTest(name),
+                self.assertRaises(gemm_moe_tune.Mxfp4AccuracyError),
+            ):
+                self._run_ordinary_candidate(torch.ones(4, 8), timed_output)
+
+    def test_ordinary_search_reports_the_larger_of_both_errors(self):
+        import torch
+
+        exact, drifted = torch.ones(4, 8), torch.full((4, 8), 0.8)
+        for name, first_output, timed_output in (
+            ("timed output drifts", exact, drifted),
+            ("first output drifts", drifted, exact),
+        ):
+            with self.subTest(name):
+                candidate = self._run_ordinary_candidate(first_output, timed_output)
+
+                # cosine diff of 0.8 * ref against ref: 1 - 1.6 / 1.64.
+                self.assertAlmostEqual(candidate["_err"], 1 - 1.6 / 1.64)
+                self.assertEqual(candidate["err1"], "2.4%")
+
     def test_accuracy_failure_rejects_only_the_candidate(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
