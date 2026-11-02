@@ -10,10 +10,42 @@ import os
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import _run_compiled, ptr_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
+
+
+def _launch_address(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Rank-1 tensor at ``tensor``'s base address.
+
+    The launcher cache must not specialize on buffer rank. ``view(-1)`` does
+    that for a contiguous buffer. Compact FP4 scales are a strided window on
+    the dispatch-wire pitch, so that view is rejected. The kernel steps rows
+    with ``a_scale_row_stride_bytes`` and only needs the base pointer, which a
+    unit-stride span of the pitched storage still provides.
+    """
+    if tensor.numel() == 0:
+        empty = tensor if tensor.dtype == dtype else tensor.view(dtype)
+        return empty.view(0)
+    if not tensor.is_contiguous():
+        last = 0
+        for size, stride in zip(tensor.shape, tensor.stride()):
+            if size > 1:
+                last += (size - 1) * stride
+        span = last + 1
+        # view(dtype) needs the pitched span to be a whole number of elements.
+        # The bytes in between rows are the wire padding, so rounding up to
+        # the dtype stays inside the row pitch.
+        byte_span = span * tensor.element_size()
+        unit = dtype.itemsize
+        if byte_span % unit:
+            byte_span = (byte_span + unit - 1) // unit * unit
+            span = byte_span // tensor.element_size()
+        tensor = torch.as_strided(tensor, (span,), (1,))
+    if tensor.dtype != dtype:
+        tensor = tensor.view(dtype)
+    return tensor.view(-1)
 
 
 def _select_bool_env(name: str, csv_value: int) -> int:
@@ -145,6 +177,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    m_align=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -176,7 +209,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = current_stream_arg()
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
@@ -279,14 +312,15 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers,
         rolled_drain,
         int(a_preshuffled),
+        int(m_align),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
         out.view(-1),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32).view(-1),
-        w_scales.view(torch.int32).view(-1),
+        _launch_address(a_scales, torch.int32),
+        _launch_address(w_scales, torch.int32),
         contiguous_m,
         stream,
         N,
