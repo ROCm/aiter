@@ -64,3 +64,7 @@ def test_fused_moe_blockscale_token_ignores_other_routing(inter_dim, token):
             f"rerouting the last {moved} tokens to experts {first}..{first + TOPK - 1} "
             f"moved the others by {err:.2f} of the output range"
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
