@@ -545,10 +545,10 @@ def mp_tuner(
     logged_error_types = (
         set()
     )  # Track error types that already logged to avoid duplicates
+    mapping_error_tasks = set()
 
     while remaining_tasks:
         completed_this_round = []
-        dummy_failed_tasks = []
         consecutive_timeouts = 0
         half_gpu = max(1, (mp_num + 1) // 2)
 
@@ -634,10 +634,9 @@ def mp_tuner(
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
                 is_accelerator_error = _is_accelerator_error(e)
-                # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
-                    dummy_failed_tasks.append((k, "mapping error"))
+                    mapping_error_tasks.add(k)
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
@@ -677,6 +676,17 @@ def mp_tuner(
         # Remove completed tasks from remaining list
         for item in completed_this_round:
             remaining_tasks.remove(item)
+        remaining_task_indices = {k for k, _ in remaining_tasks}
+        mapping_error_tasks.intersection_update(remaining_task_indices)
+
+        # Mapping errors are symptoms of a worker restart, not necessarily the
+        # root failure. Keep polling other tasks so timeout/worker-exit handling
+        # can identify the cause. If every remaining task has a stale mapping,
+        # rebuild the pool rather than livelocking on the tail.
+        if remaining_tasks and all(
+            k in mapping_error_tasks for k, _ in remaining_tasks
+        ):
+            pool_restart_needed = True
 
         # If pool restart needed due to crash, restart pool and resubmit remaining tasks
         if pool_restart_needed and remaining_tasks:
@@ -711,6 +721,7 @@ def mp_tuner(
 
             # Reset pool restart flag
             pool_restart_needed = False
+            mapping_error_tasks.clear()
             print(
                 f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n",
                 flush=True,
