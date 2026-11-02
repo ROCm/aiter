@@ -5,12 +5,14 @@
 """The two GEMMs: QK^T and PV."""
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import probability_swap_pairs
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _anchor_v_o,
@@ -122,7 +124,31 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         for pks in range_constexpr(self.traits.PV_K_STEPS):
             p_base = pks * 8
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
-        return self._pack_fp8_i32x8(f32)
+        packed = self._pack_fp8_i32x8(f32)
+        if const_expr(self.traits.V_SHUFFLED):
+            # Match V's intact 16-token vectors after rounding P to fp8.
+            words = Vec(packed)
+            pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            reordered = []
+            pairs = probability_swap_pairs()
+            for i in range_constexpr(len(pairs)):
+                first, second = pairs[i]
+                # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
+                # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
+                # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at v0.4.0.
+                pair = rocdl.permlane32_swap(
+                    pair_ty,
+                    fx.as_ir_value(words[first]),
+                    fx.as_ir_value(words[second]),
+                    False,
+                    False,
+                )
+                reordered += [
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
+                    fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
+                ]
+            packed = Vec.from_elements(reordered, fx.Int32).ir_value()
+        return packed
 
     def _pv_fp8_direct(self, p_fp8, v_v, v_o):
         v_o = _anchor_v_o(self.traits, v_o)

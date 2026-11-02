@@ -5,7 +5,8 @@
 """FlyDSL Flash Attention fp8 (e4m3fn) forward for gfx950.
 
 Q/K/V are pre-quantized e4m3fn with per-tensor fp32 shape-[1] descales; the
-output is bf16. Dense, packed-varlen and split-K.
+output is bf16 (or f16 when ``out`` is f16, non-split-K). Dense, packed-varlen and
+split-K.
 """
 
 from __future__ import annotations
@@ -241,6 +242,7 @@ def _build_fp8(
     block_m: int = 256,
     batch_interleave_group: int = 1,
     return_lse: bool = False,
+    out_dtype: str = "bf16",
 ):
     """Build (and cache) the gfx950 fp8 launcher (dense, packed varlen, or split-K)."""
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
@@ -264,6 +266,7 @@ def _build_fp8(
         block_m=block_m,
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
+        out_dtype=out_dtype,
     )
 
 
@@ -315,7 +318,8 @@ def flydsl_flash_attn_fp8_func(
             ``None`` autotunes it.
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
-        out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
+        out: Optional pre-allocated bf16 or f16 (non-split-K) output of shape
+            ``q.shape[:-1] + (Dv,)``.
         return_lse: Also return the fp32 log-sum-exp of the softmax logits.
         lse: Optional pre-allocated fp32 LSE buffer; allocated here when None.
             Dense: ``[B, H, Sq]``. Varlen: ``[H, total_q]``.
@@ -326,7 +330,8 @@ def flydsl_flash_attn_fp8_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``, or
+        bf16 (or ``out.dtype``) output tensor of shape
+        ``q.shape[:-1] + (v.shape[-1],)``, or
         ``(out, lse)`` when ``return_lse``.
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
@@ -347,6 +352,7 @@ def flydsl_flash_attn_fp8_func(
         )
 
     _auto_splits = num_kv_splits is None
+    _out_f16 = out is not None and out.dtype == torch.float16
     if _auto_splits:
         num_kv_splits = 1
 
@@ -509,7 +515,7 @@ def flydsl_flash_attn_fp8_func(
         else int(fp8_block_m)
     )
     splitk_supported = Sq >= 384 or (cross and not causal)
-    if _auto_splits and splitk_supported:
+    if _auto_splits and splitk_supported and not _out_f16:
         _auto = _fp8_auto_kv_splits(
             B, H, Sq, _skv_eff, causal, _num_cu(q.device), block_m=_block_m
         )
@@ -564,6 +570,7 @@ def flydsl_flash_attn_fp8_func(
                 B, causal, cross, int(num_kv_splits)
             ),
             return_lse=return_lse,
+            out_dtype="f16" if _out_f16 else "bf16",
         )
 
         _out_shape = tuple(q.shape[:-1]) + (Dv,)
@@ -573,9 +580,9 @@ def flydsl_flash_attn_fp8_func(
             raise ValueError(
                 f"flydsl_flash_attn_fp8_func: out must be {_out_shape}, got {tuple(out.shape)}"
             )
-        elif out.dtype != torch.bfloat16:
+        elif out.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(
-                f"flydsl_flash_attn_fp8_func: fp8 output must be bf16, got {out.dtype}"
+                f"flydsl_flash_attn_fp8_func: fp8 output must be bf16 or f16, got {out.dtype}"
             )
         elif not out.is_contiguous():
             raise ValueError(

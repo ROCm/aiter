@@ -6,9 +6,16 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import (
+    k_stripe_layout,
+    shuffled_v_copy,
+    shuffled_v_layout,
+    shuffled_v_tokens,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _ds_read_tr8_b64_imm,
@@ -28,15 +35,73 @@ class DualwaveFp8QLoader(DualwaveFp8KernelContext):
             row = c // chunks_per_row
             dchunk = c % chunks_per_row
             src_elem = self.q_gmem_elem_offset + row * self.stride_q_n_v + dchunk * 16
+            if const_expr(traits.GQA_PACK_M):
+                # The descriptor stays uniform; only the byte offset gathers heads.
+                src_elem = (
+                    self.q_gmem_elem_offset
+                    + (row // traits.GQA_GROUP_SIZE) * self.stride_q_n_v
+                    + (row % traits.GQA_GROUP_SIZE) * traits.HEAD_DIM
+                    + dchunk * 16
+                )
             lds_addr = self.lds_q_base_idx + c * 16
             self.buffer_load_lds_128(self.q_div, lds_addr, src_elem, 0)
 
 
-class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
+class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
+    def load_block_table_to_lds(self):
+        traits = self.traits
+
+        @flyc.jit
+        def _run():
+            segment_tiles = self.split_t_end - self.split_t0
+            staged_tiles = (segment_tiles > traits.NUM_PREFETCH_K).select(
+                segment_tiles, fx.Index(traits.NUM_PREFETCH_K)
+            )
+            num_kv_tiles = (self.seqlen_kv_v + traits.BLOCK_N - 1) // traits.BLOCK_N
+            for pas in range_constexpr(traits.PAGED_BT_LDS_SIZE // traits.BLOCK_SIZE):
+                local_tile = self.tid + pas * traits.BLOCK_SIZE
+                if local_tile < staged_tiles:
+                    bt_ptr = fx.recast_iter(fx.Int32, self.lds.bt.ptr)
+                    dst = fx.add_offset(bt_ptr, fx.Int32(local_tile))
+                    # Empty segments and rounded pipeline tiles still resolve to
+                    # an in-bounds page before descriptor bounds zero their data.
+                    fx.ptr_store(fx.Int32(0), dst)
+                    tile = fx.Index(self.split_t0) + local_tile
+                    if (local_tile < segment_tiles) & (tile < num_kv_tiles):
+                        row = self.batch_idx * self.block_table_stride_v + tile
+                        reg = fx.make_rmem_tensor(1, fx.Int32)
+                        fx.copy(
+                            self.bt_atom,
+                            fx.slice(self.bt_div, (None, fx.Int32(row))),
+                            reg,
+                        )
+                        page = Vec(fx.memref_load_vec(reg))[0]
+                        fx.ptr_store(fx.Int32(page), dst)
+
+        _run()
+
+    def begin_page_ids(self, tiles):
+        handles = []
+        for tile in tiles:
+            last = fx.Index(self.split_t_end) - 1
+            clamped = (tile < last).select(tile, last)
+            first = fx.Index(self.split_t0)
+            clamped = (clamped > first).select(clamped, first)
+            bt = self.lds.bt.view(fx.make_layout(self.traits.PAGED_BT_LDS_SIZE, 1))
+            handles.append(fx.memref_load(bt, fx.Int32(clamped - first)))
+        return handles
+
+    def end_page_ids(self, handles):
+        rocdl.s_waitcnt(lgkmcnt=0)
+        # Page ids must be wave-uniform SGPRs for buffer descriptors; the pinned FlyDSL exports no stable readfirstlane.
+        return [fx.Int64(fx.Int32(rocdl.readfirstlane(T.i32, h))) for h in handles]
+
+
+class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def load_k(self, tile_start, buf_id):
+    def load_k(self, tile_start, buf_id, page_id=None):
         """DMA one K tile into LDS, one pass per head-dim band.
 
         A band's LDS line is this wave's n-rows of `chunk` bytes, row-contiguous,
@@ -45,7 +110,59 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
         """
         traits = self.traits
         eb = traits.ELEM_BYTES
+        k_div = self.k_div
+        if const_expr(traits.PAGED):
+            k_div = self.kv_page_div("k", page_id, tile_start)
         k_lds_byte_base = self.lds_kv_base_idx + self.k_buf_base(buf_id) * eb
+        if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+            self._load_k_bn64(k_div, tile_start, k_lds_byte_base)
+        else:
+            self._load_k_bands(k_div, tile_start, k_lds_byte_base)
+
+    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start):
+        """Element index of a shuffled-layout K chunk, or an OOB sentinel past the tail."""
+        traits = self.traits
+        layout = fx.make_layout(
+            (traits.HEAD_DIM // 16, traits.BLOCK_N, 16),
+            (traits.BLOCK_N * 16, 16, 1),
+        )
+        src_elem = self.kv_gmem_elem_offset + fx.Index(
+            fx.get_scalar(
+                fx.crd2idx((fx.Int32(global_d // 16), fx.Int32(n_in_tile), 0), layout)
+            )
+        )
+        # Shuffled tokens are strided across the page, so a prefix descriptor
+        # bound cannot mask the logical K tail.
+        valid = n_in_tile + tile_start < self.seqlen_kv_v
+        return valid.select(src_elem, fx.Index(0x7FFFFFF0))
+
+    def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base):
+        traits = self.traits
+        ownership = k_stripe_layout(traits.HEAD_DIM, traits.VEC_KV)
+        logical = fx.make_layout((traits.BLOCK_N, traits.HEAD_DIM), (1, traits.BLOCK_N))
+        for pas in range_constexpr(2):
+            stripe = self.wave_id_uni + pas * traits.NUM_WAVES
+            element = fx.crd2idx(
+                (
+                    fx.Int32(self.lane_in_warp),
+                    fx.Int32(self.wave_id) + pas * traits.NUM_WAVES,
+                ),
+                ownership,
+            )
+            coord = fx.idx2crd(element, logical)
+            n_in_tile = fx.Index(fx.get(coord, 0))
+            global_d = fx.Index(fx.get(coord, 1))
+            src_elem = (
+                self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
+            )
+            if const_expr(traits.K_SHUFFLED):
+                src_elem = self._shuffled_k_src_elem(global_d, n_in_tile, tile_start)
+            lds_addr = k_lds_byte_base + stripe * traits.K_BAND_LINE_STRIDE[0]
+            self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
+
+    def _load_k_bands(self, k_div, tile_start, k_lds_byte_base):
+        traits = self.traits
+        eb = traits.ELEM_BYTES
         rows_per_wave = -(-traits.BLOCK_N // traits.NUM_WAVES)
         for d in range_constexpr(self.NUM_DMA_K):
             lanes_per_row = traits.K_BAND_CHUNK[d] // traits.VEC_KV
@@ -64,12 +181,22 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                 src_elem = (
                     self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
                 )
+                if const_expr(traits.K_SHUFFLED):
+                    src_elem = self._shuffled_k_src_elem(
+                        global_d, n_in_tile, tile_start
+                    )
                 lds_addr = band_base + pas * traits.WARP_SIZE * traits.VEC_KV * eb
                 active = min(slots - pas * traits.WARP_SIZE, traits.WARP_SIZE)
                 if const_expr(active == traits.WARP_SIZE):
-                    self.buffer_load_lds_128(
-                        self.k_div, lds_addr, src_elem, tile_start * self.stride_kv_n_v
-                    )
+                    if const_expr(traits.PAGED):
+                        self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
+                    else:
+                        self.buffer_load_lds_128(
+                            self.k_div,
+                            lds_addr,
+                            src_elem,
+                            tile_start * self.stride_kv_n_v,
+                        )
                 else:
                     self._load_k_band_partial_wave(
                         lds_addr, src_elem, tile_start, active
@@ -86,11 +213,34 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
 
         _run()
 
-    def load_v(self, tile_start, buf_id):
-        self._stage_v_fp8_block_dma(tile_start, buf_id)
+    def load_v(self, tile_start, buf_id, page_id=None):
+        if const_expr(self.traits.V_SHUFFLED):
+            self._stage_v_fp8_coalesced(tile_start, buf_id, page_id)
+        else:
+            self._stage_v_fp8_block_dma(tile_start, buf_id, page_id)
 
-    def _stage_v_fp8_block_dma(self, tile_start, buf_id):
+    def _stage_v_fp8_coalesced(self, tile_start, buf_id, page_id):
         traits = self.traits
+        v_div = self.kv_page_div("v", page_id, tile_start)
+        aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
+        buf_off = buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
+        num_dma = traits.BLOCK_N * traits.HEAD_DIM_V // 1024
+        for pas in range_constexpr(num_dma // traits.NUM_WAVES):
+            src_elem = (
+                self.v_gmem_elem_offset + (self.tid + pas * traits.BLOCK_SIZE) * 16
+            )
+            lds_addr = (
+                aligned_base
+                + buf_off
+                + (self.wave_id_uni + pas * traits.NUM_WAVES) * 1024
+            )
+            self.buffer_load_lds_128(v_div, lds_addr, src_elem, 0)
+
+    def _stage_v_fp8_block_dma(self, tile_start, buf_id, page_id=None):
+        traits = self.traits
+        v_div = self.v_div
+        if const_expr(traits.PAGED):
+            v_div = self.kv_page_div("v", page_id, tile_start)
         nbands = traits.HEAD_DIM_V // 16
         v_tile_bytes = (traits.BLOCK_N // 8) * nbands * 128
         buf_off = buf_id * v_tile_bytes
@@ -124,9 +274,12 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                 self.v_gmem_elem_offset + fx.Index(n) * self.stride_v_n_v + d_block * 16
             )
             if const_expr(num_dma % traits.NUM_WAVES == 0 or pas < passes - 1):
-                self.buffer_load_lds_128(
-                    self.v_div, lds_addr, src_elem, tile_start * self.stride_v_n_v
-                )
+                if const_expr(traits.PAGED):
+                    self.buffer_load_lds_128(v_div, lds_addr, src_elem, 0)
+                else:
+                    self.buffer_load_lds_128(
+                        self.v_div, lds_addr, src_elem, tile_start * self.stride_v_n_v
+                    )
             else:
                 self._load_v_group_if_in_tile(
                     lds_addr, src_elem, tile_start, dma_id, num_dma
@@ -157,7 +310,9 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         n_lo = self.lane_mod_32
         n_hi = self.lane_mod_32 + 32
 
-        rows_per_line = traits.NUM_WAVES
+        rows_per_line = (
+            8 if traits.BODY_VARIANT == "conventional_bn64" else traits.NUM_WAVES
+        )
 
         def _read_strip(key):
             out = []
@@ -173,8 +328,87 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
 
         return (_read_strip(n_lo), _read_strip(n_hi))
 
-    def load_v(self, buf_id):
-        return self._load_v_fp8_block(buf_id)
+    def load_v(self, buf_id, tile_start=None):
+        if const_expr(
+            self.traits.BODY_VARIANT == "conventional_bn64" and self.traits.V_SHUFFLED
+        ):
+            packs = self._load_v_fp8_bn64(buf_id, tile_start)
+        elif const_expr(self.traits.V_SHUFFLED):
+            packs = self._load_v_fp8_coalesced(buf_id, tile_start)
+        else:
+            packs = self._load_v_fp8_block(buf_id)
+        return packs
+
+    def _load_v_fp8_bn64(self, buf_id, tile_start):
+        traits = self.traits
+        full_tile = fx.Int64(tile_start) + traits.BLOCK_N <= fx.Int64(self.seqlen_kv_v)
+
+        @flyc.jit
+        def _run():
+            packs = [[fx.Int64(0).ir_value()] * traits.D_CHUNKS for _ in range(4)]
+            if full_tile:
+                packs = self._load_v_fp8_coalesced(buf_id, tile_start, mask_tail=False)
+            else:
+                packs = self._load_v_fp8_coalesced(buf_id, tile_start)
+            return packs
+
+        return _run()
+
+    def _load_v_fp8_coalesced(self, buf_id, tile_start, mask_tail=True):
+        traits = self.traits
+        aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
+        tile_base = aligned_base + buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
+        copy_atom, thr_copy = shuffled_v_copy(self.lane)
+        ptr_ty = fx.PointerType.get(
+            fx.Float8E4M3FN.ir_type, fx.AddressSpace.Shared, alignment=16
+        )
+        vt_base = fx.recast_iter(ptr_ty, self.lds.vt.ptr)
+        tile = fx.make_view(
+            fx.add_offset(vt_base, fx.Int32(tile_base - self.lds_vt_base_idx)),
+            shuffled_v_layout(traits.HEAD_DIM_V),
+        )
+        source = thr_copy.partition_S(tile)
+        token_layout = shuffled_v_tokens()
+        masks = []
+        if const_expr(mask_tail):
+            for half in range_constexpr(2):
+                for word in range_constexpr(4):
+                    token = fx.Int32(tile_start) + fx.Int32(
+                        fx.get_scalar(
+                            fx.crd2idx(
+                                (fx.Int32(self.lane), half * 16 + word * 4),
+                                token_layout,
+                            )
+                        )
+                    )
+                    count = self.seqlen_kv_i32 - token
+                    count = (count > 0).select(count, fx.Int32(0))
+                    count = (count < 4).select(count, fx.Int32(4))
+                    # Shift a 32-bit all-ones word; avoid shifting by the word width.
+                    shift = (count > 0).select((4 - count) * 8, fx.Int32(24))
+                    mask = fx.arith.shrui(fx.Int32(-1), shift)
+                    masks.append((count > 0).select(mask, fx.Int32(0)))
+        packs = [[None] * traits.D_CHUNKS for _ in range(4)]
+        for dc in range_constexpr(traits.D_CHUNKS):
+            for half in range_constexpr(2):
+                fragment = fx.make_rmem_tensor(16, fx.Float8E4M3FN)
+                fx.copy(copy_atom, source[(None, half), dc, 0], fragment)
+                words = Vec(fragment.load()).bitcast(fx.Int32)
+                if const_expr(mask_tail):
+                    # Integer masks remove invalid bytes without sanitizing valid NaNs.
+                    words = words & Vec.from_elements(
+                        masks[4 * half : 4 * half + 4], fx.Int32
+                    )
+                for pair in range_constexpr(2):
+                    packs[2 * half + pair][dc] = (
+                        Vec.from_elements(
+                            [fx.Int32(words[2 * pair]), fx.Int32(words[2 * pair + 1])],
+                            fx.Int32,
+                        )
+                        .bitcast(fx.Int64)[0]
+                        .ir_value()
+                    )
+        return packs
 
     def _load_v_fp8_block(self, buf_id):
         traits = self.traits

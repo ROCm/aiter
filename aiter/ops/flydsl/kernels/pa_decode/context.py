@@ -37,7 +37,9 @@ class PaDecodeContext:
         planned_start,
         planned_end,
         planned_context,
+        query_scale_ptr,
     ):
+        self.query_scale_ptr = query_scale_ptr
         self.traits = traits
         self.shared_storage = shared_storage
         self.pmax_ptr = pmax_ptr
@@ -113,6 +115,11 @@ class PaDecodeContext:
                 key_scale
             )
             self.v_scale_f = fx.Float32(value_scale)
+        if const_expr(self.traits.FP8_QUERY):
+            query_descale = fx.ptr_load(
+                fx.recast_iter(fx.Float32, self.query_scale_ptr)
+            )
+            self.scale_qk = self.scale_qk * query_descale
         self.NEG_INF = fx.Float32(float("-inf"))
         self.ZERO_F = fx.Float32(0.0)
         # Finite or -inf scores permit nnan's bare max instructions.
