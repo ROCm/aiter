@@ -77,27 +77,32 @@ def generate_qk_norm_rope_inputs(
     return q, k, q_weight, k_weight, cos, sin
 
 
-@pytest.mark.parametrize(
-    "B, S_q, S_k, heads, head_dim",
-    [
-        (1, 1560, 1560, 12, 128),
-        (1, 1560, 512, 12, 128),
-        (2, 333, 333, 24, 128),
-        (1, 777, 512, 40, 128),
-        (1, 64, 64, 3, 64),
-        (1, 5, 0, 12, 128),
-    ],
-)
+_SHAPES = [
+    (1, 1560, 1560, 12, 128),
+    (1, 1560, 512, 12, 128),
+    (2, 333, 333, 24, 128),
+    (1, 777, 512, 40, 128),
+    (1, 64, 64, 3, 64),
+    (1, 5, 0, 12, 128),
+]
+# S_k != S_q is cross-attention (Wan attn2): no RoPE, and q and k come from
+# different inputs, so no fused QKV.
+_CASES = [
+    (*shape, rope, fused_qkv)
+    for shape in _SHAPES
+    for rope in (True, False)
+    for fused_qkv in (False, True)
+    if shape[1] == shape[2] or not (rope or fused_qkv)
+]
+
+
+@pytest.mark.parametrize("B, S_q, S_k, heads, head_dim, rope, fused_qkv", _CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("rope", [True, False])
-@pytest.mark.parametrize("fused_qkv", [False, True])
 def test_fused_qk_norm_rope_across_heads(
-    B, S_q, S_k, heads, head_dim, dtype, rope, fused_qkv
+    B, S_q, S_k, heads, head_dim, rope, fused_qkv, dtype
 ):
     if get_arch() not in SUPPORTED_ARCHS:
         pytest.skip(f"no fused_qk_norm_rope_across_heads config for {get_arch()}")
-    if (rope or fused_qkv) and S_k != S_q:
-        pytest.skip("RoPE and a fused QKV need S_k == S_q")
     q, k, wq, wk, cos, sin = generate_qk_norm_rope_inputs(
         B, S_q, S_k, heads, head_dim, dtype, rope, fused_qkv
     )
