@@ -35,11 +35,13 @@ launches can be captured into a CUDA graph and replayed.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from typing_extensions import Self
 
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
@@ -68,6 +70,8 @@ from .stage2 import (
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
 
+logger = logging.getLogger(__name__)
+
 WORLD_SIZE = 16
 GPUS_PER_NODE = 8
 # Stage1 tiles are 32 rows; GMM1 groups tile_group of them, GEMM2 reads them
@@ -82,22 +86,39 @@ _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 # Window regions read or written by the rail (GDA RDMA).  Only this prefix of
 # the window is registered with the NIC (see _build_cco_runtime).
 _RDMA_STAGE1_REGIONS = (
-    "dispatch_staging", "remote_dispatch_rx", "remote_chunk_ready",
-    "remote_chunk_credit", "sparse_remote_qp_ready", "sparse_remote_credit",
-    "rail_count_inbox", "rail_count_inbox_ready",
+    "dispatch_staging",
+    "remote_dispatch_rx",
+    "remote_chunk_ready",
+    "remote_chunk_credit",
+    "sparse_remote_qp_ready",
+    "sparse_remote_credit",
+    "rail_count_inbox",
+    "rail_count_inbox_ready",
 )
 _RDMA_STAGE2_REGIONS = (
-    "node_accumulator", "remote_partial_rx", "return_group_ready", "return_consumed",
+    "node_accumulator",
+    "remote_partial_rx",
+    "return_group_ready",
+    "return_consumed",
 )
 # Parity-planed regions as stage2 kernel1 / kernel2 expect them, in order.
 _K1_EPOCH_PLANES = (
-    "h1_output_q", "h1_output_scale", "tile_expert_sorted", "num_valid",
-    "tile_row_source_sorted", "tile_row_weight_sorted",
+    "h1_output_q",
+    "h1_output_scale",
+    "tile_expert_sorted",
+    "num_valid",
+    "tile_row_source_sorted",
+    "tile_row_weight_sorted",
 )
 _K2_PARITY_PLANES = (
-    "plane_slot_inbox", "node_dest_slot_mask", "node_accumulator",
-    "remote_partial_rx", "node_partial_ready", "return_group_ready",
-    "return_consumed", "plane_slot_arrived",
+    "plane_slot_inbox",
+    "node_dest_slot_mask",
+    "node_accumulator",
+    "remote_partial_rx",
+    "node_partial_ready",
+    "return_group_ready",
+    "return_consumed",
+    "plane_slot_arrived",
 )
 
 
@@ -123,9 +144,17 @@ def _align_up(value: int, alignment: int) -> int:
     return (int(value) + int(alignment) - 1) // int(alignment) * int(alignment)
 
 
-def build_window_layout(*, model_dim: int, inter_dim: int, experts: int, topk: int,
-                        max_tok_per_rank: int, max_routes_per_token_per_rank: int,
-                        tile_group: int, comm_quant: str = "fp8") -> TwoKernelArenaLayout:
+def build_window_layout(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    max_tok_per_rank: int,
+    max_routes_per_token_per_rank: int,
+    tile_group: int,
+    comm_quant: str = "fp8",
+) -> TwoKernelArenaLayout:
     """Stage1 and Stage2 layouts sharing one registered window.
 
     Stage2 is embedded right after Stage1's RDMA prefix, so every rail
@@ -133,18 +162,28 @@ def build_window_layout(*, model_dim: int, inter_dim: int, experts: int, topk: i
     route capacity.
     """
     # Rail row width, as k2 sizes it (RECORD_BYTES): fp8 rows carry e8m0 scales.
-    rail_record_bytes = (model_dim + model_dim // 32 if comm_quant == "fp8"
-                         else 2 * model_dim)
+    rail_record_bytes = (
+        model_dim + model_dim // 32 if comm_quant == "fp8" else 2 * model_dim
+    )
     stage2 = Stage2ArenaLayout.create(
-        hidden=model_dim, topk=topk, max_tokens=max_tok_per_rank,
-        world_size=WORLD_SIZE, gpus_per_node=GPUS_PER_NODE,
+        hidden=model_dim,
+        topk=topk,
+        max_tokens=max_tok_per_rank,
+        world_size=WORLD_SIZE,
+        gpus_per_node=GPUS_PER_NODE,
         rail_record_bytes=rail_record_bytes,
     )
     stage1 = Stage1ArenaLayout.create(
-        hidden=model_dim, inter=inter_dim, experts=experts, world_size=WORLD_SIZE,
-        gpus_per_node=GPUS_PER_NODE, topk=topk, max_tokens=max_tok_per_rank,
+        hidden=model_dim,
+        inter=inter_dim,
+        experts=experts,
+        world_size=WORLD_SIZE,
+        gpus_per_node=GPUS_PER_NODE,
+        topk=topk,
+        max_tokens=max_tok_per_rank,
         max_routes_per_token_per_rank=max_routes_per_token_per_rank,
-        block_m=TILE_M, tile_group=tile_group,
+        block_m=TILE_M,
+        tile_group=tile_group,
         embed_stage2_bytes=int(stage2.total_bytes),
     )
     return TwoKernelArenaLayout.compose(stage1, stage2)
@@ -370,6 +409,7 @@ class MegaMoEInternode:
             )
         except Exception:
             # A missing or unreadable table falls back to the built-in rules.
+            logger.debug("Stage2 tune lookup failed; using built-in rules", exc_info=True)
             tuned = None
         return tuned or {}
 
@@ -494,48 +534,48 @@ class MegaMoEInternode:
         arrival_delta = s2.region("plane_slot_arrived").offset - s2.region("plane_slot_inbox").offset
         arrival_delta_step = s2_plane("plane_slot_arrived") - s2_plane("plane_slot_inbox")
         a_tile_map = s1.region("tile_src_of_dst")
-        self._k1_ptrs = dict(
-            arg_aq=s1_addr("h1_output_q"), arg_ascale=s1_addr("h1_output_scale"),
-            arg_bq=self._w2.data_ptr(), arg_bscale=self._w2_scale.data_ptr(),
-            arg_eids=s1_addr("tile_expert_sorted"), arg_cumsum=s1_addr("num_valid"),
-            arg_stids=s1_addr("tile_row_source_sorted"),
-            arg_sweights=s1_addr("tile_row_weight_sorted"),
-            arg_trb=self._k1_trb.data_ptr(), arg_p2p=self._k1_peer_table.data_ptr(),
-            arg_arrival_count=self._k1_arrival_count.data_ptr(),
-            arg_generation=base + self._epoch_off, arg_a_tile_map=base + a_tile_map.offset,
-            row_capacity=s1.max_route_rows,
-        )
-        self._k1_compile = dict(
-            model_dim=self.model_dim, inter_dim=self.inter_dim, experts=self.epr,
-            topk=self.topk, npes=self.world_size, max_tok=self.mtpr,
-            recv_cap=self.world_size * self.mtpr,
-            comb_inp_nbytes=2 * self.mtpr * self.topk * self.model_dim * 2,
-            BN=self._gemm2_bn, cu_num=self._gemm2_cu, gpus_per_node=GPUS_PER_NODE,
-            arrival_delta=arrival_delta, arrival_delta_step=arrival_delta_step,
-            epoch_planes=tuple(s1.region(n).nbytes // 2 for n in _K1_EPOCH_PLANES),
-            a_tile_map_plane=a_tile_map.nbytes // 2,
+        self._k1_ptrs = {
+            "arg_aq": s1_addr("h1_output_q"), "arg_ascale": s1_addr("h1_output_scale"),
+            "arg_bq": self._w2.data_ptr(), "arg_bscale": self._w2_scale.data_ptr(),
+            "arg_eids": s1_addr("tile_expert_sorted"), "arg_cumsum": s1_addr("num_valid"),
+            "arg_stids": s1_addr("tile_row_source_sorted"),
+            "arg_sweights": s1_addr("tile_row_weight_sorted"),
+            "arg_trb": self._k1_trb.data_ptr(), "arg_p2p": self._k1_peer_table.data_ptr(),
+            "arg_arrival_count": self._k1_arrival_count.data_ptr(),
+            "arg_generation": base + self._epoch_off, "arg_a_tile_map": base + a_tile_map.offset,
+            "row_capacity": s1.max_route_rows,
+        }
+        self._k1_compile = {
+            "model_dim": self.model_dim, "inter_dim": self.inter_dim, "experts": self.epr,
+            "topk": self.topk, "npes": self.world_size, "max_tok": self.mtpr,
+            "recv_cap": self.world_size * self.mtpr,
+            "comb_inp_nbytes": 2 * self.mtpr * self.topk * self.model_dim * 2,
+            "BN": self._gemm2_bn, "cu_num": self._gemm2_cu, "gpus_per_node": GPUS_PER_NODE,
+            "arrival_delta": arrival_delta, "arrival_delta_step": arrival_delta_step,
+            "epoch_planes": tuple(s1.region(n).nbytes // 2 for n in _K1_EPOCH_PLANES),
+            "a_tile_map_plane": a_tile_map.nbytes // 2,
             # Place a tile group's m-blocks on one XCD only for G=2 (K3 TPR128,
             # DSV4 TPR256: GEMM2 -14~22us).  At G=4 it measured neutral to
             # +12us (K3 TPR512), so G=4 keeps the plain order.
-            m_group=2 if self._s1_tile["tile_group"] == 2 else 1,
-        )
+            "m_group": 2 if self._s1_tile["tile_group"] == 2 else 1,
+        }
 
         self._k2_scratch = torch.zeros(SCRATCH_WORDS, dtype=torch.int32, device=dev)
-        self._k2_compile = dict(
-            hidden=self.model_dim, max_tokens=self.mtpr, topk=self.topk, rank=self.rank,
-            gpus_per_node=GPUS_PER_NODE, num_qp=NUM_QP, return_chunk_tokens=self._chunk_tokens,
-            rail_quant=_COMM_QUANT[self.comm_quant],
-            inbox_off=s2_off("plane_slot_inbox"), inbox_bytes=s2_plane("plane_slot_inbox"),
-            slot_mask_off=s2_off("node_dest_slot_mask"),
-            accumulator_off=s2_off("node_accumulator"),
-            accumulator_bytes=s2_plane("node_accumulator"),
-            rx_off=s2_off("remote_partial_rx"), rx_bytes=s2_plane("remote_partial_rx"),
-            partial_ready_off=s2_off("node_partial_ready"),
-            group_ready_off=s2_off("return_group_ready"),
-            consumed_off=s2_off("return_consumed"), arrival_off=s2_off("plane_slot_arrived"),
-            s2_window_off=layout.stage2_offset, epoch_off=self._epoch_off,
-            parity_planes=tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
-        )
+        self._k2_compile = {
+            "hidden": self.model_dim, "max_tokens": self.mtpr, "topk": self.topk, "rank": self.rank,
+            "gpus_per_node": GPUS_PER_NODE, "num_qp": NUM_QP, "return_chunk_tokens": self._chunk_tokens,
+            "rail_quant": _COMM_QUANT[self.comm_quant],
+            "inbox_off": s2_off("plane_slot_inbox"), "inbox_bytes": s2_plane("plane_slot_inbox"),
+            "slot_mask_off": s2_off("node_dest_slot_mask"),
+            "accumulator_off": s2_off("node_accumulator"),
+            "accumulator_bytes": s2_plane("node_accumulator"),
+            "rx_off": s2_off("remote_partial_rx"), "rx_bytes": s2_plane("remote_partial_rx"),
+            "partial_ready_off": s2_off("node_partial_ready"),
+            "group_ready_off": s2_off("return_group_ready"),
+            "consumed_off": s2_off("return_consumed"), "arrival_off": s2_off("plane_slot_arrived"),
+            "s2_window_off": layout.stage2_offset, "epoch_off": self._epoch_off,
+            "parity_planes": tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
+        }
 
     # ------------------------------------------------------------------
     # forward
@@ -643,7 +683,7 @@ class MegaMoEInternode:
             runtime.window.close()
             runtime.memory.close()
 
-    def __enter__(self) -> "MegaMoEInternode":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:

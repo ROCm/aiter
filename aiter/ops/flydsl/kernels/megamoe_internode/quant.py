@@ -10,12 +10,12 @@ k1 的 T0 按 QP 切 token 段,每段一个 PUT 发出,不再有零散的 scale/
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import ReductionOp, T
 
 from .. import buffer_ops
-from ..mega_moe.quant import BLOCK, GROUP, _FP4_INV_MAX_POS_BITS
+from ..mega_moe.quant import _FP4_INV_MAX_POS_BITS, BLOCK, GROUP
 
 
 def rail_record_layout(hidden: int, topk: int):
@@ -38,10 +38,7 @@ def build_rail_record_quant(hidden: int, topk: int):
     assert scale_n >= 2 * topk, "ids/weights 由每 token 前 2*topk 个 group 线程顺带写"
     rec, off_q, off_s, off_i, off_w = rail_record_layout(hidden, topk)
 
-
-    @flyc.kernel(
-        name=f"per_1x32_mx_quant_fp4_n{hidden}_railrec_k{topk}_r{rec}"
-    )
+    @flyc.kernel(name=f"per_1x32_mx_quant_fp4_n{hidden}_railrec_k{topk}_r{rec}")
     def rec_quant_kernel(
         x: fx.Int64,
         topk_ids: fx.Int64,
@@ -113,7 +110,9 @@ def build_rail_record_quant(hidden: int, topk: int):
                     ids_rs, token * fx.Int32(topk) + gi, vec_width=1, dtype=T.i32
                 )
                 buffer_ops.buffer_store(
-                    v, out_rs, rec_base + fx.Int32(off_i) + gi * fx.Int32(4),
+                    v,
+                    out_rs,
+                    rec_base + fx.Int32(off_i) + gi * fx.Int32(4),
                     offset_is_bytes=True,
                 )
             if (gi >= fx.Int32(topk)) & (gi < fx.Int32(2 * topk)):

@@ -32,16 +32,19 @@ shape 一律参数化,不写死。tokens 不被 num_qp*chunk 整除时走尾块�
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import const_expr, range_constexpr, rocdl, gpu
-from flydsl.expr.typing import Int8, T, BFloat16, Float32
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import BFloat16, Float32, Int8, T
 from flydsl.runtime.device import get_rocm_arch
-from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load, _fabs_f32 as fabs_f32
-from . import communication as comm
-from ..tensor_shim import _run_compiled, buf_copy_store, ptr_buf_tensor
-from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
-from aiter.ops.flydsl.kernels import buffer_ops
-from .communication import release as _rail, ccqe_enabled as _rail_ccqe
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
+from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
+from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load
+from ..tensor_shim import _run_compiled, buf_copy_store, ptr_buf_tensor
+from . import communication as comm
+from .communication import ccqe_enabled as _rail_ccqe
+from .communication import release as _rail
+from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 # Tile shape: 32-row M tiles (one Stage1 tile each), K step 256.
@@ -251,9 +254,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
 
         @flyc.jit
-        def _count_and_publish():
-            if lane == fx.Int32(0):
-              if valid:
+        def _count_and_publish(valid, t, s, peer_base, dest_lid):
+            if (lane == fx.Int32(0)) & valid:
                 # Keyed by t, not by the destination-side slot: dest_lid
                 # has dest_pe folded out of it, so owner ranks 3 and 4
                 # share a dest_lid and would have shared a counter here.
@@ -278,7 +280,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         generation,
                     )
 
-        _count_and_publish()
+        _count_and_publish(valid, t, s, peer_base, dest_lid)
 
 
 # fmt: off
@@ -1103,31 +1105,30 @@ def compile_stage2_node_combine(
         # 写入"想用一次 gpu.barrier() 表达;但阶段1 各 CTA 写的
         # SCRATCH_WQE_POSTED[qp] 已经是跨 CTA 计数器,而 QP 之间没有顺序
         # 要求 —— 那个理由不成立了。这里不用任何 barrier。
-        if bx < fx.Int32(NUM_QP):
-          if wave == fx.Int32(0):
-           _want = _max_rt(
-               (total_chunks - bx + fx.Int32(NUM_QP - 1))
-               // fx.Int32(NUM_QP), fx.Int32(0))
-           _posted = fx.Int32(comm.load_i32_global_system_relaxed(
-               arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
-               + fx.Int64(bx) * fx.Int64(4)))
-           while _posted < _want:
-               _posted = fx.Int32(comm.load_i32_global_system_relaxed(
-                   arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
-                   + fx.Int64(bx) * fx.Int64(4)))
-           comm.fence_system_acquire()
-           for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
-               _rail.put_value(
-                   dev_comm, bx, fx.Int32(remote_node), arena_win,
-                   _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
-                   generation, aggregate=True)
-           # 原来是 flush_async 拿 request、下一行立刻 wait_request —— 中间
-           # 什么都没做,拆成两步没有收益。同步 flush 就是它。
-           _rail.flush_peer(dev_comm, bx, fx.Int32(remote_node))
-           if lane == fx.Int32(0):
-               comm.store_i32_system(
-                   arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
-                   fx.Int32(0))
+        if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+         _want = _max_rt(
+             (total_chunks - bx + fx.Int32(NUM_QP - 1))
+             // fx.Int32(NUM_QP), fx.Int32(0))
+         _posted = fx.Int32(comm.load_i32_global_system_relaxed(
+             arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+             + fx.Int64(bx) * fx.Int64(4)))
+         while _posted < _want:
+             _posted = fx.Int32(comm.load_i32_global_system_relaxed(
+                 arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                 + fx.Int64(bx) * fx.Int64(4)))
+         comm.fence_system_acquire()
+         for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
+             _rail.put_value(
+                 dev_comm, bx, fx.Int32(remote_node), arena_win,
+                 _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
+                 generation, aggregate=True)
+         # 原来是 flush_async 拿 request、下一行立刻 wait_request —— 中间
+         # 什么都没做,拆成两步没有收益。同步 flush 就是它。
+         _rail.flush_peer(dev_comm, bx, fx.Int32(remote_node))
+         if lane == fx.Int32(0):
+             comm.store_i32_system(
+                 arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
+                 fx.Int32(0))
 
         # ------------------------------------------------------------------
         # 阶段 3:所有 CTA 做 node 间归约 + unpermute

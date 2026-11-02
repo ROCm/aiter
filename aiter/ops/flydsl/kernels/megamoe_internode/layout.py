@@ -28,9 +28,9 @@ parity.
 
 from __future__ import annotations
 
-import torch
 from dataclasses import dataclass
 
+import torch
 
 SPARSE_QP_TOKEN_BITS = 32
 SPARSE_QP_GENERATION_SHIFT = 32
@@ -114,7 +114,9 @@ class Stage1DispatchWire:
         if self.record_bytes > 64 * 1024:
             raise ValueError("one dispatch record must fit in the 64-KiB CCO group")
         if (64 * 1024) // self.record_bytes < self.num_qp:
-            raise ValueError("one dispatch group must contain at least one record per QP")
+            raise ValueError(
+                "one dispatch group must contain at least one record per QP"
+            )
 
     @property
     def payload_bytes(self) -> int:
@@ -252,9 +254,8 @@ class Stage1ArenaLayout:
         # E_local-1 additional partially occupied tiles.  Keep one extra tile
         # as the existing conservative bound does.
         return (
-            (self.route_capacity + self.block_m - 1) // self.block_m
-            + 2 * self.local_experts * self.tile_group  # 本地/远端各自按 G 补齐
-        )
+            self.route_capacity + self.block_m - 1
+        ) // self.block_m + 2 * self.local_experts * self.tile_group  # 本地/远端各自按 G 补齐
 
     @property
     def max_route_rows(self) -> int:
@@ -266,7 +267,9 @@ class Stage1ArenaLayout:
 
     @property
     def dispatch_chunks(self) -> int:
-        return (self.max_tokens + self.wire.records_per_chunk - 1) // self.wire.records_per_chunk
+        return (
+            self.max_tokens + self.wire.records_per_chunk - 1
+        ) // self.wire.records_per_chunk
 
     @property
     def wire(self) -> Stage1DispatchWire:
@@ -296,7 +299,7 @@ class Stage1ArenaLayout:
         parity_depth: int = 2,
         num_qp: int = 4,
         embed_stage2_bytes: int = 0,
-    ) -> "Stage1ArenaLayout":
+    ) -> Stage1ArenaLayout:
         hidden = int(hidden)
         inter = int(inter)
         experts = int(experts)
@@ -349,9 +352,7 @@ class Stage1ArenaLayout:
                 f"max_tokens must be in [1, {MAX_FUSED_TOKENS_PER_RANK}] for the fused Stage-1 ABI"
             )
         if not 1 <= max_routes_per_token_per_rank <= topk:
-            raise ValueError(
-                "max_routes_per_token_per_rank must be in [1, topk]"
-            )
+            raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
         local_experts = experts // world_size
         source_capacity = world_size * max_tokens
         if source_capacity > MAX_PACKED_SOURCE_CAPACITY:
@@ -385,8 +386,7 @@ class Stage1ArenaLayout:
         }
         if oversized_payloads:
             detail = ", ".join(
-                f"{name}={nbytes}"
-                for name, nbytes in oversized_payloads.items()
+                f"{name}={nbytes}" for name, nbytes in oversized_payloads.items()
             )
             raise ValueError(
                 "Stage-1 parity-local payloads must each be smaller than 2 GiB "
@@ -407,9 +407,19 @@ class Stage1ArenaLayout:
         # in this single registered window.  Generation arrays are absolute and
         # parity buffered; payload clearing between hot forwards is unnecessary.
         specs: list[tuple[str, tuple[int, ...], torch.dtype, int]] = [
-            ("dispatch_staging", (parity_depth, max_tokens, wire.record_bytes), torch.uint8, 256),
+            (
+                "dispatch_staging",
+                (parity_depth, max_tokens, wire.record_bytes),
+                torch.uint8,
+                256,
+            ),
             ("dispatch_staging_ready", (parity_depth, max_tokens), torch.int64, 64),
-            ("remote_dispatch_rx", (parity_depth, max_tokens, wire.record_bytes), torch.uint8, 256),
+            (
+                "remote_dispatch_rx",
+                (parity_depth, max_tokens, wire.record_bytes),
+                torch.uint8,
+                256,
+            ),
             ("remote_chunk_ready", (parity_depth, chunks, num_qp), torch.int64, 64),
             ("remote_chunk_credit", (parity_depth, chunks, num_qp), torch.int64, 64),
             ("remote_chunk_request", (parity_depth, chunks, num_qp), torch.int64, 64),
@@ -574,21 +584,28 @@ class Stage1ArenaLayout:
                     )
                 )
 
-
         # 被 RDMA(rail GDA)读写的 region 排在窗口最前,其后预留 stage2 整块(embed_stage2_bytes),
         # 再放其余(LSA/本地,按 max_route_rows 放大的大块都在这里)。CCO 的 GDA 把整窗注册成一个
         # iova=0 的 MR、raddr=窗口偏移;ionic 单 MR 有效范围有限(实测 rail 目标落在 ~1.07GiB 之后的写
         # 全部不落地,10-08 TPR1024 random 挂死)。这样 RDMA 偏移只随 tokens 增长,与路由上限无关。
         # 所有 kernel/host 都按名字取偏移,顺序可以随意调;stage1 仍从窗口偏移 0 开始。
         _rdma_first = (
-            "dispatch_staging", "remote_dispatch_rx", "remote_chunk_ready",
-            "remote_chunk_credit", "sparse_remote_qp_ready", "sparse_remote_credit",
-            "plan_local_hist", "rail_count_inbox", "rail_count_inbox_ready",
+            "dispatch_staging",
+            "remote_dispatch_rx",
+            "remote_chunk_ready",
+            "remote_chunk_credit",
+            "sparse_remote_qp_ready",
+            "sparse_remote_credit",
+            "plan_local_hist",
+            "rail_count_inbox",
+            "rail_count_inbox_ready",
         )
         _head = [sp for sp in specs if sp[0] in _rdma_first]
         _tail = [sp for sp in specs if sp[0] not in _rdma_first]
         if int(embed_stage2_bytes) > 0:
-            _head.append(("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096))
+            _head.append(
+                ("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096)
+            )
         specs = _head + _tail
 
         offset = 0
@@ -647,7 +664,6 @@ class Stage1ArenaLayout:
         return offset
 
 
-
 @dataclass(frozen=True)
 class TwoKernelArenaLayout:
     """Compose the logical Stage-1 and Stage-2 ABIs in one CCO window."""
@@ -660,12 +676,14 @@ class TwoKernelArenaLayout:
     @classmethod
     def compose(
         cls, stage1: Stage1ArenaLayout, stage2: object, *, alignment: int = 4096
-    ) -> "TwoKernelArenaLayout":
+    ) -> TwoKernelArenaLayout:
         # stage2 嵌在 stage1 的 RDMA 前缀之后(见 Stage1ArenaLayout.create 的 embed_stage2_bytes)。
         slot = stage1.region("stage2_embed")
         if slot.nbytes < int(stage2.total_bytes) or slot.offset % alignment:
             raise ValueError("stage2_embed slot is smaller than stage2 or misaligned")
-        return cls(stage1, stage2, slot.offset, _align_up(stage1.total_bytes, alignment))
+        return cls(
+            stage1, stage2, slot.offset, _align_up(stage1.total_bytes, alignment)
+        )
 
 
 # Words of the retired "timeline" diagnostic region; kept only so the
@@ -774,7 +792,7 @@ class Stage2ArenaLayout:
         num_qp: int = 4,
         records_per_group: int = 4,
         rail_record_bytes: int | None = None,
-    ) -> "Stage2ArenaLayout":
+    ) -> Stage2ArenaLayout:
         """Two-kernel Stage2 window layout.
 
         Only node_accumulator, remote_partial_rx, return_group_ready,
@@ -808,7 +826,11 @@ class Stage2ArenaLayout:
             if rail_record_bytes is None:
                 raise ValueError("max_tokens > 4096 needs rail_record_bytes")
             rail_record_bytes = int(rail_record_bytes)
-            if rail_record_bytes <= 0 or rail_record_bytes % 8 or rail_record_bytes > 2 * int(hidden):
+            if (
+                rail_record_bytes <= 0
+                or rail_record_bytes % 8
+                or rail_record_bytes > 2 * int(hidden)
+            ):
                 raise ValueError(f"bad rail_record_bytes {rail_record_bytes}")
         if not 1 <= int(max_tokens) <= MAX_FUSED_TOKENS_PER_RANK:
             raise ValueError(
@@ -866,9 +888,11 @@ class Stage2ArenaLayout:
                 # 2-byte elements, while parity stride stays the full allocation.
                 # Above 4096 tokens it is the rail row width exactly (the NIC
                 # registration must stay below ~1 GiB; see wide_rail_rows).
-                (parity_depth, source_nodes, max_tokens, rail_record_bytes)
-                if wide_rail_rows
-                else (parity_depth, source_nodes, max_tokens, hidden),
+                (
+                    (parity_depth, source_nodes, max_tokens, rail_record_bytes)
+                    if wide_rail_rows
+                    else (parity_depth, source_nodes, max_tokens, hidden)
+                ),
                 torch.uint8 if wide_rail_rows else torch.float32,
                 256,
             ),
@@ -906,9 +930,11 @@ class Stage2ArenaLayout:
             # source tokens directly here, in token order.
             (
                 "remote_partial_rx",
-                (parity_depth, max_tokens, rail_record_bytes)
-                if wide_rail_rows
-                else (parity_depth, max_tokens, hidden),
+                (
+                    (parity_depth, max_tokens, rail_record_bytes)
+                    if wide_rail_rows
+                    else (parity_depth, max_tokens, hidden)
+                ),
                 torch.uint8 if wide_rail_rows else torch.bfloat16,
                 256,
             ),
@@ -1070,11 +1096,9 @@ class Stage2ArenaLayout:
             )
         )
 
-
         # MORI's Stage2 fp8_blockwise combine uses one FP32 scale per 128
         # hidden values: H7168 therefore has scale_dim=56.  Append after every
         # optional legacy ABI so enabling quantization changes no old offset.
-
 
         # Rank-group watermark: publish local completion once per
         # (this rank, N-group) across ALL active tokens, instead of once
@@ -1134,13 +1158,28 @@ class Stage2ArenaLayout:
         # Each rank writes a disjoint contributor slot on the source proxy.
         # Payload stays uninitialized until arrival publication; a missing
         # rank is masked at the local reader, never interpreted as stale zero.
-        specs.extend((
-            ("rank_push_inbox", (parity_depth, source_nodes * max_tokens,
-                                 ready_groups, gpus_per_node,
-                                 ready_group_tiles * tile_n), torch.bfloat16, 256),
-            ("rank_push_arrived", (parity_depth, source_nodes * max_tokens,
-                                   ready_groups), torch.int32, 64),
-        ))
+        specs.extend(
+            (
+                (
+                    "rank_push_inbox",
+                    (
+                        parity_depth,
+                        source_nodes * max_tokens,
+                        ready_groups,
+                        gpus_per_node,
+                        ready_group_tiles * tile_n,
+                    ),
+                    torch.bfloat16,
+                    256,
+                ),
+                (
+                    "rank_push_arrived",
+                    (parity_depth, source_nodes * max_tokens, ready_groups),
+                    torch.int32,
+                    64,
+                ),
+            )
+        )
 
         # Bit s is set when top-k slot s of this source token routes to an
         # expert owned by some rank on this node.  Stage-1 writes it from
@@ -1182,8 +1221,13 @@ class Stage2ArenaLayout:
         specs.append(
             (
                 "plane_slot_inbox",
-                (parity_depth, source_nodes * max_tokens, ready_groups,
-                 topk, ready_group_tiles * tile_n),
+                (
+                    parity_depth,
+                    source_nodes * max_tokens,
+                    ready_groups,
+                    topk,
+                    ready_group_tiles * tile_n,
+                ),
                 torch.bfloat16,
                 256,
             )
@@ -1191,9 +1235,15 @@ class Stage2ArenaLayout:
 
         # rail(RDMA)读写的 region 排在 stage2 最前(源 node_accumulator、目标 remote_partial_rx/
         # return_group_ready/return_consumed),原因见 Stage1ArenaLayout.create 的说明。
-        _rdma_first = ("node_accumulator", "remote_partial_rx", "return_group_ready", "return_consumed")
-        specs = ([sp for sp in specs if sp[0] in _rdma_first]
-                 + [sp for sp in specs if sp[0] not in _rdma_first])
+        _rdma_first = (
+            "node_accumulator",
+            "remote_partial_rx",
+            "return_group_ready",
+            "return_consumed",
+        )
+        specs = [sp for sp in specs if sp[0] in _rdma_first] + [
+            sp for sp in specs if sp[0] not in _rdma_first
+        ]
 
         offset = 0
         regions: list[Stage2ArenaRegion] = []
