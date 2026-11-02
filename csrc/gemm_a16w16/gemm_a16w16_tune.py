@@ -309,6 +309,7 @@ def run_flydsl_gemm_bf16(
         group_m=config["group_m"],
         policy="ht" if config["use_half_tile_interleaved"] else "ft",
         out_dtype=otype,
+        split_k_workspace=config.get("use_split_k_workspace", False),
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias

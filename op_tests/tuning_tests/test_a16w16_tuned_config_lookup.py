@@ -118,30 +118,59 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
 
 class TestGfx950FlydslCandidates(unittest.TestCase):
     def test_split_k_workspace_boundary_and_fallbacks(self):
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_hgemm_kernel_name,
+            get_flydsl_hgemm_kernel_params,
+        )
         from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
-            _use_split_k_workspace,
+            GEMM_A16W16_DTYPE_BF16,
+            GEMM_A16W16_DTYPE_FP32,
+            split_k_workspace_supported,
         )
 
-        self.assertTrue(
-            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, False)
+        bf16 = GEMM_A16W16_DTYPE_BF16
+        self.assertTrue(split_k_workspace_supported(320, 6288, 7, bf16, False))
+        self.assertTrue(split_k_workspace_supported(386, 6288, 7, bf16, False))
+        self.assertFalse(split_k_workspace_supported(387, 6288, 7, bf16, False))
+        self.assertFalse(split_k_workspace_supported(320, 6288, 1, bf16, False))
+        self.assertFalse(
+            split_k_workspace_supported(320, 6288, 7, GEMM_A16W16_DTYPE_FP32, False)
         )
-        self.assertTrue(
-            _use_split_k_workspace(386, 6288, 7, torch.bfloat16, False, False)
+        self.assertFalse(split_k_workspace_supported(320, 6288, 7, bf16, True))
+
+        config = {
+            "block_m": 320,
+            "block_n": 192,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 7,
+            "m_waves": 4,
+            "n_waves": 4,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+        }
+        for workspace in (False, True):
+            name = flydsl_hgemm_kernel_name(
+                dtype=torch.bfloat16,
+                out_dtype=torch.bfloat16,
+                config={**config, "use_split_k_workspace": workspace},
+                has_bias=False,
+                target_gfx="gfx950",
+            )
+            self.assertEqual("_ks7ws_" in name, workspace, name)
+            params = get_flydsl_hgemm_kernel_params(name)
+            self.assertEqual(params["use_split_k_workspace"], workspace, name)
+        # Names tuned before the marker existed keep the atomic reduction.
+        legacy = flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            config=config,
+            has_bias=False,
+            target_gfx="gfx950",
         )
         self.assertFalse(
-            _use_split_k_workspace(387, 6288, 7, torch.bfloat16, False, False)
-        )
-        self.assertFalse(
-            _use_split_k_workspace(320, 6288, 1, torch.bfloat16, False, False)
-        )
-        self.assertFalse(
-            _use_split_k_workspace(320, 6288, 7, torch.float32, False, False)
-        )
-        self.assertFalse(
-            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, True, False)
-        )
-        self.assertTrue(
-            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, True)
+            get_flydsl_hgemm_kernel_params(legacy)["use_split_k_workspace"]
         )
 
     def test_ragged_large_n_keeps_the_required_large_tile(self):
@@ -228,6 +257,54 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 torch.bfloat16,
                 False,
                 use_large_gemm_fast_path=False,
+            )
+            no_workspace = [
+                policy.get_flydsl_a16w16_configs(
+                    128,
+                    256,
+                    128,
+                    torch.bfloat16,
+                    out_dtype,
+                    has_bias,
+                    use_large_gemm_fast_path=False,
+                    apply_policy_pruning=False,
+                )
+                for out_dtype, has_bias in (
+                    (torch.float32, False),
+                    (torch.bfloat16, True),
+                )
+            ]
+
+        def without_workspace(config):
+            return tuple(
+                sorted(
+                    (key, value)
+                    for key, value in config.items()
+                    if key != "use_split_k_workspace"
+                )
+            )
+
+        atomic = {
+            without_workspace(config)
+            for config in raw_configs
+            if config["split_k"] > 1 and not config.get("use_split_k_workspace")
+        }
+        workspace = {
+            without_workspace(config)
+            for config in raw_configs
+            if config.get("use_split_k_workspace")
+        }
+        self.assertTrue(atomic)
+        self.assertEqual(atomic, workspace)
+        self.assertFalse(
+            any(
+                config.get("use_split_k_workspace") and config["split_k"] == 1
+                for config in raw_configs
+            )
+        )
+        for other in no_workspace:
+            self.assertFalse(
+                any(config.get("use_split_k_workspace") for config in other)
             )
 
         self.assertGreater(len(configs), 2)

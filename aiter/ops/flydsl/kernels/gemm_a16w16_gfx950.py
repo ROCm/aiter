@@ -38,9 +38,10 @@ GEMM_A16W16_DTYPE_FP16 = 3
 SPLIT_K_WORKSPACE_MAX_ELEMS = 7 * 386 * 6288
 
 
-def _use_split_k_workspace(m, n, split_k, out_dtype, has_bias, half_tile):
+def split_k_workspace_supported(m, n, split_k, out_dtype_id, has_bias):
+    """Whether a split-K launch may reduce BF16 partials through the workspace."""
     return (
-        out_dtype is torch.bfloat16
+        out_dtype_id == GEMM_A16W16_DTYPE_BF16
         and split_k > 1
         and not has_bias
         and split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS
@@ -1694,6 +1695,10 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)
+    if kwargs.get("use_split_k_workspace") and not split_k_workspace_supported(
+        m, n, split_k, kwargs.get("out_dtype_id"), kwargs.get("has_bias", False)
+    ):
+        return None
     try:
         assert_no_k_tail(k, kwargs)
     except AssertionError:
@@ -1936,14 +1941,14 @@ def gemm_a16w16(
     )
     kwargs["has_bias"] = bias is not None
     split_k = kwargs["split_k"]
-    use_split_k_workspace = _use_split_k_workspace(
-        m,
-        n,
-        split_k,
-        out.dtype,
-        bias is not None,
-        kwargs["use_half_tile_interleaved"],
-    )
+    use_split_k_workspace = bool(kwargs.get("use_split_k_workspace", False))
+    if use_split_k_workspace and not split_k_workspace_supported(
+        m, n, split_k, kwargs["out_dtype_id"], bias is not None
+    ):
+        raise ValueError(
+            "split-K workspace needs BF16 output, no bias, split_k > 1 and "
+            f"split_k * M * N <= {SPLIT_K_WORKSPACE_MAX_ELEMS}"
+        )
     kwargs["use_split_k_workspace"] = use_split_k_workspace
     assert_no_k_tail(k, kwargs)
 

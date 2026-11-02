@@ -373,6 +373,7 @@ def test_flydsl_split_k_workspace_survives_graph_replay():
                 k_waves=1,
                 group_m=0,
                 policy=policy,
+                split_k_workspace=True,
             )
 
         with torch.cuda.stream(stream):

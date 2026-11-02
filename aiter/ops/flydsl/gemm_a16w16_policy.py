@@ -16,6 +16,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_FP32,
     SPLIT_K_WORKSPACE_MAX_ELEMS,
     make_gemm_a16w16_param_and_validate,
+    split_k_workspace_supported,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 
@@ -581,4 +582,15 @@ def get_flydsl_a16w16_configs(
             is not None
         ):
             valid_configs.append(config)
+            # Atomic and workspace reductions trade launch count for traffic;
+            # keep both so tuning picks the faster one per shape.
+            if split_k_workspace_supported(
+                m, n, config["split_k"], out_dtype_id, has_bias
+            ) and (
+                make_gemm_a16w16_param_and_validate(
+                    m, n, k, {**validation_config, "use_split_k_workspace": True}
+                )
+                is not None
+            ):
+                valid_configs.append({**config, "use_split_k_workspace": True})
     return valid_configs

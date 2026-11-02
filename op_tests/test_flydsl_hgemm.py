@@ -25,6 +25,10 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+    GEMM_A16W16_DTYPE_BF16,
+    split_k_workspace_supported,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -278,6 +282,12 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
             return out_graph
 
         candidates["flydsl_graph"] = _run_flydsl_graph
+    if split_k_workspace_supported(
+        m, n, split_k, GEMM_A16W16_DTYPE_BF16 if dtype is dtypes.bf16 else 0, False
+    ):
+        candidates["flydsl_skws"] = lambda: flydsl_hgemm(
+            a, w, out=out, split_k_workspace=True, **kwargs
+        )
 
     flops = 2 * m * n * k
     nbytes = (
