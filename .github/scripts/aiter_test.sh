@@ -52,6 +52,15 @@ skip_tests=(
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
+    # DPX 128 GiB partition: real memory-pressure OOMs, not the
+    # allocator-desync bug (see DPX_CLUSTER_VALIDATION_NOTE.md). Needs
+    # process isolation / tiling, tracked separately.
+    "op_tests/test_kvcache.py"
+    "op_tests/test_moe_blockscale.py"
+    "op_tests/test_moeTopkSoftmax.py"
+    # DPX 152-CU partition: a16w16 split-K kernels are only registered/tuned
+    # for the full 304-CU chip ("unregistered OPUS namespace a16w16/gfx942/152").
+    "op_tests/test_opus_a16w16_gemm.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
