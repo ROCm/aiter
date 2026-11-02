@@ -53,8 +53,8 @@ skip_tests=(
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
     # DPX 128 GiB partition: real memory-pressure OOMs, not the
-    # allocator-desync bug (see DPX_CLUSTER_VALIDATION_NOTE.md). Needs
-    # process isolation / tiling, tracked separately.
+    # allocator-desync bug. Needs process isolation / tiling, tracked
+    # separately.
     "op_tests/test_kvcache.py"
     "op_tests/test_moe_blockscale.py"
     "op_tests/test_moeTopkSoftmax.py"

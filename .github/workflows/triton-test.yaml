@@ -248,7 +248,6 @@ jobs:
           --shm-size=16G \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-          -e AITER_GPU_MEMTRACE=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -277,8 +276,8 @@ jobs:
           fi
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
           # Deselected below: real memory-pressure OOM on the DPX 128/144 GiB
-          # partitions (see DPX_CLUSTER_VALIDATION_NOTE.md), not the
-          # allocator-desync bug -- needs process isolation / tiling, tracked
+          # partitions, not the allocator-desync bug -- needs process isolation
+          # / tiling, tracked
           # separately. test_mha_varlen is excluded entirely via -k; the rest
           # are the specific large-shape params confirmed to OOM on both
           # MI325X and MI350X. test_flash_attn_kvcache_sliding_window is a
@@ -457,7 +456,6 @@ jobs:
           --shm-size=16G \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-          -e AITER_GPU_MEMTRACE=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
