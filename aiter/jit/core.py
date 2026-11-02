@@ -507,6 +507,16 @@ class AITER_CONFIG:
 
         untunedf = pd.read_csv(untuned_path)
         keys = untunedf.columns.to_list()
+        if merge_name == "a4w4_blockscale_tuned_gemm":
+            # B and scales have independent layouts. Legacy a4w4 rows are
+            # shuffled/shuffled; another layout is a distinct dispatch key.
+            for column in ("bpreshuffle", "scale_preshuffle"):
+                if column not in merge_df:
+                    merge_df[column] = "1"
+                else:
+                    merge_df[column] = merge_df[column].replace("", "1").fillna("1")
+                if column not in keys:
+                    keys.append(column)
         if "cu_num" not in keys:
             keys.append("cu_num")
         if "gfx" in merge_df.columns and "gfx" not in keys:
@@ -665,6 +675,8 @@ class AITER_CONFIG:
             )
 
         _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        if merge_name == "a4w4_blockscale_tuned_gemm":
+            _FILL_DEFAULTS.update(bpreshuffle=1, scale_preshuffle=1)
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
             for c in df.columns:

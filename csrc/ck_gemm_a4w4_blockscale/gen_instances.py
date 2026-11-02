@@ -271,14 +271,39 @@ aiter_tensor_t&
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         df = pd.read_csv(tune_dict_csv)
-        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
-        # no libtype column.  The Python dispatcher in
-        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
-        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
-        # apply the same filter here so the CK codegen sees only CK rows and
-        # build_tune_dict's strict validation stays effective on genuine CK
-        # references.
-        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
+        # Match the Python dispatcher's backend selection, including legacy
+        # tables without libtype. Keep unknown CK names for strict validation.
+        names = df["kernelName"].astype(str)
+        backend = (
+            df.get("libtype", pd.Series("", index=df.index))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        triton = backend.eq("triton") | (
+            ~backend.isin(["ck", "asm", "triton"]) & names.eq("triton")
+        )
+        df = df[~names.str.startswith("_ZN") & ~triton]
+        layout_columns = [c for c in ("bpreshuffle", "scale_preshuffle") if c in df]
+        if layout_columns:
+            # The generic helper keys only on MNK. Preserve each layout's CK
+            # winner so the name-keyed registry compiles every referenced name.
+            result = dict(default_kernels_dict)
+            for layout, group in df.groupby(layout_columns, dropna=False):
+                layout = layout if isinstance(layout, tuple) else (layout,)
+                kernels = build_tune_dict(
+                    group,
+                    default_kernels_dict,
+                    kernels_list,
+                    kernels_by_name=kernels_by_name,
+                )
+                result.update(
+                    {
+                        (key + layout if isinstance(key, tuple) else key): kernel
+                        for key, kernel in kernels.items()
+                    }
+                )
+            return result
         return build_tune_dict(
             df,
             default_kernels_dict,

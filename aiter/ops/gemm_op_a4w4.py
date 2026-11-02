@@ -34,29 +34,42 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return 3
 
 
+def _a4w4_layout_flag(value=1) -> int:
+    """Missing layout columns describe the historical shuffled contract."""
+    if pd.isna(value) or str(value).strip() == "":
+        return 1
+    if str(value).strip() not in ("0", "1", "0.0", "1.0", "True", "False"):
+        raise ValueError(f"a4w4 layout flags must be 0 or 1, got {value!r}")
+    return int(str(value).strip() in ("1", "1.0", "True"))
+
+
 @functools.lru_cache(maxsize=1024)
-def get_GEMM_config(M: int, N: int, K: int):
+def get_GEMM_config(
+    M: int, N: int, K: int, bpreshuffle: bool = True, scale_preshuffle: bool = True
+):
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     if not hasattr(get_GEMM_config, "gemm_dict"):
         gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
         ).drop_duplicates()
-        # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
-        # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
-        if "gfx" in gemm_dict.columns:
-            get_GEMM_config.gemm_dict = gemm_dict.set_index(
-                ["gfx", "cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            get_GEMM_config.has_gfx = True
-        else:
+        get_GEMM_config.has_gfx = "gfx" in gemm_dict.columns
+        if not get_GEMM_config.has_gfx:
             logger.warning(
                 f"{AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE} has no 'gfx' column -- "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
-            get_GEMM_config.gemm_dict = gemm_dict.set_index(
-                ["cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            get_GEMM_config.has_gfx = False
+        keys = (["gfx"] if get_GEMM_config.has_gfx else []) + ["cu_num", "M", "N", "K"]
+        rows = {}
+        for row in gemm_dict.to_dict("records"):
+            layout = tuple(
+                _a4w4_layout_flag(row.get(c, 1))
+                for c in ("bpreshuffle", "scale_preshuffle")
+            )
+            key = tuple(row[c] for c in keys) + layout
+            if key in rows:
+                raise ValueError(f"Duplicate a4w4 shape/layout config: {key}")
+            rows[key] = row
+        get_GEMM_config.gemm_dict = rows
     gfx = get_gfx()
     cu_num = get_cu_num()
     padded_M = M
@@ -67,7 +80,7 @@ def get_GEMM_config(M: int, N: int, K: int):
             (gfx, cu_num, padded_M, N, K)
             if get_GEMM_config.has_gfx
             else (cu_num, padded_M, N, K)
-        )
+        ) + (int(bpreshuffle), int(scale_preshuffle))
         config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
@@ -80,6 +93,228 @@ def get_GEMM_config(M: int, N: int, K: int):
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
+
+
+def _a4w4_config_libtype(config: dict | None, kernelName: str = "") -> str:
+    """Backend column of an a4w4_blockscale tuned row ("" for legacy CSVs).
+
+    Rows written before the ``libtype`` column existed have no backend and are
+    dispatched the old way (CK vs asm by ``kernelName``).  ``kernelName ==
+    "triton"`` is also accepted on its own so a table with the column stripped
+    still selects the triton backend.
+    """
+    libtype = "" if config is None else config.get("libtype", "")
+    if pd.isna(libtype):
+        libtype = ""
+    libtype = str(libtype).strip()
+    # Merged multi-file configs backfill a missing libtype with 0; only the
+    # known backend names count, so the kernelName hint still works there.
+    if libtype in ("ck", "asm", "triton"):
+        return libtype
+    return "triton" if str(kernelName) == "triton" else ""
+
+
+# A Triton row selects the raw or preshuffled MXFP4 kernel according to B's
+# layout. Scale conversion, when required, is included in the tuned operation.
+# A caller outside the supported contract falls back to the untuned ASM kernel.
+A4W4_TRITON_MIN_M = 32  # below this triton wants un-shuffled activation scales
+
+
+def a4w4_triton_shape_supported(
+    M: int, N: int, K: int, bpreshuffle: bool = True
+) -> bool:
+    """Shape gate shared by the a4w4 tuner and the CSV dispatch."""
+    if not bpreshuffle:
+        return M > 0 and N > 0 and K > 0 and K % 32 == 0
+    return M >= A4W4_TRITON_MIN_M and N > 0 and N % 16 == 0 and K > 0 and K % 256 == 0
+
+
+def _a4w4_triton_accessible(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    dtype: torch.dtype,
+    bpreshuffle: bool,
+    bias: Tensor | None,
+    alpha: float | None,
+    beta: float | None,
+    global_A_scale: Tensor | None,
+    global_B_scale: Tensor | None,
+    scale_preshuffle: bool = True,
+) -> bool:
+    """True when Triton can consume the declared input layouts."""
+    if (
+        dtype != dtypes.bf16
+        or bias is not None
+        or (alpha is not None and alpha != 1.0)
+        or (beta is not None and beta != 0.0)
+        or global_A_scale is not None
+        or global_B_scale is not None
+    ):
+        return False
+    if A.dim() < 2 or B.dim() != 2 or A_scale.dim() != 2 or B_scale.dim() != 2:
+        return False
+    m = A.numel() // A.shape[-1]
+    k = A.shape[-1] * 2
+    n = B.shape[0]
+    if not a4w4_triton_shape_supported(m, n, k, bpreshuffle):
+        return False
+    if B.shape[1] != A.shape[-1] or not all(
+        tensor.is_contiguous() for tensor in (A, B, A_scale, B_scale)
+    ):
+        return False
+    if any(tensor.element_size() != 1 for tensor in (A, B, A_scale, B_scale)):
+        return False
+    cols = (k // 32 + 7) // 8 * 8 if scale_preshuffle else k // 32
+    if A_scale.shape[-1] != cols or B_scale.shape[-1] != cols:
+        return False
+    return (
+        (not scale_preshuffle or A_scale.shape[0] % 32 == 0)
+        and (not scale_preshuffle or B_scale.shape[0] % 32 == 0)
+        and A_scale.shape[0] >= m
+        and B_scale.shape[0] >= n
+    )
+
+
+def _a4w4_convert_scale(
+    scale: Tensor, rows: int, k: int, source_shuffled: bool, target_shuffled: bool
+) -> Tensor:
+    """Adapt scales only when the selected backend needs another layout.
+
+    These copies are part of the timed operator; no pointer-based cache is used.
+    Raw B + raw scales reaches plain Triton without a layout conversion.
+    """
+    if source_shuffled == target_shuffled:
+        return scale
+    if target_shuffled:
+        from .triton.utils.shuffle import shuffle_scale_gemm
+
+        padded_rows = (rows + 255) // 256 * 256
+        padded_cols = (k // 32 + 7) // 8 * 8
+        # Match quantization's zero scale bytes in the padding. ASM may read
+        # full K tiles; padding with E8M0 1.0 would include out-of-range data.
+        padded = torch.nn.functional.pad(
+            scale[:rows, : k // 32].view(torch.uint8),
+            (0, padded_cols - k // 32, 0, padded_rows - rows),
+            value=0,
+        )
+        return shuffle_scale_gemm(
+            padded, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        ).view(padded_rows, padded_cols)
+    from .triton.utils.shuffle import unshuffle_scale_gemm
+
+    s = scale.view(torch.uint8)
+    return unshuffle_scale_gemm(
+        s.reshape(s.shape[0] // 32, s.shape[1] * 32), arch="gfx950"
+    )[:rows, : k // 32]
+
+
+def _a4w4_triton_scale(scale: Tensor, k: int) -> Tensor:
+    """[pad256(rows), K/32] 32x4-shuffled e8m0 -> (rows/32, K) row-major view."""
+    if scale.shape[-1] * 32 != k:
+        raise ValueError(
+            f"triton a4w4 scales need K/32 columns for K={k}, got {scale.shape[-1]}"
+        )
+    if scale.shape[0] % 32:
+        raise ValueError(
+            f"triton a4w4 scales need 32-row stripes, got {scale.shape[0]} rows"
+        )
+    # e8m0 and uint8 are bit-identical; contiguous() first because view(dtype)
+    # is only legal on a contiguous tensor (a caller may pass a strided view).
+    s = scale if scale.dtype == torch.uint8 else scale.contiguous().view(torch.uint8)
+    if not s.is_contiguous():
+        s = s.contiguous()
+    return s.reshape(-1, k)
+
+
+def gemm_a4w4_triton(
+    A: Tensor,  # A:[M, K/2] f4x2
+    B: Tensor,  # B:[N, K/2] f4x2, layout selected by bpreshuffle
+    A_scale: Tensor,  # e8m0, layout selected by scale_preshuffle
+    B_scale: Tensor,  # e8m0, layout selected by scale_preshuffle
+    dtype: torch.dtype = dtypes.bf16,
+    config: dict | None = None,
+    out: Tensor | None = None,
+    *,
+    bpreshuffle: bool = True,
+    scale_preshuffle: bool = True,
+) -> Tensor:
+    """MXFP4 GEMM through Triton, with explicit weight and scale layouts.
+
+    Takes the layouts documented by :func:`gemm_a4w4`.
+    ``config`` overrides the triton kernel parameters;
+    ``None`` (what the tuned table records) uses triton's own per-shape table.
+    """
+    m = A.numel() // A.shape[-1]
+    k = A.shape[-1] * 2
+    n = B.shape[0]
+    # Validate before importing triton so an unsupported call (or a CPU-only
+    # environment) reports the layout/shape error rather than ModuleNotFoundError.
+    if not a4w4_triton_shape_supported(m, n, k, bpreshuffle):
+        raise ValueError(
+            f"Unsupported Triton shape/layout (bpreshuffle={bpreshuffle}): "
+            f"got M={m}, N={n}, K={k}"
+        )
+    if not _a4w4_triton_accessible(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        dtype,
+        bpreshuffle,
+        None,
+        1.0,
+        0.0,
+        None,
+        None,
+        scale_preshuffle,
+    ):
+        raise ValueError(
+            "gemm_a4w4_triton requires contiguous packed byte operands, "
+            "matching K dimensions, scales in the declared layout and bf16 output"
+        )
+    if out is not None and (
+        tuple(out.shape) != (m, n)
+        or out.dtype != dtype
+        or out.device != A.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be a contiguous {(m, n)} {dtype} tensor, got "
+            f"{tuple(out.shape)} {out.dtype}"
+        )
+    if out is None:
+        out = torch.empty((m, n), dtype=dtype, device=A.device)
+    A_scale = _a4w4_convert_scale(A_scale, m, k, scale_preshuffle, bpreshuffle)
+    B_scale = _a4w4_convert_scale(B_scale, n, k, scale_preshuffle, bpreshuffle)
+    if not bpreshuffle:
+        from .triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
+
+        y = gemm_afp4wfp4(
+            A.view(torch.uint8).reshape(m, k // 2),
+            B.view(torch.uint8),
+            A_scale.view(torch.uint8)[:m, : k // 32],
+            B_scale.view(torch.uint8)[:n, : k // 32],
+            dtype,
+            y=out,
+            config=config,
+        )
+        return y.view(*A.shape[:-1], n)
+    from .triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+    # Triton consumes packed bytes, including when torch exposes native fp4x2.
+    # These dtype/shape views preserve the data pointer and add no layout copy.
+    y = gemm_afp4wfp4_preshuffle(
+        A.view(torch.uint8).reshape(m, k // 2),
+        B.view(torch.uint8).reshape(n // 16, (k // 2) * 16),
+        _a4w4_triton_scale(A_scale, k),
+        _a4w4_triton_scale(B_scale, k),
+        dtype,
+        y=out,
+        config=config,
+    )
+    return y.view(*A.shape[:-1], n)
 
 
 # gfx1250 MXFP4 rows (1x32 e8m0 scales in the 32x4 layout), kept apart from the
@@ -252,6 +487,7 @@ def gemm_a4w4_fake(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    scale_preshuffle: bool = True,
 ) -> torch.Tensor:
     if dtype == dtypes.fp8:
         raise NotImplementedError(
@@ -275,12 +511,24 @@ def gemm_a4w4(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    scale_preshuffle: bool = True,
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor.
 
     On gfx1250 the a4w4_mxscale_bpreshuffle table picks FlyDSL or the F4GEMM asm
     kernels per shape. MXFP4 vs NVFP4 is selected by the presence of ``global_A_scale``/
     ``global_B_scale`` (NVFP4 per-tensor global scales).
+
+    On gfx950 the a4w4_blockscale table picks the backend per shape and layout.
+    ``bpreshuffle`` selects 16x16-shuffled B (True) or raw packed B (False).
+    Independently, ``scale_preshuffle`` selects 32x4-shuffled, padded e8m0
+    scales (True) or row-major [M or N, K/32] scales (False). Both default to
+    True for existing callers and CSVs. Raw scales are supported on gfx950.
+
+    A ``libtype == "triton"`` row selects the corresponding raw or preshuffled
+    MXFP4 kernel. Required scale conversions are part of the operation; raw
+    B with raw scales enters Triton without a layout copy. Rows without a
+    ``libtype`` column retain CK/ASM ``kernelName`` dispatch.
     """
     # Low-precision output has a different return arity/shape (mxfp8 is a
     # (data, scale) tuple), so it lives on a separate fixed-arity op.
@@ -293,6 +541,10 @@ def gemm_a4w4(
     n = B.shape[0]
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
+    if not scale_preshuffle and gfx_arch != "gfx950":
+        raise NotImplementedError(
+            "gemm_a4w4 raw scales are currently supported on gfx950 only"
+        )
     if gfx_arch in ["gfx1250"]:
         # FlyDSL serves plain MXFP4 with row-major A and a bf16 output; the rest is asm.
         plain_mxfp4 = (
@@ -333,18 +585,76 @@ def gemm_a4w4(
             beta=beta,
         )
         return out.view(*A.shape[:-1], out.shape[-1])
-    out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
-    ck_config = get_GEMM_config(m, n, k)
+    # None has historically meant the default (shuffled B), like the ASM wrapper.
+    bpreshuffle = True if bpreshuffle is None else bool(bpreshuffle)
+    ck_config = get_GEMM_config(m, n, k, bpreshuffle, scale_preshuffle)
     # splitK = None
     splitK = 0
     kernelName = ""
     if ck_config is not None:
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
+    if _a4w4_config_libtype(ck_config, kernelName) == "triton":
+        if (
+            gfx_arch == "gfx950"
+            and not apreshuffle
+            and _a4w4_triton_accessible(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                dtype,
+                bool(bpreshuffle),
+                bias,
+                alpha,
+                beta,
+                global_A_scale,
+                global_B_scale,
+                scale_preshuffle,
+            )
+        ):
+            return gemm_a4w4_triton(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                dtype=dtype,
+                bpreshuffle=bpreshuffle,
+                scale_preshuffle=scale_preshuffle,
+            )
+        # Other operand contracts retain the untuned ASM fallback.
+        logger.debug(
+            f"gemm_a4w4 triton row for M={m}, N={n}, K={k} does not match these "
+            "operands (needs bf16, supported shapes/layouts and default scaling); "
+            "falling back to the default asm kernel."
+        )
+        ck_config = None
+        splitK = 0
+        kernelName = ""
+    if ck_config is not None:
+        is_asm = kernelName.startswith("_ZN")
+        if (not is_asm and not bpreshuffle) or (
+            is_asm and bpreshuffle == ("noBpreShuffle" in kernelName)
+        ):
+            raise ValueError(
+                f"a4w4 kernel {kernelName!r} does not match bpreshuffle={bpreshuffle}"
+            )
+    # CK and both ASM weight variants require shuffled scales on gfx950.
+    if not scale_preshuffle:
+        A_scale = _a4w4_convert_scale(A_scale, m, k, False, True)
+        B_scale = _a4w4_convert_scale(B_scale, n, k, False, True)
+    # The noB ASM kernel stores complete 256-row tiles, even when M is smaller.
+    # Its tuning buffer already has this padding; production must match it.
+    row_alignment = 32 if bpreshuffle else 256
+    out = torch.empty(
+        ((m + row_alignment - 1) // row_alignment * row_alignment, n),
+        dtype=dtype,
+        device=A.device,
+    )
     if (
         ck_config is not None
         and kernelName.find("_ZN") == -1

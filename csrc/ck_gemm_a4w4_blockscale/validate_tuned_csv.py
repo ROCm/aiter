@@ -8,7 +8,7 @@ Usage:
 
 Checks performed:
     1. CSV schema: expected columns present, no missing values in key columns
-    2. No duplicate (cu_num, M, N, K) keys
+    2. No duplicate (gfx, cu_num, M, N, K, weight layout, scale layout) keys
     3. All M, N, K are positive integers
     4. All us > 0 (no invalid timings)
     5. All errRatio <= 0.05 (tuner threshold)
@@ -40,6 +40,7 @@ EXPECTED_COLUMNS = [
 KNOWN_KERNEL_PATTERNS = [
     "f4gemm_bf16_per1x32Fp4",  # ASM kernels
     "a4w4_blockscale",  # CK-Tile kernels
+    "^triton$",  # Triton backend
 ]
 
 
@@ -58,7 +59,11 @@ def validate(csv_path, verbose=False):
     missing_cols = set(EXPECTED_COLUMNS) - set(df.columns)
     if missing_cols:
         errors.append(f"Missing columns: {missing_cols}")
-    extra_cols = set(df.columns) - set(EXPECTED_COLUMNS)
+    extra_cols = (
+        set(df.columns)
+        - set(EXPECTED_COLUMNS)
+        - {"libtype", "gfx", "bpreshuffle", "scale_preshuffle"}
+    )
     if extra_cols:
         warnings.append(f"Extra columns (ignored): {extra_cols}")
     if errors:
@@ -73,12 +78,22 @@ def validate(csv_path, verbose=False):
             errors.append(f"Column '{col}' has {nulls} null values")
 
     # 3. Duplicate keys
-    dup_mask = df.duplicated(subset=["cu_num", "M", "N", "K"], keep=False)
+    layout_keys = []
+    for column in ("bpreshuffle", "scale_preshuffle"):
+        if column in df:
+            df[column] = pd.to_numeric(
+                df[column].replace("", 1).fillna(1), errors="coerce"
+            )
+            if not df[column].isin([0, 1]).all():
+                errors.append(f"Column '{column}' must contain 0 or 1")
+            layout_keys.append(column)
+    keys = (["gfx"] if "gfx" in df else []) + ["cu_num", "M", "N", "K"] + layout_keys
+    dup_mask = df.duplicated(subset=keys, keep=False)
     n_dups = dup_mask.sum()
     if n_dups > 0:
-        dup_keys = df[dup_mask][["cu_num", "M", "N", "K"]].drop_duplicates()
+        dup_keys = df[dup_mask][keys].drop_duplicates()
         errors.append(
-            f"{n_dups} rows with duplicate (cu_num, M, N, K) keys "
+            f"{n_dups} rows with duplicate shape/layout keys {keys} "
             f"({len(dup_keys)} unique duplicate keys)"
         )
         if verbose:
@@ -140,7 +155,8 @@ def validate(csv_path, verbose=False):
 
     # Summary
     n_asm = df["kernelName"].str.contains("f4gemm_bf16", na=False).sum()
-    n_cktile = len(df) - n_asm
+    n_triton = df["kernelName"].eq("triton").sum()
+    n_cktile = len(df) - n_asm - n_triton
     unique_nk = df[["N", "K"]].drop_duplicates()
 
     print("\n=== Summary ===")
@@ -151,6 +167,7 @@ def validate(csv_path, verbose=False):
     print(f"  K range:            [{df['K'].min()}, {df['K'].max()}]")
     print(f"  ASM kernels:        {n_asm} ({100*n_asm/len(df):.1f}%)")
     print(f"  CK-Tile kernels:    {n_cktile} ({100*n_cktile/len(df):.1f}%)")
+    print(f"  Triton kernels:     {n_triton} ({100*n_triton/len(df):.1f}%)")
     print(
         f"  TFLOPS:             min={df['tflops'].min():.1f},"
         f" max={df['tflops'].max():.1f},"
