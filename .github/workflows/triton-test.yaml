@@ -276,8 +276,7 @@ jobs:
           fi
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
           # Deselected below: real memory-pressure OOM on the DPX 128/144 GiB
-          # partitions, not the allocator-desync bug -- needs process isolation
-          # / tiling, tracked
+          # partitions -- needs process isolation / tiling, tracked
           # separately. test_mha_varlen is excluded entirely via -k; the rest
           # are the specific large-shape params confirmed to OOM on both
           # MI325X and MI350X. test_flash_attn_kvcache_sliding_window is a
