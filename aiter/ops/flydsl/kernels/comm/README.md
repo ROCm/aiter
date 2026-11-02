@@ -16,6 +16,7 @@ node.
 | `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `protocol.py` | The flag protocol and the LDS fanout built on `transport.py`: the publish and the wait (multi-peer, and single-peer for the ring), the colour sequence, and the striped or contiguous fanout. The mesh and the ring use them. |
 | `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
 The host classes are in `aiter/ops/flydsl/`:
@@ -462,7 +463,7 @@ and how it prevents bias in the comparison.
 
 The FlyDSL JIT cache key includes the source of the kernel function. It does
 not include helper functions from other modules, for example
-`transport.py`, `quick_allreduce_codec.py` or the epilogue modules
+`transport.py`, `protocol.py`, `quick_allreduce_codec.py` or the epilogue modules
 (`*_epilogue.py`, `*_rmsnorm.py`). If you change a helper,
 FlyDSL can run an old binary from the cache.
 

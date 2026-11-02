@@ -550,3 +550,13 @@ def _codec_load(codec, get, tid, scale_slot):
         get(fx.Int32(codec.scale_i32_off) + scale_slot) if codec.has_scale else None
     )
     return words, scale_word
+
+
+def codec_recv(codec, get, tid, scale_slot, pair_in_slot):
+    """Read one packet through ``get(i32_off_in_tile) -> i32`` and resolve its
+    decoding scale: ``(words, scale)``, ready for :func:`_codec_dequant`.
+
+    ``scale`` is ``None`` for a codec with no scale plane (fp16 passthrough).
+    """
+    words, word = _codec_load(codec, get, tid, scale_slot)
+    return words, _scale_from_word(codec, word, pair_in_slot)
