@@ -10,7 +10,7 @@ from flydsl.expr.typing import ReductionOp
 
 from ..tensor_shim import buf_base_i64, buf_copy_store, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import LOG2E, MFMA_MNK, MX_V_CHUNK_BYTES, WAVE
+from .traits import LOG2E, MFMA_MNK, MX_P_EXP_SHIFT, MX_V_CHUNK_BYTES, WAVE
 
 
 class PaDecodeEpilogue:
@@ -178,6 +178,9 @@ class PaDecodeEpilogue:
             inv = (h_sum > self.ctx.ZERO_F).select(
                 fx.Float32(rcp_f32(h_sum)), self.ctx.ZERO_F
             )
+            # O holds PV * 2**-MX_P_EXP_SHIFT (``single_query_tile_mx``): restore it
+            # here, after the normalization (the row's max token has p = 1, so h_sum >= 1).
+            inv = inv * fx.Float32(2.0**MX_P_EXP_SHIFT)
             o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.Q_DTYPE)
             global_row = self.ctx.query_begin * self.traits.query_group_size + row
             for half in range_constexpr(2):

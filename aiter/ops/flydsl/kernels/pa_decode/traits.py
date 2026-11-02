@@ -24,6 +24,15 @@ KV_COMPUTE_BLOCK = 256
 # [16 chunks of 8 dims][16 tokens][16 B] (conflict free for the 16 B row writes
 # and the transposed reads).
 MX_V_CHUNK_BYTES = 16 * 16 * 16
+# MXFP4 PV: P (<= 1) feeds the MFMA times 2**-MX_P_EXP_SHIFT and the epilogue restores
+# it after the softmax normalization. The f32 O accumulator then holds at most
+# tokens * |V| * 2**-20 <= |V| / 2 for the 2**19 tokens one task can own, so it cannot
+# overflow where the normalized output is finite.
+# shortcut: a fixed shift cannot be lossless at both ends. Terms p * |V| below 2**-129
+# (the f32 subnormal floor 2**-149 after the shift) are rounded or lost, and so are
+# weights p below ~2**-113 (bf16 floor 2**-133 after it). The smallest MXFP4 V,
+# 2**-128, is exact. Upgrade to a shift from the task's token count if that matters.
+MX_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK

@@ -1322,15 +1322,24 @@ _EXTREME_SCALE_CASES = [
     ("mxfp4-huge-query-k2e-120", (120, 7, (0x22, 0xAA), (0x22, 0xAA))),
     # Logits 0.35, 0.71, 1.06: the softmax weights depend on the restored scale.
     ("mxfp4-weighted", (-104, 227, (0x11, 0x22, 0x33), (0x22, 0xAA, 0x11))),
+    # Q = K = 0: four equal weights of V = 1.0 * 2**126 (e8m0 byte 253). The output is
+    # 2**126, but an unscaled f32 PV sum reaches 2**128 before it is divided by four.
+    ("mxfp4-pv-sum-2e128", (None, 127, (0x00,) * 4, (0x22,) * 4, 253)),
+    # Two of four tokens at 2**127 (byte 254), two zeros: sum 2**128, output 2**126.
+    (
+        "mxfp4-pv-sum-2e127-mixed",
+        (None, 127, (0x00,) * 4, (0x22, 0x00, 0x22, 0x00), 254),
+    ),
 ]
 
 
 @benchmark()
-def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
-    """A bf16 query at 2**q_exp meets K scales of 2**(k_byte - 127).
+def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes, v_byte=127):
+    """A bf16 query at 2**q_exp (zero for None) meets K scales of 2**(k_byte - 127).
 
     The logits are finite, but the e4m3-normalized query times such a K scale
-    reaches f32 range or beyond before the query scale is restored.
+    reaches f32 range or beyond before the query scale is restored. V scales of
+    2**(v_byte - 127) test the PV sum: it must not overflow where the output is finite.
     """
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
 
@@ -1344,11 +1353,16 @@ def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
 
     (key_pool, logical_key), (value_pool, logical_value) = (
         page(k_codes, k_byte),
-        page(v_codes, 127),
+        page(v_codes, v_byte),
     )
     kd, ks = _mxfp4_views(key_pool)
     vd, vs = _mxfp4_views(value_pool)
-    query = torch.full((1, 1, 128), 2.0**q_exp, dtype=torch.bfloat16, device=DEVICE)
+    query = torch.full(
+        (1, 1, 128),
+        0.0 if q_exp is None else 2.0**q_exp,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
     table = torch.zeros(1, 1, dtype=torch.int32, device=DEVICE)
     context = torch.tensor([len(k_codes)], dtype=torch.int32, device=DEVICE)
     output = torch.full_like(query, float("nan"))
@@ -1370,6 +1384,68 @@ def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
     )
     assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
     return {"gfx": get_gfx_runtime(), "err": _check_output(output, reference)}
+
+
+# (tag, (tokens, V e2m1 bytes cycled over the tokens, V e8m0 byte)). K = 0, so every
+# token has weight 1 and the output is the mean of V, a power of two or a short sum of
+# them: exactly representable in bf16.
+_PV_RANGE_CASES = [
+    # The smallest MXFP4 magnitudes: the PV sum sits at the f32 subnormal floor once P
+    # carries its 2**-MX_P_EXP_SHIFT, and must still come out exactly (not zero).
+    ("mxfp4-pv-1tok-2e-126", (1, (0x22,), 1)),
+    ("mxfp4-pv-1tok-2e-128", (1, (0x11,), 0)),
+    ("mxfp4-pv-4tok-2e-128", (4, (0x11,) * 4, 0)),
+    ("mxfp4-pv-4tok-mixed-2e-127", (4, (0x11, 0x33, 0x11, 0x33), 0)),
+    # The largest context one task owns (4096 staged pages) at the largest finite V
+    # (1.5 * 2**127): an unscaled f32 PV sum would reach 1.5 * 2**146.
+    ("mxfp4-pv-ctx2e19-v2e127", (2**19, (0x33,), 254)),
+]
+
+
+@benchmark()
+def run_pa_decode_mxfp4_pv_range(tokens, v_codes, v_byte):
+    """Output equals the analytic mean of V (all weights 1), bit for bit and nonzero:
+    the 5e-3 atol of the other cases would pass a flushed result at 2**-126."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    pages = -(-tokens // 128)
+    # Every logical page is physical page 0. Tokens past the context hold 6.0 so a
+    # missing mask shows.
+    key_pool = torch.zeros(1, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=DEVICE)
+    value_pool = torch.zeros_like(key_pool)
+    key_pool[..., 128 * 64 :] = 127
+    value_pool[..., 128 * 64 :] = v_byte
+    data = value_pool[..., : 128 * 64].view(1, 1, 128, 64)
+    data[...] = 0x77 if tokens < 128 else 0
+    for token in range(min(tokens, 128)):
+        data[..., token, :] = v_codes[token % len(v_codes)]
+    kd, ks = _mxfp4_views(key_pool)
+    vd, vs = _mxfp4_views(value_pool)
+    expected = (
+        _mxfp4_dequant(value_pool)[0, 0, : min(tokens, 128)]
+        .double()
+        .mean(0)
+        .to(torch.bfloat16)
+    )
+    assert (expected != 0).all()
+    query = torch.ones(1, 1, 128, dtype=torch.bfloat16, device=DEVICE)
+    table = torch.zeros(1, pages, dtype=torch.int32, device=DEVICE)
+    context = torch.tensor([tokens], dtype=torch.int32, device=DEVICE)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        kd,
+        vd,
+        context,
+        table,
+        128**-0.5,
+        1,
+        key_scale=ks,
+        value_scale=vs,
+        work_plan=None,
+    )
+    assert torch.equal(output[0, 0], expected), (output[0, 0, :4], expected[:4])
+    return {"gfx": get_gfx_runtime(), "out": output[0, 0, 0].item()}
 
 
 @benchmark()
@@ -1525,6 +1601,8 @@ def _unsupported():
     """Why pa_decode cannot run here, or None."""
     if not torch.cuda.is_available():
         return "pa_decode needs a GPU"
+    # The live GPU, not get_gfx(): that follows GPU_ARCHS, a build list ("gfx942;gfx950"
+    # in the prebuild step) whose last entry is not necessarily the GPU the test runs on.
     arch = get_gfx_runtime()
     if arch not in SUPPORTED_GFX:
         return f"pa_decode unsupported on {arch}"
@@ -1579,10 +1657,11 @@ def _sweeps(arch, kv_dtypes):
             _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
         ),
     )
-    one_task, extreme_scales, short_bound = [], [], []
+    one_task, extreme_scales, pv_range, short_bound = [], [], [], []
     if "mxfp4" in kv_dtypes and arch == "gfx950":
         one_task = [("mxfp4-one-task-per-row", ())]
         extreme_scales = _EXTREME_SCALE_CASES
+        pv_range = _PV_RANGE_CASES
         short_bound = [("mxfp4-short-bound", ())]
     return [
         ("pa_decode", run_pa_decode, decode),
@@ -1605,6 +1684,7 @@ def _sweeps(arch, kv_dtypes):
             run_pa_decode_mxfp4_extreme_scales,
             extreme_scales,
         ),
+        ("pa_decode MXFP4 PV range", run_pa_decode_mxfp4_pv_range, pv_range),
         ("pa_decode MXFP4 short bound", run_pa_decode_mxfp4_short_bound, short_bound),
     ]
 

@@ -19,7 +19,7 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, WAVE
+from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MX_P_EXP_SHIFT, WAVE
 
 
 class PaDecodePipeline:
@@ -713,8 +713,11 @@ class PaDecodePipeline:
         for a in range_constexpr(t.NCHUNK):
             l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
         # S^T[token 4g+v][head] is the B operand layout of the PV MFMA: P stays here.
+        # P enters the PV MFMA times 2**-MX_P_EXP_SHIFT (l_new above is unscaled): the
+        # f32 sum then cannot overflow; ``store_mx`` restores it after normalizing.
+        p_shift = fx.full(4, 2.0**-MX_P_EXP_SHIFT, fx.Float32)
         p_ops = [
-            probs[a].to(fx.BFloat16).bitcast(fx.Int64)[0]
+            (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
             for a in range_constexpr(t.NCHUNK)
         ]
         # V's loads follow K's by part of a tile so the two bursts do not queue together.
