@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import glob
 import json
 import logging
@@ -16,6 +17,9 @@ from typing import Any, Literal
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 import aiter
 from aiter.ops.mha import (
@@ -71,12 +75,12 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
     compare_accuracy,
@@ -1789,15 +1793,31 @@ def benchmark_payload_bytes(
     return KERNEL_SPECS[args.kernel].payload_bytes
 
 
-def benchmark_single_case(
+_POOL_FIELDS = ["q", "k", "v", "block_attn_mask", "runner"]
+
+
+def _kernel_fn(runner, **_):
+    return runner()
+
+
+def _generate_pool_entry(
+    qkv_gen,
     args: argparse.Namespace,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    provider: str,
     loaded_single_mask: LoadedMask | None,
-    explicit_block_attn_mask: torch.Tensor | None = None,
-) -> float:
+    explicit_block_attn_mask: torch.Tensor | None,
+):
+    """Build one full q/k/v (+ block-sparse mask) set and its kernel runner.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random tensors (and, when sparsity is random, an independent
+    mask), so replaying through the pool during timing defeats cache
+    residency the same way a repeat-and-average loop would. ``qkv_gen`` is a
+    zero-arg callable, supplied by the caller, that returns one ``(q, k, v)``
+    draw -- random generation or a captured-input clone, depending on which
+    run_benchmark_* entry point is driving this call.
+    """
+    q, k, v = qkv_gen()
+
     if os.environ.get("AITER_PROBE_VIDENTITY"):
         # LAYOUT PROBE (not accuracy): V := identity so O[q,d] = sum_kv P[q,kv] d(kv==d) = P[q,d].
         # The output's d-axis then IS the kv axis, so any kv scramble in the PV contraction shows up
@@ -1825,17 +1845,50 @@ def benchmark_single_case(
         else None
     )
 
-    fn = make_kernel_runner(
+    runner = make_kernel_runner(
         args, q, k, v, block_lut=block_lut, block_mask=block_attn_mask
     )
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    return q, k, v, block_attn_mask, runner
+
+
+def benchmark_single_case(
+    args: argparse.Namespace,
+    qkv_gen,
+    provider: str,
+    bencher: RotatingBufferBench,
+    loaded_single_mask: LoadedMask | None,
+    explicit_block_attn_mask: torch.Tensor | None = None,
+) -> float:
+    pool_gen = functools.partial(
+        _generate_pool_entry,
+        qkv_gen,
+        args,
+        loaded_single_mask,
+        explicit_block_attn_mask,
+    )
+    rot_bufs = bencher.build_pool([pool_gen], [_POOL_FIELDS])
+    entry0 = rot_bufs[0]
+    q, k, v, block_attn_mask = (
+        entry0["q"],
+        entry0["k"],
+        entry0["v"],
+        entry0["block_attn_mask"],
+    )
+    block_lut = (
+        block_attn_mask_to_ragged_lut(block_attn_mask, return_none_if_dense=True)
+        if block_attn_mask is not None
+        else None
+    )
 
     if args.report_quality:
-        current_primary = primary_output(fn())
+        current_primary = primary_output(entry0["runner"]())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         report_quality_against_reference(args, current_primary, ref_primary)
 
+    ms = bencher.bench(_kernel_fn)
+
+    shape = infer_shape_spec(q, v, args.layout)
     total_flops = (
         2.0
         * shape.batch
@@ -2036,8 +2089,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.block_sparsity is None or args.block_mask_file
     ):
         raise ValueError(
-            "--n-repetitions requires random --block-sparsity without "
-            "--block-mask-file"
+            "--n-repetitions requires random --block-sparsity without --block-mask-file"
         )
 
     if args.ref not in ("torch", "aiter_bf16"):
@@ -2068,10 +2120,41 @@ def validate_args(args: argparse.Namespace) -> None:
         logger.warning("--hadamard-rotate is ignored for kernel %s", args.kernel)
 
 
+def _random_qkv_gen(
+    BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, dtype, device, args, layout
+):
+    q, k, v = generate_test_tensors(
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        device,
+        args.input_distribution,
+        hadamard_rotate=args.hadamard_rotate,
+    )
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+    return q, k, v
+
+
+def _captured_qkv_gen(q_src, k_src, v_src):
+    # q_src/k_src/v_src are a single captured sample; clone per pool entry so
+    # each rotation targets an independent buffer (cache-defeating) even
+    # though the content itself is the same captured data every time.
+    return q_src.clone(), k_src.clone(), v_src.clone()
+
+
 def run_benchmark_generated(
     args: argparse.Namespace,
     loaded_single_mask: LoadedMask | None,
 ) -> None:
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report(create_single_shape_config(args))
     def bench_mha(
         BATCH,
@@ -2086,7 +2169,8 @@ def run_benchmark_generated(
         provider,
         device="cuda",
     ):
-        q, k, v = generate_test_tensors(
+        qkv_gen = functools.partial(
+            _random_qkv_gen,
             BATCH,
             HQ,
             HK,
@@ -2096,22 +2180,14 @@ def run_benchmark_generated(
             D_HEAD_V,
             dtype,
             device,
-            args.input_distribution,
-            hadamard_rotate=args.hadamard_rotate,
+            args,
+            layout,
         )
-
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
-
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
-
         return benchmark_single_case(
             args,
-            q,
-            k,
-            v,
+            qkv_gen,
             provider,
+            bencher,
             loaded_single_mask=loaded_single_mask,
         )
 
@@ -2123,6 +2199,9 @@ def run_benchmark_captured(
     loaded_single_mask: LoadedMask | None,
 ) -> None:
     inputs = load_captured_inputs(args.captured_dir)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report(create_captured_config(args, inputs))
     def bench_mha_captured(INPUT_IDX, inputs, provider, device="cuda"):
@@ -2131,12 +2210,12 @@ def run_benchmark_captured(
         k = inp["k"].to(device)
         v = inp["v"].to(device)
 
+        qkv_gen = functools.partial(_captured_qkv_gen, q, k, v)
         return benchmark_single_case(
             args,
-            q,
-            k,
-            v,
+            qkv_gen,
             provider,
+            bencher,
             loaded_single_mask=loaded_single_mask,
         )
 
@@ -2145,6 +2224,9 @@ def run_benchmark_captured(
 
 def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -> None:
     block_m, block_n = kernel_block_sizes(args.kernel)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report(create_mask_list_config(args, masks))
     def bench_mha_masks(
@@ -2166,7 +2248,8 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
         n_ctx_q = loaded.num_q_blocks * block_m
         n_ctx_k = loaded.num_kv_blocks * block_n
 
-        q, k, v = generate_test_tensors(
+        qkv_gen = functools.partial(
+            _random_qkv_gen,
             loaded.batch,
             HQ,
             HK,
@@ -2176,20 +2259,14 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
             D_HEAD_V,
             dtype,
             device,
-            args.input_distribution,
-            hadamard_rotate=args.hadamard_rotate,
+            args,
+            layout,
         )
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
-
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
         return benchmark_single_case(
             args,
-            q,
-            k,
-            v,
+            qkv_gen,
             provider,
+            bencher,
             loaded_single_mask=None,
             explicit_block_attn_mask=mask,
         )
@@ -2213,8 +2290,12 @@ def run_block_sparse_repetitions(
 
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
-    q, k, v = generate_test_tensors(
+    qkv_gen = functools.partial(
+        _random_qkv_gen,
         args.b,
         args.hq,
         args.hk,
@@ -2224,35 +2305,35 @@ def run_block_sparse_repetitions(
         args.dv,
         dtype,
         device,
-        args.input_distribution,
-        hadamard_rotate=args.hadamard_rotate,
+        args,
+        args.layout,
     )
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
-    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
-    shape = infer_shape_spec(q, v, args.layout)
+    # Use one draw only to size the block-sparse geometry; q/k/v themselves
+    # rotate through an independent pool entry on every timed call below.
+    q0, _, v0 = qkv_gen()
+    shape = infer_shape_spec(q0, v0, args.layout)
     block_m, block_n = kernel_block_sizes(args.kernel)
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
-    warmup_mask = (
-        torch.rand(
-            shape.batch,
-            shape.hq,
-            num_q_blocks,
-            num_kv_blocks,
-            device=device,
-            dtype=torch.float32,
-        )
-        > args.block_sparsity
-    ).to(torch.bool)
-    warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(
-        args, q, k, v, block_lut=warmup_lut, block_mask=warmup_mask
+    def _draw_mask():
+        return (
+            torch.rand(
+                shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device
+            )
+            > args.block_sparsity
+        ).to(torch.bool)
+
+    # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
+    benchmark_single_case(
+        args,
+        qkv_gen,
+        "time(ms)",
+        bencher,
+        loaded_single_mask=None,
+        explicit_block_attn_mask=_draw_mask(),
     )
-    triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
         2.0
@@ -2268,21 +2349,17 @@ def run_block_sparse_repetitions(
     tflops_effective: list[float] = []
 
     for _ in range(args.n_repetitions):
-        mask = (
-            torch.rand(
-                shape.batch,
-                shape.hq,
-                num_q_blocks,
-                num_kv_blocks,
-                device=device,
-                dtype=torch.float32,
-            )
-            > args.block_sparsity
-        ).to(torch.bool)
+        mask = _draw_mask()
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
-        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        ms = benchmark_single_case(
+            args,
+            qkv_gen,
+            "time(ms)",
+            bencher,
+            loaded_single_mask=None,
+            explicit_block_attn_mask=mask,
+        )
         latencies_ms.append(ms)
 
         dense_tflops = (total_flops / (ms * 1e-3)) / 1e12
@@ -2648,14 +2725,21 @@ def benchmark_all_kernel_row(
     v: torch.Tensor,
     total_flops: float,
     ref_primary: torch.Tensor,
+    bencher: RotatingBufferBench,
 ) -> AllKernelRow:
     saved_kernel = args.kernel
     args.kernel = kernel_name
     try:
-        fn = make_kernel_runner(args, q, k, v, block_lut=None)
-        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        # Every variant must see the exact same q/k/v as ref_primary was
+        # computed from, so pool entries clone that one draw (cache-defeating
+        # via distinct buffers, not independent data) rather than drawing
+        # fresh random tensors per entry.
+        qkv_gen = functools.partial(_captured_qkv_gen, q, k, v)
+        pool_gen = functools.partial(_generate_pool_entry, qkv_gen, args, None, None)
+        rot_bufs = bencher.build_pool([pool_gen], [_POOL_FIELDS])
+        ms = bencher.bench(_kernel_fn)
         tflops = total_flops / ms * 1e-9
-        current_primary = primary_output(fn())
+        current_primary = primary_output(rot_bufs[0]["runner"]())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
@@ -2724,6 +2808,9 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     )
 
     rows: list[AllKernelRow] = []
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     for kernel_name in ALL_KERNELS:
         try:
@@ -2736,6 +2823,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
                     v,
                     total_flops,
                     ref_primary,
+                    bencher,
                 )
             )
         except Exception as e:  # noqa: BLE001
