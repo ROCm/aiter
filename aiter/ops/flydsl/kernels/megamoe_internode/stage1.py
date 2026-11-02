@@ -40,16 +40,10 @@ from ..mxfp4_gemm_common import k_tiles_total_for
 from . import communication as comm
 from .communication import ccqe_enabled as _rail_ccqe
 
-# rail GDA 原语:MORI 公开绑定给不了 team/optFlags,见 communication.py / gda_rail.cpp
-#
-# checked = 带 MORI device assert;release = assert 编译掉。kernel2
-# (stage2.py)当初就是因为 rail 关键路径才换成 release,而 stage1
-# 一直用 checked。stage1 每代发 176 个 WQE(88 put + 88 put_value),kernel2 只发
-# ~32 个,所以同样的 per-WQE assert 成本在 stage1 上被放大 5.5 倍。
+# The checked rail shim keeps MORI device assertions on dispatch.
 from .communication import checked as _rail
 
-# gemm.py 的改动不进本文件 kernel 的 flydsl 缓存 key;改 GMM1 时同步改这行强制重编。
-# gemm1 rev: megamoev2-style wait_lds_barrier pipeline, nofence barrier v1, next_claim v1, aqout_row_base v1
+# GEMM helper changes must also invalidate this module's kernel cache.
 from .gemm import (
     _bm_constants,
     _gemm1_body,
@@ -74,9 +68,8 @@ def _plane_bytes(layout: Stage1ArenaLayout, name: str) -> int:
     return region.nbytes // layout.parity_depth
 
 
-# 进程内编译缓存:stage1 kernel 名超过文件名长度上限,进不了 flydsl 的磁盘缓存,
-# 每构造一次算子就要重编一次(大 TPR 约 25~30 秒)。launcher 只闭包编译期常量,
-# 运行期地址全部走 launch 参数,所以同样的编译参数可以直接复用。
+# Long kernel names can exceed disk-cache filename limits. Reuse launchers
+# in-process; all window and weight addresses are runtime arguments.
 _COMPILED: dict = {}
 
 
@@ -120,25 +113,11 @@ def _compile_stage1(
     fan2_shards = 16 if split_local else 0
     extra_consumers = split_local
     static_g0 = not split_local
-    # 不 split 路径独有的三项(split 路径没有接线):
-    # tile_ready:GMM1 按组(G 个 tile)就绪启动,不等全局封尾。
-    #   到达计数:每批写完(waitcnt+barrier)后,按 expert 把本批行数拆到它跨的(至多 2 个)
-    #     物理组,加到 dest 的 tile_row_done[组首 tile]。只有这一种计数:两条 relaxed 原子乱序可见会让消费者
-    #     按旧组计数把已到的真行补成 pad。
-    #     认领溢出组时把组在 expert 内的序号 k 写进 tile_row_base[组首 tile](该 region 此路径无其他读者)。
-    #   预约终值:fan CTA 在 fan2 最后一批 P2 后给本地 gmm1_job_head[dest] +1,满 fan_stride 的给 dest 的
-    #     gmm1_job_head[16] +1;==8 ⇒ expert_count / tile_alloc 都是终值。
-    #   消费者:A 段 = 静态组(g<LE),组计数满 32*G 即算;否则等预约终值后,组应有 clamp(count-k*32G,0,32G) 行,
-    #     到齐后自补组尾;B 段 = 预约终值后按 tile_alloc 做溢出组。A+B 的 job 集合与过门后的静态跨步完全相同,
-    #     所以完成计数公式不变;过门后不再做 job(sortcopy 仍等门)。
-    #   每 job 的 acquire 只由 tx0 做(每 wave 一次 buffer_inv 会冲掉 L2 里 GMM1 的权重复用)。
-    # lite_sync:fan 尾巴去掉冗余 release fence、consumed 计数用 relaxed 原子;
-    #   sealer 的 _seal_pad_par/_seal_perm 不再逐 tile 自旋 map_ready(已经 acquire 过全部 comm_eos)。
-    # fan_wt:fan 的远端写(行元数据、payload/scale、认领的 map)全部写穿到系统一致点
-    #   (sc0|sc1,payload 另加 nt,同 kernel1 的 pay_cm=19),于是 s_waitcnt(0) 即可见,不再需要整 L2 写回:
-    #   认领后的 fence、tile_ready 每批的 fence 改成只等完成;fan 尾每个分片的 acq_rel RMW 改成 relaxed。
-    # Keep constexpr guards outside runtime guards: Python `and` would mix
-    # specialization decisions with GPU predicates (the local SIM102 exemptions).
+    # Unsplit groups publish row counts only after their batch stores retire.
+    # Reservation completion fixes the final row counts before consumers pad tails.
+    # Metadata/payload writes use system write-through, so publication needs no
+    # repeated L2 writeback; consumers acquire once per job to preserve weight reuse.
+    # Keep constexpr guards outside runtime guards (local SIM102 exemptions).
     tile_ready = lite_sync = fan_wt = not split_local
     # buffer_store cache_modifier(pre-gfx12 编码):1=sc0(GLC) 16=sc1(SCC) 2=nt(SLC)。
     _WT_META = 17 if fan_wt else 0
@@ -154,11 +133,8 @@ def _compile_stage1(
     LOCAL_EXPERTS = int(layout.local_experts)
     TOPK = int(layout.topk)
     BM = int(layout.block_m)
-    # 成对(成组)认领:arena 的 tile 仍是 BM 行(Stage2 / MegaMoEv2 的 SBM
-    # 依赖这个粒度),但 tile_alloc 一次固定分配 G 个,于是同一个 expert 的
-    # G 个 tile 物理相邻,GMM1 可以按 BM*G 行做一个 m_block。
+    # Claim G adjacent BM32 tiles per expert; Stage2 retains the BM32 ABI.
     G = int(layout.tile_group)
-    # GMM1 以一个认领组(G 个 tile)为一个 m_block。
     GBM = BM * G
     GROUP_ROWS = BM * G
     BN = int(layout.block_n)
@@ -188,23 +164,14 @@ def _compile_stage1(
         raise ValueError(
             "Stage-1 swiglu_limit applies to silu only and must be positive"
         )
-    # agent: token capacity来自arena specialization；producer CTA池保持固定，
-    # 避免大batch把resident grid扩张到硬件无法同时驻留的规模。
+    # Keep the progress grid resident even when token capacity grows.
     MAX_TOKENS = int(layout.max_tokens)
     COMM_CTAS = GPUS_PER_NODE
     PRODUCER_FIRST = COMM_CTAS
-    # 量化池原本写死 128:512 个 token 由 128 个 CTA 各做 4 个,另外 128 个
-    # CTA 在 fanout 之前完全空转。staging 段实测占 stage1 的 38%
-    # ([[stage1 四段分解]]),所以池子大小是个直接旋钮。0 = 保持原默认。
     PRODUCER_CTAS = min(128, MAX_TOKENS)
     ESSENTIAL_CTAS = PRODUCER_FIRST + PRODUCER_CTAS
-    # GMM1 消费者的起始 ticket。默认 ESSENTIAL_CTAS(=136),即 8 个 comm 和
-    # 128 个 producer 干完自己的活就退出,GMM1 阶段 136/256 个 CTA 空转。
-    # 实测把它降到 0(全员参与)GMM1 段确实快了 30%(797->555us),但总时间
-    # 大幅回归:comm CTA 还欠着 rail 的 credit/reclaim,而 finisher 要等
-    # h1_compute_done 收满,于是 GMM1 的收尾被 rail 拆链拖住。
-    # 所以它是个**边界**而不是开关:8 = 放 producer 进来但不放 comm
-    # (原来的 ESSENTIAL_CTAS 在实测的每个 shape 上都慢 44~87us)。
+    # Producers may rejoin GEMM; communication CTAs must retain their rail
+    # credit/reclaim role until the protocol completes, otherwise progress stalls.
     COMPUTE_FIRST = min(8, ESSENTIAL_CTAS)
     INVALID_SOURCE = WORLD * MAX_TOKENS
     if not 1 <= MAX_TOKENS <= MAX_FUSED_TOKENS_PER_RANK:
@@ -212,13 +179,7 @@ def _compile_stage1(
             f"Stage-1 max_tokens must be in [1, {MAX_FUSED_TOKENS_PER_RANK}]"
         )
     if fanout_shards < 1 or GPUS_PER_NODE * fanout_shards > worker_blocks:
-        # 原来只在 comm+producer 这 ESSENTIAL_CTAS 个 CTA 内铺开,理由是
-        # producer 做完量化(实测 ~10us)就闲着,借用它们不减少 GMM1 消费者。
-        # 但 fanout 是**跨 GPU 往返延迟**受限的(每条 record 约 5 次
-        # atomic_add_system/spin 串行往返),并发度就是吞吐,而 ticket >=
-        # ESSENTIAL_CTAS 的消费者在第一个 tile 发布前本来就只是在自旋。
-        # 放开到 worker_blocks 后 shards>17 会让消费者先做完自己那片 fanout
-        # 再入池 —— 是否划算由实测决定,所以这里只放开上界,不改默认。
+        # Fanout may borrow waiting compute CTAs; the whole grid must stay resident.
         raise ValueError(
             "fanout_shards must satisfy 1 <= GPUS_PER_NODE*shards <= "
             f"{worker_blocks}"
@@ -682,8 +643,6 @@ def _compile_stage1(
                     control_generation,
                 )
             _cta_acquire()
-
-        # ------------------------------------------------------------------
         # 目的端预计算放置 —— 第 1 步:算计数并交换。
         #
         # 计数只依赖 topk_ids,kernel 入口就有,所以整个 plan 可以和量化
@@ -697,23 +656,16 @@ def _compile_stage1(
         #
         # 计数不需要清零:每个源只写自己那一行,再把 plan_count_ready[src]
         # 置成 generation,目的端等 `== generation`,天然免疫上一代的残留。
-        # ------------------------------------------------------------------
-
-        # ------------------------------------------------------------------
         # A bounded producer CTA pool owns tokens in a strided schedule.  At
         # capacity 128 this is identical to the historical one-CTA-per-token
         # mapping; larger capacities reuse the same resident CTA for later
         # tokens instead of increasing the resident grid.
-        # ------------------------------------------------------------------
         # split fanout 原先把 token 直接写成 ticket,循环每轮重搬同一个
         # token:512 个只落 128 个,且从 ticket 起算(token 0..7 无人写)。
         # 那是 MORI「128 token / 一 CTA 一 token / 单轮」的形状。
-
-        # ------------------------------------------------------------------
         # Four waves own four QPs.  Each chunk is one aggregate PUT per QP plus
         # a trailing ready value and one flush/doorbell.  The same CTA receives
         # the reciprocal chunk and performs selected-rank proxy fan-out.
-        # ------------------------------------------------------------------
         if is_cco:
             qp = wave
 
@@ -803,12 +755,9 @@ def _compile_stage1(
                     ),
                     fx.Int32(remote_node * MAX_TOKENS) + token,
                 )
-
-        # ------------------------------------------------------------------
         # Split fanout CTAs cover the eight node-local destinations. Each writes
         # both its local source rank and the aligned remote source rank directly
         # into destination expert tiles; there is no rank inbox/sort.
-        # ------------------------------------------------------------------
         is_finisher = is_comm & (ticket == fx.Int32(local_rank))
 
         # 两个 finisher 职责必须分开:封尾 partial tile 属于 dispatch 那一半,
@@ -1657,13 +1606,7 @@ def _compile_stage1(
                     )
 
         dest = fx.Int32(0)
-        # fanout 的并发度:原本 is_comm = ticket < GPUS_PER_NODE,即 8 个 CTA
-        # 各钉死一个目的 rank、串行走完全部 MAX_TOKENS。实测这一段占 stage1
-        # 的 82%(8,338us 搬 15.6MB = 1.87 GB/s,而同一块 arena 流式读是
-        # 3.6 TB/s)—— 是并发度不是带宽。分片后 CTA t 负责
-        # dest = t % GPUS_PER_NODE、shard = t // GPUS_PER_NODE,token 按
-        # shard 跨步。借用的是 producer CTA(量化只要 ~10us 就闲置),
-        # 不动 GMM1 消费者池。
+        # Shard each destination's fanout across CTAs to hide peer round trips.
         is_fanout = ticket < fx.Int32(GPUS_PER_NODE * fanout_shards)
         # T0(CCO 收发 + credit + seal)是关键路径,不再兼做 dest0
         # 的 0 号分片;dest0 由其余 fanout_shards-1 个分片分掉。
@@ -1693,11 +1636,6 @@ def _compile_stage1(
             if tx == fx.Int32(0):
                 _spin(_peer_addr(dest, "launch_ready"), control_generation)
             gpu.barrier()
-            # 和 CCO CTA 那边同一个毛病:逐个 token 用单线程去看一个
-            # 早已置位的 flag,每次一条 system scope load,串行依赖。
-            # 实测所有 producer 在 ~98us 就发布完了,所以这些等待几乎
-            # 全是白等。把它们提到循环前、用整个 CTA 一次看完。
-            # 见 [[串行等 flag 的 700us]]。
             for token in range(
                 fan_wshard, fx.Int32(MAX_TOKENS), fan_tstride * fx.Int32(_GB_NB)
             ):
@@ -1733,15 +1671,11 @@ def _compile_stage1(
                             generation,
                         )
             if const_expr(early_local_gmm):  # noqa: SIM102
-                # F5:本地组封尾挪到 fan CTA(ticket 8+local_rank,非 T0/非 rail post)的 fan1 之后,
-                # 不再等 sealer 自己做完 fan2(E1T:本地门 ~175µs ≈ 全局 comm_eos 时刻)。
-                # 只等 node 内各源的 fan1,fan1 不依赖 fan2/封尾,无环。
-                # fan2_shards 时挪到 fan2 池外(shard=F2S),不拖本 dest 的 fan2。
+                # Seal local groups after intra-node fanout; this does not wait
+                # for remote fanout and stays outside the rail-post pool.
                 if ticket == fx.Int32(GPUS_PER_NODE * _SEG1_SHARD + local_rank):
                     _seal_seg1()
-            # 这里比原来保守:等**全部** chunk 而不是本 token 那个。
-            # dispatch_chunks=2 且整批只有一次 flush,两者实际同时到,
-            # 代价上限是半次传输(~10us),换掉每 token 一次的自旋。
+            # One flush publishes all dispatch chunks together; wait once per CTA.
             if (tx < fx.Int32(layout.num_qp)) & (
                 fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
             ):
@@ -2068,9 +2002,7 @@ def _compile_stage1(
                 aqout_row_base=H1_ROW_BASE,
             )
 
-        # ------------------------------------------------------------------
         # GMM1 consumers.
-        # ------------------------------------------------------------------
         # GMM1 消费者本来只有 ticket >= ESSENTIAL_CTAS 的 120 个,8 个 comm
         # 和 128 个 producer 干完自己的活就退出,整个 GMM1 阶段(实测 797us,
         # 占 stage1 的 46%)里 136/256 个 CTA 是空的。所有 CTA 本来就是在

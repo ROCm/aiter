@@ -331,8 +331,6 @@ class MegaMoEInternode:
         except Exception:
             self.close()
             raise
-
-    # ------------------------------------------------------------------
     # construction
 
     @staticmethod
@@ -577,8 +575,6 @@ class MegaMoEInternode:
             "s2_window_off": layout.stage2_offset, "epoch_off": self._epoch_off,
             "parity_planes": tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
         }
-
-    # ------------------------------------------------------------------
     # forward
 
     def quantize(self, x_bf16: torch.Tensor):
@@ -666,9 +662,6 @@ class MegaMoEInternode:
             WORKER_BLOCKS, stream, **self._k2_compile,
         )
         return self._output[: self.mtpr] if slice_output else self._output
-
-    # ------------------------------------------------------------------
-
     def close(self) -> None:
         if self._closed:
             return

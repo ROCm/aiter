@@ -68,16 +68,9 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     lane_mod_16 = lane % 16
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
 
-    # CPol (SIDefines.h:593, pre-gfx12 encoding): GLC=SC0=1, SLC=NT=2,
-    # SCC=SC1=16.  The default 2 is non-temporal with no coherence scope, so
-    # the payload sits dirty in this rank's L2 and someone has to write it
-    # back before a peer can see it -- that writeback is what made the
-    # per-row release RMW cost 41x.  17|2 = sc0|sc1|nt writes through to the
-    # system coherence point instead, so no writeback is ever needed and the
-    # outgoing payload stops competing with w2 for L2 as well.
-    # Publishing implies write-through: there is no fence anywhere in this
-    # path any more, so a payload left dirty in this rank's L2 would never
-    # reach the peer.  The two are one decision, not two knobs.
+    # SIDefines.h (pre-gfx12): SC0=1, NT=2, SC1=16. System write-through
+    # makes payload stores peer-visible once vmcnt retires and avoids evicting w2.
+    # Publication relies on this policy; a dirty-L2 payload would need a fence.
     pay_cm = 19
     out_elem_bytes = 2
     token_nbytes = N_OUT * out_elem_bytes
@@ -198,28 +191,11 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         )
 
 
-    # One (token, slot) row is written by num_n_blocks CTAs, one column
-    # range each.  They count themselves on a rank-private counter and the
-    # last arriver publishes the generation to the consumer.
-    #
-    # Ordering: the payload is stored sc0|sc1|nt, so it is at the system
-    # coherence point once vmcnt retires.  One s_waitcnt for the whole
-    # batch puts every row's payload there before any increment -- which is
-    # why there is no fence anywhere in this path.  An earlier version put
-    # a fence_system_release here: +399us.
-    #
-    # Neither publication store may be a *release* store.  store_i32_system
-    # and store_i64_global_system are, and LLVM gives every one of those a
-    # buffer_wbl2 -- a full L2 writeback, ~18k per generation, +6.7ms.  The
-    # relaxed variant keeps the one-as scope and drops the writeback.
-    #
-    # The indices are re-decoded rather than carried across the store loop:
-    # the counter needs t as well as slot, and keeping five values per row
-    # live pushes SGPR past the 102 budget.
-    #
-    # p2p_scatter_epilog is a plain Python function -- the AST rewriter
-    # never sees its `if`s -- so the dynamic branches live in a nested
-    # @flyc.jit, the same reason everything else here uses .select().
+    # One CTA writes each column range; the last arrival publishes the row.
+    # Drain the whole write-through batch before incrementing any row counter.
+    # Publish with monotonic system stores: release stores add a redundant L2
+    # writeback per row. Re-decode indices here to stay within the SGPR budget.
+    # Runtime branches need a local @flyc.jit because this helper is plain Python.
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     for row_iter in range_constexpr(BM // 4):
         row = wave + fx.Int32(row_iter * 4)
@@ -622,7 +598,6 @@ def _fp8_scale_for_leader(is_leader, local_max):
     return e8m0
 
 
-
 def _fp8_encode8(vals, lane, *, VEC):
     """VEC 个 f32 -> (打包好的 i32 列表, 本块 e8m0, 本 lane 是否块 leader)。
 
@@ -886,43 +861,15 @@ def compile_stage2_node_combine(
             word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
             while word < expected:
                 word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
-
-
-
-        # ------------------------------------------------------------------
         # 阶段 1:归约 + 写 WQE
-        # ------------------------------------------------------------------
-        # 两个 plane 都要归约(本端 plane 供阶段 3 用,对端 plane 要发出去)。
-        # 分片按 (plane, token, hidden tile) 到 wave;**簿记按 (CTA, chunk)**。
-        #
-        # 上一版把完成计数放在每个工作单元后面,代价是每单元一次
-        # rocdl.s_waitcnt(0) —— 它等的是全部未完成访存,于是下一个单元的
-        # load 一个都发不出去,跨单元的访存重叠被切断。隔离 kernel 里单变量
-        # 量过:同样的读,加上「每单元 s_waitcnt(0) + 一次 agent 原子」就从
-        # 26.4us 变成 117.2us(4.4x)。而 stride=twaves(640) 大于一个 chunk
-        # 的 224 个单元,一个 wave 在每个 chunk 里只做一个单元,这笔开销连摊
-        # 都摊不掉。
-        #
-        # 现在 CTA bx 认领 chunk (bx % total_chunks),同一个 chunk 由
-        # G 个 CTA 分担,G = 该 chunk 分到的 CTA 数。完成计数数的是 **CTA**:
-        # 16 个 chunk x G=10 => 160 次原子,而不是 7168 次;s_waitcnt(0) 每
-        # CTA 每 chunk 一次。活跃 CTA 数仍然是整个 grid。
-        #
-        # 对照(同一块 arena、同样的分片和软流水,不带任何簿记)是 2.2 TB/s。
-        # 【设计点:不要再试"提早发 put"】两个方向都实测过,一律没有收益:
-        # 先做会发 put 的 remote plane(PLANE_FIRST)-> 200.0 vs 201.2,零;
-        # 把 chunk 分成 S 级让前几级的 put 早发(RAIL_STAGES)-> S=2 回退到
-        # 221.6(基线 195.6)、S=4 回退到 280.5。结论:rail 的时间是**线上
-        # 时间不是发射延迟**,在发射侧做流水不会有回报 —— 剩下的杠杆只有减
-        # 字节(就是现在的 rail fp8,实测 -38us)。两条代码路径已按此结论删除。
+        # Reduce both planes, then ship only the remote plane. G CTAs share
+        # each chunk and count completion once per CTA, retaining overlap between
+        # memory operations. Per-unit waits would serialize this bandwidth path.
         _PLANES = (0, 1)
         ck_local = bx % total_chunks
         sub = bx // total_chunks
         n_cta = (grid - ck_local + total_chunks - fx.Int32(1)) // total_chunks
-        # 必须是 range_constexpr:AST 改写器只特判它。写成
-        # `for plane in _PLANES:`(普通 Python 元组循环)会让嵌在里面的动态
-        # range 不被改写,编译期报 "dynamic 'ArithValue' has no Python
-        # integer representation"。
+        # The rewriter needs range_constexpr to reach nested runtime loops.
         for _pi in range_constexpr(2):
           plane = _PLANES[_pi]
           if const_expr(INBOX_PER_PLANE):
@@ -931,18 +878,11 @@ def compile_stage2_node_combine(
               inbox_rsrc_p = buffer_ops.create_buffer_resource_from_addr(
                   inbox_ptr + fx.Int64(plane * INBOX_PLANE_BYTES),
                   num_records_bytes=fx.Int32(INBOX_PLANE_BYTES))
-          # 运行期 range:ck_local, +total_chunks, ...
-          # 用它而不是 `for _st in constexpr: if ck < total_chunks:` —— 动态
-          # range 落在 scf.if 生成的分支函数里不会被 AST 改写(和
-          # p2p_scatter_epilog 同一个坑),编译期就炸。
-          # 和分级前逐字等价。
+          # Keep a typed runtime range so branch rewriting preserves the loop.
           for ck in range(ck_local, total_chunks, total_chunks):
               ck_first = ck * fx.Int32(CHUNK)
               ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
-              # 每 CTA 每 chunk 一次,和老的 chunk 路径同粒度(实测只要
-              # +2.7us)。按工作单元等会把 acquire fence 乘 7 倍 —— 那
-              # 一版实测 +86.8us。认领同一 chunk 的 G 个 CTA 会重复等,
-              # 第一个之后都是已就绪的缓存命中。
+              # Wait/acquire once per CTA and chunk, rather than per work unit.
               for _wi in range_constexpr(WAIT_ITERS):
                 w_flat = tx + fx.Int32(_wi * THREADS)
                 w_token = ck_first + w_flat // fx.Int32(TOPK)
@@ -1037,12 +977,8 @@ def compile_stage2_node_combine(
                           // fx.Int32(2),
                           cache_modifier=_acm)
               # token 段模式:本 CTA 的字节范围是连续的,自己发自己的 put,
-              # 不等本 chunk 最慢的那个 CTA。WQE 只是写进发送队列
-              # (aggregate 不敲门铃),所以 10 个 CTA 并发写没有问题;
-              # 门铃仍由最后一个到达者通过 wqe_posted[qp] 触发 —— 它的
-              # acq_rel 能看见其它 9 个 CTA 在各自 s_waitcnt(0) 之后的 release,
-              # 也就保证了那 10 份 WQE 都已经写好。
-              # --- 每 CTA 每 chunk 一次:这里才是排空点 ---
+              # Drain this CTA's stores before its acq_rel arrival. The last
+              # arrival observes every partial before posting the chunk's WQE.
               fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
               gpu.barrier()
               cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
@@ -1056,10 +992,7 @@ def compile_stage2_node_combine(
                   # 能整 wave 一起进(put 是 warp 级 collective)。
                   prev = fx.Int32(rocdl.readfirstlane(T.i32, prev.ir_value()))
                   if (prev + fx.Int32(1)) == n_cta:
-                      # 系统可见性(NIC 要读 node_accumulator)由这**一次**
-                      # fence 负责,每 chunk 一次,不是每个 wave 一次。
-                      # 写穿模式下 accumulator 的写本来就落到系统一致点了,
-                      # 这次整 L2 写回纯属多余。
+                      # Publish the whole chunk to the NIC with one system fence.
                       comm.fence_system_release()
                       if lane == fx.Int32(0):
                           comm.store_i32_system(
@@ -1093,18 +1026,9 @@ def compile_stage2_node_combine(
                                   + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
                                   + fx.Int64(_qp) * fx.Int64(4),
                                   fx.Int32(1))
-
-
-        # ------------------------------------------------------------------
         # 阶段 2:rail 返回
-        # ------------------------------------------------------------------
-        # 整段只在一个 CTA 里跑,qp = wave。这样 gpu.barrier() 是合法的(CTA 的
-        # 每个 wave 都会走到),"本批 WQE 已全部写入"就是一次 barrier,不需要
-        # 任何跨 CTA 计数器。NUM_QP 多于 wave 数时,一个 wave 顺序带几个 QP。
-        # 一个 CTA 带一个 QP。当初整段收在 CTA0 里是因为"本批 WQE 已全部
-        # 写入"想用一次 gpu.barrier() 表达;但阶段1 各 CTA 写的
-        # SCRATCH_WQE_POSTED[qp] 已经是跨 CTA 计数器,而 QP 之间没有顺序
-        # 要求 —— 那个理由不成立了。这里不用任何 barrier。
+        # One CTA's wave0 flushes each QP after all its WQEs are posted.
+        # QPs are independent; this phase needs no CTA barrier.
         if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
          _want = _max_rt(
              (total_chunks - bx + fx.Int32(NUM_QP - 1))
@@ -1129,21 +1053,9 @@ def compile_stage2_node_combine(
              comm.store_i32_system(
                  arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
                  fx.Int32(0))
-
-        # ------------------------------------------------------------------
         # 阶段 3:所有 CTA 做 node 间归约 + unpermute
-        # ------------------------------------------------------------------
-        # 节点内累加已在阶段 1 完成,remote_partial_rx 里也是对端累加好的,
-        # 所以这里只是两者相加再按 token 序写出。
-        # 和阶段1 同一个形状。老写法是"一个 CTA 一个 token",每个 token 一次
-        # gpu.barrier() + fence_system_acquire() + s_waitcnt(0) + 一次
-        # **system scope** acq_rel 原子(每条自带整 L2 写回,kernel1 上量过
-        # ~370ns/条),512 个 token 就是 512 次,全撞在 L2 上;而且
-        # CHUNK_ITERS=2 只用掉 7/8 个 wave 槽。实测 29.4us,而这段只搬
-        # 11 MB —— 按探针量到的 2.2 TB/s 应该是 5us。
-        #
-        # 现在:CTA 认领 chunk,同步降到每 CTA 每 chunk 一次;chunk 内的
-        # (token, hidden tile) 按 wave 铺开(HPARTS=7 整除,没有掩码空转)。
+        # Both node partials are already reduced. Add and unpermute them;
+        # synchronize once per CTA/chunk and distribute its work across waves.
         for ck in range(bx % total_chunks, total_chunks, grid):
           ck_first = ck * fx.Int32(CHUNK)
           ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
@@ -1230,11 +1142,7 @@ def compile_stage2_node_combine(
                       ck_tok)
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         gpu.barrier()
-
-
-        # ------------------------------------------------------------------
         # 收尾:return_consumed 信用交换
-        # ------------------------------------------------------------------
         # remote_partial_rx 只有 2 个 parity 槽,第 N 代和第 N+2 代共用同一块。
         # 没有这个握手,两端代数可以自由漂移;而 wait_ready 是 >= 语义,对端跑快
         # 两代时它写的新 ready 会同时满足我们对旧代的等待 —— 不挂死,直接读到
