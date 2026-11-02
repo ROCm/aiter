@@ -13,6 +13,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
+from ._all_reduce_config import get_ar_1stage_max_bytes
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 # gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
@@ -30,7 +31,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", "-1"))
+    _ar_1stage_max_bytes = get_ar_1stage_max_bytes(os.environ)
     _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
         os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
@@ -372,8 +373,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_fuse_ar_rms(input_, n, out_n)
         )
         total_bytes_limit = (
-            self._ar_1stage_max_kb
-            if self._ar_1stage_max_kb >= 0
+            self._ar_1stage_max_bytes
+            if self._ar_1stage_max_bytes >= 0
             else 128 * 7168 * 2 // self.world_size
         )
         use_1stage = (
@@ -566,7 +567,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             total_bytes_limit = (
-                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+                self._ar_1stage_max_bytes
+                if self._ar_1stage_max_bytes >= 0
+                else 128 * 1024
             )
             use_1stage = (
                 self._ar_1stage_override
@@ -645,7 +648,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
             total_bytes_limit = (
-                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+                self._ar_1stage_max_bytes
+                if self._ar_1stage_max_bytes >= 0
+                else 128 * 1024
             )
             use_1stage = (
                 self._ar_1stage_override
