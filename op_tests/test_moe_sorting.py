@@ -28,12 +28,15 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
         return
 
     device_id = torch.cuda.current_device()
-    tokens = (1, 7, 8, 12, 16, 24, 25, 31)
+    tokens = (1, 7, 8, 12, 16, 17, 24, 25, 31)
     multi_tokens = {
-        255: (25, 31),
-        256: (8, 12, 16, 24, 25, 31),
-        257: (8, 12, 16, 24, 25, 31),
-        384: (8, 12, 16, 24, 25, 31),
+        127: (),
+        128: (17, 24, 25, 31),
+        192: (17, 24, 25, 31),
+        255: (17, 24, 25, 31),
+        256: (8, 12, 16, 17, 24, 25, 31),
+        257: (8, 12, 16, 17, 24, 25, 31),
+        384: (8, 12, 16, 17, 24, 25, 31),
         385: tokens,
     }
     for E, token in itertools.product(multi_tokens, tokens):
