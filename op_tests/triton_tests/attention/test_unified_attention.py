@@ -1384,28 +1384,42 @@ def test_unified_attn_non_causal_features(
 
 
 @pytest.mark.parametrize(
-    "window_size, use_alibi, match",
+    "window_size, unsupported, match",
     [
-        ((255, 0), False, "sliding window"),
-        ((-1, 0), False, "sliding window"),
-        ((-1, -1), True, "ALiBi"),
+        ((255, 0), None, "sliding window"),
+        ((-1, 0), None, "sliding window"),
+        ((-1, -1), "alibi", "ALiBi"),
+        ((-1, -1), "qq_bias", "query-query bias"),
+        ((-1, -1), "fp4_q", "fp4 Q"),
+        ((-1, -1), "fp4_kv", "fp4 Q or KV"),
     ],
-    ids=["left_window", "right_window", "alibi"],
+    ids=["left_window", "right_window", "alibi", "qq_bias", "fp4_q", "fp4_kv"],
 )
 # a decode batch runs on the causal kernels, but it must reject them too
 @pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
 def test_unified_attn_non_causal_rejects_unsupported(
-    window_size: tuple[int, int], use_alibi: bool, match: str, query_len: int
+    window_size: tuple[int, int], unsupported: str | None, match: str, query_len: int
 ) -> None:
-    q = torch.empty(query_len, 1, 64, dtype=torch.bfloat16, device="cuda")
-    kv = torch.empty(1, 16, 1, 64, dtype=torch.bfloat16, device="cuda")
-    alibi = torch.ones(1, dtype=torch.float32, device="cuda") if use_alibi else None
+    q_dtype = torch.uint8 if unsupported == "fp4_q" else torch.bfloat16
+    kv_dtype = torch.uint8 if unsupported == "fp4_kv" else torch.bfloat16
+    q = torch.empty(query_len, 1, 64, dtype=q_dtype, device="cuda")
+    kv = torch.empty(1, 16, 1, 64, dtype=kv_dtype, device="cuda")
+    alibi = (
+        torch.ones(1, dtype=torch.float32, device="cuda")
+        if unsupported == "alibi"
+        else None
+    )
+    qq_bias = (
+        torch.zeros(query_len, query_len, dtype=torch.float32, device="cuda")
+        if unsupported == "qq_bias"
+        else None
+    )
     with pytest.raises(AssertionError, match=match):
         unified_attention(
             q=q,
             k=kv,
             v=kv,
-            out=torch.empty_like(q),
+            out=torch.empty(query_len, 1, 64, dtype=torch.bfloat16, device="cuda"),
             cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device="cuda"),
             seqused_k=torch.tensor([2], dtype=torch.int32, device="cuda"),
             max_seqlen_q=query_len,
@@ -1419,6 +1433,7 @@ def test_unified_attn_non_causal_rejects_unsupported(
             k_descale=None,
             v_descale=None,
             alibi_slopes=alibi,
+            qq_bias=qq_bias,
         )
 
 
