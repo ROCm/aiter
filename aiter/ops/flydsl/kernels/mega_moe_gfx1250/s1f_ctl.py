@@ -21,7 +21,6 @@ import torch
 
 from aiter import ActivationType
 
-from ..mega_moe import envs
 from .arena import _align_up
 
 _log = logging.getLogger("aiter")
@@ -65,20 +64,12 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 # waits out dispatch first. At or below this token count the next layer's plan
 # starts before dispatch returns and overlaps both.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
-# The S1F defaults (AITER_MEGA_S1F, AITER_S1F_* and the compact route
-# schedule, all registered in mega_moe/envs.py, plus S1F_BLOCK_RUNS in
-# s1f_stage1.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf Endpoints
-# agentic c512: +2.1% gen tok/s/GPU over S1F off. Each env var only overrides
-# its default.
+# The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
+# route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
+# Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
 #: A step whose receive bound exceeds this runs the whole S1F=0 path (see
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
-#: AITER_S1F_MAX_RECV=N overrides it (default 4096); 0 means no limit.
-_S1F_MAX_RECV = envs.AITER_S1F_MAX_RECV
-#: Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel then runs
-#: its own 256x256 n/k tiles instead of the tuned GEMM1's (e.g. tpr 480's
-#: t64x256x128 GEMM1 can fuse). AITER_S1F_ANY_TILE=0 requires tile_m, tile_n
-#: and tile_k to all match.
-_S1F_ANY_TILE = envs.AITER_S1F_ANY_TILE
+_S1F_MAX_RECV = 4096
 
 
 def read_s1f_mode() -> bool:
@@ -88,7 +79,10 @@ def read_s1f_mode() -> bool:
     fit keeps dispatch and GEMM1 as separate launches. ``AITER_MEGA_S1F=0``
     turns it off.
     """
-    return envs.AITER_MEGA_S1F != "0"
+    mode = os.environ.get("AITER_MEGA_S1F", "1").strip() or "1"
+    if mode not in ("0", "1"):
+        raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
+    return mode == "1"
 
 
 def _s1f_cu_num() -> int:
@@ -103,9 +97,8 @@ def _fallback_warn(owner, reasons) -> None:
     if not reasons or getattr(owner, "_warned", False):
         return
     owner._warned = True
-    # S1F is on by default, so only an explicit AITER_MEGA_S1F=1 warns.
-    log = _log.warning if envs.AITER_MEGA_S1F == "1" else _log.info
-    log("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
+    # S1F is on by default, so a config that does not fit is not a warning.
+    _log.info("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
 
 
 def tile_flag_nbytes(*, compact_rows: int, world_size: int) -> int:
@@ -306,14 +299,10 @@ class _Stage1Fusion:
     def _recv_too_big(self) -> bool:
         # The receive bound is identical on every rank.
         step = getattr(self.d, "_step", None)
-        return (
-            bool(_S1F_MAX_RECV)
-            and step is not None
-            and (int(step.recv_bound) > _S1F_MAX_RECV)
-        )
+        return step is not None and int(step.recv_bound) > _S1F_MAX_RECV
 
     def step_off(self) -> bool:
-        """A step over AITER_S1F_MAX_RECV runs exactly the S1F=0 path.
+        """A step over _S1F_MAX_RECV runs exactly the S1F=0 path.
 
         Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
         kernel per alignment and slot, instead of one per launch width, block
@@ -328,7 +317,7 @@ class _Stage1Fusion:
         reasons = self.tile_reasons(self.d._step.align_m)
         if self._recv_too_big():
             reasons = reasons + [
-                f"recv_bound {int(self.d._step.recv_bound)} > AITER_S1F_MAX_RECV"
+                f"recv_bound {int(self.d._step.recv_bound)} > {_S1F_MAX_RECV}"
             ]
         seen = self.g1_seen.get(self._g1_key())
         if seen is None:
@@ -453,13 +442,10 @@ class _Stage1Fusion:
 
     @staticmethod
     def _mismatches(got: dict, align_m: int) -> tuple:
-        want = {
-            "tile_m": int(align_m),
-            "tile_n": _S1F_TILE_N,
-            "tile_k": _S1F_TILE_K,
-        }
-        if _S1F_ANY_TILE:
-            want = {"tile_m": int(align_m)}
+        # Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel
+        # then runs its own 256x256 n/k tiles instead of the tuned GEMM1's
+        # (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
+        want = {"tile_m": int(align_m)}
         return tuple(
             f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
         )
@@ -638,9 +624,8 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        if _S1F_ANY_TILE:
-            # The stage-1 kernel runs its own 256x256 n/k tiles.
-            got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        # The stage-1 kernel runs its own 256x256 n/k tiles.
+        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
