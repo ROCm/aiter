@@ -93,6 +93,10 @@ class Stage2ScatterContext:
     # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
     # ep_combine_fused dequantize on the way out.
     combine_quant_bits: int = 0
+    # S1F (AITER_MEGA_S1F=1): a stand-in for the GEMM1 launch with the
+    # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
+    # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
+    stage1_gemm1: object = None
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):
