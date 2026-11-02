@@ -2450,11 +2450,15 @@ def _compile_stage1(
             _cta_acquire()
             # 融合版:GMM1 消费者(ticket>=COMPUTE_FIRST,从不写 T0 专用的 3..10 槽)
             # 3 = 过 h1_queue_eos 门,4 = 自己的 job 做完。
-            tiles = buffer_ops.buffer_load(
-                buffer_ops.create_buffer_resource_from_addr(local_addr("tile_alloc")),
-                fx.Int32(0),
-                vec_width=1,
-                dtype=T.i32,
+            tiles = fx.Int32(
+                buffer_ops.buffer_load(
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("tile_alloc")
+                    ),
+                    fx.Int32(0),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
             )
             # early_local_gmm:job 已在上面两段领完,这里只剩 sortcopy + 完成计数(每 CTA +1)。
             total_jobs = (tiles // fx.Int32(G)) * fx.Int32(
