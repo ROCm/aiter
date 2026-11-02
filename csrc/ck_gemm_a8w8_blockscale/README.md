@@ -12,7 +12,9 @@
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_tune via jit:
 `python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv --libtype both`
-libtype can be `ck`, `cktile` or `both`. We recommend to tune together by setting `--libtype both` to get both ck legacy and tile implementations, then choose the best one, this will take more time but help to get better performance. You can find the results of the tuning in `aiter/configs/a8w8_blockscale_tuned_gemm.csv`, like this:
+`--libtype` accepts `ck`, `cktile`, `asm`, `opus`, `flydsl`, `all` (default), or `both`.
+`both` compares CK/CKTile only; `all` compares every supported backend, including FlyDSL.
+You can find the results in [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv), like this:
     |**gfx**  |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
     |---------|----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
     |gfx942   |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
@@ -25,6 +27,21 @@ Test the performance, modify the test instance in `op_tests/test_gemm_a8w8_block
 If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE`, the default one will be results merged from `aiter/configs/a8w8_blockscale_tuned_gemm.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_a8w8_blockscale_tuned_gemm_xx.csv`, the merged result is store in `/tmp/aiter_configs/a8w8_blockscale_tuned_gemm.csv`.
 
 ## More Options
+
+### FlyDSL blockscale (gfx950)
+
+Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare it with
+the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
+
+- Plain B: row-major `x_scale[M, K/128]`; the adapter transposes it to
+  `[K/128, M]` inside the timed call.
+- `--preshuffle`: `x_scale` is stored as `[K/128, M]`
+  (`x_scale.T.contiguous().view_as(x_scale)`), prepared before timing.
+  Pass `-o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`, and keep
+  `--preshuffle` when replaying with `--run_config`.
+
+Public API defaults are unchanged; FlyDSL runs only where a tuned CSV row
+selects it.
 
 ### Output Configuration
 
