@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness tests for QSA quantized cache writes, scoring, selection and
-sparse paged GQA."""
+"""Correctness tests for QSA scoring, selection and sparse paged GQA."""
 
 import functools
 
@@ -782,7 +781,7 @@ def test_qsa_stacked_scorer_matches_cuda_core(page_size, rows_per_request):
         )
         assert torch.equal(visible, ref_visible)
         assert not row_starts.any()
-        used = any("STACK_HEADS_1" in name for name in kernels)
+        used = any("_qsa_paged_mqa_logits_stacked" in name for name in kernels)
         assert used == stacked, sorted(kernels)
         out[stacked] = _seen(logits, visible)
         torch.testing.assert_close(
@@ -799,7 +798,7 @@ def test_qsa_stacked_decode_falls_back_without_a_tile(without_qsa_config):
     (logits, visible), kernels = _launched_kernels(
         qsa_paged_mqa_logits, *case, compress_ratio=_RATIO, stacked_decode=True
     )
-    assert not any("STACK_HEADS_1" in name for name in kernels), sorted(kernels)
+    assert not any("_stacked" in name for name in kernels), sorted(kernels)
     assert torch.equal(visible, ref_visible)
     torch.testing.assert_close(
         _seen(logits, visible), _seen(ref, visible), rtol=1e-4, atol=1e-4
@@ -839,7 +838,7 @@ def test_qsa_takes_unquantized_fp16_and_fp32_caches(dtype):
             compress_ratio=_RATIO,
             stacked_decode=stacked,
         )
-        assert any("STACK_HEADS_1" in name for name in kernels) == stacked
+        assert any("_stacked" in name for name in kernels) == stacked
         assert torch.equal(visible, ref_visible)
         torch.testing.assert_close(
             _seen(logits, visible), _seen(ref, visible), rtol=tol, atol=tol

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA operators for quantized cache writes, index scoring, selection and
-sparse paged GQA."""
+"""QSA operators for index scoring, selection and sparse paged GQA."""
 
 import functools
 
@@ -15,6 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.qsa import (
     _expand_selected_groups,
     _qsa_paged_mqa_logits_kernel,
     _qsa_paged_mqa_logits_mfma_kernel,
+    _qsa_paged_mqa_logits_stacked_kernel,
     _qsa_sparse_paged_gqa_kernel,
     _qsa_store_rows_fp4_kernel,
     _qsa_store_rows_fp8_kernel,
@@ -360,14 +360,14 @@ def qsa_paged_mqa_logits(
     stacked = tile is not None and tile["BMT"] * heads >= 16
     if stacked or (q.shape[0] > 256 and contiguous and head_dim >= 16):
         if stacked:
+            kernel = _qsa_paged_mqa_logits_stacked_kernel
             bmt, bn, num_warps = tile["BMT"], tile["BN"], tile["num_warps"]
             column_programs = min(triton.cdiv(columns, bn), tile["column_programs"])
         else:
+            kernel = _qsa_paged_mqa_logits_mfma_kernel
             bmt, bn, num_warps = 16, 128, 4
             column_programs = triton.cdiv(columns, bn)
-        _qsa_paged_mqa_logits_mfma_kernel[
-            (triton.cdiv(q.shape[0], bmt), column_programs)
-        ](
+        kernel[(triton.cdiv(q.shape[0], bmt), column_programs)](
             q,
             compressed_k_cache,
             compressed_k_scale,
@@ -392,14 +392,13 @@ def qsa_paged_mqa_logits(
             float(divisor),
             PAGE_SIZE=compressed_k_cache.shape[1],
             PAGE_TABLE_WIDTH=_table_width_bucket(page_table.shape[1]),
-            NUM_HEADS=heads,
-            HEAD_DIM=head_dim,
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
             COMPRESS_RATIO=compress_ratio,
             BMT=bmt,
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
-            STACK_HEADS=stacked,
             num_warps=num_warps,
         )
         return logits, visible_groups

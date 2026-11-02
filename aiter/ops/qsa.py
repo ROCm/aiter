@@ -57,16 +57,17 @@ def qsa_paged_mqa_logits(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score compressed key groups.
 
-    Dispatches to the FlyDSL MFMA scorer for large prefill batches over BF16
-    keys when ``allow_flydsl`` is set and FlyDSL is available, otherwise falls
-    through to the triton wrapper, which also takes FP8 / MXFP4 keys with
-    their ``compressed_k_scale`` and the ``stacked_decode`` scorer.
+    Dispatches to the FlyDSL MFMA scorer for large prefill batches when
+    ``allow_flydsl`` is set and FlyDSL is available, otherwise falls through
+    to the triton wrapper.
+
+    FP8 / MXFP4 keys (with ``compressed_k_scale``) and ``stacked_decode`` are
+    triton only.
     """
     if (
         allow_flydsl
         and _HAS_FLYDSL
         and compressed_k_scale is None
-        and compressed_k_cache.dtype == torch.bfloat16
         and q.shape[0] > 256
         and q.stride(2) == 1
         and compressed_k_cache.stride(3) == 1

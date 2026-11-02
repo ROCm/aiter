@@ -26,9 +26,9 @@ from aiter.ops.qsa import (
     qsa_cache_row_layout,
     qsa_paged_mqa_logits,
     qsa_select_paged_tokens,
-    qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
 )
+from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # Qwen3.8-Flash-Next-120B model config
@@ -141,18 +141,7 @@ def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
     }
 
 
-def _label(args, name):
-    parts = []
-    if name in ("select", "logits"):
-        parts.append(f"index {args.index_dtype}")
-        if args.stacked_decode:
-            parts.append("stacked")
-    if name == "gqa":
-        parts.append(f"kv {args.kv_dtype}")
-    return f"{name}, {', '.join(parts)}"
-
-
-# -- qsa_paged_mqa_logits / qsa_select_paged_tokens ------------------------
+# -- qsa_select_paged_tokens (scoring + topk + expand) --------------------
 
 # (batch, tokens_per_seq, context_len)
 _SELECT_SHAPES = [
@@ -185,7 +174,7 @@ def bench_select(args, scoring_only=False):
         x_vals=_SELECT_SHAPES,
         line_arg="provider",
         line_vals=[name],
-        line_names=[f"{fn_name} [{_label(args, name)}] ({unit})"],
+        line_names=[f"{fn_name} ({unit})"],
         styles=[("blue", "-")],
         ylabel=unit,
         plot_name=get_caller_name_no_ext() + "_" + name,
@@ -201,23 +190,33 @@ def bench_select(args, scoring_only=False):
         columns = s["pages_per_req"] * COMPRESSED_PAGE_SIZE
         rows = s["rows"]
         elem = 2  # bf16
-        common = (
+        kwargs = {
+            "compressed_k_scale": s["compressed_scale"],
+            "stacked_decode": args.stacked_decode,
+        }
+
+        fn = lambda: qsa_select_paged_tokens(
             s["index_q"],
             s["compressed"],
             s["tables"],
             s["requests"],
             s["positions"],
             s["lengths"],
+            BUDGET,
+            RATIO,
+            **kwargs,
         )
-        kwargs = {
-            "compressed_k_scale": s["compressed_scale"],
-            "stacked_decode": args.stacked_decode,
-        }
-
         if scoring_only:
-            fn = lambda: qsa_paged_mqa_logits(*common, RATIO, **kwargs)
-        else:
-            fn = lambda: qsa_select_paged_tokens(*common, BUDGET, RATIO, **kwargs)
+            fn = lambda: qsa_paged_mqa_logits(
+                s["index_q"],
+                s["compressed"],
+                s["tables"],
+                s["requests"],
+                s["positions"],
+                s["lengths"],
+                RATIO,
+                **kwargs,
+            )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if args.metric == "time":
@@ -268,7 +267,7 @@ def bench_gqa(args):
         x_vals=_GQA_SHAPES,
         line_arg="provider",
         line_vals=["gqa"],
-        line_names=[f"qsa_sparse_paged_gqa [{_label(args, 'gqa')}] ({unit})"],
+        line_names=[f"qsa_sparse_paged_gqa ({unit})"],
         styles=[("green", "-")],
         ylabel=unit,
         plot_name=get_caller_name_no_ext() + "_gqa",
@@ -333,7 +332,7 @@ def parse_args():
         "--op",
         choices=["select", "logits", "gqa", "all"],
         default="all",
-        help="Which op to benchmark (default: all = select and gqa)",
+        help="Which op to benchmark (default: all)",
     )
     parser.add_argument(
         "--index-dtype",
