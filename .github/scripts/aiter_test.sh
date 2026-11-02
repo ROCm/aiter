@@ -162,6 +162,31 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
+        op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
+            {
+                echo "Running $file at its default group size, then at 6 ranks when available"
+            } | tee -a latest_test.log
+            # 6 ranks has no gather / scatter kernels (NCCL fallback) and a
+            # one-stage all-reduce whose 512 threads do not split evenly.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file"
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$ngpu" -lt 6 ]]; then
+                        echo "Skipping the 6-rank pass of $test_file: $ngpu GPUs"
+                        exit 0
+                    fi
+                    case "$test_file" in
+                        *test_custom_allreduce.py) exec python3 "$test_file" -t 6 --regression ;;
+                        *) exec python3 "$test_file" -t 6 ;;
+                    esac
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"

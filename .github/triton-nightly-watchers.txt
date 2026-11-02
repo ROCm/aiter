@@ -1,0 +1,4 @@
+# GitHub users that the Triton nightly mentions on the "Triton nightly status"
+# issue. GitHub emails each mentioned user, as their notification settings allow.
+# One username per line, without "@". Text after "#" is a comment.
+Boss2002n

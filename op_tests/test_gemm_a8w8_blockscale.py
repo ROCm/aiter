@@ -19,7 +19,11 @@ from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_ck,
+    gemm_a8w8_blockscale_cktile,
+    gemm_a8w8_blockscale_flydsl,
+)
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
@@ -214,6 +218,31 @@ def test_gemm(
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
 
+        # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
+        if get_gfx() == "gfx950":
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+                kernel_fits_shape,
+                kernelInstance,
+            )
+
+            flydsl_kernel = kernelInstance(ck_preshuffle)
+            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
+                f, avg_f = run_flydsl(
+                    x,
+                    gemm_weight,
+                    gemm_x_scale,
+                    w_scale,
+                    flydsl_kernel.name,
+                    ck_preshuffle,
+                    dtype,
+                )
+                ret["flydsl us"] = avg_f
+                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_f / 1e6
+                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_f / 1e6
+                ret["flydsl err"] = checkAllclose(
+                    a, f, msg="flydsl", catastrophic_check=True
+                )
+
     return ret
 
 
@@ -243,6 +272,18 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_flydsl(
+    x, weight, x_scale, w_scale, kernel_name, preshuffle_b, dtype=dtypes.bf16
+):
+    m, _k = x.shape
+    n, _ = weight.shape
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return gemm_a8w8_blockscale_flydsl(
+        x, weight, x_scale, w_scale, out, {"kernelName": kernel_name}, preshuffle_b
+    )
 
 
 def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
