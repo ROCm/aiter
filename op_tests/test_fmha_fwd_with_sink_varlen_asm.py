@@ -265,12 +265,13 @@ def _kv_alignment_ok(hdim_q, seqlens):
 
 @benchmark()
 def test_fmha_fwd_with_sink_varlen_asm(
-    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init, d64_sink=True
 ):
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v, init=init)
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(hdim_q)
-    sink = _d64_sink(hq) if hdim_q == 64 else None
+    # D64 without a sink: the wrapper passes the kernel a -inf sink.
+    sink = _d64_sink(hq) if hdim_q == 64 and d64_sink else None
 
     ref_out, ref_lse = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=sink)
 
@@ -280,6 +281,8 @@ def test_fmha_fwd_with_sink_varlen_asm(
     )
 
     # The model calls the public dispatcher (flash_attn_varlen_func) → asm path.
+    # It sends D64 without a sink to another backend, so that case calls the ops.
+    via = "public" if hdim_q != 64 or d64_sink else "ops"
     candidates = {
         "asm": lambda: run_kernel(
             q,
@@ -291,7 +294,7 @@ def test_fmha_fwd_with_sink_varlen_asm(
             scale=scale,
             is_causal=is_causal,
             sink=sink,
-            via="public",
+            via=via,
         )
     }
 
@@ -641,11 +644,12 @@ def main():
         for is_causal, init in itertools.product(causal_modes, args.init):
             if not is_causal and not _kv_alignment_ok(hdim_q, seqlens):
                 continue
-            df.append(
-                test_fmha_fwd_with_sink_varlen_asm(
-                    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+            for d64_sink in (True, False) if hdim_q == 64 else (True,):
+                df.append(
+                    test_fmha_fwd_with_sink_varlen_asm(
+                        hdim_q, hdim_v, hq, hk, seqlens, is_causal, init, d64_sink
+                    )
                 )
-            )
     df = pd.DataFrame(df)
     aiter.logger.info(
         "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
