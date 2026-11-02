@@ -2160,8 +2160,8 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
         "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     }
     if head_dim != 128:
-        # Only MXFP4 has a kernel past hd128; the rest would raise rather than return a number.
-        recipes = {"mxfp4": recipes["mxfp4"]}
+        # Only all-MXFP6 and all-MXFP4 have kernels past hd128; the rest would raise.
+        recipes = {name: recipes[name] for name in ("mxfp6", "mxfp4")}
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(
