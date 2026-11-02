@@ -94,6 +94,22 @@ __device__ __forceinline__ int32_t mxfp6_k_tail(const int32_t head,
            (head % 2) * 4 + slot;
 }
 
+#if defined(__gfx950__)
+// The convert writes its destination while still reading the sources, and ROCm 7.2 may allocate
+// the result over them; early-clobber keeps them disjoint.
+__device__ __forceinline__ uint32_t __attribute__((ext_vector_type(6)))
+cvt_scalef32_2xpk16_fp6(float __attribute__((ext_vector_type(16))) lo,
+                        float __attribute__((ext_vector_type(16))) hi,
+                        float scale)
+{
+    uint32_t __attribute__((ext_vector_type(6))) packed;
+    asm("v_cvt_scalef32_2xpk16_fp6_f32 %0, %1, %2, %3"
+        : "=&v"(packed)
+        : "v"(lo), "v"(hi), "v"(scale));
+    return packed;
+}
+#endif
+
 template <int thread_size>
 __device__ float swap_thread_data(float data)
 {
@@ -418,7 +434,7 @@ __global__ void hadamard_rotate_activation_mxfp6_quant_kernel(
             hi[i] = peer[i];
         }
 #if defined(__gfx950__)
-        packed_t packed = __builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32(lo, hi, mx_scale);
+        packed_t packed = cvt_scalef32_2xpk16_fp6(lo, hi, mx_scale);
 #else
         packed_t packed{};
 #endif
@@ -797,8 +813,7 @@ __global__ __launch_bounds__(256) void quantize_v_mxfp6_fp6_p_kernel(
     const uint32_t scale_exp   = abs_max == 0.0f ? 127u : abs_max_exp - 2u;
     const float mx_scale       = __builtin_bit_cast(float, scale_exp << 23);
 #if defined(__gfx950__)
-    const packed_t packed =
-        __builtin_amdgcn_cvt_scalef32_2xpk16_fp6_f32(even, odd, mx_scale);
+    const packed_t packed = cvt_scalef32_2xpk16_fp6(even, odd, mx_scale);
 #else
     const packed_t packed{};
 #endif
