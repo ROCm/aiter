@@ -8,12 +8,26 @@ from dataclasses import dataclass
 from functools import cache
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 
-__all__ = ["MegaMHCWorkspace", "mega_mhc", "mega_mhc_shuffle_fn", "prepare_mega_mhc"]
+__all__ = [
+    "MEGA_MHC_RES_KS",
+    "MegaMHCWorkspace",
+    "mega_mhc",
+    "mega_mhc_post_shuffled",
+    "mega_mhc_res_preshuffle_supported",
+    "mega_mhc_res_repeat",
+    "mega_mhc_res_shuffle",
+    "mega_mhc_res_unshuffle",
+    "mega_mhc_shuffle_fn",
+    "precompile_mega_mhc_post_shuffled",
+    "prepare_mega_mhc",
+]
 
 
 _STREAM_HIDDEN_SIZES = (5120, 7168)
@@ -576,3 +590,191 @@ def mega_mhc(
             scale_row_major,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre
+
+
+# ---------------------------------------------------------------------------
+# Carrying the residual in the res_preshuffle layout between Mega-MHC calls.
+#
+# mega_mhc(res_preshuffle=True) reads and returns the residual as
+# resS[k // MEGA_MHC_RES_KS][stream][token][k % MEGA_MHC_RES_KS], same
+# (T, hc, H) shape. A model that keeps its residual in that layout from the
+# embedding to the end of the stack needs to enter it (repeat), leave it
+# (unshuffle), and, where a sublayer's post cannot fold into the next
+# mega_mhc call, apply the post in place of mhc_post (mega_mhc_post_shuffled).
+# Unlike aiter.ops.mhc's mhc_res_* helpers these never pick the block width
+# or the layout from the row count: the caller decides, and every helper
+# here takes and returns the layout mega_mhc reads, for any rows.
+# ---------------------------------------------------------------------------
+
+#: Block width of the residual layout mega_mhc(res_preshuffle=True) reads.
+MEGA_MHC_RES_KS = 32
+
+
+@cache
+def _res_layout_ops():
+    try:
+        from .mhc import (
+            mhc_res_repeat_flydsl,
+            mhc_res_shuffle_flydsl,
+            mhc_res_unshuffle_flydsl,
+        )
+    except ImportError:
+        return None
+    return mhc_res_repeat_flydsl, mhc_res_shuffle_flydsl, mhc_res_unshuffle_flydsl
+
+
+@cache
+def mega_mhc_res_preshuffle_supported() -> bool:
+    """Whether mega_mhc(res_preshuffle=True) and the helpers below run here."""
+    return get_gfx_runtime() == "gfx1250" and _res_layout_ops() is not None
+
+
+def _res_rows(residual: Tensor) -> Tensor:
+    hc, hidden = residual.shape[-2:]
+    return residual.reshape(-1, hc, hidden).contiguous()
+
+
+def mega_mhc_res_shuffle(residual: Tensor) -> Tensor:
+    """Plain (..., hc, H) residual -> the res_preshuffle layout, same shape."""
+    return _res_layout_ops()[1](_res_rows(residual), MEGA_MHC_RES_KS).view_as(residual)
+
+
+def mega_mhc_res_unshuffle(residual: Tensor) -> Tensor:
+    """res_preshuffle-layout (..., hc, H) residual -> the plain layout."""
+    return _res_layout_ops()[2](_res_rows(residual), MEGA_MHC_RES_KS).view_as(residual)
+
+
+def mega_mhc_res_repeat(hidden_states: Tensor, hc_mult: int) -> Tensor:
+    """(..., H) hidden states -> the (..., hc_mult, H) residual of hc_mult
+    copies, written straight in the res_preshuffle layout."""
+    dim = hidden_states.shape[-1]
+    rows = hidden_states.reshape(-1, dim).contiguous()
+    return _res_layout_ops()[0](rows, hc_mult, MEGA_MHC_RES_KS).view(
+        *hidden_states.shape[:-1], hc_mult, dim
+    )
+
+
+# `num_tokens` only scales strides that are multiples of KS, so specializing on
+# its value buys nothing: one compile per launch config, whatever the rows.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _mega_mhc_post_shuffled_kernel(
+    x_ptr,
+    res_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    num_tokens,
+    DIM: tl.constexpr,
+    TB: tl.constexpr,
+    CH: tl.constexpr,
+    KS: tl.constexpr,
+):
+    # hc = 4. One program: TB tokens x CH columns, all four streams, so each
+    # stream's rows are TB * KS contiguous elements per KS block.
+    tok = (tl.program_id(0) * TB + tl.arange(0, TB)).to(tl.int64)
+    col = tl.program_id(1) * CH + tl.arange(0, CH)
+    tlive = tok < num_tokens
+    live = tlive[:, None] & (col < DIM)[None, :]
+    x = tl.load(x_ptr + tok[:, None] * DIM + col[None, :], live, 0).to(tl.float32)
+    base = (
+        (col // KS)[None, :] * (4 * num_tokens * KS)
+        + tok[:, None] * KS
+        + (col % KS)[None, :]
+    )
+    stream = num_tokens * KS
+    r0 = tl.load(res_ptr + base, live, 0).to(tl.float32)
+    r1 = tl.load(res_ptr + base + stream, live, 0).to(tl.float32)
+    r2 = tl.load(res_ptr + base + 2 * stream, live, 0).to(tl.float32)
+    r3 = tl.load(res_ptr + base + 3 * stream, live, 0).to(tl.float32)
+    for b in tl.static_range(4):
+        # comb_res_mix[token, input_stream, output_stream]
+        c0 = tl.load(comb_ptr + tok * 16 + 0 * 4 + b, tlive, 0)[:, None]
+        c1 = tl.load(comb_ptr + tok * 16 + 1 * 4 + b, tlive, 0)[:, None]
+        c2 = tl.load(comb_ptr + tok * 16 + 2 * 4 + b, tlive, 0)[:, None]
+        c3 = tl.load(comb_ptr + tok * 16 + 3 * 4 + b, tlive, 0)[:, None]
+        p = tl.load(post_ptr + tok * 4 + b, tlive, 0)[:, None]
+        mixed = c0 * r0 + c1 * r1 + c2 * r2 + c3 * r3
+        out = mixed + p * x
+        tl.store(out_ptr + base + b * stream, out, live)
+
+
+# (rows upper bound, (TB, CH, num_warps)), from a gfx1250 H=5120 sweep: small
+# tiles while the grid still fills the device, then taller token tiles, whose
+# TB * KS contiguous elements per KS block keep the loads and stores long.
+_POST_SHUFFLED_LAUNCH = (
+    (256, (8, 128, 4)),
+    (512, (8, 64, 4)),
+    (None, (32, 64, 2)),
+)
+
+
+def _post_shuffled_launch(rows: int):
+    for bound, config in _POST_SHUFFLED_LAUNCH:
+        if bound is None or rows <= bound:
+            return config
+
+
+def _launch_post_shuffled(x, residual, post_mix, combination, out, rows, config):
+    tb, ch, warps = config
+    hidden = residual.shape[-1]
+    _mega_mhc_post_shuffled_kernel[(triton.cdiv(rows, tb), triton.cdiv(hidden, ch))](
+        x,
+        residual,
+        post_mix,
+        combination,
+        out,
+        rows,
+        DIM=hidden,
+        TB=tb,
+        CH=ch,
+        KS=MEGA_MHC_RES_KS,
+        num_warps=warps,
+        enable_fp_fusion=False,
+    )
+
+
+def mega_mhc_post_shuffled(
+    sublayer_out: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+) -> Tensor:
+    """mhc_post on a res_preshuffle-layout residual, returning that layout.
+
+    new[t, b] = sum_a comb_res_mix[t, a, b] * residual[t, a]
+                + post_layer_mix[t, b] * sublayer_out[t], FP32 then BF16,
+    with residual and the result as (..., 4, H) in the res_preshuffle layout
+    and sublayer_out (..., H) plain. For a post that cannot fold into the
+    next mega_mhc call (e.g. a module that reads the residual in between).
+    """
+    hc, hidden = residual.shape[-2:]
+    if hc != 4 or hidden % MEGA_MHC_RES_KS:
+        raise ValueError(
+            f"mega_mhc_post_shuffled needs hc=4 and H % {MEGA_MHC_RES_KS} == 0"
+        )
+    rows = residual.numel() // (hc * hidden)
+    out = torch.empty_like(residual)
+    if rows:
+        _launch_post_shuffled(
+            sublayer_out.reshape(rows, hidden).contiguous(),
+            residual.contiguous(),
+            post_layer_mix.reshape(rows, hc).float().contiguous(),
+            comb_res_mix.reshape(rows, hc, hc).float().contiguous(),
+            out,
+            rows,
+            _post_shuffled_launch(rows),
+        )
+    return out
+
+
+def precompile_mega_mhc_post_shuffled(hidden: int, device) -> None:
+    """Compile every launch config of mega_mhc_post_shuffled on one dummy row,
+    so no step pays a Triton compile (`num_tokens` is not specialized: one
+    compile per config, whatever the rows). Call before graph capture."""
+    x = torch.zeros(1, hidden, dtype=torch.bfloat16, device=device)
+    residual = torch.zeros(1, 4, hidden, dtype=torch.bfloat16, device=device)
+    post_mix = torch.zeros(1, 4, dtype=torch.float32, device=device)
+    combination = torch.zeros(1, 4, 4, dtype=torch.float32, device=device)
+    out = torch.empty_like(residual)
+    for _, config in _POST_SHUFFLED_LAUNCH:
+        _launch_post_shuffled(x, residual, post_mix, combination, out, 1, config)
