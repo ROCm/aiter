@@ -22,7 +22,10 @@ LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
-D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
+# Three M-tiles: MTP-5 verify at GQA 8 (6 x 8 = 48 rows). Four M-tiles take
+# a different per-token V-scale load (op_softmax, M_TILES >= 4) and are not
+# validated on this path yet.
+D256_PIPE_MAX_ROWS = 3 * MFMA_MNK
 
 
 def d256_pipe(
@@ -33,10 +36,10 @@ def d256_pipe(
     query_length,
     query_group_size,
 ) -> bool:
-    """gfx950 FP8 head 256, page 16/64, <= two M-tiles.
+    """gfx950 FP8 head 256, page 16/64, <= three M-tiles.
 
-    Uniform query length; rows = query_length * query_group_size fit two
-    16-row M-tiles that share one K/V stream. Packed caches support both V
+    Uniform query length; rows = query_length * query_group_size fit at most
+    three 16-row M-tiles that share one K/V stream. Packed caches support both V
     layouts, per-tensor/per-token scales and causal sliding windows.
     """
     return (
