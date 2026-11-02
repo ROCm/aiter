@@ -81,7 +81,7 @@ def test_flydsl_matches_torch(n_tok, pattern, kernel):
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, kv_indptr=indptr)
     ref = _torch_flat(q, kv, indices, topk)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
+    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("kernel", ["one_q", "qblock"])
@@ -104,11 +104,11 @@ def test_flydsl_attn_sink(kernel):
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, block_q=4, **common)
     ref = _torch_flat(q, kv, indices, topk, sink, scale)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
+    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.parametrize("pattern", ["shared"])
-def test_pa_decode_sparse_dispatch(pattern):
+@pytest.mark.parametrize("pattern,qblock_reuse", [("shared", False), ("shared", True)])
+def test_pa_decode_sparse_dispatch(pattern, qblock_reuse, monkeypatch):
     torch.manual_seed(2)
     n_tok, topk, pool = 16, 256, 8192
     q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
@@ -116,6 +116,22 @@ def test_pa_decode_sparse_dispatch(pattern):
     indices = _indices(pattern, n_tok, pool, topk)
     sink = torch.zeros(H, dtype=torch.float32, device="cuda")
     scale = D**-0.5
+    calls = {"one_q": 0, "qblock": 0}
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as _fly
+
+    real_one = _fly.sparse_mla_one_query_fwd_flydsl
+    real_qb = _fly.sparse_mla_qblock_fwd_flydsl
+
+    def _wrap_one(*a, **k):
+        calls["one_q"] += 1
+        return real_one(*a, **k)
+
+    def _wrap_qb(*a, **k):
+        calls["qblock"] += 1
+        return real_qb(*a, **k)
+
+    monkeypatch.setattr(_fly, "sparse_mla_one_query_fwd_flydsl", _wrap_one)
+    monkeypatch.setattr(_fly, "sparse_mla_qblock_fwd_flydsl", _wrap_qb)
     out = pa_decode_sparse(
         q,
         kv,
@@ -125,9 +141,41 @@ def test_pa_decode_sparse_dispatch(pattern):
         scale,
         has_invalid=False,
         kv_splits=1,
+        qblock_reuse=qblock_reuse,
     )
+    if qblock_reuse:
+        assert calls["qblock"] == 1 and calls["one_q"] == 0
+    else:
+        assert calls["one_q"] == 1 and calls["qblock"] == 0
     ref = _torch_flat(q, kv, indices, topk, sink, scale)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
+    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
+
+
+def test_pa_decode_sparse_default_splits_skips_flydsl(monkeypatch):
+    """Default kv_splits=None must keep Triton's auto split-K, not FlyDSL."""
+    torch.manual_seed(6)
+    n_tok, topk, pool = 8, 64, 1024
+    q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(pool, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("shared", n_tok, pool, topk)
+    sink = torch.zeros(H, dtype=torch.float32, device="cuda")
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as _fly
+
+    monkeypatch.setattr(
+        _fly,
+        "sparse_mla_one_query_fwd_flydsl",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("FlyDSL one_q")),
+    )
+    monkeypatch.setattr(
+        _fly,
+        "sparse_mla_qblock_fwd_flydsl",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("FlyDSL qblock")),
+    )
+    out = pa_decode_sparse(
+        q, kv, indices, _indptr(n_tok, topk), sink, D**-0.5, has_invalid=False
+    )
+    ref = _torch_flat(q, kv, indices, topk, sink, D**-0.5)
+    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 def test_qblock_probe_requires_every_row():

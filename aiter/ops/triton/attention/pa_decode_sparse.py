@@ -198,9 +198,9 @@ def pa_decode_sparse(
         num_stages: software-pipeline depth of the K loop (default 2).
         out: optional ``[N, H, D]`` destination. Supplied -> written in place and
             returned, which saves the caller a full-size device copy.
-        qblock_reuse: gfx942 only. ``True`` selects FlyDSL Q-block reuse,
-            ``False`` skips the probe, ``None`` probes the first block for an
-            exact shared slot list. Ignored on other architectures.
+        qblock_reuse: gfx942 only. ``True`` selects FlyDSL Q-block reuse
+            (exact shared slot list). Default ``None``/``False`` keeps the
+            one-query FlyDSL path; no host probe. Ignored on other architectures.
         uniform_topk: gfx942 only. Honored when ``kv_indptr[t] == t * topk``
             and ``kv_indices`` has exactly ``T * topk`` entries. Any other CSR
             stays on the generic path. Ignored on other architectures.
@@ -728,7 +728,11 @@ def _launch_splits(num_splits):
 
 
 def _packed_uniform_topk(kv_indices, kv_indptr, n_tok, topk_hint):
-    """Return topk when every row is the packed span ``[t * topk, (t + 1) * topk)``."""
+    """Return topk when every row is the packed span ``[t * topk, (t + 1) * topk)``.
+
+    Uses host syncs (``.item`` / ``torch.equal``). Callers must not invoke this
+    under CUDA-graph capture; the gfx942 FlyDSL gate skips capture instead.
+    """
     if n_tok <= 0 or kv_indptr is None or int(kv_indptr.numel()) != n_tok + 1:
         return None
     if topk_hint is None:
@@ -757,10 +761,20 @@ def _pa_decode_sparse_gfx942_flydsl(
     uniform_topk=None,
     qblock_reuse=None,
 ):
-    """Return the gfx942 FlyDSL path, or None so the caller uses Triton."""
+    """Return the gfx942 FlyDSL path, or None so the caller uses Triton.
+
+    FlyDSL is opt-in for decode-safe contracts only:
+    - ``kv_splits == 1`` (explicit). Default ``None`` keeps Triton's auto
+      split-K so small decode batches stay occupied.
+    - ``has_invalid=False`` (no ``-1`` padding in the CSR).
+    - Not under CUDA-graph capture (packed-CSR probes sync the host).
+    - Q-block reuse only when ``qblock_reuse is True`` (no automatic probe).
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return None
     if not (
         q.shape[1:] == (16, 512)
-        and kv_splits in (None, 1)
+        and kv_splits == 1
         and not skip_reduce
         and not has_invalid
         and q.is_contiguous()
@@ -776,10 +790,7 @@ def _pa_decode_sparse_gfx942_flydsl(
     if topk is None:
         return None
     out = _check_out(out, q, q.dtype)
-    use_qblock = qblock_reuse is True or (
-        qblock_reuse is None and _qblock_reuse_wins(kv_indices, q.shape[0], topk)
-    )
-    if use_qblock:
+    if qblock_reuse is True:
         return _pa_decode_sparse_gfx942_qblock(
             q,
             unified_kv,
@@ -803,11 +814,15 @@ def _pa_decode_sparse_gfx942_flydsl(
         attn_sink=attn_sink,
         softmax_scale=softmax_scale,
         uniform_topk=topk,
+        verify_csr=False,
     )
 
 
 def _qblock_reuse_wins(kv_indices, n_tok, topk, block_q=4):
-    """True when the first ``block_q`` queries attend one identical slot list."""
+    """True when the first ``block_q`` queries attend one identical slot list.
+
+    Host helper for tests/opt-in callers. Not used by the default dispatch path.
+    """
     if n_tok < block_q or kv_indices.numel() < block_q * topk:
         return False
     sample = kv_indices[: block_q * topk].view(block_q, topk)
@@ -839,6 +854,7 @@ def _pa_decode_sparse_gfx942_qblock(
         attn_sink=attn_sink,
         softmax_scale=softmax_scale,
         uniform_topk=uniform_topk,
+        verify_csr=False,
     )
 
 

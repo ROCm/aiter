@@ -23,7 +23,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
@@ -162,8 +162,11 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
             )
 
         qk_scale = fx.Float32(scale) * fx.Float32(LOG2E)
-        neg_inf = fx.Float32(NEG_INF)
-        zero_f = fx.Float32(0.0)
+        # Keep -inf / 0.0 as raw arith constants: ambient fast_fp_math would
+        # otherwise corrupt the empty-row ``== -inf`` guards (same pattern as
+        # fused_compress_attn_hca).
+        neg_inf = fx.Float32(arith.constant(NEG_INF, type=T.f32))
+        zero_f = fx.Float32(arith.constant(0.0, type=T.f32))
         n_u = fx.Int32(n_unique)
         n_kt = (n_u + fx.Int32(BLOCK_K - 1)) // fx.Int32(BLOCK_K)
         idx_row = q_row if const_expr(ONE_Q) else tile

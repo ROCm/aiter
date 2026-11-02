@@ -73,7 +73,15 @@ def _uniform_topk(
     n_tok: int,
     indptr: torch.Tensor | None,
     topk_hint: int | None = None,
+    *,
+    verify_csr: bool = True,
 ):
+    """Return packed flat indices and topk.
+
+    When ``verify_csr`` is False the caller already proved
+    ``indptr[t] == t * topk`` (e.g. ``pa_decode_sparse``), so this skips the
+    host ``torch.equal`` sync.
+    """
     if n_tok <= 0:
         raise ValueError(f"T must be positive, got {n_tok}")
     if topk_hint is not None:
@@ -92,7 +100,7 @@ def _uniform_topk(
         raise ValueError(
             f"packed topk={topk} requires {n_tok * topk} indices, got {indices.numel()}"
         )
-    if indptr is not None and (
+    if verify_csr and indptr is not None and (
         indptr.numel() != n_tok + 1 or not _packed_csr(indptr, n_tok, topk)
     ):
         raise ValueError("FlyDSL sparse MLA requires kv_indptr[t] == t * topk")
@@ -181,11 +189,14 @@ def sparse_mla_one_query_fwd_flydsl(
     attn_sink: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     uniform_topk: int | None = None,
+    verify_csr: bool = True,
 ):
     """One CTA per query. `uniform_topk` must describe a packed CSR."""
     _require_gfx942()
     n_tok, _n_kv = _require_contract(q, kv, out)
-    flat, topk = _uniform_topk(kv_indices, n_tok, kv_indptr, uniform_topk)
+    flat, topk = _uniform_topk(
+        kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr
+    )
     if topk % 16:
         raise ValueError("FlyDSL fast path requires topk divisible by 16")
     _launch(
@@ -214,11 +225,14 @@ def sparse_mla_qblock_fwd_flydsl(
     attn_sink: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     uniform_topk: int | None = None,
+    verify_csr: bool = True,
 ):
     """Exact shared-list reuse. Partial overlap falls back to one-query."""
     _require_gfx942()
     n_tok, _n_kv = _require_contract(q, kv, out)
-    flat, topk = _uniform_topk(kv_indices, n_tok, kv_indptr, uniform_topk)
+    flat, topk = _uniform_topk(
+        kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr
+    )
     if topk % 16:
         raise ValueError("FlyDSL fast path requires topk divisible by 16")
     if block_q is None:
@@ -240,6 +254,7 @@ def sparse_mla_qblock_fwd_flydsl(
             attn_sink=attn_sink,
             softmax_scale=softmax_scale,
             uniform_topk=topk,
+            verify_csr=False,
         )
     _launch(
         q,
