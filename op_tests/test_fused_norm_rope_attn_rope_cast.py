@@ -473,6 +473,73 @@ def check_bf16_contract(bad):
         fused_norm_rope_attn_rope_cast_bf16(q, kv, ids, ptr, cos, sin, pos, **kw)
 
 
+def _bf16_buffer_inputs():
+    kwargs = dict(
+        zip(
+            ("q", "kv", "indices", "indptr", "cos", "sin", "positions"),
+            simple_inputs(),
+        )
+    )
+    kwargs.update(
+        extend_kv=torch.ones_like(kwargs["kv"]),
+        extend=kwargs["indices"].clone(),
+        extend_indptr=kwargs["indptr"].clone(),
+        attn_sink=torch.zeros(64, device="cuda"),
+        out=torch.empty(1, 8, 4096, device="cuda", dtype=torch.float8_e4m3fn),
+        out_scale=torch.empty(1, 8, 128, device="cuda", dtype=torch.float8_e8m0fnu),
+        max_logits=torch.empty(1, 64, device="cuda"),
+        lse=torch.empty(1, 64, device="cuda"),
+    )
+    return kwargs
+
+
+def check_bf16_buffer_overlap(output, other, offset):
+    kwargs = _bf16_buffer_inputs()
+    left, right = kwargs[output], kwargs[other]
+    left_bytes = left.numel() * left.element_size()
+    right_bytes = right.numel() * right.element_size()
+    storage = torch.empty(
+        max(left_bytes, offset + right_bytes), device="cuda", dtype=torch.uint8
+    )
+    kwargs[output] = storage[:left_bytes].view(left.dtype).view(left.shape)
+    kwargs[other] = (
+        storage[offset : offset + right_bytes].view(right.dtype).view(right.shape)
+    )
+    kwargs[other].copy_(right)
+    with _raises(RuntimeError, match="outputs must not overlap"):
+        fused_norm_rope_attn_rope_cast_bf16(**kwargs)
+
+
+def check_bf16_nonoverlapping_views():
+    kwargs = _bf16_buffer_inputs()
+    expected = [x.clone() for x in fused_norm_rope_attn_rope_cast_bf16(**kwargs)]
+    sizes = [x.numel() * x.element_size() for x in kwargs.values()]
+    storage = torch.empty(
+        sum((size + 15) // 16 * 16 for size in sizes),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    offset = 0
+    for name, value in kwargs.items():
+        size = value.numel() * value.element_size()
+        view = storage[offset : offset + size].view(value.dtype).view(value.shape)
+        view.copy_(value)
+        kwargs[name] = view
+        offset += (size + 15) // 16 * 16
+    actual = fused_norm_rope_attn_rope_cast_bf16(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_norm_rope_attn_rope_cast_bf16(**kwargs)
+    for _ in range(2):
+        for x in actual:
+            x.view(torch.uint8).fill_(255)
+        graph.replay()
+        for x, ref in zip(actual, expected):
+            torch.testing.assert_close(
+                x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+            )
+
+
 # Two-source FP8 QK.
 
 
@@ -2375,25 +2442,25 @@ def check_h64_short_split_boundary(tokens, prefix_rows, extend_rows, mode, split
             q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 0.125)
         ).bfloat16()
     query = q
-    kwargs = dict(
-        q=query,
-        unified_kv=packed[:5, :512].view(torch.float8_e4m3fn),
-        unified_kv_scale=packed[:5, 512:].view(torch.float8_e8m0fnu),
-        kv_indices_prefix=pids,
-        kv_indptr_prefix=pp,
-        kv=packed[5:, :512].view(torch.float8_e4m3fn),
-        kv_scale=packed[5:, 512:].view(torch.float8_e8m0fnu),
-        kv_indices_extend=eids,
-        kv_indptr_extend=ep,
-        cos=cos,
-        sin=sin,
-        positions=positions,
-        attn_sink=sink,
-        q_is_rotated=False,
-        q_norm=mode == "norm",
-        norm_eps=0.125,
-        num_splits=splits,
-    )
+    kwargs = {
+        "q": query,
+        "unified_kv": packed[:5, :512].view(torch.float8_e4m3fn),
+        "unified_kv_scale": packed[:5, 512:].view(torch.float8_e8m0fnu),
+        "kv_indices_prefix": pids,
+        "kv_indptr_prefix": pp,
+        "kv": packed[5:, :512].view(torch.float8_e4m3fn),
+        "kv_scale": packed[5:, 512:].view(torch.float8_e8m0fnu),
+        "kv_indices_extend": eids,
+        "kv_indptr_extend": ep,
+        "cos": cos,
+        "sin": sin,
+        "positions": positions,
+        "attn_sink": sink,
+        "q_is_rotated": False,
+        "q_norm": mode == "norm",
+        "norm_eps": 0.125,
+        "num_splits": splits,
+    }
     probes = [0, tokens // 2, tokens - 1]
     rows = [
         torch.cat(
@@ -2415,7 +2482,7 @@ def check_h64_short_split_boundary(tokens, prefix_rows, extend_rows, mode, split
             torch.testing.assert_close(
                 lse[probes], expected_lse, rtol=0.0001, atol=3e-05
             )
-        buffers = dict(out=result[0], out_scale=result[1], lse=lse)
+        buffers = {"out": result[0], "out_scale": result[1], "lse": lse}
         reference = [x.clone() for x in result if x is not None]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -2460,6 +2527,20 @@ def check_raw_q_dtype_contract(direct):
 
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
+    bf16_outputs = ("out", "out_scale", "max_logits", "lse")
+    bf16_inputs = (
+        "q",
+        "kv",
+        "indices",
+        "indptr",
+        "cos",
+        "sin",
+        "positions",
+        "extend_kv",
+        "extend",
+        "extend_indptr",
+        "attn_sink",
+    )
     checks = [
         (check_raw_q_dtype_contract, [("direct", [False, True])]),
         (
@@ -2668,6 +2749,18 @@ def run_contract_checks():
             check_bf16_contract,
             [("bad", ["dtype", "shape", "strides", "indices", "empty_cache"])],
         ),
+        (
+            check_bf16_buffer_overlap,
+            [
+                (
+                    "output,other",
+                    list(itertools.product(bf16_outputs, bf16_inputs))
+                    + list(itertools.combinations(bf16_outputs, 2)),
+                ),
+                ("offset", [0, 16]),
+            ],
+        ),
+        (check_bf16_nonoverlapping_views, []),
         (
             check_norm_contract,
             [

@@ -233,6 +233,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_bf16_fwd,
         check_tensor(extend, "extend", AITER_DTYPE_i32, {ecap}, device, 4);
         check_tensor(extend_indptr, "extend_indptr", AITER_DTYPE_i32, {t + 1}, device, 4);
     }
+    const aiter_tensor_t* outputs[] = {out, out_scale, max_logits, lse};
+    const aiter_tensor_t* inputs[]  = {q,
+                                       pool,
+                                       prefix,
+                                       prefix_indptr,
+                                       cos,
+                                       sin,
+                                       positions,
+                                       extend_kv,
+                                       extend,
+                                       extend_indptr,
+                                       attn_sink};
+    for(size_t i = 0; i < 4; ++i)
+    {
+        for(const auto* input : inputs)
+            AITER_CHECK(!overlaps(outputs[i], input), "outputs must not overlap inputs");
+        for(size_t j = 0; j < i; ++j)
+            AITER_CHECK(!overlaps(outputs[i], outputs[j]), "outputs must not overlap one another");
+    }
     AITER_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0 &&
                     std::isfinite(softmax_scale * 1.4426950408889634f),
                 "softmax_scale must be positive and finite after conversion to base-2 units");
