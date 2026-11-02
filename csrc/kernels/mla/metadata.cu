@@ -229,6 +229,7 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                                                      kv_dtype,
                                                      fast_mode,
                                                      intra_batch_mode,
+                                                     cp_round_robin,
                                                      flags);
     const bool reduce_supported =
         mla_reduce_v1_supports(p.kernel_num_heads, static_cast<int32_t>(v_head_dim));

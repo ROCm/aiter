@@ -2084,6 +2084,7 @@ def _mla_metadata_head_plan(
     kv_dtype: torch.dtype,
     fast_mode: bool,
     intra_batch_mode: bool,
+    cp_round_robin: bool = False,
 ) -> _MlaHeadPlan:
     return _mla_decode_head_plan_cached(
         int(num_head_qo),
@@ -2098,7 +2099,7 @@ def _mla_metadata_head_plan(
         512,
         1,
         1,
-        False,
+        bool(cp_round_robin),
         True,
         False,
         False,
@@ -2196,7 +2197,9 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo == 96
-            and effective_seqlen_qo <= 6
+            # qlen 7 and 8 are native only under round-robin CP; the fold that
+            # runs without it is sized from its own plan.
+            and effective_seqlen_qo <= 8
         )
         or (
             get_gfx() == "gfx950"
@@ -2307,30 +2310,40 @@ def _mla_metadata_info_v1_cached(
     if num_head_qo < 1:
         return sizes(batch_size, legacy_tiles)
 
-    plan = _mla_metadata_head_plan(
-        num_head_qo=num_head_qo,
-        max_seqlen_qo=max_seqlen_qo,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
-        fast_mode=fast_mode,
-        intra_batch_mode=intra_batch_mode,
-    )
-    if plan.plan == _MlaHeadPlanKind.UNSUPPORTED:
-        assert num_head_qo % 4 == 0
-    if plan.kernel_num_heads * 2 > plan.packed_qo_len_per_wg:
-        max_qo_tiles_per_batch = max_seqlen_qo
-    else:
-        max_qo_tiles_per_batch = math.ceil(
-            max_seqlen_qo * plan.kernel_num_heads / plan.packed_qo_len_per_wg
+    # The head plan can depend on round-robin CP (96 fp8 heads at qlen 7 and 8),
+    # which get_mla_metadata_v1 learns only when it plans: size for both.
+    plans = {
+        _mla_metadata_head_plan(
+            num_head_qo=num_head_qo,
+            max_seqlen_qo=max_seqlen_qo,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            cp_round_robin=cp_round_robin,
         )
-    planned = sizes(
-        batch_size * plan.qk_batch_ratio, max_qo_tiles_per_batch, v12_intra=True
-    )
-    if legacy_tiles is None:
-        return planned
-    return tuple(
-        (_mla_max_shape(a[0], b[0]), a[1])
-        for a, b in zip(planned, sizes(batch_size, legacy_tiles))
+        for cp_round_robin in (False, True)
+    }
+    candidates = [] if legacy_tiles is None else [sizes(batch_size, legacy_tiles)]
+    for plan in plans:
+        if plan.plan == _MlaHeadPlanKind.UNSUPPORTED:
+            assert num_head_qo % 4 == 0
+        if plan.kernel_num_heads * 2 > plan.packed_qo_len_per_wg:
+            max_qo_tiles_per_batch = max_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = math.ceil(
+                max_seqlen_qo * plan.kernel_num_heads / plan.packed_qo_len_per_wg
+            )
+        candidates.append(
+            sizes(
+                batch_size * plan.qk_batch_ratio,
+                max_qo_tiles_per_batch,
+                v12_intra=True,
+            )
+        )
+    return _functools.reduce(
+        lambda a, b: tuple((_mla_max_shape(x[0], y[0]), x[1]) for x, y in zip(a, b)),
+        candidates,
     )
 
 
@@ -2456,6 +2469,9 @@ def _get_mla_metadata_v1_impl(
         max_split_per_batch: Cap on KV splits per batch. -1 means unbounded (default -1).
         intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
         is_cp_round_robin: Context-parallel round-robin work assignment (default False).
+            Must be True exactly when mla_decode_fwd gets g_kv_indptr: 96 fp8 heads at
+            qlen 7 and 8 are planned natively with it and folded without it, and
+            mla_decode_fwd raises ValueError where the two disagree on the plan.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
@@ -2540,7 +2556,7 @@ def get_mla_metadata_v1(
     def _dtype_id(d):
         return _aiter_dtype_id(d) if d is not None else None
 
-    return _get_mla_metadata_v1_impl(
+    _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
         kv_last_page_lens,
@@ -2568,6 +2584,9 @@ def get_mla_metadata_v1(
         dtype_kv_nope=_dtype_id(dtype_kv_nope),
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
+    # mla_decode_fwd checks its launch against this: for some shapes the head
+    # plan, folded or native, depends on round-robin CP.
+    work_metadata_ptrs._aiter_planned_cp_round_robin = bool(is_cp_round_robin)
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -2734,6 +2753,9 @@ def decode_update_mla_metadata_v1(
     """
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
+    Not for round-robin CP metadata: every request's KV grows by one token here.
+    Raises ValueError for metadata get_mla_metadata_v1 planned with
+    is_cp_round_robin=True.
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2742,6 +2764,14 @@ def decode_update_mla_metadata_v1(
     assert (
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
+    # The head plan below assumes no CP, so for 96 fp8 heads at qlen 7 and 8 it
+    # would also rewrite a native plan as the fold, which decode would not catch.
+    if getattr(work_metadata_ptrs, "_aiter_planned_cp_round_robin", False):
+        raise ValueError(
+            "decode_update_mla_metadata_v1 cannot update metadata planned with "
+            "is_cp_round_robin=True: a round-robin CP rank's local KV does not grow "
+            "by one token per request. Call get_mla_metadata_v1 again instead."
+        )
     head_plan = _mla_metadata_head_plan(
         num_heads_per_head_k,
         max_seqlen_qo,

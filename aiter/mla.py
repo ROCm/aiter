@@ -1419,6 +1419,33 @@ def mla_decode_fwd(
             g_kv_indptr is not None,
             q_scale is not None and kv_scale is not None,
         )
+        planned_cprr = getattr(work_meta_data, "_aiter_planned_cp_round_robin", None)
+        if planned_cprr is not None and planned_cprr != (g_kv_indptr is not None):
+            planned, _ = _mla_decode_launch_plan(
+                ori_nhead,
+                max_seqlen_q,
+                q.dtype,
+                kv_buffer.dtype,
+                fast_mode,
+                intra_batch_mode,
+                page_size,
+                cp_world_size,
+                planned_cprr,
+                q_scale is not None and kv_scale is not None,
+            )
+            if (planned.qk_batch_ratio, planned.kernel_num_heads) != (
+                head_plan.qk_batch_ratio,
+                head_plan.kernel_num_heads,
+            ):
+                raise ValueError(
+                    f"work_meta_data was planned with is_cp_round_robin={planned_cprr}, "
+                    f"but g_kv_indptr is {'set' if g_kv_indptr is not None else 'None'}: "
+                    f"for {ori_nhead} heads at max_seqlen_q={max_seqlen_q} that changes "
+                    f"the head plan ({planned.qk_batch_ratio}x{planned.kernel_num_heads} "
+                    f"planned vs {head_plan.qk_batch_ratio}x{head_plan.kernel_num_heads}). "
+                    "Pass is_cp_round_robin=True to get_mla_metadata_v1 exactly when "
+                    "mla_decode_fwd gets g_kv_indptr."
+                )
         if num_kv_splits is None:
             num_kv_splits = max_splits
         use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM
