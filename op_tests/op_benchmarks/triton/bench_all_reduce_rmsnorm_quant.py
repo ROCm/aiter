@@ -12,10 +12,7 @@ import triton
 
 import aiter
 from aiter import logger, rmsnorm2d_fwd_with_add
-from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_allreduce_rmsnorm,
-)
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group, graph_capture
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
@@ -82,8 +79,9 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             ),
             "rccl": rccl,
             "car": car,
-            "car_fused": lambda x, res: tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, res, weight, EPS, gemma_norm=True
+            # The fused CAR kernel itself: the dispatch runs 2 kernels at small sizes.
+            "car_fused": lambda x, res: ca.custom_fused_ar_rms(
+                x, res, weight, EPS, True, gemma_norm=True
             ),
         }
 

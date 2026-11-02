@@ -153,11 +153,17 @@ def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
 
 
 def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
-    """generate_rotating_buffers_pool kwargs from the --rot-bufs-* flags added by get_parser()."""
+    """generate_rotating_buffers_pool kwargs from the --rot-bufs-* flags and added by get_parser().
+    Note: max_pool_len is set to --graph-kernels-per-graph
+    """
     return {
         "target_mb": args.rot_bufs_target_mb,
         "min_pool_len": args.rot_bufs_min_pool_len,
         "print_info": args.rot_bufs_print_info,
+        # By default keep the rotating buffer pool length <= graph_kernels_per_graph
+        # Otherwise, in case per-set bytes are too small, then covering target_mb might
+        # blow up the pool_len. This is not ideal for capturing graph
+        "max_pool_len": args.graph_kernels_per_graph,
     }
 
 

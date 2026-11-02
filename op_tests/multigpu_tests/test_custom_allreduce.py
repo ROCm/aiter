@@ -257,6 +257,10 @@ def test_allreduce_tail_regression(tp_size, dtype, iterations=20, shapes=None):
     # dimensions exercise both partial and complete blocks in reduce-scatter.
     if shapes is None:
         shapes = [(1023, 512), (1024, 512), (1025, 512)]
+        if tp_size == 6:
+            # Under the 80 KiB one-stage cutoff: 512 threads split into 6
+            # groups of 85 leave two threads with no rank to read.
+            shapes.append((79, 512))
         if tp_size in (4, 8):
             pack_size = 16 // torch.empty((), dtype=dtype).element_size()
             # The optimized kernel assigns 512 / tp_size packs to each rank
