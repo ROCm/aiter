@@ -5,7 +5,7 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 and MXFP6 on GFX950.
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
 - GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
@@ -38,8 +38,8 @@ V packing and scale modes.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
-Head dimension 256 exists only for MXFP4 Q/K/V, dense, on GFX950. Every other recipe, sorted
-sparse, and GFX942 reject it.
+Head dimension 256 exists only for all-MXFP4 and all-MXFP6 Q/K/V, dense, on GFX950. Every other
+recipe, sorted sparse, and GFX942 reject it.
 
 ## Ownership
 
@@ -135,6 +135,10 @@ contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 by
 At head dimension 256 the MXFP4 producers run the hd128 kernels on a `[B, S, 2H, 128]` view, so
 each tile carries twice the data and scale bytes and the slack doubles to 128 bytes. The Hadamard
 acts on each 128-wide half independently, which keeps it orthogonal and Q.K^T unchanged.
+
+hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers each pair of 128-token
+hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
+tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
 
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the

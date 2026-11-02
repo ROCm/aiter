@@ -20,6 +20,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    FP6_K_BUFFER_SLACK_BYTES,
+    FP6_K_TILE_TOKENS,
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
     pack_fp6_v_data_scale_views,
@@ -116,8 +118,12 @@ def rotate_activation_mxfp6_quant_k(
     scale: Tensor,
     input: Tensor,
     mean: Tensor,
+    head_split: int = 1,
 ) -> None:
-    """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers."""
+    """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers.
+
+    `head_split` 2 writes the hd256 layout from a [b, s, 2h, 128] half-head view.
+    """
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -125,6 +131,7 @@ def _quantize_v_mxfp6_fp6_p_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack V in the contraction order required by an FP6 P operand."""
 
@@ -891,3 +898,150 @@ def _quantize_v_mxfp4_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
         batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     )
     return data, scale
+
+
+# ---- hd256 MXFP6 ---------------------------------------------------------------------------
+# Same half-head reuse as hd256 MXFP4: the hd128 HIP packers take head_split=2 and write the hd256
+# code object's 64-token records directly, each the two half-heads' blocks of one 64-token tile.
+MHA_V4_MXFP6_HD256_K_TILE_TOKENS = 64
+# Per 64-token tile: C0 8 KiB, C1 4 KiB, then the 1 KiB lane-major K-scale tail.
+MHA_V4_MXFP6_HD256_K_TILE_BYTES = 13312
+MHA_V4_MXFP6_HD256_K_ROW_BYTES = (
+    MHA_V4_MXFP6_HD256_K_TILE_BYTES // MHA_V4_MXFP6_HD256_K_TILE_TOKENS
+)
+MHA_V4_MXFP6_HD256_V_TILE_BYTES = 2 * MHA_V4_MXFP6_V_TILE_BYTES
+MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES = 2 * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
+
+
+def _fp6_producer_tiles(sequence: int) -> int:
+    return (sequence + FP6_K_TILE_TOKENS - 1) // FP6_K_TILE_TOKENS
+
+
+def _mxfp6_hd256_k_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int]:
+    """(data payload, data allocation) for an hd256 MXFP6 K buffer."""
+    tiles = _fp6_producer_tiles(sequence)
+    payload = batch * heads * 2 * tiles * MHA_V4_MXFP6_HD256_K_TILE_BYTES
+    return payload, payload + FP6_K_BUFFER_SLACK_BYTES
+
+
+def _mxfp6_hd256_v_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int]:
+    """(data payload, data allocation) for an hd256 MXFP6 V buffer."""
+    payload = batch * heads * mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_TILE_BYTES
+    return payload, payload + MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES
+
+
+def _mxfp6_hd256_v_view(raw: Tensor, batch: int, sequence: int, heads: int) -> Tensor:
+    head_stride = mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_TILE_BYTES
+    return torch.as_strided(
+        raw,
+        (batch, sequence, heads, MHA_V4_HD256),
+        (heads * head_stride, 2 * MHA_V4_MXFP6_V_PACKED_ROW_BYTES, head_stride, 1),
+    )
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q_hd256", mutates_args=())
+def quantize_mxfp6_q_hd256(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD Q as MXFP6 E2M3 with E8M0 block scales."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP6 E2M3 Q quantization"
+    )
+    quantized, scale = quantize_mxfp6_q(_hd256_half_heads(input), multiplier)
+    return (
+        quantized.reshape(batch, sequence, heads, MHA_V4_HD256 // 32 * 24),
+        scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32),
+    )
+
+
+@quantize_mxfp6_q_hd256.register_fake
+def _quantize_mxfp6_q_hd256_fake(
+    input: Tensor, multiplier: float
+) -> tuple[Tensor, Tensor]:
+    del multiplier
+    batch, sequence, heads, _ = input.shape
+    return input.new_empty(
+        (batch, sequence, heads, MHA_V4_HD256 // 32 * 24), dtype=torch.uint8
+    ), _plain_block_scale(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_hd256_raw", mutates_args=())
+def quantize_mxfp6_k_hd256(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD K into raw MXFP6 ASM data and scale buffers."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP6 E2M3 K quantization"
+    )
+    half_mean = (
+        None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
+    )
+    payload, allocation = _mxfp6_hd256_k_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    raw[payload:].zero_()
+    # The scale buffer is head-major over the logical head, so hd128's is already hd256's.
+    _, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads * 2)
+    scale_raw = input.new_empty((scale_size,), dtype=torch.uint8)
+    rotate_activation_mxfp6_quant_k(
+        raw, scale_raw, _hd256_half_heads(input), _or_empty(input, half_mean), 2
+    )
+    return raw, scale_raw
+
+
+@quantize_mxfp6_k_hd256.register_fake
+def _quantize_mxfp6_k_hd256_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    del mean
+    batch, sequence, heads, _ = input.shape
+    _, allocation = _mxfp6_hd256_k_sizes(batch, sequence, heads)
+    _, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads * 2)
+    return input.new_empty((allocation,), dtype=torch.uint8), input.new_empty(
+        (scale_size,), dtype=torch.uint8
+    )
+
+
+def mxfp6_k_view_hd256(
+    raw: Tensor,
+    scale_raw: Tensor,
+    batch: int,
+    sequence: int,
+    heads: int,
+) -> tuple[Tensor, Tensor]:
+    """Rebuild the logical hd256 MXFP6 K and scale views from raw backing buffers."""
+    head_stride = 2 * _fp6_producer_tiles(sequence) * MHA_V4_MXFP6_HD256_K_TILE_BYTES
+    k_view = raw.as_strided(
+        (batch, sequence, heads, MHA_V4_HD256 // 32 * 24),
+        (heads * head_stride, MHA_V4_MXFP6_HD256_K_ROW_BYTES, head_stride, 1),
+    )
+    blocks = MHA_V4_HD256 // 32
+    scale = scale_raw[: batch * sequence * heads * blocks].view(
+        batch, sequence, heads, blocks
+    )
+    return k_view, scale
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6_fp6_p_hd256", mutates_args=())
+def quantize_v_mxfp6_fp6_p_hd256(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd256 MXFP6 V in the contraction order required by an FP6 P operand."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 FP6-P MXFP6 V quantization"
+    )
+    tiles = mxfp6_v_tiles(sequence)
+    # The packer zeroes the slack itself, as it does for hd128.
+    _, allocation = _mxfp6_hd256_v_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    scale = input.new_empty(
+        (batch, heads, tiles * MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES), dtype=torch.uint8
+    )
+    _quantize_v_mxfp6_fp6_p_hip(raw, scale, _hd256_half_heads(input), 2)
+    return _mxfp6_hd256_v_view(raw, batch, sequence, heads), scale
+
+
+@quantize_v_mxfp6_fp6_p_hd256.register_fake
+def _quantize_v_mxfp6_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    _, allocation = _mxfp6_hd256_v_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    return _mxfp6_hd256_v_view(raw, batch, sequence, heads), input.new_empty(
+        (batch, heads, mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES),
+        dtype=torch.uint8,
+    )

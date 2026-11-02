@@ -35,11 +35,13 @@ void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
 void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
                                      const aiter_tensor_t& input,
-                                     const aiter_tensor_t& mean);
+                                     const aiter_tensor_t& mean,
+                                     int64_t head_split = 1);
 
 void quantize_v_mxfp6_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
-                            const aiter_tensor_t& input);
+                            const aiter_tensor_t& input,
+                            int64_t head_split = 1);
 
 void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,

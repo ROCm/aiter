@@ -734,6 +734,9 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     assert torch.equal(compiled, expected)
 
 
+_MX_RECIPE_FORMATS = {"mxfp4": AttentionFormat.MXFP4, "mxfp6": AttentionFormat.MXFP6}
+
+
 @skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
@@ -748,6 +751,7 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
         param("mxfp4", 128, skip=get_gfx() != "gfx950"),
         # hd256 routes K and its mean through a half-head view a 128 head never exercises.
         param("mxfp4", 256, skip=get_gfx() != "gfx950"),
+        param("mxfp6", 256, skip=get_gfx() != "gfx950"),
     ],
 )
 def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
@@ -775,7 +779,7 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
             "v_scale_mode": AttentionScaleMode.F32_PER_TENSOR,
         }
     else:
-        formats = (AttentionFormat.MXFP4,) * 3
+        formats = (_MX_RECIPE_FORMATS[recipe],) * 3
         scale_modes = {}
 
     errors = []
@@ -800,7 +804,7 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
 )
 @parametrize(
     "recipe,head_dim",
-    [("fp8", 128), ("mxfp8", 128), ("mxfp4", 128), ("mxfp4", 256)],
+    [("fp8", 128), ("mxfp8", 128), ("mxfp4", 128), ("mxfp4", 256), ("mxfp6", 256)],
 )
 def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
     """K smoothing must not leak into the exported LSE.
@@ -828,7 +832,7 @@ def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
             "v_scale_mode": AttentionScaleMode.F32_PER_TENSOR,
         }
     else:
-        formats = (AttentionFormat.MXFP4,) * 3
+        formats = (_MX_RECIPE_FORMATS[recipe],) * 3
         scale_modes = {}
 
     softmax_scale = q.shape[-1] ** -0.5
@@ -1737,9 +1741,12 @@ _HD256_SHAPES = [
 ]
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MX validation")
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
 @parametrize(("batch", "sequence_q", "sequence_k", "heads"), _HD256_SHAPES)
-def test_mha_v4_mxfp4_hd256_matches_attention(batch, sequence_q, sequence_k, heads):
+def test_mha_v4_mx_hd256_matches_attention(
+    qkv_format, batch, sequence_q, sequence_k, heads
+):
     torch.manual_seed(43)
     q = torch.randn(
         (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
@@ -1749,9 +1756,7 @@ def test_mha_v4_mxfp4_hd256_matches_attention(batch, sequence_q, sequence_k, hea
     )
     v = torch.randn_like(k)
 
-    actual = mha_v4(
-        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
-    )
+    actual = mha_v4(q, k, v, qkv_format, qkv_format, qkv_format)
     torch.cuda.synchronize()
 
     assert actual.shape == (batch, sequence_q, heads, 256)
@@ -1784,12 +1789,20 @@ def test_mha_v4_mxfp4_hd256_gqa_matches_repeated_kv():
 
 @parametrize(
     "qk_format",
-    [AttentionFormat.BF16, native_fp8_format(), AttentionFormat.MXFP6],
+    [AttentionFormat.BF16, native_fp8_format()],
 )
-def test_mha_v4_rejects_non_mxfp4_head_dim_256(qk_format):
+def test_mha_v4_rejects_non_mx_head_dim_256(qk_format):
     q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="MXFP4-only"):
+    with expect_raises(ValueError, match="MXFP4- or all-MXFP6-only"):
         mha_v4(q, q, q, qk_format, qk_format, qk_format)
+
+
+def test_mha_v4_rejects_mixed_mxfp6_head_dim_256():
+    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
+    with expect_raises(ValueError, match="MXFP4- or all-MXFP6-only"):
+        mha_v4(
+            q, q, q, AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP4
+        )
 
 
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation")
@@ -1994,8 +2007,9 @@ def test_mha_v4_raw_mxfp8_compile_parity():
     assert torch.isfinite(compiled).all()
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
-def test_mha_v4_mxfp4_hd256_compile_parity():
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MX validation")
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_mx_hd256_compile_parity(qkv_format):
     """The hd256 producers are custom ops so this path can be traced; only tracing it proves that.
 
     hd256 reaches its quantizers through a separate trio rather than a head-dim argument, so the
@@ -2007,7 +2021,7 @@ def test_mha_v4_mxfp4_hd256_compile_parity():
     v = torch.randn_like(k)
     eager_out = torch.empty_like(q)
     compiled_out = torch.empty_like(q)
-    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+    formats = (qkv_format, qkv_format, qkv_format)
 
     eager = mha_v4(q, k, v, *formats, out=eager_out)
     compiled = torch.compile(mha_v4, fullgraph=True)(
@@ -2285,13 +2299,14 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         assert cosine > 0.99, f"batch {b} of {lengths}"
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MX validation")
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
 @parametrize(
     "lengths,padded",
     [((192, 128), 256), ((320, 192, 64), 384), ((576, 320, 128, 64), 640)],
 )
-def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
-    """hd256 MXFP4 per-batch key lengths, against the same kernel on cut-down K/V.
+def test_mha_v4_mx_hd256_seqlens_k_matches_truncated_kv(qkv_format, lengths, padded):
+    """hd256 MX per-batch key lengths, against the same kernel on cut-down K/V.
 
     A torch reference cannot adjudicate this: MXFP4 sits at a flat ~0.978 cosine whatever the
     length, which is looser than the failure. The hazard is that kv_seq_len also strides the MX
@@ -2300,7 +2315,7 @@ def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
     """
     torch.manual_seed(41)
     batch, heads = len(lengths), 4
-    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+    formats = (qkv_format, qkv_format, qkv_format)
     q = torch.randn((batch, 256, heads, 256), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((batch, padded, heads, 256), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -2324,14 +2339,15 @@ def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
         ), f"batch {b} of {lengths} differs from its truncated control"
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
-def test_mha_v4_mxfp4_hd256_lse_tracks_hd128():
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MX validation")
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_mx_hd256_lse_tracks_hd128(qkv_format):
     """_LSE_CAPABLE_QV is keyed on (q_format, v_format) with no head-dim term, so hd256 inherited
-    the MXFP4 claim without its epilogue ever being compared against torch.
+    the MX claims without its epilogue ever being compared against torch.
 
     Two bounds because they catch different things. The absolute one separates a real LSE from an
     object that never wrote one, which leaves the buffer as torch.empty handed it back. The
-    comparison against hd128 is what a constant cannot do: the residual is MXFP4 quantization, so
+    comparison against hd128 is what a constant cannot do: the residual is MX quantization, so
     only a sibling recipe says whether hd256 carries more of it than it should.
     """
 
@@ -2340,7 +2356,7 @@ def test_mha_v4_mxfp4_hd256_lse_tracks_hd128():
         q = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
         v = torch.randn_like(k)
-        formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+        formats = (qkv_format, qkv_format, qkv_format)
 
         _, lse = mha_v4(q, k, v, *formats, return_lse=True)
         torch.cuda.synchronize()

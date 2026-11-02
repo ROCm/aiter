@@ -27,6 +27,7 @@ from aiter.ops.mha_v4_quant import (
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -35,7 +36,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_q,
     quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
+    quantize_mxfp6_k_hd256,
     quantize_mxfp6_q,
+    quantize_mxfp6_q_hd256,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -43,6 +46,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
+    quantize_v_mxfp6_fp6_p_hd256,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
@@ -61,6 +65,7 @@ __all__ = (
     "mxfp4_k_view",
     "mxfp4_v_view",
     "mxfp6_k_view",
+    "mxfp6_k_view_hd256",
     "native_fp8_format",
     "quantize_fp8",
     "quantize_fp8_rotated",
@@ -70,7 +75,9 @@ __all__ = (
     "quantize_mxfp4_q",
     "quantize_mxfp4_q_hd256",
     "quantize_mxfp6_k",
+    "quantize_mxfp6_k_hd256",
     "quantize_mxfp6_q",
+    "quantize_mxfp6_q_hd256",
     "quantize_mxfp8_k",
     "quantize_mxfp8_q",
     "quantize_v_fp8",
@@ -78,6 +85,7 @@ __all__ = (
     "quantize_v_mxfp4_fp6_p_hd256",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
+    "quantize_v_mxfp6_fp6_p_hd256",
     "rotate_activation_hd128",
     "rotate_activation_mxfp6_quant",
     "scale_modes_for_formats",
@@ -947,8 +955,11 @@ def mha_v4_packed(
     logical_head_dim = v.shape[-1]
     if logical_head_dim not in (128, 256):
         raise ValueError("MHA v4 supports logical head dimension 128 or 256")
-    if logical_head_dim == 256 and q_format != AttentionFormat.MXFP4:
-        raise ValueError("MHA v4 head dimension 256 is MXFP4-only")
+    if logical_head_dim == 256 and q_format not in (
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP6,
+    ):
+        raise ValueError("MHA v4 head dimension 256 is MXFP4- or MXFP6-only")
     expected_q_width = _packed_qk_width(q_format, logical_head_dim)
     if q.shape[-1] != expected_q_width or k.shape[-1] != expected_q_width:
         raise ValueError(
@@ -1113,7 +1124,8 @@ def _launch_mxfp6(
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
     resolved_v_pack = AttentionPack(v_pack)
-    k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
+    k_view = mxfp6_k_view_hd256 if v_data.shape[-1] == 256 else mxfp6_k_view
+    k, k_descale = k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
     v = (
         mxfp4_v_view(v_data, v_descale, sequence_k)
         if resolved_v_format == AttentionFormat.MXFP4
@@ -1313,9 +1325,16 @@ def mha_v4(
         sparse=sparse,
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
-    if q.shape[-1] != 128 and recipe.kind is not _RawRecipeKind.MXFP4:
+    hd256_mxfp6 = (
+        recipe.kind is _RawRecipeKind.MXFP6 and v_format == AttentionFormat.MXFP6
+    )
+    if (
+        q.shape[-1] != 128
+        and recipe.kind is not _RawRecipeKind.MXFP4
+        and not hd256_mxfp6
+    ):
         raise ValueError(
-            f"head dimension {q.shape[-1]} is MXFP4-only; "
+            f"head dimension {q.shape[-1]} is MXFP4- or all-MXFP6-only; "
             f"{recipe.kind.name} is packed for head dimension 128"
         )
 
@@ -1404,16 +1423,23 @@ def mha_v4(
             k_quantized = k_view
             v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
+        head_dim = q.shape[-1]
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
-        if _is_fp8_format(v_format):
-            v_quantized, v_descale = quantize_v_fp8(v)
-        elif v_format == AttentionFormat.MXFP6:
-            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            softmax_scale = head_dim**-0.5
+        multiplier = mha_v4_q_multiplier(softmax_scale)
+        if head_dim == 256:
+            q_quantized, q_descale = quantize_mxfp6_q_hd256(q, multiplier)
+            k_quantized, k_descale = quantize_mxfp6_k_hd256(k, k_mean)
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p_hd256(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            q_quantized, q_descale = quantize_mxfp6_q(q, multiplier)
+            k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
+            if _is_fp8_format(v_format):
+                v_quantized, v_descale = quantize_v_fp8(v)
+            elif v_format == AttentionFormat.MXFP6:
+                v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            else:
+                v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
             launch = functools.partial(
                 _launch_mxfp6,
@@ -1432,7 +1458,8 @@ def mha_v4(
                 seqlens_k,
             )
         else:
-            k_view, k_descale_view = mxfp6_k_view(
+            k_view_fn = mxfp6_k_view_hd256 if head_dim == 256 else mxfp6_k_view
+            k_view, k_descale_view = k_view_fn(
                 k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
             )
             v_view = (
