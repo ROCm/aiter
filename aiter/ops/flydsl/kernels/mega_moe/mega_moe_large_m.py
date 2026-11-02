@@ -2012,8 +2012,14 @@ class LargeMRuntime:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        # Contiguous copies of strided weights live as long as the runtime: a graph captured with
+        # them keeps their pointers even after another bind_weights() call.
+        w1, w1_scale, w2, w2_scale = (
+            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
+        )
+        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
         self._build_stage2_invariants()
         self._allocate_fused_counters()
@@ -2244,8 +2250,11 @@ class LargeMRuntime:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        if not scales.is_contiguous():
-            raise ValueError("scales must be contiguous")
+        if not scales.is_contiguous() or scales.element_size() != 1 or scales.device != self.dev:
+            raise ValueError(f"scales must be contiguous 1-byte E8M0 on {self.dev}")
+        if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
+            # The kernel reads a full row of scales per token.
+            raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
         op = self._s1_op
         s1, fused_kw = self._fused_all_kwargs(cur_tok, config)
         # fmt: off

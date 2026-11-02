@@ -869,8 +869,11 @@ class MegaMoEV2:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        if not scales.is_contiguous():
-            raise ValueError("scales must be contiguous")
+        if not scales.is_contiguous() or scales.element_size() != 1 or scales.device != self.dev:
+            raise ValueError(f"scales must be contiguous 1-byte E8M0 on {self.dev}")
+        if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
+            # The kernel reads a full row of scales per token.
+            raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
         if config is None:
             config = self._select_config(cur_tok).stage1
         # Every rank at the indexed-capable MTPR class uses the indexed payload

@@ -1479,6 +1479,10 @@ class SmallMRuntime:
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
+        num_cu = torch.cuda.get_device_properties(self.dev).multi_processor_count
+        if num_cu != 256:
+            # The kernel splits its work over 8 XCDs by XCC id; a 4-XCD part leaves half unclaimed.
+            raise ValueError(f"SmallMRuntime needs an 8-XCD (256-CU) gfx950 device, got {num_cu} CUs")
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.
         self._reducers = _COMBINE_REDUCERS
@@ -1502,8 +1506,14 @@ class SmallMRuntime:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        # Contiguous copies of strided weights live as long as the runtime: a graph captured with
+        # them keeps their pointers even after another bind_weights() call.
+        w1, w1_scale, w2, w2_scale = (
+            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
+        )
+        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._build(w1, w1_scale)
 
     def _build(self, w1, w1_scale):

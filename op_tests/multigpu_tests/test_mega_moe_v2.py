@@ -725,10 +725,12 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
 
     w1_a, sw1_a = moe._s1_w1, moe._s1_w1_scale
     w2_a, sw2_a = moe.w2, moe.w2_scale
-    # Distinct pointers with identical values isolate binding/protocol behavior
-    # from numerical changes in expert weights.
+    # Layer B has its own pointers and doubles W2 (E8M0 exponent + 1), so a call that ran
+    # on the other layer's weights changes the output.
     w1_b, sw1_b = w1_a.clone(), sw1_a.clone()
-    w2_b, sw2_b = w2_a.clone(), sw2_a.clone()
+    w2_b = w2_a.clone()
+    exponent = sw2_a.view(torch.uint8)
+    sw2_b = torch.where(exponent < 254, exponent + 1, exponent).view(sw2_a.dtype)
     route_row = torch.arange(ids.shape[0], dtype=torch.int32, device=ids.device)[
         :, None
     ]
@@ -738,7 +740,12 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
         .remainder(moe.experts)
         .contiguous()
     )
-    weights_b = torch.zeros_like(weights)
+    weights_b = weights.flip(0).contiguous()
+    tokens = x.shape[0]
+    # A few slots per cycle, covering both layers, are checked against the main path on the same
+    # binding: the large-M path matches it bit for bit.
+    checked_slots = {0, 1, slots - 1}
+    checked = 0
 
     for cycle in range(cycles):
         for slot in range(slots):
@@ -752,15 +759,41 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
                     (ids + cycle * 37 + slot * 11).remainder(moe.experts).contiguous()
                 )
             moe.bind_layer(slot, *bound)
-            output = moe(x, route_weights, route_ids)
-        if not torch.isfinite(output).all():
-            raise AssertionError(f"non-finite output after layer cycle={cycle}")
+            output = moe(x, route_weights, route_ids)[:tokens]
+            if slot not in checked_slots:
+                continue
+            output = output.clone()
+            moe.set_large_m_enabled(False)
+            try:
+                reference = moe(x, route_weights, route_ids)[:tokens].clone()
+            finally:
+                moe.set_large_m_enabled(True)
+            mismatched = (output != reference).any(dim=-1).sum().to(torch.int64)
+            finite = torch.isfinite(output).all().to(torch.int64)
+            dist.all_reduce(mismatched)
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if int(mismatched.item()) or not int(finite.item()):
+                raise AssertionError(
+                    f"layer cycle={cycle} slot={slot}: {int(mismatched.item())} rows "
+                    "differ from the main path on the same binding"
+                )
+            checked += 1
+    # The doubled W2 must change the result, or the comparisons above could not see a stale binding.
+    moe.bind_layer(0, w1_a, sw1_a, w2_a, sw2_a)
+    out_a = moe(x, weights, ids)[:tokens].clone()
+    moe.bind_layer(0, w1_b, sw1_b, w2_b, sw2_b)
+    out_b = moe(x, weights, ids)[:tokens].clone()
+    differ = (out_a != out_b).any().to(torch.int64)
+    dist.all_reduce(differ, op=dist.ReduceOp.MAX)
+    if not int(differ.item()):
+        raise AssertionError("layer B weights do not change the output")
     moe.bind_layer(0, w1_a, sw1_a, w2_a, sw2_a)
     _barrier()
     if rank == 0:
         print(
             f"[LARGE-M-LAYERS] slots={slots} cycles={cycles} "
-            f"calls={slots * cycles} route_mutation=PASS weight_rebind=PASS",
+            f"calls={slots * cycles} main_checks={checked} route_mutation=PASS "
+            "weight_rebind=PASS",
             flush=True,
         )
 
