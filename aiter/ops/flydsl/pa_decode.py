@@ -827,6 +827,9 @@ def pa_decode(
         sliding_window=sliding_window,
         max_context_length=max_context_length,
     )
+    # The same shape limits can_use_flydsl_pa_decode applies, checked here
+    # first so the two share them; the kernel builders still enforce theirs.
+    _check_pa_decode_compile(call, query_length)
     arch = call.arch
     sliding_window = call.sliding_window
     num_seqs = call.num_seqs
