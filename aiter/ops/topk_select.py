@@ -1166,6 +1166,7 @@ def topk_select(
     abort_when_nan_found: bool = False,
     tie: str | None = None,
     deterministic: bool = False,
+    max_row_len: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Per-row top-k, dispatched across aiter's five selectors.
 
@@ -1255,6 +1256,9 @@ def topk_select(
             258us on ``stream``) and up to 3.7x on the wide rows where
             ``sampled`` would have (k=2048, m=64 n=1M: 57 against 210us on
             ``decode``).
+        max_row_len: an upper bound on every entry of ``end``. It opts the call
+            into the adaptive decode kernel and changes only its speed, never
+            the result (see ``top_k_per_row_decode``). ``None`` declines it.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -1300,6 +1304,7 @@ def topk_select(
                 abort_when_nan_found=abort_when_nan_found,
                 tie=tie,
                 deterministic=deterministic,
+                max_row_len=max_row_len,
             )
 
     if end is None:
@@ -1374,6 +1379,7 @@ def topk_select(
         tie,
         deterministic,
         with_values=with_values,
+        max_row_len=max_row_len,
     )
 
     values = None
@@ -1423,6 +1429,7 @@ def _dispatch(
     tie=None,
     deterministic=False,
     with_values=False,
+    max_row_len=None,
 ):
     """Run `backend` into `idx`; returns the selected values where the backend
     writes them itself (`whole_row` with `with_values`), else None."""
@@ -1547,6 +1554,7 @@ def _dispatch(
             1,
             topk,
             stable=tie == "low" or deterministic,
+            max_row_len=max_row_len,
         )
     elif backend == "stream":
         topk_per_row_radix_stream(
