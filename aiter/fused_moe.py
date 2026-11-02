@@ -3326,11 +3326,12 @@ def _flydsl_v2_stage2_wrapper(
                 device=out.device,
             )
         else:
+            # Power-of-two rows so per-step token counts reuse cached segments.
             target = torch.empty(
-                (token_num, topk, model_dim_runtime),
+                (nextPow2(token_num), topk, model_dim_runtime),
                 dtype=out.dtype,
                 device=out.device,
-            )
+            )[:token_num]
         if expert_mask is not None:
             # EP sorting omits remote and fake routes, so GEMM2 intentionally
             # leaves their per-route slots unwritten. Zero them before the
