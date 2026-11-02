@@ -2121,20 +2121,15 @@ def contiguous_psum_remap(
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
-        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
-        # pointer as "no truncation".
-        num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        # A null pointer means no truncation; no Tensor storage is needed.
+        num_valid_routes_i32 = None
     else:
         num_valid_routes_i32 = (
             num_valid_routes.reshape(-1)[:1]
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
-    row_to_token_i32 = (
-        row_to_token.reshape(-1)
-        if row_to_token is not None
-        else torch.empty(0, dtype=torch.int32, device=device)
-    )
+    row_to_token_i32 = row_to_token.reshape(-1) if row_to_token is not None else None
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
@@ -2267,9 +2262,8 @@ def flydsl_moe_gather_reduce(
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
     # truncation) processes every token.
     if num_valid_tokens is None:
-        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
-        # pointer as "no truncation".
-        num_valid_tokens_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        # A null pointer means no truncation; no Tensor storage is needed.
+        num_valid_tokens_i32 = None
     else:
         num_valid_tokens_i32 = (
             num_valid_tokens.reshape(-1)[:1]

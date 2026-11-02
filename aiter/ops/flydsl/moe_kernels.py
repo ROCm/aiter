@@ -2581,9 +2581,8 @@ def flydsl_moe_topids_to_rows(
             * int(topk)
         ).contiguous()
     else:
-        # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
-        # null as "no truncation".
-        num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
+        # Kernels read a null pointer as "no truncation".
+        num_valid_routes = None
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
@@ -2626,11 +2625,7 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
-        _ep_rowmap_ptr = (
-            ep_rowmap.reshape(-1)
-            if ep_rowmap is not None
-            else torch.empty(0, dtype=torch.int32, device=device)
-        )
+        _ep_rowmap_ptr = ep_rowmap.reshape(-1) if ep_rowmap is not None else None
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         # Only the LDS launcher takes the ep_rowmap (ptr, cap) tail and fuses its
         # (-1, 0) sentinel fill (fire-and-forget stores, no standalone .fill_()).
@@ -3313,14 +3308,12 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
 def _routeks_ep_psum_args(device, ep_psum_params: dict | None):
     """Extra routeks operands: live EP psum fusion, or compile-away dummies."""
     if ep_psum_params is None:
-        empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
-        empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=device)
         return (
-            ptr_arg(empty_i32),
-            ptr_arg(empty_i32),
-            ptr_arg(empty_bf16),
-            ptr_arg(empty_i32),
-            ptr_arg(empty_i32),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
             0,
             1,
             1,
@@ -3646,8 +3639,7 @@ def flydsl_moe_fused_quant_preshuffle(
         # padding rows of the dispatch buffer and are not gathered/quantized. When
         # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
         if num_valid_routes is None:
-            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
-            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+            num_valid_routes_i32 = None
         else:
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)

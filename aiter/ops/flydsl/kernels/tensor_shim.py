@@ -277,10 +277,12 @@ def check_e8m0(
         raise RuntimeError(f"[{owner}] {name} must be contiguous")
 
 
-def ptr_arg(t: torch.Tensor, dtype=None):
-    """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+def ptr_arg(t: torch.Tensor | None, dtype=None):
+    """Wrap a tensor or optional null operand as a launch pointer."""
     if dtype is None:
         dtype = fx.Uint8
+    if t is None:
+        return flyc.from_c_void_p(dtype, 0)
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
