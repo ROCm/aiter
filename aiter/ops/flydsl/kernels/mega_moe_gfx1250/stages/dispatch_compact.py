@@ -205,8 +205,30 @@ class _CompactDispatch(_Dispatch):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
+        # Optional overrides (unset = the default schedule):
+        #  AITER_TDM_COMPACT_ROUTE_PARALLEL=0|1 picks the walk for the
+        #    BLOCKS/WARPS override (else token-major).
+        #  AITER_TDM_COMPACT_ROUTE_UPTO=N keeps the route-parallel walk up to
+        #    N tokens/rank with AITER_TDM_COMPACT_ROUTE_SPEC=B,W blocks/warps
+        #    (DSV4.1-Flash DEP4 c512: 1024 and 384,16).
+        route_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_PARALLEL")
+        upto_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_UPTO")
         if blocks_env is not None or warps_env is not None:
-            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
+            spec = (None, int(blocks_env or "64"), int(warps_env or "8"))
+            if route_env is not None:
+                spec = spec + (route_env == "1",)
+            schedule = (spec,)
+        elif upto_env is not None:
+            rb, rw = (
+                int(v)
+                for v in os.environ.get("AITER_TDM_COMPACT_ROUTE_SPEC", "192,16").split(
+                    ","
+                )
+            )
+            upto = int(upto_env)
+            schedule = tuple(
+                e for e in _DISPATCH_COMPACT if e[0] is not None and e[0] < 512
+            ) + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
         else:
             schedule = _DISPATCH_COMPACT
         super().__init__(config, schedule)
@@ -349,6 +371,7 @@ class _CompactDispatch(_Dispatch):
                         tok_map=False,
                         quant_blocks=_QUANT_FUSE_BLOCKS,
                     )
+        self._precompile_s1f_plans()
         self._kernels = self._build_kernels()
         # Width in whatever recv_dtype counts: bytes on both quantizing wires.
         width = (
@@ -659,6 +682,59 @@ class _CompactDispatch(_Dispatch):
         )
         return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
 
+    def _precompile_s1f_plans(self) -> None:
+        """Compile every stage-1 plan variant before serving.
+
+        With ``AITER_MEGA_S1F=1`` the plan is keyed by (align_m, slot, waves,
+        blocks, tok_map, fused quant), and waves/blocks follow the step's token
+        count, so eager steps (prefill, or any width the warmup never ran)
+        reached the JIT inside the serving loop (the first ~100 s of a c512
+        run had 250-470 ms prefill steps). This walks every recv bound a
+        fused step can have (<= AITER_S1F_MAX_RECV, else the arena's), takes
+        the alignments they map to, and one token count per distinct
+        (waves, blocks), and compiles all variants (compile only, no launch).
+        ``AITER_S1F_PRECOMPILE=0`` skips it.
+        """
+        if not self.fusion.enabled:
+            return
+        if os.environ.get("AITER_S1F_PRECOMPILE", "1") == "0":
+            return
+        from ..compact_plan import compact_plan_blocks
+        from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb
+        from ..s1f_ctl import _S1F_MAX_RECV as _lim
+
+        config = self.config
+        limit = int(config.max_recv)
+        if _lim:
+            limit = min(limit, int(_lim))
+        saved = self._step
+        bounds = sorted(set(range(16, limit + 1, 16)) | {1, limit})
+        steps = {}
+        for b in bounds:
+            st = self._step_for(b)
+            steps.setdefault(int(st.align_m), st)
+        max_tok = min(int(config.max_tokens_per_rank), limit)
+        widths = {}
+        for tok in range(1, max_tok + 1):
+            routes = tok * int(config.topk)
+            wb = (self._plan_waves_for(tok), compact_plan_blocks(routes))
+            widths.setdefault(wb, tok)
+        try:
+            for align_m, st in sorted(steps.items()):
+                self._step = st
+                if not self.fusion.plan_mode(align_m):
+                    continue
+                for tok in sorted(widths.values()):
+                    for slot in range(self._PLAN_SLOTS):
+                        self._plan_for(align_m, slot, tok)
+                        self._plan_for(align_m, slot, tok, tok_map=False)
+                        if _qfb:
+                            self._plan_for(
+                                align_m, slot, tok, tok_map=False, quant_blocks=_qfb
+                            )
+        finally:
+            self._step = saved
+
     def _plan_waves_for(self, token_count: int | None) -> int:
         """Wave count for this step's route count.
 
@@ -671,7 +747,7 @@ class _CompactDispatch(_Dispatch):
         if token_count is not None:
             routes = min(routes, max(1, int(token_count) * int(self.config.topk)))
         waves = compact_plan_waves(npes=self.config.world_size, max_routes=routes)
-        if self.fusion.enabled:
+        if self.fusion.enabled and not self.fusion.step_off():
             # The stage-1 plan runs alone between the quant and the kernel,
             # and its tables want the wide scan.
             waves = max(waves, 16)
@@ -712,13 +788,15 @@ class _CompactDispatch(_Dispatch):
 
         align_m = int(align_m)
         slot = int(slot)
-        plan_s1f = self.fusion.plan_mode(align_m)
+        # A step over AITER_S1F_MAX_RECV keeps the S1F=0 plan.
+        fused = self.fusion.enabled and not self.fusion.step_off()
+        plan_s1f = fused and self.fusion.plan_mode(align_m)
         write_tok_map = (not plan_s1f) or bool(tok_map)
-        qb = int(quant_blocks)
+        qb = int(quant_blocks) if plan_s1f else 0
         # With the stage-1 kernel off, one launch per alignment and slot, as
         # before: the width is the plan's own default. On, the width follows
         # the step, and tok_map / the fused quant are their own kernels.
-        if self.fusion.enabled:
+        if fused:
             waves = self._plan_waves_for(token_count)
             routes = (
                 self.compact.max_routes
@@ -740,7 +818,7 @@ class _CompactDispatch(_Dispatch):
                 )
             config, geo, arena = self.config, self.compact, self.res.arena
             extra = {}
-            if self.fusion.enabled:
+            if fused:
                 full_waves = compact_plan_waves(
                     npes=config.world_size, max_routes=geo.max_routes
                 )
@@ -831,7 +909,7 @@ class _CompactDispatch(_Dispatch):
         quant_src: torch.Tensor | None = None,
         ready_event: torch.cuda.Event | None = None,
     ) -> None:
-        plan_s1f = self.fusion.plan_mode(align_m)
+        plan_s1f = self.fusion.plan_mode(align_m) and not self.fusion.step_off()
         qb = _QUANT_FUSE_BLOCKS if plan_s1f and quant_src is not None else 0
         plan_stream = self._plan_stream
         if ready_event is None:
