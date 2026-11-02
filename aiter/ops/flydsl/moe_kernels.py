@@ -3156,6 +3156,11 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 # Every destination costs a buffer descriptor held live across the store pass,
 # so the saving stops being free once they crowd the register budget.
 _TOKEN_MULTIDEST_MAX_TOPK = 8
+# Received tokens from which the prequantized multidest path writes row-major
+# scales and preshuffles them in a second pass (see the dispatch below).
+_TOKEN_MULTIDEST_PREQUANT_TWO_PASS_MIN_TOKENS = int(
+    os.environ.get("AITER_FLYDSL_MULTIDEST_PREQUANT_TWO_PASS_MIN_TOKENS", "4096")
+)
 
 
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
@@ -3215,6 +3220,30 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+    )
+
+
+@functools.cache
+@fast_jit_result
+def _get_compiled_token_multidest_prequant(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str,
+    src_scale_bytes_per_row: int,
+    row_major_scale: bool = False,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_token_multidest_prequant_module,
+    )
+
+    return build_moe_token_multidest_prequant_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        topk=topk,
+        quant_mode=quant_mode,
+        src_scale_bytes_per_row=src_scale_bytes_per_row,
+        row_major_scale=row_major_scale,
     )
 
 
@@ -3485,6 +3514,70 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale
+        # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
+        # padding rows of the dispatch buffer and are not gathered/quantized. When
+        # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
+        if num_valid_routes is None:
+            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+        else:
+            num_valid_routes_i32 = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            ).contiguous()
+        # A prequantized row needs no quant, so one warp per token copies it once
+        # to each local route instead of one warp per route re-reading it.
+        use_token_multidest_prequant = (
+            prequantized
+            and not remap_rows
+            and not fuse_ep_psum
+            and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
+            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_PREQUANT", "1")
+            in ("1", "true", "True")
+        )
+        if use_token_multidest_prequant:
+            # The interleaved layout puts a row's e8m0 dwords on separate cache
+            # lines, so one scattered store per dword dominates a large step.
+            # There, write the scales row-major and preshuffle them in one
+            # coalesced pass instead.
+            two_pass_scale = (
+                not row_major_scale
+                and token_num >= _TOKEN_MULTIDEST_PREQUANT_TWO_PASS_MIN_TOKENS
+            )
+            scale_dst = (
+                torch.empty((n_rows, Ws), dtype=torch.uint8, device=device)
+                if two_pass_scale
+                else out_scale
+            )
+            launch = _get_compiled_token_multidest_prequant(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                topk=int(source_topk),
+                quant_mode=quant_mode,
+                src_scale_bytes_per_row=int(prequantized_scale.shape[-1]),
+                row_major_scale=row_major_scale or two_pass_scale,
+            )
+            launch(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(scale_dst.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                ptr_arg(num_valid_routes_i32),
+                ptr_arg(prequantized_scale.view(-1)),
+                token_num,
+                (token_num + warps_per_block - 1) // warps_per_block,
+                stream=torch.cuda.current_stream(),
+            )
+            if two_pass_scale:
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                    flydsl_moe_preshuffle_scale,
+                )
+
+                # scale_k_per_tile only names the module; the layout ignores it.
+                flydsl_moe_preshuffle_scale(
+                    scale_dst, E, max_m, wmma_rep=wmma_rep, scale_k_per_tile=4,
+                    out=out_scale,
+                )
+            return out_payload, out_scale
         # Row-major stores are emitted only by the full-row prequant copy.
         use_ksplit = (
             not row_major_scale and grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
@@ -3503,16 +3596,6 @@ def flydsl_moe_fused_quant_preshuffle(
             fuse_ep_psum=fuse_ep_psum,
             row_major_scale=row_major_scale,
         )
-        # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
-        # padding rows of the dispatch buffer and are not gathered/quantized. When
-        # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
-        if num_valid_routes is None:
-            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
-            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
-        else:
-            num_valid_routes_i32 = (
-                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
-            ).contiguous()
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),
