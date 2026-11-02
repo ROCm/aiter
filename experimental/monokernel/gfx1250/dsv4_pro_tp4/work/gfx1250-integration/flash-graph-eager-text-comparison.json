@@ -1,0 +1,26 @@
+{
+  "1": {
+    "completed": 1,
+    "text_mismatches": 0
+  },
+  "8": {
+    "completed": 8,
+    "text_mismatches": 1
+  },
+  "16": {
+    "completed": 16,
+    "text_mismatches": 0
+  },
+  "32": {
+    "completed": 32,
+    "text_mismatches": 0
+  },
+  "64": {
+    "completed": 64,
+    "text_mismatches": 0
+  },
+  "128": {
+    "completed": 128,
+    "text_mismatches": 17
+  }
+}

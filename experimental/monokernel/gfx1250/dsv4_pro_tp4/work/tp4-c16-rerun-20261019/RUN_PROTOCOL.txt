@@ -1,0 +1,31 @@
+Requested Pro TP4 concurrency16 rerun,2026-10-19.
+Native baseline and corrected unsplit hybrid use the SAME upstream ATOM source
+at base53e4fb52403707ab07b69ee909501ea3cc25ca5c plus the saved integration patch.
+AITER/runtime/model are unchanged between configurations. Only ATOM_DSV4_MONO
+changes0->1. Both have ATOM_MONO_ENABLE=1, ATOM_MONO_CHECK=0, no profiler,
+real routing, TP4, no EP/speculation/prefix caching, BF16KV and FP8index.
+Pro launcher enables native Triton MoE A4W4, identically for both arms.
+
+Each arm: exactly ONE server launch, then two FULL client invocations with
+no server/container restart between client1 and client2. Client1 is warmup.
+Report ONLY client2. Server PID and /proc start ticks are recorded before
+client1 and after each client, and must match. No automatic third client.
+
+Each client also performs the benchmark tool's default one-prompt warmup,
+which is excluded from its reported64-request measurement.
+
+Per client:64 requests, C16,1024 input+1024 output tokens, random dataset,
+random_range_ratio1,seed0,request_rate inf,ignore_eos. Same existing TP4
+benchmark_serving arguments as the prior experiments. CUDA graphs enabled,
+max_num_seqs128,capture_sizes1/2/4/8/16/32/64/128. Fresh preserved ATOM compiler
+caches per server; separate Inductor caches. No image push or source change.
+
+Earlier C16 comparison.csv: baseline TPOT22.274755ms,TTFT500.399025ms,
+total1406.979155tokens/s; old hybrid16.170040ms,489.022605ms,1923.756347tokens/s.
+Those used the older ATOM tree and split-K candidate. Do not present them as
+measurements of this corrected upstream integration. The fresh paired rerun
+is authoritative for this run.
+
+All target GPUs were idle at startup. The kit timer-gap scheduling probe was
+inconclusive on gfx1250; see PROBE_NOTE.txt. No scheduling-health conclusion
+is drawn from that probe.

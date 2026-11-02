@@ -1,0 +1,194 @@
+[
+  {
+    "concurrency": 16,
+    "rank": 0,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.2010720661157026,
+    "us_per_decode": 387.32972
+  },
+  {
+    "concurrency": 16,
+    "rank": 0,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.775442479338843,
+    "us_per_decode": 456.82854
+  },
+  {
+    "concurrency": 16,
+    "rank": 0,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 2.9369396721311474,
+    "us_per_decode": 179.15331999999998
+  },
+  {
+    "concurrency": 16,
+    "rank": 1,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.1548907438016527,
+    "us_per_decode": 381.74178
+  },
+  {
+    "concurrency": 16,
+    "rank": 1,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.675892231404959,
+    "us_per_decode": 444.78296
+  },
+  {
+    "concurrency": 16,
+    "rank": 1,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 2.5982895081967214,
+    "us_per_decode": 158.49566000000002
+  },
+  {
+    "concurrency": 16,
+    "rank": 2,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.2118153719008267,
+    "us_per_decode": 388.62966
+  },
+  {
+    "concurrency": 16,
+    "rank": 2,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.830015702479339,
+    "us_per_decode": 463.43190000000004
+  },
+  {
+    "concurrency": 16,
+    "rank": 2,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 2.9464219672131144,
+    "us_per_decode": 179.73174
+  },
+  {
+    "concurrency": 16,
+    "rank": 3,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.0927082644628103,
+    "us_per_decode": 374.21770000000004
+  },
+  {
+    "concurrency": 16,
+    "rank": 3,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.608415702479339,
+    "us_per_decode": 436.61830000000003
+  },
+  {
+    "concurrency": 16,
+    "rank": 3,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 2.9465996721311476,
+    "us_per_decode": 179.74258
+  },
+  {
+    "concurrency": 64,
+    "rank": 0,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.8820996694214878,
+    "us_per_decode": 469.73406
+  },
+  {
+    "concurrency": 64,
+    "rank": 0,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.96244347107438,
+    "us_per_decode": 479.45565999999997
+  },
+  {
+    "concurrency": 64,
+    "rank": 0,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 3.770375081967213,
+    "us_per_decode": 229.99288
+  },
+  {
+    "concurrency": 64,
+    "rank": 1,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.4081618181818185,
+    "us_per_decode": 412.38758
+  },
+  {
+    "concurrency": 64,
+    "rank": 1,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.821271074380165,
+    "us_per_decode": 462.37379999999996
+  },
+  {
+    "concurrency": 64,
+    "rank": 1,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 3.0229583606557373,
+    "us_per_decode": 184.40045999999998
+  },
+  {
+    "concurrency": 64,
+    "rank": 2,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.9210328925619833,
+    "us_per_decode": 474.44498
+  },
+  {
+    "concurrency": 64,
+    "rank": 2,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 3.9635568595041324,
+    "us_per_decode": 479.59038
+  },
+  {
+    "concurrency": 64,
+    "rank": 2,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 3.8268629508196725,
+    "us_per_decode": 233.43864000000002
+  },
+  {
+    "concurrency": 64,
+    "rank": 3,
+    "operator": "mhc_projection",
+    "calls": 6050,
+    "mean_us": 3.7875302479338844,
+    "us_per_decode": 458.29116
+  },
+  {
+    "concurrency": 64,
+    "rank": 3,
+    "operator": "mhc_epilogue",
+    "calls": 6050,
+    "mean_us": 4.009514710743802,
+    "us_per_decode": 485.15128
+  },
+  {
+    "concurrency": 64,
+    "rank": 3,
+    "operator": "attention_input_quant",
+    "calls": 3050,
+    "mean_us": 3.7884380327868854,
+    "us_per_decode": 231.09472000000002
+  }
+]

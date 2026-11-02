@@ -1,0 +1,542 @@
+[
+  {
+    "m": 64,
+    "n": 512,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 5,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 4.991724250609415,
+    "us": 4.982714817441743
+  },
+  {
+    "m": 64,
+    "n": 512,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 4.973066726635242,
+    "us": 12.494277246927812
+  },
+  {
+    "m": 64,
+    "n": 512,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 4.986279041080151,
+    "us": 7.38717327683659
+  },
+  {
+    "m": 64,
+    "n": 512,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 4.941390328488108,
+    "us": 5.801042811623935
+  },
+  {
+    "m": 64,
+    "n": 512,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 5,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.005744944016139,
+    "us": 4.98181735475858
+  },
+  {
+    "m": 64,
+    "n": 1024,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 7,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 6.015205383300781,
+    "us": 6.023930807908376
+  },
+  {
+    "m": 64,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 6.043509406558537,
+    "us": 21.840732097625732
+  },
+  {
+    "m": 64,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 6.050078646611359,
+    "us": 12.73876239856084
+  },
+  {
+    "m": 64,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 6.0489751524844415,
+    "us": 9.291620552539825
+  },
+  {
+    "m": 64,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 5,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 6.045758261762816,
+    "us": 7.617786725362142
+  },
+  {
+    "m": 64,
+    "n": 2048,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.372435718251948,
+    "us": 7.3640788005570235
+  },
+  {
+    "m": 64,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.356736586804975,
+    "us": 23.561558278940492
+  },
+  {
+    "m": 64,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.364878623649992,
+    "us": 13.323386240813692
+  },
+  {
+    "m": 64,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.362266861159227,
+    "us": 9.837902414387669
+  },
+  {
+    "m": 64,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 5,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.382851253662791,
+    "us": 8.165074101949141
+  },
+  {
+    "m": 128,
+    "n": 512,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.535175111787073,
+    "us": 5.541866144229626
+  },
+  {
+    "m": 128,
+    "n": 512,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.5381582728747665,
+    "us": 12.53407505051843
+  },
+  {
+    "m": 128,
+    "n": 512,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.527560155967186,
+    "us": 7.198720348292383
+  },
+  {
+    "m": 128,
+    "n": 512,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.522522748562328,
+    "us": 5.526596156217284
+  },
+  {
+    "m": 128,
+    "n": 512,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 32,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 5,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 5.524517065387661,
+    "us": 4.99206503917431
+  },
+  {
+    "m": 128,
+    "n": 1024,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.063480858075417,
+    "us": 7.065974638379854
+  },
+  {
+    "m": 128,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.062517535888543,
+    "us": 23.291917776657364
+  },
+  {
+    "m": 128,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.0648856082205045,
+    "us": 13.104074679572006
+  },
+  {
+    "m": 128,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.068709094645613,
+    "us": 9.645573567535918
+  },
+  {
+    "m": 128,
+    "n": 1024,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 5,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 7.057498395442963,
+    "us": 7.987626376798597
+  },
+  {
+    "m": 128,
+    "n": 2048,
+    "k": 7168,
+    "name": "default",
+    "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 9.14591016440556,
+    "us": 9.149810621293923
+  },
+  {
+    "m": 128,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds2",
+    "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 9.169065335701251,
+    "us": 25.666295454419892
+  },
+  {
+    "m": 128,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds3",
+    "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 9.158010318361478,
+    "us": 14.367042122216061
+  },
+  {
+    "m": 128,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds4",
+    "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 9.160524474249947,
+    "us": 10.819207080479325
+  },
+  {
+    "m": 128,
+    "n": 2048,
+    "k": 7168,
+    "name": "lds5",
+    "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 5,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+    },
+    "relative_rmse": 0.0,
+    "exact_fraction": 1.0,
+    "baseline_us": 9.154753684997559,
+    "us": 9.380349392692247
+  }
+]

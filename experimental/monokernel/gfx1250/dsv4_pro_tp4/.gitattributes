@@ -1,0 +1,3 @@
+# Preserve archived bytes so SOURCE_MANIFEST hashes survive checkout.
+work/** -text
+runtime/** -text

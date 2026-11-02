@@ -1,0 +1,67 @@
+Round 2 reproduction
+
+The working container is vigokhal_dsv4_tp4, created from:
+  rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Host /home/vigokhal/dsv4-monokernel is mounted at /work.
+The checkpoint is /data/DeepSeek-V4-Pro. Do not enable fake EPLB routing.
+
+Source installation
+The first-round ATOM and AITER mHC patches are prerequisites. On top of those:
+  git -C /app/ATOM apply /work/round2/atom-round2.patch
+The current working container already contains these changes.
+Alternatively, install the supplied source snapshots with:
+  bash /work/round2/install_candidate.sh
+This also restores the original FP8 AITER files after prefetch experimentation;
+it preserves the first-round AITER mHC changes.
+
+Serving flags (in the container, from /work)
+  ATOM_DSV4_HYBRID=1 ATOM_DSV4_HYBRID_GEMM=1 \
+  ATOM_DSV4_HYBRID_ATTN=1 ATOM_DSV4_HYBRID_CHECK=1 \
+  ATOM_FORCE_ATTN_TRITON=1 FAKE_EPLB=0 \
+  TRACE=1 TRACE_DIR=/work/traces/my_candidate \
+  TRITON_CACHE_DIR=/work/triton-cache bash /work/serve.sh
+
+Set ATOM_DSV4_HYBRID_ATTN=0 for the prior-hybrid control. All other flags remain
+identical. Start a new server process when changing flags, so GPU graphs are
+captured with the selected implementation. CHECK performs exact live projection
+comparisons during uncaptured warmup; it does not time additional reference
+kernels during steady captured serving.
+
+Benchmarks (separate shell, same container, from /work)
+  bash /work/round2/run_serving_suite.sh my_candidate
+This profiles concurrency 64 and 128, then runs a full workload warmup and a
+reported repetition for each. It also saves deterministic concurrent completions.
+The exact workload comes from /work/run_bench.sh: 1024 input tokens, 1024 output
+tokens, 4*C requests, seed 0, ignore EOS, no prefix caching.
+Avoid concurrent GPU workloads. Trace analysis can run after measurements:
+  python /work/round2/analyze_serving.py my_candidate
+
+Experiments
+attention_tune.json: initial tile, LDS, multicast and prefetch sweep. Compilation
+failures are retained in the log and JSON; these configurations were not selected.
+attention_joint.json: joint pipeline/cluster tuning (also retains failed trials).
+attention_prefetch.json: corrected prefetch lookahead sweep.
+attention_finalists.json: rotating-weight, alternating baseline/candidate timings.
+selected_attention.json: selected measured configurations before deployment.
+candidate/dsv4_attention_configs.json: actual serving dispatch table.
+
+The optional aiter-prefetch-experiment.patch is NOT installed for serving. Apply
+it only in an experimental checkout on top of the first-round AITER state before
+running the prefetch tuning scripts. It adds L2_PREFETCH_DISTANCE to existing
+configuration files and launches. The installed serving configuration uses no
+added prefetch, semaphore, or collective override.
+
+The semaphore probes are isolated experiments, not production implementations.
+Only the acq_rel reference and explicitly drained scoped-asm versions satisfy
+the tested ordering checks. The .cg/relaxed version is not accepted as correct;
+the first explicit-asm attempt failed correctness. Keep those failures when
+reviewing the experiment. Do not reuse the probes as a general synchronization
+library or apply device scope to peer-GPU memory.
+
+Validation details: serve_validation.sh enables eager execution. Set
+ATOM_DSV4_HYBRID_ATTN_CHECK_LIMIT=100000 and ATOM_DSV4_HYBRID_CHECK=1, then run
+validate_real_batches.py. This is not a timed serving run. Production default
+check limit remains2. See real_validation_summary.json for logged lower bounds.
+The final successful intra-device semaphore experiment is
+semaphore_probe_scoped_buffer.py; its scalar-ASM predecessor failed and is not
+an alternative implementation. All semaphore experiments remain unintegrated.

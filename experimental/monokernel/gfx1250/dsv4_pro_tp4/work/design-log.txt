@@ -1,0 +1,102 @@
+DSV4 TP4 hybrid investigation
+Image: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Image ID: d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a
+ATOM: f19778df4054e94d64d6f6bf6dd68f5681bd5945
+AITER: 7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe
+Container: vigokhal_dsv4_tp4
+Checkpoint: /data/DeepSeek-V4-Pro, 61 layers, hidden 7168, HC=4, Q rank 1536,
+head dim 512, 128 attention heads, 384 routed experts, top-6, FP4 experts.
+TP=4, EP disabled, real routing (FAKE_EPLB=0), no speculative decoding.
+Original TP4 script: BF16 KV, FP4 index cache, prefix caching off, full graphs.
+Baseline keeps original MoE implementation. ATOM_FORCE_ATTN_TRITON=1 explicitly set
+because original TP4 script references it without assigning a default.
+Bench workload matches supplied scripts: random ISL=1024 OSL=1024, 4*C requests,
+request-rate infinity, seed 0, ignore EOS. Profile: OSL=50, C requests.
+
+Observed source graph:
+MoE result (after existing TP reduce) -> next Block.fuse_hc -> attention.
+mHC post + pre already uses two Gluon launches for supported shuffled residuals:
+1. previous residual mix + next residual store + split-K HC projection + square sum
+2. split reduction + sigmoid + 20 Sinkhorn iterations + weighted HC reduction + RMSNorm.
+The result has BF16 shape [M,7168]. The attention projection wqkv_a quantizes
+this input; other attention consumers include compressors on auxiliary streams.
+Any fused quant epilogue must also retain the original BF16 input for those consumers.
+MoE, routing, and stream scheduling are out of modification scope.
+Fusion choice remains pending measured decode trace.
+
+Preflight:
+No KFD processes before experiment. Four visible gfx1250 devices, 256 CUs/device.
+Kit's s_memrealtime probe does not compile on gfx1250. Ported to HIP wall_clock64
+and queried wall clock frequency, but returns suspicious full-duration gaps even
+for a single process: this probe result is NOT valid evidence of host descheduling.
+Missing libamdhip64.so development symlink repaired inside isolated container.
+
+Startup failure / baseline recovery:
+First run failed during graph-size-256 warmup: MoE routing topk load_binary
+returned HIP error 200, invalid device kernel image. No serving metrics collected.
+Standalone topk at M=16,128,256,512 passed for FP32 and BF16, with/without bias,
+including HSA_XNACK=1/HSA_USE_SVM=1. Thus failure not yet isolated to code or cache.
+Retry uses a separate writable copy of Triton cache, with topk entries quarantined
+for recompilation, and max_num_seqs=128 / captures [1,2,4,8,16,32,64,128].
+These launch settings apply equally to baseline and hybrid.
+
+Candidate design (pending profile):
+Retain stage 1 split-K mHC projection and stage 2 reduce/Sinkhorn/RMSNorm.
+Extend stage 2 to emit FP8 input and column-major per-128 E8M0 scales for wqkv_a.
+BF16 normalized output remains materialized for compressor/indexer consumers.
+Ownership: each stage-1 CTA owns a row tile/K-split and writes partial sums and
+residual region; kernel completion orders stage 2 reads. Each stage-2 CTA owns
+whole output rows; within-row group max reductions create scales without global
+flags. FP8 payload, scale and BF16 output all become ready at kernel completion.
+No added cross-rank or cross-CTA synchronization. Existing MoE and collectives stay.
+Resource validation needed: stage-2 registers/spills/LDS compared to baseline;
+FP8 group reductions should reuse already-normalized register values.
+Numerical contract: normalize exactly in baseline order, round to BF16 first,
+then per-128 FP8 e4m3fn quantization with HIP RoundUp E8M0 policy (NOT the old
+Gluon common mx_e8m0_scale helper's round-even policy). Verify exact scale bytes,
+FP8 payload and original outputs against original mHC + per_group_quant_hip.
+
+Validation / microbench:
+17 original-kernel golden cases passed bitwise, including all six outputs, zeros,
+odd M=7, M=1,2,8,16,32,64,128, plain/shuffled residuals, C=7168 and C=4096.
+Each case runs twice and checks three graph replays. Quantizer floor fixed to
+HIP absMax >= 1e-10 after the zero case exposed differing E8M0 bytes.
+Gluon API fixes: broadcast instead of broadcast_to, explicit output layout,
+no repeated constexpr binding within the unrolled loop.
+Graph microbenchmark uses five alternating baseline/hybrid samples at each M.
+Boundary saves 1.5--2.8 us, approximately 15--27%; see mhc_microbench.json.
+C=7168 epilogue has 85 VGPRs vs baseline 84 (some old variants 86), unchanged
+65,636-byte LDS allocation, zero private scratch. No spill regression observed.
+Hybrid serving begins with ATOM_DSV4_HYBRID_CHECK=1 (first 16 eligible warmup calls
+per rank compared exactly against mHC + HIP quant); new graph cache avoids stale
+capture paths. The source import from /app alone hit a namespace shadowing issue;
+actual server launched from /work (same as baseline) imports successfully.
+
+Projection follow-up:
+The N=2048 K=7168 projection already has tuned gfx1250 Gluon split-K configs.
+Use its public gemm_afp8wfp8_preshuffle API with existing preshuffled weights,
+column-major per-128 activation E8M0 scales and per-128x128 weight E8M0 scales.
+No repack or new tuning constants. Two launches: partial GEMM then reduction.
+FP8 quantized input is retained from the fused mHC epilogue; first layer uses
+baseline HIP quant. Exact synthetic BF16 outputs at all tested rows.
+M=1,8,16,32,64 baseline -> Gluon us:
+46.30->3.44, 46.23->4.92, 46.32->5.25, 5.33->4.80, 44.08->5.55.
+Did not help: M=128, 6.04->7.84us. Retain baseline projection above64.
+ATOM_DSV4_HYBRID_GEMM=1 enables this only with hybrid eligibility and measured
+N/K dimensions. Live validation compares first16 eligible calls per rank exactly.
+
+Trace engagement correction:
+The first fusion-only serving attempt had enabled=True but no FUSE_QUANT_1
+kernels. Kernel counts exactly matched baseline. Therefore its serving profile
+and completion comparisons DO NOT validate execution of the new path.
+The model's outer row-count test specialized to the large compile warmup shape.
+Moved all row-count dispatch into the opaque custom-op body. The outer model
+uses static capability guards only. Large-M mHC uses original fused post/pre
+plus original HIP quant; projection >64 uses original GEMM. Added explicit
+16-check completion markers per rank. Recheck actual kernel names/counts in
+final profiles before accepting performance or numerical results.
+
+Final experiment complete: 6 original baseline points, 6 final hybrid points,
+6 control-repeat points; all requests successful with full1024-token outputs.
+Final control also matches all4 hybrid deterministic completions exactly.
+See comparison.csv and REPORT.txt for final serving metrics.

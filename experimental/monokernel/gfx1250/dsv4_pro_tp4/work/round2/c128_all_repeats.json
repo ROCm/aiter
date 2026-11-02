@@ -1,0 +1,44 @@
+[
+  {
+    "mode": "round2_control",
+    "role": "primary second run",
+    "mean_tpot_ms": 17.226216816591517,
+    "mean_ttft_ms": 1611.1593975038047,
+    "total_token_throughput": 13622.944766140634
+  },
+  {
+    "mode": "round2_candidate",
+    "role": "primary second run",
+    "mean_tpot_ms": 18.163164634834278,
+    "mean_ttft_ms": 1565.6282380469052,
+    "total_token_throughput": 13005.885036067895
+  },
+  {
+    "mode": "round2_candidate_repeat2",
+    "role": "confirmatory second run after restart",
+    "mean_tpot_ms": 16.912120526091222,
+    "mean_ttft_ms": 1588.343331939498,
+    "total_token_throughput": 13871.10662114416
+  },
+  {
+    "mode": "round2_candidate_repeat3",
+    "role": "diagnostic third run",
+    "mean_tpot_ms": 17.072075719045838,
+    "mean_ttft_ms": 1561.5339964590617,
+    "total_token_throughput": 13771.19207763091
+  },
+  {
+    "mode": "round2_control_repeat2",
+    "role": "diagnostic third run",
+    "mean_tpot_ms": 17.163051126418473,
+    "mean_ttft_ms": 1599.1419378768726,
+    "total_token_throughput": 13677.627197451502
+  },
+  {
+    "mode": "round2_control_repeat3",
+    "role": "diagnostic fourth run",
+    "mean_tpot_ms": 17.40924632335778,
+    "mean_ttft_ms": 1589.1741895311143,
+    "total_token_throughput": 13507.109701805315
+  }
+]

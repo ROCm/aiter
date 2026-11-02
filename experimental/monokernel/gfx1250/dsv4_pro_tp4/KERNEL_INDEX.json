@@ -1,0 +1,397 @@
+[
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_load_fn_plane",
+    "line": 129
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_res_offsets",
+    "line": 149
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_issue_loads",
+    "line": 161
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_wait_next_stage",
+    "line": 188
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_read_stage",
+    "line": 201
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel",
+    "line": 239
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_rcp",
+    "line": 601
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_pin",
+    "line": 609
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_sigmoid",
+    "line": 618
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_res_ptrs",
+    "line": 624
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_load_partials",
+    "line": 642
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_fold_splits",
+    "line": 696
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_load_norm_w",
+    "line": 710
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_reduce_apply_main",
+    "line": 796
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_post_sinkhorn_ws",
+    "line": 1077
+  },
+  {
+    "file": "runtime/app/aiter/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py",
+    "symbol": "_mhc_pre_reduce_apply_gfx1250_kernel",
+    "line": 1160
+  },
+  {
+    "file": "work/aiter-pre-audit/check_pre.py",
+    "symbol": "new",
+    "line": 10
+  },
+  {
+    "file": "work/aiter-pre-audit/check_pre.py",
+    "symbol": "old",
+    "line": 14
+  },
+  {
+    "file": "work/aiter-pre-audit/check_pre_real.py",
+    "symbol": "new",
+    "line": 10
+  },
+  {
+    "file": "work/aiter-pre-audit/check_pre_real.py",
+    "symbol": "old",
+    "line": 14
+  },
+  {
+    "file": "work/aiter-pre-audit/model_layer_batch.before.py",
+    "symbol": "model_layer",
+    "line": 19
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_load_fn_plane",
+    "line": 129
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_res_offsets",
+    "line": 149
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_issue_loads",
+    "line": 161
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_wait_next_stage",
+    "line": 188
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_read_stage",
+    "line": 201
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel",
+    "line": 239
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_rcp",
+    "line": 601
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_pin",
+    "line": 609
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_sigmoid",
+    "line": 618
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_res_ptrs",
+    "line": 624
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_load_partials",
+    "line": 642
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_fold_splits",
+    "line": 696
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_load_norm_w",
+    "line": 710
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_reduce_apply_main",
+    "line": 796
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_post_sinkhorn_ws",
+    "line": 1077
+  },
+  {
+    "file": "work/candidate/mhc_kernel.py",
+    "symbol": "_mhc_pre_reduce_apply_gfx1250_kernel",
+    "line": 1160
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_load_fn_plane",
+    "line": 129
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_res_offsets",
+    "line": 149
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_issue_loads",
+    "line": 161
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_wait_next_stage",
+    "line": 188
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_read_stage",
+    "line": 201
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_mhc_post_pre_gemm_sqrsum_gfx1250_kernel",
+    "line": 239
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_rcp",
+    "line": 592
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_pin",
+    "line": 600
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_sigmoid",
+    "line": 609
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_res_ptrs",
+    "line": 615
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_load_partials",
+    "line": 633
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_fold_splits",
+    "line": 687
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_load_norm_w",
+    "line": 701
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_reduce_apply_main",
+    "line": 784
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_post_sinkhorn_ws",
+    "line": 1038
+  },
+  {
+    "file": "work/originals/mhc_kernel.py",
+    "symbol": "_mhc_pre_reduce_apply_gfx1250_kernel",
+    "line": 1121
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "depreshuffle_b",
+    "line": 154
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_load_scale_tile",
+    "line": 180
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_gather_scale_tile",
+    "line": 221
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_gather_scale_vec",
+    "line": 259
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_read_tile",
+    "line": 308
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_gemm_mxfp8_preshuffle_bandwidth_bound_kernel",
+    "line": 405
+  },
+  {
+    "file": "work/round2/candidate/gemm_mxfp8.py",
+    "symbol": "_gemm_mxfp8_preshuffle_compute_bound_kernel",
+    "line": 1123
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "depreshuffle_b",
+    "line": 153
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_load_scale_tile",
+    "line": 179
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_gather_scale_tile",
+    "line": 220
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_gather_scale_vec",
+    "line": 258
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_read_tile",
+    "line": 307
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_gemm_mxfp8_preshuffle_bandwidth_bound_kernel",
+    "line": 404
+  },
+  {
+    "file": "work/round2/originals/gemm_mxfp8.py",
+    "symbol": "_gemm_mxfp8_preshuffle_compute_bound_kernel",
+    "line": 1107
+  },
+  {
+    "file": "work/round2/semaphore_probe.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe.py",
+    "symbol": "_reduce",
+    "line": 26
+  },
+  {
+    "file": "work/round2/semaphore_probe_cg.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe_cg.py",
+    "symbol": "_reduce",
+    "line": 29
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_asm.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_asm.py",
+    "symbol": "_reduce",
+    "line": 29
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_batched.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_batched.py",
+    "symbol": "_reduce",
+    "line": 32
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_buffer.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_buffer.py",
+    "symbol": "_reduce",
+    "line": 30
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_drain.py",
+    "symbol": "_publish",
+    "line": 10
+  },
+  {
+    "file": "work/round2/semaphore_probe_scoped_drain.py",
+    "symbol": "_reduce",
+    "line": 29
+  }
+]

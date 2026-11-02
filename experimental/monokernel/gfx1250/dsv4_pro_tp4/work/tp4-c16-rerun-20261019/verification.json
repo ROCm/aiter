@@ -1,0 +1,13 @@
+{
+  "server_launches": {
+    "baseline": 1,
+    "hybrid": 1
+  },
+  "reported_client": 2,
+  "both_same_server_identities_verified": true,
+  "hybrid_c16_prepared_ranks": 4,
+  "total_requests_per_client": 64,
+  "input_tokens_per_client": 65536,
+  "output_tokens_per_client": 65536,
+  "source_unchanged_between_variants": true
+}

@@ -1,0 +1,25 @@
+{
+  "pid": 21,
+  "start_ticks": 1185305,
+  "args": [
+    "python",
+    "-m",
+    "atom.entrypoints.openai_server",
+    "-tp",
+    "4",
+    "--model",
+    "/data/DeepSeek-V4-Pro",
+    "--server-port",
+    "8000",
+    "--kv_cache_dtype",
+    "bf16",
+    "--index-cache-dtype",
+    "fp8",
+    "--no-enable_prefix_caching",
+    "--disable_uvicorn_access_log",
+    "--max-num-seqs",
+    "128",
+    "--cudagraph-capture-sizes",
+    "[1,2,4,8,16,32,64,128]"
+  ]
+}

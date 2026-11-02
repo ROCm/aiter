@@ -1,0 +1,1855 @@
+diff --git a/.gitattributes b/.gitattributes
+index dfdb8b7..1d15ac9 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -1 +1,3 @@
+ *.sh text eol=lf
++# Unified patches require a leading space on blank context lines.
++scripts/patches/dsv4_gfx1250_mhc_quant.patch -whitespace
+diff --git a/atom/model_engine/model_runner.py b/atom/model_engine/model_runner.py
+index 2f3c5f6..9c64c44 100644
+--- a/atom/model_engine/model_runner.py
++++ b/atom/model_engine/model_runner.py
+@@ -150,6 +150,9 @@ support_model_arch_dict = {
+ # metadata builder before they are bound. Architectures not listed here route
+ # mono decode inside their own model class instead.
+ mono_decode_installers = {
++    "DeepseekV4ForCausalLM": (
++        "atom.models.deepseek_v4_mono.dispatch.install_mono_decode"
++    ),
+     "DeepseekV41ForCausalLM": (
+         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
+     ),
+diff --git a/atom/models/deepseek_v4.py b/atom/models/deepseek_v4.py
+index 8a798c8..beeaeb5 100644
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -2893,6 +2893,8 @@ class DeepseekV4Attention(nn.Module):
+         x: torch.Tensor,
+         positions: torch.Tensor,
+         run_indexer_proj: bool = True,
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ):
+         """Graphable projection/norm prelude shared by both attention paths.
+ 
+@@ -2912,7 +2914,9 @@ class DeepseekV4Attention(nn.Module):
+             x = x.clone()
+             act_quant_inplace(x, 128, "ue8m0")
+ 
+-        qkv_a = self.wqkv_a(x)
++        qkv_a = (
++            self.wqkv_a(x) if x_quant is None else self.wqkv_a(x_quant, x_scale=x_scale)
++        )
+         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+         assert (
+             not _V4_FORCE_UE8M0_QUANT
+@@ -3064,6 +3068,8 @@ class DeepseekV4Attention(nn.Module):
+         self,
+         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
++        x_quant: torch.Tensor | None = None,
++        x_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
+         """Compute attention for `x` at absolute token `positions`.
+ 
+@@ -3105,7 +3111,7 @@ class DeepseekV4Attention(nn.Module):
+         # FULL order: compressor launch overlaps projections, then inline
+         # QK-norm/RoPE, compressor join, paged core, and output projection.
+         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
+-            x, positions, run_indexer_proj=False
++            x, positions, run_indexer_proj=False, x_quant=x_quant, x_scale=x_scale
+         )
+         qkn = self._qk_norm_rope(q, kv_pre, positions)
+         self._attn_compress(
+diff --git a/atom/models/deepseek_v4_mono/__init__.py b/atom/models/deepseek_v4_mono/__init__.py
+new file mode 100644
+index 0000000..e858f8d
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/__init__.py
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: MIT
++"""gfx1250 DeepSeek-V4 regional hybrid decode, installed after weight loading.
++
++The native model retains prefill and unsupported steps. GPU dependencies are
++imported only after the deployment has passed the opt-in and geometry guards.
++"""
+diff --git a/atom/models/deepseek_v4_mono/config.py b/atom/models/deepseek_v4_mono/config.py
+new file mode 100644
+index 0000000..9c825b5
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/config.py
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: MIT
++"""Measured deployment and row contracts; no GPU or DSL imports."""
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class Profile:
++    name: str
++    hidden: int
++    tp: int
++    heads: int
++    q_rank: int
++    experts: int
++    max_rows: int
++
++
++FLASH = Profile("flash_tp1", 4096, 1, 64, 1024, 256, 16)
++PRO = Profile("pro_tp4", 7168, 4, 128, 1536, 384, 64)
++
++
++def select_profile(hf, tp):
++    for profile in (FLASH, PRO):
++        if (
++            getattr(hf, "hidden_size", None),
++            tp,
++            getattr(hf, "num_attention_heads", None),
++            getattr(hf, "q_lora_rank", None),
++            getattr(hf, "n_routed_experts", None),
++        ) == (
++            profile.hidden,
++            profile.tp,
++            profile.heads,
++            profile.q_rank,
++            profile.experts,
++        ):
++            return profile
++    return None
++
++
++def geometry_refusal(hf, tp):
++    if select_profile(hf, tp) is None:
++        return "only measured Flash TP1 and Pro TP4 geometries"
++    expected = {
++        "hc_mult": 4,
++        "head_dim": 512,
++        "index_n_heads": 64,
++        "index_head_dim": 128,
++        "num_experts_per_tok": 6,
++        "n_shared_experts": 1,
++        "hc_sinkhorn_iters": 20,
++    }
++    for field, value in expected.items():
++        if getattr(hf, field, None) != value:
++            return f"{field} must be {value}"
++    return None
++
++
++def step_supported(rows, profile, *, prefill, embeds=False, ubatches=False):
++    return not (prefill or embeds or ubatches) and 0 < rows <= profile.max_rows
++
++
++def config_refusal(config, *, arch):
++    import os
++
++    from atom.mono.runtime.deployment import common_refusals, first_refusal
++    from atom.utils import envs
++
++    if not envs.ATOM_MONO_ENABLE or not envs.ATOM_DSV4_MONO:
++        return "switched off"
++    if arch.split(":", 1)[0] != "gfx1250":
++        return "not gfx1250"
++    hf = config.hf_config
++    why = geometry_refusal(hf, config.tensor_parallel_size)
++    if why:
++        return why
++    # Sharding is fully specified by the measured profile. The shared deployment
++    # validator still owns EP/DP/PP/CP/TBO/plugin/weight-update/compile refusals.
++    checks = [
++        (os.getenv("V4_FORCE_UE8M0_QUANT", "0") != "1", "forced UE8M0 round-trip")
++    ]
++    checks += common_refusals(config, lambda tp: None, (1, 4)) + [
++        (not config.enable_dp_attention, "DP attention"),
++        (config.speculative_config is None, "speculative decoding"),
++        (config.kv_cache_dtype == "bf16", "KV cache must be bf16"),
++        (config.index_cache_dtype == "fp8", "index cache must be fp8"),
++        (envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE, "FP8 weight preshuffle off"),
++    ]
++    return first_refusal(checks)
+diff --git a/atom/models/deepseek_v4_mono/configs/flash_tp1.json b/atom/models/deepseek_v4_mono/configs/flash_tp1.json
+new file mode 100644
+index 0000000..06779f6
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/configs/flash_tp1.json
+@@ -0,0 +1,194 @@
++{
++  "1,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,8192,1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,1536,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,4096,8192": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,8192,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,32768,1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,4096,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,4096,4096": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "1,4096,2048": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,4096,2048": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 3,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  }
++}
+diff --git a/atom/models/deepseek_v4_mono/configs/pro_tp4.json b/atom/models/deepseek_v4_mono/configs/pro_tp4.json
+new file mode 100644
+index 0000000..3862ee9
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/configs/pro_tp4.json
+@@ -0,0 +1,146 @@
++{
++  "64,16384,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 2,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "64,8192,1536": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 2,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": ".ca",
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "1,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "2,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "4,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "8,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "16,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "32,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  },
++  "64,2048,7168": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound",
++    "LOOP_UNROLL_FACTOR": 1
++  }
++}
+diff --git a/atom/models/deepseek_v4_mono/dispatch.py b/atom/models/deepseek_v4_mono/dispatch.py
+new file mode 100644
+index 0000000..8036beb
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/dispatch.py
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: MIT
++"""Post-load routing, following V4.1/K3 mono's installer and LazyRunner ABI."""
++
++import logging
++
++from torch import nn
++
++from atom.models.deepseek_v4_mono.config import (
++    config_refusal,
++    select_profile,
++    step_supported,
++)
++from atom.mono.runtime.consensus import MonoUnsupported
++from atom.mono.runtime.route import LazyRunner
++from atom.utils import envs
++from atom.utils.forward_context import get_forward_context
++
++logger = logging.getLogger("atom")
++
++
++class MonoDecodeModel(nn.Module):
++    def __init__(self, model, profile):
++        super().__init__()
++        self.model = model
++        self.profile = profile
++
++        def create():
++            try:
++                from atom.models.deepseek_v4_mono.runner import HybridDecodeRunner
++            except ImportError as error:
++                raise MonoUnsupported(
++                    f"gfx1250 hybrid kernels unavailable: {error}"
++                ) from error
++            return HybridDecodeRunner(model, profile)
++
++        self._mono = LazyRunner(create, f"DSV4 gfx1250 {profile.name} hybrid")
++
++    def forward(self, input_ids, positions):
++        context = get_forward_context()
++        state = context.context
++        eligible = state is not None and step_supported(
++            input_ids.numel(),
++            self.profile,
++            prefill=state.is_prefill,
++            ubatches=getattr(context, "ubatch_slices", None) is not None,
++        )
++        # Inputs are TP-uniform. Do not gate on rank-local is_dummy_run.
++        # Before paged-cache binding the native warmup is the only valid
++        # path. This lifecycle state is uniform across the TP group. Views
++        # bind lazily afterwards so they see the final cache tensor addresses.
++        cache_bound = (
++            getattr(self.model.model.layers[0].attn, "unified_kv", None) is not None
++        )
++        if eligible and cache_bound and self._mono.ready(input_ids.numel()):
++            state.input_ids = input_ids.flatten()  # hash-routing contract
++            return self._mono.runner.forward(input_ids, positions)
++        return self.model(input_ids, positions)
++
++    def compute_logits(self, hidden_states):
++        return self.model.compute_logits(hidden_states)
++
++    def __getattr__(self, name):
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            return getattr(self.model, name)
++
++
++def install_mono_decode(model, atom_config, drafter, metadata_builder):
++    # Disabled/native deployments must not import a DSL or query a device.
++    if not envs.ATOM_MONO_ENABLE or not envs.ATOM_DSV4_MONO:
++        return model
++    from aiter.jit.utils.chip_info import get_gfx_runtime
++
++    why = config_refusal(atom_config, arch=get_gfx_runtime())
++    if why is not None:
++        logger.info("DSV4 gfx1250 hybrid off: %s", why)
++        return model
++    if drafter is not None:
++        logger.info("DSV4 gfx1250 hybrid off: drafter")
++        return model
++    profile = select_profile(atom_config.hf_config, atom_config.tensor_parallel_size)
++    return MonoDecodeModel(model, profile)
+diff --git a/atom/models/deepseek_v4_mono/kernels/__init__.py b/atom/models/deepseek_v4_mono/kernels/__init__.py
+new file mode 100644
+index 0000000..fc315c4
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/kernels/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: MIT
++"""Lazy host wrappers around the validated gfx1250 AITER Gluon kernels."""
+diff --git a/atom/models/deepseek_v4_mono/kernels/ops.py b/atom/models/deepseek_v4_mono/kernels/ops.py
+new file mode 100644
+index 0000000..8957bce
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/kernels/ops.py
+@@ -0,0 +1,206 @@
++# SPDX-License-Identifier: MIT
++"""Graph-safe regional operations; public AITER math and measured configurations."""
++
++import json
++import logging
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++from aiter.jit.utils.torch_guard import torch_compile_guard
++
++from atom.utils import envs
++
++logger = logging.getLogger("atom")
++_checks = {}
++
++
++def _check(key, actual, reference):
++    if envs.ATOM_MONO_CHECK and not torch.cuda.is_current_stream_capturing():
++        count = _checks.get(key, 0)
++        if count < 16:
++            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
++            _checks[key] = count + 1
++            if count + 1 in (2, 16):
++                logger.info(
++                    "DSV4 gfx1250 hybrid exact checks=%d key=%s", count + 1, key
++                )
++
++
++@lru_cache(None)
++def configs(profile):
++    return json.loads(
++        (Path(__file__).parent.parent / "configs" / f"{profile}.json").read_text()
++    )
++
++
++def _projection_fake(x, weight, x_scale, weight_scale, profile, role):
++    return torch.empty(
++        (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16
++    )
++
++
++@torch_compile_guard(gen_fake=_projection_fake, mutates_args=[])
++def projection(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    x_scale: torch.Tensor,
++    weight_scale: torch.Tensor,
++    profile: str,
++    role: str,
++) -> torch.Tensor:
++    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
++
++    key = f"{x.shape[0]},{weight.shape[0]},{weight.shape[1]}"
++    config = configs(profile).get(key)
++    allowed = (
++        profile == "flash_tp1"
++        or (role == "wqkv_a" and weight.shape == (2048, 7168))
++        or (role in ("wq_b", "indexer.wq_b") and weight.shape[1] == 1536)
++    )
++    if config is None or not allowed:
++        return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
++
++    result = gemm_afp8wfp8_preshuffle(
++        x,
++        weight,
++        x_scale.view(torch.uint8),
++        weight_scale.view(torch.uint8),
++        backend="gluon",
++        is_x_scale_transposed=True,
++        config=dict(config),
++    )
++    check_key = (profile, role, weight.data_ptr(), key)
++    if (
++        envs.ATOM_MONO_CHECK
++        and _checks.get(check_key, 0) < 16
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        reference = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++        try:
++            _check(check_key, result, reference)
++        except AssertionError:
++            logger.exception("DSV4 gfx1250 exact projection failure key=%s", check_key)
++            directory = os.environ.get("ATOM_MONO_FAILURE_DIR")
++            if directory:
++                target = Path(directory)
++                target.mkdir(parents=True, exist_ok=True)
++                torch.save(
++                    {
++                        "x": x.cpu(),
++                        "weight": weight.cpu(),
++                        "x_scale": x_scale.cpu(),
++                        "weight_scale": weight_scale.cpu(),
++                        "actual": result.cpu(),
++                        "reference": reference.cpu(),
++                        "profile": profile,
++                        "role": role,
++                        "config": config,
++                    },
++                    target
++                    / f"projection-{weight.data_ptr()}-{key.replace(',', '-')}.pt",
++                )
++            raise
++    return result
++
++
++def _mhc_fake(
++    x,
++    residual,
++    post,
++    comb,
++    fn,
++    scale,
++    base,
++    norm_weight,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_iters: int,
++    res_preshuffle: bool,
++):
++    m, c = x.shape
++    return (
++        torch.empty((m, 4, 1), device=x.device, dtype=torch.float32),
++        torch.empty((m, 4, 4), device=x.device, dtype=torch.float32),
++        torch.empty_like(x),
++        torch.empty_like(residual),
++        torch.empty_like(x, dtype=torch.float8_e4m3fn),
++        torch.empty((m, c // 128), device=x.device, dtype=torch.float8_e8m0fnu),
++    )
++
++
++@torch_compile_guard(gen_fake=_mhc_fake, mutates_args=[])
++def mhc_quant(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    fn: torch.Tensor,
++    scale: torch.Tensor,
++    base: torch.Tensor,
++    norm_weight: torch.Tensor,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_iters: int,
++    res_preshuffle: bool,
++) -> tuple[
++    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
++]:
++    from aiter.ops.triton.fusions.mhc import mhc_post_pre_quant_gfx1250
++
++    result = mhc_post_pre_quant_gfx1250(
++        x,
++        residual,
++        post,
++        comb,
++        fn,
++        scale,
++        base,
++        norm_weight,
++        eps=rms_eps,
++        hc_pre_eps=hc_eps,
++        hc_post_mult_value=2.0,
++        sinkhorn_iters=sinkhorn_iters,
++        hc_sinkhorn_eps=hc_eps,
++        norm_eps=rms_eps,
++        res_preshuffle=res_preshuffle,
++    )
++    key = ("mhc", fn.data_ptr(), x.shape[0])
++    if (
++        envs.ATOM_MONO_CHECK
++        and _checks.get(key, 0) < 16
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        import aiter
++        from aiter.ops.quant import per_group_quant_hip
++
++        reference = aiter.mhc_fused_post_pre(
++            x,
++            residual,
++            post,
++            comb,
++            fn,
++            scale,
++            base,
++            rms_eps,
++            hc_eps,
++            hc_eps,
++            2.0,
++            sinkhorn_iters,
++            norm_weight,
++            rms_eps,
++            w_preshuffle_bf16=fn.dtype == torch.int32,
++            res_preshuffle=res_preshuffle,
++            backend="gluon",
++        )
++        q, qs = per_group_quant_hip(
++            reference[2],
++            quant_dtype=torch.float8_e4m3fn,
++            group_size=128,
++            transpose_scale=True,
++            scale_type=torch.float8_e8m0fnu,
++        )
++        _check(key, result, (*reference, q, qs))
++    return result
+diff --git a/atom/models/deepseek_v4_mono/linear.py b/atom/models/deepseek_v4_mono/linear.py
+new file mode 100644
+index 0000000..452c349
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/linear.py
+@@ -0,0 +1,57 @@
++# SPDX-License-Identifier: MIT
++"""Hybrid-only linear view: share loaded weights and preserve the native ABI."""
++
++import torch
++from torch import nn
++
++from atom.models.deepseek_v4_mono.kernels.ops import projection
++
++
++def linear_refusal(linear):
++    from aiter import QuantType
++
++    checks = [
++        (linear.params_dtype == torch.float8_e4m3fn, "not FP8"),
++        (linear.quant_type.value == QuantType.per_1x128.value, "not per-1x128"),
++        (linear.blockscale_e8m0_scale, "not E8M0"),
++        (linear.native_a8_group_rows is None, "native group layout"),
++        (not getattr(linear, "use_mxscale_shuffle", False), "MX scale shuffle"),
++        (linear.weight_scale.dtype == torch.float8_e8m0fnu, "weight scale dtype"),
++    ]
++    return next((why for ok, why in checks if not ok), None)
++
++
++class HybridLinear(nn.Module):
++    def __init__(self, native, profile, role):
++        super().__init__()
++        self.native, self.profile, self.role = native, profile, role
++
++    def forward(self, x, x_scale=None, otype=torch.bfloat16, out=None):
++        n = self.native
++        if out is not None or otype != torch.bfloat16:
++            return n(x, x_scale=x_scale, otype=otype, out=out)
++        if x_scale is None:
++            from atom.model_ops.linear import per_1x128_e8m0_quant
++
++            x, x_scale = per_1x128_e8m0_quant(
++                x,
++                quant_dtype=n.params_dtype,
++                transpose_scale=True,
++                scale=getattr(n, "input_scale", None),
++            )
++        y = projection(x, n.weight, x_scale, n.weight_scale, self.profile, self.role)
++        if n.bias is not None:
++            y += n.bias
++        if n.is_output_padded:
++            y = y[..., : n._output_size_before_padding]
++        if n.tp_dim == 1 and n.tp_size > 1 and n.reduce_results:
++            from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
++
++            y = tensor_model_parallel_all_reduce(y)
++        return y
++
++    def __getattr__(self, name):
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            return getattr(self.native, name)
+diff --git a/atom/models/deepseek_v4_mono/runner.py b/atom/models/deepseek_v4_mono/runner.py
+new file mode 100644
+index 0000000..b2d26a9
+--- /dev/null
++++ b/atom/models/deepseek_v4_mono/runner.py
+@@ -0,0 +1,218 @@
++# SPDX-License-Identifier: MIT
++"""The native V4 layer walk with regional gfx1250 replacements.
++
++A hybrid owns shallow module views, never a second GPU weight copy. Native
++modules and their compiled forwards remain available for prefill/fallback.
++The attention and MoE side-stream ordering and TP reductions are unchanged.
++"""
++
++import copy
++import logging
++
++import torch
++from aiter.dist.parallel_state import get_tp_group
++
++from atom.models.deepseek_v4 import HCState
++from atom.models.deepseek_v4_mono.kernels.ops import configs, mhc_quant, projection
++from atom.models.deepseek_v4_mono.linear import HybridLinear, linear_refusal
++from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
++
++logger = logging.getLogger("atom")
++
++
++def module_view(module):
++    result = copy.copy(module)
++    result._modules = module._modules.copy()
++    return result
++
++
++class HybridDecodeRunner:
++    def __init__(self, causal_lm, profile):
++        self.native = causal_lm.model
++        self.profile = profile
++        self.group = get_tp_group().cpu_group if profile.tp > 1 else None
++        self.layers = []
++        self.linears = []
++        self.prepared = set()
++        self.refused = set()
++        bind_agreed(self._bind, self.group)
++
++    def _linear(self, native, role):
++        why = linear_refusal(native)
++        if why is not None:
++            # An optional projection can keep its native path. QKV is the
++            # consumer of the fused quant output and must match its ABI.
++            if role == "wqkv_a":
++                raise MonoUnsupported(f"QKV layout: {why}")
++            return native
++        result = HybridLinear(native, self.profile.name, role)
++        self.linears.append(result)
++        return result
++
++    def _bind(self):
++        # Dependency refusal happens on every rank before a hybrid launch.
++        from aiter.ops.triton.fusions.mhc import mhc_post_pre_quant_gfx1250
++        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
++
++        assert callable(mhc_post_pre_quant_gfx1250) and callable(
++            gemm_afp8wfp8_preshuffle
++        )
++        if not self.native.layers:
++            raise MonoUnsupported("no decoder layers")
++        for original in self.native.layers:
++            if getattr(original, "_moe_merge_enabled", False):
++                raise MonoUnsupported("MoE PCP merge")
++            layer = module_view(original)
++            attn = module_view(original.attn)
++            layer.attn = attn
++            for name in ("wqkv_a", "wq_b", "wo_b"):
++                setattr(attn, name, self._linear(getattr(attn, name), name))
++            if attn.indexer is not None:
++                attn.indexer = module_view(attn.indexer)
++                attn.indexer.wq_b = self._linear(attn.indexer.wq_b, "indexer.wq_b")
++            ffn = module_view(original.ffn)
++            layer.ffn = ffn
++            if ffn.shared_experts is not None and self.profile.name == "flash_tp1":
++                ffn.shared_experts = module_view(ffn.shared_experts)
++                for name in ("gate_up_proj", "w2"):
++                    setattr(
++                        ffn.shared_experts,
++                        name,
++                        self._linear(
++                            getattr(ffn.shared_experts, name), f"shared.{name}"
++                        ),
++                    )
++            self.layers.append(layer)
++        self.res_preshuffle = self.native.enable_res_preshuffle and (
++            self.layers[0]._mhc_fused_post_pre is not None
++        )
++        if not all(layer._mhc_fused_post_pre is not None for layer in self.layers):
++            raise MonoUnsupported("mHC fused post/pre unavailable")
++        self.configs = configs(self.profile.name)
++
++    def prepare(self, rows):
++        if rows in self.prepared:
++            return True
++        if rows in self.refused or not 0 < rows <= self.profile.max_rows:
++            return False
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        # Compile with real weight layouts before capture, agree any failure
++        # across ranks, and refuse only this width. Kernels here have no
++        # cross-CTA persistent waits or cross-GPU mailboxes.
++        ok = True
++        try:
++            seen = set()
++            for linear in self.linears:
++                w = linear.native.weight
++                key = f"{rows},{w.shape[0]},{w.shape[1]}"
++                if key in seen or key not in self.configs:
++                    continue
++                seen.add(key)
++                from aiter.ops.quant import per_group_quant_hip
++
++                x, scales = per_group_quant_hip(
++                    torch.zeros(
++                        (rows, w.shape[1]), dtype=torch.bfloat16, device=w.device
++                    ),
++                    quant_dtype=torch.float8_e4m3fn,
++                    group_size=128,
++                    transpose_scale=True,
++                    scale_type=torch.float8_e8m0fnu,
++                )
++                projection(
++                    x,
++                    w,
++                    scales,
++                    linear.native.weight_scale,
++                    self.profile.name,
++                    linear.role,
++                )
++            layer = self.layers[min(1, len(self.layers) - 1)]
++            x = torch.zeros(
++                (rows, self.profile.hidden),
++                device=layer.hc_attn_fn.device,
++                dtype=torch.bfloat16,
++            )
++            residual = self._repeat(x)
++            post = torch.zeros((rows, 4), device=x.device, dtype=torch.float32)
++            comb = torch.zeros((rows, 4, 4), device=x.device, dtype=torch.float32)
++            self._mhc(layer, HCState(residual, post, comb, x, self.res_preshuffle))
++        except Exception:
++            logger.exception("DSV4 gfx1250 hybrid failed to prepare %d rows", rows)
++            ok = False
++        if not tp_agree(ok, self.group):
++            self.refused.add(rows)
++            return False
++        self.prepared.add(rows)
++        logger.info("DSV4 gfx1250 %s hybrid prepared %d rows", self.profile.name, rows)
++        return True
++
++    def _repeat(self, x):
++        import aiter
++
++        if hasattr(aiter, "mhc_res_repeat"):
++            return aiter.mhc_res_repeat(x, 4, self.res_preshuffle)
++        if self.res_preshuffle:
++            raise MonoUnsupported("shuffled residual repeat unavailable")
++        return x.unsqueeze(-2).repeat(1, 4, 1)
++
++    @staticmethod
++    def _mhc(layer, state):
++        return mhc_quant(
++            state.x_prev,
++            state.residual,
++            state.post_mix,
++            state.comb_mix,
++            layer.hc_attn_fn,
++            layer.hc_attn_scale,
++            layer.hc_attn_base,
++            layer.attn_norm.weight,
++            float(layer.norm_eps),
++            float(layer.hc_eps),
++            int(layer.hc_sinkhorn_iters),
++            state.res_preshuffle,
++        )
++
++    def forward(self, input_ids, positions):
++        h = self.native.embed(input_ids)
++        state = HCState(residual=self._repeat(h), res_preshuffle=self.res_preshuffle)
++        for layer in self.layers:
++            q = qs = None
++            if state.x_prev is not None:
++                post, comb, x, res, q, qs = self._mhc(layer, state)
++                state = HCState(res, post.squeeze(-1), comb, x, state.res_preshuffle)
++            else:
++                state = layer.fuse_hc(
++                    state,
++                    layer.hc_attn_fn,
++                    layer.hc_attn_scale,
++                    layer.hc_attn_base,
++                    layer.attn_norm.weight,
++                    layer.norm_eps,
++                )
++            # Calling the bound view's implementation retains native attention
++            # work/stream ordering; the prefix-based opaque op targets the
++            # original module and would bypass the hybrid linear views.
++            state.x_prev = layer.attn.forward_impl(state.x_prev, positions, q, qs)
++            state = layer.fuse_hc(
++                state,
++                layer.hc_ffn_fn,
++                layer.hc_ffn_scale,
++                layer.hc_ffn_base,
++                layer.ffn_norm.weight,
++                layer.norm_eps,
++            )
++            ffn = layer.ffn
++            if ffn._use_dual_stream or getattr(ffn, "_use_comm_fused_dispatch", False):
++                state.x_prev = ffn.dual_stream_moe_forward(state.x_prev)
++            else:
++                state.x_prev = ffn.single_stream_moe_forward(state.x_prev)
++        last = self.layers[-1]
++        return last.hc_post(
++            state.x_prev,
++            state.residual,
++            state.post_mix,
++            state.comb_mix,
++            res_preshuffle=state.res_preshuffle,
++        )
+diff --git a/atom/utils/envs.py b/atom/utils/envs.py
+index f890344..c329f17 100644
+--- a/atom/utils/envs.py
++++ b/atom/utils/envs.py
+@@ -486,6 +486,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+     # Fused decode for measured model/deployment/step geometries. Unsupported
+     # configurations and forwards keep the production path. 0 disables it.
++    # Opt-in gfx1250 regional hybrid for measured V4 Flash TP1 / Pro TP4.
++    "ATOM_DSV4_MONO": lambda: os.getenv("ATOM_DSV4_MONO", "0") == "1",
+     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
+     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
+diff --git a/docs/deepseek_v4_gfx1250_mono.md b/docs/deepseek_v4_gfx1250_mono.md
+new file mode 100644
+index 0000000..c2802c6
+--- /dev/null
++++ b/docs/deepseek_v4_gfx1250_mono.md
+@@ -0,0 +1,92 @@
++# DeepSeek V4 gfx1250 hybrid decode
++
++Opt-in regional fusion for DeepSeek-V4-Flash on one gfx1250 (TP1) and
++DeepSeek-V4-Pro on four gfx1250 GPUs (TP4). This follows the post-load installer,
++deployment refusals, lazy binding, TP agreement, per-width preparation and native
++fallback used by `deepseek_v41/mono` and `kimi_k3/mono`. The original gfx950
++FlyDSL kernels and their dispatch are unchanged.
++
++This is the regional hybrid implementation developed in the prior experiments, packaged for
++ATOM's mono integration. It does not claim a new full-layer kernel or new
++performance results from the integration alone.
++
++## Activate
++
++The environment must include AITER gfx1250 Gluon FP8 preshuffle GEMM and the
++public `aiter.ops.triton.fusions.mhc.mhc_post_pre_quant_gfx1250` wrapper. The
++latter is supplied by `scripts/patches/dsv4_gfx1250_mhc_quant.patch`, originally
++validated against AITER `7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe`.
++Apply that patch to a compatible AITER checkout before installing ATOM. If the
++public wrapper is already present, do not apply it twice. An unavailable kernel
++refuses hybrid binding on every TP rank and logs the original exception; the
++native model remains available.
++
++```bash
++pip install -e .
++bash scripts/serve_dsv4_mono_gfx1250.sh flash
++# or, with four free gfx1250 GPUs:
++bash scripts/serve_dsv4_mono_gfx1250.sh pro
++```
++
++`MODEL_PATH`, `HIP_VISIBLE_DEVICES`, and `PORT` override launcher defaults.
++The launcher selects its adjacent checkout automatically; `ATOM_SOURCE_ROOT`
++can override it. A copy under `/app/scripts` also recognizes the isolated
++`/opt/atom-gfx1250-integration` installation.
++For an existing launch command, set `ATOM_DSV4_MONO=1` and `ATOM_MONO_ENABLE=1`.
++The first flag defaults to **0**. Set either flag to 0 for the native baseline.
++Use a fresh ATOM compilation cache after source changes; preserve old cache
++folders instead of overwriting experimental evidence.
++
++`ATOM_MONO_CHECK=1` compares each selected regional output exactly to the native
++operation, up to 16 checks per weight/width. Check-mode comparisons run outside
++capture; use `--level 0 --enforce-eager` to check actual serving tensors on every
++step. CUDA graph replays do not execute Python check code.
++
++## Regions and fallback
++
++| Profile | Eligible decode rows | Replacements |
++|---|---|---|
++| Flash TP1 | 1–16 | mHC reduce/apply + RMSNorm epilogue also emits FP8 input and per-128 E8M0 scales; separate tuned attention and shared-expert Gluon GEMMs at 1/8 rows |
++| Pro TP4 | 1–64 | same mHC/quant fusion; separate unsplit QKV Gluon GEMM through 64 rows; measured multicast projection configurations at 64 rows |
++
++A tuning table selects validated `(M,N,K)` combinations. Missing keys use
++native GEMM. Linear bias, output padding, and row-parallel all-reduce follow the
++native order. Attention compression, indexer and shared-expert streams retain
++their native ordering. All routed MoE remains native. The earlier experimental
++Flash C1 routed-MoE fusion was slower in its serving ablation and is deliberately
++not enabled by this integration; its source and results remain in the experiment
++handoff.
++
++Prefill, batches above the profile limit (including C128), other geometries or
++architectures, EP/DP/PP/CP, TBO, plugins, speculative decoding, rollout weight
++updates and incompatible compilation modes retain native dispatch. KV must be
++BF16, index cache FP8, and FP8 weights use the measured preshuffle/E8M0 ABI.
++
++The installer runs after loading and before graph warmup. It wraps the outer
++model; it does not replace the compiled native inner model. The runner binds
++only after paged caches have final addresses. Module views share loaded GPU
++weights and cache tensors while owning their selected linear children; native
++children are not modified. Hash-routing token IDs are published before each
++hybrid forward. Failed binding is agreed across TP ranks; a failed width is
++refused independently. Warmup uses public quantization to create the actual
++column-major-byte scale ABI before capture. There are no new inter-GPU
++mailboxes or persistent synchronization grids in this recommended hybrid.
++
++Pro integration validation found a one-element BF16 mismatch at C8 with the
++earlier split-K QKV configuration. The integration uses unsplit QKV throughout;
++older Pro benchmark numbers must not be presented as measurements of this revised
++configuration. `ATOM_MONO_FAILURE_DIR` optionally records failing projection
++inputs for offline reproduction.
++
++## Tests
++
++```bash
++python -m pytest tests/models/deepseek_v4_mono -q
++```
++
++The CPU tests cover deployment and row refusals, disabled lazy imports, native
++fallback, logits delegation, hash IDs, shared weight ownership and the linear
++bias/padding/TP-reduction ABI. Serving validation must additionally confirm the
++`DSV4 gfx1250 ... hybrid prepared` log, exact checks on actual decode tensors,
++and CUDA-graph requests at both eligible and fallback widths. For performance,
++run two full clients for each configuration and report only the second client.
+diff --git a/docs/environment_variables.md b/docs/environment_variables.md
+index e394513..772fab7 100644
+--- a/docs/environment_variables.md
++++ b/docs/environment_variables.md
+@@ -592,3 +592,11 @@ Set on the decode side; the prefill side follows what each write request offers
+ | Variable | Type | Default | Description |
+ |----------|------|---------|-------------|
+ | **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1, a plain MLA model) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank; it and the scatter's segment table (about 12 MiB at block size 1, less for larger blocks) are held back from the KV cache budget. Only a non-DCP MLA prefill with `ATOM_PD_MLA_STAGING=1` lands, so set 0 where none does (for example symmetric DCP P/D) to give the pool back to the KV cache. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A stage that reports it cannot land returns its partition at its first write-done and is not offered slots again. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |
++
++### DeepSeek V4 gfx1250 regional hybrid
++
++`ATOM_DSV4_MONO=1` opts into Flash TP1 / Pro TP4 regional hybrid decode through
++the shared mono post-load installer. Default: `0`. Also requires
++`ATOM_MONO_ENABLE=1`. Unsupported deployments and steps use the native model.
++`ATOM_MONO_CHECK=1` enables exact regional comparisons outside graph capture.
++See [the gfx1250 V4 integration guide](deepseek_v4_gfx1250_mono.md).
+diff --git a/pyproject.toml b/pyproject.toml
+index 20f7fe7..528ef77 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -40,6 +40,7 @@ include-package-data = true
+ atom = [
+     "mesh/target/release/libmesh.so",
+     "benchmarks/results/schemas/*.json",
++    "models/deepseek_v4_mono/configs/*.json",
+ ]
+ 
+ [project.entry-points."vllm.platform_plugins"]
+diff --git a/scripts/patches/dsv4_gfx1250_mhc_quant.patch b/scripts/patches/dsv4_gfx1250_mhc_quant.patch
+new file mode 100644
+index 0000000..b2028c6
+--- /dev/null
++++ b/scripts/patches/dsv4_gfx1250_mhc_quant.patch
+@@ -0,0 +1,336 @@
++--- a/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
+++++ b/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
++@@ -524,7 +524,16 @@
++ 
++ _mhc_pre_reduce_apply_repr = make_kernel_repr(
++     "_mhc_pre_reduce_apply_gfx1250_kernel",
++-    ["C", "ROWS", "CHUNK", "N_CHUNKS", "S", "FUSE_RMSNORM", "RES_SHUFFLED"],
+++    [
+++        "C",
+++        "ROWS",
+++        "CHUNK",
+++        "N_CHUNKS",
+++        "S",
+++        "FUSE_RMSNORM",
+++        "RES_SHUFFLED",
+++        "FUSE_QUANT",
+++    ],
++ )
++ 
++ 
++@@ -731,6 +740,7 @@
++     SMEM_MIX: gl.constexpr
++     SMEM_RES: gl.constexpr
++     RES_KS: gl.constexpr
+++    FUSE_QUANT: gl.constexpr
++ 
++     @gluon.constexpr_function
++     def __init__(
++@@ -753,6 +763,7 @@
++         SMEM_MIX,
++         SMEM_RES,
++         RES_KS=32,
+++        FUSE_QUANT=False,
++     ):
++         self.C = gl.constexpr(C)
++         self.HC = gl.constexpr(HC)
++@@ -772,6 +783,7 @@
++         self.SMEM_MIX = gl.constexpr(SMEM_MIX)
++         self.SMEM_RES = gl.constexpr(SMEM_RES)
++         self.RES_KS = gl.constexpr(RES_KS)
+++        self.FUSE_QUANT = gl.constexpr(FUSE_QUANT)
++ 
++ 
++ @gluon.constexpr_function
++@@ -791,6 +803,8 @@
++     base_ptr,  # (N_OUT,) fp32
++     res_ptr,  # residual (M, HC, C) bf16, or shuffled [C/32][HC][M][32]
++     norm_w_ptr,  # (C,) bf16, read only with FUSE_RMSNORM
+++    quant_ptr,
+++    quant_scale_ptr,
++     M,
++     gemm_stride,
++     rms_eps,
++@@ -1020,6 +1034,31 @@
++                 ok = li_ok
++             out = li.to(dt).to(gl.float32) * w.to(gl.float32) * nrms3
++             gl.store(li_ptr + li_rows * C + cc + li_c, out.to(dt), mask=ok)
+++            if K.FUSE_QUANT:
+++                # Match HIP per-128 RoundUp scales after the BF16 rounding point.
+++                v = gl.reshape(
+++                    gl.where(ok, out.to(dt).to(gl.float32), 0.0),
+++                    [ROWS, CHUNK // 128, 128],
+++                )
+++                amax = gl.maximum(gl.max(gl.abs(v), 2), 1e-10)
+++                bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+++                exponent = gl.minimum(((bits & 0x7FFFFFFF) + 0x7FFFFF) >> 23, 254)
+++                scales, _ = gl.broadcast(exponent[:, :, None], v)
+++                scales = gl.max(gl.reshape(scales, [ROWS, CHUNK // 32, 32]), 2).to(gl.uint8)
+++                q = gl.amd.cdna5.scaled_downcast(
+++                    gl.reshape(v, [ROWS, CHUNK]), scales, "e4m3", axis=1
+++                )
+++                q = gl.convert_layout(gl.reshape(q, [ROWS, CHUNK // 32, 32]), LI_L)
+++                gl.store(quant_ptr + li_rows * C + cc + li_c, q, mask=ok)
+++                qr = row0 + gl.arange(0, ROWS, layout=gl.SliceLayout(1, exponent.type.layout))
+++                qg = cc // 128 + gl.arange(
+++                    0, CHUNK // 128, layout=gl.SliceLayout(0, exponent.type.layout)
+++                )
+++                gl.store(
+++                    quant_scale_ptr + qg[None, :] * M + qr[:, None],
+++                    exponent.to(gl.uint8),
+++                    (qr[:, None] < M) & (qg[None, :] < C // 128),
+++                )
++     else:
++         gl.amd.gfx1250.tdm.async_wait(0)
++         gl.barrier()
++@@ -1152,6 +1191,9 @@
++     SMEM_MIX: gl.constexpr,
++     SMEM_RES: gl.constexpr,
++     RES_KS: gl.constexpr = 32,
+++    quant_ptr=None,
+++    quant_scale_ptr=None,
+++    FUSE_QUANT: gl.constexpr = False,
++ ):
++     WS: gl.constexpr = FUSE_RMSNORM  # whole rows per CTA, one K-block
++     main_args = (
++@@ -1164,6 +1206,8 @@
++         base_ptr,
++         res_ptr,
++         norm_w_ptr,
+++        quant_ptr if FUSE_QUANT else li_ptr,
+++        quant_scale_ptr if FUSE_QUANT else li_ptr,
++         M,
++         gemm_stride,
++         rms_eps,
++@@ -1191,6 +1235,7 @@
++         SMEM_MIX,
++         SMEM_RES,
++         RES_KS,
+++        FUSE_QUANT,
++     )
++     if WS:
++         gl.warp_specialize(
++--- a/aiter/ops/triton/fusions/mhc.py
+++++ b/aiter/ops/triton/fusions/mhc.py
++@@ -198,19 +198,19 @@
++     )
++ 
++     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
++-    assert (
++-        total_phi_cols == N_total
++-    ), f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
++-
++-    assert (
++-        bias.shape[0] == N_total
++-    ), f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
+++    assert total_phi_cols == N_total, (
+++        f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
+++    )
+++
+++    assert bias.shape[0] == N_total, (
+++        f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
+++    )
++     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
++     assert sinkhorn_iters >= 0, f"sinkhorn_iters must be >= 0, got {sinkhorn_iters}"
++ 
++-    assert (
++-        x.device == phi.device == bias.device
++-    ), "All tensors must be on the same device"
+++    assert x.device == phi.device == bias.device, (
+++        "All tensors must be on the same device"
+++    )
++     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
++     if alphas is not None:
++         assert alphas.shape == (3,), f"alphas must have shape (3,), got {alphas.shape}"
++@@ -218,9 +218,9 @@
++         assert alphas.device == x.device, "alphas must be on the input device"
++     alpha_ptr = alphas if alphas is not None else bias
++     # Pre-stream programs assume one program owns all H^pre cols for its row block.
++-    assert (
++-        BLOCK_N >= n
++-    ), f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
+++    assert BLOCK_N >= n, (
+++        f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
+++    )
++     # In-kernel SK requires a single program to own the full (n, n) res tile and
++     # reshapes its res sub-tile to (BLOCK_M, n, n); both kernels need
++     # n_squared to be a power of 2 (i.e. N_POW2_RES == n_squared) for the reshape
++@@ -716,6 +716,8 @@
++     h_res: torch.Tensor | None = None,
++     layer_input_out: torch.Tensor | None = None,
++     residual_out: torch.Tensor | None = None,
+++    quant_out: torch.Tensor | None = None,
+++    quant_scale: torch.Tensor | None = None,
++ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++     """gfx1250 mhc_post_pre: Gluon split kernel + Gluon reduce/apply, the two
++     launches of the HIP ``mhc_fused_post_pre`` (``gemm_sqrsum`` +
++@@ -887,6 +889,9 @@
++         RES_SHUFFLED=res_shuffled,
++         RES_KS=KS,
++         FUSE_RMSNORM=fuse_norm,
+++        quant_ptr=quant_out,
+++        quant_scale_ptr=quant_scale,
+++        FUSE_QUANT=quant_out is not None,
++         APPLY=apply_l,
++         RED4=red4,
++         RED16=red16,
++@@ -1029,7 +1034,9 @@
++         M_res,
++         n_res,
++         C_res,
++-    ), f"shape mismatch: layer_input=({M},{C}), residual_in=({M_res},{n_res},{C_res}), n={n}"
+++    ), (
+++        f"shape mismatch: layer_input=({M},{C}), residual_in=({M_res},{n_res},{C_res}), n={n}"
+++    )
++ 
++     K_phi, N_phi = phi.shape
++     n_squared = n * n
++@@ -1049,9 +1056,9 @@
++         n,
++         n,
++     ), f"comb_mix shape mismatch: expected ({M}, {n}, {n}), got {tuple(comb_mix.shape)}"
++-    assert (
++-        bias.shape[0] == N_total
++-    ), f"bias shape mismatch: expected ({N_total},), got {tuple(bias.shape)}"
+++    assert bias.shape[0] == N_total, (
+++        f"bias shape mismatch: expected ({N_total},), got {tuple(bias.shape)}"
+++    )
++     assert (
++         layer_input.device
++         == residual_in.device
++@@ -1173,9 +1180,9 @@
++         NUM_C_BLOCKS,
++         N_TOTAL_POW2,
++     )
++-    assert alphas.shape == (
++-        3,
++-    ), f"alphas shape mismatch: expected (3,), got {tuple(alphas.shape)}"
+++    assert alphas.shape == (3,), (
+++        f"alphas shape mismatch: expected (3,), got {tuple(alphas.shape)}"
+++    )
++ 
++     if residual_out is None:
++         residual_out = torch.empty(M, n, C, dtype=dtype, device=device)
++@@ -1184,10 +1191,12 @@
++             M,
++             n,
++             C,
++-        ), f"residual_out shape mismatch: expected ({M}, {n}, {C}), got {tuple(residual_out.shape)}"
++-        assert (
++-            residual_out.dtype == dtype
++-        ), f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
+++        ), (
+++            f"residual_out shape mismatch: expected ({M}, {n}, {C}), got {tuple(residual_out.shape)}"
+++        )
+++        assert residual_out.dtype == dtype, (
+++            f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
+++        )
++ 
++     # Split-K reduce-apply scratch. Write-before-read within this call (the
++     # split kernel writes every entry the reduce kernel reads, masked the same
++@@ -1202,9 +1211,9 @@
++             f"acc_partial shape mismatch: expected ({NUM_KSPLIT}, {M}, {N_total}), "
++             f"got {tuple(acc_partial.shape)}"
++         )
++-        assert (
++-            acc_partial.dtype == torch.float32
++-        ), f"acc_partial dtype mismatch: expected float32, got {acc_partial.dtype}"
+++        assert acc_partial.dtype == torch.float32, (
+++            f"acc_partial dtype mismatch: expected float32, got {acc_partial.dtype}"
+++        )
++     if acc_sq_partial is None:
++         acc_sq_partial = torch.empty(
++             (NUM_KSPLIT, M), dtype=torch.float32, device=device
++@@ -1271,13 +1280,17 @@
++             assert h_post.shape == (
++                 M,
++                 n,
++-            ), f"h_post 2D shape mismatch: expected ({M}, {n}), got {tuple(h_post.shape)}"
+++            ), (
+++                f"h_post 2D shape mismatch: expected ({M}, {n}), got {tuple(h_post.shape)}"
+++            )
++         else:
++             assert h_post.shape == (
++                 M,
++                 n,
++                 1,
++-            ), f"h_post 3D shape mismatch: expected ({M}, {n}, 1), got {tuple(h_post.shape)}"
+++            ), (
+++                f"h_post 3D shape mismatch: expected ({M}, {n}, 1), got {tuple(h_post.shape)}"
+++            )
++     if h_res is None:
++         h_res = torch.empty(M, n, n, dtype=dtype, device=device)
++     else:
++@@ -1739,3 +1752,72 @@
++     ``[M,C]`` in ``residual.dtype``. Backward uses PyTorch recomputation.
++     """
++     return _MHCHeadDSV4.apply(residual, fn, scale, base, rms_eps, hc_pre_eps, config)
+++
+++
+++def mhc_post_pre_quant_gfx1250(
+++    layer_input,
+++    residual_in,
+++    post_mix,
+++    comb_mix,
+++    fn,
+++    alphas,
+++    bias,
+++    norm_weight,
+++    eps=1e-6,
+++    hc_pre_eps=1e-6,
+++    hc_post_mult_value=2.0,
+++    sinkhorn_iters=20,
+++    hc_sinkhorn_eps=1e-6,
+++    norm_eps=1e-6,
+++    res_preshuffle=True,
+++):
+++    """Run mHC post/pre and RMSNorm, and quantize its BF16 result for an FP8 GEMM.
+++
+++    Inputs follow mhc_post_pre, except fn uses the (24, 4*C) AITER layout.
+++    Return its four outputs plus FP8 data and per-128 E8M0 scales. The scale
+++    tensor has shape (M, C/128), with column-major bytes as in per_group_quant_hip.
+++    Requires gfx1250, four HC streams, a supported hidden size, and RMSNorm.
+++    """
+++    if get_arch() != "gfx1250" or norm_weight is None:
+++        raise ValueError("mHC quant requires gfx1250 and a norm weight")
+++    if not mhc_post_pre_gfx1250_supported(
+++        layer_input,
+++        residual_in,
+++        fn.T,
+++        alphas,
+++        bias,
+++        4,
+++        sinkhorn_iters,
+++        True,
+++        norm_weight,
+++        fn.dtype == torch.int32,
+++    ):
+++        raise ValueError("unsupported mHC quant inputs")
+++    m, c = layer_input.shape
+++    if not 0 < m <= 128 or c not in (4096, 7168):
+++        raise ValueError("mHC quant requires 1..128 rows and hidden size 4096 or 7168")
+++    q = torch.empty((m, c), device=layer_input.device, dtype=torch.float8_e4m3fn)
+++    scales = torch.empty(
+++        (m, c // 128), device=layer_input.device, dtype=torch.float8_e8m0fnu
+++    )
+++    result = _mhc_post_pre_gluon_gfx1250(
+++        layer_input,
+++        residual_in,
+++        post_mix,
+++        comb_mix,
+++        fn.T,
+++        alphas,
+++        bias,
+++        4,
+++        eps,
+++        hc_pre_eps,
+++        hc_post_mult_value,
+++        sinkhorn_iters,
+++        hc_sinkhorn_eps,
+++        norm_weight,
+++        norm_eps,
+++        res_preshuffle,
+++        quant_out=q,
+++        quant_scale=scales.view(torch.uint8),
+++    )
+++    return (*result, q, scales)
+diff --git a/scripts/serve_dsv4_mono_gfx1250.sh b/scripts/serve_dsv4_mono_gfx1250.sh
+new file mode 100755
+index 0000000..6ada711
+--- /dev/null
++++ b/scripts/serve_dsv4_mono_gfx1250.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# Regional gfx1250 hybrid; run from an environment with this ATOM checkout installed.
++set -euo pipefail
++# Prefer the checkout next to this script, or the isolated test installation
++# when this launcher has been copied into /app/scripts.
++source_root=${ATOM_SOURCE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
++if [[ -d "$source_root/atom/models/deepseek_v4_mono" ]]; then
++ export PYTHONPATH="$source_root${PYTHONPATH:+:$PYTHONPATH}"
++elif [[ -d /opt/atom-gfx1250-integration/atom/models/deepseek_v4_mono ]]; then
++ export PYTHONPATH="/opt/atom-gfx1250-integration${PYTHONPATH:+:$PYTHONPATH}"
++fi
++profile=${1:?usage: serve_dsv4_mono_gfx1250.sh flash|pro [server arguments]}
++shift
++case "$profile" in
++ flash) tp=1; model=${MODEL_PATH:-/data/DeepSeek-V4-Flash}; gpus=0; a4w4=0;;
++ pro) tp=4; model=${MODEL_PATH:-/data/DeepSeek-V4-Pro}; gpus=0,1,2,3; a4w4=1;;
++ *) echo "Unknown profile: $profile" >&2; exit 2;;
++esac
++export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-$gpus}
++export ATOM_MONO_ENABLE=${ATOM_MONO_ENABLE:-1} ATOM_DSV4_MONO=${ATOM_DSV4_MONO:-1}
++export ATOM_MONO_CHECK=${ATOM_MONO_CHECK:-0} AITER_LOG_LEVEL=${AITER_LOG_LEVEL:-WARNING}
++export ATOM_USE_TRITON_MOE=1 ATOM_USE_TRITON_MOE_DECODE=1
++export ATOM_USE_TRITON_MOE_A4W4=${ATOM_USE_TRITON_MOE_A4W4:-$a4w4}
++export ATOM_USE_UNIFIED_ATTN=1 ATOM_FORCE_ATTN_TRITON=1
++export ATOM_LOADER_USE_THREADPOOL=1 AITER_ROPE_TRITON_BACKEND=1
++export ATOM_USE_TRITON_GEMM=1 ENABLE_CK=0
++export AITER_USE_OPUS_MOE_SORTING=1 AITER_FORCE_A8W4=0 AITER_USE_GROUPED_GEMM=1
++export ATOM_USE_AITER_TRITON_ATTN=1 AITER_TRITON_USE_HERD=1
++export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1 ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1
++export ATOM_MOE_GU_ITLV=1 ATOM_DP_LM_HEAD_MODE=allgather
++export ATOM_ENABLE_DS_QKNORM_FUSION=0 ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION=0
++export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=0
++export AITER_CUSTOM_AR_MIN_SIZE=131072 AITER_CUSTOM_AR_MAX_SIZE=8388608
++export HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 AITER_DISABLE_KERNARG_PRELOAD=0
++ulimit -c 0
++exec python -m atom.entrypoints.openai_server -tp "$tp" --model "$model" \
++ --server-port "${PORT:-8000}" --kv_cache_dtype bf16 --index-cache-dtype fp8 \
++ --no-enable_prefix_caching --disable_uvicorn_access_log --max-num-seqs 128 \
++ --cudagraph-capture-sizes '[1,2,4,8,16,32,64,128]' "$@"
+diff --git a/tests/models/deepseek_v4_mono/test_dispatch.py b/tests/models/deepseek_v4_mono/test_dispatch.py
+new file mode 100644
+index 0000000..c3570d3
+--- /dev/null
++++ b/tests/models/deepseek_v4_mono/test_dispatch.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: MIT
++from types import SimpleNamespace as NS
++
++import pytest
++import torch
++
++from atom.models.deepseek_v4_mono import config, dispatch
++from atom.mono.runtime import deployment
++
++
++def cfg(profile=config.FLASH):
++    hf = NS(
++        hidden_size=profile.hidden,
++        num_attention_heads=profile.heads,
++        q_lora_rank=profile.q_rank,
++        n_routed_experts=profile.experts,
++        hc_mult=4,
++        head_dim=512,
++        index_n_heads=64,
++        index_head_dim=128,
++        num_experts_per_tok=6,
++        n_shared_experts=1,
++        hc_sinkhorn_iters=20,
++    )
++    return NS(
++        hf_config=hf,
++        tensor_parallel_size=profile.tp,
++        enable_expert_parallel=False,
++        enable_dp_attention=False,
++        parallel_config=NS(data_parallel_size=1),
++        pipeline_parallel_size=1,
++        decode_context_parallel_size=1,
++        prefill_context_parallel_size=1,
++        enable_tbo=False,
++        enable_tbo_decode=False,
++        compilation_config=NS(level=0, cudagraph_mode=None),
++        kv_cache_dtype="bf16",
++        index_cache_dtype="fp8",
++        speculative_config=None,
++    )
++
++
++@pytest.fixture(autouse=True)
++def native(monkeypatch):
++    monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
++    monkeypatch.setenv("ATOM_DSV4_MONO", "1")
++    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
++    monkeypatch.setattr(deployment, "is_vllm", lambda: False)
++    monkeypatch.setattr(deployment, "is_sglang", lambda: False)
++
++
++@pytest.mark.parametrize("profile", [config.FLASH, config.PRO])
++def test_measured_deployments(profile):
++    assert config.config_refusal(cfg(profile), arch="gfx1250:sramecc+") is None
++
++
++@pytest.mark.parametrize("profile", [config.FLASH, config.PRO])
++def test_rows_and_prefill_contract(profile):
++    assert config.step_supported(profile.max_rows, profile, prefill=False)
++    assert not config.step_supported(profile.max_rows + 1, profile, prefill=False)
++    assert not config.step_supported(0, profile, prefill=False)
++    assert not config.step_supported(1, profile, prefill=True)
++    assert not config.step_supported(1, profile, prefill=False, ubatches=True)
++
++
++@pytest.mark.parametrize(
++    "field,value,reason",
++    [
++        ("tensor_parallel_size", 2, "geometries"),
++        ("enable_expert_parallel", True, "expert parallel"),
++        ("enable_dp_attention", True, "DP attention"),
++        ("speculative_config", NS(method="eagle"), "speculative"),
++        ("kv_cache_dtype", "fp8", "KV cache"),
++        ("enable_tbo", True, "TBO"),
++    ],
++)
++def test_deployment_refusals(field, value, reason):
++    c = cfg()
++    setattr(c, field, value)
++    assert reason in config.config_refusal(c, arch="gfx1250")
++
++
++def test_wrong_arch_and_geometry():
++    assert config.config_refusal(cfg(), arch="gfx950") == "not gfx1250"
++    c = cfg()
++    c.hf_config.hc_mult = 8
++    assert "hc_mult" in config.config_refusal(c, arch="gfx1250")
++
++
++def test_piecewise_refused():
++    c = cfg()
++    c.compilation_config.cudagraph_mode = NS(
++        requires_piecewise_compilation=lambda: True
++    )
++    assert "piecewise" in config.config_refusal(c, arch="gfx1250")
++
++
++def test_disabled_installer_does_not_query_device(monkeypatch):
++    monkeypatch.setenv("ATOM_DSV4_MONO", "0")
++    model = torch.nn.Identity()
++    assert dispatch.install_mono_decode(model, None, None, None) is model
++
++
++def test_native_forward_and_logits_delegation(monkeypatch):
++    class Native(torch.nn.Module):
++        marker = "native"
++        model = NS(layers=[NS(attn=NS(unified_kv=None))])
++
++        def forward(self, ids, positions):
++            return ids + positions
++
++        def compute_logits(self, x):
++            return x * 2
++
++    wrapper = dispatch.MonoDecodeModel(Native(), config.FLASH)
++    monkeypatch.setattr(
++        dispatch, "get_forward_context", lambda: NS(context=NS(is_prefill=True))
++    )
++    # A prefill must not bind a runner at all.
++    wrapper._mono._create = lambda: pytest.fail("prefill created a runner")
++    ids = torch.tensor([1, 2])
++    positions = torch.tensor([3, 4])
++    assert torch.equal(wrapper(ids, positions), ids + positions)
++    assert torch.equal(wrapper.compute_logits(ids), ids * 2)
++    assert wrapper.marker == "native"
++
++
++def test_decode_routes_and_publishes_hash_ids(monkeypatch):
++    native = torch.nn.Identity()
++    native.model = NS(layers=[NS(attn=NS(unified_kv=torch.empty(0)))])
++    wrapper = dispatch.MonoDecodeModel(native, config.FLASH)
++    state = NS(is_prefill=False, input_ids=None)
++    monkeypatch.setattr(dispatch, "get_forward_context", lambda: NS(context=state))
++    ids = torch.tensor([4, 7])
++    expected = torch.zeros(2, 4, 4096)
++    wrapper._mono = NS(
++        ready=lambda rows: True, runner=NS(forward=lambda i, p: expected)
++    )
++    assert wrapper(ids, ids) is expected
++    assert torch.equal(state.input_ids, ids)
++
++
++def test_shipped_gemms_keep_unsplit_accumulation():
++    # A real C8 Pro input differed by one BF16 element under split-K.
++    # Keep the shipped profiles on the validated single-accumulator order.
++    import json
++    from pathlib import Path
++
++    root = Path(config.__file__).parent / "configs"
++    for name in ("flash_tp1", "pro_tp4"):
++        table = json.loads((root / f"{name}.json").read_text())
++        assert table
++        assert all(value["NUM_KSPLIT"] == 1 for value in table.values())
+diff --git a/tests/models/deepseek_v4_mono/test_linear.py b/tests/models/deepseek_v4_mono/test_linear.py
+new file mode 100644
+index 0000000..0666be9
+--- /dev/null
++++ b/tests/models/deepseek_v4_mono/test_linear.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: MIT
++
++import torch
++
++from atom.models.deepseek_v4_mono import linear, runner
++
++
++def test_weight_view_does_not_mutate_native_children():
++    original = torch.nn.Module()
++    original.child = torch.nn.Linear(4, 4)
++    view = runner.module_view(original)
++    assert view.child.weight.data_ptr() == original.child.weight.data_ptr()
++    view.child = torch.nn.Identity()
++    assert isinstance(original.child, torch.nn.Linear)
++
++
++def test_linear_preserves_padding_bias_and_tp_reduction(monkeypatch):
++    class Native(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.weight = torch.nn.Parameter(torch.ones(4, 4))
++            self.weight_scale = torch.ones(4, 1)
++            self.bias = torch.ones(4)
++            self.is_output_padded = True
++            self._output_size_before_padding = 3
++            self.tp_dim = 1
++            self.tp_size = 4
++            self.reduce_results = True
++
++    native = Native()
++    calls = []
++    monkeypatch.setattr(linear, "projection", lambda *args: torch.full((2, 4), 2.0))
++    from atom.model_ops import communication_op
++
++    monkeypatch.setattr(
++        communication_op,
++        "tensor_model_parallel_all_reduce",
++        lambda y: calls.append(y.clone()) or y * 4,
++    )
++    out = linear.HybridLinear(native, "pro_tp4", "wo_b")(
++        torch.ones(2, 4), x_scale=torch.ones(2, 1)
++    )
++    assert out.shape == (2, 3)
++    assert torch.equal(out, torch.full((2, 3), 12.0))
++    assert len(calls) == 1

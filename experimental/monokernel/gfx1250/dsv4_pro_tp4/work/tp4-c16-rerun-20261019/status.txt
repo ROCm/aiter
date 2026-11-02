@@ -1,0 +1,1 @@
+Both configurations completed; server stopped; report only client2

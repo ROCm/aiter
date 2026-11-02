@@ -1,0 +1,22 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "exact_text": true,
+    "same_token_count": true
+  },
+  {
+    "prompt": "Calculate 17 times 23.",
+    "exact_text": true,
+    "same_token_count": true
+  },
+  {
+    "prompt": "Write a Python function that adds two numbers.",
+    "exact_text": true,
+    "same_token_count": true
+  },
+  {
+    "prompt": "Explain why the sky appears blue in one sentence.",
+    "exact_text": true,
+    "same_token_count": true
+  }
+]

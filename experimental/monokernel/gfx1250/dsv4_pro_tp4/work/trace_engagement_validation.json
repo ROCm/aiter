@@ -1,0 +1,58 @@
+[
+  {
+    "concurrency": 16,
+    "rank": 0,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 16,
+    "rank": 1,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 16,
+    "rank": 2,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 16,
+    "rank": 3,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 64,
+    "rank": 0,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 64,
+    "rank": 1,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 64,
+    "rank": 2,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  },
+  {
+    "concurrency": 64,
+    "rank": 3,
+    "baseline": 12200,
+    "hybrid": 9200,
+    "quant_launches_removed_per_step": 60
+  }
+]

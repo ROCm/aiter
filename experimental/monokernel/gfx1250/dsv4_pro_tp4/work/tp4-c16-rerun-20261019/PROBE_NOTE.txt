@@ -1,0 +1,8 @@
+GPUs were idle before measurement. The kit scheduling probe is inconclusive
+on gfx1250: it reports the entire programmed1/2-second span as the maximum
+adjacent gap, identically for1,2,and4 processes. Explicit gfx1250 realtime
+counter reads gave the same degenerate result. The gfx950 s_memrealtime
+instruction is unsupported by gfx1250. Do not interpret these results as a
+valid host time-slicing measurement. Raw source, build diagnostics and outputs
+are preserved. This rerun uses back-to-back baseline/hybrid serving clients
+on otherwise idle devices; no scheduling-health claim is made from that probe.

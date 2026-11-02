@@ -1,0 +1,15 @@
+LATEST TP4 C16 RERUN COMPLETE — 2026-10-19
+Exactly one server launch per configuration, two full clients against each
+unchanged server, ONLY second full client reported. Pro TP4, C16,64requests,
+1024in/1024out,real routing,seed0,ignoreEOS,CUDA graphs,profiling/checks off.
+Same current ATOM53e4fb5+corrected unsplit integration for both variants.
+Baseline meanTPOT21.226944ms,TTFT475.767748ms,total1476.495503tokens/s.
+Hybrid meanTPOT16.006508ms,TTFT474.620049ms,total1944.518545tokens/s.
+Hybrid TPOT reduction24.593%;total throughput gain31.698%.
+PID/start ticks unchanged within each arm; baseline21/1185305,hybrid21/1240407.
+All client1/client2 JSON and logs,source fingerprints,controller and protocol:
+ /home/vigokhal/dsv4-monokernel/tp4-c16-rerun-20261019/
+Read REPORT.txt and RUN_PROTOCOL.txt there. Container stopped. No pending job.
+The older22.274755ms baseline belongs to the older checkout. This fresh result
+is4.7% lower; do not attribute the difference solely to client warmup.
+

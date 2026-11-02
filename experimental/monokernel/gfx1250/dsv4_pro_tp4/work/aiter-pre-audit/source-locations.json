@@ -1,0 +1,902 @@
+{
+  "model_layer_batch.py": [
+    {
+      "line": 17,
+      "text": "from masked_prefetch import masked_line_prefetch"
+    },
+    {
+      "line": 20,
+      "text": "def model_layer(A,F,MC,IC,MW,IW,MY,IY,Positions,CosTable,SinTable,"
+    },
+    {
+      "line": 29,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 34,
+      "text": "gl.amd.gfx1250.tdm.prefetch(pfd,[(p//16)*128,(p%16)*256+pf*128],pred=p<192,speculative=False)"
+    },
+    {
+      "line": 39,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 46,
+      "text": "i=gl.arange(0,8,layout=gl.BlockedLayout([1],[32],[4],[0]));pos=gl.load(Positions+p)"
+    },
+    {
+      "line": 47,
+      "text": "valid=gl.load(BatchIds+p)>=0 if BatchIds is not None else True"
+    },
+    {
+      "line": 53,
+      "text": "if p<N//16:sync(CompCounter,A[30],N//16,3)"
+    },
+    {
+      "line": 54,
+      "text": "else:sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 55,
+      "text": "if DBG is not None and p==0:gl.store(DBG,gl.load(A[30]))"
+    },
+    {
+      "line": 58,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 59,
+      "text": "if DBG is not None and p==0:gl.store(DBG+1,gl.load(A[30]))"
+    },
+    {
+      "line": 70,
+      "text": "valid=gl.load(BatchIds+row)>=0 if BatchIds is not None else True"
+    },
+    {
+      "line": 72,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 73,
+      "text": "if DBG is not None and p==0:gl.store(DBG+2,gl.load(A[30]))"
+    },
+    {
+      "line": 75,
+      "text": "i=gl.arange(0,32,layout=gl.BlockedLayout([1],[32],[4],[0]));pos=gl.load(Positions+p)"
+    },
+    {
+      "line": 76,
+      "text": "gl.store(A[21]+p*32+i,gl.load(CosTable+pos*32+i));gl.store(A[22]+p*32+i,gl.load(SinTable+pos*32+i))"
+    },
+    {
+      "line": 77,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 79,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 80,
+      "text": "if DBG is not None and p==0:gl.store(DBG+3,gl.load(A[30]))"
+    },
+    {
+      "line": 83,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 86,
+      "text": "sync(A[29],A[30],256,3)"
+    },
+    {
+      "line": 90,
+      "text": "sync(F[-2],F[-1],256,3)"
+    },
+    {
+      "line": 93,
+      "text": "sync(F[-2],F[-1],256,3)"
+    },
+    {
+      "line": 96,
+      "text": "sync(F[-2],F[-1],256,3)"
+    },
+    {
+      "line": 99,
+      "text": "i=gl.arange(0,512,layout=gl.BlockedLayout([1],[32],[4],[0]));dest=gl.load(Dest+p).to(gl.int64)"
+    },
+    {
+      "line": 100,
+      "text": "valid=gl.load(BatchIds+p)>=0 if BatchIds is not None else True"
+    },
+    {
+      "line": 101,
+      "text": "gl.store(RealCache+dest*512+i,gl.load(A[23]+p*512+i),(dest>=0)&(dest<CacheRows)&valid)"
+    }
+  ],
+  "mhc_pre_aiter.py": [
+    {
+      "line": 9,
+      "text": "def pre_project(R,W,G,SQ,M:gl.constexpr,L:gl.constexpr,FP32=None):"
+    },
+    {
+      "line": 19,
+      "text": "gl.amd.gfx1250.tdm.async_load(wd,[0,0,p*128],wb.index(0))"
+    },
+    {
+      "line": 20,
+      "text": "gl.amd.gfx1250.tdm.async_load(rd,[0,0,p*64],rb)"
+    },
+    {
+      "line": 24,
+      "text": "gl.amd.gfx1250.tdm.async_load(fd,[0,0,p*64],fb)"
+    },
+    {
+      "line": 47,
+      "text": "def pre(R,Mix,Y,S,B,NW,Args,H,M:gl.constexpr,L:gl.constexpr,V:gl.constexpr,FP32=None):"
+    },
+    {
+      "line": 52,
+      "text": "sync(CT,H,64,3)"
+    },
+    {
+      "line": 56,
+      "text": "comb=gl.load(CO+p*16+i-8,(i>=8)&(i<24),0.)"
+    },
+    {
+      "line": 57,
+      "text": "post=gl.load(PO+p*4+i-4,(i>=4)&(i<8),0.)"
+    }
+  ],
+  "mhc_batch.py": [
+    {
+      "line": 6,
+      "text": "def rcp(x):"
+    },
+    {
+      "line": 11,
+      "text": "def tail_fused(R,S,B,AN,M,Temp,Raw,X,rbuf,abuf,EARLY:gl.constexpr,MODE:gl.constexpr,FP32=None,ROLE=0):"
+    },
+    {
+      "line": 32,
+      "text": "gl.amd.gfx1250.tdm.async_load(fd,[0,0],fb);gl.amd.gfx1250.tdm.async_wait(0)"
+    },
+    {
+      "line": 97,
+      "text": "def mhc_project(R,W,Temp,M:gl.constexpr):"
+    },
+    {
+      "line": 107,
+      "text": "gl.amd.gfx1250.tdm.async_load(xd,[0,ks*128],xs,cache_modifier='.cg')"
+    },
+    {
+      "line": 108,
+      "text": "gl.amd.gfx1250.tdm.async_load(wd,[nt*16,ks*128],ws,cache_modifier='.cg')"
+    },
+    {
+      "line": 120,
+      "text": "def mhc_batch(R,W,S,B,AN,Mix,Temp,Raw,X,Counter,Health,M:gl.constexpr,FP32=None):"
+    },
+    {
+      "line": 129,
+      "text": "gl.amd.gfx1250.tdm.async_load(rd,[0,0],rb,cache_modifier='.cg')"
+    },
+    {
+      "line": 130,
+      "text": "gl.amd.gfx1250.tdm.async_load(ad,[0,0],ab,cache_modifier='.cg')"
+    },
+    {
+      "line": 132,
+      "text": "sync(Counter,Health,256,3)"
+    }
+  ],
+  "mhc_integrated.py": [
+    {
+      "line": 6,
+      "text": "def post_pre(X,R,Mix,NR,NewMix,Y,S,B,NW,Args,H,M:gl.constexpr,L:gl.constexpr,V:gl.constexpr):"
+    },
+    {
+      "line": 11,
+      "text": "if p<64:sync(CT,H,64,3)"
+    },
+    {
+      "line": 16,
+      "text": "v=gl.load(CO+p*16+i-8,(i>=8)&(i<24),0.)"
+    },
+    {
+      "line": 17,
+      "text": "post=gl.load(PO+p*4+i-4,(i>=4)&(i<8),0.)"
+    }
+  ],
+  "mhc_native_inline.py": [
+    {
+      "line": 53,
+      "text": "def create_layouts("
+    },
+    {
+      "line": 104,
+      "text": "def _fn_read_layout(HC, N_PAD, KS):"
+    },
+    {
+      "line": 113,
+      "text": "def _split_k_axis(ll):"
+    },
+    {
+      "line": 116,
+      "text": "def f(b):"
+    },
+    {
+      "line": 129,
+      "text": "def _load_fn_plane("
+    },
+    {
+      "line": 149,
+      "text": "def _res_offsets("
+    },
+    {
+      "line": 161,
+      "text": "def _issue_loads("
+    },
+    {
+      "line": 176,
+      "text": "gl.amd.gfx1250.tdm.async_load(x_desc, [row0, kb * KS], x_smem.index(slot))"
+    },
+    {
+      "line": 177,
+      "text": "gl.amd.gfx1250.tdm.async_load("
+    },
+    {
+      "line": 182,
+      "text": "gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * 2 * KS], fn_smem.index(slot))"
+    },
+    {
+      "line": 184,
+      "text": "gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * KS], fn_smem.index(slot))"
+    },
+    {
+      "line": 188,
+      "text": "def _wait_next_stage(i, NUM_STAGES: gl.constexpr, K_LOOP: gl.constexpr):"
+    },
+    {
+      "line": 201,
+      "text": "def _read_stage("
+    },
+    {
+      "line": 239,
+      "text": "def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel("
+    },
+    {
+      "line": 290,
+      "text": "post_c = gl.load(post_ptr + coef_off)"
+    },
+    {
+      "line": 292,
+      "text": "comb0_c = gl.load(comb_ptr + comb_off)"
+    },
+    {
+      "line": 293,
+      "text": "comb1_c = gl.load(comb_ptr + comb_off + HC)"
+    },
+    {
+      "line": 294,
+      "text": "comb2_c = gl.load(comb_ptr + comb_off + 2 * HC)"
+    },
+    {
+      "line": 295,
+      "text": "comb3_c = gl.load(comb_ptr + comb_off + 3 * HC)"
+    },
+    {
+      "line": 542,
+      "text": "def _split_spt(S, s_threads):"
+    },
+    {
+      "line": 551,
+      "text": "def create_reduce_apply_layouts(HC: int, ROWS: int, NUM_WARPS: int, S: int = 32):"
+    },
+    {
+      "line": 602,
+      "text": "def _rcp(x):"
+    },
+    {
+      "line": 610,
+      "text": "def _pin(x):"
+    },
+    {
+      "line": 619,
+      "text": "def _sigmoid(x):"
+    },
+    {
+      "line": 625,
+      "text": "def _res_ptrs("
+    },
+    {
+      "line": 643,
+      "text": "def _load_partials("
+    },
+    {
+      "line": 676,
+      "text": "acc = gl.load(gemm_ptr + (sc3 * M + r3) * gemm_stride + col0 + n3)"
+    },
+    {
+      "line": 679,
+      "text": "sqa = gl.load(sq_ptr + gl.minimum(s2, S - 1) * M + r2)"
+    },
+    {
+      "line": 684,
+      "text": "acc += gl.load("
+    },
+    {
+      "line": 690,
+      "text": "sqa += gl.load("
+    },
+    {
+      "line": 697,
+      "text": "def _fold_splits(acc, sqa, S: gl.constexpr, L: gl.constexpr):"
+    },
+    {
+      "line": 711,
+      "text": "def _load_norm_w("
+    },
+    {
+      "line": 716,
+      "text": "return gl.load("
+    },
+    {
+      "line": 720,
+      "text": "return gl.load(norm_w_ptr + cc + li_c)"
+    },
+    {
+      "line": 747,
+      "text": "def __init__("
+    },
+    {
+      "line": 791,
+      "text": "def _res5_layout():"
+    },
+    {
+      "line": 797,
+      "text": "def _reduce_apply_main("
+    },
+    {
+      "line": 870,
+      "text": "alpha0 = gl.load(scale_ptr)"
+    },
+    {
+      "line": 871,
+      "text": "alpha1 = gl.load(scale_ptr + 1)"
+    },
+    {
+      "line": 872,
+      "text": "alpha2 = gl.load(scale_ptr + 2)"
+    },
+    {
+      "line": 874,
+      "text": "bias_pre = gl.expand_dims(gl.load(base_ptr + ph), 0)"
+    },
+    {
+      "line": 879,
+      "text": "bias_post = gl.load(base_ptr + HC + p_h)"
+    },
+    {
+      "line": 883,
+      "text": "bias_comb = gl.expand_dims(gl.load(base_ptr + 2 * HC + ij), 0)"
+    },
+    {
+      "line": 928,
+      "text": "gl.amd.gfx1250.tdm.async_load("
+    },
+    {
+      "line": 947,
+      "text": "gl.amd.gfx1250.tdm.async_load("
+    },
+    {
+      "line": 1079,
+      "text": "def _post_sinkhorn_ws("
+    },
+    {
+      "line": 1122,
+      "text": "alpha1 = gl.load(scale_ptr + 1)"
+    },
+    {
+      "line": 1123,
+      "text": "alpha2 = gl.load(scale_ptr + 2)"
+    },
+    {
+      "line": 1128,
+      "text": "bias_post = gl.load(base_ptr + HC + p_h)"
+    },
+    {
+      "line": 1132,
+      "text": "bias_comb = gl.expand_dims(gl.load(base_ptr + 2 * HC + ij), 0)"
+    },
+    {
+      "line": 1162,
+      "text": "def _mhc_pre_reduce_apply_gfx1250_kernel("
+    }
+  ],
+  "qkv_candidate.py": [
+    {
+      "line": 12,
+      "text": "def qkv_batch(X,XQ,XS,W,WS,P,NW,Raw,QR,QS,Cos,Sin,KV,Counter,Health,"
+    },
+    {
+      "line": 19,
+      "text": "for j in gl.static_range(8):gl.amd.gfx1250.tdm.async_load(wd,[0,j*128],wb.index(j))"
+    },
+    {
+      "line": 30,
+      "text": "sync(Counter,Health,256,SYNC_STYLE)"
+    },
+    {
+      "line": 34,
+      "text": "for j in gl.static_range(8):gl.amd.gfx1250.tdm.async_load(ad,[0,j*128],ab.index(j))"
+    },
+    {
+      "line": 46,
+      "text": "for j in gl.static_range(8):gl.amd.gfx1250.tdm.async_load(hd,[0,j*128],wb.index(j))"
+    },
+    {
+      "line": 51,
+      "text": "asc=gl.load(QS+sr[:,None]*8+j+sk[None,:]*0,sr[:,None]<M,0)"
+    },
+    {
+      "line": 52,
+      "text": "bsc=gl.load(QBS+pid*8+j)+gl.full((64,4),0,gl.uint8,BSL)"
+    },
+    {
+      "line": 56,
+      "text": "sync(Counter,Health,256,SYNC_STYLE)"
+    },
+    {
+      "line": 61,
+      "text": "v=gl.load(QBRaw+row*32768+head*512+i).to(gl.float32)"
+    },
+    {
+      "line": 64,
+      "text": "cv=gl.load(Cos+row*32+(i-448)//2,i>=448,1.);sv=gl.load(Sin+row*32+(i-448)//2,i>=448,0.)"
+    },
+    {
+      "line": 68,
+      "text": "bid=gl.load(BatchId+pid)"
+    },
+    {
+      "line": 73,
+      "text": "gl.atomic_add(Audit+1,1,mask=(bid>=0)&(gl.load(Positions+pid)<0),sem='relaxed',scope='gpu')"
+    },
+    {
+      "line": 74,
+      "text": "raw_dest=gl.load(Dest+pid,bid>=0,-1)"
+    },
+    {
+      "line": 76,
+      "text": "if Positions is not None:bid=gl.where(gl.load(Positions+pid)>=0,bid,-1)"
+    },
+    {
+      "line": 77,
+      "text": "dest=gl.load(Dest+pid,bid>=0,-1).to(gl.int64)"
+    },
+    {
+      "line": 87,
+      "text": "gl.amd.gfx1250.tdm.async_load(kd,[0,0],kb);gl.amd.gfx1250.tdm.async_wait(0)"
+    }
+  ],
+  "qa_candidate.py": [
+    {
+      "line": 7,
+      "text": "from masked_prefetch import masked_line_prefetch"
+    },
+    {
+      "line": 10,
+      "text": "def finish(P,NW,Y,Q,S,Cos,Sin,KV,M:gl.constexpr,BASE:gl.constexpr,N:gl.constexpr,ROW,Cache=None,Dest=None,BatchId=None,CacheRows=0,Positions=None,SPLITS:gl.constexpr=16,ATOMIC:gl.constexpr=False):"
+    },
+    {
+      "line": 16,
+      "text": "else:v+=gl.load(P+k*M*1536+ROW*1536+BASE+i)"
+    },
+    {
+      "line": 29,
+      "text": "y=v*gl.rsqrt(total/N+1.e-6)*gl.load(NW+BASE+i)"
+    },
+    {
+      "line": 41,
+      "text": "c=gl.load(Cos+ROW*32+(i-448)//2,i>=448,1.)"
+    },
+    {
+      "line": 42,
+      "text": "sn=gl.load(Sin+ROW*32+(i-448)//2,i>=448,0.)"
+    },
+    {
+      "line": 46,
+      "text": "bid=gl.load(BatchId+ROW)"
+    },
+    {
+      "line": 47,
+      "text": "if Positions is not None:bid=gl.where(gl.load(Positions+ROW)>=0,bid,-1)"
+    },
+    {
+      "line": 48,
+      "text": "dest=gl.load(Dest+ROW,bid>=0,-1).to(gl.int64)"
+    },
+    {
+      "line": 52,
+      "text": "def prefetch_qb(QBW, pid):"
+    },
+    {
+      "line": 55,
+      "text": "for j in gl.static_range(8):gl.amd.gfx1250.tdm.prefetch(d,[pid*128,j*128],pred=pid<256,speculative=False)"
+    },
+    {
+      "line": 58,
+      "text": "def qa_candidate(X,XQ,XS,W,WS,P,NW,Y,Q,S,Cos,Sin,KV,Counter,Health,M:gl.constexpr,QBW=None,Cache=None,Dest=None,BatchId=None,CacheRows=0,Positions=None,SYNC_STYLE:gl.constexpr=3,PREFETCH_STYLE:gl.constexpr=1,QB_BYTES=33554432,SPLITS:gl.constexpr=16,BN:gl.constexpr=128,LOCAL:gl.constexpr=True,PRE:gl.constexpr=True,ATOMIC:gl.constexpr=False):"
+    },
+    {
+      "line": 65,
+      "text": "gl.amd.gfx1250.tdm.async_load(desc,[0,pid*128],sm);gl.amd.gfx1250.tdm.async_wait(0)"
+    },
+    {
+      "line": 78,
+      "text": "if not LOCAL or ATOMIC:sync(Counter,Health,256,SYNC_STYLE)"
+    },
+    {
+      "line": 85,
+      "text": "for j in gl.static_range(J):gl.amd.gfx1250.tdm.async_load(wd,[0,j*128],sw.index(j))"
+    },
+    {
+      "line": 94,
+      "text": "for j in gl.static_range(J):gl.amd.gfx1250.tdm.async_load(xd,[0,j*128],sx.index(j))"
+    },
+    {
+      "line": 115,
+      "text": "asc=gl.load(XS+sr[:,None]*32+split*J+j+sk[None,:]*0,sr[:,None]<M,0)"
+    },
+    {
+      "line": 117,
+      "text": "bsc=gl.load(WS+(tile*BN//128)*32+split*J+j)+gl.full((BN,4),0,gl.uint8,BSL)"
+    },
+    {
+      "line": 123,
+      "text": "if PRE and QBW is not None:prefetch_qb(QBW,pid)"
+    },
+    {
+      "line": 124,
+      "text": "sync(Counter,Health,256,SYNC_STYLE)"
+    },
+    {
+      "line": 125,
+      "text": "if not PRE and QBW is not None:prefetch_qb(QBW,pid)"
+    }
+  ],
+  "attention_paged.py": [
+    {
+      "line": 5,
+      "text": "from masked_prefetch import masked_line_prefetch"
+    },
+    {
+      "line": 7,
+      "text": "def compute_attention(Q,KV,Cache,Indices,Indptr,Sink,M,L,A,O,Counts,T:gl.constexpr,PAGES,SPLITS:gl.constexpr,BH:gl.constexpr=16,BK:gl.constexpr=32,WRITE_SLOT=0,DIRECT:gl.constexpr=False,PID=0):"
+    },
+    {
+      "line": 11,
+      "text": "n=gl.load(Indptr+1)-gl.load(Indptr)"
+    },
+    {
+      "line": 21,
+      "text": "def attention_paged(Q,KV,Cache,Indices,Indptr,Sink,Max,Sum,Acc,Out,Counts,Counter,Health,Dest,Pages,M:gl.constexpr,SPLITS:gl.constexpr=8):"
+    },
+    {
+      "line": 25,
+      "text": "beg=gl.load(Indptr+row);n=gl.load(Indptr+row+1)-beg"
+    },
+    {
+      "line": 28,
+      "text": "slot=gl.load(Indices+beg+first)"
+    },
+    {
+      "line": 31,
+      "text": "gl.amd.gfx1250.tdm.prefetch(pd,[0,0],pred=(slot>=0)&(slot<Pages),speculative=False)"
+    },
+    {
+      "line": 32,
+      "text": "dest=gl.load(Dest+row)"
+    },
+    {
+      "line": 36,
+      "text": "sync(Counter,Health,256,3)"
+    }
+  ],
+  "output_batch.py": [
+    {
+      "line": 7,
+      "text": "def split_project(X,XS,W,WS,P,N:gl.constexpr,K:gl.constexpr,SPLIT:gl.constexpr,GROUPED:gl.constexpr,M:gl.constexpr):"
+    },
+    {
+      "line": 27,
+      "text": "gl.amd.gfx1250.tdm.async_load(wd,[0,first*128],sh.index(0));gl.amd.gfx1250.tdm.async_load(xd,[0,first*128],xsh.index(0))"
+    },
+    {
+      "line": 28,
+      "text": "gl.amd.gfx1250.tdm.async_load(wd,[0,(first+1)*128],sh.index(1));gl.amd.gfx1250.tdm.async_load(xd,[0,(first+1)*128],xsh.index(1))"
+    },
+    {
+      "line": 37,
+      "text": "gl.amd.gfx1250.tdm.async_load(wd,[0,(first+b+2)*128],sh.index(b%2));gl.amd.gfx1250.tdm.async_load(xd,[0,(first+b+2)*128],xsh.index(b%2))"
+    },
+    {
+      "line": 40,
+      "text": "ax=gl.load(XS+sr[:,None]*(256 if GROUPED else K//128)+xb//128+first+b+sk[None,:]*0,sr[:,None]<M,0).to(gl.uint32)"
+    },
+    {
+      "line": 41,
+      "text": "bx=gl.load(WS+nt*(K//128)+first+b).to(gl.uint32)"
+    },
+    {
+      "line": 53,
+      "text": "def inverse_quant(O,Cos,Sin,Q,S,M:gl.constexpr):"
+    },
+    {
+      "line": 65,
+      "text": "def reduce_quant(P,Y,Q,S,N:gl.constexpr,SPLIT:gl.constexpr,QUANT:gl.constexpr,M:gl.constexpr):"
+    },
+    {
+      "line": 74,
+      "text": "def output_body(O,Cos,Sin,OA,OAS,OB,OBS,XQ,XS,AP,AY,AQ,AS,BP,Y,Counter,Health,M:gl.constexpr,SA:gl.constexpr=4,SB:gl.constexpr=8,STOP:gl.constexpr=0):"
+    },
+    {
+      "line": 76,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 79,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 82,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 85,
+      "text": "sync(Counter,Health,256,3)"
+    }
+  ],
+  "ffn_batch.py": [
+    {
+      "line": 12,
+      "text": "def quant_body(X,Q,S,N:gl.constexpr,GROUP:gl.constexpr,STRIDE:gl.constexpr=1,M:gl.constexpr=1):"
+    },
+    {
+      "line": 19,
+      "text": "gl.amd.gfx1250.tdm.async_load(desc,[0,pcol*GROUP],sm);gl.amd.gfx1250.tdm.async_wait(0)"
+    },
+    {
+      "line": 30,
+      "text": "def router_body(X,W,Y,M:gl.constexpr):"
+    },
+    {
+      "line": 40,
+      "text": "def shared_body(X,XS,W,WS,Y,K:gl.constexpr,BN:gl.constexpr,M:gl.constexpr):"
+    },
+    {
+      "line": 46,
+      "text": "def activation_quant(GU,A,AQ,AS,M:gl.constexpr):"
+    },
+    {
+      "line": 53,
+      "text": "gl.amd.gfx1250.tdm.async_load(d,[0,p*128],sm.index(0));gl.amd.gfx1250.tdm.async_load(d,[0,2048+p*128],sm.index(1));gl.amd.gfx1250.tdm.async_wait(0)"
+    },
+    {
+      "line": 63,
+      "text": "def ffn_body(R,Out,HFN,HFS,HFB,FN,Mix,Temp,Raw,X,XQ,XS,MX,MS,GU,ACT,AQ,AS,SO,Gate,Logits,"
+    },
+    {
+      "line": 68,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 72,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 75,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 77,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 80,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 83,
+      "text": "gl.store(Sum+i,(gl.load(SO+i).to(gl.float32)+gl.load(Z+i).to(gl.float32)).to(gl.bfloat16))"
+    },
+    {
+      "line": 84,
+      "text": "sync(Counter,Health,256,3)"
+    }
+  ],
+  "optimized_routing.py": [
+    {
+      "line": 5,
+      "text": "def add(a,b):return a+b"
+    },
+    {
+      "line": 7,
+      "text": "def route_body(Logits,Hist,Offs,Pad,Map,Gather,Scatter,Gamma,Bias,HAS_BIAS:gl.constexpr,Chosen,Weights,Counter,Health,M:gl.constexpr):"
+    },
+    {
+      "line": 10,
+      "text": "x=gl.load(Logits+p*256+i).to(gl.float32)"
+    },
+    {
+      "line": 13,
+      "text": "bias=gl.load(Bias+i);scores=(scores+bias.to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)"
+    },
+    {
+      "line": 21,
+      "text": "sync(Counter,Health,256,3)"
+    },
+    {
+      "line": 25,
+      "text": "allch=gl.load(Chosen+rr[:,None]*256+cc[None,:])"
+    },
+    {
+      "line": 32,
+      "text": "ch=gl.load(Chosen+p*256+i);j=gl.associative_scan(ch,0,add)-ch;dst=offs+used"
+    },
+    {
+      "line": 34,
+      "text": "gl.store(Gamma+dst,gl.load(Weights+p*256+i),ch!=0)"
+    }
+  ],
+  "optimized_moe.py": [
+    {
+      "line": 8,
+      "text": "def phase(Count,Health,GRID:gl.constexpr):"
+    },
+    {
+      "line": 10,
+      "text": "return sync(Count,Health,GRID,3)"
+    },
+    {
+      "line": 13,
+      "text": "def fused(X,XS,W1,S1,W2,S2,I,IS,Y,Gather,Hist,Offs,Pad,Map,Gamma,Count,Health,Z,Scatter,"
+    },
+    {
+      "line": 17,
+      "text": "for task in range(pid,gl.load(Pad)*16,GRID):"
+    },
+    {
+      "line": 26,
+      "text": "for task in range(pid,gl.load(Pad)*16,GRID):"
+    },
+    {
+      "line": 40,
+      "text": "row=gl.load(Scatter+token*6+j).to(gl.int32)"
+    }
+  ],
+  "optimized_compressor.py": [
+    {
+      "line": 6,
+      "text": "def row(P, N:gl.constexpr):"
+    },
+    {
+      "line": 10,
+      "text": "gl.amd.gfx1250.tdm.async_load(desc,[0,0],sm)"
+    },
+    {
+      "line": 16,
+      "text": "def compressor_body(KV,Score,APE,Norm,Cos,Sin,Plan,WritePlan,SlotIn,SlotOut,"
+    },
+    {
+      "line": 28,
+      "text": "pos=gl.load(Plan+2)"
+    },
+    {
+      "line": 31,
+      "text": "slot=gl.load(SlotIn).to(gl.int64)"
+    },
+    {
+      "line": 38,
+      "text": "pm=gl.load(Partial+rr[:,None]*3*D+dd[None,:]);pa=gl.load(Partial+rr[:,None]*3*D+D+dd[None,:]);pz=gl.load(Partial+rr[:,None]*3*D+2*D+dd[None,:])"
+    },
+    {
+      "line": 54,
+      "text": "gl.amd.gfx1250.tdm.async_load(kd,[0,0],sk)"
+    },
+    {
+      "line": 55,
+      "text": "gl.amd.gfx1250.tdm.async_load(sd,[0,0],sg)"
+    },
+    {
+      "line": 93,
+      "text": "c=gl.load(Cos+rp*32+pair,d>=D-64,1.).to(gl.float32)"
+    },
+    {
+      "line": 94,
+      "text": "s=gl.load(Sin+rp*32+pair,d>=D-64,0.).to(gl.float32)"
+    },
+    {
+      "line": 97,
+      "text": "block=gl.load(Blocks+ci//kb).to(gl.int64);token=ci%kb"
+    },
+    {
+      "line": 111,
+      "text": "wp=gl.load(WritePlan+2)"
+    },
+    {
+      "line": 113,
+      "text": "slot=gl.load(SlotOut).to(gl.int64)"
+    },
+    {
+      "line": 123,
+      "text": "def pool_partial(KS,SS,Plan,Slots,Work,KSS:gl.constexpr,KSP:gl.constexpr,SSS:gl.constexpr,SSP:gl.constexpr,M:gl.constexpr=8,PLAN_STRIDE:gl.constexpr=4):"
+    },
+    {
+      "line": 126,
+      "text": "pos=gl.load(Plan+row*PLAN_STRIDE+2)"
+    },
+    {
+      "line": 128,
+      "text": "slot=gl.load(Slots+row).to(gl.int64)"
+    },
+    {
+      "line": 133,
+      "text": "gl.amd.gfx1250.tdm.async_load(kd,[part*32,0],kb);gl.amd.gfx1250.tdm.async_load(sd,[part*32,0],sb);gl.amd.gfx1250.tdm.async_wait(0)"
+    }
+  ],
+  "post_batch.py": [
+    {
+      "line": 4,
+      "text": "def post_body(R,X,M,Out,B:gl.constexpr=128,SHUFFLED:gl.constexpr=False,FMA:gl.constexpr=2,FP32=None,PID=0):"
+    },
+    {
+      "line": 12,
+      "text": "gl.amd.gfx1250.tdm.async_load(rd,[0,pid*B],rb,cache_modifier='.cg')"
+    },
+    {
+      "line": 13,
+      "text": "gl.amd.gfx1250.tdm.async_load(xd,[0,pid*B],xb,cache_modifier='.cg')"
+    },
+    {
+      "line": 19,
+      "text": "y=x*gl.load(M+4+j)"
+    },
+    {
+      "line": 21,
+      "text": "ri=gl.sum(gl.where(h[:,None]==i,r,0),0);c=gl.load(M+8+i*4+j)"
+    },
+    {
+      "line": 22,
+      "text": "if FMA==2 and i==0:y=gl.fma(x,gl.load(M+4+j),ri*c)"
+    },
+    {
+      "line": 32,
+      "text": "def post_batch(R,X,Mix,Out,M:gl.constexpr,SHUFFLED:gl.constexpr=False,FP32=None):"
+    }
+  ],
+  "project_batch.py": [
+    {
+      "line": 8,
+      "text": "def project_body(X,W,Y,N:gl.constexpr,ROWS:gl.constexpr):"
+    }
+  ],
+  "layout_batch.py": [
+    {
+      "line": 4,
+      "text": "def unshuffle(X,Y,M:gl.constexpr):"
+    },
+    {
+      "line": 12,
+      "text": "gl.amd.gfx1250.tdm.async_load(desc,[0,0],sm);gl.amd.gfx1250.tdm.async_wait(0)"
+    },
+    {
+      "line": 16,
+      "text": "def shuffle(X,Y,M:gl.constexpr):"
+    },
+    {
+      "line": 24,
+      "text": "gl.amd.gfx1250.tdm.async_load(desc,[0,tile*64],sm);gl.amd.gfx1250.tdm.async_wait(0)"
+    }
+  ]
+}

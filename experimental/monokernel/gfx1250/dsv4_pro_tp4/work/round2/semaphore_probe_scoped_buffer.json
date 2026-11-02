@@ -1,0 +1,107 @@
+[
+  {
+    "splits": 2,
+    "tiles": 32,
+    "elements_per_tile": 1024,
+    "two_launch_us": 2.5729520067515352,
+    "semaphore_us": 2.4483217210410215
+  },
+  {
+    "splits": 2,
+    "tiles": 128,
+    "elements_per_tile": 1024,
+    "two_launch_us": 2.7297443079661177,
+    "semaphore_us": 2.7120943662999557
+  },
+  {
+    "splits": 2,
+    "tiles": 512,
+    "elements_per_tile": 1024,
+    "two_launch_us": 3.3533281044579017,
+    "semaphore_us": 3.528509225079751
+  },
+  {
+    "splits": 2,
+    "tiles": 32,
+    "elements_per_tile": 8192,
+    "two_launch_us": 3.238778574130895,
+    "semaphore_us": 3.2538920980273014
+  },
+  {
+    "splits": 2,
+    "tiles": 128,
+    "elements_per_tile": 8192,
+    "two_launch_us": 4.897166678662839,
+    "semaphore_us": 5.010332642424456
+  },
+  {
+    "splits": 4,
+    "tiles": 32,
+    "elements_per_tile": 1024,
+    "two_launch_us": 2.604116806794133,
+    "semaphore_us": 2.5567616523992114
+  },
+  {
+    "splits": 4,
+    "tiles": 128,
+    "elements_per_tile": 1024,
+    "two_launch_us": 2.9223377662313688,
+    "semaphore_us": 2.9552119928703013
+  },
+  {
+    "splits": 4,
+    "tiles": 512,
+    "elements_per_tile": 1024,
+    "two_launch_us": 4.321090954881602,
+    "semaphore_us": 4.724191621546761
+  },
+  {
+    "splits": 4,
+    "tiles": 32,
+    "elements_per_tile": 8192,
+    "two_launch_us": 4.4129644160648045,
+    "semaphore_us": 4.421788861628158
+  },
+  {
+    "splits": 4,
+    "tiles": 128,
+    "elements_per_tile": 8192,
+    "two_launch_us": 7.652726464155244,
+    "semaphore_us": 8.362630616908538
+  },
+  {
+    "splits": 8,
+    "tiles": 32,
+    "elements_per_tile": 1024,
+    "two_launch_us": 2.8288913940411793,
+    "semaphore_us": 2.8345061213636855
+  },
+  {
+    "splits": 8,
+    "tiles": 128,
+    "elements_per_tile": 1024,
+    "two_launch_us": 3.3695822856465325,
+    "semaphore_us": 3.764441027780487
+  },
+  {
+    "splits": 8,
+    "tiles": 512,
+    "elements_per_tile": 1024,
+    "two_launch_us": 6.509499588100088,
+    "semaphore_us": 7.871657595870815
+  },
+  {
+    "splits": 8,
+    "tiles": 32,
+    "elements_per_tile": 8192,
+    "two_launch_us": 6.757983878354607,
+    "semaphore_us": 6.5774974920330145
+  },
+  {
+    "splits": 8,
+    "tiles": 128,
+    "elements_per_tile": 8192,
+    "two_launch_us": 13.075732717461804,
+    "semaphore_us": 14.503619115854113
+  }
+]

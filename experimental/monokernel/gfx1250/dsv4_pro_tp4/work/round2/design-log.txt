@@ -1,0 +1,80 @@
+Round2: higher-concurrency gfx1250 opportunities
+Keep round1 hybrid as reference; MoE remains unchanged.
+Profile128 directly, then isolate attention projection tuning on idle GPUs.
+Candidate knobs: existing CTA cluster multicast; existing NUM_BUFFERS LDS depth;
+new optional TDM weight-tile L2 prefetch ahead of the operand pipeline.
+Stages/ownership: each GEMM CTA (or cluster-sharded CTA) owns its output tile and
+K partition. TDM fills private LDS operand slots; async_wait retires fills before
+WMMA reads them. Cluster arrive/wait preserves aligned multicast fetch issue.
+L2 prefetch reads weights only, introduces no payload writes or consumer changes.
+Scale slabs already preload whole per-split ranges into LDS; retain that path.
+LDS cap320KiB; inspect emitted resources/spills and reject excessive occupancy loss.
+Correctness: compare BF16 outputs vs current GEMM, repeated calls and graph replay.
+Measure M64/128, N/K from actual trace; first compare candidates individually,
+then alternate finalists vs reference with multiple samples. Integrate only wins.
+
+Synchronization investigation:
+Round1 uses kernel boundaries, no mailbox. A new last-producer split-K semaphore
+could replace the reduction launch. Payload is still FP32 split partials; coherent
+L2 alone does not make memory ordering correct or eliminate those writes.
+Need release publication, acquiring last producer, deterministic reduction order,
+and safe graph reuse without initializing counters on every launch. Do not spin
+on an oversubscribed producer grid. Validate the protocol separately before any
+fusion, and retain two-launch path unless the total boundary cost improves.
+
+Collective opportunity and rejected existing alternative:
+128 trace: ar_ll_gfx1250 accounts for2474.5us summed duration per decode step.
+LL sends8B payload+8B epoch flags; actual threshold4MiB (stale source comment128KiB).
+Existing native pull AR uses separate start/end signals and untagged peer reads.
+TP4 captured32 collectives/graph,200 replays/sample,7 samples, exact rotational
+FP32 sum then BF16 conversion, changed payload and100 repeated graph replays:
+M1/8/16/32/64/128 LL us8.18/8.74/9.18/10.17/12.30/18.41.
+Pull us31.71/38.08/39.16/42.06/43.99/46.49. Keep LL; native signal barriers and
+peer reads outweigh saved tag traffic. This does not prove every custom push
+semaphore design loses; it rejects this existing implementation on this stack.
+Intra-GPU last-producer probe remains independent. Never replace cross-device
+visibility with device scope based only on within-device L2 coherence.
+
+Scoped semaphore probes (not integrated):
+acq_rel GPU atomic emits global_wb/global_inv and is slower than two launches.
+A relaxed atomic plus .cg payload accesses passed graph replay stress, but the
+installed compiler emits no SCOPE_DEV on those payload loads/stores despite .cg
+being present in TTGIR. Therefore this version is NOT accepted as a correct
+publication protocol; its timings are diagnostic only. Explicit ISA variant
+will require device-scoped payload stores, wait_storecnt+CTA barrier before
+counter increment, and device-scoped partial loads after the winning ticket.
+No spin-wait, split counts power-of-two, monotonically incrementing uint32
+counters, serialized stream workspace reuse; graph stress includes wraparound.
+
+Final production selection:
+Four FP8 attention shapes only: main/indexer Q at M64 and M128. Native wo_b kept.
+M64 uses1x2 and2x2 CTA clusters, five LDS operand buffers, existing scale slabs.
+M128 uses1x1 CTA, four LDS buffers, single-pass K (no split-K reduction boundary).
+Rejected prefetch patch retained for reproducibility but restored out of AITER
+before serving. Original round1 AITER mHC fusion remains installed.
+Final dispatcher is inside Linear's opaque custom op; prefix, dtype, scale layout,
+GPU, and concrete shape guarded. Quantization/bias/TP all-reduce remain in Linear.
+No modified MoE path, no new counter/workspace allocation in serving.
+
+Ordered explicit-ISA semaphore probe:
+Initial explicit scoped stores exposed stale values when compiler did not know
+the asm had outstanding stores. Corrected probe puts wait_storecnt in the asm,
+uses a compiler memory clobber, CTA barrier, relaxed GPU atomic, and device-scoped
+loads with wait_loadcnt. All15 cases passed eager equality,1000 changing-payload
+graph replays, and uint32 counter wraparound. Conservative scalar inline asm is
+slower than the two-launch baseline; not integrated. This is NOT a claim that a
+vectorized semaphore GEMM or a tuned peer-push protocol cannot improve later.
+
+Interpretation limits:
+Device-scope global_wb/global_inv operate on lower-scope caches; they do not by
+themselves establish that allL2data was written toHBM. No hardware write-traffic
+counter comparison was collected. Within-GPU coherence does not substitute for
+system-scope visibility in peer-GPU collectives. The accepted serving kernels
+use the existing TDM completion and cluster barriers, with no new mailbox.
+
+Final validation: all four attention shape specializations exact on actual eager
+decode inputs on all4ranks at64/128. Full completion text equality not established.
+Vectorized buffer-scoped semaphore passed15cases, emitted SCOPE_DEV accesses,
+mostly flat/slower. Batched scalar ASM variant failed. No semaphore integrated.
+Second-run metric policy applied. At64:9.22%TPOT gain. At128: primary18.163ms,
+confirmatory16.912ms, control17.226ms: no reliable serving gain claimed.

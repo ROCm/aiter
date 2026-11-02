@@ -1,0 +1,16 @@
+[
+  {
+    "mean_tpot_ms": 16.274159936133056,
+    "median_tpot_ms": 16.28370397360634,
+    "mean_ttft_ms": 2303.858017261689,
+    "total_token_throughput": 6914.058204519451,
+    "concurrency": 64
+  },
+  {
+    "mean_tpot_ms": 17.273169564035058,
+    "median_tpot_ms": 17.235981651026076,
+    "mean_ttft_ms": 1562.191712714764,
+    "total_token_throughput": 13623.584013872918,
+    "concurrency": 128
+  }
+]

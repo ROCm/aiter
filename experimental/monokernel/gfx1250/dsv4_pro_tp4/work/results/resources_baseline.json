@@ -1,0 +1,50 @@
+[
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_2_CHUNK_2048_N_CHUNKS_4_S_16_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 131268,
+    "vgpr": 196,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/ODRQQ3MSVOXZ22G5F6IXCUS27IZUQMSKYWDEKY3PVX27XVV4CI7A/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/GQPBGI3BV6TRXB5EXM6POXQOLVTPEZL6VAUIEELHY2MCNOVHN7BA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/WCHVVU3A4LJXMVPGZHQKPDXWKKH3MN2JTI37MJ77INLPGPHBKZQQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/JFT3FT6ORA4X2XAI4UQVEAEFFAFLEF4MPVXBGE2QPAYMK3UBGVGA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 86,
+    "sgpr": 54,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/RXMINAXC2KF3P2G2FDMNCDOURBR4OUCZBZEMQAZWMNGXYOKPQUEA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_16_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/H3DYNYICOWM2GO7JJMPSMVWC3SJE2NIHG2D3NPFKFIAHB4R4E3PQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  }
+]

@@ -1,0 +1,124 @@
+DSV4 TP4: second-round hybrid optimization on gfx1250
+
+Scope
+The first-round hybrid was tested at concurrency128 and was essentially flat
+there (17.237 to17.162ms meanTPOT in the prior matched run). This round explicitly
+profiles128 and experiments with CTA multicast, larger LDS pipelines, descriptor
+L2 prefetch, and semaphore synchronization. MoE remains unchanged.
+
+Serving metrics
+Only the second full client run is reported; the first is discarded as warmup.
+Control = first-round hybrid; candidate adds the attention projection dispatch.
+Means in ms; total tok/s includes input plus output.
+
+Concurrency  Arm        TPOT       TTFT        Total tok/s
+64           Control    16.315     1036.551     7391.880
+64           Candidate  14.811     1043.136     8091.200
+128          Control    17.226     1611.159    13622.945
+128          Candidate  18.163     1565.628    13005.885
+
+At64, TPOT improved9.22% and throughput9.46%. TTFT was essentially unchanged.
+At128, this primary pair regressed5.44% TPOT. A separate candidate restart,
+full-client warmup, then second full client measured16.912ms TPOT,
+1588.343ms TTFT and13871.107total tok/s. Both second-run results are retained;
+the repeat does not replace the primary result. Diagnostic third/fourth clients
+are in c128_all_repeats.json. No dependable end-to-end128win is established.
+
+All-rank decode trace means: at64, main Q22.183->4.736us and indexer Q
+19.845->4.288us per call, about1.53ms less kernel time over61+30calls/step.
+At128 the corresponding6.254->5.626us and5.013->4.120us changes save only
+about65us of summed kernel time/step; MoE and communication dominate.
+Summed kernel durations do not equal wall time when streams overlap.
+
+Implemented
+The existing fused mHC+quantization stays enabled. An opt-in attention-only
+Linear dispatch selects measured gfx1250 Gluon configurations for main Q and
+indexer Q at64/128rows. All other shapes use the existing implementation.
+Activation quantization, scale layout, bias, TP all-reduce, and MoE are unchanged.
+Set ATOM_DSV4_HYBRID_ATTN=1 in addition to the first-round flags to enable it.
+The concrete shape check is inside the opaque operation, preventing Dynamo's
+large warmup shape from specializing away the decode path.
+
+Hardware experiments
+At64rows: main Q uses1x2CTA multicast and indexer Q uses2x2CTA multicast; both use
+five LDS operand buffers and existing preloaded scale slabs. At128rows: selected
+single-CTA configurations use four LDS buffers and no split-K reduction.
+The selected compiled resource records are in selected_resources.json and isa/.
+
+L2 prefetch: added optional descriptor-tile prefetch ahead of LDS loads, tested
+lookahead1/2/4 and pipeline depths2..6. Confirmed global_prefetch_b8 emission;
+Triton's gfx1250 TDMUtility.cpp describes256-byte chunks prefetched intoL2.
+Every successful numerical comparison was exact. Extra prefetch did not win the
+final selection. Its patch is retained separately and is NOT installed for
+serving. Configurations exceeding327680bytes LDS were rejected by the compiler.
+
+Synchronization: the existing TP4 peer-pull semaphore all-reduce was much slower
+than the default LL protocol: at128,46.49us versus18.41us in the isolated captured
+collective test. The default remains installed. This rejects that implementation,
+not every possible peer-push semaphore design.
+A last-producer intra-GPU semaphore prototype was tested separately. acq_rel GPU
+atomics emitted broad global_wb/global_inv operations and were slower. Replacing
+these with .cg accesses was not accepted: the emitted payload ISA omitted device
+scope despite .cg in IR. Explicit scoped asm then exposed the need for an explicit
+store drain before publication. The corrected conservative scalar-asm version
+passed all15 eager/replay/wraparound cases but was slower than two launches.
+A later batched explicit-asm drain variant failed correctness (5% mismatches
+in one case). It is rejected, and its log is preserved. The vectorized buffer instruction variant passed all15cases, including1000
+changing-payload graph replays and uint32 wraparound. ISA contains device-scoped
+buffer_load/store_b128, s_wait_storecnt before publication, and device-scoped
+atomic. This avoids broad WB/INV but did not give a useful speedup: about2.45vs
+2.57us in the smallest case,14.50vs13.08us at8splits/128tiles/8192elements, and
+7.87vs6.51us at8splits/512tiles/1024elements. This is an intra-device partial
+reduction microbenchmark, not proof of an end-to-end or inter-GPU benefit.
+No semaphore prototype is integrated. Payload partials are still necessary;
+coherentL2 alone does not eliminate their writes or establish publication ordering.
+
+Other opportunity
+BF16 compressor projections were tested with rotated weights and LDS-depth
+changes. Most were flat/slower; the M128,N512,K7168 case improved about0.53us,
+roughly16us across30calls/step. No compressor override was integrated.
+
+Method
+Image rocm/fw-bringup-mlperf:gfx1250-atom-20261015; /data/DeepSeek-V4-Pro;
+TP4, actual expert routing, noEP/speculation/prefix cache, BF16KV, FP4indexcache.
+Same /work/serve.sh and run_bench.sh setup as round1. Each reported serving run:
+ISL1024, OSL1024,4*C requests, fixed seed0, ignoreEOS, saturated concurrency.
+Profile warmups at64and128 followed by a full workload warmup for each shape
+before its reported repetition. Profiler is not active during metric runs.
+Total tok/s counts input plus output tokens. TTFT/TPOT are means in milliseconds.
+Decode analysis walks backward from trace end to the last prefill annotation,
+then averages every kernel across the50decode steps on each rank.
+Projection finalists use32rotating weight allocations and five alternating
+reference/candidate graph timing samples, avoiding a single-hot-weight comparison.
+
+Validation
+Synthetic attention comparisons and initial live startup checks were exact
+on all four ranks. Stronger eager real-decode checks passed at both64and128requests. On EACH
+of four ranks, logged lower bounds are384exact main-Q and128exact indexer-Q
+comparisons at EACH size. All192requests completed without assertion errors.
+The checking hook ran on every selected uncaptured operation, and logged each
+128th success. See real_validation_summary.json and validation-launch.log.
+Concurrent completion text equality is NOT an established correctness result:
+only12/64 and31/128 texts matched across arms. The control itself produced
+multiple different outputs for repeated identical prompts in each batch;
+therefore text equality was not a usable deterministic oracle in this setup.
+This does not establish the cause of variation or prove full-model equivalence.
+The eager validation compares the changed operations directly on real inputs.
+Microbenchmarks compare BF16 outputs against the existing operation; accepted
+attention configurations were bitwise exact for the synthetic inputs tested.
+The semaphore stress changes payload every replay, executes1000replays, and
+crosses uint32 counter wrap with power-of-two splits; it is not a validation of
+arbitrary overlapping streams, non-power-of-two mHC splits, or peer-GPU memory.
+
+Artifacts
+atom-round2.patch applies on top of the round1 ATOM patch.
+candidate/ contains the installed ATOM additions plus the separate prefetch trial.
+aiter-prefetch-experiment.patch is optional experimental code, NOT a serving win.
+attention_*.json, compressor.json, collective_*rank*.json, semaphore_probe*.json
+and logs preserve measurements and failures. isa/ preserves compact compiler
+output. Raw traces remain in ../traces/; per-kernel CSVs are in ../analysis/.
+
+References
+https://github.com/ROCm/aiter/tree/main/aiter/ops/triton/_gluon_kernels/gfx1250
+https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html
+https://llvm.org/docs/AMDGPUMemoryModel.html

@@ -1,0 +1,336 @@
+--- a/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx1250/fusions/mhc.py
+@@ -524,7 +524,16 @@
+ 
+ _mhc_pre_reduce_apply_repr = make_kernel_repr(
+     "_mhc_pre_reduce_apply_gfx1250_kernel",
+-    ["C", "ROWS", "CHUNK", "N_CHUNKS", "S", "FUSE_RMSNORM", "RES_SHUFFLED"],
++    [
++        "C",
++        "ROWS",
++        "CHUNK",
++        "N_CHUNKS",
++        "S",
++        "FUSE_RMSNORM",
++        "RES_SHUFFLED",
++        "FUSE_QUANT",
++    ],
+ )
+ 
+ 
+@@ -731,6 +740,7 @@
+     SMEM_MIX: gl.constexpr
+     SMEM_RES: gl.constexpr
+     RES_KS: gl.constexpr
++    FUSE_QUANT: gl.constexpr
+ 
+     @gluon.constexpr_function
+     def __init__(
+@@ -753,6 +763,7 @@
+         SMEM_MIX,
+         SMEM_RES,
+         RES_KS=32,
++        FUSE_QUANT=False,
+     ):
+         self.C = gl.constexpr(C)
+         self.HC = gl.constexpr(HC)
+@@ -772,6 +783,7 @@
+         self.SMEM_MIX = gl.constexpr(SMEM_MIX)
+         self.SMEM_RES = gl.constexpr(SMEM_RES)
+         self.RES_KS = gl.constexpr(RES_KS)
++        self.FUSE_QUANT = gl.constexpr(FUSE_QUANT)
+ 
+ 
+ @gluon.constexpr_function
+@@ -791,6 +803,8 @@
+     base_ptr,  # (N_OUT,) fp32
+     res_ptr,  # residual (M, HC, C) bf16, or shuffled [C/32][HC][M][32]
+     norm_w_ptr,  # (C,) bf16, read only with FUSE_RMSNORM
++    quant_ptr,
++    quant_scale_ptr,
+     M,
+     gemm_stride,
+     rms_eps,
+@@ -1020,6 +1034,31 @@
+                 ok = li_ok
+             out = li.to(dt).to(gl.float32) * w.to(gl.float32) * nrms3
+             gl.store(li_ptr + li_rows * C + cc + li_c, out.to(dt), mask=ok)
++            if K.FUSE_QUANT:
++                # Match HIP per-128 RoundUp scales after the BF16 rounding point.
++                v = gl.reshape(
++                    gl.where(ok, out.to(dt).to(gl.float32), 0.0),
++                    [ROWS, CHUNK // 128, 128],
++                )
++                amax = gl.maximum(gl.max(gl.abs(v), 2), 1e-10)
++                bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
++                exponent = gl.minimum(((bits & 0x7FFFFFFF) + 0x7FFFFF) >> 23, 254)
++                scales, _ = gl.broadcast(exponent[:, :, None], v)
++                scales = gl.max(gl.reshape(scales, [ROWS, CHUNK // 32, 32]), 2).to(gl.uint8)
++                q = gl.amd.cdna5.scaled_downcast(
++                    gl.reshape(v, [ROWS, CHUNK]), scales, "e4m3", axis=1
++                )
++                q = gl.convert_layout(gl.reshape(q, [ROWS, CHUNK // 32, 32]), LI_L)
++                gl.store(quant_ptr + li_rows * C + cc + li_c, q, mask=ok)
++                qr = row0 + gl.arange(0, ROWS, layout=gl.SliceLayout(1, exponent.type.layout))
++                qg = cc // 128 + gl.arange(
++                    0, CHUNK // 128, layout=gl.SliceLayout(0, exponent.type.layout)
++                )
++                gl.store(
++                    quant_scale_ptr + qg[None, :] * M + qr[:, None],
++                    exponent.to(gl.uint8),
++                    (qr[:, None] < M) & (qg[None, :] < C // 128),
++                )
+     else:
+         gl.amd.gfx1250.tdm.async_wait(0)
+         gl.barrier()
+@@ -1152,6 +1191,9 @@
+     SMEM_MIX: gl.constexpr,
+     SMEM_RES: gl.constexpr,
+     RES_KS: gl.constexpr = 32,
++    quant_ptr=None,
++    quant_scale_ptr=None,
++    FUSE_QUANT: gl.constexpr = False,
+ ):
+     WS: gl.constexpr = FUSE_RMSNORM  # whole rows per CTA, one K-block
+     main_args = (
+@@ -1164,6 +1206,8 @@
+         base_ptr,
+         res_ptr,
+         norm_w_ptr,
++        quant_ptr if FUSE_QUANT else li_ptr,
++        quant_scale_ptr if FUSE_QUANT else li_ptr,
+         M,
+         gemm_stride,
+         rms_eps,
+@@ -1191,6 +1235,7 @@
+         SMEM_MIX,
+         SMEM_RES,
+         RES_KS,
++        FUSE_QUANT,
+     )
+     if WS:
+         gl.warp_specialize(
+--- a/aiter/ops/triton/fusions/mhc.py
++++ b/aiter/ops/triton/fusions/mhc.py
+@@ -198,19 +198,19 @@
+     )
+ 
+     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
+-    assert (
+-        total_phi_cols == N_total
+-    ), f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
+-
+-    assert (
+-        bias.shape[0] == N_total
+-    ), f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
++    assert total_phi_cols == N_total, (
++        f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
++    )
++
++    assert bias.shape[0] == N_total, (
++        f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
++    )
+     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
+     assert sinkhorn_iters >= 0, f"sinkhorn_iters must be >= 0, got {sinkhorn_iters}"
+ 
+-    assert (
+-        x.device == phi.device == bias.device
+-    ), "All tensors must be on the same device"
++    assert x.device == phi.device == bias.device, (
++        "All tensors must be on the same device"
++    )
+     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
+     if alphas is not None:
+         assert alphas.shape == (3,), f"alphas must have shape (3,), got {alphas.shape}"
+@@ -218,9 +218,9 @@
+         assert alphas.device == x.device, "alphas must be on the input device"
+     alpha_ptr = alphas if alphas is not None else bias
+     # Pre-stream programs assume one program owns all H^pre cols for its row block.
+-    assert (
+-        BLOCK_N >= n
+-    ), f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
++    assert BLOCK_N >= n, (
++        f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
++    )
+     # In-kernel SK requires a single program to own the full (n, n) res tile and
+     # reshapes its res sub-tile to (BLOCK_M, n, n); both kernels need
+     # n_squared to be a power of 2 (i.e. N_POW2_RES == n_squared) for the reshape
+@@ -716,6 +716,8 @@
+     h_res: torch.Tensor | None = None,
+     layer_input_out: torch.Tensor | None = None,
+     residual_out: torch.Tensor | None = None,
++    quant_out: torch.Tensor | None = None,
++    quant_scale: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """gfx1250 mhc_post_pre: Gluon split kernel + Gluon reduce/apply, the two
+     launches of the HIP ``mhc_fused_post_pre`` (``gemm_sqrsum`` +
+@@ -887,6 +889,9 @@
+         RES_SHUFFLED=res_shuffled,
+         RES_KS=KS,
+         FUSE_RMSNORM=fuse_norm,
++        quant_ptr=quant_out,
++        quant_scale_ptr=quant_scale,
++        FUSE_QUANT=quant_out is not None,
+         APPLY=apply_l,
+         RED4=red4,
+         RED16=red16,
+@@ -1029,7 +1034,9 @@
+         M_res,
+         n_res,
+         C_res,
+-    ), f"shape mismatch: layer_input=({M},{C}), residual_in=({M_res},{n_res},{C_res}), n={n}"
++    ), (
++        f"shape mismatch: layer_input=({M},{C}), residual_in=({M_res},{n_res},{C_res}), n={n}"
++    )
+ 
+     K_phi, N_phi = phi.shape
+     n_squared = n * n
+@@ -1049,9 +1056,9 @@
+         n,
+         n,
+     ), f"comb_mix shape mismatch: expected ({M}, {n}, {n}), got {tuple(comb_mix.shape)}"
+-    assert (
+-        bias.shape[0] == N_total
+-    ), f"bias shape mismatch: expected ({N_total},), got {tuple(bias.shape)}"
++    assert bias.shape[0] == N_total, (
++        f"bias shape mismatch: expected ({N_total},), got {tuple(bias.shape)}"
++    )
+     assert (
+         layer_input.device
+         == residual_in.device
+@@ -1173,9 +1180,9 @@
+         NUM_C_BLOCKS,
+         N_TOTAL_POW2,
+     )
+-    assert alphas.shape == (
+-        3,
+-    ), f"alphas shape mismatch: expected (3,), got {tuple(alphas.shape)}"
++    assert alphas.shape == (3,), (
++        f"alphas shape mismatch: expected (3,), got {tuple(alphas.shape)}"
++    )
+ 
+     if residual_out is None:
+         residual_out = torch.empty(M, n, C, dtype=dtype, device=device)
+@@ -1184,10 +1191,12 @@
+             M,
+             n,
+             C,
+-        ), f"residual_out shape mismatch: expected ({M}, {n}, {C}), got {tuple(residual_out.shape)}"
+-        assert (
+-            residual_out.dtype == dtype
+-        ), f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
++        ), (
++            f"residual_out shape mismatch: expected ({M}, {n}, {C}), got {tuple(residual_out.shape)}"
++        )
++        assert residual_out.dtype == dtype, (
++            f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
++        )
+ 
+     # Split-K reduce-apply scratch. Write-before-read within this call (the
+     # split kernel writes every entry the reduce kernel reads, masked the same
+@@ -1202,9 +1211,9 @@
+             f"acc_partial shape mismatch: expected ({NUM_KSPLIT}, {M}, {N_total}), "
+             f"got {tuple(acc_partial.shape)}"
+         )
+-        assert (
+-            acc_partial.dtype == torch.float32
+-        ), f"acc_partial dtype mismatch: expected float32, got {acc_partial.dtype}"
++        assert acc_partial.dtype == torch.float32, (
++            f"acc_partial dtype mismatch: expected float32, got {acc_partial.dtype}"
++        )
+     if acc_sq_partial is None:
+         acc_sq_partial = torch.empty(
+             (NUM_KSPLIT, M), dtype=torch.float32, device=device
+@@ -1271,13 +1280,17 @@
+             assert h_post.shape == (
+                 M,
+                 n,
+-            ), f"h_post 2D shape mismatch: expected ({M}, {n}), got {tuple(h_post.shape)}"
++            ), (
++                f"h_post 2D shape mismatch: expected ({M}, {n}), got {tuple(h_post.shape)}"
++            )
+         else:
+             assert h_post.shape == (
+                 M,
+                 n,
+                 1,
+-            ), f"h_post 3D shape mismatch: expected ({M}, {n}, 1), got {tuple(h_post.shape)}"
++            ), (
++                f"h_post 3D shape mismatch: expected ({M}, {n}, 1), got {tuple(h_post.shape)}"
++            )
+     if h_res is None:
+         h_res = torch.empty(M, n, n, dtype=dtype, device=device)
+     else:
+@@ -1739,3 +1752,72 @@
+     ``[M,C]`` in ``residual.dtype``. Backward uses PyTorch recomputation.
+     """
+     return _MHCHeadDSV4.apply(residual, fn, scale, base, rms_eps, hc_pre_eps, config)
++
++
++def mhc_post_pre_quant_gfx1250(
++    layer_input,
++    residual_in,
++    post_mix,
++    comb_mix,
++    fn,
++    alphas,
++    bias,
++    norm_weight,
++    eps=1e-6,
++    hc_pre_eps=1e-6,
++    hc_post_mult_value=2.0,
++    sinkhorn_iters=20,
++    hc_sinkhorn_eps=1e-6,
++    norm_eps=1e-6,
++    res_preshuffle=True,
++):
++    """Run mHC post/pre and RMSNorm, and quantize its BF16 result for an FP8 GEMM.
++
++    Inputs follow mhc_post_pre, except fn uses the (24, 4*C) AITER layout.
++    Return its four outputs plus FP8 data and per-128 E8M0 scales. The scale
++    tensor has shape (M, C/128), with column-major bytes as in per_group_quant_hip.
++    Requires gfx1250, four HC streams, a supported hidden size, and RMSNorm.
++    """
++    if get_arch() != "gfx1250" or norm_weight is None:
++        raise ValueError("mHC quant requires gfx1250 and a norm weight")
++    if not mhc_post_pre_gfx1250_supported(
++        layer_input,
++        residual_in,
++        fn.T,
++        alphas,
++        bias,
++        4,
++        sinkhorn_iters,
++        True,
++        norm_weight,
++        fn.dtype == torch.int32,
++    ):
++        raise ValueError("unsupported mHC quant inputs")
++    m, c = layer_input.shape
++    if not 0 < m <= 128 or c not in (4096, 7168):
++        raise ValueError("mHC quant requires 1..128 rows and hidden size 4096 or 7168")
++    q = torch.empty((m, c), device=layer_input.device, dtype=torch.float8_e4m3fn)
++    scales = torch.empty(
++        (m, c // 128), device=layer_input.device, dtype=torch.float8_e8m0fnu
++    )
++    result = _mhc_post_pre_gluon_gfx1250(
++        layer_input,
++        residual_in,
++        post_mix,
++        comb_mix,
++        fn.T,
++        alphas,
++        bias,
++        4,
++        eps,
++        hc_pre_eps,
++        hc_post_mult_value,
++        sinkhorn_iters,
++        hc_sinkhorn_eps,
++        norm_weight,
++        norm_eps,
++        res_preshuffle,
++        quant_out=q,
++        quant_scale=scales.view(torch.uint8),
++    )
++    return (*result, q, scales)

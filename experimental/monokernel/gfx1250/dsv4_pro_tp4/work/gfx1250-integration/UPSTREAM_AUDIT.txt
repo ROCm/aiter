@@ -1,0 +1,24 @@
+ROCm/ATOM main inspected at 53e4fb52403707ab07b69ee909501ea3cc25ca5c
+Fetched from https://github.com/ROCm/ATOM.git on 2026-10-19.
+
+Existing mono integration:
+- atom/model_engine/model_runner.py: mono_decode_installers, after weight
+  loading/drafter hooks and before warmup.
+- atom/models/deepseek_v41/mono/dispatch.py and kimi_k3/mono/dispatch.py:
+  outer nn.Module wrapper, deployment refusal, TP-uniform step eligibility,
+  lazy runner outside graph capture, native fallback and attribute delegation.
+- atom/mono/runtime/{route,consensus,deployment,widths}.py: bind/prepare
+  agreement across TP ranks, per-width refusal, compilation/plugin/parallelism
+  restrictions. GLM52 also integrates within its uncompiled outer wrapper.
+- atom/mono/device/mx.py and gfx950 model kernels use scaled MFMA and wave64
+  conventions; these are not a gfx1250 implementation.
+
+No gfx1250-specific mono kernels or DeepseekV4ForCausalLM mono installer were
+found in this main snapshot. This audit does not claim every remote branch or
+unmerged PR has been exhaustively inspected.
+
+New integration follows the same installer contract using existing validated
+Gluon regional kernels. Package: atom/models/deepseek_v4_mono (deepseek_v4.py
+already occupies the model module name, so it is not converted to a package).
+Recommended routed MoE remains native. Earlier experimental MoE code/results
+are preserved separately; it was slower in serving and is not enabled here.

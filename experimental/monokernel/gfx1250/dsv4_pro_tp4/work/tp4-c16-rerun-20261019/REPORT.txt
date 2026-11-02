@@ -1,0 +1,12 @@
+Pro TP4 C16 rerun — second full client only
+
+One server launch per configuration; full client1 warmup, full client2 reported; no restart between clients.
+1024 input/1024 output,64requests,seed0,ignoreEOS,request rate inf,real routing,BF16KV,FP8index,CUDA graphs,no profiler or debug comparisons. Same current upstream ATOM plus corrected unsplit integration for both arms; only ATOM_DSV4_MONO changes0->1.
+
+Configuration | mean TPOT ms | median TPOT ms | mean TTFT ms | total tokens/s | same-server PID/start ticks
+baseline | 21.226944 | 21.222773 | 475.767748 | 1476.495503 | 21/1185305
+hybrid | 16.006508 | 16.014016 | 474.620049 | 1944.518545 | 21/1240407
+
+Hybrid TPOT reduction:24.593%; total throughput change:31.698%.
+
+Client1 JSON/logs are preserved as warmup, not selected for the comparison. PID and start-time snapshots prove no restart across the two full clients. Prior22.274755ms baseline used the older checkout; this is a fresh same-source pair. No statistical-confidence claim from one reported client per arm. Scheduling timer probe inconclusive on gfx1250; see PROBE_NOTE.txt.

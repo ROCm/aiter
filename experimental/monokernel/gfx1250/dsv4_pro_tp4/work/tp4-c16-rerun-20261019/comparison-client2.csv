@@ -1,0 +1,3 @@
+configuration,reported_client,concurrency,completed,server_pid,server_start_ticks,same_server_for_both_clients,source,mean_tpot_ms,median_tpot_ms,mean_ttft_ms,median_ttft_ms,total_token_throughput,output_throughput,duration,total_input_tokens,total_output_tokens
+baseline,2,16,64,21,1185305,True,results/baseline_client2_c16.json,21.226944035816764,21.22277270625543,475.76774804687716,482.693108499916,1476.4955029304842,738.2477514652421,88.7723665529993,65536,65536
+hybrid,2,16,64,21,1240407,True,results/hybrid_client2_c16.json,16.006508062622196,16.0140164931587,474.6200490468482,482.2222234997753,1944.5185447255421,972.2592723627711,67.40588839100019,65536,65536

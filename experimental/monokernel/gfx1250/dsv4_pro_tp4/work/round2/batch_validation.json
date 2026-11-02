@@ -1,0 +1,759 @@
+{
+  "64": {
+    "requests": 64,
+    "exact_text_matches": 12,
+    "mismatches": [
+      {
+        "index": 1,
+        "control": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 24",
+        "candidate": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (360) and 18 by 3 (54), then"
+      },
+      {
+        "index": 2,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (380) and 19 by 3 (57) and",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = "
+      },
+      {
+        "index": 3,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. This is calculated by multiplying 20 by 23, which is 20 * 23 = 460.\nQuestion"
+      },
+      {
+        "index": 4,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483. This is a simple arithmetic and reasoning exercise"
+      },
+      {
+        "index": 5,
+        "control": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 24 times 25"
+      },
+      {
+        "index": 7,
+        "control": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 8,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 17 times 23 is 391. I calculated it by multiplying 17 by 20 (which is 340) and 17 by 3 ("
+      },
+      {
+        "index": 9,
+        "control": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 24",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 10,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and then adding 19 times ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 3: What is 19 times 23"
+      },
+      {
+        "index": 11,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 3: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. This is because 20 times 23 is the same as 2 times 23 times 10, which is"
+      },
+      {
+        "index": 12,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483.\nThis is a simple arithmetic and reasoning exercise"
+      },
+      {
+        "index": 13,
+        "control": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise.",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 14,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 16,
+        "control": " 391\nExplanation: 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise.",
+        "candidate": " 17 * 23 = 391\nQuestion 1: What is 17 times 23? Explain the calculation.\nAnswer: 17 * 23"
+      },
+      {
+        "index": 18,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and then adding 19 times ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 3: What is 19 times 23"
+      },
+      {
+        "index": 21,
+        "control": " 22 times 23 equals 506. The calculation is performed as follows: 22 * 23 = 22 * (20 + 3) =",
+        "candidate": " 22 times 23 is 506. The calculation is done as follows: 22 * 23 = 22 * (20 + 3) ="
+      },
+      {
+        "index": 22,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 23,
+        "control": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 26,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and then adding 19 times ",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = "
+      },
+      {
+        "index": 27,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. This is because 20 times 20 is 400, and 20 times 3 is 60, so"
+      },
+      {
+        "index": 28,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and 21 by 3 (63), then"
+      },
+      {
+        "index": 29,
+        "control": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 22 times 23"
+      },
+      {
+        "index": 31,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (# "
+      },
+      {
+        "index": 32,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 17 times 23 is 391. I calculated it by multiplying 17 by 20 (which is 340) and 17 by 3 ("
+      },
+      {
+        "index": 33,
+        "control": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (360) and 18 by 3 (54), then",
+        "candidate": " 414\nQuestion 2: What is 18 times 24? Explain the calculation.\nAnswer: 432\nQuestion 3: What is 18"
+      },
+      {
+        "index": 34,
+        "control": " 19 times 23 is 437. I get this by multiplying 19 by 20 (which is 380) and 19 by 3 (",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = "
+      },
+      {
+        "index": 35,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. This is calculated by multiplying 20 by 23, which equals 460. This is a simple arithmetic and reasoning"
+      },
+      {
+        "index": 36,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and 21 by 3 (63), then",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 21 * (20 + 3) = "
+      },
+      {
+        "index": 37,
+        "control": " 22 times 23 is 506. The calculation is done by multiplying 22 by 20 (440) and 22 by 3 (66),",
+        "candidate": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then"
+      },
+      {
+        "index": 39,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 24 * 23 = 552\nExplanation: To multiply 24 by 23, we can use the distributive property: 24 * 23 ="
+      },
+      {
+        "index": 40,
+        "control": " 17 times 23 equals 391. This is calculated by multiplying 17 by 20 (340) and 17 by 3 (51), then",
+        "candidate": " 391\nExplanation: 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise."
+      },
+      {
+        "index": 41,
+        "control": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (360) and 18 by 3 (54), then",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 42,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = ",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 43,
+        "control": " 20 times 23 is 460. This is because 20 multiplied by 23 equals 460. This is a simple arithmetic and reasoning exercise. This",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 44,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 20 by 23 to get 460, and 1 by 23 to get"
+      },
+      {
+        "index": 45,
+        "control": " 506. 22 times 23 is 22 * 23 = 506. \nQuestion 6: What is 22 times 24? Explain",
+        "candidate": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then"
+      },
+      {
+        "index": 46,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 48,
+        "control": " 17 times 23 is 391. The calculation is as follows: 17 * 23 = 391.\nQuestion 1: What is 17",
+        "candidate": " 17 times 23 equals 391. This is calculated by multiplying 17 by 20 (340) and 17 by 3 (51), then"
+      },
+      {
+        "index": 49,
+        "control": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23",
+        "candidate": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18"
+      },
+      {
+        "index": 50,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 (",
+        "candidate": " 19 times 23 is 437. I get this by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 51,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 3: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 52,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 53,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 22 times 24",
+        "candidate": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise."
+      },
+      {
+        "index": 54,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 55,
+        "control": " 24 times 23 equals 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 56,
+        "control": " 17 times 23 is 391. I calculated this by multiplying 17 by 20 (which gives 340) and 17 by 3 (",
+        "candidate": " 391\nExplanation: 17 * 23 = 391\n\nQuestion 1: What is 17 times 23? Explain the calculation.\nAnswer:"
+      },
+      {
+        "index": 57,
+        "control": " 18 times 23 is 414. I calculated this by multiplying 18 by 20 (which is 360) and 18 by 3 (",
+        "candidate": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (360) and 18 by 3 (54), then"
+      },
+      {
+        "index": 58,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = ",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 23, which equals 437.\nThis is a simple arithmetic and reasoning"
+      },
+      {
+        "index": 60,
+        "control": " 21 times 23 is 483. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 21 by 23, which is 21 * 23 = 483.\nExecution"
+      },
+      {
+        "index": 61,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 22 times 23 equals 506. The calculation is done as follows: 22 * 20 = 440, and 22 * 3 ="
+      },
+      {
+        "index": 62,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 63,
+        "control": " 24 times 23 equals 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      }
+    ]
+  },
+  "128": {
+    "requests": 128,
+    "exact_text_matches": 31,
+    "mismatches": [
+      {
+        "index": 0,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 17 * 23 = 391\nQuestion 1: What is 17 times 23? Explain the calculation.\nAnswer: 17 * 23"
+      },
+      {
+        "index": 2,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 3: What is 19 times 23"
+      },
+      {
+        "index": 3,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 460\nExplanation: 20 times 23 is 20 * 23 = 460. This is a simple arithmetic and reasoning exercise. This is a"
+      },
+      {
+        "index": 5,
+        "control": " 22 times 23 equals 506. The calculation is as follows: 22 * 23 = 22 * (20 + 3) = ",
+        "candidate": " 22 times 23 is 506. This is calculated by multiplying 22 by 20 (which is 440) and then adding 22 times "
+      },
+      {
+        "index": 7,
+        "control": " 24 times 23 equals 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 8,
+        "control": " 17 * 23 = 391\nQuestion 1: What is 19 times 27? Explain the calculation.\nAnswer: 19 * 27",
+        "candidate": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23"
+      },
+      {
+        "index": 9,
+        "control": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 24"
+      },
+      {
+        "index": 10,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 (",
+        "candidate": " 19 times 23 is 437. I calculated it by multiplying 19 by 23 using the standard multiplication method. 19 times 23 equals "
+      },
+      {
+        "index": 12,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483.\nQuestion 5: What is 21"
+      },
+      {
+        "index": 13,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 24 times 25",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 15,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 times 23 is 552. The calculation is as follows: 24 * 23 = 24 * (20 + 3) = "
+      },
+      {
+        "index": 16,
+        "control": " 391\nExplanation: 17 * 23 = 17 * (20 + 3) = 17*20 + 17*3 = ",
+        "candidate": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23"
+      },
+      {
+        "index": 18,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 19,
+        "control": " 20 times 23 is 460. This is calculated by multiplying 20 by 23, which equals 460 hilab This is a simple arithmetic and reasoning",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 20,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63"
+      },
+      {
+        "index": 23,
+        "control": " 24 times 23 is 552. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic",
+        "candidate": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then"
+      },
+      {
+        "index": 24,
+        "control": " 17 times 23 is 391. I calculated this by multiplying 17 by 20 (340) and 17 by 3 (51) and",
+        "candidate": " 17 times 23 is 391. I get this by multiplying 17 by 20 (which is 340) and then 17 by 3"
+      },
+      {
+        "index": 26,
+        "control": " 19 times 23 is 437. I calculated it by multiplying 19 by 20 (which is 380) and 19 by 3 (",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 27,
+        "control": " 20 times 23 is 460. This is because 20 times 20 is 400, and 20 times 3 is 60, so",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 28,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and 21 by 3 (63), then",
+        "candidate": " 21 times 23 equals 483. This is calculated by multiplying 20 by 23 to get 460, and then adding 1 times 23"
+      },
+      {
+        "index": 29,
+        "control": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 31,
+        "control": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 32,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 17 times 23 is 391. This is calculated by multiplying 17 by 20 (340) and 17 by 3 (51) and"
+      },
+      {
+        "index": 33,
+        "control": " 18 times 23 equals 414. The calculation is performed as follows: 18 * 20 = 360, and 18 * 3 =",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 34,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 23, which is the same as 19 times 20 plus ",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 35,
+        "control": " 20 times 23 is 460. This is because 20 multiplied by 23 equals 460. This is a simple arithmetic and reasoning exercise. This",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 36,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483.\nQuestion 5: What is 21"
+      },
+      {
+        "index": 37,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 22 times 23",
+        "candidate": " 22 times 23 is 506. The calculation is as follows: 22 * 23 = 22 * (20 + 3) = "
+      },
+      {
+        "index": 38,
+        "control": " 23 times 23 equals 529. This is calculated by multiplying 20 by 20 (400), 20 by 3 (60), 3",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 40,
+        "control": " 391\nExplanation: 17 * 23 = 17 * (20 + 3) = 17*20 + 17*3 = ",
+        "candidate": " 17 times 23 is 391. I calculated it by multiplying 17 by 20 (340) and 17 by 3 (51) and"
+      },
+      {
+        "index": 41,
+        "control": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (which gives 360) and then adding 18 times ",
+        "candidate": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 18 * (20 + 3) = "
+      },
+      {
+        "index": 42,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 43,
+        "control": " 20 times 23 is 460. This is calculated by multiplying 20 by 23, which equals 460.\nThis is a simple arithmetic and reasoning",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 44,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 4: What is 21 times 23",
+        "candidate": " 21 times 23 equals 483. This is calculated by multiplying 20 by 23 to get 460, then adding 1 times 23,"
+      },
+      {
+        "index": 45,
+        "control": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise.",
+        "candidate": " 22 times 23 is 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then"
+      },
+      {
+        "index": 47,
+        "control": " 24 times 23 is 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 48,
+        "control": " 391\nExplanation: 17 * 23 = 17 * (20 + 3) = 17*20 + 17*3 = ",
+        "candidate": " 17 * 23 = 391\nQuestion 1: What is 17 times 23? Explain the calculation.\nAnswer: 17 * 23"
+      },
+      {
+        "index": 49,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (which is 360) and 18 by 3 ("
+      },
+      {
+        "index": 50,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 437.\nQuestion 3: What is 19",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = "
+      },
+      {
+        "index": 51,
+        "control": " 20 times 23 is 460. This is calculated by multiplying 20 by 23, which equals 460. This is a simple arithmetic and reasoning",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 52,
+        "control": " 21 times 23 equals 483. This is calculated by multiplying 20 by 23 (460) and adding 1 by 23 (23),",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 21 * (20 + 3) = "
+      },
+      {
+        "index": 53,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 22 times 23"
+      },
+      {
+        "index": 55,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 * 23 = 24 * (20 + 3) = 24 * 20 + 24 * 3 = 480 + "
+      },
+      {
+        "index": 56,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 391\nExplanation: 17 * 23 = 17 * (20 + 3) = 17*20 + 17*3 = "
+      },
+      {
+        "index": 57,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 59,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460. The calculation is 20 * 23 = 460",
+        "candidate": " 20 times 23 is 460. This is because 20 times 20 is 400, and 20 times 3 is 60, so"
+      },
+      {
+        "index": 61,
+        "control": " 506. 22 times 23 equals 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 506. 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 62,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 63,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 times 23 equals 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then"
+      },
+      {
+        "index": 65,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 66,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 2: What is 19 times 23"
+      },
+      {
+        "index": 68,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 equals 483. This is because 21 multiplied by 20 is 420, and 21 multiplied by 3 is 63"
+      },
+      {
+        "index": 69,
+        "control": " 22 times 23 equals 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then",
+        "candidate": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise."
+      },
+      {
+        "index": 71,
+        "control": " 24 times 23 equals 552. This is calculated by multiplying 24 by 20 (480) and 24 by 3 (72), then",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 74,
+        "control": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and 19 by 3 (",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = "
+      },
+      {
+        "index": 75,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 3: What is 20 times 23"
+      },
+      {
+        "index": 76,
+        "control": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483. This is a simple arithmetic and reasoning exercise",
+        "candidate": " 21 times 23 equals 483. This is calculated by multiplying 20 by 23 to get 460, and then adding 1 times 23"
+      },
+      {
+        "index": 77,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 5: What is 22 times 23",
+        "candidate": " 22 times 23 is 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then"
+      },
+      {
+        "index": 80,
+        "control": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23",
+        "candidate": " 17 times 23 is 391. I calculated it by multiplying 17 by 20 (340) and 17 by 3 (51) and"
+      },
+      {
+        "index": 81,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 82,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = ",
+        "candidate": " 19 times 23 is 437. I calculated it by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 83,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 3: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23"
+      },
+      {
+        "index": 84,
+        "control": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 21 * (20 + 3) = ",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63"
+      },
+      {
+        "index": 85,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nQuestion 6: What is 22 times 23",
+        "candidate": " 22 times 23 is 506. The calculation is 22 x 23 = 506.\nQuestion 6: What is 22 times 23"
+      },
+      {
+        "index": 86,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 87,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 88,
+        "control": " 17 times 23 is 391. The calculation is as follows: 17 * 20 = 340, 17 * 3 = 51",
+        "candidate": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23"
+      },
+      {
+        "index": 89,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. This is calculated by multiplying 18 by 20 (360) and 18 by 3 (54), then"
+      },
+      {
+        "index": 90,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = ",
+        "candidate": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 2: What is 19 times 23"
+      },
+      {
+        "index": 91,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. This is because 20 multiplied by 23 equals 460. This is a simple arithmetic and reasoning exercise. This"
+      },
+      {
+        "index": 92,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 equals 483. This is because 21 multiplied by 20 is 420, and 21 multiplied by 3 is 63"
+      },
+      {
+        "index": 93,
+        "control": " 22 times 23 is 506. This is calculated by multiplying 22 by 20 (440) and 22 by 3 (66), then",
+        "candidate": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise."
+      },
+      {
+        "index": 94,
+        "control": " 23 times 23 is 529. The calculation is 23 * 23 = 529. \nQuestion 7: What is 23 times ",
+        "candidate": " 23 times 23 is 529. The calculation is 23 * 23 = 529.\nQuestion 7: What is 23 times 23"
+      },
+      {
+        "index": 95,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 96,
+        "control": " 17 * 23 = 391\nQuestion 1: What is 19 times 27? Explain the calculation.\nAnswer: 19 * 27",
+        "candidate": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23"
+      },
+      {
+        "index": 97,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: What is 18",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 98,
+        "control": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = (20 - 1) * 23 = ",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and then adding 19 times "
+      },
+      {
+        "index": 100,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 21 * (20 + 3) = "
+      },
+      {
+        "index": 101,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506. This is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 22 times 23 is 506. The calculation is as follows: 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise"
+      },
+      {
+        "index": 103,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23",
+        "candidate": " 24 times 23 is 552. The calculation is as follows: 24 * 23 = 24 * (20 + 3) = "
+      },
+      {
+        "index": 104,
+        "control": " 17 times 23 is 391. The calculation is as follows: 17 * 23 = 17 * (20 + 3) = ",
+        "candidate": " 17 times 23 is 391. I calculated it by multiplying 17 by 20 (340) and 17 by 3 (51) and"
+      },
+      {
+        "index": 105,
+        "control": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\nQuestion 2: A store sells ",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 106,
+        "control": " 19 times 23 is 437. I calculated it by multiplying 19 by 20 (which is 380) and then adding 19 times ",
+        "candidate": " 19 times 23 is 437. I calculated this by multiplying 19 by 20 (which is 380) and then adding 19 times "
+      },
+      {
+        "index": 108,
+        "control": " 21 times 23 is 483. The calculation is 21 * 23 = 483.\nQuestion 5: What is 21 times 23",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63"
+      },
+      {
+        "index": 109,
+        "control": " 506\nExplanation: 22 times 23 is 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise.",
+        "candidate": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 112,
+        "control": " 17 times 23 equals 391. This is calculated by multiplying 17 by 20 (340) and 17 by 3 (51), then",
+        "candidate": " 17 times 23 is 391. The calculation is 17 * 23 = 391.\nQuestion 1: What is 17 times 23"
+      },
+      {
+        "index": 113,
+        "control": " 18 times 23 equals 414. This is calculated by multiplying 18 by 20 (which equals 360) and 18 by 3 (",
+        "candidate": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23"
+      },
+      {
+        "index": 114,
+        "control": " 19 times 23 is 437. The calculation is 19 * 23 = 437.\nQuestion 3: What is 19 times 23",
+        "candidate": " 19 times 23 is 437. The calculation is as follows: 19 * 23 = 19 * (20 + 3) = "
+      },
+      {
+        "index": 116,
+        "control": " 21 times 23 is 483. The calculation is as follows: 21 * 23 = 483. This is a simple arithmetic and reasoning exercise",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 20 by 23 to get 460, and then adding 1 times 23"
+      },
+      {
+        "index": 117,
+        "control": " 22 times 23 is 506. The calculation is 22 * 23 = 506.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 506. 22 times 23 equals 506. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 119,
+        "control": " 24 * 23 = 552. \nExplanation: 24 * 20 = 480, 24 * 3 = 72, 480",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      },
+      {
+        "index": 120,
+        "control": " 391\nReasoning: 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise",
+        "candidate": " 391\nExplanation: 17 times 23 is 391. This is a simple arithmetic and reasoning exercise. This is a simple arithmetic and reasoning exercise."
+      },
+      {
+        "index": 121,
+        "control": " 18 times 23 is 414. The calculation is 18 * 23 = 414.\nQuestion 2: What is 18 times 23",
+        "candidate": " 18 times 23 is 414. The calculation is as follows: 18 * 23 = 414.\n\nQuestion 2: What is 18"
+      },
+      {
+        "index": 122,
+        "control": " 19 times 23 is 437. I calculated it by multiplying 19 by 20 (which is 380) and then adding 19 times ",
+        "candidate": " 19 times 23 is 437. I calculated it by multiplying 19 by 20 (which is 380) and 19 by 3 ("
+      },
+      {
+        "index": 123,
+        "control": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nQuestion 4: What is 20 times 23",
+        "candidate": " 20 times 23 is 460. The calculation is 20 * 23 = 460.\nThis is a simple arithmetic and reasoning exercise. This is"
+      },
+      {
+        "index": 124,
+        "control": " 21 times 23 is 483. This is calculated by multiplying 21 by 20 (420) and then adding 21 times 3 (63",
+        "candidate": " 21 times 23 is 483. This is calculated by multiplying 20 by 23 to get 460, and then adding 1 times 23"
+      },
+      {
+        "index": 127,
+        "control": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nThis is a simple arithmetic and reasoning exercise. This is",
+        "candidate": " 24 times 23 is 552. The calculation is 24 * 23 = 552.\nQuestion 8: What is 24 times 23"
+      }
+    ]
+  }
+}

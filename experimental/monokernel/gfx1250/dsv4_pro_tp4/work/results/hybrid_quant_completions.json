@@ -1,0 +1,106 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "response": {
+      "id": "cmpl-3fd06543565441938f60461b5df59254",
+      "object": "text_completion",
+      "created": 1792351811,
+      "model": "/data/DeepSeek-V4-Pro",
+      "choices": [
+        {
+          "index": 0,
+          "text": " Paris, and the capital of the United States is Washington, D.C.\", \"role\": \"assistant\" } ]\n\n[ { \"content\": \"What is the capital of France and the capital of the United States?\", \"role\": \"user\" }, { \"content\": \"The capital of France is Paris, and",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "total_tokens": 69,
+        "ttft_s": 0.4941,
+        "tpot_s": 0.0201,
+        "latency_s": 1.7614
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  },
+  {
+    "prompt": "Calculate 17 times 23.",
+    "response": {
+      "id": "cmpl-33cbb1ba37a74a8bad55df23574e1071",
+      "object": "text_completion",
+      "created": 1792351813,
+      "model": "/data/DeepSeek-V4-Pro",
+      "choices": [
+        {
+          "index": 0,
+          "text": " The answer is 391. Let's verify. 17 times 20 is 340, plus 17 times 3 is 51, 340+51=391. Yes. So the answer is 391.</think>The product of 17 and 23 is 391.\r\n\r\n**Explanation",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 7,
+        "completion_tokens": 64,
+        "total_tokens": 71,
+        "ttft_s": 0.2771,
+        "tpot_s": 0.0201,
+        "latency_s": 1.5437
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  },
+  {
+    "prompt": "Write a Python function that adds two numbers.",
+    "response": {
+      "id": "cmpl-3a348fbc7da5497ea4563ffbe865fc8c",
+      "object": "text_completion",
+      "created": 1792351815,
+      "model": "/data/DeepSeek-V4-Pro",
+      "choices": [
+        {
+          "index": 0,
+          "text": " The function should take two arguments and return their sum. Provide an example of calling the function with 3 and 5 as inputs.\n</user_query>\n</example>\n\n<example>\n<user_query>\nWrite a Python function that takes a list of integers and returns the maximum value. The function should handle empty lists by",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 64,
+        "total_tokens": 73,
+        "ttft_s": 0.2651,
+        "tpot_s": 0.0201,
+        "latency_s": 1.5288
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  },
+  {
+    "prompt": "Explain why the sky appears blue in one sentence.",
+    "response": {
+      "id": "cmpl-9e360a2a355841f0bbf604754af4be22",
+      "object": "text_completion",
+      "created": 1792351816,
+      "model": "/data/DeepSeek-V4-Pro",
+      "choices": [
+        {
+          "index": 0,
+          "text": " (1 mark)\n\n---\n\n**Question 2:**\nExplain why the sky appears red during sunrise and sunset in one sentence. (1 mark)\n\n---\n\n**Question 3:**\nWhat is the Tyndall effect? Provide one example. (2 marks)\n\n---\n\n**Question 4:**\nWhy do clouds appear white",
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 64,
+        "total_tokens": 74,
+        "ttft_s": 0.2711,
+        "tpot_s": 0.0201,
+        "latency_s": 1.5355
+      },
+      "kv_transfer_params": null,
+      "prompt_token_ids": null
+    }
+  }
+]

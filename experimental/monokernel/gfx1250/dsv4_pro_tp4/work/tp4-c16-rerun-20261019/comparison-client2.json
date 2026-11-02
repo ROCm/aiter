@@ -1,0 +1,45 @@
+{
+  "protocol": "One server launch per configuration; full client1 warmup, full client2 reported; no restart between clients.",
+  "rows": [
+    {
+      "configuration": "baseline",
+      "reported_client": 2,
+      "concurrency": 16,
+      "completed": 64,
+      "server_pid": 21,
+      "server_start_ticks": 1185305,
+      "same_server_for_both_clients": true,
+      "source": "results/baseline_client2_c16.json",
+      "mean_tpot_ms": 21.226944035816764,
+      "median_tpot_ms": 21.22277270625543,
+      "mean_ttft_ms": 475.76774804687716,
+      "median_ttft_ms": 482.693108499916,
+      "total_token_throughput": 1476.4955029304842,
+      "output_throughput": 738.2477514652421,
+      "duration": 88.7723665529993,
+      "total_input_tokens": 65536,
+      "total_output_tokens": 65536
+    },
+    {
+      "configuration": "hybrid",
+      "reported_client": 2,
+      "concurrency": 16,
+      "completed": 64,
+      "server_pid": 21,
+      "server_start_ticks": 1240407,
+      "same_server_for_both_clients": true,
+      "source": "results/hybrid_client2_c16.json",
+      "mean_tpot_ms": 16.006508062622196,
+      "median_tpot_ms": 16.0140164931587,
+      "mean_ttft_ms": 474.6200490468482,
+      "median_ttft_ms": 482.2222234997753,
+      "total_token_throughput": 1944.5185447255421,
+      "output_throughput": 972.2592723627711,
+      "duration": 67.40588839100019,
+      "total_input_tokens": 65536,
+      "total_output_tokens": 65536
+    }
+  ],
+  "tpot_reduction_pct": 24.59344107369386,
+  "throughput_gain_pct": 31.69823686331221
+}

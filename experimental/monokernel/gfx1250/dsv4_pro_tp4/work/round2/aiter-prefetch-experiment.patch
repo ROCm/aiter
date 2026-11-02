@@ -1,0 +1,405 @@
+--- a/aiter/ops/triton/_gluon_kernels/gfx1250/gemm/basic/gemm_mxfp8.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx1250/gemm/basic/gemm_mxfp8.py
+@@ -34,6 +34,7 @@
+     "B_SCALE_TDM",
+     "CTAS_M",
+     "CTAS_N",
++    "L2_PREFETCH_DISTANCE",
+ ]
+ 
+ 
+@@ -437,6 +438,7 @@
+     warp_bases: gl.constexpr,
+     cache_modifier: gl.constexpr,
+     NUM_BUFFERS: gl.constexpr,
++    L2_PREFETCH_DISTANCE: gl.constexpr,
+     LOOP_UNROLL_FACTOR: gl.constexpr = 1,
+     B_SCALE_TDM: gl.constexpr = True,
+     waves_per_eu: gl.constexpr = 0,
+@@ -845,6 +847,14 @@
+ 
+     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
+ 
++    # Prefetch weights beyond the LDS pipeline without allocating more LDS.
++    if L2_PREFETCH_DISTANCE > 0:
++        for pf in gl.static_range(NUM_BUFFERS - 1 + L2_PREFETCH_DISTANCE):
++            if pf < NUM_K_ITER:
++                gl.amd.gfx1250.tdm.prefetch(
++                    b_desc, [off_bn_tdm, pf * BLOCK_SIZE_K * 16]
++                )
++
+     # ---------------- Prologue ----------------
+     # The scale slab is issued first and never waited on directly: tensorcnt is a
+     # single in-order counter, so the async_wait below -- which already drains
+@@ -900,6 +910,12 @@
+ 
+     # ---------------- Main loop ----------------
+     for _ in tl.range(0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL):
++        if L2_PREFETCH_DISTANCE > 0:
++            pf_next = num_loads + L2_PREFETCH_DISTANCE
++            if pf_next < NUM_K_ITER:
++                gl.amd.gfx1250.tdm.prefetch(
++                    b_desc, [off_bn_tdm, pf_next * BLOCK_SIZE_K * 16]
++                )
+         slot_c = num_computes % NUM_BUFFERS
+         cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
+         cur_b = depreshuffle_b(
+@@ -1140,6 +1156,7 @@
+     warp_bases: gl.constexpr,
+     cache_modifier: gl.constexpr,
+     NUM_BUFFERS: gl.constexpr,
++    L2_PREFETCH_DISTANCE: gl.constexpr,
+     LOOP_UNROLL_FACTOR: gl.constexpr = 1,
+     B_SCALE_TDM: gl.constexpr = True,
+     waves_per_eu: gl.constexpr = 0,
+--- a/aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py
++++ b/aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py
+@@ -535,6 +535,7 @@
+             warp_bases=tuple(warp_bases),
+             cache_modifier=config["cache_modifier"],
+             NUM_BUFFERS=num_buffers,
++            L2_PREFETCH_DISTANCE=config["L2_PREFETCH_DISTANCE"],
+             # Every gluon preshuffle config declares this; configs/AGENTS.md
+             # forbids Python-side defaults for tuning values, so a missing key
+             # is a config bug and should fail loudly rather than silently tune
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=6144-K=7168.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=6144-K=7168.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 128,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=16384-K=1536.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=16384-K=1536.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 64,
+@@ -29,7 +30,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=1536-K=7168.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=1536-K=7168.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 64,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=3072.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=3072.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 128,
+@@ -29,7 +30,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 2,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=768.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=768.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 32,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/DEFAULT.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/DEFAULT.json
+@@ -13,6 +13,7 @@
+         "cache_modifier": null,
+         "B_SCALE_TDM": true,
+         "kernel_type": "bandwidth_bound",
+-        "LOOP_UNROLL_FACTOR": 1
++        "LOOP_UNROLL_FACTOR": 1,
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=65536-K=1536.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=65536-K=1536.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".cg",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 256,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=4096.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=4096.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 64,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=8192-K=1536.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=8192-K=1536.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 32,
+@@ -29,7 +30,8 @@
+         "cache_modifier": ".ca",
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 128,
+@@ -45,7 +47,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -61,6 +64,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=16384.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=7168-K=16384.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 128,
+@@ -29,7 +30,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 4,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -45,6 +47,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 2,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }
+--- a/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=2048-K=7168.json
++++ b/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_afp8wfp8_preshuffled/GEMM-AFP8WFP8_PRESHUFFLED-N=2048-K=7168.json
+@@ -13,7 +13,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_64": {
+         "BLOCK_SIZE_M": 64,
+@@ -29,7 +30,8 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 1,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "M_LEQ_512": {
+         "BLOCK_SIZE_M": 128,
+@@ -45,7 +47,8 @@
+         "cache_modifier": ".cg",
+         "LOOP_UNROLL_FACTOR": 2,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     },
+     "any": {
+         "BLOCK_SIZE_M": 256,
+@@ -61,6 +64,7 @@
+         "cache_modifier": null,
+         "LOOP_UNROLL_FACTOR": 2,
+         "B_SCALE_TDM": true,
+-        "kernel_type": "bandwidth_bound"
++        "kernel_type": "bandwidth_bound",
++        "L2_PREFETCH_DISTANCE": 0
+     }
+ }

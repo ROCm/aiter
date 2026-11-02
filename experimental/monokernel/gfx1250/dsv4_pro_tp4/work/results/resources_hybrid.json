@@ -1,0 +1,234 @@
+[
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/PHL5B7ABPAO73WOMMWPIKYJZ42HIOWSTDRWKREGJJ6VJ3EIANL5A/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 68,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/UUHAQPNWKCQW4X7S2KGHIUNSRK7WJCAY27OZMB66UPQDAHUKY4DA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 68,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/M5455WGQ566RX2BNSMMYQGJI3GCYZ2YGCQKL6EBV7MGXI34IYZDQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_2_CHUNK_2048_N_CHUNKS_4_S_16_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 131268,
+    "vgpr": 196,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/ODRQQ3MSVOXZ22G5F6IXCUS27IZUQMSKYWDEKY3PVX27XVV4CI7A/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/RQKRRVB3HK5XAWF5CFFMOTOKBMKKQWF4ITITAJGRNPK5P4TE72XA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/GQPBGI3BV6TRXB5EXM6POXQOLVTPEZL6VAUIEELHY2MCNOVHN7BA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/WCHVVU3A4LJXMVPGZHQKPDXWKKH3MN2JTI37MJ77INLPGPHBKZQQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 56,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/QOVOPJTROI7BFL53XYXRP2QEQCVQQADQSIZ6BJIKUQQSJHUNGTDA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/IOLYI5VU526EYF5Q2YY4KPZU37ZUJKIWUADML2PYDS4QEOSIBB5Q/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 56,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/JVSHB67KC4YCSHP7OYG6CFMMXMXBPPHE3WDUCUCH2RGPXZWZNZLA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/32OA2NAHUWL4KXFKRR2I42YXQ4O4GQ6AXUUPOXBX534MU6P224HA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/5P4IJ34Z2WSYDX724N33MMADW2UYG3NTN2E36LU4V5SQAQBRTUNQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 70,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/2CE2TCI434NIBHADGTNIGDSTN7QIZG5D4RG4F3DY5VKPHKXIXTDA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/JFT3FT6ORA4X2XAI4UQVEAEFFAFLEF4MPVXBGE2QPAYMK3UBGVGA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/OST2BRW6QFB52TCTPQFKIVNGO7FQIO3MRRKOIA7OGYI6STLZECPA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "shared": 65636,
+    "vgpr": 86,
+    "sgpr": 54,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/QNDOOSUAIQ4G2Y67MOKNWHJFJZGBOAZ7US4OD5E2HCQGCX6NLFHA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/U2T7APKIL4UZX2IYY5OCMR7LYRPG5SMUSNJESLDAWX2QDRTKLOHA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/XCUT6WCUCV2J2CM5T3JGEOXZ6BDQB45C5PM6EF7QRAEUMD3VAOUQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 70,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/JHT6BA3S7IV56SBEKATIBBLT7FY2VUVWUISFTQAFJ3T6ZXDL4V7A/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/FMUCS4KCFZNEEN5U77ITY4GNFLXWMYH2DN5NRRWAR64X2C6GQLEQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 70,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/4QBZ6YR2KZLF6KXKRAKQWLQEUQAKRDIG3TSGOXT37QCCKZZZ6IVA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 56,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/OAQCZUYDEJWCKYRSC7VMNNLFGRCVY5H2MC65SZ3IT5GRVM4MFVHA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 72,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/FQKBFWB4SB2ZUWCDIJVGSZ5VL2SATNFO2E3ZF4EBT3BZSS4LPPXA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 86,
+    "sgpr": 54,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/RXMINAXC2KF3P2G2FDMNCDOURBR4OUCZBZEMQAZWMNGXYOKPQUEA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_0",
+    "shared": 65636,
+    "vgpr": 86,
+    "sgpr": 56,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/KT2VCP5SLA2Q5T4G4CXPNF4WYQJBMFULD3JJVBOHX3ROVQOWMBJQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_16_FUSE_RMSNORM_1_RES_SHUFFLED_1",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/H3DYNYICOWM2GO7JJMPSMVWC3SJE2NIHG2D3NPFKFIAHB4R4E3PQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_0",
+    "shared": 65636,
+    "vgpr": 84,
+    "sgpr": 62,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/7K362DM4GXFU6MXNEZ255KN6AJFUGVDVG74GKCAGBYFSPHWHOZ5Q/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_28_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 70,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/VQUEQ4JEWNLMAFAF3JKEWTCR6XEC4T45QRMO67252S7JZ5QT5YLA/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  },
+  {
+    "name": "_mhc_pre_reduce_apply_gfx1250_kernel_C_7168_ROWS_1_CHUNK_2048_N_CHUNKS_4_S_56_FUSE_RMSNORM_1_RES_SHUFFLED_1_FUSE_QUANT_1",
+    "shared": 65636,
+    "vgpr": 85,
+    "sgpr": 70,
+    "scratch_bytes": 0,
+    "path": "/work/triton-cache/XPTPFXK4HUTSQZCLP42KGA2INOMRBSDG7Q2LM2YVLN2OO77T5SVQ/_mhc_pre_reduce_apply_gfx1250_kernel.amdgcn"
+  }
+]

@@ -1,0 +1,469 @@
+{
+  "trace": "/work/traces/hybrid/rank_0/DeepSeek-V4-Pro_ts_20261018_192958_765.pt.trace.json.gz",
+  "last_prefill": {
+    "ph": "X",
+    "cat": "gpu_user_annotation",
+    "name": "prefill[bs=15 tok=15360 ctx=[1024, 1024, 1024]...+12 nctx=7.9M]",
+    "pid": 2,
+    "tid": 2,
+    "ts": 1494770654834.648,
+    "dur": 565847.379,
+    "args": {
+      "External id": 268580
+    }
+  },
+  "decode_steps": 50,
+  "kernel_count": 123800,
+  "steps": [
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24811.947,
+      "busy_union_us": 21485.9775390625,
+      "wall_us": 23352.4228515625,
+      "overlap_us": 3325.9694609375,
+      "idle_us": 1866.4453125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24435.592,
+      "busy_union_us": 21166.48291015625,
+      "wall_us": 22935.43701171875,
+      "overlap_us": 3269.1090898437506,
+      "idle_us": 1768.9541015625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24521.391,
+      "busy_union_us": 21241.2548828125,
+      "wall_us": 23006.706298828125,
+      "overlap_us": 3280.1361171874996,
+      "idle_us": 1765.451416015625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24936.472,
+      "busy_union_us": 21390.608642578125,
+      "wall_us": 23153.764892578125,
+      "overlap_us": 3545.8633574218766,
+      "idle_us": 1763.15625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24599.346,
+      "busy_union_us": 21282.55078125,
+      "wall_us": 23026.053955078125,
+      "overlap_us": 3316.7952187500014,
+      "idle_us": 1743.503173828125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24570.733,
+      "busy_union_us": 21267.98486328125,
+      "wall_us": 23047.944091796875,
+      "overlap_us": 3302.74813671875,
+      "idle_us": 1779.959228515625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24614.302,
+      "busy_union_us": 21297.303955078125,
+      "wall_us": 23062.307861328125,
+      "overlap_us": 3316.9980449218747,
+      "idle_us": 1765.00390625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25016.529,
+      "busy_union_us": 21408.727294921875,
+      "wall_us": 23187.880859375,
+      "overlap_us": 3607.8017050781236,
+      "idle_us": 1779.153564453125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24693.729,
+      "busy_union_us": 21385.01171875,
+      "wall_us": 23139.82421875,
+      "overlap_us": 3308.7172812499994,
+      "idle_us": 1754.8125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24706.97,
+      "busy_union_us": 21391.67333984375,
+      "wall_us": 23160.3759765625,
+      "overlap_us": 3315.296660156251,
+      "idle_us": 1768.70263671875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24767.999,
+      "busy_union_us": 21401.3916015625,
+      "wall_us": 23153.047119140625,
+      "overlap_us": 3366.6073984375,
+      "idle_us": 1751.655517578125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24933.929,
+      "busy_union_us": 21378.669677734375,
+      "wall_us": 23122.597900390625,
+      "overlap_us": 3555.259322265625,
+      "idle_us": 1743.92822265625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24834.921,
+      "busy_union_us": 21427.2998046875,
+      "wall_us": 23180.967041015625,
+      "overlap_us": 3407.6211953124985,
+      "idle_us": 1753.667236328125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24660.772,
+      "busy_union_us": 21327.2314453125,
+      "wall_us": 23074.76318359375,
+      "overlap_us": 3333.540554687501,
+      "idle_us": 1747.53173828125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24799.163,
+      "busy_union_us": 21422.677001953125,
+      "wall_us": 23175.31689453125,
+      "overlap_us": 3376.4859980468755,
+      "idle_us": 1752.639892578125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25128.465,
+      "busy_union_us": 21502.58642578125,
+      "wall_us": 23228.958984375,
+      "overlap_us": 3625.87857421875,
+      "idle_us": 1726.37255859375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24774.476,
+      "busy_union_us": 21411.74169921875,
+      "wall_us": 23153.718017578125,
+      "overlap_us": 3362.7343007812487,
+      "idle_us": 1741.976318359375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24744.079,
+      "busy_union_us": 21369.2509765625,
+      "wall_us": 23116.14892578125,
+      "overlap_us": 3374.8280234375015,
+      "idle_us": 1746.89794921875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24883.391,
+      "busy_union_us": 21463.262451171875,
+      "wall_us": 23217.540771484375,
+      "overlap_us": 3420.1285488281246,
+      "idle_us": 1754.2783203125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25074.829,
+      "busy_union_us": 21454.902587890625,
+      "wall_us": 23196.251953125,
+      "overlap_us": 3619.9264121093765,
+      "idle_us": 1741.349365234375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24821.852,
+      "busy_union_us": 21436.87109375,
+      "wall_us": 23171.27197265625,
+      "overlap_us": 3384.980906249999,
+      "idle_us": 1734.40087890625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25002.55,
+      "busy_union_us": 21536.644287109375,
+      "wall_us": 23273.304931640625,
+      "overlap_us": 3465.9057128906243,
+      "idle_us": 1736.66064453125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24871.066,
+      "busy_union_us": 21461.118408203125,
+      "wall_us": 23196.93798828125,
+      "overlap_us": 3409.947591796874,
+      "idle_us": 1735.819580078125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25241.071,
+      "busy_union_us": 21556.054443359375,
+      "wall_us": 23317.931884765625,
+      "overlap_us": 3685.016556640625,
+      "idle_us": 1761.87744140625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24905.361,
+      "busy_union_us": 21500.4541015625,
+      "wall_us": 23261.60693359375,
+      "overlap_us": 3404.906898437501,
+      "idle_us": 1761.15283203125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24944.816,
+      "busy_union_us": 21491.7275390625,
+      "wall_us": 23242.39599609375,
+      "overlap_us": 3453.088460937499,
+      "idle_us": 1750.66845703125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24954.499,
+      "busy_union_us": 21475.0859375,
+      "wall_us": 23265.212890625,
+      "overlap_us": 3479.4130625,
+      "idle_us": 1790.126953125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25130.207,
+      "busy_union_us": 21488.375244140625,
+      "wall_us": 23237.931884765625,
+      "overlap_us": 3641.8317558593735,
+      "idle_us": 1749.556640625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24881.157,
+      "busy_union_us": 21448.010498046875,
+      "wall_us": 23179.561279296875,
+      "overlap_us": 3433.1465019531242,
+      "idle_us": 1731.55078125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24903.716,
+      "busy_union_us": 21478.1572265625,
+      "wall_us": 23223.8310546875,
+      "overlap_us": 3425.5587734375003,
+      "idle_us": 1745.673828125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24900.546,
+      "busy_union_us": 21487.827880859375,
+      "wall_us": 23233.323974609375,
+      "overlap_us": 3412.7181191406235,
+      "idle_us": 1745.49609375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25211.793,
+      "busy_union_us": 21544.915283203125,
+      "wall_us": 23288.66015625,
+      "overlap_us": 3666.8777167968765,
+      "idle_us": 1743.744873046875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24945.291,
+      "busy_union_us": 21490.146240234375,
+      "wall_us": 23230.9609375,
+      "overlap_us": 3455.144759765626,
+      "idle_us": 1740.814697265625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24908.075,
+      "busy_union_us": 21454.434814453125,
+      "wall_us": 23194.426025390625,
+      "overlap_us": 3453.6401855468757,
+      "idle_us": 1739.9912109375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25092.867,
+      "busy_union_us": 21569.908447265625,
+      "wall_us": 23315.736083984375,
+      "overlap_us": 3522.9585527343734,
+      "idle_us": 1745.82763671875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25136.887,
+      "busy_union_us": 21506.751953125,
+      "wall_us": 23265.573974609375,
+      "overlap_us": 3630.135046874999,
+      "idle_us": 1758.822021484375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25061.789,
+      "busy_union_us": 21580.42626953125,
+      "wall_us": 23295.93896484375,
+      "overlap_us": 3481.3627304687507,
+      "idle_us": 1715.5126953125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25129.503,
+      "busy_union_us": 21604.60791015625,
+      "wall_us": 23334.035888671875,
+      "overlap_us": 3524.8950898437506,
+      "idle_us": 1729.427978515625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24959.729,
+      "busy_union_us": 21510.19970703125,
+      "wall_us": 23270.381103515625,
+      "overlap_us": 3449.5292929687494,
+      "idle_us": 1760.181396484375
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25204.494,
+      "busy_union_us": 21530.115234375,
+      "wall_us": 23279.914306640625,
+      "overlap_us": 3674.378765624999,
+      "idle_us": 1749.799072265625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24980.476,
+      "busy_union_us": 21516.082763671875,
+      "wall_us": 23256.958251953125,
+      "overlap_us": 3464.3932363281237,
+      "idle_us": 1740.87548828125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25049.327,
+      "busy_union_us": 21553.661865234375,
+      "wall_us": 23289.969970703125,
+      "overlap_us": 3495.665134765626,
+      "idle_us": 1736.30810546875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24986.48,
+      "busy_union_us": 21526.54052734375,
+      "wall_us": 23270.98193359375,
+      "overlap_us": 3459.9394726562496,
+      "idle_us": 1744.44140625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25180.303,
+      "busy_union_us": 21513.590576171875,
+      "wall_us": 23273.759765625,
+      "overlap_us": 3666.712423828125,
+      "idle_us": 1760.169189453125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24857.239,
+      "busy_union_us": 21449.2373046875,
+      "wall_us": 23209.1689453125,
+      "overlap_us": 3408.0016953125014,
+      "idle_us": 1759.931640625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24940.256,
+      "busy_union_us": 21497.050537109375,
+      "wall_us": 23253.31494140625,
+      "overlap_us": 3443.205462890626,
+      "idle_us": 1756.264404296875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24968.574,
+      "busy_union_us": 21510.26904296875,
+      "wall_us": 23256.987060546875,
+      "overlap_us": 3458.3049570312505,
+      "idle_us": 1746.718017578125
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25266.348,
+      "busy_union_us": 21585.0380859375,
+      "wall_us": 23325.262939453125,
+      "overlap_us": 3681.309914062502,
+      "idle_us": 1740.224853515625
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 25033.951,
+      "busy_union_us": 21558.982666015625,
+      "wall_us": 23309.118896484375,
+      "overlap_us": 3474.968333984376,
+      "idle_us": 1750.13623046875
+    },
+    {
+      "label": "decode[bs=16 tok=16 d=16]",
+      "kernels": 2476,
+      "sum_us": 24899.427,
+      "busy_union_us": 21469.036376953125,
+      "wall_us": 23226.472900390625,
+      "overlap_us": 3430.3906230468747,
+      "idle_us": 1757.4365234375
+    }
+  ]
+}

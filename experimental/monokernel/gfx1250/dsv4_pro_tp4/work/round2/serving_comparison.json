@@ -1,0 +1,72 @@
+[
+  {
+    "concurrency": 64,
+    "control": {
+      "mode": "round2_control",
+      "concurrency": 64,
+      "warmup": false,
+      "mean_tpot_ms": 16.31531195307906,
+      "median_tpot_ms": 16.25242217106458,
+      "p99_tpot_ms": 16.834486534214047,
+      "mean_ttft_ms": 1036.5512619531785,
+      "median_ttft_ms": 1098.0005104993324,
+      "p99_ttft_ms": 1336.3266434500474,
+      "total_token_throughput": 7391.8803084633655,
+      "output_throughput": 3695.9401542316828,
+      "duration": 70.92755538799975,
+      "completed": 256
+    },
+    "candidate": {
+      "mode": "round2_candidate",
+      "concurrency": 64,
+      "warmup": false,
+      "mean_tpot_ms": 14.810578932070232,
+      "median_tpot_ms": 14.79630241055796,
+      "p99_tpot_ms": 15.297724793253574,
+      "mean_ttft_ms": 1043.136431968776,
+      "median_ttft_ms": 1093.2545580017177,
+      "p99_ttft_ms": 1329.51006250114,
+      "total_token_throughput": 8091.199727971278,
+      "output_throughput": 4045.599863985639,
+      "duration": 64.79731283699948,
+      "completed": 256
+    },
+    "tpot_reduction_pct": 9.222827153634972,
+    "throughput_increase_pct": 9.4606431696036
+  },
+  {
+    "concurrency": 128,
+    "control": {
+      "mode": "round2_control",
+      "concurrency": 128,
+      "warmup": false,
+      "mean_tpot_ms": 17.226216816591517,
+      "median_tpot_ms": 17.248422652492234,
+      "p99_tpot_ms": 18.300254438405055,
+      "mean_ttft_ms": 1611.1593975038047,
+      "median_ttft_ms": 1591.2246275001962,
+      "p99_ttft_ms": 2387.3039001800134,
+      "total_token_throughput": 13622.944766140634,
+      "output_throughput": 6811.472383070317,
+      "duration": 76.97131699500096,
+      "completed": 512
+    },
+    "candidate": {
+      "mode": "round2_candidate",
+      "concurrency": 128,
+      "warmup": false,
+      "mean_tpot_ms": 18.163164634834278,
+      "median_tpot_ms": 17.577937779082493,
+      "p99_tpot_ms": 21.42383742695824,
+      "mean_ttft_ms": 1565.6282380469052,
+      "median_ttft_ms": 1515.6830020005145,
+      "p99_ttft_ms": 2324.4558714002414,
+      "total_token_throughput": 13005.885036067895,
+      "output_throughput": 6502.942518033948,
+      "duration": 80.62319458399725,
+      "completed": 512
+    },
+    "tpot_reduction_pct": -5.439080607300473,
+    "throughput_increase_pct": -4.529562004878851
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "hashes_verified": 414,
+  "python_parsed": 78,
+  "shell_parsed": 25,
+  "gpu_tests_run": false,
+  "staged_source_hashes_verified": 414,
+  "staged_files": 420,
+  "model": "pro",
+  "tp": 4,
+  "note": "Original snapshot bytes preserved, including historical whitespace. No GPU execution or new model accuracy qualification."
+}

@@ -1,0 +1,186 @@
+CORRECTNESS UPDATE — 2026-10-19 upstream integration validation
+A later real Pro C8 decode input differed by one BF16 element in the split-K
+QKV projection (rank3,1/16384 elements,absolute difference0.00390625).
+The timings below are historical measurements of that earlier configuration;
+they are not performance measurements of the corrected unsplit implementation.
+The new upstream-style integration is in /home/vigokhal/ATOM-gfx1250-integration.
+Its Pro profile uses NUM_KSPLIT=1 and passed full live regional validation.
+The published old TP4 image is unchanged. To avoid its split-K QKV path, set
+ATOM_DSV4_HYBRID_GEMM=0 when using its existing launcher. The mHC/quant fusion
+and other projection tuning are independent flags. Do not infer universal
+exactness from the older sampled exact checks.
+
+DeepSeek-V4-Pro TP4 hybrid monokernel experiment
+
+Environment and workload
+Image: rocm/fw-bringup-mlperf:gfx1250-atom-20261015
+Image ID: d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a
+ATOM f19778df4054e94d64d6f6bf6dd68f5681bd5945
+AITER 7cddd8e632e8d07eebdf9e1cab7e7a9f1e8c65fe
+Four gfx1250 GPUs, TP4, EP off. Checkpoint /data/DeepSeek-V4-Pro.
+61 layers, hidden7168, HC4, q_lora1536, head_dim512, 384 experts/top6.
+BF16 KV, FP4 index cache, real routing, no prefix cache, no speculative decoding.
+Scripts derived from /app/scripts/dsv4. FAKE_EPLB=0 in both arms instead of the
+supplied synthetic routing default. ATOM_FORCE_ATTN_TRITON=1 explicitly set.
+Capture batches [1,2,4,8,16,32,64,128], max_num_seqs128 in both arms.
+Random input1024/output1024, exactly 4*C requests, concurrency C, seed0,
+ignore EOS, infinite request rate. Profile workloads use C requests/output50.
+Total tokens/s includes input plus output. Output tokens/s is also in metrics.csv.
+Results are inference serving measurements, not a model quality evaluation.
+
+Source review and boundary choice
+MoE routed/shared outputs are combined and TP-reduced, then the next layer's
+mHC post/pre path produces normalized attention input. Baseline already uses
+2 gfx1250 Gluon launches: residual mixing + split-K HC projection/square sums;
+then partial reduction + sigmoid/Sinkhorn20 + HC weighted sum + RMSNorm.
+Attention wqkv_a separately quantizes this BF16 input in groups of128.
+Compressor consumers also need the BF16 activation, including side streams.
+
+Implementation
+Extend the second existing mHC launch to emit FP8 e4m3fn payload and column-major
+E8M0 per128 scales, retaining the BF16 output. Quantization rounds the normalized
+value to BF16 first, uses HIP's ceil-power-of-two RoundUp scale and 1e-10 floor,
+and emits the exact existing consumer ABI. It removes60 quant launches/step.
+Keep stage1 and stage2 separate: kernel completion orders their partial buffers;
+no new cross-CTA flags, peer mailboxes, epochs or cross-rank synchronization.
+Each epilogue CTA owns whole rows. Maximum supported fused rows128.
+
+For wqkv_a [N2048,K7168], use the existing public AITER gfx1250 Gluon
+bandwidth-bound preshuffled FP8 GEMM through64 rows. It uses existing tuned JSON
+configurations and adds a split-K reduction launch. No weight repacking or MoE
+changes. Above64 rows, retain baseline GEMM because M128 microbench regressed.
+The retained projection consumes [M,K] FP8, column-major activation scale bytes,
+[N,K] preshuffled FP8 weights and [N/128,K/128] E8M0 weight scales; it overwrites
+BF16 output after its partial reduction. Original attention side streams remain.
+Kernel count rises by1/step overall: remove60 quant launches, add61 split reductions.
+This is a hybrid implementation, not a fully fused attention+MoE layer kernel.
+
+Integration and fallback
+ATOM_DSV4_HYBRID=1 enables fused mHC/quant, ATOM_DSV4_HYBRID_GEMM=1 also enables
+projection dispatch. Both default off. ATOM_DSV4_HYBRID_MAX_TOKENS caps fusion
+at128. Eligibility guards require gfx1250, HC4, supported hidden dimensions,
+FP8 E8M0 preshuffled dense weights, and full-graph mode. Unsupported contracts
+retain baseline. Concrete row dispatch occurs inside opaque custom ops so the
+large compile warmup cannot specialize away decode paths. Large-row mHC uses
+original post/pre plus original HIP quant. Projection >64 uses original GEMM.
+ATOM_DSV4_HYBRID_CHECK=1 checks first16 eligible calls per rank outside capture.
+
+Validation
+17 original-baseline golden cases passed bitwise for all6 outputs, including
+plain/shuffled residuals, odd rows, zeros, C4096/C7168, repeated calls and3 graph
+replays. Projection synthetic tests at1,8,16,32,64,128 rows were bitwise equal.
+Final server passed16 exact real-weight mHC and16 exact projection comparisons
+on each of4 ranks (8 completion markers in hybrid-final-launch.log).
+No added scratch spills: fused C7168 epilogue85 VGPR vs84 baseline, unchanged
+65,636-byte LDS, scratch0. Some baseline variants use86 VGPR.
+Static syntax and focused Ruff checks passed. Patches reverse-dry-run cleanly
+against installed experiment source.
+
+Profiling method and evidence
+Walk GPU forward annotations backward from trace end until last prefill/mixed
+prefill. Aggregate every contained GPU kernel across all50 pure decode steps;
+do not infer boundaries from CPU launch timestamps. Full names, counts,
+mean/median/min/max and total microseconds are in analysis/*/kernels.csv.
+Capture-trace mapping attributes kernels to model operators in operators.csv.
+GPU union time accounts for overlapping streams; summed durations do not equal
+critical-path latency. Every TP rank is analyzed.
+Final profiles show3000 fused mHC epilogues over50 steps per rank (60/step),
+plus3050 split-K projection/reduction pairs (61/step), at concurrency16 and64.
+Rank0 profiled decode wall: c16 24.232->17.939ms; c64 23.983->17.544ms.
+These are profiled diagnostics, not the final serving latency metrics.
+
+Microbenchmarks (five alternating graph replay samples, median)
+Rows      mHC+quant baseline->fused us     projection baseline->Gluon us
+1         7.288 -> 5.666                  46.305 -> 3.444
+8         7.858 -> 6.273                  46.227 -> 4.924
+16        8.828 -> 6.481                  46.323 -> 5.252
+32        8.906 -> 6.831                   5.328 -> 4.798
+64       10.151 -> 7.361                  44.076 -> 5.550
+128      10.149 -> 8.623                   6.044 -> 7.845 (rejected)
+The large low-row serving gain includes projection kernel selection; it should
+not be attributed to elementwise fusion alone.
+
+Experiment caveats and rejected attempts
+Initial graph256 warmup failed with HIP200 invalid device image in topk;
+standalone reproduction passed. Separate cache and128 maximum were used for
+both measured arms. See design-log.txt and startup logs.
+The first hybrid_quant serving attempt specialized away the new path during
+outer-model row dispatch. Its traces have FUSE_QUANT_0 only; those measurements
+are explicitly excluded as hybrid evidence. Final traces use FUSE_QUANT_1.
+Kit s_memrealtime probe was unsupported; the wall-clock port was inconclusive.
+No host-descheduling claims are based on that probe.
+
+Reproduction and artifacts
+Run install.sh in a fresh requested image with this folder mounted /work;
+patches modify AITER and ATOM only. See serve.sh and run_bench.sh for exact args.
+Set FAKE_EPLB=0 ATOM_FORCE_ATTN_TRITON=1 TRITON_CACHE_DIR=/work/triton-cache.
+Hybrid: ATOM_DSV4_HYBRID=1 ATOM_DSV4_HYBRID_GEMM=1.
+Control: both flags0. Use distinct ATOM compile caches for changing modes.
+TRACE=1 TRACE_DIR=/work/traces/<mode> enables profiler endpoints; --profile
+is used only for diagnostic runs. Keep GPU execution exclusive across runs.
+Raw results and logs remain under results/ and logs/. Full traces in traces/.
+Metrics summary and serving comparisons are recorded below after completion.
+
+Image-specific setup: the SDK contained libamdhip64.so.7 but lacked the linker
+name. Create libamdhip64.so -> libamdhip64.so.7 under
+/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib inside the container.
+Launch Python from /work; /app shadows the installed aiter package with a source
+namespace directory. Keep /data mounted read-only and disable core dumps.
+Existing projection configuration is copied to projection-config.original.json
+for provenance; the implementation reads AITER's normal configuration loader.
+
+Final hybrid deterministic generation: four fixed prompts, temperature0, seed0,
+max64 tokens. All four texts and completion token counts match the original
+baseline exactly. See completion_validation.json and results/*completions.json.
+This is a smoke test, not a comprehensive task-quality evaluation.
+Control-repeat trace validation: all8 traces have zero fused-quant calls and
+baseline kernel counts. Rank0 wall c16=24.339ms, c64=23.990ms, close to the
+original baseline24.232ms/23.983ms. All8 final hybrid traces remove exactly60
+HIP group-quant launches per decode step. See trace_engagement_validation.json.
+
+SERVING RESULTS
+Comparison uses the matched baseline_recheck control versus final hybrid.
+Mean TPOT/TTFT in milliseconds; total throughput includes input+output.
+ C | baseline TPOT -> hybrid | baseline TTFT -> hybrid | total tok/s baseline -> hybrid | TPOT reduction
+  1 | 20.896 -> 14.649 | 270.65 -> 275.83 | 94.61 -> 134.19 | 29.90%
+  8 | 21.548 -> 15.310 | 494.71 -> 487.43 | 726.90 -> 1014.40 | 28.95%
+ 16 | 22.275 -> 16.170 | 500.40 -> 489.02 | 1406.98 -> 1923.76 | 27.41%
+ 32 | 11.747 -> 11.340 | 705.92 -> 697.44 | 5149.71 -> 5327.59 | 3.46%
+ 64 | 22.269 -> 16.380 | 1040.73 -> 1026.07 | 5500.95 -> 7368.59 | 26.44%
+128 | 17.237 -> 17.162 | 1587.23 -> 1571.38 | 13631.84 -> 13697.87 | 0.44%
+
+All runs, including medians and the original baseline:
+mode,C,mean_TPOT,median_TPOT,mean_TTFT,median_TTFT,total_tok_s
+baseline,1,21.003,21.004,246.976,248.758,94.232
+baseline,8,21.638,21.657,894.753,453.383,711.346
+baseline,16,24.987,22.500,496.917,500.388,1257.388
+baseline,32,11.895,11.882,696.595,661.058,5092.990
+baseline,64,22.247,22.264,1030.398,982.444,5508.636
+baseline,128,18.023,18.064,1594.469,1518.668,13080.146
+baseline_recheck,1,20.896,20.888,270.652,243.624,94.606
+baseline_recheck,8,21.548,21.550,494.711,464.175,726.903
+baseline_recheck,16,22.275,22.273,500.399,502.702,1406.979
+baseline_recheck,32,11.747,11.790,705.925,678.558,5149.711
+baseline_recheck,64,22.269,22.231,1040.731,997.367,5500.950
+baseline_recheck,128,17.237,17.222,1587.235,1516.774,13631.836
+hybrid,1,14.649,14.657,275.834,247.793,134.187
+hybrid,8,15.310,15.320,487.426,460.740,1014.398
+hybrid,16,16.170,16.188,489.023,491.112,1923.756
+hybrid,32,11.340,11.341,697.443,663.762,5327.592
+hybrid,64,16.380,16.358,1026.068,984.091,7368.587
+hybrid,128,17.162,17.085,1571.377,1514.797,13697.866
+
+Each hybrid point is one completed run; controls were measured twice. These
+are observations on this image/workload, not confidence intervals or broad
+model-quality claims. Original c8 TTFT included a large tail; original c16 TPOT
+also varied materially. All raw runs are retained, rather than selecting the
+best result per concurrency. Profile latency is reported separately above.
+
+Interpretation: matched-repeat TPOT gains are29.90%,28.95%,27.41%,3.46%,
+26.44%,0.44% at concurrency1,8,16,32,64,128 respectively. Concurrency128 is
+effectively flat at this measurement precision; its larger apparent gain
+against the original baseline did not survive the control repeat. TTFT changes
+are small, with a slight regression at concurrency1. No statistical confidence
+claim is made for the smaller changes. The final control's four deterministic
+completions also match the hybrid exactly. Servers were stopped after testing;
+the modified container remains available with no KFD processes running.

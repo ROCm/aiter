@@ -1,0 +1,13 @@
+{
+  "exact_keys_reaching_16": 598,
+  "regions": {
+    "wqkv_a": 86,
+    "wq_b": 86,
+    "wo_b": 86,
+    "shared.gate_up_proj": 86,
+    "shared.w2": 86,
+    "mhc": 126,
+    "indexer.wq_b": 42
+  },
+  "errors": 0
+}

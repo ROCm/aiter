@@ -1,0 +1,15 @@
+Name:      docker.io/rocm/fw-bringup:gfx1250-atom-20261018-mk_tp
+MediaType: application/vnd.oci.image.index.v1+json
+Digest:    sha256:603780dba9d6ee5f96b21833281656304c15ae07ddec5879dac2ff65e266044e
+           
+Manifests: 
+  Name:        docker.io/rocm/fw-bringup:gfx1250-atom-20261018-mk_tp@sha256:ec43efb1336a051ae515daeb019b4d30f468ccbca614656d90ebe0efa071cb35
+  MediaType:   application/vnd.oci.image.manifest.v1+json
+  Platform:    linux/amd64
+               
+  Name:        docker.io/rocm/fw-bringup:gfx1250-atom-20261018-mk_tp@sha256:1e658d7bf6b9d896c191ae1fa5ec77e78b70b26b2c46ed0be28cf97ca6e62722
+  MediaType:   application/vnd.oci.image.manifest.v1+json
+  Platform:    unknown/unknown
+  Annotations: 
+    vnd.docker.reference.digest: sha256:ec43efb1336a051ae515daeb019b4d30f468ccbca614656d90ebe0efa071cb35
+    vnd.docker.reference.type:   attestation-manifest

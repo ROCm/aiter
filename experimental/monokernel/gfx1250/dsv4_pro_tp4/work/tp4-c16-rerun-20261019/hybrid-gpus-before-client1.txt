@@ -1,0 +1,18 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID   	PROCESS NAME	GPU(s)	VRAM USED   	SDMA USED	CU OCCUPANCY	
+935456	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+911273	UNKNOWN     	1     	374381572096	0        	UNKNOWN     	
+935953	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+911276	UNKNOWN     	1     	374381572096	0        	UNKNOWN     	
+910696	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+935777	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+911274	UNKNOWN     	1     	372320071680	0        	UNKNOWN     	
+908271	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+935458	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+911275	UNKNOWN     	1     	374381572096	0        	UNKNOWN     	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

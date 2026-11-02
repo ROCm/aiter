@@ -1,0 +1,337 @@
+[
+  {
+    "shape": "64,16384,1536",
+    "config": {
+      "BLOCK_SIZE_M": 64,
+      "BLOCK_SIZE_N": 64,
+      "BLOCK_SIZE_K": 256,
+      "CTAS_M": 1,
+      "CTAS_N": 2,
+      "GROUP_SIZE_M": 1,
+      "NUM_KSPLIT": 1,
+      "num_warps": 2,
+      "waves_per_eu": 1,
+      "NUM_BUFFERS": 5,
+      "cache_modifier": null,
+      "LOOP_UNROLL_FACTOR": 1,
+      "B_SCALE_TDM": true,
+      "kernel_type": "bandwidth_bound",
+      "L2_PREFETCH_DISTANCE": 0
+    },
+    "compiled_matches": [
+      {
+        "cache": "WMHPNR22V46QQ4DGYPXO3E4UD4AFWZOO4OG3EVQRZL6Z5JF324CQ",
+        "shared": 169984,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 288,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 3,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "VDDU3CTJQJKH3XCJ5NRR343XIFWD6TW2CHPTUHPK3UJ6F2TK2DLA",
+        "shared": 169984,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 288,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 3,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "4UHLQZMZFKNUQYSXBVGZSBJ6KMLRRZOLV45D4MCS4DUIC3MK7Z4A",
+        "shared": 169984,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 288,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 3,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      }
+    ]
+  },
+  {
+    "shape": "128,16384,1536",
+    "config": {
+      "BLOCK_SIZE_M": 64,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 256,
+      "CTAS_M": 1,
+      "CTAS_N": 1,
+      "GROUP_SIZE_M": 1,
+      "NUM_KSPLIT": 1,
+      "num_warps": 4,
+      "waves_per_eu": 0,
+      "NUM_BUFFERS": 4,
+      "cache_modifier": null,
+      "LOOP_UNROLL_FACTOR": 4,
+      "B_SCALE_TDM": true,
+      "kernel_type": "bandwidth_bound",
+      "L2_PREFETCH_DISTANCE": 0
+    },
+    "compiled_matches": [
+      {
+        "cache": "R2KU6Q2WQDSE3SH4D76JTN6OHQZIDTQI7SCKOFWP5GO4D57VASMA",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 319,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 10,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "M5PL2IPFRE7AD5Q7DJKHOGPP7I66TUKHFYZTHC5R7POX6REHKEUQ",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 314,
+          "sgpr_count": 97,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "D2G3F4UBZBINCHSP4BYTMYSRDJ6ILXC2C7SZUEMZFNOYLS25EFRQ",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 319,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 10,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "R4HOYSYOV47VYERQVSUBRAXVEK6GCHORHAP7YGBGMMLMKF6OMIKQ",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 314,
+          "sgpr_count": 97,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "SDSPHKWWIXUMXZ4ACLA4SGXGS5335TYM44XQC56HY73OAYNZYRCA",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 314,
+          "sgpr_count": 97,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "QHGA2TKDZPZKTWS3K3UKDJIYG5O3TTDMOFGN26NFIO7UCFUFUDMA",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 319,
+          "sgpr_count": 107,
+          "sgpr_spill_count": 10,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      }
+    ]
+  },
+  {
+    "shape": "64,8192,1536",
+    "config": {
+      "BLOCK_SIZE_M": 32,
+      "BLOCK_SIZE_N": 64,
+      "BLOCK_SIZE_K": 256,
+      "CTAS_M": 2,
+      "CTAS_N": 2,
+      "GROUP_SIZE_M": 1,
+      "NUM_KSPLIT": 1,
+      "num_warps": 4,
+      "waves_per_eu": 0,
+      "NUM_BUFFERS": 5,
+      "cache_modifier": ".ca",
+      "LOOP_UNROLL_FACTOR": 1,
+      "B_SCALE_TDM": true,
+      "kernel_type": "bandwidth_bound",
+      "L2_PREFETCH_DISTANCE": 0
+    },
+    "compiled_matches": [
+      {
+        "cache": "L3I4ZS6HOTYMMPAYTIDI3ZFPPYAMLCCA4SZPR63TO7LNR4RGDGXQ",
+        "shared": 125952,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 133,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "6YJFFLW5TZCQKPCW3TCPE24RLZURFTJHXWNOLQKHJTX4WX53OB6A",
+        "shared": 125952,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 133,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "UBOO24QNCR2TUUWNSR35CHIBD7XKIYHUNMTN3TXR2BSFENE4E73Q",
+        "shared": 125952,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 133,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      }
+    ]
+  },
+  {
+    "shape": "128,8192,1536",
+    "config": {
+      "BLOCK_SIZE_M": 64,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 256,
+      "CTAS_M": 1,
+      "CTAS_N": 1,
+      "GROUP_SIZE_M": 1,
+      "NUM_KSPLIT": 1,
+      "num_warps": 4,
+      "waves_per_eu": 0,
+      "NUM_BUFFERS": 4,
+      "cache_modifier": null,
+      "LOOP_UNROLL_FACTOR": 1,
+      "B_SCALE_TDM": true,
+      "kernel_type": "bandwidth_bound",
+      "L2_PREFETCH_DISTANCE": 0
+    },
+    "compiled_matches": [
+      {
+        "cache": "F2HWDSW5PF4X2OGIHMOXWI7J5WYFQRMMDLU7EAZ7CKCQCVU6UL6Q",
+        "shared": 204848,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 92,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "DI5UFCTGLAVKWJKOZ5WULQRXQ4MQWNORJE6CNJLRQ42VTKQMDBCA",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 88,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "OT3SGEKQA3DUVBLCUQKOY4YYWXEV4H6E7GVQETA76KQZBTYKCSPQ",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 88,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "BFEDT5QGDVDWCOUTW7F3ZBEJHIOOA6DXF3UNHOVCDCRNZNTXD64A",
+        "shared": 201728,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 88,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "3E5GE6JVY2FXDNC2NP2HFVWSUEDUZSSWYKU3BB5WN5VIYDJNBEVA",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 96,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "ITQ5BCWAAR4MKK6XAHBHTOXUAUSRQ24NWKQJ2MHL5QYQRZ2DHXPQ",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 96,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      },
+      {
+        "cache": "5WXL7S75OFR4JCRXGZJCQEE34Y6VBGH5DVPMRSSJHW4ODSZFGIMQ",
+        "shared": 202768,
+        "resources": {
+          "group_segment_fixed_size": 0,
+          "private_segment_fixed_size": 0,
+          "vgpr_count": 274,
+          "sgpr_count": 96,
+          "sgpr_spill_count": 0,
+          "vgpr_spill_count": 0
+        },
+        "multicast_instructions": []
+      }
+    ]
+  }
+]

@@ -1,0 +1,3002 @@
+{
+  "1": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.3164,
+        "tpot_s": 0.1448,
+        "latency_s": 4.6475
+      }
+    }
+  ],
+  "8": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.3754,
+        "tpot_s": 0.154,
+        "latency_s": 3.9172
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5817,
+        "tpot_s": 0.145,
+        "latency_s": 3.9164
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5814,
+        "tpot_s": 0.145,
+        "latency_s": 3.9161
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5812,
+        "tpot_s": 0.145,
+        "latency_s": 3.9159
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5784,
+        "tpot_s": 0.145,
+        "latency_s": 3.9131
+      }
+    },
+    {
+      "index": 5,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5789,
+        "tpot_s": 0.145,
+        "latency_s": 3.9137
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5786,
+        "tpot_s": 0.145,
+        "latency_s": 3.9133
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.5782,
+        "tpot_s": 0.145,
+        "latency_s": 3.913
+      }
+    }
+  ],
+  "16": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4535,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1133
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. This is because 18 * 23 = 18 * (20 +",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.2208,
+        "tpot_s": 0.1258,
+        "latency_s": 4.1136
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.452,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1119
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.453,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1129
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4515,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1114
+      }
+    },
+    {
+      "index": 5,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4511,
+        "tpot_s": 0.1156,
+        "latency_s": 4.111
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4506,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1105
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.45,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1099
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4495,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1095
+      }
+    },
+    {
+      "index": 9,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4491,
+        "tpot_s": 0.1156,
+        "latency_s": 4.109
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4483,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1082
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4477,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1077
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.448,
+        "tpot_s": 0.1156,
+        "latency_s": 4.108
+      }
+    },
+    {
+      "index": 13,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.447,
+        "tpot_s": 0.1156,
+        "latency_s": 4.107
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4467,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1068
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4464,
+        "tpot_s": 0.1156,
+        "latency_s": 4.1065
+      }
+    }
+  ],
+  "32": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6136,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0841
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. This is because 18 * 20 = 360 and 18 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.4149,
+        "tpot_s": 0.1161,
+        "latency_s": 3.0847
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6137,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0841
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6132,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0837
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6113,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0818
+      }
+    },
+    {
+      "index": 5,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6118,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0823
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6096,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0801
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6113,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0819
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6109,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0814
+      }
+    },
+    {
+      "index": 9,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.61,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0805
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6091,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0797
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6088,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0794
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6079,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0785
+      }
+    },
+    {
+      "index": 13,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6086,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0792
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6075,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0782
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6072,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0778
+      }
+    },
+    {
+      "index": 16,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6068,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0774
+      }
+    },
+    {
+      "index": 17,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6059,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0766
+      }
+    },
+    {
+      "index": 18,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6056,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0762
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6052,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0759
+      }
+    },
+    {
+      "index": 20,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6049,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0756
+      }
+    },
+    {
+      "index": 21,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6043,
+        "tpot_s": 0.1074,
+        "latency_s": 3.075
+      }
+    },
+    {
+      "index": 22,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6045,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0752
+      }
+    },
+    {
+      "index": 23,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.604,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0747
+      }
+    },
+    {
+      "index": 24,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6036,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0744
+      }
+    },
+    {
+      "index": 25,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6034,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0741
+      }
+    },
+    {
+      "index": 26,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6026,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0734
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6029,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0736
+      }
+    },
+    {
+      "index": 28,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6024,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0731
+      }
+    },
+    {
+      "index": 29,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6021,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0729
+      }
+    },
+    {
+      "index": 30,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6016,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0725
+      }
+    },
+    {
+      "index": 31,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 0.6014,
+        "tpot_s": 0.1074,
+        "latency_s": 3.0722
+      }
+    }
+  ],
+  "64": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6783,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1519
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.4328,
+        "tpot_s": 0.1182,
+        "latency_s": 4.1519
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6755,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1492
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6771,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1507
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6771,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1507
+      }
+    },
+    {
+      "index": 5,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6755,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1492
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6751,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1488
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6743,
+        "tpot_s": 0.1075,
+        "latency_s": 4.148
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6735,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1472
+      }
+    },
+    {
+      "index": 9,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6726,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1463
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6718,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1455
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6708,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1446
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.67,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1438
+      }
+    },
+    {
+      "index": 13,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6714,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1452
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6694,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1433
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6691,
+        "tpot_s": 0.1075,
+        "latency_s": 4.143
+      }
+    },
+    {
+      "index": 16,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6689,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1427
+      }
+    },
+    {
+      "index": 17,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6686,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1425
+      }
+    },
+    {
+      "index": 18,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6682,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1421
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6675,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1415
+      }
+    },
+    {
+      "index": 20,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6672,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1412
+      }
+    },
+    {
+      "index": 21,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6679,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1418
+      }
+    },
+    {
+      "index": 22,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6668,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1408
+      }
+    },
+    {
+      "index": 23,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6666,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1406
+      }
+    },
+    {
+      "index": 24,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6663,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1403
+      }
+    },
+    {
+      "index": 25,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6661,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1401
+      }
+    },
+    {
+      "index": 26,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6657,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1397
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6653,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1393
+      }
+    },
+    {
+      "index": 28,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6631,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1373
+      }
+    },
+    {
+      "index": 29,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6641,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1381
+      }
+    },
+    {
+      "index": 30,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6638,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1378
+      }
+    },
+    {
+      "index": 31,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6633,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1374
+      }
+    },
+    {
+      "index": 32,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6624,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1366
+      }
+    },
+    {
+      "index": 33,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6622,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1363
+      }
+    },
+    {
+      "index": 34,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.662,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1362
+      }
+    },
+    {
+      "index": 35,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6617,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1359
+      }
+    },
+    {
+      "index": 36,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6613,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1355
+      }
+    },
+    {
+      "index": 37,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.661,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1352
+      }
+    },
+    {
+      "index": 38,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6601,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1344
+      }
+    },
+    {
+      "index": 39,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6604,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1346
+      }
+    },
+    {
+      "index": 40,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6599,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1341
+      }
+    },
+    {
+      "index": 41,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6595,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1338
+      }
+    },
+    {
+      "index": 42,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6587,
+        "tpot_s": 0.1075,
+        "latency_s": 4.133
+      }
+    },
+    {
+      "index": 43,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6591,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1334
+      }
+    },
+    {
+      "index": 44,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6584,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1327
+      }
+    },
+    {
+      "index": 45,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6574,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1318
+      }
+    },
+    {
+      "index": 46,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6579,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1323
+      }
+    },
+    {
+      "index": 47,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6572,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1316
+      }
+    },
+    {
+      "index": 48,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6569,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1313
+      }
+    },
+    {
+      "index": 49,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6567,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1311
+      }
+    },
+    {
+      "index": 50,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6564,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1308
+      }
+    },
+    {
+      "index": 51,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6557,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1302
+      }
+    },
+    {
+      "index": 52,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6559,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1303
+      }
+    },
+    {
+      "index": 53,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6549,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1293
+      }
+    },
+    {
+      "index": 54,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6545,
+        "tpot_s": 0.1075,
+        "latency_s": 4.129
+      }
+    },
+    {
+      "index": 55,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6543,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1288
+      }
+    },
+    {
+      "index": 56,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6539,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1284
+      }
+    },
+    {
+      "index": 57,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6535,
+        "tpot_s": 0.1075,
+        "latency_s": 4.128
+      }
+    },
+    {
+      "index": 58,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6533,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1278
+      }
+    },
+    {
+      "index": 59,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.653,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1275
+      }
+    },
+    {
+      "index": 60,
+      "text": " 21 times 23 is 483. This is because 20 times 23 is 460, and 1",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6527,
+        "tpot_s": 0.1075,
+        "latency_s": 4.1273
+      }
+    },
+    {
+      "index": 61,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6215,
+        "tpot_s": 0.1075,
+        "latency_s": 4.0961
+      }
+    },
+    {
+      "index": 62,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6217,
+        "tpot_s": 0.1075,
+        "latency_s": 4.0963
+      }
+    },
+    {
+      "index": 63,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 1.6214,
+        "tpot_s": 0.1075,
+        "latency_s": 4.0959
+      }
+    }
+  ],
+  "128": [
+    {
+      "index": 0,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1263,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8045
+      }
+    },
+    {
+      "index": 1,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1267,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8049
+      }
+    },
+    {
+      "index": 2,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0031,
+        "tpot_s": 0.1218,
+        "latency_s": 4.8048
+      }
+    },
+    {
+      "index": 3,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1263,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8045
+      }
+    },
+    {
+      "index": 4,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1249,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8032
+      }
+    },
+    {
+      "index": 5,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1247,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8029
+      }
+    },
+    {
+      "index": 6,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1232,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8015
+      }
+    },
+    {
+      "index": 7,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1237,
+        "tpot_s": 0.1164,
+        "latency_s": 4.802
+      }
+    },
+    {
+      "index": 8,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1235,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8018
+      }
+    },
+    {
+      "index": 9,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1228,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8011
+      }
+    },
+    {
+      "index": 10,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1217,
+        "tpot_s": 0.1164,
+        "latency_s": 4.8
+      }
+    },
+    {
+      "index": 11,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1213,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7996
+      }
+    },
+    {
+      "index": 12,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1211,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7994
+      }
+    },
+    {
+      "index": 13,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1201,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7985
+      }
+    },
+    {
+      "index": 14,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1189,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7973
+      }
+    },
+    {
+      "index": 15,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1182,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7967
+      }
+    },
+    {
+      "index": 16,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1166,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7951
+      }
+    },
+    {
+      "index": 17,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1176,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7961
+      }
+    },
+    {
+      "index": 18,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1171,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7956
+      }
+    },
+    {
+      "index": 19,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1158,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7944
+      }
+    },
+    {
+      "index": 20,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1162,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7947
+      }
+    },
+    {
+      "index": 21,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1156,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7941
+      }
+    },
+    {
+      "index": 22,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1144,
+        "tpot_s": 0.1164,
+        "latency_s": 4.793
+      }
+    },
+    {
+      "index": 23,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1141,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7927
+      }
+    },
+    {
+      "index": 24,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1137,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7923
+      }
+    },
+    {
+      "index": 25,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1128,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7914
+      }
+    },
+    {
+      "index": 26,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1134,
+        "tpot_s": 0.1164,
+        "latency_s": 4.792
+      }
+    },
+    {
+      "index": 27,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1124,
+        "tpot_s": 0.1164,
+        "latency_s": 4.791
+      }
+    },
+    {
+      "index": 28,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1121,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7907
+      }
+    },
+    {
+      "index": 29,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1117,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7903
+      }
+    },
+    {
+      "index": 30,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1112,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7899
+      }
+    },
+    {
+      "index": 31,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1108,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7895
+      }
+    },
+    {
+      "index": 32,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1102,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7889
+      }
+    },
+    {
+      "index": 33,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1098,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7885
+      }
+    },
+    {
+      "index": 34,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1095,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7882
+      }
+    },
+    {
+      "index": 35,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1089,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7876
+      }
+    },
+    {
+      "index": 36,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1081,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7868
+      }
+    },
+    {
+      "index": 37,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1086,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7874
+      }
+    },
+    {
+      "index": 38,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1077,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7865
+      }
+    },
+    {
+      "index": 39,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1072,
+        "tpot_s": 0.1164,
+        "latency_s": 4.786
+      }
+    },
+    {
+      "index": 40,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1068,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7856
+      }
+    },
+    {
+      "index": 41,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1064,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7852
+      }
+    },
+    {
+      "index": 42,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1061,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7849
+      }
+    },
+    {
+      "index": 43,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1054,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7843
+      }
+    },
+    {
+      "index": 44,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1034,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7823
+      }
+    },
+    {
+      "index": 45,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1039,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7827
+      }
+    },
+    {
+      "index": 46,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1036,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7825
+      }
+    },
+    {
+      "index": 47,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1031,
+        "tpot_s": 0.1164,
+        "latency_s": 4.782
+      }
+    },
+    {
+      "index": 48,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1019,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7808
+      }
+    },
+    {
+      "index": 49,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1026,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7815
+      }
+    },
+    {
+      "index": 50,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1016,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7806
+      }
+    },
+    {
+      "index": 51,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1013,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7803
+      }
+    },
+    {
+      "index": 52,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.101,
+        "tpot_s": 0.1164,
+        "latency_s": 4.78
+      }
+    },
+    {
+      "index": 53,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1006,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7796
+      }
+    },
+    {
+      "index": 54,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.1002,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7792
+      }
+    },
+    {
+      "index": 55,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0996,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7787
+      }
+    },
+    {
+      "index": 56,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0989,
+        "tpot_s": 0.1164,
+        "latency_s": 4.778
+      }
+    },
+    {
+      "index": 57,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0993,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7783
+      }
+    },
+    {
+      "index": 58,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0978,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7769
+      }
+    },
+    {
+      "index": 59,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0986,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7776
+      }
+    },
+    {
+      "index": 60,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0981,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7772
+      }
+    },
+    {
+      "index": 61,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0974,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7765
+      }
+    },
+    {
+      "index": 62,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0969,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7761
+      }
+    },
+    {
+      "index": 63,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0965,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7757
+      }
+    },
+    {
+      "index": 64,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.096,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7751
+      }
+    },
+    {
+      "index": 65,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0957,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7749
+      }
+    },
+    {
+      "index": 66,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0947,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7739
+      }
+    },
+    {
+      "index": 67,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0953,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7745
+      }
+    },
+    {
+      "index": 68,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0944,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7736
+      }
+    },
+    {
+      "index": 69,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0937,
+        "tpot_s": 0.1164,
+        "latency_s": 4.773
+      }
+    },
+    {
+      "index": 70,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0941,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7734
+      }
+    },
+    {
+      "index": 71,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.0931,
+        "tpot_s": 0.1164,
+        "latency_s": 4.7724
+      }
+    },
+    {
+      "index": 72,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3403,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7721
+      }
+    },
+    {
+      "index": 73,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3401,
+        "tpot_s": 0.1057,
+        "latency_s": 4.772
+      }
+    },
+    {
+      "index": 74,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3398,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7716
+      }
+    },
+    {
+      "index": 75,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3391,
+        "tpot_s": 0.1057,
+        "latency_s": 4.771
+      }
+    },
+    {
+      "index": 76,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3388,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7706
+      }
+    },
+    {
+      "index": 77,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3384,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7703
+      }
+    },
+    {
+      "index": 78,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3381,
+        "tpot_s": 0.1057,
+        "latency_s": 4.77
+      }
+    },
+    {
+      "index": 79,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3378,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7697
+      }
+    },
+    {
+      "index": 80,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3373,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7692
+      }
+    },
+    {
+      "index": 81,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3369,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7689
+      }
+    },
+    {
+      "index": 82,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3365,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7684
+      }
+    },
+    {
+      "index": 83,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.336,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7679
+      }
+    },
+    {
+      "index": 84,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3356,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7676
+      }
+    },
+    {
+      "index": 85,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3345,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7665
+      }
+    },
+    {
+      "index": 86,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3342,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7662
+      }
+    },
+    {
+      "index": 87,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3339,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7659
+      }
+    },
+    {
+      "index": 88,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3331,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7651
+      }
+    },
+    {
+      "index": 89,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3336,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7656
+      }
+    },
+    {
+      "index": 90,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3329,
+        "tpot_s": 0.1057,
+        "latency_s": 4.765
+      }
+    },
+    {
+      "index": 91,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3323,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7644
+      }
+    },
+    {
+      "index": 92,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3321,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7642
+      }
+    },
+    {
+      "index": 93,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3318,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7639
+      }
+    },
+    {
+      "index": 94,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3314,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7635
+      }
+    },
+    {
+      "index": 95,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3308,
+        "tpot_s": 0.1057,
+        "latency_s": 4.763
+      }
+    },
+    {
+      "index": 96,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3306,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7627
+      }
+    },
+    {
+      "index": 97,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3303,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7625
+      }
+    },
+    {
+      "index": 98,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3298,
+        "tpot_s": 0.1057,
+        "latency_s": 4.762
+      }
+    },
+    {
+      "index": 99,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3295,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7617
+      }
+    },
+    {
+      "index": 100,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3289,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7611
+      }
+    },
+    {
+      "index": 101,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3286,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7608
+      }
+    },
+    {
+      "index": 102,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3283,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7605
+      }
+    },
+    {
+      "index": 103,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3277,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7599
+      }
+    },
+    {
+      "index": 104,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3274,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7597
+      }
+    },
+    {
+      "index": 105,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3271,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7594
+      }
+    },
+    {
+      "index": 106,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3268,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7591
+      }
+    },
+    {
+      "index": 107,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3265,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7588
+      }
+    },
+    {
+      "index": 108,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3263,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7586
+      }
+    },
+    {
+      "index": 109,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3255,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7579
+      }
+    },
+    {
+      "index": 110,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3259,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7582
+      }
+    },
+    {
+      "index": 111,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3252,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7575
+      }
+    },
+    {
+      "index": 112,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3247,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7571
+      }
+    },
+    {
+      "index": 113,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3244,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7568
+      }
+    },
+    {
+      "index": 114,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.324,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7564
+      }
+    },
+    {
+      "index": 115,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3229,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7554
+      }
+    },
+    {
+      "index": 116,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3236,
+        "tpot_s": 0.1057,
+        "latency_s": 4.756
+      }
+    },
+    {
+      "index": 117,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3226,
+        "tpot_s": 0.1057,
+        "latency_s": 4.755
+      }
+    },
+    {
+      "index": 118,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3224,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7548
+      }
+    },
+    {
+      "index": 119,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3221,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7546
+      }
+    },
+    {
+      "index": 120,
+      "text": " 17 times 23 is 391. This is because 17 times 20 is 340, and 17",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3218,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7542
+      }
+    },
+    {
+      "index": 121,
+      "text": " 18 times 23 is 414. This is because 18 times 20 is 360, and 18",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3211,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7536
+      }
+    },
+    {
+      "index": 122,
+      "text": " 19 times 23 is 437. This is because 19 times 20 is 380, and 19",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3208,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7533
+      }
+    },
+    {
+      "index": 123,
+      "text": " 20 times 23 is 460. This is because 20 times 23 is the same as 20 *",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3201,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7526
+      }
+    },
+    {
+      "index": 124,
+      "text": " 21 times 23 is 483. This is because 21 times 20 is 420, and 21",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3197,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7522
+      }
+    },
+    {
+      "index": 125,
+      "text": " 22 times 23 is 506. This is because 22 times 20 is 440, and 22",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3192,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7518
+      }
+    },
+    {
+      "index": 126,
+      "text": " 23 times 23 is 529. This is because 23 times 20 is 460, and 23",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.319,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7515
+      }
+    },
+    {
+      "index": 127,
+      "text": " 24 times 23 is 552. This is because 24 times 20 is 480, and 24",
+      "usage": {
+        "prompt_tokens": 229,
+        "completion_tokens": 24,
+        "total_tokens": 253,
+        "ttft_s": 2.3189,
+        "tpot_s": 0.1057,
+        "latency_s": 4.7514
+      }
+    }
+  ]
+}

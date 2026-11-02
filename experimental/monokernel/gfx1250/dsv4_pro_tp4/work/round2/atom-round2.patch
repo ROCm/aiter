@@ -1,0 +1,168 @@
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -408,6 +408,13 @@
+     prefix: str = "",
+     mxscale_shuffle: bool = False,
+ ) -> torch.Tensor:
++    from atom.model_ops.dsv4_hybrid import try_dsv4_attention_projection
++
++    candidate = try_dsv4_attention_projection(
++        x, weight, x_scale, w_scale, dtype, prefix, mxscale_shuffle
++    )
++    if candidate is not None:
++        return candidate
+     return _blockscale_preshuffle_gemm(mxscale_shuffle)(
+         x, weight, x_scale, w_scale, dtype
+     )
+--- a/atom/model_ops/dsv4_hybrid.py
++++ b/atom/model_ops/dsv4_hybrid.py
+@@ -203,3 +203,80 @@
+         if _projection_checked == 16:
+             print("DSV4 hybrid projection: 16 exact live checks passed", flush=True)
+     return result
++
++
++_ATTN = os.environ.get("ATOM_DSV4_HYBRID_ATTN", "0") == "1"
++_attention_checks = {}
++_ATTENTION_CHECK_LIMIT = int(os.environ.get("ATOM_DSV4_HYBRID_ATTN_CHECK_LIMIT", "2"))
++_attention_configs = None
++
++
++def try_dsv4_attention_projection(
++    x, weight, x_scale, weight_scale, dtype, prefix, mxscale_shuffle
++):
++    """Attention-only override inside the existing opaque Linear operation.
++
++    Keep the Linear caller's quantization, bias, and TP all-reduce unchanged.
++    Dispatch on concrete shapes, and retain native execution for every shape
++    or scale layout absent from the measured configuration table.
++    """
++    if not _ATTN or mxscale_shuffle or dtype != torch.bfloat16:
++        return None
++    if not prefix.endswith((".attn.wq_b", ".attn.indexer.wq_b", ".attn.wo_b")):
++        return None
++    if x.ndim != 2 or x.dtype != torch.float8_e4m3fn:
++        return None
++    if (
++        x_scale.dtype != torch.float8_e8m0fnu
++        or weight_scale.dtype != torch.float8_e8m0fnu
++    ):
++        return None
++    from aiter.jit.utils.chip_info import get_gfx_runtime
++
++    if get_gfx_runtime() != "gfx1250":
++        return None
++    global _attention_configs
++    if _attention_configs is None:
++        from pathlib import Path
++        from aiter.ops.triton.utils.config_utils import load_config_json
++
++        _attention_configs = load_config_json(
++            Path(__file__).with_name("dsv4_attention_configs.json")
++        )
++    key = f"{x.shape[0]},{weight.shape[0]},{weight.shape[1]}"
++    config = _attention_configs.get(key)
++    if config is None:
++        return None
++    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
++
++    result = gemm_afp8wfp8_preshuffle(
++        x,
++        weight,
++        x_scale.view(torch.uint8),
++        weight_scale.view(torch.uint8),
++        backend="gluon",
++        is_x_scale_transposed=True,
++        config=dict(config),
++    )
++    count = _attention_checks.get(key, 0)
++    if (
++        _CHECK
++        and count < _ATTENTION_CHECK_LIMIT
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
++
++        reference = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, weight_scale)
++        torch.testing.assert_close(result, reference, rtol=0, atol=0)
++        _attention_checks[key] = count + 1
++        if count == 1 or (count + 1) % 128 == 0:
++            rank = (
++                torch.distributed.get_rank()
++                if torch.distributed.is_initialized()
++                else 0
++            )
++            print(
++                f"DSV4 hybrid attention rank={rank} {key}: {count + 1} exact live checks passed",
++                flush=True,
++            )
++    return result
+--- /dev/null
++++ b/atom/model_ops/dsv4_attention_configs.json
+@@ -0,0 +1,66 @@
++{
++  "64,16384,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 2,
++    "waves_per_eu": 1,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "128,16384,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 4,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "64,8192,1536": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 2,
++    "CTAS_N": 2,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 5,
++    "cache_modifier": ".ca",
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  },
++  "128,8192,1536": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "CTAS_M": 1,
++    "CTAS_N": 1,
++    "GROUP_SIZE_M": 1,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "waves_per_eu": 0,
++    "NUM_BUFFERS": 4,
++    "cache_modifier": null,
++    "LOOP_UNROLL_FACTOR": 1,
++    "B_SCALE_TDM": true,
++    "kernel_type": "bandwidth_bound"
++  }
++}
