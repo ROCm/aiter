@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 
 import torch
 import triton
@@ -824,6 +825,14 @@ parser.add_argument(
           or --kv_cache_dtypes fp8""",
 )
 
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help="""Sweep the full matrix (~600 cases, ~19 min on MI355X) instead of the
+default covering set (46 cases). -n/-t/-hd/-hs/-i/-k only apply with
+--full; -d and -m apply to both.""",
+)
+
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
 # MRoPE sections for partial rotary: sum(section) == rotary_dim / 2
@@ -832,8 +841,112 @@ mrope_partial_sections_dict = {
     (128, 32): [4, 6, 6],  # head_size=128, rotary_dim=32, sum=16
 }
 
-if __name__ == "__main__":
-    args = parser.parse_args()
+
+def _case(kv, tokens, heads_q, heads_kv, head_size, mrope_section, **kw):
+    is_mrope = mrope_section is not None
+    return dict(
+        kv_cache_dtype=kv,
+        num_tokens=tokens,
+        num_heads_q=heads_q,
+        num_heads_k=heads_kv,
+        num_heads_v=heads_kv,
+        head_size=head_size,
+        mrope_section=mrope_section,
+        is_mrope=is_mrope,
+        is_neox_style=kw.pop("neox", True),
+        is_interleaved=kw.pop("interleaved", True) if is_mrope else None,
+        test_return_kv=kw.pop("return_kv", True),
+        use_shuffle_layout=not kw.get("use_strided_layout", False),
+        page_size=16,
+        **kw,
+    )
+
+
+def _default_cases():
+    """Covering set for the default run: every kernel instantiation the full
+    matrix reaches, run once, plus the feature and model cases below.
+
+    The kernels are templated on <head_size, neox, interleaved, KV dtype>
+    (MRoPE) and <head_size, neox, KV dtype> (RoPE); everything else is a
+    runtime argument. Token count (3 / 127 / 1257 = decode, small, non-power-
+    of-2 prefill), head count and return-kv rotate across the instantiations;
+    return-kv is XORed with the KV dtype bit so every instantiation family
+    runs fp8 and bf16 KV with return-kv both on and off.
+    """
+    bf16, fp8 = dtypes.bf16, dtypes.fp8
+    tokens, heads = [3, 127, 1257], [32, 64]
+    cases = []
+    for i, (head_size, neox, interleaved, kv) in enumerate(
+        itertools.product([64, 128, 256], [True, False], [True, False], [bf16, fp8])
+    ):
+        cases.append(
+            _case(
+                kv,
+                tokens[i % 3],
+                heads[(i ^ i >> 2) & 1],
+                1,
+                head_size,
+                mrope_sections_dict[head_size],
+                neox=neox,
+                interleaved=interleaved,
+                return_kv=(i ^ i >> 1) & 1 == 0,
+            )
+        )
+    for i, (head_size, neox, kv) in enumerate(
+        itertools.product([64, 128, 256], [True, False], [bf16, fp8])
+    ):
+        num_heads = heads[(i ^ i >> 2) & 1]
+        cases.append(
+            _case(
+                kv,
+                tokens[i % 3],
+                num_heads,
+                num_heads,
+                head_size,
+                None,
+                neox=neox,
+                return_kv=(i ^ i >> 1) & 1 == 0,
+            )
+        )
+    cases += [
+        # vLLM unified-attention strided KV view (non-contiguous token/head strides)
+        _case(
+            bf16,
+            127,
+            32,
+            1,
+            128,
+            [24, 20, 20],
+            return_kv=False,
+            use_strided_layout=True,
+        ),
+        _case(
+            fp8, 127, 32, 1, 128, [24, 20, 20], return_kv=False, use_strided_layout=True
+        ),
+        # Partial rotary RoPE / MRoPE (Qwen3.5: head_size=256, rotary_dim=64)
+        _case(fp8, 1257, 32, 4, 256, None, rotary_dim=64),
+        _case(bf16, 3, 8, 2, 128, None, rotary_dim=32, neox=False),
+        _case(fp8, 3, 32, 4, 256, [8, 12, 12], rotary_dim=64),
+        _case(bf16, 1257, 8, 2, 128, [4, 6, 6], rotary_dim=32, interleaved=False),
+        # GemmaRMSNorm (Qwen3.6 full-attention layer; Qwen3.8-27B TP1 = 24q / 4kv)
+        _case(bf16, 1257, 16, 2, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 3, 16, 2, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 127, 24, 4, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 127, 8, 2, 128, [4, 6, 6], rotary_dim=32, gemma_norm=True),
+    ]
+    return cases
+
+
+def run_default_cases(args):
+    print("\n=== Default covering set (use --full for the full matrix) ===", flush=True)
+    for case in _default_cases():
+        case["num_tokens"] = min(case["num_tokens"], args.max_positions)
+        test_mrope_3d_rms_set_kv_shuffle(
+            args.dtype, eps=1e-6, max_positions=args.max_positions, **case
+        )
+
+
+def run_full_matrix(args):
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
@@ -1026,3 +1139,20 @@ if __name__ == "__main__":
                                 rotary_dim=rotary_dim,
                                 gemma_norm=True,
                             )
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    # Compare parsed values: argparse runs `type` on string defaults.
+    defaults = parser.parse_args([])
+    sweep_axes = ["neox_style", "token", "head", "head_sizes"]
+    sweep_axes += ["is_interleaved", "kv_cache_dtypes"]
+    changed = [
+        a for a in sweep_axes if tuple(getattr(args, a)) != tuple(getattr(defaults, a))
+    ]
+    if changed and not args.full:
+        parser.error(f"--{', --'.join(changed)} only apply with --full")
+    if args.full:
+        run_full_matrix(args)
+    else:
+        run_default_cases(args)
