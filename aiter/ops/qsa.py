@@ -12,8 +12,14 @@ import torch
 
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
+    FP4_GROUP,
+    FP8_DTYPE,
+    FP8_MAX,
+    QSA_CACHE_FORMATS,
+    qsa_cache_row_layout,
     qsa_expand_block_indices,
     qsa_sparse_paged_gqa,
+    qsa_store_quantized_rows,
 )
 from aiter.ops.triton.attention.qsa import (
     qsa_paged_mqa_logits as _triton_qsa_paged_mqa_logits,
@@ -46,16 +52,21 @@ def qsa_paged_mqa_logits(
     max_columns: int | None = None,
     row_starts: torch.Tensor | None = None,
     allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score compressed key groups.
 
-    Dispatches to the FlyDSL MFMA scorer for large prefill batches when
-    ``allow_flydsl`` is set and FlyDSL is available, otherwise falls through
-    to the triton wrapper.
+    Dispatches to the FlyDSL MFMA scorer for large prefill batches over BF16
+    keys when ``allow_flydsl`` is set and FlyDSL is available, otherwise falls
+    through to the triton wrapper, which also takes FP8 / MXFP4 keys with
+    their ``compressed_k_scale`` and the ``stacked_decode`` scorer.
     """
     if (
         allow_flydsl
         and _HAS_FLYDSL
+        and compressed_k_scale is None
+        and compressed_k_cache.dtype == torch.bfloat16
         and q.shape[0] > 256
         and q.stride(2) == 1
         and compressed_k_cache.stride(3) == 1
@@ -96,6 +107,8 @@ def qsa_paged_mqa_logits(
         score_divisor,
         max_columns,
         row_starts,
+        compressed_k_scale=compressed_k_scale,
+        stacked_decode=stacked_decode,
     )
 
 
@@ -112,6 +125,8 @@ def qsa_select_paged_tokens(
     logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
 ) -> torch.Tensor:
     """Score, select and expand in one call."""
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
@@ -156,6 +171,8 @@ def qsa_select_paged_tokens(
             max_columns=columns,
             row_starts=row_starts,
             allow_flydsl=allow_flydsl,
+            compressed_k_scale=compressed_k_scale,
+            stacked_decode=stacked_decode,
         )
         selected_groups = torch.empty(
             (row_end - row_start, block_topk), dtype=torch.int32, device=q.device
@@ -187,8 +204,14 @@ def qsa_select_paged_tokens(
 
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
+    "FP4_GROUP",
+    "FP8_DTYPE",
+    "FP8_MAX",
+    "QSA_CACHE_FORMATS",
+    "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
+    "qsa_store_quantized_rows",
 ]
