@@ -13,11 +13,13 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-# Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, one
-# 256x256 block tile, and scales staged a 256-K pair at a time.
+# Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile and one
+# 256x256 block tile. Row-major scales are staged a chunk of K steps at a time
+# and need only whole K tiles; the preshuffled layout is addressed by K-pair,
+# so it needs 256 (checked separately, below).
 BLOCK_K = 128
 BLOCK_M = BLOCK_N = 256
-K_ALIGN = 256
+K_ALIGN = BLOCK_K
 SCALE_GROUP = 32
 
 # A/B stages: 4 buffers each of (BLOCK/2) x 128 fp8; the row layout adds two
@@ -66,9 +68,10 @@ def _validate(
     AssertionError escaping here would kill the tuner worker process rather than
     just failing the candidate.
     """
-    if K <= 0 or K % K_ALIGN != 0:
+    if K <= 0 or K % K_ALIGN != 0 or (scale_preshuffled and K % 256):
         raise ValueError(
-            f"[FlyDSL mxfp8 8wave] K must be a positive multiple of {K_ALIGN}, got {K}"
+            f"[FlyDSL mxfp8 8wave] K must be a positive multiple of "
+            f"{256 if scale_preshuffled else K_ALIGN}, got {K}"
         )
     if int(waves_per_eu) < 1:
         raise ValueError(
