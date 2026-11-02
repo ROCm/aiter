@@ -373,17 +373,12 @@ def compile_tdm_compact_plan(
     modulo the block (:func:`compact_dense_comb_slots` bounds the total). The
     plan writes ``comb_slot[route]`` for the reduce, and the run table of
     :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
-    Padding, the per-source prefix and that run table are one pass. A row
-    longer than a wave is one warp per 32 segments (every warp, not one warp
-    per source); the chunk carry is a prefix of those warp sums across one
-    LDS barrier. ``plan_blocks == 1`` publishes each segment's intra-0 slot
-    so the route loop loads it once. The hist matrix lives in block 0's LDS.
-    With ``plan_blocks > 1`` block 0
-    still builds that prefix and publishes each segment's slot of intra 0
-    (the exclusive padded prefix of this rank's row plus the first compact
-    row's residue) in ``block_hist[seg]``; the other blocks add their
-    exclusive route offset and the route's own intra. The matrix row pitch
-    is ``hist_dwords``.
+    The hist matrix lives in block 0's LDS, row pitch ``hist_dwords``; block 0
+    pads it, prefixes each source's row and writes the run table in one pass.
+    It also keeps each segment's slot of intra 0 (the exclusive padded prefix
+    of this rank's row plus the first compact row's residue); with
+    ``plan_blocks > 1`` it publishes that in ``block_hist[seg]`` and the other
+    blocks add their exclusive route offset and the route's own intra.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -630,14 +625,14 @@ def compile_tdm_compact_plan(
             routes_ptr = smem.allocate(chunk_cap * 4, 16)._ptr
             lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
         if const_expr(dense_comb):
-            # Per segment, the dest's first compact row of its expert; per
-            # (src, seg), the first compact row of src's run in it.
+            # Per segment, the dest's first compact row of its expert.
             segstart_ptr = smem.allocate(segs * 4, 16)._ptr
             lds_segstart = fx.Int64(fx.ptrtoint(segstart_ptr))
-            row0_ptr = smem.allocate(npes * segs * 4, 16)._ptr
-            lds_row0 = fx.Int64(fx.ptrtoint(row0_ptr))
             if const_expr(n_chunks > 1):
-                # Padded sum of one (src, 32-segment chunk), for the carry.
+                # Per (src, seg), the padded prefix within its 32-segment
+                # chunk; per (src, chunk), the chunk's padded sum.
+                cexcl_ptr = smem.allocate(npes * segs * 4, 16)._ptr
+                lds_cexcl = fx.Int64(fx.ptrtoint(cexcl_ptr))
                 csum_ptr = smem.allocate(npes * n_chunks * 4, 16)._ptr
                 lds_csum = fx.Int64(fx.ptrtoint(csum_ptr))
         if const_expr(use_sparse):
@@ -1288,10 +1283,9 @@ def compile_tdm_compact_plan(
 
             if const_expr(dense_comb):
                 # Padded size of one source's run, then the exclusive prefix
-                # of those sizes. One warp owns one (src, 32-segment) chunk, so
-                # a 384-segment row is one round on 12 warps instead of 12
-                # serial rounds on the 4 source warps. segs <= 32 needs no
-                # carry and folds pad + prefix + emit into this pass.
+                # of those sizes along the source's row. One warp owns one
+                # (src, 32-segment) chunk, and the chunk carries cross one LDS
+                # barrier; segs <= 32 is a single chunk with no carry.
                 _a = COMBINE_SLOT_ALIGN
 
                 def _row0_and_padded(src_i, seg_i, live_i):
@@ -1349,9 +1343,7 @@ def compile_tdm_compact_plan(
                             _publish(src, seg, row0_v, incl - padded)
                 else:
                     n_jobs = npes * n_chunks
-                    for job in range(
-                        warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)
-                    ):
+                    for job in range(warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)):
                         src = job // fx.Int32(n_chunks)
                         ch = job - src * fx.Int32(n_chunks)
                         seg = ch * fx.Int32(WAVE) + lane_i
@@ -1365,13 +1357,11 @@ def compile_tdm_compact_plan(
                             readlane(T.i32, arith.unwrap(incl), WAVE - 1)
                         )
                         if live:
-                            _st(lds_row0, src * fx.Int32(segs) + seg, incl - padded)
+                            _st(lds_cexcl, src * fx.Int32(segs) + seg, incl - padded)
                         if lane_i == fx.Int32(0):
                             _st(lds_csum, src * fx.Int32(n_chunks) + ch, chunk_total)
                     _lds_barrier()
-                    for job in range(
-                        warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)
-                    ):
+                    for job in range(warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)):
                         src = job // fx.Int32(n_chunks)
                         ch = job - src * fx.Int32(n_chunks)
                         seg = ch * fx.Int32(WAVE) + lane_i
@@ -1384,7 +1374,7 @@ def compile_tdm_compact_plan(
                             carry = carry + (prev_i < ch).select(add, fx.Int32(0))
                         if live:
                             row0_v, _padded = _row0_and_padded(src, seg_s, live)
-                            excl = carry + _ld(lds_row0, src * fx.Int32(segs) + seg)
+                            excl = carry + _ld(lds_cexcl, src * fx.Int32(segs) + seg)
                             _publish(src, seg, row0_v, excl)
                 _lds_barrier()
                 if const_expr(plan_blocks > 1):

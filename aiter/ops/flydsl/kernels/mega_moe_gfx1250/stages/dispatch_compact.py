@@ -22,7 +22,6 @@ from ..config import (
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..s1f_ctl import (
-    _DECODE_PLAN_OVERLAP_TOKENS,
     _QUANT_FUSE_BLOCKS,
     _Stage1Fusion,
     allocates_flags,
@@ -232,8 +231,6 @@ class _CompactDispatch(_Dispatch):
             rows=self.compact.cap,
         )
         self._slot = 0
-        self._plan_pending = False
-        self._pending_align = None  # the alignment the pending plan writes
         self._plan_launches = {}
         self.fusion = _Stage1Fusion(self)
 
@@ -513,15 +510,14 @@ class _CompactDispatch(_Dispatch):
         # Launch the plan before the quant so the two overlap, unless the plan
         # itself is quantizing (then there is no second kernel to overlap).
         fused_quant = self.fusion.wants_fused_quant(s1f)
-        if not self._plan_pending:
-            self._launch_plan(
-                topk_ids,
-                token_count,
-                self._slot,
-                self._step.align_m,
-                tok_map=not s1f,
-                quant_src=hidden_states if fused_quant else None,
-            )
+        self._launch_plan(
+            topk_ids,
+            token_count,
+            self._slot,
+            self._step.align_m,
+            tok_map=not s1f,
+            quant_src=hidden_states if fused_quant else None,
+        )
         if fused_quant:
             payload = self._quant_payload[:token_count]
             scales_ptr = (
@@ -531,7 +527,7 @@ class _CompactDispatch(_Dispatch):
             payload, scales_ptr, _ = self.fusion.quantize(
                 hidden_states, token_count, s1f
             )
-        self._wait_plan()
+        torch.cuda.current_stream().wait_event(self._plan_event)
         slot, step = self._slot, self._step
         if s1f:
             self.fusion.stash(
@@ -855,15 +851,11 @@ class _CompactDispatch(_Dispatch):
         *,
         tok_map: bool = True,
         quant_src: torch.Tensor | None = None,
-        ready_event: torch.cuda.Event | None = None,
     ) -> None:
         plan_s1f = self.fusion.plan_mode(align_m) and not self.fusion.step_off()
         qb = _QUANT_FUSE_BLOCKS if plan_s1f and quant_src is not None else 0
         plan_stream = self._plan_stream
-        if ready_event is None:
-            plan_stream.wait_stream(torch.cuda.current_stream())
-        else:
-            plan_stream.wait_event(ready_event)
+        plan_stream.wait_stream(torch.cuda.current_stream())
         quant_ptr = 0 if quant_src is None else quant_src.data_ptr()
         wire_ptr = 0 if self.fusion.wire is None else self.fusion.wire.data_ptr()
         with torch.cuda.stream(plan_stream):
@@ -885,14 +877,6 @@ class _CompactDispatch(_Dispatch):
                 ),
             )
         self._plan_event.record(plan_stream)
-        self._plan_pending = True
-        self._pending_align = align_m
-
-    def _wait_plan(self) -> None:
-        if not self._plan_pending:
-            return
-        torch.cuda.current_stream().wait_event(self._plan_event)
-        self._plan_pending = False
 
     def close(self) -> None:
         """Nothing to release: its kernels and buffers are not held by mori."""
