@@ -30,6 +30,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_gfx1250 import (
+    _resolve_splitk_gfx1250,
     prepare_operands_gfx1250,
     run_conv3d_gfx1250,
 )
@@ -173,9 +174,8 @@ def generate_data_gfx1250(
 def run_flydsl_conv3d_gfx1250(
     x_tune, w_tune, w_packed, bias, out, params, tile, wgm, splitk, block_rows
 ):
-    # Same call flydsl_conv_implicit makes on gfx1250, which forwards neither
-    # wgm nor splitK: the dispatch derives splitK itself.
-    del wgm, splitk
+    # Pin the final legal split-K recorded in the candidate metadata and CSV.
+    del wgm
     return run_conv3d_gfx1250(
         x_tune,
         w_tune,
@@ -186,6 +186,7 @@ def run_flydsl_conv3d_gfx1250(
         groups=params["groups"],
         padding_mode="zeros",
         tile=tile,
+        splitk=splitk,
         block_rows=block_rows,
         input_layout="NDHWC",
         output_layout="NDHWC",
@@ -444,10 +445,22 @@ class Conv3dTuner(TunerCommon):
             cgp = _pad_channels(c // groups)
         crs = cgp * kt * kh * kw
 
-        def splitk_for(tile):
-            # num_cu explicitly, so the CU count behind the split is the same
-            # one the policy enumerated against and the tuned row is stamped
-            # with; the device probe it would fall back to is a second source.
+        def splitk_for(tile, block_rows):
+            # Use the policy's CU count and the runtime's final legality gate.
+            if is_1250:
+                return _resolve_splitk_gfx1250(
+                    None,
+                    m_gemm,
+                    crs,
+                    k,
+                    None,
+                    tile,
+                    groups,
+                    block_rows,
+                    out_dhw[1],
+                    out_dhw[2],
+                    num_cu=self.get_cu_num(),
+                )
             return _resolve_splitk(
                 None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
             )
@@ -456,7 +469,7 @@ class Conv3dTuner(TunerCommon):
             param = _implicit_param_from_problem(
                 n, c, d, h, w, k, kt, kh, kw,
                 *params["stride"], *params["padding"], *params["dilation"],
-                groups, has_bias, splitk_for(tile), tile, 1, True,
+                groups, has_bias, splitk_for(tile, block_rows), tile, 1, True,
                 block_rows=block_rows,
             )  # fmt: skip
             try:
@@ -532,7 +545,7 @@ class Conv3dTuner(TunerCommon):
             # pinned rather than re-derived at dispatch, so the column records
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
-            sk = splitk_for(tile)
+            sk = splitk_for(tile, block_rows)
             if is_1250:
                 kname = tile_kernel_name_gfx1250(
                     tile_m, tile_n, wave_m, wave_n, block_rows
@@ -796,9 +809,6 @@ class Conv3dTuner(TunerCommon):
             has_bias = _parse_tuned_bool(kv["bias"])
             params = _row_params(kv)
             shape = f"{n}x{c}x{d}x{h}x{w}->{k} {kt}x{kh}x{kw}"
-            allowed_err_ratio, allowed_err_ratio_desc = (
-                self._get_run_config_err_ratio_limit(row, args)
-            )
             # With --run_config <tuned_csv> the row carries its tuned `us`, the
             # kernel alone on gfx1250; reported next to e2e as the MoE tuner does.
             kernel_us = None
@@ -828,15 +838,14 @@ class Conv3dTuner(TunerCommon):
                     if us_i < us:
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
-                # strict_compare, as in tuning: any element outside RTOL/ATOL
-                # reads as 1.0, over every limit the base class can return.
+                # Strict pass/fail: historical CSV error cannot excuse a mismatch.
                 err_ratio = strict_compare(ref, out, msg=f"run_config {shape} ")
                 # e2e: run_perftest includes the host-side pads and the weight
                 # pack, which the gfx1250 tuned us leaves out.
                 status = (
                     "ok"
-                    if err_ratio <= allowed_err_ratio
-                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                    if err_ratio == 0
+                    else f"mismatch:err_ratio={err_ratio:.6g}(strict_compare requires 0)"
                 )
                 results.append(
                     {

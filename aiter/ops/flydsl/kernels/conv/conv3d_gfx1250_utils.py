@@ -198,9 +198,11 @@ def make_launch_grid_gfx1250(n, geom, cfg, groups, k, splitk=1):
         not use_splitk or geom.npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
     ), f"split-K staging {geom.npq * k * 4}B exceeds {SPLITK_MAX_STAGING_BYTES}B"
     assert splitk <= MAX_GRID_YZ, f"splitk={splitk} exceeds grid.z limit {MAX_GRID_YZ}"
+    grid_y = groups * tiles_per_group
+    assert grid_y <= MAX_GRID_YZ, f"grid.y={grid_y} exceeds limit {MAX_GRID_YZ}"
     return LaunchGrid1250(
         grid_m=grid_m,
-        grid_y=groups * tiles_per_group,
+        grid_y=grid_y,
         tile_m=cfg.tile_m,
         tile_n=cfg.tile_n,
         block_rows=rows,

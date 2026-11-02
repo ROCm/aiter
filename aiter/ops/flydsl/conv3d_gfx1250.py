@@ -15,6 +15,7 @@ import os
 import weakref
 
 import torch
+from flydsl.utils import env
 
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import _as_stream
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
@@ -201,6 +202,43 @@ def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows):
     return b
 
 
+def _resolve_splitk_gfx1250(
+    splitk,
+    npq,
+    crs,
+    k,
+    device,
+    tile,
+    groups,
+    block_rows,
+    ho,
+    wo,
+    *,
+    explicit=False,
+    num_cu=None,
+):
+    """Final split-K shared by runtime, tuner and AOT.
+
+    Only a caller's explicit request rejects incompatible tails; an automatic
+    choice or a tuned CSV value falls back to the non-split kernel.
+    """
+    from aiter.ops.flydsl.conv_kernels import _resolve_splitk
+
+    sk = _resolve_splitk(splitk, npq, crs, k, device, tile, groups, num_cu=num_cu)
+    rows, cols = block_rows, tile[0] // block_rows
+    row_chk = ho % rows != 0 or wo % cols != 0
+    n_tail = (k // groups) % tile[1] != 0
+    big_out = npq * k * BF16_BYTES > 0x7FFFFFFF
+    if sk > 1 and (row_chk or n_tail or big_out):
+        if explicit and splitk is not None and int(splitk) > 1:
+            raise AssertionError(
+                f"explicit splitk={splitk} incompatible with tails/BIG_OUT "
+                f"(row_chk={row_chk}, n_tail={n_tail}, big_out={big_out})"
+            )
+        return 1
+    return sk
+
+
 def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo, groups):
     """Variable-resolution path: env on, no BIG_IN/OUT, no tile tails."""
     if not AITER_CONV3D_DYN_HW:
@@ -219,6 +257,11 @@ def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo, g
 
 
 def _dispatch(exe, *args, stream=None):
+    # This builder returns a host adapter, not a JitFunction; retain its compile
+    # hook while matching tensor_shim._run_compiled's compile-only-first gate.
+    if env.compile.compile_only:
+        exe.compile(*args, stream=stream)
+        return
     cf = getattr(exe, "_cf", None)
     if cf is None:
         exe._cf = exe.compile(*args, stream=stream)
@@ -398,25 +441,21 @@ def run_conv3d_gfx1250(
             if block_rows is not None:
                 chosen_br = max(1, int(block_rows))
 
-    from aiter.ops.flydsl.conv_kernels import _resolve_splitk
-
     crs = cgp * kt * kh * kw
     sk_arg = splitk if splitk is not None else tuned_splitk
-    sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, chosen_tile, groups)
-
-    # 2D-block tails cannot combine with split-K / BIG_OUT.
-    rows, cols = chosen_br, chosen_tile[0] // chosen_br
-    row_chk = ho % rows != 0 or wo % cols != 0
-    n_tail = (k // groups) % chosen_tile[1] != 0
-    y_bytes = npq * k * BF16_BYTES
-    big_out = y_bytes > 0x7FFFFFFF
-    if sk > 1 and (row_chk or n_tail or big_out):
-        if splitk is not None and int(splitk) > 1:
-            raise AssertionError(
-                f"explicit splitk={splitk} incompatible with tails/BIG_OUT "
-                f"(row_chk={row_chk}, n_tail={n_tail}, big_out={big_out})"
-            )
-        sk = 1
+    sk = _resolve_splitk_gfx1250(
+        sk_arg,
+        npq,
+        crs,
+        k,
+        x.device,
+        chosen_tile,
+        groups,
+        chosen_br,
+        ho,
+        wo,
+        explicit=splitk is not None,
+    )
 
     dyn_hw = _dyn_hw_ok_gfx1250(
         n, c_padded, d, h, w, k, npq, chosen_tile, chosen_br, ho, wo, groups

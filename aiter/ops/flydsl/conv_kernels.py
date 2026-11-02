@@ -901,6 +901,7 @@ def _conv3d_impl(
             dilation=(dt, dh, dw),
             groups=groups,
             padding_mode=pad_mode,
+            splitk=splitk,
             stream=stream,
             tile=tile,
             input_layout="NDHWC" if in_ndhwc else "NCDHW",

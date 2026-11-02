@@ -45,6 +45,7 @@ from aiter.ops.flydsl.conv3d_gfx1250 import (
 )
 from aiter.ops.flydsl.conv3d_gfx1250 import (
     _dyn_hw_ok_gfx1250,
+    _resolve_splitk_gfx1250,
 )
 from aiter.ops.flydsl.conv_kernels import (
     AITER_CONV3D_DYN_HW,
@@ -248,16 +249,45 @@ def parse_csv(csv_path: str):
             # splitK is in the compile key: match what the runtime will request.
             crs = cgp * shape["kT"] * shape["kH"] * shape["kW"]
             npq = shape["N"] * _row_npq_per_sample(shape)
-            splitk = _resolve_splitk(
-                splitk,
-                npq,
-                crs,
-                shape["K"],
-                None,
-                tile,
-                groups,
-                num_cu=cu_num or None,
-            )
+            if is_1250:
+                ho = out_extent(
+                    shape["H"],
+                    shape["pad_h"],
+                    shape["dil_h"],
+                    shape["kH"],
+                    shape["stride_h"],
+                )
+                wo = out_extent(
+                    shape["W"],
+                    shape["pad_w"],
+                    shape["dil_w"],
+                    shape["kW"],
+                    shape["stride_w"],
+                )
+                splitk = _resolve_splitk_gfx1250(
+                    splitk,
+                    npq,
+                    crs,
+                    shape["K"],
+                    None,
+                    tile,
+                    groups,
+                    config["block_rows"],
+                    ho,
+                    wo,
+                    num_cu=cu_num or None,
+                )
+            else:
+                splitk = _resolve_splitk(
+                    splitk,
+                    npq,
+                    crs,
+                    shape["K"],
+                    None,
+                    tile,
+                    groups,
+                    num_cu=cu_num or None,
+                )
             for out_ndhwc in (False, True):
                 if is_1250:
                     dyn_hw = _resolve_dyn_hw_gfx1250(
