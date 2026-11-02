@@ -344,26 +344,30 @@ def test_qsa_fp4_writer_caps_the_scale_for_the_fp16_decode():
     )
 
 
-def test_qsa_writer_rejects_bad_slots_and_planes():
-    from aiter.ops.qsa import FP8_DTYPE, qsa_cache_row_layout, qsa_store_quantized_rows
+def _planes(fmt, pages, page_size=4):
+    """Zeroed cache and scale planes for 2 heads of head_dim 256."""
+    from aiter.ops.qsa import qsa_cache_row_layout
 
-    def planes(fmt, pages):
-        vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
-        cache = torch.zeros(pages, 4, 2, vdim, device="cuda", dtype=vdtype)
-        return cache, torch.zeros(pages, 4, 2, *tail, device="cuda", dtype=sdtype)
+    vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
+    cache = torch.zeros(pages, page_size, 2, vdim, device="cuda", dtype=vdtype)
+    return cache, torch.zeros(pages, page_size, 2, *tail, device="cuda", dtype=sdtype)
+
+
+def test_qsa_writer_rejects_bad_slots_and_planes():
+    from aiter.ops.qsa import FP8_DTYPE, qsa_store_quantized_rows
 
     values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
     backing = torch.arange(8, device="cuda")
     # The writers read slots[row] without a stride.
     for fmt in ("fp8", "fp4"):
-        cache, scale = planes(fmt, 2)
+        cache, scale = _planes(fmt, 2)
         for slots in (backing[::2], backing[:4].float(), backing[:4].view(2, 2)):
             with pytest.raises(ValueError):
                 qsa_store_quantized_rows(cache, scale, slots, values)
 
     # Planes with fewer pages can have the same strides as the first cache.
-    cache, scale = planes("fp8", 2)
-    small_cache, small_scale = planes("fp8", 1)
+    cache, scale = _planes("fp8", 2)
+    small_cache, small_scale = _planes("fp8", 1)
     assert small_cache.stride() == cache.stride()
     assert small_scale.stride() == scale.stride()
     slots = backing[:4] + 4
@@ -383,7 +387,7 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
                 second_scale,
                 values,
             )
-    second_cache, second_scale = planes("fp8", 2)
+    second_cache, second_scale = _planes("fp8", 2)
     qsa_store_quantized_rows(
         cache, scale, slots, values, second_cache, second_scale, values
     )
@@ -394,8 +398,8 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
 
     # A second tensor comes with its scale plane and values, or not at all.
     for fmt in ("fp8", "fp4"):
-        first_cache, first_scale = planes(fmt, 2)
-        other_cache, other_scale = planes(fmt, 2)
+        first_cache, first_scale = _planes(fmt, 2)
+        other_cache, other_scale = _planes(fmt, 2)
         for partial in (
             (other_cache, None, None),
             (other_cache, other_scale, None),
@@ -410,19 +414,16 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
 
 
 def test_qsa_writer_rejects_wrong_scale_dtypes_and_pool_slices():
-    from aiter.ops.qsa import qsa_cache_row_layout, qsa_store_quantized_rows
+    from aiter.ops.qsa import qsa_store_quantized_rows
 
     values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
     slots = torch.arange(4, device="cuda")
     for fmt, wrong_dtype in (("fp8", torch.float64), ("fp4", torch.int8)):
-        vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
-        cache = torch.zeros(2, 4, 2, vdim, device="cuda", dtype=vdtype)
-        scale = torch.zeros(2, 4, 2, *tail, device="cuda", dtype=sdtype)
+        cache, scale = _planes(fmt, 2)
         with pytest.raises(ValueError, match="plane of the cache"):
             qsa_store_quantized_rows(cache, scale.to(wrong_dtype), slots, values)
         # The first 4 of 8 slots of each page of a larger pool.
-        pool = torch.zeros(2, 8, 2, vdim, device="cuda", dtype=vdtype)
-        pool_scale = torch.zeros(2, 8, 2, *tail, device="cuda", dtype=sdtype)
+        pool, pool_scale = _planes(fmt, 2, page_size=8)
         for sliced_cache, sliced_scale in (
             (pool[:, :4], scale),
             (cache, pool_scale[:, :4]),
@@ -467,10 +468,10 @@ def test_qsa_fp4_rows_need_a_power_of_two_head_dim():
 def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
     from aiter.ops.qsa import FP8_DTYPE, qsa_paged_mqa_logits, qsa_sparse_paged_gqa
 
-    keys, q, table, t2r, positions, lens = _index_case(1, 256, 4, 16)
-    args = (table, t2r, positions, lens, 4)
+    q, keys, table, t2r, positions, lens = _case([256], 4, 16)
+    args = (table, t2r, positions, lens, _RATIO)
     for fmt in ("fp8", "fp4"):
-        cache, scale = _store(fmt, keys, 16)
+        cache, scale = _store(fmt, keys.flatten(0, 1), 16)
         qsa_paged_mqa_logits(q, cache, *args, compressed_k_scale=scale)
         if fmt == "fp8":
             bad = [scale[..., None].repeat(1, 1, 1, 4), scale.double()]
@@ -512,44 +513,60 @@ def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
         qsa_sparse_paged_gqa(q, bf16, bf16, *args, k_scale=scale, v_scale=scale)
 
 
-def _index_case(
-    requests, context, rows_per_request, page_rows, seed=2, heads=4, dim=128
+_RATIO = 4
+
+
+def _case(
+    contexts, rows_per_request, page_size, heads=4, dim=128, padded_rows=0, seed=0
 ):
+    """Q, BF16 keys `[pages, page_size, 1, dim]` behind a shuffled page table,
+    and the last `rows_per_request` positions of each context, plus
+    `padded_rows` rows of no request."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    groups = context // 4
-    pages_per_request = -(-groups // page_rows)
-    pages = requests * pages_per_request + 3
-    order = torch.randperm(pages, device="cuda", generator=g).to(torch.int32)
-    table = order[: requests * pages_per_request].view(requests, pages_per_request)
+    used = [-(-(ctx // _RATIO) // page_size) for ctx in contexts]
+    width = max(used) + 2
+    pages = len(contexts) * width + 5
+    table = torch.full((len(contexts), width), -1, dtype=torch.int32, device="cuda")
+    order = torch.randperm(pages, generator=g, device="cuda").to(torch.int32)
+    for req, n in enumerate(used):
+        table[req, :n] = order[req * width : req * width + n]
     keys = torch.randn(
-        pages * page_rows, 1, dim, dtype=torch.float32, device="cuda", generator=g
+        pages, page_size, 1, dim, generator=g, dtype=torch.float32, device="cuda"
     )
+    requests, positions = [], []
+    for req, ctx in enumerate(contexts):
+        requests += [req] * rows_per_request
+        positions += range(ctx - rows_per_request, ctx)
+    requests += [-1] * padded_rows
+    positions += [0] * padded_rows
     q = torch.randn(
-        requests * rows_per_request,
-        heads,
-        dim,
-        dtype=torch.float32,
-        device="cuda",
-        generator=g,
+        len(requests), heads, dim, generator=g, dtype=torch.float32, device="cuda"
     )
-    t2r = torch.arange(requests, device="cuda", dtype=torch.int32)
-    t2r = t2r.repeat_interleave(rows_per_request)
-    positions = torch.arange(rows_per_request, device="cuda").repeat(requests)
-    positions = (positions + context - rows_per_request).to(torch.int64)
-    lens = torch.full((requests,), context, device="cuda", dtype=torch.int32)
-    return keys.bfloat16(), q.bfloat16(), table, t2r, positions, lens
+    return (
+        q.bfloat16(),
+        keys.bfloat16(),
+        table,
+        torch.tensor(requests, dtype=torch.int32, device="cuda"),
+        torch.tensor(positions, dtype=torch.int64, device="cuda"),
+        torch.tensor(contexts, dtype=torch.int32, device="cuda"),
+    )
 
 
-def _index_reference(q, restored, table, t2r, columns):
-    """FP32 scores of every column against dequantized keys `[slots, dim]`."""
-    page_rows = restored.shape[1]
-    groups = torch.arange(columns, device="cuda")
-    ref = torch.empty(q.shape[0], columns, dtype=torch.float32, device="cuda")
-    for request in range(table.shape[0]):
-        rows = t2r == request
-        k = restored[table[request, groups // page_rows].long(), groups % page_rows]
-        ref[rows] = torch.relu(q[rows].float() @ k.T).sum(1) / q.shape[2] ** 0.5
-    return ref
+def _reference(q, keys, table, t2r, positions, lens):
+    """FP32 logits against `keys` (`-inf` past each row's visible groups) and
+    the visible group counts."""
+    page_size = keys.shape[1]
+    groups = torch.arange(table.shape[1] * page_size, device="cuda")
+    logits = torch.full((q.shape[0], groups.numel()), -float("inf"), device="cuda")
+    visible = torch.zeros(q.shape[0], dtype=torch.int32, device="cuda")
+    for req in range(table.shape[0]):
+        rows = t2r == req
+        n = torch.minimum((positions[rows] + 1) // _RATIO, lens[req] // _RATIO)
+        k = keys[table[req, groups // page_size].long(), groups % page_size, 0]
+        scores = torch.relu(q[rows].float() @ k.float().T).sum(1) / q.shape[2] ** 0.5
+        logits[rows] = torch.where(groups < n[:, None], scores, -float("inf"))
+        visible[rows] = n.to(torch.int32)
+    return logits, visible
 
 
 @pytest.mark.parametrize("fmt", ["fp8", "fp4"])
@@ -568,10 +585,10 @@ def test_qsa_quantized_index_scores_match_dequantized_keys(
     from aiter.ops.qsa import qsa_paged_mqa_logits
 
     requests = 9 if rows_per_request == 4 else 2
-    keys, q, table, t2r, positions, lens = _index_case(
-        requests, 8192, rows_per_request, page_rows, heads=heads, dim=dim
+    q, keys, table, t2r, positions, lens = _case(
+        [8192] * requests, rows_per_request, page_rows, heads, dim, seed=2
     )
-    cache, scale = _store(fmt, keys, page_rows)
+    cache, scale = _store(fmt, keys.flatten(0, 1), page_rows)
     out, visible = qsa_paged_mqa_logits(
         q,
         cache,
@@ -579,17 +596,16 @@ def test_qsa_quantized_index_scores_match_dequantized_keys(
         t2r,
         positions,
         lens,
-        4,
+        _RATIO,
         compressed_k_scale=scale,
         stacked_decode=stacked,
     )
-    restored = _dequant(fmt, cache, scale).view(-1, page_rows, dim)
-    ref = _index_reference(q, restored, table, t2r, out.shape[1])
-    expected = torch.minimum((positions + 1) // 4, lens[t2r.long()] // 4)
-    assert torch.equal(visible, expected.to(visible.dtype))
-    groups = torch.arange(out.shape[1], device="cuda")
-    seen = groups[None, :] < visible[:, None]
-    torch.testing.assert_close(out[seen], ref[seen], rtol=1e-4, atol=1e-4)
+    restored = _dequant(fmt, cache, scale)
+    ref, ref_visible = _reference(q, restored, table, t2r, positions, lens)
+    assert torch.equal(visible, ref_visible)
+    torch.testing.assert_close(
+        _seen(out, visible), _seen(ref, visible), rtol=1e-4, atol=1e-4
+    )
 
 
 @pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4"])
@@ -600,12 +616,12 @@ def test_qsa_quantized_index_topk_matches_reference(fmt, rows_per_request, stack
     ranks in its top-k (up to near ties) and appends the causal tail."""
     from aiter.ops.qsa import qsa_select_paged_tokens
 
-    ratio, budget, page_rows = 4, 512, 16
+    ratio, budget, page_rows = _RATIO, 512, 16
     requests = 9 if rows_per_request == 4 else 1
-    keys, q, table, t2r, positions, lens = _index_case(
-        requests, 4096, rows_per_request, page_rows, seed=5
+    q, keys, table, t2r, positions, lens = _case(
+        [4096] * requests, rows_per_request, page_rows, seed=5
     )
-    cache, scale = _store(fmt, keys, page_rows)
+    cache, scale = _store(fmt, keys.flatten(0, 1), page_rows)
     selected = qsa_select_paged_tokens(
         q,
         cache,
@@ -618,8 +634,7 @@ def test_qsa_quantized_index_topk_matches_reference(fmt, rows_per_request, stack
         compressed_k_scale=scale,
         stacked_decode=stacked,
     )
-    restored = _dequant(fmt, cache, scale).view(-1, page_rows, 128)
-    ref = _index_reference(q, restored, table, t2r, table.shape[1] * page_rows)
+    ref, _ = _reference(q, _dequant(fmt, cache, scale), table, t2r, positions, lens)
     block_topk = budget // ratio
     for row in range(q.shape[0]):
         length = int(positions[row]) + 1
@@ -726,74 +741,6 @@ def test_qsa_fp8_sparse_gqa_matches_dequantized_kv(tokens, requests, config, req
     assert _rel(out, ref) < 1e-2
 
 
-_STACKED_HEADS, _STACKED_DIM, _STACKED_RATIO = 4, 128, 4
-
-
-def _stacked_case(rows_per_request, page_size, contexts, padded_rows=3, seed=0):
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    ratio = _STACKED_RATIO
-    width = max(-(-(ctx // ratio) // page_size) for ctx in contexts) + 2
-    pages = len(contexts) * width + 5
-    table = torch.full((len(contexts), width), -1, dtype=torch.int32, device="cuda")
-    order = torch.randperm(pages, generator=g, device="cuda").to(torch.int32)
-    for req, ctx in enumerate(contexts):
-        used = -(-(ctx // ratio) // page_size)
-        table[req, :used] = order[req * width : req * width + used]
-    keys = torch.randn(
-        pages,
-        page_size,
-        1,
-        _STACKED_DIM,
-        generator=g,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    keys = keys.to(torch.bfloat16)
-    requests, positions = [], []
-    for req, ctx in enumerate(contexts):
-        requests += [req] * rows_per_request
-        positions += range(ctx - rows_per_request, ctx)
-    requests += [-1] * padded_rows
-    positions += [0] * padded_rows
-    rows = len(requests)
-    q = torch.randn(
-        rows,
-        _STACKED_HEADS,
-        _STACKED_DIM,
-        generator=g,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    q = q.to(torch.bfloat16)
-    token_to_request = torch.tensor(requests, dtype=torch.int32, device="cuda")
-    query_positions = torch.tensor(positions, dtype=torch.int64, device="cuda")
-    context_lens = torch.tensor(contexts, dtype=torch.int32, device="cuda")
-    return q, keys, table, token_to_request, query_positions, context_lens
-
-
-def _stacked_reference(q, keys, table, token_to_request, query_positions, lens):
-    page_size = keys.shape[1]
-    columns = table.shape[1] * page_size
-    logits = torch.full(
-        (q.shape[0], columns), -float("inf"), dtype=torch.float32, device="cuda"
-    )
-    visible = torch.zeros(q.shape[0], dtype=torch.int32, device="cuda")
-    for row in range(q.shape[0]):
-        req = int(token_to_request[row])
-        if req < 0:
-            continue
-        n = min(
-            (int(query_positions[row]) + 1) // _STACKED_RATIO,
-            int(lens[req]) // _STACKED_RATIO,
-        )
-        visible[row] = n
-        groups = torch.arange(n, device="cuda")
-        k = keys[table[req, groups // page_size].long(), groups % page_size, 0]
-        scores = torch.relu(q[row].float() @ k.float().T).sum(0)
-        logits[row, :n] = scores / _STACKED_DIM**0.5
-    return logits, visible
-
-
 def _seen(logits, visible):
     # Top-k reads a row only up to its visible count; nothing past it is kept.
     columns = torch.arange(logits.shape[1], device="cuda")
@@ -817,8 +764,10 @@ def test_qsa_stacked_scorer_matches_cuda_core(page_size, rows_per_request):
 
     # Uneven contexts: a block of stacked rows spans requests and the widest
     # row sets the tile count, the narrower ones must still mask their tails.
-    case = _stacked_case(rows_per_request, page_size, [4103, 37, 1990, 8, 12288, 515])
-    ref, ref_visible = _stacked_reference(*case)
+    case = _case(
+        [4103, 37, 1990, 8, 12288, 515], rows_per_request, page_size, padded_rows=3
+    )
+    ref, ref_visible = _reference(*case)
     out = {}
     for stacked in (True, False):
         row_starts = torch.full(
@@ -827,7 +776,7 @@ def test_qsa_stacked_scorer_matches_cuda_core(page_size, rows_per_request):
         (logits, visible), kernels = _launched_kernels(
             qsa_paged_mqa_logits,
             *case,
-            compress_ratio=_STACKED_RATIO,
+            compress_ratio=_RATIO,
             row_starts=row_starts,
             stacked_decode=stacked,
         )
@@ -845,10 +794,10 @@ def test_qsa_stacked_scorer_matches_cuda_core(page_size, rows_per_request):
 def test_qsa_stacked_decode_falls_back_without_a_tile(without_qsa_config):
     from aiter.ops.qsa import qsa_paged_mqa_logits
 
-    case = _stacked_case(4, 16, [4103, 37, 1990])
-    ref, ref_visible = _stacked_reference(*case)
+    case = _case([4103, 37, 1990], 4, 16, padded_rows=3)
+    ref, ref_visible = _reference(*case)
     (logits, visible), kernels = _launched_kernels(
-        qsa_paged_mqa_logits, *case, compress_ratio=_STACKED_RATIO, stacked_decode=True
+        qsa_paged_mqa_logits, *case, compress_ratio=_RATIO, stacked_decode=True
     )
     assert not any("_stacked" in name for name in kernels), sorted(kernels)
     assert torch.equal(visible, ref_visible)
@@ -860,10 +809,10 @@ def test_qsa_stacked_decode_falls_back_without_a_tile(without_qsa_config):
 def test_qsa_stacked_scorer_respects_max_columns():
     from aiter.ops.qsa import qsa_paged_mqa_logits
 
-    case = _stacked_case(4, 16, [9000, 600])
-    ref, _ = _stacked_reference(*case)
+    case = _case([9000, 600], 4, 16, padded_rows=3)
+    ref, _ = _reference(*case)
     logits, visible = qsa_paged_mqa_logits(
-        *case, compress_ratio=_STACKED_RATIO, max_columns=1000, stacked_decode=True
+        *case, compress_ratio=_RATIO, max_columns=1000, stacked_decode=True
     )
     assert logits.shape[1] == 1000
     visible = visible.clamp(max=1000)
@@ -879,15 +828,15 @@ def test_qsa_takes_unquantized_fp16_and_fp32_caches(dtype):
     # FP32 dots may run as xf32 (gfx942).
     tol = 1e-4 if dtype == torch.float16 else 1e-2
     for rows_per_request, stacked in ((4, True), (4, False), (300, False)):
-        q, keys, *rest = _stacked_case(rows_per_request, 16, [4103, 1990])
+        q, keys, *rest = _case([4103, 1990], rows_per_request, 16, padded_rows=3)
         q, keys = q.to(dtype), keys.to(dtype)
-        ref, ref_visible = _stacked_reference(q, keys, *rest)
+        ref, ref_visible = _reference(q, keys, *rest)
         (logits, visible), kernels = _launched_kernels(
             qsa_paged_mqa_logits,
             q,
             keys,
             *rest,
-            compress_ratio=_STACKED_RATIO,
+            compress_ratio=_RATIO,
             stacked_decode=stacked,
         )
         assert any("_stacked" in name for name in kernels) == stacked
@@ -924,32 +873,22 @@ def test_qsa_scorers_stay_inside_a_narrow_page_table(fmt, rows):
 
     # The kernels round the width of a [1, 3] table up to 4. With page size 4
     # the 12 columns of the three pages must still score right.
-    g = torch.Generator(device="cuda").manual_seed(3)
-    keys = torch.randn(
-        16, 1, _STACKED_DIM, generator=g, dtype=torch.float32, device="cuda"
-    ).bfloat16()
-    cache, scale = _store(fmt, keys, 4)
-    restored = _dequant(fmt, cache, scale)
+    q, keys, _, t2r, _, lens = _case([48], rows, 4, seed=3)
     table = torch.tensor([[2, 0, 3]], dtype=torch.int32, device="cuda")
-    q = torch.randn(
-        rows,
-        _STACKED_HEADS,
-        _STACKED_DIM,
-        generator=g,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    q = q.bfloat16()
-    token_to_request = torch.zeros(rows, dtype=torch.int32, device="cuda")
     positions = torch.full((rows,), 47, dtype=torch.int64, device="cuda")
-    lens = torch.tensor([48], dtype=torch.int32, device="cuda")
-    case = (q, cache, table, token_to_request, positions, lens)
-    ref, ref_visible = _stacked_reference(q, restored, *case[2:])
+    cache, scale = _store(fmt, keys.flatten(0, 1), 4)
+    restored = _dequant(fmt, cache, scale)
+    ref, ref_visible = _reference(q, restored, table, t2r, positions, lens)
     assert ref_visible.eq(12).all()
     for stacked in (True, False):
         logits, visible = qsa_paged_mqa_logits(
-            *case,
-            compress_ratio=_STACKED_RATIO,
+            q,
+            cache,
+            table,
+            t2r,
+            positions,
+            lens,
+            compress_ratio=_RATIO,
             compressed_k_scale=scale,
             stacked_decode=stacked,
         )

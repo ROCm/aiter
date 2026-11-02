@@ -108,13 +108,13 @@ def _qsa_store_rows_fp8_kernel(
     stride_scale_head,
     stride_value_row,
     stride_value_head,
+    num_rows,
+    num_slots,
     second_cache_ptr,
     second_scale_ptr,
     second_values_ptr,
     stride_second_value_row,
     stride_second_value_head,
-    num_rows,
-    num_slots,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     FP8_MAX_C: tl.constexpr,
@@ -219,6 +219,27 @@ def _load_q_row(q_ptr, token, head, stride_q_token, stride_q_head, dims, mask):
     ).to(tl.float32)
 
 
+@triton.jit
+def _fp4_key_tile(
+    k_rows, scale_rows, key_ok, HEAD_DIM: tl.constexpr, GROUP: tl.constexpr, dtype
+):
+    """Even- and odd-dim planes `[HEAD_DIM // 2, BN]` of an MXFP4 key tile in
+    `dtype` (exact). `k_rows` and `scale_rows` point at each column's row."""
+    pairs = tl.arange(0, HEAD_DIM // 2)
+    packed = tl.load(
+        k_rows[None, :] + pairs[:, None], mask=key_ok[None, :], other=0
+    ).to(tl.int32)
+    exponent = tl.load(
+        scale_rows[None, :] + (pairs // (GROUP // 2))[:, None],
+        mask=key_ok[None, :],
+        other=127,
+    )
+    group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
+    low = (_e2m1_value_lo(packed & 15) * group_scale).to(dtype)
+    high = (_e2m1_value_lo(packed >> 4) * group_scale).to(dtype)
+    return low, high
+
+
 @triton.jit(repr=_qsa_paged_mqa_logits_repr)
 def _qsa_paged_mqa_logits_kernel(
     q_ptr,
@@ -303,26 +324,18 @@ def _qsa_paged_mqa_logits_kernel(
         q3e = _load_q_row(q_ptr, token, 3, stride_q_token, stride_q_head, even, m3)
         q3o = _load_q_row(q_ptr, token, 3, stride_q_token, stride_q_head, even + 1, m3)
     else:
-        q0 = tl.load(
-            q_ptr + token * stride_q_token + dims * stride_q_dim,
-            mask=dims < HEAD_DIM,
-            other=0.0,
-        ).to(tl.float32)
-        q1 = tl.load(
-            q_ptr + token * stride_q_token + stride_q_head + dims * stride_q_dim,
-            mask=(dims < HEAD_DIM) & (NUM_HEADS > 1),
-            other=0.0,
-        ).to(tl.float32)
-        q2 = tl.load(
-            q_ptr + token * stride_q_token + 2 * stride_q_head + dims * stride_q_dim,
-            mask=(dims < HEAD_DIM) & (NUM_HEADS > 2),
-            other=0.0,
-        ).to(tl.float32)
-        q3 = tl.load(
-            q_ptr + token * stride_q_token + 3 * stride_q_head + dims * stride_q_dim,
-            mask=(dims < HEAD_DIM) & (NUM_HEADS > 3),
-            other=0.0,
-        ).to(tl.float32)
+        offs = dims * stride_q_dim
+        ok = dims < HEAD_DIM
+        q0 = _load_q_row(q_ptr, token, 0, stride_q_token, stride_q_head, offs, ok)
+        q1 = _load_q_row(
+            q_ptr, token, 1, stride_q_token, stride_q_head, offs, ok & (NUM_HEADS > 1)
+        )
+        q2 = _load_q_row(
+            q_ptr, token, 2, stride_q_token, stride_q_head, offs, ok & (NUM_HEADS > 2)
+        )
+        q3 = _load_q_row(
+            q_ptr, token, 3, stride_q_token, stride_q_head, offs, ok & (NUM_HEADS > 3)
+        )
     tl.static_assert(NUM_HEADS <= 4)
     num_tiles = tl.cdiv(tl.minimum(visible_groups, num_columns), BLOCK_N)
     for tile in range(tl.program_id(1), num_tiles, tl.num_programs(1)):
@@ -484,8 +497,7 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     req_lo = tl.min(tl.where(active, safe_request, num_requests), axis=0)
     req_hi = tl.max(tl.where(active, safe_request, -1), axis=0)
     score = tl.zeros((BMT, BN), dtype=tl.float32)
-    HALF: tl.constexpr = HEAD_DIM // 2
-    pairs = tl.arange(0, HALF)
+    pairs = tl.arange(0, HEAD_DIM // 2)
     q_even = q_ptr + rows[:, None].to(tl.int64) * stride_q_token + 2 * pairs[None, :]
     for req in range(req_lo, req_hi + 1):
         physical = tl.load(
@@ -495,32 +507,23 @@ def _qsa_paged_mqa_logits_mfma_kernel(
         )
         key_ok = page_ok & (physical >= 0) & (physical < num_cache_pages)
         safe_physical = tl.maximum(physical, 0).to(tl.int64)
+        k_rows = (
+            k_cache_ptr
+            + safe_physical * stride_cache_page
+            + page_offset * stride_cache_token
+        )
         s = tl.zeros((BMT, BN), dtype=tl.float32)
         if KEY_FMT == 2:
-            # Decode each nibble plane to Q's dtype (exact). Two dots multiply
-            # them by the even and odd Q dims.
-            packed = tl.load(
-                k_cache_ptr
-                + safe_physical[None, :] * stride_cache_page
-                + page_offset[None, :] * stride_cache_token
-                + pairs[:, None],
-                mask=key_ok[None, :],
-                other=0,
-            ).to(tl.int32)
-            exponent = tl.load(
+            # Two dots multiply the nibble planes by the even and odd Q dims.
+            low_t, high_t = _fp4_key_tile(
+                k_rows,
                 k_scale_ptr
-                + safe_physical[None, :] * stride_scale_page
-                + page_offset[None, :] * stride_scale_token
-                + (pairs // (GROUP // 2))[:, None],
-                mask=key_ok[None, :],
-                other=127,
-            )
-            group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
-            low_t = (_e2m1_value_lo(packed & 15) * group_scale).to(
-                q_ptr.dtype.element_ty
-            )
-            high_t = (_e2m1_value_lo(packed >> 4) * group_scale).to(
-                q_ptr.dtype.element_ty
+                + safe_physical * stride_scale_page
+                + page_offset * stride_scale_token,
+                key_ok,
+                HEAD_DIM,
+                GROUP,
+                q_ptr.dtype.element_ty,
             )
             for head in tl.static_range(NUM_HEADS):
                 qe = tl.load(
@@ -532,12 +535,7 @@ def _qsa_paged_mqa_logits_mfma_kernel(
                 s += tl.maximum(tl.dot(qo, high_t, acc=tl.dot(qe, low_t)), 0.0)
         else:
             keys_t = tl.load(
-                k_cache_ptr
-                + safe_physical[None, :] * stride_cache_page
-                + page_offset[None, :] * stride_cache_token
-                + dims[:, None],
-                mask=key_ok[None, :],
-                other=0.0,
+                k_rows[None, :] + dims[:, None], mask=key_ok[None, :], other=0.0
             ).to(q_ptr.dtype.element_ty)
             for head in tl.static_range(NUM_HEADS):
                 qh = tl.load(
@@ -545,7 +543,6 @@ def _qsa_paged_mqa_logits_mfma_kernel(
                 )
                 s += tl.maximum(tl.dot(qh, keys_t), 0.0)
             if KEY_FMT == 1:
-                # The row scale is positive, so it commutes with every ReLU.
                 s *= tl.load(
                     k_scale_ptr
                     + safe_physical * stride_scale_page
@@ -637,8 +634,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
         + (stacked % NUM_HEADS) * stride_q_head
     )
     q_ok = (stacked_row < num_tokens)[:, None]
-    HALF: tl.constexpr = HEAD_DIM // 2
-    pairs = tl.arange(0, HALF)
+    pairs = tl.arange(0, HEAD_DIM // 2)
     dims = tl.arange(0, HEAD_DIM)
     if KEY_FMT == 2:
         q_lo = tl.load(q_base[:, None] + 2 * pairs[None, :], mask=q_ok, other=0.0)
@@ -653,7 +649,6 @@ def _qsa_paged_mqa_logits_stacked_kernel(
         columns = tile * BN + tl.arange(0, BN)
         logical_page = columns // PAGE_SIZE
         page_offset = columns % PAGE_SIZE
-        # The width is rounded up; columns < num_columns keeps table reads in bounds.
         page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
         safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
         score = tl.zeros((BMT, BN), dtype=tl.float32)
@@ -665,44 +660,30 @@ def _qsa_paged_mqa_logits_stacked_kernel(
             )
             key_ok = page_ok & (physical >= 0) & (physical < num_cache_pages)
             safe_physical = tl.maximum(physical, 0).to(tl.int64)
+            k_rows = (
+                k_cache_ptr
+                + safe_physical * stride_cache_page
+                + page_offset * stride_cache_token
+            )
             if KEY_FMT == 2:
-                packed = tl.load(
-                    k_cache_ptr
-                    + safe_physical[None, :] * stride_cache_page
-                    + page_offset[None, :] * stride_cache_token
-                    + pairs[:, None],
-                    mask=key_ok[None, :],
-                    other=0,
-                ).to(tl.int32)
-                exponent = tl.load(
+                low_t, high_t = _fp4_key_tile(
+                    k_rows,
                     k_scale_ptr
-                    + safe_physical[None, :] * stride_scale_page
-                    + page_offset[None, :] * stride_scale_token
-                    + (pairs // (GROUP // 2))[:, None],
-                    mask=key_ok[None, :],
-                    other=127,
-                )
-                group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
-                low_t = (_e2m1_value_lo(packed & 15) * group_scale).to(
-                    q_ptr.dtype.element_ty
-                )
-                high_t = (_e2m1_value_lo(packed >> 4) * group_scale).to(
-                    q_ptr.dtype.element_ty
+                    + safe_physical * stride_scale_page
+                    + page_offset * stride_scale_token,
+                    key_ok,
+                    HEAD_DIM,
+                    GROUP,
+                    q_ptr.dtype.element_ty,
                 )
                 s = tl.dot(q_hi, high_t, acc=tl.dot(q_lo, low_t))
             else:
                 keys_t = tl.load(
-                    k_cache_ptr
-                    + safe_physical[None, :] * stride_cache_page
-                    + page_offset[None, :] * stride_cache_token
-                    + dims[:, None],
-                    mask=key_ok[None, :],
-                    other=0.0,
+                    k_rows[None, :] + dims[:, None], mask=key_ok[None, :], other=0.0
                 ).to(q_ptr.dtype.element_ty)
                 s = tl.dot(q_all, keys_t)
             s = tl.sum(tl.reshape(tl.maximum(s, 0.0), (BMT, NUM_HEADS, BN)), axis=1)
             if KEY_FMT == 1:
-                # The row scale is positive, so it commutes with every ReLU.
                 s *= tl.load(
                     k_scale_ptr
                     + safe_physical * stride_scale_page

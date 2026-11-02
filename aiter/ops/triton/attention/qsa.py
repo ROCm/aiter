@@ -130,6 +130,17 @@ def qsa_store_quantized_rows(
         raise ValueError("quantized QSA rows must be contiguous in the head dim")
     flat = _merge_slots(cache, "cache")
     flat_scale = _merge_slots(scale, "scale")
+    args = (
+        flat,
+        flat_scale,
+        slots,
+        values,
+        *flat.stride()[:2],
+        *flat_scale.stride()[:2],
+        *values.stride()[:2],
+        rows,
+        flat.shape[0],
+    )
     if fmt == _FMT_FP8:
         if cache.shape[3] != head_dim:
             raise ValueError("values and FP8 cache disagree on head_dim")
@@ -145,23 +156,11 @@ def qsa_store_quantized_rows(
         ):
             raise ValueError("the second FP8 tensor must mirror the first")
         _qsa_store_rows_fp8_kernel[(rows, heads)](
-            flat,
-            flat_scale,
-            slots,
-            values,
-            flat.stride(0),
-            flat.stride(1),
-            flat_scale.stride(0),
-            flat_scale.stride(1),
-            values.stride(0),
-            values.stride(1),
+            *args,
             second_cache if second else flat,
             second_scale if second else flat_scale,
             second_values if second else values,
-            second_values.stride(0) if second else 0,
-            second_values.stride(1) if second else 0,
-            rows,
-            flat.shape[0],
+            *(second_values.stride()[:2] if second else (0, 0)),
             HEAD_DIM=head_dim,
             BLOCK_D=triton.next_power_of_2(head_dim),
             FP8_MAX_C=FP8_MAX,
@@ -174,18 +173,7 @@ def qsa_store_quantized_rows(
     if cache.shape[3] * 2 != head_dim:
         raise ValueError("values and FP4 cache disagree on head_dim")
     _qsa_store_rows_fp4_kernel[(rows, heads)](
-        flat,
-        flat_scale,
-        slots,
-        values,
-        flat.stride(0),
-        flat.stride(1),
-        flat_scale.stride(0),
-        flat_scale.stride(1),
-        values.stride(0),
-        values.stride(1),
-        rows,
-        flat.shape[0],
+        *args,
         HEAD_DIM=head_dim,
         GROUP=FP4_GROUP,
         num_warps=1,
@@ -323,8 +311,9 @@ def qsa_paged_mqa_logits(
         ):
             raise ValueError("compressed_k_scale must be the scale plane of the cache")
     # BF16 keys pass a None scale, which binds as a constexpr.
-    scale = compressed_k_scale
-    scale_strides = (0, 0) if scale is None else (scale.stride(0), scale.stride(1))
+    scale_strides = (
+        (0, 0) if compressed_k_scale is None else compressed_k_scale.stride()[:2]
+    )
     if page_table.ndim != 2 or page_table.dtype not in (torch.int32, torch.int64):
         raise ValueError("page_table must be a two-dimensional integer tensor")
     _check_vector("token_to_request", token_to_request, q.shape[0])
@@ -364,17 +353,20 @@ def qsa_paged_mqa_logits(
     ):
         tile = _tuned_tile("stacked_decode", QSA_CACHE_FORMATS[key_fmt])
     # No stacked tile for this arch, or too few heads to fill M: other kernels.
-    if tile is not None and tile["BMT"] * heads >= 16:
-        bmt, bn = tile["BMT"], tile["BN"]
-        _qsa_paged_mqa_logits_stacked_kernel[
-            (
-                triton.cdiv(q.shape[0], bmt),
-                min(triton.cdiv(columns, bn), tile["column_programs"]),
-            )
-        ](
+    stacked = tile is not None and tile["BMT"] * heads >= 16
+    if stacked or (q.shape[0] > 256 and contiguous and head_dim >= 16):
+        if stacked:
+            kernel = _qsa_paged_mqa_logits_stacked_kernel
+            bmt, bn, num_warps = tile["BMT"], tile["BN"], tile["num_warps"]
+            column_programs = min(triton.cdiv(columns, bn), tile["column_programs"])
+        else:
+            kernel = _qsa_paged_mqa_logits_mfma_kernel
+            bmt, bn, num_warps = 16, 128, 4
+            column_programs = triton.cdiv(columns, bn)
+        kernel[(triton.cdiv(q.shape[0], bmt), column_programs)](
             q,
             compressed_k_cache,
-            scale,
+            compressed_k_scale,
             page_table,
             token_to_request,
             query_positions,
@@ -403,46 +395,7 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
-            num_warps=tile["num_warps"],
-        )
-        return logits, visible_groups
-    if q.shape[0] > 256 and contiguous and q.shape[2] >= 16:
-        bmt, bn = 16, 128
-        _qsa_paged_mqa_logits_mfma_kernel[
-            (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))
-        ](
-            q,
-            compressed_k_cache,
-            scale,
-            page_table,
-            token_to_request,
-            query_positions,
-            context_lens,
-            visible_groups,
-            row_starts,
-            logits,
-            q.stride(0),
-            q.stride(1),
-            compressed_k_cache.stride(0),
-            compressed_k_cache.stride(1),
-            *scale_strides,
-            page_table.stride(0),
-            logits.stride(0),
-            q.shape[0],
-            columns,
-            compressed_k_cache.shape[0],
-            page_table.shape[0],
-            float(divisor),
-            PAGE_SIZE=compressed_k_cache.shape[1],
-            PAGE_TABLE_WIDTH=_table_width_bucket(page_table.shape[1]),
-            NUM_HEADS=q.shape[1],
-            HEAD_DIM=q.shape[2],
-            COMPRESS_RATIO=compress_ratio,
-            BMT=bmt,
-            BN=bn,
-            KEY_FMT=key_fmt,
-            GROUP=FP4_GROUP,
-            num_warps=4,
+            num_warps=num_warps,
         )
         return logits, visible_groups
     # Fallback calls use the CUDA-core kernel.
@@ -452,7 +405,7 @@ def qsa_paged_mqa_logits(
     _qsa_paged_mqa_logits_kernel[(q.shape[0], column_programs)](
         q,
         compressed_k_cache,
-        scale,
+        compressed_k_scale,
         page_table,
         token_to_request,
         query_positions,
