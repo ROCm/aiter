@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Q/K Gemma RMSNorm and interleaved MRoPE, and the K/V write into the paged KV cache
+# (bf16, or fp8 with one per-tensor scale and Q emitted in fp8: row kernel only)
 
 import functools
 
@@ -26,7 +27,7 @@ def get_fused_qk_norm_mrope_layouts(num_warps):
 
 
 _fused_qk_norm_mrope_repr = make_kernel_repr(
-    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE"]
+    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE", "FP8"]
 )
 _fused_qk_norm_mrope_tdm_repr = make_kernel_repr(
     "fused_qk_norm_mrope_tdm_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE"]
@@ -68,6 +69,7 @@ def fused_qk_norm_mrope_gfx1250(
     num_slots,
     k_cache_ptr,
     v_cache_ptr,
+    kv_inv_scale,
     EPS: gl.constexpr,
     Q_HEADS: gl.constexpr,
     K_HEADS: gl.constexpr,
@@ -76,6 +78,8 @@ def fused_qk_norm_mrope_gfx1250(
     BLOCK_M: gl.constexpr,
     CACHE: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
+    FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
     row_layout: gl.constexpr,
     rope_layout: gl.constexpr,
 ):
@@ -127,10 +131,10 @@ def fused_qk_norm_mrope_gfx1250(
     x_hi = gl.load(
         x_row_r[:, None] + ROPE_HALF + offs_r[None, :], mask=mask_r[:, None], other=0.0
     )
+    head_r = gl.convert_layout(head, gl.SliceLayout(1, rope_layout))
     if CACHE:
         # The slot and the V row of each K row. Tokens past the slot table are padding.
         # Lane l holds V values l, l + 32, ...: the cache keeps the V values of a token 16 bytes apart.
-        head_r = gl.convert_layout(head, gl.SliceLayout(1, rope_layout))
         is_k_r = mask_r & (head_r >= Q_HEADS) & (token_r < num_slots)
         slot = gl.load(slot_mapping_ptr + token_r, mask=is_k_r, other=-1).to(gl.int64)
         offs_v = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, rope_layout))
@@ -163,28 +167,50 @@ def fused_qk_norm_mrope_gfx1250(
         sin_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
     )
 
-    # Gemma RMSNorm: x / rms(x) * (1 + w). Columns [64, 256) are done.
+    # Gemma RMSNorm: x / rms(x) * (1 + w). Columns [64, 256) are done. K keeps the input
+    # dtype; so does Q unless it goes out in fp8.
     x = x.to(gl.float32)
     rstd = gl.rsqrt(gl.sum(x * x, axis=1) / HEAD_DIM + EPS)
-    y = (x * rstd[:, None] * (w.to(gl.float32) + 1.0)).to(q_out_ptr.dtype.element_ty)
-    out_row = gl.where(is_q, q_out_ptr, k_out_ptr) + offs_out
-    gl.store(
-        out_row[:, None] + offs_n[None, :],
-        y,
-        mask=mask_m[:, None] & (offs_n >= 2 * ROPE_HALF)[None, :],
-    )
+    y = (x * rstd[:, None] * (w.to(gl.float32) + 1.0)).to(k_out_ptr.dtype.element_ty)
+    tail = (offs_n >= 2 * ROPE_HALF)[None, :]
 
     # Neox RoPE of columns [0, 64), from the same normalized values.
     rstd_r = gl.convert_layout(rstd, gl.SliceLayout(1, rope_layout))[:, None]
     y_lo = x_lo.to(gl.float32) * rstd_r * (w_lo.to(gl.float32) + 1.0)
     y_hi = x_hi.to(gl.float32) * rstd_r * (w_hi.to(gl.float32) + 1.0)
-    rope_lo = (y_lo * cos - y_hi * sin).to(q_out_ptr.dtype.element_ty)
-    rope_hi = (y_hi * cos + y_lo * sin).to(q_out_ptr.dtype.element_ty)
-    out_row_r = gl.convert_layout(out_row, gl.SliceLayout(1, rope_layout))
-    gl.store(out_row_r[:, None] + offs_r[None, :], rope_lo, mask=mask_r[:, None])
-    gl.store(
-        out_row_r[:, None] + ROPE_HALF + offs_r[None, :], rope_hi, mask=mask_r[:, None]
-    )
+    rope_lo = (y_lo * cos - y_hi * sin).to(k_out_ptr.dtype.element_ty)
+    rope_hi = (y_hi * cos + y_lo * sin).to(k_out_ptr.dtype.element_ty)
+
+    if FP8:
+        # Q goes out in fp8 and K stays bf16, so they need separate stores. Q is the bf16
+        # value clamped and cast, as on the unfused path: the fp8 cast does not saturate.
+        fp8_ty = q_out_ptr.dtype.element_ty
+        q_rows = mask_m & is_q
+        k_rows = mask_m & (head >= Q_HEADS)
+        q_rows_r = mask_r & is_q_r
+        k_rows_r = mask_r & (head_r >= Q_HEADS)
+        out_n = offs_out[:, None] + offs_n[None, :]
+        q_n = gl.minimum(gl.maximum(y.to(gl.float32), -FP8_MAX), FP8_MAX)
+        gl.store(q_out_ptr + out_n, q_n.to(fp8_ty), mask=q_rows[:, None] & tail)
+        gl.store(k_out_ptr + out_n, y, mask=k_rows[:, None] & tail)
+        offs_out_r = gl.convert_layout(offs_out, gl.SliceLayout(1, rope_layout))
+        out_r = offs_out_r[:, None] + offs_r[None, :]
+        q_lo = gl.minimum(gl.maximum(rope_lo.to(gl.float32), -FP8_MAX), FP8_MAX)
+        q_hi = gl.minimum(gl.maximum(rope_hi.to(gl.float32), -FP8_MAX), FP8_MAX)
+        gl.store(q_out_ptr + out_r, q_lo.to(fp8_ty), mask=q_rows_r[:, None])
+        gl.store(q_out_ptr + ROPE_HALF + out_r, q_hi.to(fp8_ty), mask=q_rows_r[:, None])
+        gl.store(k_out_ptr + out_r, rope_lo, mask=k_rows_r[:, None])
+        gl.store(k_out_ptr + ROPE_HALF + out_r, rope_hi, mask=k_rows_r[:, None])
+    else:
+        out_row = gl.where(is_q, q_out_ptr, k_out_ptr) + offs_out
+        gl.store(out_row[:, None] + offs_n[None, :], y, mask=mask_m[:, None] & tail)
+        out_row_r = gl.convert_layout(out_row, gl.SliceLayout(1, rope_layout))
+        gl.store(out_row_r[:, None] + offs_r[None, :], rope_lo, mask=mask_r[:, None])
+        gl.store(
+            out_row_r[:, None] + ROPE_HALF + offs_r[None, :],
+            rope_hi,
+            mask=mask_r[:, None],
+        )
 
     if CACHE:
         # K[block, head, d // X, offset, d % X] and V[block, head, offset // X, d, offset % X].
@@ -194,18 +220,33 @@ def fused_qk_norm_mrope_gfx1250(
         offset = slot % BLOCK_SIZE
         cache_row = (block * K_HEADS + head_r - Q_HEADS) * (HEAD_DIM * BLOCK_SIZE)
         v_dst = cache_row + (offset // X) * (HEAD_DIM * X) + offset % X
-        gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v, mask=write)
+        if FP8:
+            # One per-tensor scale, as reshape_and_cache(kv_cache_dtype="fp8") applies it.
+            cache_ty = k_cache_ptr.dtype.element_ty
+            v_c = gl.minimum(gl.maximum(v.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
+            kc_lo = gl.minimum(gl.maximum(rope_lo.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
+            kc_hi = gl.minimum(gl.maximum(rope_hi.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
+            kc_n = gl.minimum(gl.maximum(y.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
+            v_c, kc_lo, kc_hi, kc_n = (
+                v_c.to(cache_ty),
+                kc_lo.to(cache_ty),
+                kc_hi.to(cache_ty),
+                kc_n.to(cache_ty),
+            )
+        else:
+            v_c, kc_lo, kc_hi, kc_n = v, rope_lo, rope_hi, y
+        gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v_c, mask=write)
         # ROPE_HALF is a multiple of X: the high RoPE half is a constant step after the low one.
         k_dst = cache_row + offset * X
         k_lo = k_dst[:, None] + (offs_r // X * BLOCK_SIZE * X + offs_r % X)[None, :]
-        gl.store(k_cache_ptr + k_lo, rope_lo, mask=write)
-        gl.store(k_cache_ptr + k_lo + ROPE_HALF * BLOCK_SIZE, rope_hi, mask=write)
+        gl.store(k_cache_ptr + k_lo, kc_lo, mask=write)
+        gl.store(k_cache_ptr + k_lo + ROPE_HALF * BLOCK_SIZE, kc_hi, mask=write)
         # Columns [64, 256) from the norm layout, 16 bytes per lane.
         k_dst_n = gl.convert_layout(k_dst, gl.SliceLayout(1, row_layout))
         write_n = gl.convert_layout(slot >= 0, gl.SliceLayout(1, row_layout))
         k_n = k_dst_n[:, None] + (offs_n // X * BLOCK_SIZE * X + offs_n % X)[None, :]
-        mask_n = write_n[:, None] & (offs_n >= 2 * ROPE_HALF)[None, :]
-        gl.store(k_cache_ptr + k_n, y, mask=mask_n)
+        mask_n = write_n[:, None] & tail
+        gl.store(k_cache_ptr + k_n, kc_n, mask=mask_n)
 
 
 @gluon.jit

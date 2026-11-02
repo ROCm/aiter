@@ -137,3 +137,59 @@ def test_fused_qk_norm_mrope_cache(num_tokens, q_heads, k_heads):
         inputs["k_cache"].float(), ref_k_cache, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(inputs["v_cache"], ref_v_cache, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+@pytest.mark.parametrize("kv_scale", [1.0, 0.5])
+def test_fused_qk_norm_mrope_cache_fp8(num_tokens, kv_scale):
+    """An fp8 cache: K and V stored as value / kv_scale clamped to the fp8 range, Q
+    returned in fp8 (clamped, unscaled); each value rounded to bf16 first."""
+    import aiter
+
+    fp8 = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8).max
+    q_heads, k_heads, block, x = 16, 2, 64, 16  # 16 fp8 values in 16 bytes
+    inputs = make_inputs(num_tokens, q_heads, k_heads)
+    num_blocks = num_tokens // block + 4
+    v = torch.randn(
+        (num_tokens, 2 * k_heads * HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+    )[:, : k_heads * HEAD_DIM]
+    v[:, :8] = 3000.0  # past the fp8 range: stored clamped
+    inputs["v"] = v
+    slots = torch.randperm(num_blocks * block, device="cuda")[:num_tokens]
+    slots[2::7] = -1
+    inputs["slot_mapping"] = slots
+    inputs["k_cache"] = torch.zeros(
+        (num_blocks, k_heads, HEAD_DIM // x, block, x), dtype=torch.uint8, device="cuda"
+    ).view(fp8)
+    inputs["v_cache"] = torch.zeros(
+        (num_blocks, k_heads, block // x, HEAD_DIM, x), dtype=torch.uint8, device="cuda"
+    ).view(fp8)
+    q_out, k_out = fused_qk_norm_mrope_cache(**inputs, kv_scale=kv_scale)
+    ref_q = torch_ref(inputs["q"], inputs["q_weight"], q_heads, inputs).bfloat16()
+    ref_k = torch_ref(inputs["k"], inputs["k_weight"], k_heads, inputs).bfloat16()
+    assert q_out.dtype == fp8 and k_out.dtype == torch.bfloat16
+    to_fp8 = lambda t: t.float().clamp(-fp8_max, fp8_max).to(fp8).float()
+    torch.testing.assert_close(q_out.float(), to_fp8(ref_q), atol=0.5, rtol=0.125)
+    torch.testing.assert_close(k_out.float(), ref_k.float(), atol=1e-2, rtol=1e-2)
+
+    written = slots >= 0
+    blk, off = slots[written] // block, slots[written] % block
+    ref_k_cache = torch.zeros(
+        inputs["k_cache"].shape, dtype=torch.float32, device="cuda"
+    )
+    ref_k_cache[blk, :, :, off, :] = to_fp8(ref_k.float() / kv_scale)[written].unflatten(
+        -1, (k_heads, HEAD_DIM // x, x)
+    )
+    ref_v_cache = torch.zeros(
+        inputs["v_cache"].shape, dtype=torch.float32, device="cuda"
+    )
+    ref_v_cache[blk, :, off // x, :, off % x] = to_fp8(v.float() / kv_scale)[
+        written
+    ].unflatten(-1, (k_heads, HEAD_DIM))
+    torch.testing.assert_close(
+        inputs["k_cache"].float(), ref_k_cache, atol=0.5, rtol=0.125
+    )
+    # V takes no arithmetic before the cast but the scale: exact.
+    assert not torch.isnan(inputs["v_cache"].float()).any()
+    torch.testing.assert_close(inputs["v_cache"].float(), ref_v_cache, atol=0, rtol=0)
