@@ -35,7 +35,8 @@ def qsa_cache_row_layout(fmt: str, head_dim: int):
     """`(value dim, value dtype, scale tail, scale dtype)` of one cached row.
 
     The scale tail is the per-row scale shape after the row's own axes, None
-    when the row is stored unquantized.
+    when the row is stored unquantized. `"bf16"` stands for every unquantized
+    cache; FP16 / FP32 caches also use the `stacked_decode.bf16` tile.
     """
     if fmt == "bf16":
         return head_dim, torch.bfloat16, None, None
@@ -245,7 +246,8 @@ _SCORING_COLUMN_PROGRAMS = 64
 @functools.lru_cache(maxsize=1024)
 def _tuned_tile(kernel: str, case: str) -> dict | None:
     """`kernel[case]` of `configs/<arch>/triton/attention/qsa/DEFAULT.json`,
-    None on an arch without that file."""
+    None on an arch without that file. Cached because `resolve_config_dir` is
+    not; `load_config_json` already caches the file read."""
     cfg_dir = resolve_config_dir("attention", "QSA", backend="triton")
     table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     return None if table is None else table[kernel][case]
