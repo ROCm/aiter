@@ -70,7 +70,10 @@ _DPP_ROW_SHL8 = 0x108
 _DPP_ROW_SHR8 = 0x118
 _DPP_ROW_BCAST15 = 0x142
 _DPP_ROW_BCAST31 = 0x143
+_DPP_ROW_MIRROR = 0x140
+_DPP_ROW_HALF_MIRROR = 0x141
 _DPP_ROW_MASK = 0xF
+_ROW_LANES = 16
 # row_bcast:15 moves row 0 -> 1 and row 2 -> 3.
 _DPP_ROW_BCAST15_MASK = 0xA
 # row_bcast:31 moves the row-0/1 total into rows 2 and 3.
@@ -198,6 +201,64 @@ def _narrow_dpp_reduce_f32(value, red_slots: int, fastmath, op: str = "add"):
     bits = reduced.bitcast(fx.Int32)
     broadcast = fx.Int32(fx.rocdl.readfirstlane(T.i32, bits))
     return broadcast.bitcast(fx.Float32)
+
+
+def _has_permlane_swap() -> bool:
+    return get_gfx_runtime() == "gfx950"
+
+
+def _exchange_halves(a, b, offset: int, lane, native: bool):
+    """Return ``(x, y)`` with ``x + y`` equal to ``a[l] + a[l ^ offset]`` on lanes in
+    even ``offset``-lane blocks and ``b[l] + b[l ^ offset]`` on lanes in odd blocks.
+    """
+    if native:
+        swap = fx.rocdl.permlane32_swap if offset == 32 else fx.rocdl.permlane16_swap
+        pair = swap(
+            llvm.StructType.get_literal([T.i32, T.i32]),
+            a.bitcast(fx.Int32).ir_value(),
+            b.bitcast(fx.Int32).ir_value(),
+            False,
+            False,
+        )
+        return tuple(
+            fx.Int32(llvm.extractvalue(T.i32, pair, [index])).bitcast(fx.Float32)
+            for index in range(2)
+        )
+    keeps_a = (lane // offset) % 2 == 0
+    received = keeps_a.select(b, a).shuffle_xor(offset, _WARP_SIZE)
+    return keeps_a.select(a, received), keeps_a.select(received, b)
+
+
+def _row_reduce_f32(value, span: int, fastmath, op: str = "add"):
+    """Reduce each aligned group of ``span`` lanes (2, 4, 8, or 16). Every lane gets the result."""
+    reduced = value
+    for dpp_ctrl in (
+        _DPP_QUAD_XOR1,
+        _DPP_QUAD_XOR2,
+        _DPP_ROW_HALF_MIRROR,
+        _DPP_ROW_MIRROR,
+    )[: int(math.log2(span))]:
+        reduced = _combine_f32(reduced, _dpp_row_f32(reduced, dpp_ctrl), op, fastmath)
+    return reduced
+
+
+def _wave_sum_batched(values, lane, fastmath, native: bool):
+    """Return ``ceil(len(values) / 4)`` registers; every lane of 16-lane row ``g`` of
+    register ``k`` holds the wave total of ``values[4 * k + g]``.
+    """
+    zero = fx.Float32(0.0)
+    totals = []
+    for first in range_constexpr(0, len(values), 4):
+        quad = [
+            values[first + g] if first + g < len(values) else zero for g in range(4)
+        ]
+        x, y = _exchange_halves(quad[0], quad[2], 32, lane, native)
+        low = x + y
+        x, y = _exchange_halves(quad[1], quad[3], 32, lane, native)
+        high = x + y
+        x, y = _exchange_halves(low, high, 16, lane, native)
+        totals.append(_row_reduce_f32(x + y, 16, fastmath))
+    return totals
 
 
 def _pack_fp8(values, width: int):
@@ -379,13 +440,19 @@ def _build_attn_res(spec: _AttnResSpec):
     # Production is 7 (D=7168) or 1 (D=1024, which never enters finish).
     use_dpp_finish = 1 < red_slots <= 8
 
+    native_swap = _has_permlane_swap()
+    # LDS holds wave totals as (ping-pong buffer, value, wave). Successive groups
+    # use disjoint buffers. A group's values are sumsq then dot for each source,
+    # padded to a multiple of 4, the width of one batched wave reduction.
+    values_per_buf = 4 * ((2 * group_size + 3) // 4)
+    wave_stride = 1 << max(red_slots - 1, 0).bit_length()
+
+    def partial_index(buf, value):
+        return (buf * values_per_buf + value) * wave_stride
+
     @fx.struct
     class SharedStorage:
-        # Ping-pong (dim 0) so successive groups write disjoint LDS; slot
-        # (dim 1) holds G independent reductions behind one barrier. Array is
-        # 1D; the view is (2, group_size, red_slots).
-        sumsq: fx.Array[fx.Float32, 2 * group_size * red_slots, 16]
-        dot: fx.Array[fx.Float32, 2 * group_size * red_slots, 16]
+        partials: fx.Array[fx.Float32, 2 * values_per_buf * wave_stride, 16]
 
     @flyc.kernel(name=spec.kernel_name, known_block_size=[block_threads, 1, 1])
     def attn_res_kernel(
@@ -413,12 +480,11 @@ def _build_attn_res(spec: _AttnResSpec):
             return local_tid + tile_bases[tile]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        pingpong_layout = fx.make_layout(
-            (2, group_size, red_slots),
-            (group_size * red_slots, red_slots, 1),
+        s_partials = lds.partials.view(
+            fx.make_layout(2 * values_per_buf * wave_stride, 1)
         )
-        s_sumsq_all = lds.sumsq.view(pingpong_layout)
-        s_dot_all = lds.dot.view(pingpong_layout)
+        lane = local_tid % _WARP_SIZE
+        wave = local_tid // _WARP_SIZE
 
         zero = fx.Float32(0.0)
         neg_inf = fx.Float32(float("-inf"))
@@ -444,27 +510,28 @@ def _build_attn_res(spec: _AttnResSpec):
                 return _narrow_dpp_reduce_f32(value, red_slots, fm_fast, op)
             return _wave_reduce_f32(value, wave_reduce_mode, fm_fast, op)
 
-        def store_pair_partials(sumsq_local, dot_local, slot, buf):
-            """Wave-reduce and write LDS partials. No barrier."""
-            s_sumsq = fx.slice(s_sumsq_all, (buf, slot, None))
-            s_dot = fx.slice(s_dot_all, (buf, slot, None))
-            lane = local_tid % _WARP_SIZE
-            wave = local_tid // _WARP_SIZE
-            sumsq_wave = store_reduce(sumsq_local)
-            dot_wave = store_reduce(dot_local)
-            if lane == 0:
-                fx.memref_store(sumsq_wave, s_sumsq, wave)
-                fx.memref_store(dot_wave, s_dot, wave)
+        def store_group_partials(pairs, buf):
+            totals = _wave_sum_batched(
+                [value for pair in pairs for value in pair], lane, fm_fast, native_swap
+            )
+            if lane % _ROW_LANES == 0:
+                row = lane // _ROW_LANES
+                for register in range_constexpr(len(totals)):
+                    fx.memref_store(
+                        totals[register],
+                        s_partials,
+                        partial_index(buf, 4 * register) + row * wave_stride + wave,
+                    )
 
         def finish_pair_reduce(slot, buf):
             """Every wave reduces the LDS partials in registers."""
-            s_sumsq = fx.slice(s_sumsq_all, (buf, slot, None))
-            s_dot = fx.slice(s_dot_all, (buf, slot, None))
-            lane = local_tid % _WARP_SIZE
             in_range = lane < red_slots
             lane_safe = in_range.select(lane, 0)
-            sumsq_partial = fx.memref_load(s_sumsq, lane_safe)
-            dot_partial = fx.memref_load(s_dot, lane_safe)
+            sumsq_base = partial_index(buf, 2 * slot)
+            sumsq_partial = fx.memref_load(s_partials, sumsq_base + lane_safe)
+            dot_partial = fx.memref_load(
+                s_partials, sumsq_base + wave_stride + lane_safe
+            )
             sumsq_partial = in_range.select(sumsq_partial, zero)
             dot_partial = in_range.select(dot_partial, zero)
             return finish_reduce(sumsq_partial), finish_reduce(dot_partial)
@@ -472,26 +539,24 @@ def _build_attn_res(spec: _AttnResSpec):
         def block_reduce_add2(sumsq_local, dot_local, buf, slot):
             if const_expr(red_slots == 1):
                 return store_reduce(sumsq_local), store_reduce(dot_local)
-            store_pair_partials(sumsq_local, dot_local, slot, buf)
+            store_group_partials([(sumsq_local, dot_local)], buf)
             fx.gpu.barrier()
             return finish_pair_reduce(slot, buf)
 
-        def block_reduce(value, s_all, buf, op):
+        def block_reduce(value, value_index, buf, op):
             if const_expr(red_slots == 1):
                 return store_reduce(value, op)
 
-            s_partials = fx.slice(s_all, (buf, 0, None))
-            lane = local_tid % _WARP_SIZE
-            wave = local_tid // _WARP_SIZE
             wave_total = store_reduce(value, op)
+            base = partial_index(buf, value_index)
 
             if lane == 0:
-                fx.memref_store(wave_total, s_partials, wave)
+                fx.memref_store(wave_total, s_partials, base + wave)
             fx.gpu.barrier()
 
             in_range = lane < red_slots
             lane_safe = in_range.select(lane, 0)
-            partial = fx.memref_load(s_partials, lane_safe)
+            partial = fx.memref_load(s_partials, base + lane_safe)
             partial = in_range.select(partial, zero)
             return finish_reduce(partial, op)
 
@@ -668,10 +733,6 @@ def _build_attn_res(spec: _AttnResSpec):
                     )
                 return thread_sumsq, thread_dot
 
-            def store_source_partials(values_local, slot, buf):
-                thread_sumsq, thread_dot = local_sumsq_dot(values_local)
-                store_pair_partials(thread_sumsq, thread_dot, slot, buf)
-
             def finish_source_reduce(slot, buf):
                 return finish_pair_reduce(slot, buf)
 
@@ -729,6 +790,7 @@ def _build_attn_res(spec: _AttnResSpec):
                     n_members = min(group_size, num_sources - start)
                     buf = group % 2
                     group_local = []
+                    group_partials = []
                     for slot in range_constexpr(n_members):
                         src = start + slot
                         if const_expr(src == prefix_slot):
@@ -740,8 +802,9 @@ def _build_attn_res(spec: _AttnResSpec):
                                     issue_block_source(block + prefetch_in_flight)
                                 )
                             source_local = take_block_source(block)
-                        store_source_partials(source_local, slot, buf)
+                        group_partials.append(local_sumsq_dot(source_local))
                         group_local.append(source_local)
+                    store_group_partials(group_partials, buf)
                     fx.gpu.barrier()
                     for slot in range_constexpr(n_members):
                         sumsq, dot = finish_source_reduce(slot, buf)
@@ -765,7 +828,7 @@ def _build_attn_res(spec: _AttnResSpec):
                     thread_sumsq = thread_sumsq + (
                         mixed_local[tile] * mixed_local[tile]
                     ).reduce(ReductionOp.ADD, fastmath=fm_fast)
-                sumsq = block_reduce(thread_sumsq, s_sumsq_all, epilogue_buf, "add")
+                sumsq = block_reduce(thread_sumsq, 0, epilogue_buf, "add")
                 norm_scale = fmath.rsqrt(
                     sumsq * inv_hidden_size
                     + output_rms_eps * denominator * denominator,
@@ -795,7 +858,7 @@ def _build_attn_res(spec: _AttnResSpec):
                     thread_amax = thread_amax.maximumf(
                         fmath.absf(y_local[tile]).reduce(ReductionOp.MAX)
                     )
-                amax = block_reduce(thread_amax, s_dot_all, epilogue_buf, "max")
+                amax = block_reduce(thread_amax, 1, epilogue_buf, "max")
                 # amax * (1 / fp8_max), not a divide, matches the HIP per-token quant.
                 row_scale = amax * (1.0 / fp8_max)
                 inverse_scale = (row_scale > zero).select(1.0 / row_scale, zero)
