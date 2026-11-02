@@ -55,7 +55,7 @@ void hk_mla_verify_fwd(const aiter_tensor_t& q,
                     q.size(2) == k3hk::kD && q.stride(2) == 1,
                 "q must be bf16 [bs*8, 12, 576] with a contiguous last dim");
     AITER_CHECK(ntok == out.size(0), "q and out token counts differ");
-    AITER_CHECK(kv.size(-1) == k3hk::kD && kv.stride(-1) == 1 && kv.element_size() == 1,
+    AITER_CHECK(kv.size(-1) == k3hk::kD && kv.stride(-1) == 1 && kv.dtype() == AITER_DTYPE_fp8,
                 "kv must be fp8 [N, ..., 576] with a contiguous last dim");
     AITER_CHECK(kv_indptr.dtype() == AITER_DTYPE_i32 && kv_indices.dtype() == AITER_DTYPE_i32,
                 "kv_indptr / kv_indices must be int32");

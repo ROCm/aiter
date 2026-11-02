@@ -53,7 +53,7 @@ def mla_verify_hk_supported(
         get_gfx() in _HK_THRESHOLDS
         and num_heads == _HK_HEADS
         and qlen == _HK_QLEN
-        and kv_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and kv_dtype == torch.float8_e4m3fn
         and page_size == 1
     )
 
@@ -95,9 +95,9 @@ def select_mla_verify_kernel(
 
 
 def mla_verify_hk_num_splits(batch_size: int) -> int:
-    """Power-of-two KV splits per request so batch * splits ~ one CTA per CU."""
-    n = max(1, -(-_HK_TARGET_CTAS // max(batch_size, 1)))
-    return max(2, min(triton.next_power_of_2(n), _HK_MAX_SPLITS))
+    """KV splits per request so batch * splits fills one wave of CTAs."""
+    n = -(-_HK_TARGET_CTAS // max(batch_size, 1))
+    return max(2, min(n, _HK_MAX_SPLITS))
 
 
 def _use_hip_reduce(nsplit: int) -> bool:
@@ -112,18 +112,20 @@ def mla_verify_hk(
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     sm_scale: float,
-    kv_scale=None,
+    kv_scale: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MLA target verify on gfx950 for QLEN 8, 12 heads, FP8 KV, page size 1.
 
     q: bf16 [batch * 8, 12, 576]; kv_buffer: fp8 [N, ..., 576]; kv_indptr:
     int32 [batch + 1] (KV lengths include the draft tokens); kv_indices: int32;
-    kv_scale: fp32 [1] tensor, float or None (1.0). Returns bf16 [batch * 8, 12, 512] (written to out).
+    kv_scale: fp32 [1] tensor. Returns bf16 [batch * 8, 12, 512] (written to out).
     Allocates no host-dependent state, so it can be captured in a CUDA graph.
     """
     ntok = q.shape[0]
     assert ntok % _HK_QLEN == 0, "token count must be a multiple of 8"
+    # The C++ entry sees one fp8 dtype id for e4m3fn and e4m3fnuz.
+    assert kv_buffer.dtype == torch.float8_e4m3fn, "kv must be float8_e4m3fn"
     bs = ntok // _HK_QLEN
     if out is None:
         out = torch.empty(
@@ -131,13 +133,6 @@ def mla_verify_hk(
         )
     q = q.view(-1, _HK_HEADS, _HK_D)
     kv = kv_buffer.view(-1, _HK_D)
-    if not isinstance(kv_scale, torch.Tensor):
-        kv_scale = torch.full(
-            (1,),
-            1.0 if kv_scale is None else float(kv_scale),
-            dtype=torch.float32,
-            device=q.device,
-        )
     nsplit = mla_verify_hk_num_splits(bs)
     rows = _HK_HEADS * _HK_QLEN
     o_part = torch.empty(
