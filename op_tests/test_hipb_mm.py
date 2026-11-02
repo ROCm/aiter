@@ -246,15 +246,22 @@ def test_hipb_mm_accepts_mxfp8_scale_dtype(mode, scale_dtype):
 @requires_fp8
 @requires_mxfp8
 @pytest.mark.parametrize(
-    "mode", [ScaleMode.VEC32_UE8M0, ScaleMode.BLK32_UE8M0_32_8_EXT]
+    "mode, rows, k",
+    [
+        pytest.param(ScaleMode.VEC32_UE8M0, 32, 256, id="unswizzled-32x256"),
+        pytest.param(ScaleMode.VEC32_UE8M0, 64, 768, id="unswizzled-64x768"),
+        pytest.param(ScaleMode.BLK32_UE8M0_32_8_EXT, 2, 256, id="swizzled-2x256"),
+        pytest.param(ScaleMode.BLK32_UE8M0_32_8_EXT, 33, 768, id="swizzled-33x768"),
+    ],
 )
-@pytest.mark.parametrize("rows, k", [(2, 256), (33, 768)])
 @pytest.mark.parametrize("out_dtype", [dtypes.bf16, dtypes.fp16])
 def test_hipb_mm_mxfp8_nonuniform_scales(mode, rows, k, out_dtype):
     if mode == ScaleMode.BLK32_UE8M0_32_8_EXT and get_module(
         "module_hipbsolgemm"
     ).hipblaslt_build_version < (1, 3, 0):
         pytest.skip("Swizzled MXFP8 requires hipBLASLt >=1.3")
+    # Unswizzled hipBLASLt kernels require aligned rows on older libraries.
+    # The swizzled cases retain small and odd rows with padded scale storage.
     generator = torch.Generator(device="cuda").manual_seed(6582)
     x = torch.randint(-2, 3, (rows, k), device="cuda", generator=generator).to(
         dtypes.fp8
