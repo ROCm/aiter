@@ -263,7 +263,7 @@ _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
 # 1-32 splits; gfx1250 over topk 512-4096, N 8-256, H 16-128 and 1-32 splits.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
-    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
+    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(64, 32, 1, _ANY_COUNT, 500, 0.004),
     ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
     ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
     ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
