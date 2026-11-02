@@ -774,14 +774,19 @@ class TestGlm53TunedArtifact(unittest.TestCase):
         self.assertGreater(float(token_one["err2"]), 0.0)
 
     def test_in_memory_jobs_keep_the_candidate_kernel(self):
+        from aiter.aot.flydsl import mxfp4_moe
         from aiter.aot.flydsl.mxfp4_moe import _job_key, jobs_from_rows, parse_csv
 
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
 
-        file_jobs = parse_csv(str(config))
-        row_jobs = jobs_from_rows(rows)
+        with mock.patch.object(mxfp4_moe, "_ATOMIC_STAGE2", False):
+            file_jobs = parse_csv(str(config))
+            row_jobs = jobs_from_rows(rows)
+        with mock.patch.object(mxfp4_moe, "_ATOMIC_STAGE2", True):
+            self.assertEqual(jobs_from_rows(rows), row_jobs)
+            self.assertEqual(parse_csv(str(config)), row_jobs)
 
         # The file parser precompiles what the runtime dispatches (the
         # deterministic ``reduce`` sibling of a tuned atomic v2 row), while the

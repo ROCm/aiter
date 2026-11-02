@@ -3271,7 +3271,9 @@ def _flydsl_v2_stage2_wrapper(
             f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
         )
     epilog = cfg["epilog"]
-    max_sorted = inter_states.shape[0]
+    # FP8 activations are token-major; the sorted route mesh also includes
+    # per-expert padding, so its capacity determines the GEMM2 launch grid.
+    max_sorted = sorted_token_ids.numel()
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]

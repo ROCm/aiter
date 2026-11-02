@@ -393,7 +393,8 @@ def test_reduce_skips_dropped_routes_and_repeats_bitwise():
 
 
 @_GFX950_GPU
-def test_reduce_stops_at_the_device_valid_token_count():
+@pytest.mark.parametrize("is_fp8", [False, True])
+def test_reduce_stops_at_the_device_valid_token_count(is_fp8):
     """EP padding must not be reduced, and must not be gathered either.
 
     ``moe_sorting`` only sorts the first ``num_local_tokens`` rows, so the
@@ -401,6 +402,7 @@ def test_reduce_stops_at_the_device_valid_token_count():
     positive one would index past ``expert_mask``; the count guard has to stop
     the row before either load.
     """
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
     from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
     token, topk, model_dim, valid = 4, 4, 256, 2
@@ -408,28 +410,55 @@ def test_reduce_stops_at_the_device_valid_token_count():
         (token, topk, model_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
     )
     target[:valid].fill_(1.0)
+    if is_fp8:
+        packed = torch.empty(
+            (token * topk, fp8out_row_bytes(model_dim)),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        packed[:, :model_dim] = (
+            target.reshape(-1, model_dim).to(dtypes.fp8).view(torch.uint8)
+        )
+        packed[:, model_dim:] = 127  # E8M0 scale 1.
+        target = packed
     # Poisoned tail: a valid-looking expert id far outside the mask.
     topk_ids = torch.full((token, topk), 1 << 20, dtype=torch.int32, device="cuda")
     topk_ids[:valid] = 0
+    topk_ids[valid::2] = 0  # In-range padding still needs the token-count guard.
     expert_mask = torch.ones(4, dtype=torch.int32, device="cuda")
     valid_tokens = torch.tensor([valid], dtype=torch.int32, device="cuda")
 
     out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
-    _run_moe_reduction(
-        target,
-        out,
-        token,
-        topk,
-        model_dim,
-        expert_mask=expert_mask,
-        topk_ids=topk_ids,
-        valid_tokens=valid_tokens,
-    )
+
+    def launch():
+        _run_moe_reduction(
+            target,
+            out,
+            token,
+            topk,
+            model_dim,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
+            valid_tokens=valid_tokens,
+            is_fp8=is_fp8,
+        )
+
+    launch()
     torch.cuda.synchronize()
 
     assert not out.isnan().any(), "padded row leaked into the reduction"
     torch.testing.assert_close(out[valid:], torch.zeros_like(out[valid:]))
     torch.testing.assert_close(out[:valid], torch.full_like(out[:valid], float(topk)))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for count in (1, 0, valid):
+        valid_tokens.fill_(count)
+        graph.replay()
+        expected = torch.zeros_like(out)
+        expected[:count] = float(topk)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @_GFX950_GPU
@@ -476,6 +505,8 @@ def test_v2_reduce_stage2_matches_the_reference_and_repeats():
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, experts, model_dim, torch.bfloat16, block_m
     )
+    # Exercise the extra sorted tiles beyond the token-major activation rows.
+    assert num_valid_ids[0].item() > token * topk
 
     a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
         a2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0

@@ -110,7 +110,7 @@ def _moe_reduction_body(
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
-    if const_expr(skip_invalid_ids):
+    if const_expr(use_mask or skip_invalid_ids):
         tk_ptr = fx.inttoptr(
             i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
         )
@@ -159,45 +159,47 @@ def _moe_reduction_body(
         p_dst = thr_store.partition_D(
             fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
         )
-        # topk rows share one per-thread voffset via a uniform scalar
-        # soffset = k*row_stride, so the loads issue back-to-back.
-        frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
-        for k in range_constexpr(topk):
-            fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
-        if const_expr(is_fp8):
-            sc_col = (
-                fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
-            ) // fx.Int32(scale_blk)
-            scales = []
-            for k in range_constexpr(topk):
-                e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << 23).bitcast(fx.Float32))
-
         acc = fx.full(V, 0.0, fx.Float32)
-        for k in range_constexpr(topk):
+        # Guard the loads as well as the sum. Graph padding can contain stale
+        # ids, weights and route values, including when the valid count is zero.
+        if fx.Int32(token) < row_valid:
+            # topk rows share one per-thread voffset via a uniform scalar
+            # soffset = k*row_stride, so the loads issue back-to-back.
+            frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
+            for k in range_constexpr(topk):
+                fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
             if const_expr(is_fp8):
-                vk = _decode_fp8(frags[k], scales[k])
-            else:
-                vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
-            if const_expr(use_weight):
-                wk = tw_ptr[k]
-                vk = fx.Vector.from_elements(
-                    [vk[i] * wk for i in range_constexpr(V)], fx.Float32
-                )
-            if const_expr(use_mask or skip_invalid_ids or has_valid_tokens):
-                valid = fx.Int32(token) < row_valid
+                sc_col = (
+                    fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
+                ) // fx.Int32(scale_blk)
+                scales = []
+                for k in range_constexpr(topk):
+                    e8m0 = fx.Uint32(
+                        fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)])
+                    )
+                    scales.append((e8m0 << 23).bitcast(fx.Float32))
+
+            for k in range_constexpr(topk):
+                if const_expr(is_fp8):
+                    vk = _decode_fp8(frags[k], scales[k])
+                else:
+                    vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
+                if const_expr(use_weight):
+                    wk = tw_ptr[k]
+                    vk = fx.Vector.from_elements(
+                        [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                    )
                 if const_expr(use_mask or skip_invalid_ids):
                     route_id = tk_ptr[k]
-                    valid = valid & (route_id >= fx.Int32(0))
-                if const_expr(use_mask):
-                    # Bound the id and index 0 when the route is invalid: a
-                    # padded or dropped positive id must not reach em_ptr.
-                    valid = valid & (route_id < fx.Int32(num_experts))
-                    valid = valid & (
-                        em_ptr[valid.select(route_id, fx.Int32(0))] != fx.Int32(0)
-                    )
-                vk = valid.select(vk, fx.full(V, 0.0, fx.Float32))
-            acc = acc + vk
+                    valid = route_id >= fx.Int32(0)
+                    if const_expr(use_mask):
+                        # Invalid ids must not reach the mask gather.
+                        valid = valid & (route_id < fx.Int32(num_experts))
+                        valid = valid & (
+                            em_ptr[valid.select(route_id, fx.Int32(0))] != fx.Int32(0)
+                        )
+                    vk = valid.select(vk, fx.full(V, 0.0, fx.Float32))
+                acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)
         fx.copy(store_atom, ofrag, p_dst)
