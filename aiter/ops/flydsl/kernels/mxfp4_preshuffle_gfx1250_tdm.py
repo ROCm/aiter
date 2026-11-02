@@ -452,8 +452,12 @@ def build_gemm_a8w4_tdm_task(
     # interleave into the per-lane ds_read below (lane == M row, stride
     # SA_KDW dwords -> a 2-way bank conflict on one b32 read per operand).
     SA_KDW = AS_KSTEPS  # scale dwords per row per k-tile (tile_k // 128)
+    # The A-scale prologue keeps the full K range resident (AS_FULL_B below)
+    # and never reads a rotating A-scale stage, so it gets no per-stage slot.
     STAGE_SA = (
-        ceildiv(tile_m * SA_KDW * 4, 16) * 16
+        0
+        if tdm_as_in_prologue
+        else ceildiv(tile_m * SA_KDW * 4, 16) * 16
         if row_major_ascale
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
