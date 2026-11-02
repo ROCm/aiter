@@ -1,739 +1,936 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MXFP4 paged MQA logits for DeepSeek-style sparse attention (OPUS kernels), gfx950 and gfx1250.
+"""MXFP4 paged MQA logits (OPUS kernels): one entry for DeepSeek-V4 (64 index heads) and V4.1
+(32 index heads, full and candidate layers).
 
-Per query row ``r`` over a window ``[s, e)``:
-``out[r, s:e] = sum_H( relu(Q[r] . K^T) * weight[r] ) * weight_scale``
+Per query row ``r`` of sequence ``b`` over its window ``[0, row_ends[r])``::
 
-Prefill and decode share one launch over a per-tile schedule built on device. The plan depends
-only on per-forward data, so build it once per forward and reuse it for every CSA layer::
+    out[r, c] = sum_h relu(q[r, h] . k_b[c]) * weights[r, h] * weight_scale
 
-    width = pa_mqa_logits_mxfp4_block_table_width(max_model_len)          # once at startup
-    buf  = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, batch,         # once per pool
-                                            variant="qlen1_kv64")
-    plan = pa_mqa_logits_mxfp4_plan(cu_seq_q, local_ends, buffers=buf)    # once per forward
-    out  = pa_mqa_logits_mxfp4(q, q_scale, kv_cache, kv_scale,            # once per layer
-                               block_tables, weights, plan, max_seq_len, out=out)
+Sequence ``b`` holds rows ``query_start_loc[b] .. query_start_loc[b + 1] - 1`` and reads its keys
+through ``block_tables[b]``, an entry naming ``pages_per_block`` consecutive ``page_size``-row
+pages (its value is the first page's id / ``pages_per_block``)::
 
-Every step is device-side with no readback, so the path is CUDAGraph-safe provided the buffers
-are caller-held and reused (see :func:`pa_mqa_logits_mxfp4_plan`).
+    cfg   = mqa_logits_mxfp4_config(dev, heads=64, page_size=64, max_rows=..., max_seqs=...,
+                                    max_qlen=4, max_seq_len=...)   # once per shape bucket
+    width = cfg.block_table_width                                   # min block_tables.shape[1]
+    buf   = cfg.schedule_buffers()                                  # optional, caller-held
+    sched = mqa_logits_mxfp4_schedule(cfg, query_start_loc, row_ends, buffers=buf)  # per forward
+    out   = mqa_logits_mxfp4(q, q_scale, kv_cache, kv_scale, weights, block_tables,
+                             query_start_loc, row_ends, cfg=cfg, schedule=sched, out=out)
 
-KERNEL INSTANCES (:func:`pa_mqa_logits_mxfp4_variants`) take identical inputs and are chosen
-per buffer pool, never inferred from the shape. On gfx1250 the default suits prefill and
-MTP > 1; MTP = 1 decode should ask for ``qlen1_kv64``.
+The caller never names a kernel instance: the config picks one from the static bounds. A
+schedule is optional. Given, the launch runs the table-driven mode; absent, it runs the
+instance's schedule-free mode, or (an instance without one) builds a schedule internally into
+buffers of the call's own -- correct and graph-safe, one more launch a call. Nothing reads device
+data on the host, so every path can be captured.
 
-LAYOUTS are the caller's; this module never touches the data:
+A slice of rows ``[start, start + count)`` (a band) is scored by slicing the per-row tensors and
+passing ``query_start_loc.clamp(start, start + count) - start``.
 
-=============  =======================================  =================================
-tensor         gfx950                                   gfx1250
-=============  =======================================  =================================
-``q``          ``[total_q, H, D/2]`` uint8              same
-``weights``    ``[total_q, H]`` bf16                    same
-``q_scale``    ``[total_q, 2, 32, 4]`` MFMA-permuted    ``[total_q, H, 4]`` natural
-``kv_scale``   ``[num_blocks, 2, 32, 4]`` permuted      ``[num_blocks, PAGE, 4]`` natural
-``kv_cache``   ``[num_blocks, 4, PAGE, 16]``            ``[num_blocks, PAGE, D/2]`` natural
-=============  =======================================  =================================
+LAYOUTS (the caller's; nothing here touches the data). Every arch::
 
-On gfx1250 each scale is the plain E8M0 byte of one 32-element K block, and each packed row is
-64 contiguous bytes, low nibble first. Both layouts have the same byte count, so the C++
-launchers (which check ``numel``) would accept the wrong one and return plausible wrong logits;
-the ndim check here is the only guard, and it cannot catch an array reshaped to the right ndim.
+    q          [rows, H, D/2]  uint8 / fp4x2     weights          [rows, H]       bf16
+    row_ends   [rows]          int32             query_start_loc  [seqs + 1]      int32
+    block_tables [seqs, width] int32             out [rows, >= max_seq_len] fp32, or flat
+                                                     with out_offsets [rows] int32
 
-FOUR CONDITIONS the kernel cannot check:
+and per arch (the KV cache writer's; both have the same byte counts, so only the ndim tells
+them apart -- checked here, as nothing on device can)::
 
-1. the window rule is non-decreasing in the row index within a tile (true of every causal and
-   CSA-compressed rule), so a tile's union is its first row's start and last row's end. If
-   broken, a CTA's waves disagree on the trip count and DEADLOCK;
-2. stores are bounded only by the window, so a ``local_ends`` entry past ``out.shape[1]``
-   writes past the row -- padding rows included;
-3. a row that belongs to no live sequence (a CUDAGraph pad row) carries an EMPTY window
-   (``local_ends <= local_starts``), and only such a row may have a negative ``row_to_batch``.
-   At ``q_per_block == 1`` ``cu_seq_q`` is not consulted, so this is what keeps a pad row from
-   reading ``q`` or ``block_tables``;
-4. at ``q_per_block > 1`` ``cu_seq_q[batch] <= total_q``. The tile cut reads ``cu_seq_q`` on
-   device and the builder then reads every tiled row's ``local_ends`` / ``local_starts`` /
-   ``row_to_batch``, so a ``cu_seq_q`` claiming more rows than ``total_q`` reads those arrays
-   past ``total_q``. Claiming fewer is fine: rows past ``cu_seq_q[batch]`` are not scheduled.
+               gfx1250 (natural)                 gfx950 (MFMA-permuted, page_size 64)
+    q_scale    [rows, H, D/32]   uint8 (E8M0)    [rows, 2, 32, 4]
+    kv_cache   [pages, page_size, D/2]           [pages, 4, page_size, 16]
+    kv_scale   [pages, page_size, D/32]          [pages, 2, 32, 4]
+
+Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
+padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
+decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
+page's offset fits 32 bits -- on gfx950 its byte offset (page id x 4 KiB: a ``kv_cache`` under
+4 GiB, which the launch checks), on gfx1250 its row (page id x ``page_size``). ``max_seq_len`` is
+under 2^30 (a row's logits are addressed in 32 bits); the config checks it.
+
+NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold
+0xFF, or a weight is NaN or Inf (the kernels compute relu as max_num and put the NaN back from the
+scales; the gfx1250 TU is built with -fno-honor-nans).
 """
 
-from __future__ import annotations
-
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+import functools
+from dataclasses import dataclass
 
 import torch
 
 from ...jit.core import compile_ops
+from ...jit.utils.torch_guard import torch_compile_guard
 from ._arch import GFX950, GFX1250, _device_arch
 
-DEFAULT_KV_BLOCK_SIZE = 64
-
-
-@dataclass(frozen=True)
-class MqaLogitsVariant:
-    """One compiled kernel instance; pick one from :func:`pa_mqa_logits_mxfp4_variants`.
-
-    ``q_per_block``   query rows one CTA covers -- 4 or 1 on gfx1250, always 1 on gfx950.
-    ``block_k``       the KV tile in tokens.
-    ``cta_resident``  CTAs resident at once; sizes the grid and the schedule's split.
-    ``arch``          the target it was compiled for; refused on any other. Both arches have
-                      a ``qlen1_kv64``. ``None`` (hand-built) matches by value on the device.
-
-    All instances of one arch take the same inputs; size ``block_tables`` with
-    :func:`pa_mqa_logits_mxfp4_block_table_width`.
-    """
-
-    name: str
-    q_per_block: int
-    block_k: int
-    cta_resident: int
-    arch: str | None = None
-
-    def __str__(self) -> str:
-        return self.name
-
-
-# eq=False here and on MqaLogitsPlan: a generated __eq__ would compare tensors elementwise.
-@dataclass(frozen=True, eq=False)
-class MqaLogitsBuffers:
-    """A plan's caller-held buffers, their grid, and the kernel instance they are sized for.
-
-    Allocate with :func:`pa_mqa_logits_mxfp4_plan_buffers` and pass back to
-    :func:`pa_mqa_logits_mxfp4_plan` every forward. ``cu_tiles`` is empty at
-    ``q_per_block == 1`` (a tile is a row). Buffers for one instance or arch cannot plan another.
-    """
-
-    cta_info: torch.Tensor
-    cu_tiles: torch.Tensor
-    # The launch grid; pinned once a graph captures it.
-    num_ctas: int
-    variant: MqaLogitsVariant
-
-
-# gfx950 scales/kv_cache are 4-D (permuted); gfx1250's are 3-D (natural).
-_PERMUTED_NDIM = 4
-_NATURAL_NDIM = 3
-
-
-# == the kernel instances ==========================================================================
 _MD_NAME = "module_pa_mqa_logits_mxfp4_opus"
 
-# Kernel instances per arch, most general first. Each row must match an arm of the C++
-# `pa_mqa_logits_mxfp4_fwd_sched` dispatch, which refuses an uncompiled pair at launch.
-#
-# `cta_resident` is the CTAs resident at once and follows the kernel's occupancy; retune it
-# when the KV tile changes. A stale value only under-fills the GPU, never gives wrong results.
-# Both gfx950 instances use 1024.
-_VARIANTS = {
-    GFX1250: (
-        # Four rows per CTA, one per wave, sharing a KV tile: prefill, MTP > 1.
-        MqaLogitsVariant(
-            "qlen4_kv64", q_per_block=4, block_k=64, cta_resident=768, arch=GFX1250
-        ),
-        # One row per CTA, a single wave32: MTP = 1 decode.
-        MqaLogitsVariant(
-            "qlen1_kv64", q_per_block=1, block_k=64, cta_resident=3072, arch=GFX1250
-        ),
-    ),
-    GFX950: (
-        # One row per CTA, one wave over a 64-token KV tile: the default.
-        MqaLogitsVariant(
-            "qlen1_kv64", q_per_block=1, block_k=64, cta_resident=1024, arch=GFX950
-        ),
-        # One row per CTA, four waves over a 256-token KV tile: for long windows.
-        MqaLogitsVariant(
-            "qlen1_kv256", q_per_block=1, block_k=256, cta_resident=1024, arch=GFX950
-        ),
-    ),
-}
+# Schedule modes (opus_logits::mqa_logits_mode).
+TABLE, FREE, PREFILL = 0, 1, 2
+_MODE_NAMES = {"table": TABLE, "free": FREE, "prefill": PREFILL}
 
-# Default instance per arch, by name. Fixed rather than shape-derived: a rule over the shape
-# would average over the batch and misroute part of a mixed forward.
-_DEFAULT_VARIANT = {GFX1250: "qlen4_kv64", GFX950: "qlen1_kv64"}
-
-
-def _check_variant_tables():
-    """Import-time check: each instance is filed under its own arch and has positive numbers."""
-    for arch, variants in _VARIANTS.items():
-        for v in variants:
-            if v.arch != arch:
-                raise AssertionError(
-                    f"{v} is filed under {arch} but names arch={v.arch}"
-                )
-            if min(v.q_per_block, v.block_k, v.cta_resident) < 1:
-                raise AssertionError(
-                    f"{arch} {v}: q_per_block / block_k / cta_resident < 1"
-                )
-
-
-_check_variant_tables()
-
-# Mirrors of the C++ constants. Size cta_info only via `_cta_info` (it includes the scratch).
+_TILE = 64  # keys a KV tile, every instance's (gfx1250's rule tells V4.1 layers by it)
+_TOKEN_BYTES = 64  # a key or a head's query: D = 128 fp4
+_SCALE_BYTES = 4  # its E8M0 scales: D / 32
+_FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
+# Mirrors of the C++ builder's constants (pa_mqa_logits_mxfp4.cu).
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
+_GROUPS_BUILD_MAX_SEQS = 2048
+# max_qlen above this is a prefill bucket.
+_DECODE_MAX_QLEN = 8
+# Decode tiers: the smallest tier >= max_qlen picks the instance. 64 heads (V4): rows a CTA, one a
+# wave; a tier above the CTA's rows runs two or three groups a sequence (a CTA that fills a CU
+# stalls every SIMD at its per-phase barrier at once).
+_GFX1250_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 6, 8: 4}
+_GFX950_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 2, 8: 4}
+# 32 heads (V4.1 full layers): (rows_per_wave, waves, scale_tdm), a sequence's rows a CTA.
+_GFX1250_H32_DECODE_TIERS = {
+    1: (1, 1, 0),
+    2: (1, 2, 1),
+    3: (3, 1, 1),
+    4: (2, 2, 1),
+    6: (3, 2, 1),
+    8: (4, 2, 1),
+}
+# V4.1 candidate layers switch to the shallower ring at prefill size (ATOM's 16384-token batch).
+_CANDIDATE_PREFILL_ROWS = 16384
+# The Prefill split, from static shapes only. Full layers: PREFILL_ROUNDS rounds of resident CTAs
+# so the dispatcher balances the tail, no piece under PREFILL_MIN_WALK tiles. Candidate rows: the
+# fewest rounds that keep every CTA's walk within CAND_MAX_WALK tiles.
+_PREFILL_ROUNDS = 8
+_PREFILL_MIN_WALK = 16
+_CAND_MAX_WALK = 32
+_MAX_PREFILL_PARTS = 65536  # the kernels' 32-bit split (part_point) needs parts <= 2^16
+_MAX_SEQ_LEN = 1 << 30  # a row's logits are bounded by a 32-bit byte count (4 B a key)
+
+# Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
+# MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
+_LAYOUT = {GFX950: (4, 2), GFX1250: (3, 1)}
+# Arches whose KV layout is defined for one page size only: gfx950 permutes a 64-row page at a time.
+_PAGE_SIZE = {GFX950: 64}
+# Requests an arch serves through another op, not this one.
+_ELSEWHERE = {
+    (GFX950, 32): "V4.1 (heads=32) on gfx950 runs FlyDSL's row-group kernel "
+    "(aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4), not this op",
+}
 
 
-# == JIT stubs: signatures must match PA_MQA_LOGITS_MXFP4_PYBIND exactly ===========================
-# Raw ABI (empty-tensor sentinels, not None). `compile_ops` replaces the body, so no checks can
-# live here; the C++ side dispatches on the runtime arch.
-@compile_ops(
-    _MD_NAME,
-    fc_name="pa_mqa_logits_mxfp4_fwd_sched",
-    develop=True,
+# == JIT stubs: signatures must match MQA_LOGITS_MXFP4_PYBIND exactly ============================
+@compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_instances", develop=True)
+def _instances_raw(device_id: int, out: torch.Tensor) -> int: ...
+
+
+@compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_build_schedule", develop=True)
+def _build_schedule_raw(
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    cu_groups: torch.Tensor,
+    cta_info: torch.Tensor,
+    instance: int,
+    num_ctas: int,
+    cta_resident: int,
+) -> None: ...
+
+
+# Addresses and scalars, not tensors: a pybind tensor descriptor apiece cost the launch more host
+# time than the rest of it, and it runs once a layer, once a band in prefill. Called through
+# _mqa_logits_mxfp4_launch only, which owns the tensors and the torch op.
+@compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_launch")
+def _mqa_logits_mxfp4_launch_raw(
+    q: int,
+    q_scale: int,
+    kv_cache: int,
+    kv_scale: int,
+    weights: int,
+    block_tables: int,
+    query_start_loc: int,
+    row_ends: int,
+    cta_info: int,
+    out: int,
+    out_offsets: int,
+    kv_bytes: int,
+    rows: int,
+    num_seqs: int,
+    bt_stride: int,
+    out_stride: int,
+    instance: int,
+    schedule_mode: int,
+    weight_scale: float,
+    tpb_shift: int,
+    cta_target: int,
+    prefill_parts: int,
+    grid: int,
+    device: int,
+    stream: int,
+) -> None: ...
+
+
+# The stub's body without its own torch op dispatch (an op of integers only would take a dummy
+# tensor every call); the tensor op below is the one torch sees.
+_launch_raw = getattr(
+    _mqa_logits_mxfp4_launch_raw, "_eager_body", _mqa_logits_mxfp4_launch_raw
 )
-def _fwd_sched_raw(
+
+
+# == the launch op ================================================================================
+# A tensor custom op, so torch.compile sees one opaque call that writes `out` only. Its first
+# parameter is a tensor, so it takes no dummy one (that needs the annotations evaluated: this
+# module does not postpone them). mqa_logits_mxfp4 checks the tensors; this hands their addresses
+# on, with the current stream of q's device.
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (
+    lambda device: torch.cuda.current_stream(device).cuda_stream
+)
+
+
+def _launch_fake(*args, **kwargs) -> None:
+    return None
+
+
+@torch_compile_guard(mutates_args=["out"], device="cuda", gen_fake=_launch_fake)
+def _mqa_logits_mxfp4_launch(
     q: torch.Tensor,
     q_scale: torch.Tensor,
     kv_cache: torch.Tensor,
     kv_scale: torch.Tensor,
-    block_tables: torch.Tensor,
     weights: torch.Tensor,
-    local_starts: torch.Tensor,
-    local_ends: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
     cta_info: torch.Tensor,
     out: torch.Tensor,
-    num_rows: int,
-    num_ctas: int,
+    out_offsets: torch.Tensor,
+    rows: int,
+    num_seqs: int,
+    instance: int,
+    schedule_mode: int,  # not `mode`: auto_functionalized takes that name itself
     weight_scale: float,
-    kv_block_size: int,
-    max_seq_len: int,
-    q_per_block: int,
-    block_k: int,
-) -> None: ...
-
-
-@compile_ops(
-    _MD_NAME,
-    fc_name="pa_mqa_logits_mxfp4_build_tiles",
-    develop=True,
-)
-def _build_tiles_raw(
-    cu_seq_q: torch.Tensor,
-    cu_tiles: torch.Tensor,
-    total_q: int,
-    max_tiles: int,
-    q_per_block: int,
-) -> None: ...
-
-
-@compile_ops(
-    _MD_NAME,
-    fc_name="pa_mqa_logits_mxfp4_build_sched",
-    develop=True,
-)
-def _build_sched_raw(
-    cu_tiles: torch.Tensor,
-    local_starts: torch.Tensor,
-    local_ends: torch.Tensor,
-    row_to_batch: torch.Tensor,
-    cta_info: torch.Tensor,
-    num_tiles: int,
-    num_rows: int,
-    num_ctas: int,
-    cta_resident: int,
-    block_k: int,
-    q_per_block: int,
-) -> None: ...
-
-
-def _variants_for(arch: str) -> tuple[MqaLogitsVariant, ...]:
-    """The kernel instances this build compiled for ``arch``, most general first."""
-    try:
-        return _VARIANTS[arch]
-    except KeyError:
-        raise RuntimeError(
-            f"the MXFP4 MQA-logits op supports {GFX950} and {GFX1250}, got {arch}"
-        ) from None
-
-
-def _default_variant(arch: str) -> str:
-    """The name a caller that passes no ``variant`` gets, for ``arch``."""
-    try:
-        return _DEFAULT_VARIANT[arch]
-    except KeyError:
-        raise RuntimeError(
-            f"the MXFP4 MQA-logits op supports {GFX950} and {GFX1250}, got {arch}"
-        ) from None
-
-
-def _as_i32(t):
-    """int32 contiguous form required by C++, or None. Done once per plan, not per launch."""
-    return None if t is None else t.to(torch.int32).contiguous()
-
-
-def _max_tiles_for(total_q: int, batch: int, variant: MqaLogitsVariant) -> int:
-    """Upper bound on ``sum_b ceil(qlen_b / q_per_block)`` from static shapes only.
-
-    Slack is at most ``batch - 1`` (empty) tiles; exact at ``q_per_block == 1``.
-    """
-    qpb = variant.q_per_block
-    return (int(total_q) + int(batch) * (qpb - 1)) // qpb
-
-
-def _sched_slots(num_tiles: int, variant: MqaLogitsVariant) -> int:
-    """The ``num_ctas`` grid: ``num_tiles`` rounded up to whole resident rounds, at least one
-    round so a few long tiles can be split across the GPU. Excludes the builder's scratch.
-    """
-    r = variant.cta_resident
-    n = max(int(num_tiles), r)
-    return -(-n // r) * r
-
-
-def _cta_info(device, num_ctas):
-    # Slots plus the builder's scratch, which follows them.
-    return torch.empty(
-        (int(num_ctas) + _SCHED_SCRATCH_RECORDS, _SCHED_RECORD_INTS),
-        dtype=torch.int32,
-        device=device,
+    tpb_shift: int,
+    cta_target: int,
+    prefill_parts: int,
+    grid: int,
+) -> None:
+    device = q.get_device()
+    flat = out_offsets.numel() > 0
+    _launch_raw(
+        q.data_ptr(),
+        q_scale.data_ptr(),
+        kv_cache.data_ptr(),
+        kv_scale.data_ptr(),
+        weights.data_ptr(),
+        block_tables.data_ptr(),
+        query_start_loc.data_ptr(),
+        row_ends.data_ptr(),
+        cta_info.data_ptr() if schedule_mode == TABLE else 0,
+        out.data_ptr(),
+        out_offsets.data_ptr() if flat else 0,
+        kv_cache.numel(),
+        rows,
+        num_seqs,
+        block_tables.stride(0),
+        0 if flat else out.stride(0),
+        instance,
+        schedule_mode,
+        weight_scale,
+        tpb_shift,
+        cta_target,
+        prefill_parts,
+        grid,
+        device,
+        _raw_stream(device),
     )
 
 
-def _cu_tiles(device, num_tiles):
-    # Tile t covers rows [cu_tiles[t], cu_tiles[t + 1]); hence the terminator.
-    return torch.empty(int(num_tiles) + 1, dtype=torch.int32, device=device)
+# == the registry ===================================================================================
+@dataclass(frozen=True)
+class _Instance:
+    """One compiled kernel instance, as its registry entry describes it."""
+
+    id: int
+    heads: int
+    rows_per_wave: int
+    waves: int
+    stages: int
+    scale_tdm: int  # 1: the key scales are copied with the tile, 0: loaded per lane
+    gather: int  # 1: a 64-key tile gathers 8-row table entries (V4.1 candidate layers)
+    entry_rows_min: int  # rows a table entry may name: page_size * pages_per_block
+    entry_rows_max: int
+    tile_keys: int
+    modes: int  # bit m: schedule mode m is compiled
+    flat_out: int  # reads out_offsets
+    resident: tuple[int, int, int]  # CTAs resident at once, a mode (0: not compiled)
+
+    @property
+    def rows_per_cta(self) -> int:
+        return self.rows_per_wave * self.waves
+
+    @property
+    def name(self) -> str:
+        g = "g" if self.gather else ""
+        s = "T" if self.scale_tdm else "L"
+        shape = f"r{self.rows_per_wave}w{self.waves}s{self.stages}"
+        return f"h{self.heads}{g}_{shape}{s}"
+
+    def has(self, mode: int) -> bool:
+        return bool(self.modes >> mode & 1)
+
+    def reads(self, entry_rows: int) -> bool:
+        """Whether it reads a table whose entries name `entry_rows` plane rows."""
+        if not self.entry_rows_min <= entry_rows <= self.entry_rows_max:
+            return False
+        if self.gather:
+            return True
+        # contiguous tiles: an entry is a power-of-two run of whole tiles, or a tile a
+        # power-of-two run of whole entries (the registry's entry_rows bounds say which)
+        big, small = max(entry_rows, self.tile_keys), min(entry_rows, self.tile_keys)
+        runs = big // small
+        return big % small == 0 and runs & (runs - 1) == 0
 
 
-def _compute_tiles(cu_seq_q, total_q, variant, out=None):
-    """Cut rows into tiles of at most ``q_per_block`` rows of one batch, on device.
-
-    Only used at ``q_per_block > 1``. ``num_tiles`` is a host-side upper bound; extra tiles are
-    written empty.
-    """
-    cu = cu_seq_q.to(torch.int32).contiguous()
-    batch = int(cu.shape[0]) - 1
-    num_tiles = _max_tiles_for(total_q, batch, variant)
-    cu_tiles = _cu_tiles(cu.device, num_tiles) if out is None else out
-    _build_tiles_raw(cu, cu_tiles, int(total_q), int(num_tiles), variant.q_per_block)
-    return cu_tiles, num_tiles
-
-
-def _compute_schedule(
-    cu_tiles,
-    local_ends,
-    num_tiles,
-    num_rows,
-    variant,
-    *,
-    local_starts=None,
-    row_to_batch=None,
-    num_ctas=None,
-    cta_info=None,
-):
-    """Build the per-tile schedule on device, no sync. Window arrays must already be int32.
-
-    Every slot is written, so ``cta_info`` can be reused across forwards without clearing.
-    """
-    n = int(num_tiles)
-    slots = _sched_slots(n, variant) if num_ctas is None else int(num_ctas)
-    if cta_info is None:
-        cta_info = _cta_info(local_ends.device, slots)
-    empty = torch.empty(0, dtype=torch.int32, device=local_ends.device)
-    _build_sched_raw(
-        cu_tiles if cu_tiles is not None else empty,
-        local_starts if local_starts is not None else empty,
-        local_ends,
-        row_to_batch if row_to_batch is not None else empty,
-        cta_info,
-        n,
-        int(num_rows),
-        slots,
-        variant.cta_resident,
-        variant.block_k,
-        variant.q_per_block,
-    )
-    return cta_info, slots
+@functools.cache
+def _instances(device: torch.device) -> tuple[_Instance, ...]:
+    """The instances compiled for `device`'s arch, with their resident CTAs a mode."""
+    buf = torch.empty(1024, dtype=torch.int32, device="cpu")
+    need = _instances_raw(device.index, buf)
+    if need > buf.numel():
+        buf = torch.empty(need, dtype=torch.int32, device="cpu")
+        _instances_raw(device.index, buf)
+    flat = buf[:need].tolist()
+    n, rows = flat[0], flat[1:]
+    out = []
+    for i in range(0, len(rows), n):
+        f = rows[i : i + n]
+        out.append(_Instance(*f[:12], resident=(f[12], f[13], f[14])))
+    return tuple(out)
 
 
-def _launch(
-    variant,
-    q_fp4,
-    q_scale,
-    kv_cache,
-    kv_scale,
-    block_tables,
-    weights,
-    local_ends,
-    cta_info,
-    num_ctas,
-    num_rows,
-    max_seq_len,
-    *,
-    local_starts=None,
-    weight_scale=1.0,
-    kv_block_size=DEFAULT_KV_BLOCK_SIZE,
-    out=None,
-):
-    """Launch the kernel. ``local_ends``/``local_starts`` must be the plan's own arrays (the
-    kernel masks stores per row); ``num_rows`` is the plan's row count, not ``q``'s."""
-    if out is None:
-        out = torch.full(
-            (int(q_fp4.shape[0]), max_seq_len),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp4.device,
+def _describe(insts) -> str:
+    return (
+        ", ".join(
+            f"{i.name} (heads {i.heads}, entry rows {i.entry_rows_min}"
+            + (f"..{i.entry_rows_max}" if i.entry_rows_max != i.entry_rows_min else "")
+            + ")"
+            for i in insts
         )
-    empty = torch.empty(0, dtype=torch.int32, device=q_fp4.device)
-    _fwd_sched_raw(
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        local_starts if local_starts is not None else empty,
-        local_ends,
-        cta_info,
-        out,
-        int(num_rows),
-        int(num_ctas),
-        float(weight_scale),
-        int(kv_block_size),
-        int(max_seq_len),
-        variant.q_per_block,
-        variant.block_k,
+        or "none"
     )
-    return out
 
 
-# == the dispatcher ================================================================================
+def _tier(tiers: dict, max_qlen: int):
+    return tiers[min(t for t in tiers if t >= max_qlen)]
+
+
+def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
+    """V4 decode by tier, prefill four rows a CTA; V4.1 full layers decode by tier, prefill
+    eight rows a CTA; V4.1 candidate layers one row a CTA, a deeper ring below prefill size.
+    """
+    decode = max_qlen <= _DECODE_MAX_QLEN
+    if heads == 64:
+        rpc = _tier(_GFX1250_H64_DECODE_TIERS, max_qlen) if decode else 4
+        want = {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}
+        return want, FREE if decode else PREFILL
+    if heads == 32 and entry_rows >= _TILE:
+        rpw, waves, tdm = (
+            _tier(_GFX1250_H32_DECODE_TIERS, max_qlen) if decode else (4, 2, 1)
+        )
+        want = {
+            "rows_per_wave": rpw,
+            "waves": waves,
+            "stages": 2,
+            "scale_tdm": tdm,
+            "gather": 0,
+        }
+        return want, FREE if decode else PREFILL
+    if heads == 32:
+        stages = 3 if max_rows >= _CANDIDATE_PREFILL_ROWS else 4
+        want = {"rows_per_cta": 1, "stages": stages, "scale_tdm": 0, "gather": 1}
+        return want, PREFILL
+    return None
+
+
+def _rule_gfx950(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
+    """V4 decode by tier (qshare above one row a sequence), prefill one row a CTA. V4.1 runs
+    FlyDSL's kernel (_ELSEWHERE)."""
+    if heads != 64:
+        return None
+    decode = max_qlen <= _DECODE_MAX_QLEN
+    rpc = _tier(_GFX950_H64_DECODE_TIERS, max_qlen) if decode else 1
+    want = {"rows_per_cta": rpc, "tile_keys": _TILE}
+    return want, FREE if decode else PREFILL
+
+
+# Each arch's selection: (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
+# schedule-free mode), or None when no rule covers the request. Mixed batches run the prefill
+# choice.
+_RULES = {GFX1250: _rule_gfx1250, GFX950: _rule_gfx950}
+
+
+def _matches(inst: _Instance, want: dict) -> bool:
+    return all(getattr(inst, k) == v for k, v in want.items())
+
+
+# == the config =====================================================================================
 @dataclass(frozen=True, eq=False)
-class MqaLogitsPlan:
-    """One forward's schedule plus the windows and instance its layer launches need.
+class MqaLogitsScheduleBuffers:
+    """One live schedule's device memory, from :meth:`MqaLogitsConfig.schedule_buffers`."""
 
-    Built by :func:`pa_mqa_logits_mxfp4_plan`; reuse it for every layer of the forward.
-    ``num_ctas > num_tiles`` means the schedule split tiles across CTAs.
-    """
+    cfg: "MqaLogitsConfig"
+    cta_info: torch.Tensor  # [num_ctas + scratch, 8] int32 records
+    cu_groups: (
+        torch.Tensor
+    )  # the group cut, then each group's sequence; empty at one row a CTA
+    num_ctas: int  # the Table grid; pinned once a graph captures it
 
-    arch: str
+
+@dataclass(frozen=True, eq=False)
+class MqaLogitsSchedule:
+    """One forward's Table schedule, bound to its cfg (or an equal one) and to the very
+    `query_start_loc` and `row_ends` tensors it was built from (the launch checks their identity,
+    not contents)."""
+
+    cfg: "MqaLogitsConfig"
+    query_start_loc: torch.Tensor
+    row_ends: torch.Tensor
     cta_info: torch.Tensor
-    # The launch grid; under a graph it must come from caller-held buffers.
     num_ctas: int
-    # Windows are int32 contiguous; the kernel reads them per row for the store mask.
-    # `num_tiles` is an upper bound. `cu_tiles` is empty at `q_per_block == 1` (tile t = row t).
-    cu_tiles: torch.Tensor
-    num_tiles: int
-    local_ends: torch.Tensor
-    local_starts: torch.Tensor | None = None
-    # The instance the buffers are sized for; the launch dispatches on it.
-    variant: MqaLogitsVariant | None = None
-    # Rows the schedule covers (`total_q`); the launch raises if `q` holds fewer.
-    num_rows: int | None = None
 
 
-def pa_mqa_logits_mxfp4_variants(
-    device: torch.device | str | int | None = None,
-) -> tuple[MqaLogitsVariant, ...]:
-    """The kernel instances compiled for the device's arch, most general first.
+@dataclass(frozen=True, eq=False)
+class MqaLogitsConfig:
+    """An opaque launch configuration for one shape bucket (:func:`mqa_logits_mxfp4_config`).
 
-    Pass one (or its ``name``) to :func:`pa_mqa_logits_mxfp4_plan_buffers`; the choice is never
-    inferred from the shape. ``device`` defaults to the current one. Only probes the arch; no
-    GPU work or JIT build, so it is safe at startup.
+    Public, read-only: ``block_table_width`` (the minimum ``block_tables.shape[1]``), ``arch``,
+    ``heads``, ``page_size``, ``pages_per_block`` and the four bounds.
     """
-    arch = _device_arch(torch.cuda.current_device() if device is None else device)
-    return _variants_for(arch)
+
+    device: torch.device
+    arch: str
+    heads: int
+    page_size: int
+    pages_per_block: int
+    max_rows: int
+    max_seqs: int
+    max_qlen: int
+    max_seq_len: int
+    block_table_width: int
+    _instance: _Instance
+    # The schedule-free mode, or None: no schedule means an internal one.
+    _mode: int | None
+    _tpb_shift: int  # log2(tiles a table entry); 0 where a tile spans entries
+    _table_slots: int  # the Table grid at the bounds
+    _empty_i32: torch.Tensor
+    # What fixes the launch: device, bounds, instance, schedule-free mode. Configs compare and
+    # hash by it, so a schedule or buffers from one serve any equal one (an evicted config's
+    # successor included).
+    _key: tuple
+
+    def __eq__(self, other) -> bool:
+        return self is other or (
+            isinstance(other, MqaLogitsConfig) and self._key == other._key
+        )
+
+    def __hash__(self) -> int:
+        return hash(self._key)
+
+    def schedule_buffers(self) -> MqaLogitsScheduleBuffers:
+        """Buffers for one live schedule, sized from the bounds. Hold one set per micro-batch or
+        captured graph and pass it to every forward's :func:`mqa_logits_mxfp4_schedule`.
+        """
+        rpc = self._instance.rows_per_cta
+        groups = _max_groups(self.max_rows, self.max_seqs, rpc)
+        return MqaLogitsScheduleBuffers(
+            cfg=self,
+            cta_info=torch.empty(
+                (self._table_slots + _SCHED_SCRATCH_RECORDS, _SCHED_RECORD_INTS),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            cu_groups=(
+                self._empty_i32
+                if rpc == 1
+                else torch.empty(
+                    2 * (groups + 1), dtype=torch.int32, device=self.device
+                )
+            ),
+            num_ctas=self._table_slots,
+        )
+
+    @property
+    def instance_name(self) -> str:
+        """The chosen instance, for logs only: nothing takes it back."""
+        return self._instance.name
 
 
-def _as_variant(variant, arch: str) -> MqaLogitsVariant:
-    """Resolve a name or MqaLogitsVariant to this arch's compiled instance, or raise.
-    ``arch=None`` objects are matched by value against this arch's instances only."""
-    compiled = _variants_for(arch)
-    if isinstance(variant, MqaLogitsVariant):
-        if variant.arch is not None and variant.arch != arch:
-            raise ValueError(
-                f"variant {variant.name!r} was compiled for {variant.arch}, not {arch}; take "
-                f"this device's from pa_mqa_logits_mxfp4_variants()"
-            )
-        match = [v for v in compiled if v == replace(variant, arch=v.arch)]
-        if not match:
-            raise ValueError(
-                f"variant {variant.name!r} is not one {arch} compiled; available: "
-                f"{[v.name for v in compiled]}"
-            )
-        return match[0]
-    for v in compiled:
-        if v.name == variant:
-            return v
+def _max_groups(rows: int, seqs: int, rows_per_cta: int) -> int:
+    """Groups of at most `rows_per_cta` rows of one sequence that `rows` rows in `seqs`
+    sequences cut into, at most (each sequence's last group may be short)."""
+    if rows_per_cta == 1:
+        return rows
+    return (rows + seqs * (rows_per_cta - 1)) // rows_per_cta
+
+
+def _resolve_instance(insts, override) -> _Instance:
+    for i in insts:
+        if override in (i.id, i.name):
+            return i
     raise ValueError(
-        f"unknown variant {variant!r} for {arch}; available: {[v.name for v in compiled]}"
+        f"no MXFP4 MQA-logits instance {override!r} on this device; it has {_describe(insts)}"
     )
 
 
-def pa_mqa_logits_mxfp4_block_table_width(
-    max_seq_len: int,
-    variant: MqaLogitsVariant | str | Iterable[MqaLogitsVariant | str] | None = None,
+def mqa_logits_mxfp4_config(
+    device: torch.device | str | int,
     *,
-    device: torch.device | str | int | None = None,
-    kv_block_size: int = DEFAULT_KV_BLOCK_SIZE,
-) -> int:
-    """Minimum ``block_tables.shape[1]`` (page-table entries per sequence).
+    heads: int,
+    page_size: int,
+    pages_per_block: int = 1,
+    max_rows: int,
+    max_seqs: int,
+    max_qlen: int,
+    max_seq_len: int,
+    _instance: int | str | None = None,
+    _mode: str | None = None,
+) -> MqaLogitsConfig:
+    """The launch configuration for a shape bucket: static bounds only, no device data read.
 
-    A CTA rounds its window up to a whole KV tile (``block_k``) and reads the table for every
-    page of it, so the width is ``max_seq_len`` rounded up to the tile, in pages; the C++
-    launcher raises below it. Use this rather than deriving it from ``kv_block_size``.
+    ``heads``            index heads: 64 (V4) or 32 (V4.1).
+    ``page_size``        rows of one KV page (``kv_cache.shape[1]``): 64 (V4) or 8 (V4.1).
+    ``pages_per_block``  consecutive pages a table entry names (V4.1 full layers: 16 at ratio 2,
+                         32 at ratio 1; candidate layers and V4: 1).
+    ``max_rows``         query rows of a call, at most (CUDAGraph padding included).
+    ``max_seqs``         ``len(query_start_loc) - 1``, at most.
+    ``max_qlen``         rows of one sequence, at most; a decode bucket passes its MTP depth + 1.
+    ``max_seq_len``      the logits width: the most keys a row sees.
 
-    ``variant`` may be one, several, or ``None`` for all of the arch's; the widest wins, so a
-    table shared across instances should pass several or ``None`` (on gfx950 that sizes for
-    ``block_k`` 256). ``device`` picks the arch for names or ``None`` (default: current device);
-    with only :class:`MqaLogitsVariant` objects no GPU is touched. Never triggers the JIT build.
+    Cached, the most recent 1024: equal arguments give an equal config (the same object while
+    it stays cached), which holds no device memory, so a caller may ask once a step with that
+    step's shapes. Building one asks HIP for each instance's occupancy once a device. Raises if
+    no instance compiled for the device's arch supports the request. ``_instance`` (an id or
+    name) and ``_mode`` ("table" / "free" / "prefill") override the choice, for tuning and tests.
     """
-    wanted = (
-        None
-        if variant is None
-        else (
-            (variant,)
-            if isinstance(variant, (MqaLogitsVariant, str))
-            else tuple(variant)
-        )
+    dev = (
+        torch.device(device)
+        if not isinstance(device, int)
+        else torch.device("cuda", device)
     )
-    if (
-        device is None
-        and wanted is not None
-        and all(isinstance(v, MqaLogitsVariant) and v.arch is not None for v in wanted)
-    ):
-        # Each object names its arch, so no device probe; mixing arches is a caller error.
-        arches = {v.arch for v in wanted}
-        if len(arches) > 1:
-            raise ValueError(f"variants from more than one arch: {sorted(arches)}")
-        chosen = tuple(_as_variant(v, v.arch) for v in wanted)
-    else:
-        arch = _device_arch(torch.cuda.current_device() if device is None else device)
-        chosen = (
-            _variants_for(arch)
-            if wanted is None
-            else tuple(_as_variant(v, arch) for v in wanted)
-        )
-    n = int(max_seq_len)
-    ksz = int(kv_block_size)
-    # A tile must be a whole number of pages, or the width below would be wrong (0 when
-    # kv_block_size > block_k).
-    bad = [v for v in chosen if ksz < 1 or v.block_k % ksz]
-    if bad:
+    if dev.index is None:
+        dev = torch.device(dev.type, torch.cuda.current_device())
+    return _config(
+        dev,
+        int(heads),
+        int(page_size),
+        int(pages_per_block),
+        int(max_rows),
+        int(max_seqs),
+        int(max_qlen),
+        int(max_seq_len),
+        _instance,
+        _mode,
+    )
+
+
+# Bounded: a caller may pass each step's shapes, and prefill's rows, sequences and widths vary
+# without end. A config is a value (no device memory), so evicting one costs only its rebuild.
+@functools.lru_cache(maxsize=1024)
+def _config(
+    dev,
+    heads,
+    page_size,
+    pages_per_block,
+    max_rows,
+    max_seqs,
+    max_qlen,
+    max_seq_len,
+    override,
+    mode_name,
+):
+    bounds = (
+        heads,
+        page_size,
+        pages_per_block,
+        max_rows,
+        max_seqs,
+        max_qlen,
+        max_seq_len,
+    )
+    if min(bounds) < 1:
+        raise ValueError("every bound must be >= 1")
+    if max_seq_len >= _MAX_SEQ_LEN:
         raise ValueError(
-            f"kv_block_size={ksz} must divide the KV tile; it does not for "
-            f"{[(v.name, v.block_k) for v in bad]}"
+            f"max_seq_len must be under {_MAX_SEQ_LEN} (a row's logits are addressed in 32 "
+            f"bits), got {max_seq_len}"
         )
-    return max(-(-n // v.block_k) * (v.block_k // ksz) for v in chosen)
-
-
-def _arch_of(t: torch.Tensor) -> str:
-    """The arch of the tensor's own device (not the current one); raises if unsupported."""
-    arch = _device_arch(t.device)
-    if arch not in (GFX950, GFX1250):
-        raise RuntimeError(
-            f"the MXFP4 MQA-logits op supports {GFX950} and {GFX1250}, got {arch}"
+    arch = _device_arch(dev)
+    if (arch, heads) in _ELSEWHERE:
+        raise ValueError(_ELSEWHERE[arch, heads])
+    if _PAGE_SIZE.get(arch, page_size) != page_size:
+        raise ValueError(
+            f"{arch}'s KV layout is permuted a {_PAGE_SIZE[arch]}-row page at a time; "
+            f"page_size={page_size}"
         )
-    return arch
-
-
-def _check_layout(arch: str, q_scale, kv_scale, kv_cache) -> None:
-    """Reject the other target's scale and cache layouts, which the C++ size checks accept."""
-    if arch == GFX950:
-        want, other_ndim, other = _PERMUTED_NDIM, _NATURAL_NDIM, GFX1250
+    insts = _instances(dev)
+    entry_rows = page_size * pages_per_block
+    supported = [i for i in insts if i.heads == heads and i.reads(entry_rows)]
+    rule_of = _RULES.get(arch)
+    rule = rule_of(heads, entry_rows, max_rows, max_qlen) if rule_of else None
+    if override is not None:
+        inst = _resolve_instance(insts, override)
+        if inst not in supported:
+            raise ValueError(
+                f"instance {inst.name} does not take heads={heads} with {entry_rows}-row table "
+                f"entries; {arch} has {_describe(insts)}"
+            )
+        free_mode = rule[1] if rule is not None else None
     else:
-        want, other_ndim, other = _NATURAL_NDIM, _PERMUTED_NDIM, GFX950
+        chosen = [i for i in supported if rule is not None and _matches(i, rule[0])]
+        if not chosen:
+            raise ValueError(
+                f"no MXFP4 MQA-logits instance on {arch} for heads={heads}, "
+                f"page_size={page_size} x pages_per_block={pages_per_block}, "
+                f"max_qlen={max_qlen}; {arch} has {_describe(insts)}"
+            )
+        inst, free_mode = chosen[0], rule[1]
+    if mode_name is not None:
+        mode = _MODE_NAMES[mode_name]
+        if not inst.has(mode):
+            raise ValueError(f"instance {inst.name} has no {mode_name} mode")
+        free_mode = None if mode == TABLE else mode
+    elif free_mode is not None and not inst.has(free_mode):
+        free_mode = None
+    if (
+        inst.rows_per_cta > 1
+        and max_seqs > _GROUPS_BUILD_MAX_SEQS
+        and free_mode is None
+    ):
+        raise ValueError(
+            f"the Table schedule cuts at most {_GROUPS_BUILD_MAX_SEQS} sequences into "
+            f"{inst.rows_per_cta}-row tiles; max_seqs={max_seqs}"
+        )
+
+    tiles = -(-max_seq_len // inst.tile_keys)
+    width = -(-tiles * inst.tile_keys // entry_rows)
+    tpb = max(1, entry_rows // inst.tile_keys)
+    resident = inst.resident[TABLE]
+    slots = max(_max_groups(max_rows, max_seqs, inst.rows_per_cta), resident)
+    slots = -(-slots // resident) * resident
+    return MqaLogitsConfig(
+        device=dev,
+        arch=arch,
+        heads=heads,
+        page_size=page_size,
+        pages_per_block=pages_per_block,
+        max_rows=max_rows,
+        max_seqs=max_seqs,
+        max_qlen=max_qlen,
+        max_seq_len=max_seq_len,
+        block_table_width=width,
+        _instance=inst,
+        _mode=free_mode,
+        _tpb_shift=0 if inst.gather else tpb.bit_length() - 1,
+        _table_slots=slots,
+        _empty_i32=torch.empty(0, dtype=torch.int32, device=dev),
+        _key=(
+            dev,
+            heads,
+            page_size,
+            pages_per_block,
+            max_rows,
+            max_seqs,
+            max_qlen,
+            max_seq_len,
+            inst.id,
+            free_mode,
+        ),
+    )
+
+
+# == the schedule ===================================================================================
+def _check_rows(cfg: MqaLogitsConfig, query_start_loc, row_ends) -> tuple[int, int]:
+    for name, t in (("query_start_loc", query_start_loc), ("row_ends", row_ends)):
+        if t.dtype != torch.int32 or t.dim() != 1 or not t.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous 1-D int32 tensor")
+        if t.device != cfg.device:
+            raise ValueError(f"{name} is on {t.device}; the config is for {cfg.device}")
+    seqs, rows = query_start_loc.numel() - 1, row_ends.numel()
+    if not 1 <= seqs <= cfg.max_seqs or rows > cfg.max_rows:
+        raise ValueError(
+            f"{rows} rows in {seqs} sequences exceed the config's bounds "
+            f"(max_rows={cfg.max_rows}, max_seqs={cfg.max_seqs})"
+        )
+    return rows, seqs
+
+
+def _build(cfg, buf, query_start_loc, row_ends) -> None:
+    inst = cfg._instance
+    _build_schedule_raw(
+        query_start_loc,
+        row_ends,
+        buf.cu_groups,
+        buf.cta_info,
+        inst.id,
+        buf.num_ctas,
+        inst.resident[TABLE],
+    )
+
+
+def mqa_logits_mxfp4_schedule(
+    cfg: MqaLogitsConfig,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    buffers: MqaLogitsScheduleBuffers | None = None,
+) -> MqaLogitsSchedule:
+    """Build one forward's Table schedule on device (no host readback; capturable).
+
+    Optional: only a caller reusing it across many calls (V4's many layers) gains. ``buffers``
+    from ``cfg.schedule_buffers()`` hold it; ``None`` allocates a fresh set (eager use only: a
+    replayed graph reads the captured pointers). One buffer set holds one live schedule.
+    """
+    _check_rows(cfg, query_start_loc, row_ends)
+    if buffers is None:
+        buffers = cfg.schedule_buffers()
+    elif buffers.cfg != cfg:
+        raise ValueError("these buffers were sized for another config")
+    _build(cfg, buffers, query_start_loc, row_ends)
+    return MqaLogitsSchedule(
+        cfg=cfg,
+        query_start_loc=query_start_loc,
+        row_ends=row_ends,
+        cta_info=buffers.cta_info,
+        num_ctas=buffers.num_ctas,
+    )
+
+
+# == the launch =====================================================================================
+def _prefill_parts(inst: _Instance, groups: int, width_tiles: int) -> int:
+    """Pieces a group is cut into in the Prefill schedule, from static shapes only (the logits
+    width bounds every window), so a captured graph keeps its grid. The grid is a whole number of
+    rounds of resident CTAs: a part-filled last round costs a whole one."""
+    resident = inst.resident[PREFILL]
+    groups = max(1, groups)
+    if inst.gather:
+        rounds = max(1, -(-groups * width_tiles // (_CAND_MAX_WALK * resident)))
+        return max(1, min(rounds * resident // groups, _MAX_PREFILL_PARTS))
+    return max(
+        1,
+        min(
+            _PREFILL_ROUNDS * resident // groups,
+            width_tiles // _PREFILL_MIN_WALK,
+            _MAX_PREFILL_PARTS,
+        ),
+    )
+
+
+def mqa_logits_mxfp4(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cfg: MqaLogitsConfig,
+    schedule: MqaLogitsSchedule | None = None,
+    weight_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    out_offsets: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Paged MQA logits of ``q``'s rows (see the module docstring); returns ``out``.
+
+    ``out=None`` allocates ``[rows, max_seq_len]`` fp32 filled with ``-inf`` (pass one to avoid a
+    per-call allocation; pre-fill it only if something reads past the windows). With
+    ``out_offsets`` [rows] int32, ``out`` is flat and row r's logits start at ``out_offsets[r]``.
+    ``schedule`` must come from :func:`mqa_logits_mxfp4_schedule` with this ``cfg`` and these
+    very ``query_start_loc`` / ``row_ends`` tensors.
+    """
+    inst = cfg._instance
+    if q.device != cfg.device:
+        raise ValueError(f"q is on {q.device}; the config is for {cfg.device}")
+    want, page_dim = _LAYOUT[cfg.arch]
     for name, t in (
         ("q_scale", q_scale),
         ("kv_scale", kv_scale),
         ("kv_cache", kv_cache),
     ):
-        if t.dim() == want:
-            continue
-        why = (
-            f"; {t.dim()}-D is the {other} layout, which has the SAME byte count -- the C++ "
-            "launcher checks numel and would accept it, then return wrong logits"
-            if t.dim() == other_ndim
-            else ""
-        )
-        raise ValueError(f"{arch}: {name} must be {want}-D, got {tuple(t.shape)}{why}")
-
-
-def pa_mqa_logits_mxfp4_plan_buffers(
-    device: torch.device | str | int,
-    total_q: int,
-    batch: int,
-    *,
-    variant: MqaLogitsVariant | str | None = None,
-    num_ctas: int | None = None,
-) -> MqaLogitsBuffers:
-    """Allocate a plan's buffers and fix its grid from static shapes only.
-
-    Pass the result to :func:`pa_mqa_logits_mxfp4_plan` as ``buffers=`` every forward.
-    **Required under a CUDAGraph**, since a replay reuses the captured pointers and grid.
-
-    ``variant`` (object or name; default: the arch's general instance) is carried by the
-    buffers, which cannot plan for another instance or arch. Size for the LARGEST
-    ``total_q``/``batch`` the buffers will serve; smaller forwards reuse them, larger ones raise.
-    """
-    arch = _device_arch(device)
-    v = _as_variant(_default_variant(arch) if variant is None else variant, arch)
-    num_tiles = _max_tiles_for(total_q, batch, v)
-    slots = _sched_slots(num_tiles, v) if num_ctas is None else int(num_ctas)
-    return MqaLogitsBuffers(
-        cta_info=_cta_info(device, slots),
-        # One row per tile needs no cu_tiles.
-        cu_tiles=(
-            torch.empty(0, dtype=torch.int32, device=device)
-            if v.q_per_block == 1
-            else _cu_tiles(device, num_tiles)
-        ),
-        num_ctas=slots,
-        variant=v,
-    )
-
-
-def pa_mqa_logits_mxfp4_plan(
-    cu_seq_q: torch.Tensor,
-    local_ends: torch.Tensor,
-    *,
-    buffers: MqaLogitsBuffers | None = None,
-    total_q: int | None = None,
-    local_starts: torch.Tensor | None = None,
-    row_to_batch: torch.Tensor | None = None,
-) -> MqaLogitsPlan:
-    """Build one forward's schedule on device. Call once per forward, not per layer.
-
-    ``cu_seq_q`` is the ``[batch + 1]`` query-row prefix sum. At ``q_per_block > 1`` tiles are
-    cut from it so each holds rows of one batch only (the kernel would deadlock otherwise). At
-    ``q_per_block == 1`` it is not consulted and the row domain is ``total_q``, not
-    ``cu_seq_q[batch]``.
-
-    ``local_ends`` is the per-row window end, ``[total_q]``; ``total_q`` defaults to its
-    ``numel`` (pass it when ``local_ends`` is longer than ``q``). ``local_starts=None`` means
-    every row starts at 0. Windows must meet the module docstring's conditions.
-
-    ``row_to_batch`` maps each row to its ``block_tables`` row; ``None`` means ``block_tables``
-    is indexed per query row. Mixing per-sequence and per-row conventions silently reads wrong
-    pages. Negative ids are allowed only on empty-window rows. A tile reads ONE ``block_tables``
-    row, its first row's: at ``q_per_block > 1`` with ``None``, every row of a sequence must
-    therefore carry the same ``block_tables`` row as the sequence's first row; if they differ,
-    pass ``row_to_batch``.
-
-    ``buffers`` (from :func:`pa_mqa_logits_mxfp4_plan_buffers`) supplies the memory, grid and
-    kernel instance; without it the plan allocates fresh and uses the arch's default instance.
-
-    **Under a CUDAGraph, ``buffers`` is REQUIRED**: a replay reads the captured pointers and
-    grid, so fresh allocations here would silently go unread. Reuse the same object every
-    forward; no clearing is needed.
-    """
-    arch = _arch_of(local_ends)
-    n = int(local_ends.numel()) if total_q is None else int(total_q)
-
-    if buffers is None:
-        v = _as_variant(_default_variant(arch), arch)
-        cta_info, cu_tiles, num_ctas = None, None, None
-    else:
-        if buffers.variant.arch not in (None, arch):
-            raise ValueError(
-                f"these buffers were sized for {buffers.variant.arch}'s "
-                f"{buffers.variant.name!r} instance and this plan is for {arch}; allocate them "
-                "on the device the launch will run on"
+        if t.dim() != want:
+            other = [a for a, (n, _) in _LAYOUT.items() if n == t.dim()]
+            why = (
+                f"; {t.dim()}-D is {other[0]}'s layout, which has the SAME byte count -- the "
+                "launch would accept it and return wrong logits"
+                if other
+                else ""
             )
-        v = _as_variant(buffers.variant, arch)
-        cta_info, cu_tiles, num_ctas = (
-            buffers.cta_info,
-            buffers.cu_tiles,
-            buffers.num_ctas,
+            raise ValueError(
+                f"{cfg.arch}: {name} must be {want}-D, got {tuple(t.shape)}{why}"
+            )
+    if q.dim() != 3 or q.shape[1] != cfg.heads or q.shape[2] != _TOKEN_BYTES:
+        raise ValueError(
+            f"q must be [rows, {cfg.heads}, {_TOKEN_BYTES}] (D/2 packed fp4), got {tuple(q.shape)}"
         )
-    # Convert once per forward; the plan carries the result to every layer.
-    ends, starts = _as_i32(local_ends), _as_i32(local_starts)
-    if v.q_per_block == 1:
-        # One tile per row: no cut kernel, and `num_tiles` is exact (== rows).
-        tiles = (
-            cu_tiles
-            if cu_tiles is not None
-            else torch.empty(0, dtype=torch.int32, device=ends.device)
+    if kv_cache.shape[page_dim] != cfg.page_size:
+        raise ValueError(
+            f"kv_cache pages hold {kv_cache.shape[page_dim]} rows; the config is for "
+            f"{cfg.page_size}"
         )
-        num_tiles = _max_tiles_for(n, int(cu_seq_q.shape[0]) - 1, v)
+    if block_tables.dim() != 2 or block_tables.shape[1] < cfg.block_table_width:
+        raise ValueError(
+            f"block_tables must be [seqs, >= {cfg.block_table_width}] (cfg.block_table_width), "
+            f"got {tuple(block_tables.shape)}"
+        )
+    rows, seqs = _check_rows(cfg, query_start_loc, row_ends)
+    if q.shape[0] != rows:
+        raise ValueError(f"q has {q.shape[0]} rows and row_ends {rows}")
+    # The kernels stride every input by compile-time constants but the table's and out's rows, so
+    # a padded or permuted input would be silently wrong. Byte counts catch a wrong array, not a
+    # wrong permutation (the ndim checks above do).
+    if q.dtype not in _FP4_DTYPES or kv_cache.dtype not in _FP4_DTYPES:
+        raise ValueError("q / kv_cache must be fp4x2 (E2M1, 2 a byte) or uint8 bytes")
+    if q_scale.dtype != torch.uint8 or kv_scale.dtype != torch.uint8:
+        raise ValueError("q_scale / kv_scale hold E8M0 bytes and must be uint8")
+    if not (
+        q.is_contiguous()
+        and q_scale.is_contiguous()
+        and kv_cache.is_contiguous()
+        and kv_scale.is_contiguous()
+        and weights.is_contiguous()
+    ):
+        raise ValueError(
+            "q / q_scale / kv_cache / kv_scale / weights must be contiguous"
+        )
+    if q_scale.numel() != rows * cfg.heads * _SCALE_BYTES:
+        raise ValueError(
+            f"q_scale must hold {cfg.heads * _SCALE_BYTES} bytes a row, got {q_scale.numel()} "
+            f"for {rows} rows"
+        )
+    if (
+        kv_cache.numel() % _TOKEN_BYTES
+        or kv_scale.numel() * _TOKEN_BYTES != kv_cache.numel() * _SCALE_BYTES
+    ):
+        raise ValueError(
+            f"kv_cache must be whole {_TOKEN_BYTES}-byte keys and kv_scale {_SCALE_BYTES} bytes "
+            f"a key; got {kv_cache.numel()} and {kv_scale.numel()}"
+        )
+    if (
+        weights.dtype != torch.bfloat16
+        or weights.dim() != 2
+        or weights.shape[0] < rows
+        or weights.shape[1] != cfg.heads
+    ):
+        raise ValueError(
+            f"weights must be bf16 [rows, {cfg.heads}], got {weights.dtype} "
+            f"{tuple(weights.shape)}"
+        )
+    if (
+        block_tables.dtype != torch.int32
+        or block_tables.stride(1) != 1
+        or block_tables.shape[0] < seqs
+    ):
+        raise ValueError(
+            "block_tables must be int32 with a row a sequence and unit column stride"
+        )
+
+    if out_offsets is not None:
+        if out is None:
+            raise ValueError("a flat out (out_offsets) must be passed in")
+        if (
+            out_offsets.dtype != torch.int32
+            or not out_offsets.is_contiguous()
+            or out_offsets.numel() < rows
+        ):
+            raise ValueError(
+                f"out_offsets must be contiguous int32 with an entry a row, got "
+                f"{out_offsets.dtype} {tuple(out_offsets.shape)}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("a flat out (out_offsets) must be contiguous")
+        if not inst.flat_out:
+            raise ValueError(
+                f"instance {inst.name} does not write a flat out (out_offsets)"
+            )
+    elif out is None:
+        out = torch.full(
+            (rows, cfg.max_seq_len), float("-inf"), dtype=torch.float32, device=q.device
+        )
+    elif (
+        out.dim() != 2
+        or out.shape[0] < rows
+        or out.shape[1] < cfg.max_seq_len
+        or out.stride(1) != 1
+    ):
+        # The kernels bound a row's stores by its row_ends only.
+        raise ValueError(
+            f"out must be [>= {rows}, >= {cfg.max_seq_len}] (rows, cfg.max_seq_len) with unit "
+            f"column stride, got {tuple(out.shape)} strides {out.stride()}"
+        )
+    if out.dtype != torch.float32:
+        raise ValueError(f"out must be fp32, got {out.dtype}")
+
+    cta_target, parts = 1, 1
+    if schedule is not None:
+        if (
+            schedule.cfg != cfg
+            or schedule.query_start_loc is not query_start_loc
+            or schedule.row_ends is not row_ends
+        ):
+            raise ValueError(
+                "the schedule was built for another config or other query_start_loc / row_ends "
+                "tensors; a schedule is bound to the very tensors it was built from"
+            )
+        mode, cta_info, grid = TABLE, schedule.cta_info, schedule.num_ctas
+        if cta_info.numel() < grid * _SCHED_RECORD_INTS:
+            raise ValueError(
+                f"a Table launch over {grid} slots needs that many records"
+            )
+    elif cfg._mode is not None:
+        mode, cta_info = cfg._mode, cfg._empty_i32
+        groups = _max_groups(rows, seqs, inst.rows_per_cta)
+        if mode == FREE:
+            cta_target = inst.resident[FREE]
+            grid = groups + cta_target
+        else:
+            parts = _prefill_parts(inst, groups, -(-cfg.max_seq_len // inst.tile_keys))
+            grid = groups * parts
     else:
-        tiles, num_tiles = _compute_tiles(cu_seq_q, n, v, out=cu_tiles)
-    info, slots = _compute_schedule(
-        tiles,
-        ends,
-        num_tiles,
-        n,
-        v,
-        local_starts=starts,
-        row_to_batch=_as_i32(row_to_batch),
-        num_ctas=num_ctas,
-        cta_info=cta_info,
-    )
-    return MqaLogitsPlan(
-        arch=arch,
-        cta_info=info,
-        num_ctas=slots,
-        cu_tiles=tiles,
-        num_tiles=num_tiles,
-        local_starts=starts,
-        local_ends=ends,
-        variant=v,
-        num_rows=n,
-    )
+        # An instance without a schedule-free mode: a schedule into buffers of this call's own.
+        # Captured, they are the graph's; nothing outlives the call or races another stream.
+        buf = cfg.schedule_buffers()
+        _build(cfg, buf, query_start_loc, row_ends)
+        mode, cta_info, grid = TABLE, buf.cta_info, buf.num_ctas
 
-
-def pa_mqa_logits_mxfp4(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_scale: torch.Tensor,
-    block_tables: torch.Tensor,
-    weights: torch.Tensor,
-    plan: MqaLogitsPlan,
-    max_seq_len: int,
-    *,
-    weight_scale: float = 1.0,
-    kv_block_size: int = DEFAULT_KV_BLOCK_SIZE,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Paged MQA logits over ``plan`` (prefill or decode). Call once per layer.
-
-    The kernel instance comes from ``plan``. Returns ``out``; if not given, allocates a
-    ``[total_q, max_seq_len]`` fp32 tensor of ``-inf`` (pass one to avoid a per-layer
-    allocation). Only in-window cells ``[local_start, local_end)`` are written, so a
-    caller-held ``out`` needs ``-inf`` pre-fill only if its reader looks outside the windows.
-
-    Size ``block_tables`` with :func:`pa_mqa_logits_mxfp4_block_table_width`.
-    """
-    arch = _arch_of(q_fp4)
-    if arch != plan.arch:
-        raise ValueError(
-            f"the plan was built for {plan.arch} and this launch is on {arch}; a plan is per "
-            "forward AND per device"
-        )
-    _check_layout(arch, q_scale, kv_scale, kv_cache)
-    if plan.variant is None:
-        # Never guess: the buffers are sized for a specific instance.
-        raise ValueError(
-            "this plan carries no kernel instance; build it with pa_mqa_logits_mxfp4_plan"
-        )
-    return _launch(
-        plan.variant,
-        q_fp4,
+    _mqa_logits_mxfp4_launch(
+        q,
         q_scale,
         kv_cache,
         kv_scale,
-        block_tables,
         weights,
-        plan.local_ends,
-        plan.cta_info,
-        plan.num_ctas,
-        # A hand-built plan without `num_rows` covers every row of q.
-        int(q_fp4.shape[0]) if plan.num_rows is None else plan.num_rows,
-        int(max_seq_len),
-        local_starts=plan.local_starts,
-        weight_scale=weight_scale,
-        kv_block_size=kv_block_size,
-        out=out,
+        block_tables,
+        query_start_loc,
+        row_ends,
+        cta_info,
+        out,
+        cfg._empty_i32 if out_offsets is None else out_offsets,
+        rows,
+        seqs,
+        inst.id,
+        mode,
+        float(weight_scale),
+        cfg._tpb_shift,
+        cta_target,
+        parts,
+        int(grid),
     )
+    return out
 
 
 __all__ = [
-    "MqaLogitsBuffers",
-    "MqaLogitsPlan",
-    "MqaLogitsVariant",
-    "pa_mqa_logits_mxfp4",
-    "pa_mqa_logits_mxfp4_block_table_width",
-    "pa_mqa_logits_mxfp4_plan",
-    "pa_mqa_logits_mxfp4_plan_buffers",
-    "pa_mqa_logits_mxfp4_variants",
+    "MqaLogitsConfig",
+    "MqaLogitsSchedule",
+    "MqaLogitsScheduleBuffers",
+    "mqa_logits_mxfp4",
+    "mqa_logits_mxfp4_config",
+    "mqa_logits_mxfp4_schedule",
 ]

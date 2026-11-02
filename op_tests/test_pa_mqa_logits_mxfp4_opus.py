@@ -1,1290 +1,1140 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MXFP4 paged MQA logits (OPUS) -- correctness and perf, through the arch dispatcher.
+"""MXFP4 paged MQA logits (OPUS) through ``aiter.ops.opus.pa_mqa_logits_mxfp4``: perf and
+correctness.
 
-Tables (``--modes``): corner cases, causal prefill, CSA prefill (fresh and chunked) and MTP
-decode -- as markdown and as one-line JSON records for a benchmark driver. Every perf row runs
-each kernel instance this arch compiled as a candidate (``<instance> us/TFLOPS/TB/s/err``).
-Every launch goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``. Inputs use the natural (3-D)
-layouts on gfx1250 and the MFMA-permuted (4-D) ones on gfx950; the reference always reads
-natural E8M0. Each table sweeps ``itertools.product`` of its own list arguments.
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py                    # every table
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode -m v41 -b 1 64 --mtp 6
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes semantics --checks edges graph
 
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py             # the full default sweep
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes causal chunked -b 1 2 -c 25000
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode \\
-        --mtp 1 4 --decode-batch 32 128 --long-frac 1 0.875       # MTP decode, two raggednesses
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py \\
-        --data-init constant uniform --scale-init constant auto   # two paired init regimes
+Models (``-m``): ``v4`` (DeepSeek-V4, 64 index heads, compression ratio 4, 64-row pages, one a
+table entry), ``v41`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 256-token PAGE
+of them, ratio ``--ratio``) and ``cand`` (V4.1 candidate layers: every row its own sequence and
+its own table of 8-row pages).
 
-Data and scale are independent axes: the reference dequantizes any ``(nibbles, E8M0)`` pair, so
-the exponent spread is set by ``--scale-init`` alone. The spread is what lets a misrouted scale
-show: if rows 16 apart (one lane half) share an exponent, a wrong ``b_scale_sel`` reads a right
-value. ``correctness_blindness`` skips the correctness sweep for an init pair that cannot fail.
+``decode`` / ``prefill``: every registered instance that takes the model, in every schedule mode it
+compiles (``table``: a schedule built once outside the timing, as V4 builds one a forward;
+``internal``: no schedule, built in the call; ``free`` / ``prefill``: schedule-free, the in-kernel
+assignment timed), against an f64-GEMM reference on sampled rows; ``default`` names the
+config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget).
 
-The fp32 reference shares this file's view of the scale layout, so on gfx950 the corner cases
-also get an independent FlyDSL cross-check built from the same natural bytes (``vs flydsl``).
+``semantics`` (``--checks``), each against the reference on every instance and mode:
+  rows     every row of small shapes, NaN where an E8M0 is 0xFF, nothing written outside a
+           window, past ``out``'s guard bands or to an input; the flat out (``out_offsets``)
+           equal to the plane bit for bit
+  edges    rows carrying one source of NaN / Inf each (0xFF scales, a NaN or Inf weight, products
+           that overflow, a NaN key behind a zero q block): NaN / +-Inf masks equal the
+           reference's IEEE ones. The kernels compute relu as max_num and put NaN back from the
+           scales.
+  bands    a forward scored in slices of rows (``query_start_loc`` clamped) equals it whole
+  padding  rows past ``query_start_loc[-1]`` and empty sequences untouched, the rest right
+  graph    schedule + launch captured in a CUDA graph and replayed on new data
+  errors   the interface refuses what it cannot run (layouts, bounds, a foreign schedule, ...)
 """
 
 import argparse
+import bisect
 import itertools
-import math
-import random
 from dataclasses import dataclass
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.benchmark_data_init import (
-    DATA_DISTS,
-    E8M0_SCALE_DISTS,
-    fill,
-    fill_fp4,
-    fill_scale_e8m0,
-    make_generator,
-)
-from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus._arch import GFX950, _device_arch
+from aiter.ops.opus import pa_mqa_logits_mxfp4 as M
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-    _launch,
-    pa_mqa_logits_mxfp4,
-    pa_mqa_logits_mxfp4_block_table_width,
-    pa_mqa_logits_mxfp4_plan,
-    pa_mqa_logits_mxfp4_plan_buffers,
-    pa_mqa_logits_mxfp4_variants,
+    mqa_logits_mxfp4,
+    mqa_logits_mxfp4_config,
+    mqa_logits_mxfp4_schedule,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
-dev = "cuda"
+torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx1250", "gfx950"]
+SUPPORTED_GFX = ["gfx950", "gfx1250"]
 
-HEADS = 64
-HEAD_DIM = 128
-KV_BLOCK_SIZE = 64  # page size
-SCALE_BLOCK = 32  # E8M0 block
-WEIGHT_SCALE = 1.5
-BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
+D = 128
+PAGE_ROWS = 8  # the index plane's page
+PAGE_TOKENS = 256  # ATOM's KV PAGE: a full layer's table entry spans it, compressed
+CANDIDATE_BLOCKS = 2048
+TILE = 64
+PREFILL_ROWS = 16384
+SAMPLE_ROWS = 16  # rows checked against the reference in a perf shape
+REL_TOL = 1e-5  # of the largest finite |logit|; a misrouted E8M0 moves cells by 2x
+MODEL_HEADS = {"v4": 64, "v41": 32, "cand": 32}
 
-# gfx950 MFMA-permuted scale geometry: a lane's 4 E8M0 bytes in one dword, [.., g, m, byte].
-MFMA_N = 32
-K_TILES = HEAD_DIM // 64  # 2  (MFMA_K = 64)
-K_CHUNKS = 64 // SCALE_BLOCK  # 2  (32-K chunks per k-tile)
-SCALE_BYTES = 4  # K_TILES * n_tiles per lane dword
-
-CSA_RATIO = 4  # ATOM's compression ratio: row n sees floor((pos + 1) / 4)
-
-# Decode windows are COMPRESSED column counts: 25000 at ratio 4 is ~100k raw tokens.
-DECODE_WIN_LONG = 25000
-DECODE_WIN_SHORT = 100
-
-# Window ends around the 64-token tile edges; 1-2 tile windows run the pipeline's peeled
-# prologue and epilogue without a steady-state loop.
-TILE_EDGE_ENDS = (1, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 383, 384, 385)
-PREFILL_TOTAL_QLEN = 16384
-PREFILL_QMIN = 800
-MODES = ["corner", "causal", "fresh", "chunked", "decode"]
-N_COS_SAMPLE = 8
-
-# Pinned, not a flag: readings at different iteration counts are not comparable.
-PERF_ITERS = 50
-PERF_WARMUP = 10
-
-# Per-row / per-page byte counts for the traffic denominator (the gfx950 layout only permutes).
-Q_ROW_BYTES = HEADS * HEAD_DIM // 2  # 4096: one packed fp4 query row
-QS_ROW_BYTES = HEADS * BLOCKS_ROW  # 256: its E8M0 scales, [H, 4]
-W_ROW_BYTES = HEADS * 2  # 128: bf16 per-head weights
-KV_PAGE_BYTES = KV_BLOCK_SIZE * HEAD_DIM // 2  # 4096: one packed fp4 page
-KVS_PAGE_BYTES = KV_BLOCK_SIZE * BLOCKS_ROW  # 256: its E8M0 scales, [PAGE, 4]
-
-# `fill_fp4`'s constant fills the packed byte and defaults to 0 (same as `zero`). 0x22 is two
-# 1.0 nibbles, so an all-constant run puts every in-window cell at HEADS*HEAD_DIM*1.5 = 12288.
-FP4_CONSTANT_BYTE = 0x22
-
-# Minimum fraction of rows 16 apart with different exponents; below it the sweep is skipped.
-MISROUTE_DISAGREE_MIN = 0.2
-
-# fp32 reassociation bound, relative to the checked cells' max |ref|. A logit is a signed sum
-# over 64 heads, so a cancelled cell still carries rounding from terms as large as the row's
-# biggest logit (seen: 2.4e-7 of range). A misrouted scale moves a cell by 2x, far above this.
-REASSOC_ATOL_REL = 1e-6
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1 = _E2M1_MAGNITUDES + tuple(
+    -x for x in _E2M1_MAGNITUDES
+)  # code -> value; bit 3 the sign
 
 
-# ── the two init axes, and the dequant that joins them ────────────────────────
-def fill_nibbles(rows, data_init, gen):
-    """``[rows, HEAD_DIM/2]`` packed e2m1, low nibble = even element."""
-    return fill_fp4(
-        (rows, HEAD_DIM), data_init, gen, device=dev, constant=FP4_CONSTANT_BYTE
+# == workloads: ATOM's rows, tables and natural FP4 data ===========================================
+@dataclass
+class Rows:
+    """One scorer call: sequences of rows (``query_start_loc``), prefix windows and a table."""
+
+    label: str
+    kind: str  # "full" | "candidate"
+    query_start_loc: torch.Tensor  # [seqs + 1] i32
+    row_ends: torch.Tensor  # [rows] i32
+    # full: [seqs, entries] of ppb pages; candidate: [rows, 2048] pages
+    block_tables: torch.Tensor
+    pages_per_block: int
+    width: int  # logits columns
+    num_pages: int  # 8-row pages in the pool
+
+    @property
+    def rows(self):
+        return self.row_ends.numel()
+
+    @property
+    def num_seqs(self):
+        return self.query_start_loc.numel() - 1
+
+    @property
+    def max_qlen(self):
+        return max(1, int(self.query_start_loc.diff().max()))
+
+    def key_rows(self, r):
+        """Plane rows of row r's keys [0, row_end), in column order."""
+        end = int(self.row_ends[r])
+        k = torch.arange(end)
+        seq = bisect.bisect_right(self.query_start_loc.tolist(), r) - 1
+        per = self.pages_per_block * PAGE_ROWS
+        return self.block_tables[seq, k // per].long() * per + k % per
+
+
+def _gen(seed):
+    return torch.Generator(device="cuda").manual_seed(seed)
+
+
+def _tables(ctx_keys, rows_per_entry, g):
+    need = [-(-n // rows_per_entry) for n in ctx_keys]
+    ids = torch.randperm(sum(need), generator=g, device="cuda").to(torch.int32)
+    table = torch.zeros(len(need), max(need), dtype=torch.int32)
+    at = 0
+    for b, n in enumerate(need):
+        table[b, :n] = ids[at : at + n]
+        at += n
+    return table, sum(need)
+
+
+def full_layer(label, ctx, rows_per_seq, ratio, *, seed=0):
+    """Sequences whose last token sits at ``ctx[b] - 1``, each scoring its last
+    ``rows_per_seq[b]`` tokens at compression ``ratio`` (row at position p sees (p + 1) // ratio
+    keys). A table entry is one 256-token PAGE: 256 / ratio keys."""
+    g = _gen(seed)
+    keys = [c // ratio for c in ctx]
+    ppb = PAGE_TOKENS // ratio // PAGE_ROWS
+    table, entries = _tables(keys, ppb * PAGE_ROWS, g)
+    ends, qsl = [], [0]
+    for c, n in zip(ctx, rows_per_seq):
+        ends += [(p + 1) // ratio for p in range(c - n, c)]
+        qsl.append(qsl[-1] + n)
+    return Rows(
+        label,
+        "full",
+        torch.tensor(qsl, dtype=torch.int32),
+        torch.tensor(ends, dtype=torch.int32),
+        table,
+        ppb,
+        table.shape[1] * ppb * PAGE_ROWS,
+        entries * ppb,
     )
 
 
-def fill_exponents(shape, scale_init, gen):
-    """E8M0 on-wire bytes at the library's default (widest) pow2 spread; a narrower one would
-    blunt the misroute check, and ``REASSOC_ATOL_REL`` already covers the fp32 range."""
-    return fill_scale_e8m0(shape, scale_init, gen, device=dev)
+def candidate_layer(label, ctx, rows_per_seq, *, seed=0):
+    """V4.1's candidate layers: every row its own table of 8-row pages (picked from its request's
+    pages, the newest last) and its own sequence."""
+    g = _gen(seed)
+    table, blocks = _tables(ctx, PAGE_TOKENS, g)
+    ppb = PAGE_TOKENS // PAGE_ROWS
+    tabs, ends = [], []
+    for b, (c, n) in enumerate(zip(ctx, rows_per_seq)):
+        nblk = -(-c // PAGE_ROWS)
+        j = torch.arange(nblk)
+        phys = table[b, j // ppb].long() * ppb + j % ppb
+        base = torch.randperm(max(nblk - 1, 0), generator=g, device="cuda")[
+            : CANDIDATE_BLOCKS - 1
+        ]
+        base = torch.sort(base).values
+        for p in range(c - n, c):
+            newest = -(-(p + 1) // PAGE_ROWS) - 1
+            pick = base[: int(torch.searchsorted(base, newest))]
+            kept = torch.cat([pick, torch.tensor([newest])])
+            row = torch.zeros(CANDIDATE_BLOCKS, dtype=torch.int32)
+            row[: kept.numel()] = phys[kept].to(torch.int32)
+            tabs.append(row)
+            ends.append((kept.numel() - 1) * PAGE_ROWS + (p + 1) - newest * PAGE_ROWS)
+    rows = len(ends)
+    return Rows(
+        label,
+        "candidate",
+        torch.arange(rows + 1, dtype=torch.int32),
+        torch.tensor(ends, dtype=torch.int32),
+        torch.stack(tabs),
+        1,
+        CANDIDATE_BLOCKS * PAGE_ROWS,
+        blocks * ppb,
+    )
 
 
-def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
-    """``[..., d/2]`` packed e2m1 + ``[..., d/block]`` E8M0 -> ``[..., d]`` fp32.
+@dataclass
+class Fp4Data:
+    # [num_pages * 8, 64] u8: a key's 64 bytes, even element in the low nibble
+    values: torch.Tensor
+    # [num_pages * 8, 4] u8: its four E8M0 bytes, block c = dims [32c, 32c+32)
+    scales: torch.Tensor
+    q: torch.Tensor  # [rows, H, 64] u8
+    q_scale: torch.Tensor  # [rows, H, 4] u8
+    weights: torch.Tensor  # [rows, H] bf16
+    weight_scale: float
 
-    Defined for any pair. Both decodes come from ``aiter.utility.fp4_utils`` so the reference
-    stays canonical, e.g. E8M0 ``0xFF`` decodes to NaN rather than +inf.
+
+def make_data(rows: Rows, heads, *, seed=1):
+    """Random e2m1 codes and E8M0 exponents near 1 (no product overflows fp32); exponents vary
+    row to row, so a scale applied to the wrong 32 elements or lane half shows."""
+    g = _gen(seed)
+    u8 = {"dtype": torch.uint8, "generator": g}
+    keys, n = rows.num_pages * PAGE_ROWS, rows.rows
+    return Fp4Data(
+        values=torch.randint(0, 256, (keys, D // 2), **u8),
+        scales=torch.randint(120, 128, (keys, D // 32), **u8),
+        q=torch.randint(0, 256, (n, heads, D // 2), **u8),
+        q_scale=torch.randint(124, 130, (n, heads, D // 32), **u8),
+        weights=torch.randn(n, heads, generator=g).to(torch.bfloat16),
+        weight_scale=(D**-0.5) * (heads**-0.5),
+    )
+
+
+def dequant(values, scales):
+    """[..., D/2] e2m1 + [..., D/32] E8M0 -> [..., D] f64, 0xFF a NaN block. f64 so an E8M0 of
+    2^127 times a 6 does not overflow before the dot product does."""
+    lut = torch.tensor(E2M1, dtype=torch.float64)
+    codes = torch.stack([values & 0xF, values >> 4], dim=-1).flatten(-2).long()
+    scale = torch.where(scales == 0xFF, float("nan"), torch.exp2(scales.double() - 127))
+    return lut[codes] * scale.repeat_interleave(32, dim=-1)
+
+
+def run_torch(rows: Rows, data, r):
+    """Row r's logits over [0, row_end): sum_h relu(q_h . k) * w_h * weight_scale. The dot product
+    in f64, rounded to f32 as the WMMA's is; relu and the sum IEEE, so NaN / Inf land where the
+    kernel's do. gfx950's MFMA rounds after each 32-element block instead: it adds the block's
+    exact product to its fp32 accumulator, so an Inf from one block sticks where the f64 sum would
+    not overflow.
     """
-    *prefix, d_half = packed.shape
-    d = d_half * 2
-    vals = mxfp4_to_f32(packed).reshape(*prefix, d // block_size, block_size)
-    scale = e8m0_to_f32(e8m0)
-    return (vals * scale.unsqueeze(-1)).reshape(*prefix, d)
+    kr = rows.key_rows(r)
+    k = dequant(data.values[kr], data.scales[kr])
+    q = dequant(data.q[r], data.q_scale[r])
+    if _permuted():
+        blk = torch.einsum(
+            "hbk,ebk->heb", q.unflatten(-1, (4, 32)), k.unflatten(-1, (4, 32))
+        )
+        dot = blk[..., 0].float()
+        for b in range(1, 4):
+            dot = (dot.double() + blk[..., b]).float()
+    else:
+        dot = (q @ k.T).float()
+    s = torch.relu(dot)  # [H, end]
+    w = data.weights[r].float() * data.weight_scale
+    return (w[:, None] * s).sum(0)
 
 
-# ── per-arch scale/cache layout ───────────────────────────────────────────────
-def _is_permuted() -> bool:
-    """True on gfx950 (MFMA-permuted layouts), False on gfx1250 (natural). Queried per call on
-    the current device, never at import (the probe inits HIP before ``main()``'s arch gate).
+def inject_nans(rows: Rows, data):
+    """E8M0 0xFF where V4.1 has it -- the first compressed row of every sequence, all four bytes --
+    plus one byte of a key in the middle of every window and one q scale byte of the last row.
     """
-    return _device_arch(torch.cuda.current_device()) == GFX950
+    for r in range(rows.rows):
+        kr = rows.key_rows(r)
+        if kr.numel():
+            data.scales[kr[0]] = 0xFF
+            data.scales[kr[kr.numel() // 2], 2] = 0xFF
+    data.q_scale[rows.rows - 1, 5, 1] = 0xFF
 
 
-def _scale_to_opus(e8_nat, rows_per_group):
-    """``[rows, 4]`` natural E8M0 -> ``[rows/rpg, K_CHUNKS, MFMA_N, SCALE_BYTES]``, gfx950's
-    layout; a pure permutation. ``rows_per_group``: 64 heads (q_scale) or 64 page tokens (kv).
-    """
-    n_tiles = rows_per_group // MFMA_N
-    groups = e8_nat.shape[0] // rows_per_group
+# == a call as the model makes it, every way the interface can run it ===============================
+def _permuted():
+    """gfx950 reads MFMA-permuted q_scale / kv_cache / kv_scale; gfx1250 the natural ones."""
+    return get_gfx() == "gfx950"
+
+
+def _scale_to_gfx950(e8, rows_per_group):
+    """[rows, 4] natural E8M0 -> gfx950's [rows / 64, 2 (g), 32 (m), 4 (kt, tile)], a lane's four
+    bytes in one dword: byte kt * 2 + tile of dword (g, m) is row tile * 32 + m's block
+    kt * 2 + g. ``rows_per_group``: 64 heads (q_scale) or a 64-row page (kv_scale)."""
+    groups = e8.shape[0] // rows_per_group
     return (
-        e8_nat.reshape(groups, n_tiles, MFMA_N, K_TILES, K_CHUNKS)
-        .permute(0, 4, 2, 3, 1)  # [group, g, m, kt, tile]
-        .reshape(groups, K_CHUNKS, MFMA_N, SCALE_BYTES)
+        e8.reshape(groups, rows_per_group // 32, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .reshape(groups, 2, 32, 4)
         .contiguous()
     )
 
 
-# ── input builders: NATURAL on gfx1250, MFMA-permuted on gfx950 ────────────────
 @dataclass
-class Inputs:
-    q_packed: torch.Tensor  # [T, H, D/2]            natural
-    q_scale: torch.Tensor  # [T, H, 4] nat / [T, 2, 32, 4] permuted
-    q_dq: torch.Tensor  # [T, H, D]  dequantized, for the reference
-    weights: torch.Tensor  # [T, H] bf16             natural
-    kv_cache: torch.Tensor  # [nb, PAGE, D/2] nat / [nb, 4, PAGE, 16] permuted
-    kv_scale: torch.Tensor  # [nb, PAGE, 4] nat / [nb, 2, 32, 4] permuted
-    kv_dq: torch.Tensor  # [bs, t_max, D] dequantized
+class Case:
+    rows: Rows
+    heads: int
+    data: Fp4Data
+    page_size: int  # the plane as kv_cache [pages, page_size, 64]
+    pages_per_block: int
     block_tables: torch.Tensor
-    max_seq_len: int
-    q_e8: torch.Tensor  # [T*H, 4] natural E8M0, the source of every q_scale layout
-    kv_e8: torch.Tensor  # [nb*PAGE, 4] natural E8M0, source of all kv_scale layouts
+    # gfx950's permuted (q_scale, kv, kv_scale), made on first use
+    _arch: tuple | None = None
 
-
-def pages_for(max_end):
-    """Pages per sequence, rounded up to a whole KV tile of the widest compiled variant, since a
-    CTA reads ``block_tables`` for every page of its last tile. Uses the op's own sizing helper.
-    """
-    return pa_mqa_logits_mxfp4_block_table_width(
-        max(max_end, 1), kv_block_size=KV_BLOCK_SIZE
-    )
-
-
-def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
-    """Every buffer from one seeded generator; nibbles and exponents are drawn independently."""
-    gen = make_generator(seed, device=dev)
-    mbps = pages_for(max_end)
-    t_max = mbps * KV_BLOCK_SIZE
-    num_blocks = bs * mbps
-
-    permuted = _is_permuted()
-
-    # --- KV: the reference reads natural (kv_packed, kv_e8); the kernel the arch's layout. ---
-    kv_packed = fill_nibbles(bs * t_max, data_init, gen)
-    kv_e8 = fill_exponents((bs * t_max, BLOCKS_ROW), scale_init, gen)
-    kv_dq = fp4_dequant(kv_packed, kv_e8).reshape(bs, t_max, HEAD_DIM)
-    if permuted:
-        # gfx950: kv_cache[blk, b, o, :] holds K[token o][32b:32b+32]'s 16 packed bytes.
-        kv_cache = (
-            kv_packed.reshape(
-                num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW, HEAD_DIM // 2 // BLOCKS_ROW
+    def _layout(self):
+        d = self.data
+        if not _permuted():
+            return (
+                d.q_scale,
+                d.values.view(-1, self.page_size, D // 2),
+                d.scales.view(-1, self.page_size, D // 32),
             )
+        # kv_cache[page, b, o, :] holds key o's 32-element block b, 16 packed bytes
+        kv = (
+            d.values.view(-1, self.page_size, D // 32, 16)
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        kv_scale = _scale_to_opus(kv_e8, KV_BLOCK_SIZE)
-    else:
-        kv_cache = kv_packed.reshape(
-            num_blocks, KV_BLOCK_SIZE, HEAD_DIM // 2
-        ).contiguous()
-        kv_scale = kv_e8.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW).contiguous()
-    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
-        bs, mbps
-    )
-
-    # --- Q + weights ---
-    q_packed_flat = fill_nibbles(total_tokens * HEADS, data_init, gen)
-    q_e8 = fill_exponents((total_tokens * HEADS, BLOCKS_ROW), scale_init, gen)
-    q_dq = fp4_dequant(q_packed_flat, q_e8).reshape(total_tokens, HEADS, HEAD_DIM)
-    q_packed = q_packed_flat.reshape(total_tokens, HEADS, HEAD_DIM // 2).contiguous()
-    q_scale = (
-        _scale_to_opus(q_e8, HEADS)
-        if permuted
-        else q_e8.reshape(total_tokens, HEADS, BLOCKS_ROW).contiguous()
-    )
-    weights = fill(
-        (total_tokens, HEADS), data_init, gen, dtype=torch.bfloat16, device=dev
-    )
-
-    return Inputs(
-        q_packed=q_packed,
-        q_scale=q_scale,
-        q_dq=q_dq,
-        weights=weights,
-        kv_cache=kv_cache,
-        kv_scale=kv_scale,
-        kv_dq=kv_dq,
-        block_tables=block_tables,
-        max_seq_len=t_max,
-        q_e8=q_e8,
-        kv_e8=kv_e8,
-    )
-
-
-# ── reference ─────────────────────────────────────────────────────────────────
-def ref_rows(inp, rows, rb, ls, le):
-    """Reference logits for a few sampled rows: {row: (start, end, [values])}."""
-    w = inp.weights.float()
-    ref = {}
-    for r in rows:
-        b, s, e = int(rb[r]), int(ls[r]), int(le[r])
-        if e <= s:
-            ref[r] = (s, e, None)
-            continue
-        k = inp.kv_dq[b, s:e]  # [n, D]
-        scores = torch.relu(inp.q_dq[r] @ k.T)  # [H, n]
-        ref[r] = (s, e, (scores * w[r, :, None]).sum(0) * WEIGHT_SCALE)
-    return ref
-
-
-def check_rows(out, ref, msg):
-    """Mismatch ratio over the sampled rows' in-window cells; ``atol`` scales with their range
-    (see ``REASSOC_ATOL_REL``)."""
-    got, want = [], []
-    for r, (s, e, vals) in ref.items():
-        if vals is None:
-            continue
-        got.append(out[r, s:e].float())
-        want.append(vals.float())
-    if not got:
-        return 0.0
-    want, got = torch.cat(want), torch.cat(got)
-    atol = max(1e-2, REASSOC_ATOL_REL * float(want.abs().max()))
-    return checkAllclose(want, got, rtol=2e-5, atol=atol, msg=msg, printLog=False)
-
-
-def roofline_bytes(rb, le, total_q, n_logits):
-    """Lower bound on bytes moved: each KV page once per batch, not one K vector per logit
-    (rows of a batch share pages, so per-logit counting exceeds HBM peak)."""
-    if rb.numel() == 0:
-        return 0
-    ends = torch.zeros(int(rb.max().item()) + 1, dtype=torch.int64, device=rb.device)
-    ends.scatter_reduce_(0, rb.long(), le.long().clamp(min=0), reduce="amax")
-    pages = int(((ends + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE).sum().item())
-    return (
-        total_q * (Q_ROW_BYTES + QS_ROW_BYTES + W_ROW_BYTES)
-        + pages * (KV_PAGE_BYTES + KVS_PAGE_BYTES)
-        + n_logits * 4
-    )
-
-
-def oob_is_neginf(out, ls, le):
-    """Every cell outside ``[local_start, local_end)`` must keep its -inf pre-fill; catches
-    stray stores that leave the in-window values correct."""
-    col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
-    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
-    return bool(torch.isneginf(out[~inside]).all().item())
-
-
-def window_is_written(out, ls, le):
-    """Every cell inside ``[local_start, local_end)`` was stored, over all rows (``check_rows``
-    only samples), so a dropped tail tile shows."""
-    col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
-    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
-    return bool(torch.isfinite(out[inside]).all().item())
-
-
-def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
-    nonempty = torch.nonzero(le > 0).flatten().tolist()
-    if not nonempty:
-        return []
-    rng = random.Random(seed)
-    return sorted(rng.sample(nonempty, min(n, len(nonempty))))
-
-
-# ── gfx950 second opinion: FlyDSL, on its own layout ─────────────────────────
-# FlyDSL's preshuffle is a different permutation (16-row MFMA tiles), built from the natural
-# `q_e8` / `kv_e8`, so a layout bug shared by `_scale_to_opus` and the kernel cannot pass both.
-FLY_MFMA_M = 16
-FLY_KVS_NTPW = 4
-
-
-def _q_scale_flydsl(e8_nat, total_tokens):
-    """``[T*H, 4]`` -> FlyDSL's ``[T, D/128, 4, 16, QS_PAD]``."""
-    m_tiles = HEADS // FLY_MFMA_M
-    qs_pad = ((m_tiles + 3) // 4) * 4
-    qe = (
-        e8_nat.reshape(total_tokens, m_tiles, FLY_MFMA_M, HEAD_DIM // 128, 4)
-        .permute(0, 3, 4, 2, 1)  # [T, K_TILES_16, 4, 16, M_TILES]
-        .contiguous()
-    )
-    return torch.nn.functional.pad(qe, (0, qs_pad - m_tiles)).contiguous()
-
-
-def _kv_scale_flydsl(e8_nat, num_blocks):
-    """``[nb*PAGE, 4]`` -> FlyDSL's ``[nb, 1, 4, PAGE]``, token o at ``(o%16)*4 + o//16``."""
-    o = torch.arange(KV_BLOCK_SIZE, device=e8_nat.device)
-    sflat = (o % FLY_MFMA_M) * FLY_KVS_NTPW + (o // FLY_MFMA_M)
-    out = torch.zeros(
-        num_blocks, 1, 4, KV_BLOCK_SIZE, dtype=torch.uint8, device=e8_nat.device
-    )
-    out[:, 0, :, sflat] = e8_nat.reshape(num_blocks, KV_BLOCK_SIZE, 4).permute(0, 2, 1)
-    return out.contiguous()
-
-
-def flydsl_cross_check(inp, out, rb, ls, le, variant):
-    """Mismatch ratio of ``out`` against FlyDSL over every in-window cell, or NaN when skipped:
-    off gfx950, FlyDSL not importable, or any window start not a multiple of 4 (FlyDSL at
-    ``num_warps = 1`` drops the leading unaligned cells).
-    """
-    if not _is_permuted() or bool((ls % 4 != 0).any().item()):
-        return float("nan")
-    try:
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-            compute_prefill_schedule,
-            flydsl_pa_mqa_logits_fp4_prefill,
-        )
-    except Exception as e:  # noqa: BLE001 -- no import, no second opinion
-        aiter.logger.warning(
-            "FlyDSL cross-check unavailable: %s: %s", type(e).__name__, e
-        )
-        return float("nan")
-    total_q = int(rb.numel())
-    num_blocks = inp.block_tables.numel()
-    msl = inp.max_seq_len
-    _, cta, n_ctas = compute_prefill_schedule(rb, ls, le, variant.block_k, total_q, msl)
-    fly = torch.full((total_q, msl), float("-inf"), dtype=torch.float32, device=dev)
-    flydsl_pa_mqa_logits_fp4_prefill(
-        inp.q_packed, _q_scale_flydsl(inp.q_e8, total_q),
-        inp.kv_cache.view(-1, 1, 4, KV_BLOCK_SIZE, 16),
-        _kv_scale_flydsl(inp.kv_e8, num_blocks), inp.block_tables, inp.weights,
-        rb, ls, le, msl,
-        weight_scale=WEIGHT_SCALE, block_k=variant.block_k, kv_block_size=KV_BLOCK_SIZE,
-        num_warps=4 if variant.block_k == 256 else 1,
-        out=fly, cta_info=cta, n_ctas=n_ctas,
-    )  # fmt: skip
-    torch.cuda.synchronize()
-    col = torch.arange(msl, device=dev).unsqueeze(0)
-    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
-    want, got = fly[inside].float(), out[inside].float()
-    if want.numel() == 0:
-        return float("nan")
-    atol = max(1e-2, REASSOC_ATOL_REL * float(want.abs().max()))
-    return checkAllclose(
-        want, got, rtol=2e-5, atol=atol, msg="vs flydsl", printLog=False
-    )
-
-
-# ── correctness ───────────────────────────────────────────────────────────────
-def _variants():
-    """Compiled instances for the current device. Looked up lazily, never at import: the probe
-    inits HIP and raises on arches ``main()`` is meant to skip on other CI shards."""
-    return pa_mqa_logits_mxfp4_variants()
-
-
-def _qpb_max():
-    """The widest compiled ``Q_PER_BLOCK`` (the row replication factor of ``_g4``)."""
-    return max((v.q_per_block for v in _variants()), default=4)
-
-
-def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends, q_per_block):
-    """Assert windows are non-decreasing within each tile, which the schedule assumes so a
-    tile's union is first start .. last end. Host-side (syncs), so it lives in the test.
-    ``q_per_block`` must be this plan's instance, or the span check is vacuous.
-    """
-    ct = cu_tiles[: num_tiles + 1].tolist()
-    ls = local_starts.tolist()
-    le = local_ends.tolist()
-    for t in range(num_tiles):
-        lo, hi = ct[t], ct[t + 1]
-        if hi == lo:
-            continue  # an empty tile; its CTA gets a zero-count record
-        if not (0 < hi - lo <= q_per_block):
-            raise AssertionError(
-                f"qshare: tile {t} spans rows [{lo},{hi}), which is not 1..{q_per_block} rows"
-            )
-        for r in range(lo + 1, hi):
-            if ls[r] < ls[r - 1] or le[r] < le[r - 1]:
-                raise AssertionError(
-                    f"qshare: tile {t} window is not non-decreasing (row {r - 1}: "
-                    f"[{ls[r - 1]},{le[r - 1]}) then row {r}: [{ls[r]},{le[r]}))"
-                )
-
-
-def run_one(inp, qlens, rb, ls, le, label, seed, variant, check_windows=True):
-    """Launch one case over explicit per-row windows, on a PINNED instance, and score it."""
-    total_q = int(rb.numel())
-    cu = torch.tensor(
-        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
-    )
-    # The buffers carry the instance, which is how a case pins one instead of the plan's pick.
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(
-        dev, total_q, len(qlens), variant=variant
-    )
-    # Non-zero window starts need `local_starts`; `row_to_batch` because block_tables is per
-    # sequence, not per query row.
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
-    )
-    if check_windows and plan.variant.q_per_block > 1:
-        # Unchecked by the kernel, and a violation deadlocks the CTA; moot at one row per tile.
-        assert_qshare_windows(
-            plan.cu_tiles, plan.num_tiles, ls, le, plan.variant.q_per_block
-        )
-
-    out = pa_mqa_logits_mxfp4(
-        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, plan, inp.max_seq_len,
-        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
-    )  # fmt: skip
-    torch.cuda.synchronize()
-
-    rows = sample_rows(total_q, le, seed=seed)
-    err = check_rows(out, ref_rows(inp, rows, rb, ls, le), f"{label}")
-    oob = oob_is_neginf(out, ls, le)
-    wr = window_is_written(out, ls, le)
-    fly = flydsl_cross_check(inp, out, rb, ls, le, plan.variant)
-    fly_ok = math.isnan(fly) or fly == 0
-    return {
-        "case": label, "variant": plan.variant.name,
-        "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
-        "max_win": int(le.max()), "err": err, "vs flydsl": fly, "oob -inf": oob,
-        "window written": wr, "pass": err == 0 and oob and wr and fly_ok,
-    }  # fmt: skip
-
-
-def check_prefill(windows_per_batch, seed, label, data_init, scale_init, variant):
-    """One ragged-prefill case from explicit per-row ``(start, end)`` windows."""
-    qlens = [len(w) for w in windows_per_batch]
-    total_q = sum(qlens)
-    max_end = max(e for w in windows_per_batch for (_, e) in w)
-    inp = build_inputs(len(qlens), max_end, total_q, seed, data_init, scale_init)
-
-    rb, ls, le = [], [], []
-    for b, w in enumerate(windows_per_batch):
-        for s, e in w:
-            rb.append(b)
-            ls.append(s)
-            le.append(e)
-    rb = torch.tensor(rb, dtype=torch.int32, device=dev)
-    ls = torch.tensor(ls, dtype=torch.int32, device=dev)
-    le = torch.tensor(le, dtype=torch.int32, device=dev)
-
-    ret = run_one(inp, qlens, rb, ls, le, label, seed, variant)
-    del inp
-    torch.cuda.empty_cache()
-    return {"data_init": data_init, "scale_init": scale_init, "seed": seed, **ret}
-
-
-def _g4(windows_per_batch):
-    """Replicate each row ``_qpb_max()`` times so a tile's rows share one window (the easy
-    regime; the CSA rules below make adjacent rows differ)."""
-    return [[r for r in b for _ in range(_qpb_max())] for b in windows_per_batch]
-
-
-def _csa_fresh(qlen):
-    """Fresh sequence: row n sees ``(n + 1) // RATIO``; runs start at n = 3 mod 4."""
-    return [(0, (n + 1) // CSA_RATIO) for n in range(qlen)]
-
-
-def _csa_chunked(qlen, kvlen):
-    """``kvlen`` compressed rows committed and this chunk is the tail: row n sees
-    ``kvlen - (qlen - 1 - n) // RATIO``, so runs align to the tail rather than to n."""
-    return [(0, kvlen - (qlen - 1 - n) // CSA_RATIO) for n in range(qlen)]
-
-
-# `cu_seq_q` claims 14 rows over a 10-row `q`: at 4 rows per tile the cut [8,12) straddles the
-# bound (per-wave clause) and [12,14) is past it (CTA-uniform clause).
-ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS, ROWID_WIN = 10, 14, 200
-ROWID_CU = (0, 4, 8, ROWID_CLAIMED_ROWS)
-
-
-def check_row_id_bound(data_init, scale_init, seed, variant):
-    """Device-side ``cu_seq_q`` claims more rows than ``q`` holds (host checks all pass); the
-    kernel must bound ``row_id`` by ``num_rows`` and drop the surplus. The oversized ``out``
-    gives it teeth: surplus rows must stay -inf, where a right-sized one would absorb the
-    overrun silently. Only multi-row tiles read ``cu_seq_q``; at one row it is a control.
-    """
-    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
-    bs = len(ROWID_CU) - 1
-    inp = build_inputs(bs, ROWID_WIN, real, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    # Windows and `out` cover `claimed` rows; `q` and `total_q` hold `real`.
-    rb = t([b for b in range(bs) for _ in range(ROWID_CU[b + 1] - ROWID_CU[b])])
-    ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
-    le = t([ROWID_WIN] * claimed)
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, bs, variant=variant)
-    plan = pa_mqa_logits_mxfp4_plan(
-        t(list(ROWID_CU)),
-        le,
-        buffers=buffers,
-        total_q=real,
-        local_starts=ls,
-        row_to_batch=rb,
-    )
-    out = torch.full(
-        (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
-    pa_mqa_logits_mxfp4(
-        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, plan, inp.max_seq_len,
-        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-    )  # fmt: skip
-    torch.cuda.synchronize()
-
-    rows = list(range(real))
-    err = check_rows(out, ref_rows(inp, rows, rb, ls, le), "row_id bound")
-    oob = oob_is_neginf(out[:real], ls[:real], le[:real])
-    wr = window_is_written(out[:real], ls[:real], le[:real])
-    # Fails without the kernel's bound: rows past `q` must stay untouched.
-    untouched = bool(torch.isneginf(out[real:]).all().item())
-    ret = {
-        "data_init": data_init, "scale_init": scale_init, "seed": seed,
-        "case": f"cu_seq_q {claimed} > q {real}", "variant": plan.variant.name,
-        "rows": real,
-        "tiles": plan.num_tiles, "ctas": plan.num_ctas, "max_win": ROWID_WIN,
-        "err": err, "oob -inf": oob and untouched, "window written": wr,
-        "pass": err == 0 and oob and untouched and wr,
-    }  # fmt: skip
-    del inp, out
-    torch.cuda.empty_cache()
-    return ret
-
-
-def check_raw_row_guard(data_init, scale_init, seed, variant):
-    """Kernel row bound on both arches: a raw ``_launch`` of a 14-row schedule over a 10-row
-    ``q`` with ``num_rows = 10`` must leave rows 10..13 of the oversized ``out`` at -inf.
-    Unreachable through the public op, which passes the plan's own row count.
-    """
-    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
-    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    rb = torch.zeros(claimed, dtype=torch.int32, device=dev)
-    ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
-    le = t([ROWID_WIN] * claimed)
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
-    plan = pa_mqa_logits_mxfp4_plan(
-        t([0, claimed]),
-        le,
-        buffers=buffers,
-        total_q=claimed,
-        local_starts=ls,
-        row_to_batch=rb,
-    )
-    out = torch.full(
-        (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
-    _launch(
-        plan.variant, inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, plan.local_ends, plan.cta_info, plan.num_ctas, real, inp.max_seq_len,
-        local_starts=plan.local_starts, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
-        out=out,
-    )  # fmt: skip
-    torch.cuda.synchronize()
-
-    err = check_rows(out, ref_rows(inp, list(range(real)), rb, ls, le), "raw row guard")
-    oob = oob_is_neginf(out[:real], ls[:real], le[:real])
-    wr = window_is_written(out[:real], ls[:real], le[:real])
-    untouched = bool(torch.isneginf(out[real:]).all().item())
-    ret = {
-        "data_init": data_init, "scale_init": scale_init, "seed": seed,
-        "case": f"raw launch: cta_info {claimed} rows, num_rows {real}",
-        "variant": plan.variant.name, "rows": real,
-        "tiles": plan.num_tiles, "ctas": plan.num_ctas, "max_win": ROWID_WIN,
-        "err": err, "oob -inf": oob and untouched, "window written": wr,
-        "pass": err == 0 and oob and untouched and wr,
-    }  # fmt: skip
-    del inp, out
-    torch.cuda.empty_cache()
-    return ret
-
-
-def check_row_count_raises(data_init, scale_init, seed, variant):
-    """Host-visible row mismatches must raise before any kernel runs: a plan for 14 rows over a
-    10-row ``q`` (checked in C++ ``fwd_sched``), and ``local_ends`` shorter than ``total_q``
-    (checked in ``build_sched``).
-    """
-    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
-    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    def raises(fn, needle):
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001 -- AITER_CHECK surfaces as RuntimeError
-            return needle in str(e)
-        return False
-
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
-    le = t([ROWID_WIN] * claimed)
-    plan = pa_mqa_logits_mxfp4_plan(
-        t([0, claimed]), le, buffers=buffers, total_q=claimed,
-        row_to_batch=torch.zeros(claimed, dtype=torch.int32, device=dev),
-    )  # fmt: skip
-    q_short = raises(
-        lambda: pa_mqa_logits_mxfp4(
-            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, plan, inp.max_seq_len,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
-        ),
-        "num_rows",
-    )  # fmt: skip
-    ends_short = raises(
-        lambda: pa_mqa_logits_mxfp4_plan(
-            t([0, claimed]), t([ROWID_WIN] * real), buffers=buffers, total_q=claimed
-        ),
-        "local_ends",
-    )
-    torch.cuda.synchronize()
-    inp = None  # rebind, not del: the lambdas above close over it
-    torch.cuda.empty_cache()
-    return {
-        "data_init": data_init, "scale_init": scale_init, "seed": seed,
-        "case": f"host raises: plan {claimed} > q {real}, local_ends {real} < total_q {claimed}",
-        "variant": variant if isinstance(variant, str) else variant.name,
-        "rows": claimed, "pass": q_short and ends_short,
-    }  # fmt: skip
-
-
-# ATOM's cudagraph decode metadata: batch padded to the captured size, `cu_seq_q` flat over
-# the pad tail, pad rows with `row_to_batch = -1` and empty windows. Contexts cross tile edges.
-ATOM_REAL_CTX = (300, 70, 129, 1, 257)
-ATOM_PAD_SEQS = 8
-
-
-def check_atom_decode(data_init, scale_init, seed, variant, mtp, pad_seqs):
-    """One ATOM-shaped decode: live sequences of ``mtp`` rows padded to ``pad_seqs``. Pad rows
-    must stay -inf (pre-filled only to make that visible). ``pad_seqs == live`` leaves surplus
-    tiles at ``r0 == total_q``, one past the end of ``row_to_batch``.
-    """
-    live = len(ATOM_REAL_CTX)
-    total_q = pad_seqs * mtp
-    real_q = live * mtp
-    inp = build_inputs(live, max(ATOM_REAL_CTX), total_q, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    # MTP tail-causal: row j of a sequence sees `ctx - (mtp - 1 - j)`.
-    rb = t([b for b in range(live) for _ in range(mtp)] + [-1] * (total_q - real_q))
-    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
-    le = t(
-        [max(c - (mtp - 1 - j), 0) for c in ATOM_REAL_CTX for j in range(mtp)]
-        + [0] * (total_q - real_q)
-    )
-    cu = t([b * mtp for b in range(live + 1)] + [real_q] * (pad_seqs - live))
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, pad_seqs, variant=variant)
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, buffers=buffers, total_q=total_q, row_to_batch=rb
-    )
-    out = torch.full(
-        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
-    pa_mqa_logits_mxfp4(
-        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, plan, inp.max_seq_len,
-        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-    )  # fmt: skip
-    torch.cuda.synchronize()
-
-    rows = [r for r in range(real_q) if int(le[r]) > 0]
-    err = check_rows(out, ref_rows(inp, rows, rb, ls, le), "atom decode")
-    # Over EVERY row, pad rows included: an empty window leaves the whole row at -inf.
-    oob = oob_is_neginf(out, ls, le)
-    wr = window_is_written(out, ls, le)
-    ret = {
-        "data_init": data_init, "scale_init": scale_init, "seed": seed,
-        "case": f"atom decode mtp={mtp} {live}/{pad_seqs} seqs", "variant": plan.variant.name,
-        "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
-        "max_win": int(le.max()), "err": err, "oob -inf": oob, "window written": wr,
-        "pass": err == 0 and oob and wr,
-    }  # fmt: skip
-    del inp, out
-    torch.cuda.empty_cache()
-    return ret
-
-
-def run_corner(data_init, scale_init, seed):
-    """Corner cases (short groups, offset starts, tile edges, starts mod 128, CSA regimes) on
-    every compiled instance, plus the row-count probes and ATOM decode. Case seeds are offsets
-    from ``--seed``.
-    """
-    cases = [
-        (_g4([[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]]), 0, "ragged/2b"),
-        (_g4([[(0, 30)], [(0, 200)], [(0, 100), (0, 150)]]), 2, "ragged/3b"),
-        (_g4([[(10, 50), (64, 200)], [(0, 100), (130, 256)]]), 4, "offset starts"),
-        (_g4([[(0, 2048)], [(0, 4096)]]), 8, "long/2b"),
-        (_g4([[(0, 512), (0, 1024), (0, 1536)], [(0, 2000)]]), 10, "mixed long"),
-        (_g4([[(100, 2048), (512, 4096)], [(0, 8192)]]), 12, "offset long"),
-        (_g4([[(0, 1), (17, 33)], [(63, 65), (255, 257)]]), 34, "tiny windows"),
-        (_g4([[(0, e) for e in TILE_EDGE_ENDS]]), 40, "tile edges"),
-        (_g4([[(s, s + 96) for s in range(130)]]), 52, "start sweep mod 128"),
-        ([_csa_fresh(10), _csa_fresh(37), _csa_fresh(64)], 60, "csa fresh"),
-        (
-            [_csa_chunked(10, 200), _csa_chunked(37, 71), _csa_chunked(63, 1000)],
-            62,
-            "csa chunked",
-        ),
-        (
-            [_csa_fresh(1), _csa_fresh(2), _csa_fresh(3), _csa_chunked(2, 129)],
-            64,
-            "csa short groups",
-        ),
-        (
-            [_csa_chunked(8, 300), _csa_chunked(3, 300), _csa_fresh(2049)],
-            66,
-            "csa mixed",
-        ),
-    ]
-    # Every compiled instance, pinned: left to the plan, these shapes would never pick one-row.
-    variants = _variants()
-    if not variants:
-        raise RuntimeError(
-            "no compiled kernel instances to run the corner suite on; an empty sweep reports "
-            "`pass` having tested nothing"
-        )
-    # The cu_seq_q probe is gfx1250-only (only its tile cut reads cu_seq_q); the others run on both.
-    row_id = (
-        []
-        if _is_permuted()
-        else [check_row_id_bound(data_init, scale_init, seed + 70, v) for v in variants]
-    ) + [
-        check(data_init, scale_init, seed + 72, v)
-        for check in (check_row_count_raises, check_raw_row_guard)
-        for v in variants
-    ]
-    atom = [
-        check_atom_decode(data_init, scale_init, seed + 90 + mtp, v, mtp, pad)
-        for v in variants
-        for mtp, pad in (
-            (1, ATOM_PAD_SEQS),
-            (2, ATOM_PAD_SEQS),
-            (2, len(ATOM_REAL_CTX)),
-        )
-    ]
-    return (
-        [
-            check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
-            for v in variants
-            for w, case_seed, label in cases
-        ]
-        + row_id
-        + atom
-    )
-
-
-SPREAD_PROBE_ROWS = 4096
-
-
-def scale_spread(scale_init, seed=0, rows=SPREAD_PROBE_ROWS):
-    """``(distinct exponents, fraction of rows 16 apart that disagree)`` for a ``--scale-init``.
-    The second decides: a lane-half misroute is invisible to a spread periodic in 16."""
-    e8 = fill_exponents(
-        (rows, BLOCKS_ROW), scale_init, make_generator(seed, device=dev)
-    )
-    block0 = e8[:, 0]
-    distinct = int(torch.unique(e8).numel())
-    disagree = float((block0[:-16] != block0[16:]).float().mean().item())
-    return distinct, disagree
-
-
-def correctness_blindness(data_init, scale_init):
-    """Why this init pair cannot catch a wrong answer (all-zero data, or too little exponent
-    spread), or ``None`` when it can. Such pairs are skipped with the reason, not passed.
-    """
-    if data_init == "zero":
-        return "data-init zero makes every fp4 nibble 0, so the reference agrees with anything"
-    distinct, disagree = scale_spread(scale_init)
-    if distinct < 3 or disagree < MISROUTE_DISAGREE_MIN:
         return (
-            f"scale-init {scale_init} spreads {distinct} exponents and rows 16 apart disagree "
-            f"{disagree:.1%} (want >= 3 and >= {MISROUTE_DISAGREE_MIN:.0%}); a misrouted "
-            "b_scale_sel would read an exponent that happens to be right"
+            _scale_to_gfx950(d.q_scale.reshape(-1, D // 32), self.heads),
+            kv,
+            _scale_to_gfx950(d.scales, self.page_size),
         )
-    return None
+
+    def arch_inputs(self):
+        """(q_scale, kv_cache, kv_scale) in the device's layout. gfx950's are permuted copies of
+        the data as it was at the first call: after editing the data in place, refresh().
+        """
+        if self._arch is None or not _permuted():
+            self._arch = self._layout()
+        return self._arch
+
+    def refresh(self):
+        """Copy edited data into the permuted tensors already handed out (a captured graph
+        reads those)."""
+        if self._arch is not None:
+            for dst, src in zip(self._arch, self._layout()):
+                dst.copy_(src)
+
+    @property
+    def q_scale(self):
+        return self.arch_inputs()[0]
+
+    @property
+    def kv(self):
+        return self.arch_inputs()[1]
+
+    @property
+    def kv_scale(self):
+        return self.arch_inputs()[2]
 
 
-# ── NaN E8M0 scale propagation ────────────────────────────────────────────────
-def poison_kv_rows(kv_scale, block_tables, row_in_seq):
-    """A copy of ``kv_scale`` with KV row ``row_in_seq`` of every batch set to 0xFF (E8M0 NaN).
-    The mark is set in the natural layout and pushed through the arch's layout transform rather
-    than by computing byte offsets by hand.
-    """
-    nb = block_tables.numel()  # one entry per (batch, page)
-    mark = torch.zeros(nb * KV_BLOCK_SIZE, BLOCKS_ROW, dtype=torch.uint8, device=dev)
-    blk = block_tables[:, row_in_seq // KV_BLOCK_SIZE].long()
-    mark[blk * KV_BLOCK_SIZE + row_in_seq % KV_BLOCK_SIZE] = 1
-    out = kv_scale.clone()
-    if _is_permuted():
-        out[_scale_to_opus(mark, KV_BLOCK_SIZE) != 0] = 0xFF
-    else:
-        out[mark.reshape(out.shape) != 0] = 0xFF
+def make_case(rows: Rows, heads, *, page64=False, nan=False, seed=1):
+    """``page64``: the table as 64-row pages, one an entry (ATOM's V4 layout)."""
+    data = make_data(rows, heads, seed=seed)
+    if nan:
+        inject_nans(rows, data)
+    if not page64:
+        return Case(
+            rows, heads, data, PAGE_ROWS, rows.pages_per_block, rows.block_tables
+        )
+    tpb = rows.pages_per_block * PAGE_ROWS // TILE
+    s = tpb.bit_length() - 1
+    t = torch.arange(rows.block_tables.shape[1] * tpb)
+    table = ((rows.block_tables[:, t >> s].long() << s) + (t & (tpb - 1))).to(
+        torch.int32
+    )
+    return Case(rows, heads, data, TILE, 1, table.contiguous())
+
+
+def config(case: Case, **kw):
+    r = case.rows
+    return mqa_logits_mxfp4_config(
+        torch.cuda.current_device(),
+        heads=case.heads,
+        page_size=case.page_size,
+        pages_per_block=case.pages_per_block,
+        max_rows=r.rows,
+        max_seqs=r.num_seqs,
+        max_qlen=r.max_qlen,
+        max_seq_len=r.width,
+        **kw,
+    )
+
+
+def launch(
+    case: Case,
+    cfg,
+    out,
+    *,
+    schedule=None,
+    out_offsets=None,
+    qsl=None,
+    ends=None,
+    rows=None,
+):
+    """One call over the case's rows, or over `rows` (a slice) with its own bounds."""
+    d = case.data
+    sl = slice(None) if rows is None else rows
+    return mqa_logits_mxfp4(
+        d.q[sl],
+        case.q_scale[sl],
+        case.kv,
+        case.kv_scale,
+        d.weights[sl],
+        case.block_tables,
+        case.rows.query_start_loc if qsl is None else qsl,
+        case.rows.row_ends if ends is None else ends,
+        cfg=cfg,
+        schedule=schedule,
+        weight_scale=d.weight_scale,
+        out=out,
+        out_offsets=out_offsets,
+    )
+
+
+def launch_scheduled(case: Case, cfg, out, schedule):
+    return launch(case, cfg, out, schedule=schedule)
+
+
+def ways(case: Case):
+    """{name: (cfg, build a schedule?)}: every registered instance that takes the case, in every
+    mode it compiles -- Table from a schedule, Table from the internal schedule (an instance
+    without a schedule-free mode), Free, Prefill."""
+    entry_rows = case.page_size * case.pages_per_block
+    out = {}
+    if not takes(case):
+        return out
+    for inst in M._instances(torch.device("cuda", torch.cuda.current_device())):
+        if inst.heads != case.heads or not inst.reads(entry_rows):
+            continue
+        cfg = config(case, _instance=inst.id, _mode="table")
+        out[f"{inst.name}:table"] = (cfg, True)
+        modes = [m for m in ("free", "prefill") if inst.has(M._MODE_NAMES[m])]
+        if not modes:
+            out[f"{inst.name}:internal"] = (cfg, False)
+        for m in modes:
+            out[f"{inst.name}:{m}"] = (config(case, _instance=inst.id, _mode=m), False)
     return out
 
 
-def check_nan_scale(entry, bs, next_n, ends, seed, variant, label, kv_row=0):
-    """A NaN E8M0 scale must reach exactly the in-window cells at its KV row: the relu must
-    propagate NaN, not swallow it. Asserted as an exact set, so over-smearing also fails.
-    """
-    total_q = bs * next_n
-    # Raised, not asserted, so `python -O` keeps it.
-    if len(ends) != total_q:
-        raise ValueError(f"{label}: {len(ends)} window ends for {total_q} rows")
-    inp = build_inputs(bs, max(max(ends), 1), total_q, seed, "norm", "auto")
+def takes(case: Case):
+    """Whether this arch's KV layout exists at the case's page size (gfx950: 64 rows only)."""
+    return M._PAGE_SIZE.get(get_gfx(), case.page_size) == case.page_size
 
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
 
-    rb = t([b for b in range(bs) for _ in range(next_n)])
-    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
-    le = t(list(ends))
-    cu = t([0] + list(itertools.accumulate([next_n] * bs)))
-    kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
+def serves(model):
+    """Whether this op serves `model` on this arch (gfx950 sends V4.1 to FlyDSL)."""
+    return (get_gfx(), MODEL_HEADS[model]) not in M._ELSEWHERE
 
-    # Prefill passes (zero) `local_starts`, decode passes None: same schedule, different branch.
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, bs, variant=variant)
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu,
-        le,
-        buffers=buffers,
-        total_q=total_q,
-        local_starts=ls if entry == "prefill" else None,
-        row_to_batch=rb,
+
+def default_way(case: Case):
+    """The config's own choice for the case, or "none"."""
+    try:
+        cfg = config(case)
+    except ValueError:
+        return "none"
+    mode = {None: "internal", M.FREE: "free", M.PREFILL: "prefill"}[cfg._mode]
+    return f"{cfg.instance_name}:{mode}"
+
+
+def schedule_for(cfg, case, build, qsl=None, ends=None):
+    if not build:
+        return None
+    r = case.rows
+    return mqa_logits_mxfp4_schedule(
+        cfg,
+        r.query_start_loc if qsl is None else qsl,
+        r.row_ends if ends is None else ends,
+        buffers=cfg.schedule_buffers(),
     )
-    out = pa_mqa_logits_mxfp4(
-        inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
-        inp.weights, plan, inp.max_seq_len,
-        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
-    )  # fmt: skip
+
+
+def row_errors(got, ref):
+    """Why row `got` [end] is not `ref`: the NaN / +-Inf masks first, then the finite cells."""
+    for name, f in (
+        ("NaN", torch.isnan),
+        ("+Inf", torch.isposinf),
+        ("-Inf", torch.isneginf),
+    ):
+        if not torch.equal(f(got), f(ref)):
+            return f"{name} at {int(f(got).sum())} cells, want {int(f(ref).sum())}"
+    fin = torch.isfinite(ref)
+    if not bool(fin.any()):
+        return None
+    scale = ref[fin].abs().max().clamp_min(1e-30)
+    err = ((got[fin] - ref[fin]).abs().max() / scale).item()
+    return f"max rel err {err:.1e}" if err > REL_TOL else None
+
+
+# == decode / prefill: perf of every way, checked on sampled rows ===================================
+def model_rows(model, ratio, label, ctx, rows_per_seq):
+    if model == "cand":
+        return candidate_layer(label, ctx, rows_per_seq)
+    return full_layer(label, ctx, rows_per_seq, 4 if model == "v4" else ratio)
+
+
+def run_ways(model, rows: Rows):
+    """Time and check every way of `model` on `rows`; the @benchmark tests' common body."""
+    heads = MODEL_HEADS[model]
+    case = make_case(rows, heads, page64=model == "v4")
+    case.arch_inputs()  # gfx950's permuted copies, made outside the timing
+    n = rows.rows
+    sample = sorted(
+        {int(x) for x in torch.linspace(0, n - 1, min(n, SAMPLE_ROWS)).round()}
+    )
+    refs = [run_torch(rows, case.data, r) for r in sample]
+    ref_cat = torch.cat(refs)
+    tol = REL_TOL * float(ref_cat.abs().max())
+    row_keys = int(rows.row_ends.long().sum())
+    # Keys read at least once (a sequence's rows share its keys; a candidate row shares nothing),
+    # each row's q / scales / weights, and the logits written.
+    ends, qsl = rows.row_ends.long(), rows.query_start_loc.tolist()
+    keys = (
+        row_keys
+        if rows.kind == "candidate"
+        else sum(int(ends[a:b].max()) for a, b in itertools.pairwise(qsl) if b > a)
+    )
+    flops = 2 * heads * D * row_keys
+    nbytes = (
+        keys * (D // 2 + D // 32) + n * heads * (D // 2 + D // 32 + 2) + row_keys * 4
+    )
+
+    ret = {"gfx": get_gfx(), "rows": n, "default": default_way(case)}
+    # Preallocated, as the model passes it.
+    out = torch.empty(n, rows.width, dtype=torch.float32)
+    for name, (cfg, build) in ways(case).items():
+        # V4 builds the schedule once a forward, outside the layers.
+        schedule = schedule_for(cfg, case, build)
+        out.fill_(float("-inf"))
+        # Positional, so run_perftest's per-rotation deepcopy of the arguments keeps the schedule
+        # bound to the very query_start_loc / row_ends tensors of its copy of the case.
+        _, us = run_perftest(
+            launch_scheduled, case, cfg, out, schedule, num_iters=50, num_warmup=10
+        )
+        got = torch.cat([out[r, : ref.numel()] for r, ref in zip(sample, refs)])
+        err = checkAllclose(
+            ref_cat, got, rtol=REL_TOL, atol=tol, msg=f"{rows.label} {name}: "
+        )
+        tails = [out[r, ref.numel() :] for r, ref in zip(sample, refs)]
+        if not all(bool(torch.isneginf(t).all()) for t in tails):
+            aiter.logger.error("%s %s: wrote past a row's window", rows.label, name)
+            err = 1.0
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_decode(model, ratio, batch, ctx, mtp):
+    """`batch` sequences at context `ctx`, each scoring its last `mtp` tokens."""
+    rows = model_rows(model, ratio, f"{model} dec", [ctx] * batch, [mtp] * batch)
+    return run_ways(model, rows)
+
+
+@benchmark()
+def test_prefill(model, ratio, qlen, ctx):
+    """16384 rows: 16384 // `qlen` sequences, each a `qlen`-token chunk ending at `ctx` (fresh
+    when ctx == qlen)."""
+    batch = PREFILL_ROWS // qlen
+    rows = model_rows(
+        model, ratio, f"{model} pre", [max(ctx, qlen)] * batch, [qlen] * batch
+    )
+    return run_ways(model, rows)
+
+
+# == semantics ======================================================================================
+def rows_shapes(model):
+    """(rows, page64, nan) small enough to check every row."""
+    if model == "v4":
+        shapes = [
+            (full_layer("v4 dec mtp1", [2048, 1500, 777], [1, 1, 1], 4), False),
+            (full_layer("v4 dec mtp4 ragged", [9000, 1500, 777], [4, 3, 1], 4), False),
+            (full_layer("v4 dec r2 6 rows", [3000, 2048], [6, 6], 2), False),
+            (
+                full_layer("v4 dec tiers", [2048, 1500, 777, 3000], [2, 4, 6, 8], 4),
+                False,
+            ),
+            (full_layer("v4 dec r1 short", [70], [6], 1), False),
+            (full_layer("v4 pre fresh 600", [600], [600], 4), False),
+            (full_layer("v4 pre chunk 300@5000", [5300], [300], 4), False),
+            (full_layer("v4 mixed", [5000, 100, 2600], [6, 37, 1], 4), False),
+            (full_layer("v4 nan dec", [2048, 1500, 777], [4, 4, 1], 4), True),
+            (full_layer("v4 nan pre r2 200@1000", [1200], [200], 2), True),
+        ]
+        out = []
+        for rows, nan in shapes:
+            out.append((rows, True, nan))
+            # ratio 4: also 8-row pages, 8 an entry
+            if rows.pages_per_block * PAGE_ROWS == TILE:
+                out.append((rows, False, nan))
+        return out
+    if model == "v41":
+        return [
+            (rows, False, nan)
+            for rows, nan in [
+                (
+                    full_layer("v41 dec r2 ragged", [2048, 1500, 777], [6, 4, 1], 2),
+                    False,
+                ),
+                (
+                    full_layer(
+                        "v41 dec r1 mtp1", [3000, 2048, 777, 70], [1, 1, 1, 1], 1
+                    ),
+                    False,
+                ),
+                (full_layer("v41 dec r1", [3000, 2048], [6, 6], 1), False),
+                (
+                    full_layer(
+                        "v41 dec r2 tiers", [2048, 1500, 777, 3000], [2, 3, 4, 8], 2
+                    ),
+                    False,
+                ),
+                (full_layer("v41 dec r1 short", [70], [6], 1), False),
+                (full_layer("v41 pre r2 fresh 300", [300], [300], 2), False),
+                (full_layer("v41 pre r1 chunk 200@1000", [1200], [200], 1), False),
+                (full_layer("v41 mixed r1", [5000, 100, 2600], [6, 37, 1], 1), False),
+                (full_layer("v41 nan dec r2", [2048, 1500, 777], [6, 4, 1], 2), True),
+                (full_layer("v41 nan pre r1 200@1000", [1200], [200], 1), True),
+            ]
+        ]
+    return [
+        (rows, False, nan)
+        for rows, nan in [
+            (candidate_layer("cand bs2 ctx20K", [20000, 17000], [6, 6]), False),
+            (candidate_layer("cand short 3K", [3000], [6]), False),
+            (
+                candidate_layer("cand ragged 40K", [40000, 18000, 70000], [6, 2, 1]),
+                False,
+            ),
+            (candidate_layer("cand nan bs2", [20000, 17000], [6, 6]), True),
+        ]
+    ]
+
+
+def check_rows(model):
+    """Every row of small shapes on every way; returns [(case label, failures)]."""
+    results = []
+    for rows, page64, nan in rows_shapes(model):
+        case = make_case(rows, MODEL_HEADS[model], page64=page64, nan=nan)
+        if not takes(case):
+            continue
+        inputs = (
+            case.data.values,
+            case.data.scales,
+            case.data.q,
+            case.data.q_scale,
+            case.data.weights,
+            case.block_tables,
+            rows.row_ends,
+            rows.query_start_loc,
+        )
+        before = [x.clone() for x in inputs]
+        refs = [run_torch(rows, case.data, r) for r in range(rows.rows)]
+        tag = f"{rows.label} page{case.page_size}x{case.pages_per_block}"
+        # An instance's Table logits: its other modes must equal them bit for bit.
+        table_out = {}
+        for name, (cfg, build) in ways(case).items():
+            guard = rows.width * 4
+            store = torch.full((rows.rows * rows.width + 2 * guard,), float("-inf"))
+            out = store[guard : guard + rows.rows * rows.width].view(
+                rows.rows, rows.width
+            )
+            schedule = schedule_for(cfg, case, build)
+            launch(case, cfg, out, schedule=schedule)
+            flat = None
+            if cfg._instance.flat_out:
+                ends = rows.row_ends.long()
+                offs = (torch.cumsum(ends, 0) - ends).int()
+                total = int(ends.sum())
+                flat = torch.full((total + 256,), float("nan"))  # the tail is a guard
+                launch(case, cfg, flat, schedule=schedule, out_offsets=offs)
+            bad = []
+            for i, ref in enumerate(refs):
+                e = ref.numel()
+                why = row_errors(out[i, :e], ref)
+                if why is None and not bool(torch.isneginf(out[i, e:]).all()):
+                    why = "written past its window"
+                if why is None and flat is not None:
+                    seg = flat[offs[i] : offs[i] + e]
+                    if not torch.equal(
+                        seg.view(torch.int32), out[i, :e].contiguous().view(torch.int32)
+                    ):
+                        why = "flat out differs from the plane"
+                if why:
+                    bad.append(f"row {i}: {why}")
+            if not bool(
+                torch.isneginf(store[:guard]).all()
+                and torch.isneginf(store[-guard:]).all()
+            ):
+                bad.append("out's guard bands written")
+            if flat is not None and not bool(torch.isnan(flat[total:]).all()):
+                bad.append("the flat out's guard written")
+            inst, mode = name.split(":")
+            if mode == "table":
+                table_out[inst] = out.clone()
+            elif not torch.equal(
+                out.view(torch.int32), table_out[inst].view(torch.int32)
+            ):
+                bad.append(f"differs from {inst}:table bit for bit")
+            results.append((f"{tag} {name}", bad))
+        if not all(torch.equal(a, b) for a, b in zip(inputs, before)):
+            results.append((tag, ["an input was written"]))
+    return results
+
+
+def edge_case(model):
+    """Nine sequences, each carrying one source of NaN / Inf; the case, each sequence's rows and
+    what it carries. Two rows a full-layer sequence, so the multi-row instances take it too.
+    """
+    heads, n = MODEL_HEADS[model], 9
+    if model == "cand":
+        rows = candidate_layer("cand edges", [3000] * n, [1] * n)
+    else:
+        rows = full_layer(
+            f"{model} edges", [3000] * n, [2] * n, 4 if model == "v4" else 2
+        )
+    case = make_case(rows, heads, page64=model == "v4")
+    d = case.data
+    seq_rows = [
+        list(range(int(rows.query_start_loc[b]), int(rows.query_start_loc[b + 1])))
+        for b in range(n)
+    ]
+    kr = [rows.key_rows(rr[-1]) for rr in seq_rows]
+    ieee_heads = [0, 8] + ([32, 40] if heads == 64 else [16, 24])
+    what = []
+
+    def keys(b, value, block=None, a=100, z=110):
+        for k in kr[b][a:z]:
+            if block is None:
+                d.scales[k] = value
+            else:
+                d.scales[k, block] = value
+
+    keys(0, 0xFF, block=2)
+    what.append("key scale 0xFF")
+    keys(1, 0xFF, block=2)
+    for r in seq_rows[1]:
+        d.q[r, ieee_heads, 32:48] = 0  # that block zero in the heads whose relu is IEEE
+    what.append("key scale 0xFF, q block zero in the IEEE heads")
+    keys(2, 0xFF, block=2)
+    for r in seq_rows[2]:
+        d.q[r, :, 32:48] = 0
+    what.append("key scale 0xFF, q block zero in all heads")
+    d.q_scale[seq_rows[3][-1], 5, 1] = 0xFF
+    what.append("q scale 0xFF")
+    d.weights[seq_rows[4][-1], 7] = float("nan")
+    what.append("weight NaN")
+    for r in seq_rows[5]:
+        d.q_scale[r] = 0xFE  # 2^127: products overflow to +-Inf
+    keys(5, 0xFE, a=0, z=64)
+    what.append("scales 2^127, overflow")
+    d.weights[seq_rows[6][-1], 3] = float("inf")
+    what.append("weight +Inf")
+    for r in seq_rows[7]:
+        d.q_scale[r, 5] = 0xBF  # 2^64 x 2^64: one head's dot product overflows
+    keys(7, 0xBF)
+    what.append("one head overflows (head 5)")
+    for r in seq_rows[8]:
+        d.q_scale[r, 0] = 0xBF  # ... through head 0, an IEEE one
+    keys(8, 0xBF)
+    what.append("one head overflows (head 0)")
+    return case, seq_rows, what
+
+
+def check_edges(model):
+    case, seq_rows, what = edge_case(model)
+    rows = case.rows
+    refs = [run_torch(rows, case.data, r) for r in range(rows.rows)]
+    results = []
+    for name, (cfg, build) in ways(case).items():
+        out = torch.full((rows.rows, rows.width), float("-inf"))
+        launch(case, cfg, out, schedule=schedule_for(cfg, case, build))
+        bad = []
+        for b, rr in enumerate(seq_rows):
+            for r in rr:
+                e = refs[r].numel()
+                why = row_errors(out[r, :e], refs[r])
+                if why is None and not bool(torch.isneginf(out[r, e:]).all()):
+                    why = "written past its window"
+                if why:
+                    bad.append(f"row {r} ({what[b]}): {why}")
+        results.append((f"{rows.label} {name}", bad))
+    return results
+
+
+def band_rows(model):
+    if model == "cand":
+        return candidate_layer("cand bands", [20000, 17000, 9000], [6, 6, 6])
+    return full_layer(
+        f"{model} bands", [3000, 1700, 2600], [300, 180, 260], 4 if model == "v4" else 2
+    )
+
+
+def check_bands(model, band=97):
+    """A forward scored in bands of rows -- per-row tensors sliced, query_start_loc clamped --
+    equals it scored whole, bit for bit."""
+    rows = band_rows(model)
+    case = make_case(rows, MODEL_HEADS[model], page64=model == "v4")
+    results = []
+    for name, (cfg, build) in ways(case).items():
+        whole = torch.full((rows.rows, rows.width), float("-inf"))
+        launch(case, cfg, whole, schedule=schedule_for(cfg, case, build))
+        banded = torch.full_like(whole, float("-inf"))
+        for start in range(0, rows.rows, band):
+            count = min(band, rows.rows - start)
+            qsl = (rows.query_start_loc.clamp(start, start + count) - start).to(
+                torch.int32
+            )
+            ends = rows.row_ends[start : start + count]
+            launch(
+                case,
+                cfg,
+                banded[start : start + count],
+                schedule=schedule_for(cfg, case, build, qsl, ends),
+                qsl=qsl,
+                ends=ends,
+                rows=slice(start, start + count),
+            )
+        same = torch.equal(whole.view(torch.int32), banded.view(torch.int32))
+        results.append(
+            (f"{rows.label} {name}", [] if same else [f"bands of {band} rows differ"])
+        )
+    return results
+
+
+def check_padding(model, pad_rows=7):
+    """Rows past query_start_loc[-1] (a CUDAGraph bucket's padding, with garbage windows) and empty
+    sequences around every real one: the padding untouched, every real row right."""
+    if model == "cand":
+        real = candidate_layer("cand padding", [9000, 5000, 7000], [6, 6, 6])
+    else:
+        real = full_layer(
+            f"{model} padding", [3000, 2000, 2600], [4, 2, 3], 4 if model == "v4" else 2
+        )
+    qsl, qsl2, tab = real.query_start_loc.tolist(), [0], []
+    for b in range(real.num_seqs):
+        qsl2 += [qsl2[-1], qsl[b + 1]]  # an empty sequence, then the real one
+        tab += [real.block_tables[b], real.block_tables[b]]
+    qsl2 += [qsl2[-1]] * 3  # empty sequences at the end (a padded batch)
+    tab += [real.block_tables[-1]] * 3
+    ends = torch.cat(
+        [real.row_ends, torch.full((pad_rows,), real.width, dtype=torch.int32)]
+    )
+    rows = Rows(
+        real.label,
+        real.kind,
+        torch.tensor(qsl2, dtype=torch.int32),
+        ends,
+        torch.stack(tab).contiguous(),
+        real.pages_per_block,
+        real.width,
+        real.num_pages,
+    )
+    case = make_case(rows, MODEL_HEADS[model], page64=model == "v4")
+    refs = [run_torch(real, case.data, r) for r in range(real.rows)]
+    results = []
+    for name, (cfg, build) in ways(case).items():
+        out = torch.full((rows.rows, rows.width), float("-inf"))
+        launch(case, cfg, out, schedule=schedule_for(cfg, case, build))
+        bad = [
+            f"row {r}: {w}"
+            for r, ref in enumerate(refs)
+            for w in [row_errors(out[r, : ref.numel()], ref)]
+            if w
+        ]
+        if not bool(torch.isneginf(out[real.rows :]).all()):
+            bad.append("a padding row was written")
+        results.append((f"{rows.label} {name}", bad))
+    return results
+
+
+def check_graph(model):
+    """Schedule + launch captured once, replayed on new contents of the same tensors (new q, new
+    and shorter windows) == the same call made eagerly."""
+    if model == "cand":
+        rows = candidate_layer("cand graph", [20000, 17000], [6, 6])
+    else:
+        rows = full_layer(
+            f"{model} graph", [9000, 1500, 777], [4, 3, 1], 4 if model == "v4" else 2
+        )
+    heads, page64 = MODEL_HEADS[model], model == "v4"
+    results = []
+    for name, (cfg, build) in ways(make_case(rows, heads, page64=page64)).items():
+        case = make_case(rows, heads, page64=page64)
+        other = make_case(rows, heads, page64=page64, seed=7)
+        buf = cfg.schedule_buffers() if build else None
+        out = torch.full((rows.rows, rows.width), float("-inf"))
+        ends = rows.row_ends.clone()
+
+        def step(cfg=cfg, case=case, out=out, ends=ends, buf=buf, build=build):
+            s = (
+                mqa_logits_mxfp4_schedule(cfg, rows.query_start_loc, ends, buffers=buf)
+                if build
+                else None
+            )
+            launch(case, cfg, out, schedule=s, ends=ends)
+
+        step()  # warm: the module
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            step()
+        for src, dst in zip(
+            (other.data.q, other.data.q_scale, other.data.weights),
+            (case.data.q, case.data.q_scale, case.data.weights),
+        ):
+            dst.copy_(src)
+        case.refresh()
+        ends.copy_((rows.row_ends - 5).clamp_min(0))
+        out.fill_(float("-inf"))
+        g.replay()
+        want = torch.full_like(out, float("-inf"))
+        launch(
+            case,
+            cfg,
+            want,
+            schedule=schedule_for(cfg, case, build, ends=ends),
+            ends=ends,
+        )
+        same = torch.equal(out.view(torch.int32), want.view(torch.int32))
+        results.append(
+            (f"{rows.label} {name}", [] if same else ["replay differs from eager"])
+        )
+    return results
+
+
+def check_errors(model):
+    """What the interface must refuse."""
+    rows = model_rows(model, 2, f"{model} errors", [3000, 2000], [4, 4])
+    case = make_case(rows, MODEL_HEADS[model], page64=model == "v4")
+    cfg, d = config(case), case.data
+    qsl, ends = rows.query_start_loc, rows.row_ends
+    sched = mqa_logits_mxfp4_schedule(cfg, qsl, ends)
+
+    def call(**kw):
+        a = {
+            "q": d.q,
+            "q_scale": case.q_scale,
+            "kv_cache": case.kv,
+            "kv_scale": case.kv_scale,
+            "weights": d.weights,
+            "block_tables": case.block_tables,
+            "query_start_loc": qsl,
+            "row_ends": ends,
+        }
+        extra = {k: kw.pop(k) for k in ("schedule", "out", "out_offsets") if k in kw}
+        a.update(kw)
+        return lambda: mqa_logits_mxfp4(*a.values(), cfg=cfg, **extra)
+
+    tries = {
+        **(
+            {"3-D (gfx1250) kv_scale": call(kv_scale=case.kv_scale.view(-1, 64, 4))}
+            if _permuted()
+            else {
+                "4-D (gfx950) kv_scale": call(kv_scale=case.kv_scale.view(-1, 2, 32, 4))
+            }
+        ),
+        "heads != cfg.heads": call(
+            q=d.q[:, :16], q_scale=case.q_scale[:, :16], weights=d.weights[:, :16]
+        ),
+        "table narrower than cfg.block_table_width": call(
+            block_tables=case.block_tables[:, :1].contiguous()
+        ),
+        "a schedule built from other tensors": call(
+            query_start_loc=qsl.clone(), schedule=sched
+        ),
+        "rows over max_rows": call(
+            q=torch.cat([d.q, d.q]),
+            q_scale=torch.cat([case.q_scale, case.q_scale]),
+            weights=torch.cat([d.weights, d.weights]),
+            row_ends=torch.cat([ends, ends]),
+        ),
+        "int64 row_ends": call(row_ends=ends.long()),
+        "out narrower than cfg.max_seq_len": call(out=torch.empty(rows.rows, 1)),
+        "table entries no instance reads": lambda: mqa_logits_mxfp4_config(
+            torch.cuda.current_device(),
+            heads=64,
+            page_size=16,
+            max_rows=64,
+            max_seqs=64,
+            max_qlen=4,
+            max_seq_len=4096,
+        ),
+    }
+    if not cfg._instance.flat_out:
+        tries["out_offsets on an instance without a flat out"] = call(
+            out=torch.empty(rows.rows * rows.width),
+            out_offsets=torch.zeros(rows.rows, dtype=torch.int32),
+        )
+    else:
+        tries["int64 out_offsets"] = call(
+            out=torch.empty(rows.rows * rows.width),
+            out_offsets=torch.zeros(rows.rows, dtype=torch.int64),
+        )
+    results = []
+    for what, f in tries.items():
+        try:
+            f()
+            torch.cuda.synchronize()
+            results.append((f"{rows.label} {what}", ["accepted"]))
+        except (ValueError, RuntimeError):
+            results.append((f"{rows.label} {what}", []))
+    return results
+
+
+SEMANTIC_CHECKS = {
+    "rows": check_rows,
+    "edges": check_edges,
+    "bands": check_bands,
+    "padding": check_padding,
+    "graph": check_graph,
+    "errors": check_errors,
+}
+
+
+@benchmark()
+def test_semantics(model, check):
+    results = SEMANTIC_CHECKS[check](model)
     torch.cuda.synchronize()
-
-    col = torch.arange(out.shape[1], device=dev).unsqueeze(0)
-    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
-    want = inside & (col == kv_row)
-    got = inside & ~torch.isfinite(out)
-    exact = bool(torch.equal(want, got))
-    oob = oob_is_neginf(out, ls, le)
+    failed = [(label, bad) for label, bad in results if bad]
+    for label, bad in failed:
+        aiter.logger.error("%s %s: %s", check, label, "; ".join(bad[:3]))
     return {
-        "case": label, "entry": entry, "variant": plan.variant.name, "rows": total_q,
-        "max_win": int(le.max()), "expect nan": int(want.sum()), "got nan": int(got.sum()),
-        "exact set": exact, "oob -inf": oob, "pass": exact and oob,
-    }  # fmt: skip
-
-
-def run_nan_scale(seed):
-    """:func:`check_nan_scale` over both entry points and every compiled instance. Separate from
-    :func:`run_corner` because these cases require non-finite in-window cells."""
-    oks = []
-    for v in _variants():
-        # Ragged windows, all containing KV row 0.
-        oks.append(check_nan_scale("prefill", 2, 3, [50, 120, 200, 40, 100, 180],
-                                   seed + 80, v, "prefill, nan at kv row 0"))  # fmt: skip
-        # KV row 2: only row 3's window [0,3) holds it; rows 1-2 end at or before it.
-        oks.append(check_nan_scale("prefill", 1, 4, [0, 1, 2, 3],
-                                   seed + 81, v, "prefill, nan at kv row 2", kv_row=2))  # fmt: skip
-        # Control: no window holds the poisoned row, so any non-finite cell fails.
-        oks.append(check_nan_scale("prefill", 1, 4, [1, 2, 2, 2],
-                                   seed + 83, v, "prefill, nan outside every window",
-                                   kv_row=2))  # fmt: skip
-        # Decode, where a window spans several KV splits and only one holds the row.
-        oks.append(check_nan_scale("decode", 2, 4,
-                                   [200, 201, 202, 203, v.block_k * 2 + 1] + [130] * 3,
-                                   seed + 82, v, "decode, nan at kv row 0"))  # fmt: skip
-    df = pd.DataFrame(oks)
-    aiter.logger.info(
-        "MXFP4 MQA logits NaN E8M0 scale propagation, %d/%d pass (markdown):\n%s",
-        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
-    )  # fmt: skip
-    return bool(df["pass"].all())
-
-
-# ── perf ──────────────────────────────────────────────────────────────────────
-def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
-    g = random.Random(seed)
-    extra = total - bs * qmin
-    w = [g.random() for _ in range(bs)]
-    s = sum(w) or 1.0
-    parts = [qmin + int(extra * wi / s) for wi in w]
-    parts[0] += total - sum(parts)
-    return parts
-
-
-def score(fn, inp, rb, ls, le, total_q, n_logits, seed):
-    """Time the launch, then score it. Scoring runs after timing and frees its temporaries:
-    the reference's ~1 GB of allocator churn would otherwise skew the next timing."""
-    flops = 2 * HEADS * HEAD_DIM * n_logits
-    nbytes = roofline_bytes(rb, le, total_q, n_logits)
-    out, us = run_perftest(fn, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP)
-    ref = ref_rows(inp, sample_rows(total_q, le, seed=seed), rb, ls, le)
-    ret = {
-        "us": round(us, 2),
-        "TFLOPS": round(flops / us / 1e6, 1),
-        "TB/s": round(nbytes / us / 1e6, 3),
-        "err": check_rows(out, ref, "perf"),
-    }
-    del ref, out
-    torch.cuda.empty_cache()
-    return ret
-
-
-def run_candidates(inp, cu, rb, ls, le, batch, n_logits, seed, local_starts=True):
-    """The candidate loop: time and score every kernel instance this arch compiled on one shape.
-
-    Inputs are shared; each instance gets its own buffers, plan and ``-inf``-filled ``out``, all
-    built outside the timed region (the plan is per forward, the kernel per layer). Columns are
-    ``<instance> tiles/ctas/us/TFLOPS/TB/s/err``. ``local_starts=False`` passes None, as ATOM's
-    decode call does.
-    """
-    total_q = int(le.numel())
-    ret = {}
-    for v in _variants():
-        buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, batch, variant=v)
-        plan = pa_mqa_logits_mxfp4_plan(
-            cu,
-            le,
-            buffers=buffers,
-            total_q=total_q,
-            local_starts=ls if local_starts else None,
-            row_to_batch=rb,
-        )
-        out = torch.full(
-            (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-        )
-
-        # Bound as defaults, not closed over, to avoid late binding across instances.
-        def ours(inp=inp, plan=plan, out=out):
-            return pa_mqa_logits_mxfp4(
-                inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-                inp.weights, plan, inp.max_seq_len,
-                weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-            )  # fmt: skip
-
-        ret[f"{v.name} tiles"] = plan.num_tiles
-        ret[f"{v.name} ctas"] = plan.num_ctas
-        for k, val in score(ours, inp, rb, ls, le, total_q, n_logits, seed).items():
-            ret[f"{v.name} {k}"] = val
-        del ours, plan, out, buffers
-        torch.cuda.empty_cache()
-    return ret
-
-
-def run_windowed_case(per_batch, data_init, scale_init, seed):
-    """Run every instance on one prefill shape given as explicit per-row ``(start, end)``
-    windows. Shared by the three prefill tables."""
-    bs = len(per_batch)
-    qlens = [len(w) for w in per_batch]
-    total_q = sum(qlens)
-    max_end = max(e for w in per_batch for (_, e) in w)
-    inp = build_inputs(bs, max_end, total_q, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    rb = t([b for b, w in enumerate(per_batch) for _ in w])
-    ls = t([s for w in per_batch for (s, _) in w])
-    le = t([e for w in per_batch for (_, e) in w])
-    cu = t([0] + list(itertools.accumulate(qlens)))
-    n_logits = int((le - ls).clamp(min=0).sum().item())
-    ret = {
         "gfx": get_gfx(),
-        "rows": total_q,
-        "min_win": int((le - ls).min()),
-        "max_win": int(le.max()),
-        "max_seq_len": inp.max_seq_len,
-        "n_logits": n_logits,
+        "cases": len(results),
+        "failed": len(failed),
+        "result": "FAIL" if failed else "PASS",
+        "first failure": f"{failed[0][0]}: {failed[0][1][0]}" if failed else "",
     }
-    ret.update(run_candidates(inp, cu, rb, ls, le, bs, n_logits, seed))
-    del inp
-    torch.cuda.empty_cache()
-    return ret
-
-
-@benchmark()
-def test_prefill_causal(batch, total_q, data_init, scale_init, seed):
-    """Causal prefill: ``total_q`` rows split raggedly across ``batch`` sequences, ctx == qlen.
-    The split is seeded by ``batch`` so ``--seed`` moves only the data."""
-    qlens = gen_prefill_qlens(batch, total=total_q, seed=batch)
-    return run_windowed_case(
-        [[(0, n + 1) for n in range(q)] for q in qlens], data_init, scale_init, seed
-    )
-
-
-@benchmark()
-def test_prefill_fresh(batch, total_q, data_init, scale_init, seed):
-    """Fresh CSA prefill: ``batch`` empty sequences of ``total_q // batch`` rows, row n sees
-    ``(n + 1) // CSA_RATIO``."""
-    return run_windowed_case(
-        [_csa_fresh(total_q // batch) for _ in range(batch)],
-        data_init,
-        scale_init,
-        seed,
-    )
-
-
-@benchmark()
-def test_prefill_chunked(batch, total_q, ctx, data_init, scale_init, seed):
-    """Chunked CSA prefill: ``total_q`` rows split raggedly by ``gen_prefill_qlens``, each chunk
-    the tail of ``ctx`` compressed rows, so row n sees ``ctx - (qlen - 1 - n) // CSA_RATIO``.
-    ``total_q = 16384, ctx = 25000`` at ``batch`` 1/2/4 are PR #5332's shapes.
-    """
-    return run_windowed_case(
-        [
-            _csa_chunked(q, ctx)
-            for q in gen_prefill_qlens(batch, total=total_q, seed=batch)
-        ],
-        data_init,
-        scale_init,
-        seed,
-    )
-
-
-@benchmark()
-def test_decode(mtp, batch, ctx, long_frac, data_init, scale_init, seed):
-    """MTP decode: ``batch`` sequences of ``mtp`` rows. ``long_frac`` of them (rounded) see
-    ``ctx`` compressed columns and the rest ``DECODE_WIN_SHORT``; the tile count is fixed per
-    ``(mtp, batch)``, so ``long_frac < 1`` isolates load balance. Every row takes its sequence's
-    whole window.
-    """
-    n_long = min(max(round(long_frac * batch), 0), batch)
-    ctxs = [ctx] * n_long + [DECODE_WIN_SHORT] * (batch - n_long)
-    total_q = batch * mtp
-    inp = build_inputs(batch, max(ctxs), total_q, seed, data_init, scale_init)
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    rb = t([b for b in range(batch) for _ in range(mtp)])
-    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
-    le = t([ctxs[b] for b in range(batch) for _ in range(mtp)])
-    cu = t([0] + list(itertools.accumulate([mtp] * batch)))
-    n_logits = int(le.sum().item())
-    ret = {
-        "gfx": get_gfx(),
-        "n_long": n_long,
-        "rows": total_q,
-        "max_win": int(le.max()),
-        "n_logits": n_logits,
-    }
-    ret.update(
-        run_candidates(inp, cu, rb, ls, le, batch, n_logits, seed, local_starts=False)
-    )
-    del inp
-    torch.cuda.empty_cache()
-    return ret
 
 
 def summarize(name, rows):
-    """One result table as markdown (to read) and one-line JSON (for a benchmark driver)."""
     df = pd.DataFrame(rows)
-    aiter.logger.info("%s (markdown):\n%s", name, df.to_markdown(index=False))
-    print_json_table(name, df)
-
-
-def init_pairs(data_init, scale_init):
-    """Pair the two axes position-wise (not crossed, matching the benchmark driver); a length-1
-    side broadcasts."""
-    data, scale = list(data_init), list(scale_init)
-    if len(data) == 1:
-        data *= len(scale)
-    if len(scale) == 1:
-        scale *= len(data)
-    if len(data) != len(scale):
-        raise ValueError(
-            "--data-init and --scale-init must have equal length (a length-1 side broadcasts)"
-        )
-    return list(zip(data, scale))
+    aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
+    return df
 
 
 def main():
-    # Arch gate before anything touches the device: CI runs this file on every shard.
     if get_gfx() not in SUPPORTED_GFX:
-        why = f"built for {'/'.join(SUPPORTED_GFX)}, skipped on {get_gfx()}"
-        aiter.logger.warning("MXFP4 MQA logits: %s", why)
-        # Still emit a table, so a driver sees a skip rather than a broken extractor.
-        summarize("pa_mqa_logits_mxfp4 (not run)", [{"err_msg": why}])
+        aiter.logger.warning(
+            "mqa_logits_mxfp4 has no instances on %s; skipping", get_gfx()
+        )
         return
-
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="config input of test",
+        formatter_class=argparse.RawTextHelpFormatter, description=__doc__
     )
     parser.add_argument(
-        "--modes", nargs="*", choices=MODES, default=MODES,
-        help="which tables to run; `corner` is the correctness sweep (corner cases and\n"
-             "the NaN-scale probe), the rest are perf",
-    )  # fmt: skip
+        "--modes",
+        nargs="*",
+        default=["decode", "prefill", "semantics"],
+        choices=["decode", "prefill", "semantics"],
+        help="which tables",
+    )
     parser.add_argument(
-        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 16],
-        help="prefill sequences (causal, fresh, chunked); --total-q rows are split across them",
-    )  # fmt: skip
+        "-m",
+        "--model",
+        nargs="*",
+        default=["v4", "v41", "cand"],
+        choices=list(MODEL_HEADS),
+        help="v4 (64 heads), v41 / cand (32 heads)",
+    )
     parser.add_argument(
-        "-q", "--total-q", type=int, nargs="*", default=[PREFILL_TOTAL_QLEN],
-        help="prefill query rows",
-    )  # fmt: skip
+        "--ratio",
+        type=int,
+        nargs="*",
+        default=[2, 1],
+        help="V4.1 full layers' compression ratio (V4 is 4; cand ignores it)",
+    )
     parser.add_argument(
-        "-c", "--ctx", type=int, nargs="*", default=[DECODE_WIN_LONG],
-        help="compressed context columns: chunked prefill's committed KV, and the long\n"
-             "decode window",
-    )  # fmt: skip
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 16, 64, 128],
+        help="decode: sequences",
+    )
     parser.add_argument(
-        "--decode-batch", type=int, nargs="*", default=[1, 8, 32, 128],
-        help="decode sequences",
-    )  # fmt: skip
+        "-c",
+        "--ctx",
+        type=int,
+        nargs="*",
+        default=[65536],
+        help="context tokens a sequence (decode and prefill)",
+    )
     parser.add_argument(
-        "--mtp", type=int, nargs="*", default=[1, 4, 8],
-        help="decode query rows per sequence (next_n)",
-    )  # fmt: skip
+        "--mtp",
+        type=int,
+        nargs="*",
+        default=[1, 4, 6],
+        help="decode: rows a sequence (MTP depth + 1)",
+    )
     parser.add_argument(
-        "--long-frac", type=float, nargs="*", default=[1.0],
-        help=f"fraction of decode sequences on the --ctx window; the rest see\n"
-             f"{DECODE_WIN_SHORT} columns, so < 1 is a ragged batch",
-    )  # fmt: skip
-    # Not `add_data_init_args`: its --scale-init offers float dists, not E8M0_SCALE_DISTS.
+        "-q",
+        "--qlen",
+        type=int,
+        nargs="*",
+        default=[16384, 4096],
+        help="prefill: chunk rows a sequence (16384 rows in all)",
+    )
     parser.add_argument(
-        "--data-init", nargs="+", choices=list(DATA_DISTS), default=["norm"],
-        help="DATA init for the fp4 nibbles and the weights, paired position-wise\n"
-             "with --scale-init (a length-1 side broadcasts)",
-    )  # fmt: skip
-    parser.add_argument(
-        "--scale-init", nargs="+", choices=list(E8M0_SCALE_DISTS), default=["auto"],
-        help="E8M0 SCALE init, sampled INDEPENDENTLY of the data. This axis alone\n"
-             "decides whether the suite can see a misrouted scale -- see scale_spread",
-    )  # fmt: skip
-    parser.add_argument(
-        "--seed", type=int, default=0,
-        help="RNG seed for the data and the sampled reference rows; shapes are pinned to\n"
-             "the sweep point, so two seeds stay comparable",
-    )  # fmt: skip
+        "--checks",
+        nargs="*",
+        default=list(SEMANTIC_CHECKS),
+        choices=list(SEMANTIC_CHECKS),
+        help="semantics: which checks",
+    )
     args = parser.parse_args()
-
-    modes = set(args.modes)
-    if modes & {"causal", "chunked"}:
-        for b, q in itertools.product(args.batch, args.total_q):
-            if q < b * PREFILL_QMIN:
-                parser.error(
-                    f"--total-q {q} cannot be split raggedly across --batch {b}: the "
-                    f"split needs at least {PREFILL_QMIN} rows per sequence"
-                )
-    if "fresh" in modes:
-        for b, q in itertools.product(args.batch, args.total_q):
-            if q % b:
-                parser.error(
-                    f"fresh prefill splits --total-q evenly: {q} is not a multiple of "
-                    f"--batch {b}"
-                )
-    if "decode" in modes and any(not 0 <= f <= 1 for f in args.long_frac):
-        parser.error("--long-frac values must be in [0, 1]")
-    if any(
-        v < 1
-        for v in args.batch + args.total_q + args.ctx + args.decode_batch + args.mtp
-    ):
-        parser.error("--batch, --total-q, --ctx, --decode-batch and --mtp must be >= 1")
-
-    pairs = init_pairs(args.data_init, args.scale_init)
-    ok = True
-
-    for data_init, scale_init in pairs:
-        distinct, disagree = scale_spread(scale_init)
-        aiter.logger.info(
-            "scale-init %s spreads %d E8M0 exponents; rows 16 apart disagree %.1f%%",
-            scale_init,
-            distinct,
-            100.0 * disagree,
+    for model in [m for m in args.model if not serves(m)]:
+        aiter.logger.warning(
+            "%s: %s", model, M._ELSEWHERE[get_gfx(), MODEL_HEADS[model]]
         )
+    args.model = [m for m in args.model if serves(m)]
 
-    if "corner" in modes:
-        corner, not_judged = [], []
-        for data_init, scale_init in pairs:
-            blind = correctness_blindness(data_init, scale_init)
-            if blind is not None:
-                # Own table: a skip row would NaN-fill and turn the bool columns into floats.
-                not_judged.append(
-                    {
-                        "data_init": data_init,
-                        "scale_init": scale_init,
-                        "seed": args.seed,
-                        "err_msg": blind,
-                    }
-                )
-                continue
-            rows = run_corner(data_init, scale_init, args.seed)
-            ok = all(r["pass"] for r in rows) and ok
-            corner += rows
-        if not_judged:
-            summarize("pa_mqa_logits_mxfp4 corner (not judged)", not_judged)
-        if corner:
-            summarize("pa_mqa_logits_mxfp4 corner", corner)
-        # NaN E8M0 propagation, on its own data, independent of the init pairs.
-        ok = run_nan_scale(args.seed) and ok
+    def ratios(model):
+        return [4] if model == "v4" else [1] if model == "cand" else args.ratio
 
-    def sweep(name, fn, *axes):
-        """One table: ``fn`` over the init pairs crossed with ``itertools.product(*axes)``."""
-        rows = [
-            fn(*shape, data_init, scale_init, args.seed)
-            for data_init, scale_init in pairs
-            for shape in itertools.product(*axes)
-        ]
-        if rows:
-            summarize(name, rows)
-
-    if "causal" in modes:
-        sweep(
-            "pa_mqa_logits_mxfp4 prefill causal",
-            test_prefill_causal,
-            args.batch,
-            args.total_q,
+    failed = False
+    for model in args.model:
+        if "decode" in args.modes:
+            df = summarize(
+                f"mqa_logits_mxfp4 {model} decode",
+                [
+                    test_decode(model, ratio, batch, ctx, mtp)
+                    for ratio, batch, ctx, mtp in itertools.product(
+                        ratios(model), args.batch, args.ctx, args.mtp
+                    )
+                ],
+            )
+            failed |= bool((df.filter(like=" err") > 0).any().any())
+        if "prefill" in args.modes:
+            df = summarize(
+                f"mqa_logits_mxfp4 {model} prefill",
+                [
+                    test_prefill(model, ratio, qlen, ctx)
+                    for ratio, qlen, ctx in itertools.product(
+                        ratios(model), args.qlen, args.ctx
+                    )
+                ],
+            )
+            failed |= bool((df.filter(like=" err") > 0).any().any())
+    if "semantics" in args.modes:
+        df = summarize(
+            "mqa_logits_mxfp4 semantics",
+            [
+                test_semantics(model, check)
+                for model, check in itertools.product(args.model, args.checks)
+            ],
         )
-    if "fresh" in modes:
-        sweep(
-            f"pa_mqa_logits_mxfp4 prefill fresh (csa ratio {CSA_RATIO})",
-            test_prefill_fresh,
-            args.batch,
-            args.total_q,
-        )
-    if "chunked" in modes:
-        sweep(
-            f"pa_mqa_logits_mxfp4 prefill chunked (csa ratio {CSA_RATIO})",
-            test_prefill_chunked,
-            args.batch,
-            args.total_q,
-            args.ctx,
-        )
-    if "decode" in modes:
-        sweep(
-            f"pa_mqa_logits_mxfp4 decode (short window {DECODE_WIN_SHORT} compressed cols)",
-            test_decode,
-            args.mtp,
-            args.decode_batch,
-            args.ctx,
-            args.long_frac,
-        )
-
-    raise SystemExit(0 if ok else 1)
+        failed |= bool((~df["result"].str.startswith("PASS")).any())
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
