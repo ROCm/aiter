@@ -484,12 +484,13 @@ fmha_v3_varlen_fwd(at::Tensor &q,      // [total_q, hq, d]
     // Split-KV is only selected when the packed-varlen contract matches the
     // ASM kernel: gfx942 (not MI308), BF16, D_QK=192 / D_V=128, batch 1,
     // non-causal, no SWA/bias/dropout/paged/padded cu_seqlens, and
-    // max_seqlen_{q,k} equal the packed buffer lengths. The host gate uses
-    // those buffer lengths for split width; the kernel still reads
-    // cu_seqlens_k[1]-cu_seqlens_k[0]. Copying cu_seqlens to the host would
-    // break CUDA-graph capture, so this path requires dense packed lengths
-    // cu_seqlens_q = [0, q.size(0)] and cu_seqlens_k = [0, k.size(0)]. Any
-    // other shape stays on the unsplit kernel (or TORCH_CHECKs when forced).
+    // max_seqlen_{q,k} equal the packed buffer lengths. Host split width uses
+    // the buffer length; the kernel clamps each split against
+    // cu_seqlens_k[1]-cu_seqlens_k[0] so a split that starts past the real K
+    // length writes O=0 / LSE=-inf (combine weight 0) instead of reading OOB.
+    // Callers should still pass dense cu_seqlens_* = [0, size] for the intended
+    // packed path; other shapes stay on the unsplit kernel (or TORCH_CHECK when
+    // split is forced).
     const bool splitkv_compatible =
         head_size_q == 192 && head_size_v == 128 &&
         q_dtype == torch::kBFloat16 && batch_size == 1 &&

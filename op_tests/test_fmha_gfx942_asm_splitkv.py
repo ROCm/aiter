@@ -12,9 +12,8 @@ num_splits (asm_mha_varlen_fwd.cu): 0 = auto, 1 = unsplit kernel,
 Sk >= 8192, and Q_tiles * heads <= 2 * CU.
 
 q/k/v are packed THD, batch 1, BF16, D_QK=192 / D_V=128, non-causal.
-Split-KV also requires dense packed cu_seqlens_q = [0, q.size(0)] and
-cu_seqlens_k = [0, k.size(0)]; anything else stays on the unsplit kernel
-(or raises when num_splits is forced).
+The intended path uses dense cu_seqlens_* = [0, size]. If cu_seqlens_k is
+shorter than the K buffer, empty trailing splits write O=0 / LSE=-inf.
 """
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
@@ -422,6 +421,38 @@ def _check_non_lse():
     )
 
 
+def _check_ragged_cu_seqlens_k():
+    """Host splits on buffer length; kernel clamps to cu_seqlens_k.
+
+    Buffer Sk=8192 with logical K=100 and 3 splits: split 0 covers the real
+    keys, splits 1–2 are empty (O=0, LSE=-inf) and must not poison combine.
+    """
+    torch.manual_seed(2)
+    sq, sk_buf, sk_real, hq, num_splits = 129, 8192, 100, 4, 3
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk_buf, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk_buf, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk_real], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    ref_out, ref_lse = run_torch(q, k[:sk_real], v[:sk_real], scale)
+    out, lse, _, _ = _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, True)
+    assertAllclose(
+        ref_out.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg="ragged cu_seqlens_k O",
+    )
+    assertAllclose(
+        ref_lse.to(dtypes.fp32),
+        lse.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg="ragged cu_seqlens_k LSE",
+    )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX or get_device_name() == "MI308":
         aiter.logger.warning(
@@ -502,6 +533,7 @@ def main():
     _check_forced_split_writes_out()
     _check_forced_split_causal_rejected()
     _check_non_lse()
+    _check_ragged_cu_seqlens_k()
     _check_compile_outputs()
     _check_cuda_graph()
 
