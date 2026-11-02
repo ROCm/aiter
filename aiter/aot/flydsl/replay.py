@@ -62,7 +62,7 @@ import traceback
 import zlib
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from aiter.aot.flydsl.common import (
@@ -86,54 +86,77 @@ def job_arch(job: dict, default: str = "gfx950") -> str:
     return gfx or cu_num_to_arch(int(job.get("cu_num") or 0), default)
 
 
+class ReplayHookBroken(RuntimeError):
+    """A FlyDSL launch derived no cache key in
+    ``JitFunction._build_full_cache_key``: the FlyDSL internals the replay
+    hooks into have changed, and it would miss the launch's kernel."""
+
+
+class _Identified(BaseException):
+    """Ends a launch at its cache identity. A BaseException, so that no
+    ``except Exception`` on the way out of FlyDSL takes it for an error."""
+
+
 @contextmanager
-def requested_kernels() -> Iterator[set]:
-    """Collect the cache identity of every FlyDSL launch a replay reaches."""
+def requested_kernels(*, stop: bool = False) -> Iterator[set]:
+    """Collect the cache identity of every FlyDSL launch a replay reaches, as
+    FlyDSL itself derives it for its cache lookup. With ``stop``, a launch
+    ends there: nothing is traced, compiled or read from the cache, and the
+    launcher gets the None a COMPILE_ONLY launch returns.
+
+    Hooks two private names of FlyDSL's ``JitFunction``:
+    ``_compile_or_execute``, which every launch (``__call__``,
+    ``flyc.compile``) goes through, and ``_build_full_cache_key``, which it
+    calls once before tracing. Should either be renamed, entering this
+    fails; should a launch stop deriving its key there, it raises
+    :class:`ReplayHookBroken`."""
     from unittest import mock
 
     from flydsl.compiler.jit_function import JitFunction
 
     kernels = set()
     build_key = JitFunction._build_full_cache_key
+    dispatch = JitFunction._compile_or_execute
+    derived = depth = 0
 
     def record(self, *args, **kwargs):
+        nonlocal derived
         key = build_key(self, *args, **kwargs)
         kernels.add((self.manager_key, key))
+        derived += 1
+        # Only a launch is stopped; host code may derive a key itself.
+        if stop and depth:
+            raise _Identified
         return key
 
-    with mock.patch.object(JitFunction, "_build_full_cache_key", record):
+    def launch(self, *args, **kwargs):
+        nonlocal depth
+        before = derived
+        depth += 1
+        try:
+            result = dispatch(self, *args, **kwargs)
+        except _Identified:
+            return None
+        finally:
+            depth -= 1
+        # A launch inside another one's trace is inlined and derives no key.
+        if not depth and derived == before:
+            raise ReplayHookBroken(
+                f"FlyDSL launched {self.func.__name__} without deriving its "
+                "cache key in JitFunction._build_full_cache_key"
+            )
+        return result
+
+    with (
+        mock.patch.object(JitFunction, "_build_full_cache_key", record),
+        mock.patch.object(JitFunction, "_compile_or_execute", launch),
+    ):
         yield kernels
 
 
-@contextmanager
-def identified_kernels() -> Iterator[set]:
-    """Like :func:`requested_kernels`, but a launch stops at its cache
-    identity: nothing is traced, compiled or read from the cache, and the
-    launcher gets the None a COMPILE_ONLY launch returns. The identity is
-    derived as the head of ``JitFunction._compile_or_execute`` derives it."""
-    from unittest import mock
-
-    from flydsl.compiler.jit_function import JitFunction
-
-    kernels = set()
-
-    def identify(self, args, kwargs, *, execute, return_compiled=False):
-        bound_self, args = self._split_self(args)
-        owner_cls = type(bound_self) if bound_self is not None else None
-        self._ensure_cache_manager(owner_cls)
-        self._snapshot_or_check_globals(owner_cls)
-        bound = self._sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        key = self._build_full_cache_key(
-            bound.arguments,
-            owner_cls=owner_cls,
-            bound_self=bound_self,
-            effective_hints=self._effective_compile_hints(),
-        )
-        kernels.add((self.manager_key, key))
-
-    with mock.patch.object(JitFunction, "_compile_or_execute", identify):
-        yield kernels
+def identified_kernels() -> AbstractContextManager[set]:
+    """:func:`requested_kernels` with every launch stopped at its cache key."""
+    return requested_kernels(stop=True)
 
 
 def replay_job(
@@ -166,7 +189,7 @@ def replay_job(
             result["unsupported"] = str(error) or type(error).__name__
         except Exception as error:  # noqa: BLE001
             if (
-                not isinstance(error, GpuRuntimeReached)
+                not isinstance(error, (GpuRuntimeReached, ReplayHookBroken))
                 and _in_other_backend(error)
                 and not _in_flydsl(error)
                 and not kernels
@@ -182,7 +205,7 @@ def replay_job(
                 return result, frozenset()
             if (
                 probe
-                and not isinstance(error, GpuRuntimeReached)
+                and not isinstance(error, (GpuRuntimeReached, ReplayHookBroken))
                 and not _in_flydsl(error)
                 and not kernels
             ):
@@ -264,6 +287,8 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
                     try:
                         module.replay({**job, "m": size})
                         outcome = frozenset(kernels)
+                    except ReplayHookBroken:
+                        raise
                     except Exception as error:  # noqa: BLE001
                         outcome = (
                             type(error).__name__,
