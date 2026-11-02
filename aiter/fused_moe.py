@@ -270,7 +270,9 @@ kernel_bench_callable = None
 # (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
-def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+def _moe_prepare_unsorted_input(
+    topk_ids, topk_weights, model_dim, moebuf_dtype, num_local_tokens=None
+):
     device = topk_ids.device
     M = topk_ids.shape[0]
     # FLAT kernels zero their own output rows on-device and need an
@@ -294,9 +296,15 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
-    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+    # sorted_expert_ids is unread; alias topk_ids so the pointer is valid.
+    # XC is one dword. A CUDA num_local_tokens is that storage. Otherwise the
+    # pointer is null (no allocation, no store) and the kernel keeps kernarg
+    # token_cnt, which is M.
+    if isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda:
+        num_valid_ids = num_local_tokens
+    else:
+        num_valid_ids = torch.empty(0, dtype=dtypes.i32, device=device)
+    return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
 
 
 def _adaptive_moe_sort(
@@ -820,7 +828,11 @@ def moe_sorting(
     if flat:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
-            topk_ids, topk_weights, model_dim, moebuf_dtype
+            topk_ids,
+            topk_weights,
+            model_dim,
+            moebuf_dtype,
+            num_local_tokens,
         )
     try:
         return _moe_sorting_impl(
