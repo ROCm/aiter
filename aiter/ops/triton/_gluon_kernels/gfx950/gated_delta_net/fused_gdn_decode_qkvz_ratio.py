@@ -13,6 +13,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import softplus
 from aiter.ops.triton._triton_kernels.common.activation import _silu
+from aiter.ops.triton._triton_kernels.common.rmsnorm import _inverse_rms
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 from .fused_gdn_decode_qkvz import _exp, _quantization_scale, _sigmoid
@@ -116,83 +117,16 @@ def _dynamics(b, a, a_log, bias):
     return decay, beta
 
 
-@gluon.jit
-def _gate_loads(
-    gate_ptr,
-    NormWeight,
-    rows,
-    V: gl.constexpr,
-    ROWS: gl.constexpr,
-    HEADS: gl.constexpr,
-    BLOCKS: gl.constexpr,
-):
-    """Output gates (HEADS x BLOCKS row blocks) and the norm weight (BLOCKS blocks)."""
-    gates = ()
-    for h in gl.static_range(HEADS):
-        for part in gl.static_range(BLOCKS):
-            gates = gates + (gl.load(gate_ptr + h * V + part * ROWS).to(gl.float32),)
-    weights = ()
-    for part in gl.static_range(BLOCKS):
-        weights = weights + (gl.load(NormWeight + part * ROWS + rows).to(gl.float32),)
-    return gates, weights
-
-
-@gluon.jit
-def _epilogue(
-    outs,
-    gates,
-    weights,
-    row,
-    rows,
-    Output,
-    Quantized,
-    Scales,
-    eps,
-    fp8_max,
-    V: gl.constexpr,
-    ROWS: gl.constexpr,
-    BLOCKS: gl.constexpr,
-    HAS_FP8: gl.constexpr,
-):
-    """Gated RMSNorm of one head's bf16-rounded readout, given as BLOCKS row blocks,
-    plus optional FP8."""
-    cores = ()
-    for part in gl.static_range(BLOCKS):
-        cores = cores + (outs[part].to(gl.bfloat16).to(gl.float32),)
-    squares = cores[0] * cores[0]
-    for part in gl.static_range(1, BLOCKS):
-        squares = squares + cores[part] * cores[part]
-    rms = gl.rsqrt(gl.sum(squares, 0) / V + eps)
-    normed = ()
-    for part in gl.static_range(BLOCKS):
-        value = (cores[part] * rms * weights[part] * _silu(gates[part])).to(gl.bfloat16)
-        normed = normed + (value,)
-        gl.store(Output + row * V + part * ROWS + rows, value)
-    if HAS_FP8:
-        # FP8 scales consume the rounded BF16 output, not the FP32 precursor.
-        peak = gl.abs(normed[0].to(gl.float32))
-        for part in gl.static_range(1, BLOCKS):
-            peak = gl.maximum(peak, gl.abs(normed[part].to(gl.float32)))
-        maximum = gl.maximum(gl.max(peak, 0), 1.0e-10)
-        quant_scale = _quantization_scale(maximum, fp8_max, False)
-        gl.store(Scales + row, quant_scale)
-        for part in gl.static_range(BLOCKS):
-            gl.store(
-                Quantized + row * V + part * ROWS + rows,
-                gl.clamp(normed[part].to(gl.float32) / quant_scale, -fp8_max, fp8_max),
-            )
-
-
 @gluon.constexpr_function
-def _lds_epilogue_layout(V, HP2, NW):
-    """[HP2, V] layout of the shared-memory epilogue: up to V / 64 warps per head row, any
-    other warps on the head axis (replicated when that exceeds HP2)."""
+def _epilogue_layout(V, HP2, NW):
+    """[HP2, V] layout of the epilogue: up to V / 64 warps per head row, any other
+    warps on the head axis (replicated when that exceeds HP2)."""
     wpr = max(min(NW // HP2, V // 64), 1)
     return gl.BlockedLayout([1, V // (64 * wpr)], [1, 64], [NW // wpr, wpr], [1, 0])
 
 
 @gluon.jit
-def _lds_gate_loads(
+def _gate_loads(
     gate_base,
     NormWeight,
     V: gl.constexpr,
@@ -200,8 +134,8 @@ def _lds_gate_loads(
     HP2: gl.constexpr,
     NW: gl.constexpr,
 ):
-    """Output gates and norm weight in the shared-memory epilogue's layout."""
-    out_layout: gl.constexpr = _lds_epilogue_layout(V, HP2, NW)
+    """Output gates and norm weight in the epilogue's layout."""
+    out_layout: gl.constexpr = _epilogue_layout(V, HP2, NW)
     head = gl.arange(0, HP2, layout=gl.SliceLayout(1, out_layout))
     col = gl.arange(0, V, layout=gl.SliceLayout(0, out_layout))
     live = (head[:, None] < HEADS) & (col[None, :] < V)
@@ -210,41 +144,53 @@ def _lds_gate_loads(
 
 
 @gluon.jit
-def _lds_epilogue(
-    readouts,
+def _epilogue(
+    core_out,
     gate,
     weight,
     Output,
+    Quantized,
+    Scales,
     row,
     eps,
+    fp8_max,
     V: gl.constexpr,
     HEADS: gl.constexpr,
     HP2: gl.constexpr,
     NW: gl.constexpr,
+    HAS_FP8: gl.constexpr,
 ):
-    """Gated RMSNorm of the HEADS readouts staged in ``readouts`` ([HP2 * V] LDS),
-    one head per warp row, so the sum of squares stays within a warp."""
-    out_layout: gl.constexpr = _lds_epilogue_layout(V, HP2, NW)
+    """Gated RMSNorm, plus optional FP8, of the HEADS core outputs staged in
+    ``core_out`` ([HP2 * V] LDS), one head per warp row."""
+    out_layout: gl.constexpr = _epilogue_layout(V, HP2, NW)
     head = gl.arange(0, HP2, layout=gl.SliceLayout(1, out_layout))
     col = gl.arange(0, V, layout=gl.SliceLayout(0, out_layout))
     live = (head[:, None] < HEADS) & (col[None, :] < V)
     core = gl.where(
         live,
-        readouts.reshape([HP2, V]).load(out_layout).to(gl.bfloat16).to(gl.float32),
+        core_out.reshape([HP2, V]).load(out_layout).to(gl.bfloat16).to(gl.float32),
         0.0,
     )
-    rms = gl.rsqrt(gl.sum(core * core, 1) / V + eps)
-    value = (
+    rms = _inverse_rms(core, V, eps, False)
+    normalized = (
         core
         * rms[:, None]
         * weight.to(gl.float32)[None, :]
         * _silu(gate.to(gl.float32))
-    )
-    gl.store(
-        Output + (row + head)[:, None] * V + col[None, :],
-        value.to(gl.bfloat16),
-        mask=live,
-    )
+    ).to(gl.bfloat16)
+    out_offset = (row + head)[:, None] * V + col[None, :]
+    gl.store(Output + out_offset, normalized, mask=live)
+    if HAS_FP8:
+        # FP8 scales consume the rounded BF16 output, not the FP32 precursor.
+        values = normalized.to(gl.float32)
+        maximum = gl.maximum(gl.max(gl.abs(values), 1), 1.0e-10)
+        quant_scale = _quantization_scale(maximum, fp8_max, False)
+        gl.store(Scales + row + head, quant_scale, mask=head < HEADS)
+        gl.store(
+            Quantized + out_offset,
+            gl.clamp(values / quant_scale[:, None], -fp8_max, fp8_max),
+            mask=live,
+        )
 
 
 @gluon.jit(repr=_ratio_repr)
@@ -286,7 +232,6 @@ def _decode_group_ratio(
     HAS_FP8: gl.constexpr,
     FLAT: gl.constexpr,
     HAS_QSL: gl.constexpr,
-    REG_EPILOGUE: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 4,
     BA_KSPLIT: gl.constexpr = 1,
 ):
@@ -298,7 +243,6 @@ def _decode_group_ratio(
     gl.static_assert(VH == RATIO * KH, "VH must be RATIO * KH")
     gl.static_assert(RATIO >= 1, "RATIO must be positive")
     gl.static_assert(K % (KL * KS) == 0, "KL lanes x KS elements must tile K")
-    gl.static_assert(not HAS_FP8 or REG_EPILOGUE, "FP8 output needs REG_EPILOGUE")
     pid = gl.program_id(0)
     token = pid // KH
     group = pid % KH
@@ -391,12 +335,7 @@ def _decode_group_ratio(
         conv_channel_stride,
         conv_width_stride,
     )
-    if REG_EPILOGUE:
-        gates, weights = _gate_loads(
-            gate_base + crow, NormWeight, crow, V, RC, RATIO, V // RC
-        )
-    else:
-        gate, weight = _lds_gate_loads(gate_base, NormWeight, V, RATIO, HP2, NW)
+    gate, weight = _gate_loads(gate_base, NormWeight, V, RATIO, HP2, NW)
     for ci in gl.static_range(NPRE):
         states = states + (
             gl.amd.cdna3.buffer_load(
@@ -415,18 +354,16 @@ def _decode_group_ratio(
     key = conv_shared.slice(K, K).load(gl.SliceLayout(0, tile_layout))
     q = q * (gl.rsqrt(gl.sum(q * q, 0) + 1.0e-6) * scale)
     key = key * gl.rsqrt(gl.sum(key * key, 0) + 1.0e-6)
-    outs = ()
     decays = ()
     betas = ()
     for h in gl.static_range(RATIO):
         decay, beta = _dynamics(bs[h], as_[h], logs[h], biases[h])
         decays = decays + (decay,)
         betas = betas + (beta,)
-    # Readout from the decayed state before the write:
+    # Output from the decayed state before the write:
     # (S + r k^T) q = S q + r (k . q), so both row sums are independent.
     qk = gl.sum(q * key, 0)
-    if not REG_EPILOGUE:
-        readouts = gl.allocate_shared_memory(gl.float32, [HP2 * V], shared_layout)
+    core_out = gl.allocate_shared_memory(gl.float32, [HP2 * V], shared_layout)
     for c in gl.static_range(NCH):
         chunk = states[0].to(gl.float32)
         if c + NUM_BUFFERS < NCH:
@@ -444,7 +381,7 @@ def _decode_group_ratio(
         )
         decayed = chunk * decays[c // (V // RC)]
         predicted = gl.sum(decayed * key[None, :], 1)
-        readout = gl.sum(decayed * q[None, :], 1)
+        state_q = gl.sum(decayed * q[None, :], 1)
         residual = (value - predicted) * betas[c // (V // RC)]
         gl.amd.cdna3.buffer_store(
             (decayed + residual[:, None] * key[None, :]).to(State.dtype.element_ty),
@@ -452,43 +389,20 @@ def _decode_group_ratio(
             chunk_offset,
             cache=".wt",
         )
-        if REG_EPILOGUE:
-            outs = outs + (readout + residual * qk,)
-        else:
-            readouts.slice(c * RC, RC).store(readout + residual * qk)
-    if REG_EPILOGUE:
-        for h in gl.static_range(RATIO):
-            outs_h = ()
-            gates_h = ()
-            for part in gl.static_range(V // RC):
-                outs_h = outs_h + (outs[(V // RC) * h + part],)
-                gates_h = gates_h + (gates[(V // RC) * h + part],)
-            _epilogue(
-                outs_h,
-                gates_h,
-                weights,
-                token * VH + head0 + h,
-                crow,
-                Output,
-                Quantized,
-                Scales,
-                eps,
-                fp8_max,
-                V,
-                RC,
-                V // RC,
-                HAS_FP8,
-            )
-    else:
-        _lds_epilogue(
-            readouts,
-            gate,
-            weight,
-            Output,
-            token * VH + head0,
-            eps,
-            V,
-            RATIO,
-            HP2,
-            NW,
-        )
+        core_out.slice(c * RC, RC).store(state_q + residual * qk)
+    _epilogue(
+        core_out,
+        gate,
+        weight,
+        Output,
+        Quantized,
+        Scales,
+        token * VH + head0,
+        eps,
+        fp8_max,
+        V,
+        RATIO,
+        HP2,
+        NW,
+        HAS_FP8,
+    )

@@ -515,7 +515,6 @@ def fused_gdn_decode_qkvz(
             HAS_FP8=has_fp8,
             FLAT=flat,
             HAS_QSL=has_qsl,
-            REG_EPILOGUE=has_fp8,
             NUM_BUFFERS=num_buffers,
             BA_KSPLIT=projected_ba.shape[0] if projected_ba.dim() == 3 else 1,
             num_warps=num_warps,
