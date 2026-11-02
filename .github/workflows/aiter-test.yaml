@@ -872,6 +872,14 @@ jobs:
           for kernel in kernels:
               copy2(kernel, workspace_jit / kernel.name)
 
+          # Source imports discover FlyDSL AOT entries under their own jit dir.
+          # Reuse the wheel's cache instead of JIT-compiling the CSV sweep again.
+          installed_cache = installed_jit / "flydsl_cache"
+          workspace_cache = workspace_jit / "flydsl_cache"
+          if installed_cache.is_dir() and not workspace_cache.exists():
+              workspace_cache.symlink_to(installed_cache, target_is_directory=True)
+              print(f"Linked FlyDSL AOT cache from {installed_cache} to {workspace_cache}")
+
           print(
               f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
               f"to {workspace_jit}"
