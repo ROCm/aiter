@@ -96,8 +96,6 @@ markers = [
     "smoke: fast tests eligible for default PR CI",
     "full: tests reserved for full CI runs",
     "perf: performance tests and benchmarks",
-    "nightly: tests reserved for scheduled nightly coverage",
-    "slow: long-running tests excluded from default smoke CI",
 ]
 
 [tool.black]
