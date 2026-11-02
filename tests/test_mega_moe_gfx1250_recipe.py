@@ -29,10 +29,12 @@ from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
 )
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
+    compact_dense_comb_slots,
     compact_done_nbytes,
     compact_hist_stride,
     compact_row_capacity,
 )
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
 
 D, C = MM.DispatchKind, MM.CombineKind
 COMPACT_TILE = 64
@@ -189,8 +191,19 @@ def _reference_regions(config, tile_m):
             ("compact_done", compact_done_nbytes()),
         ]
     if recipe.combine is C.FUSED_SCATTER:
-        comb_inp = config.max_tokens_per_rank * topk * config.combine_slot_stride_bytes
+        routes = config.max_tokens_per_rank * topk
+        slots = (
+            compact_dense_comb_slots(
+                max_routes=routes,
+                npes=ws,
+                experts_per_rank=config.experts_per_rank,
+            )
+            if config.per_rank_scatter
+            else routes
+        )
+        comb_inp = slots * config.combine_slot_stride_bytes
     else:
+        slots = None
         comb_inp = max_recv * config.hidden_dim * 2
         if config.combine_quant_bits:
             land = _push_land_rows(ws, config.max_tokens_per_rank, topk)
@@ -198,6 +211,10 @@ def _reference_regions(config, tile_m):
             if 4 <= ws <= 32:
                 comb_inp += land * 8
     regions.append(("comb_inp", comb_inp))
+    if config.per_rank_scatter and config.combine_quant_bits:
+        regions.append(
+            ("comb_scale", slots * (config.hidden_dim // COMBINE_SCALE_BLOCK))
+        )
     return regions
 
 
@@ -247,6 +264,18 @@ def _config(dispatch, combine, wire, wires, *geometry, rank=0):
         dispatch=dispatch, combine=combine, dispatch_wire=wire, combine_wires=wires
     )
     return MM.MegaMoEConfig(recipe=recipe, geometry=_geometry(*geometry, rank=rank))
+
+
+def test_per_rank_scatter_defaults_on_with_stage1_fused(monkeypatch):
+    monkeypatch.delenv("AITER_MEGA_PER_RANK_SCATTER", raising=False)
+    shape = (4, 7168, 8, 16, 8)
+    compact = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
+    mori = _config(D.MORI, C.FUSED_SCATTER, "bf16", ("bf16",), *shape)
+    assert compact.stage1_fused and compact.per_rank_scatter
+    assert not mori.stage1_fused and not mori.per_rank_scatter
+    monkeypatch.setenv("AITER_MEGA_PER_RANK_SCATTER", "0")
+    off = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
+    assert off.stage1_fused and not off.per_rank_scatter
 
 
 def _cases():

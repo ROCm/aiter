@@ -70,7 +70,8 @@ with an fp4 dispatch wire; --combine_quant none is the bf16 wire, mxfp8 the fp8 
   2. DeepSeek-R1, tpr 1536 and 16384:
        torchrun --standalone --nproc_per_node=4 bench_mega_moe.py $COMMON \
          -e 256 -k 8 -hd 7168 -id 2048 -tpr 1536      # and -tpr 16384
-  Knobs to compare: AITER_MEGA_PER_RANK_SCATTER=1 (one TDM store per peer),
+  Knobs to compare: AITER_MEGA_PER_RANK_SCATTER=0 (stage1_fused turns the
+  per-rank TDM store on; set 0 for the gather scatter),
   AITER_FLYDSL_PERSISTENT_WORKERS2=<N> (persistent gemm2).
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
