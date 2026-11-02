@@ -2206,9 +2206,12 @@ class LargeMRuntime:
         self.w2_scale = w2_scale
 
     def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
-        """Atomically bind one layer's protocol slot and weight pointers."""
-        self.select_layer_state(layer_slot)
+        """Bind one layer's protocol slot and weight pointers; a refused slot or weight binding
+        changes neither."""
+        if not 0 <= int(layer_slot) < self.state_slots:
+            raise ValueError(f"layer_slot={layer_slot} outside [0, {self.state_slots})")
         self.bind_weights(w1, w1_scale, w2, w2_scale)
+        self.select_layer_state(layer_slot)
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         config = select_mega_moe_config(
