@@ -370,11 +370,8 @@ def _pa_decode_mxfp4(
             query_seq_len=1,
             query_group_size=group,
             head_size=head_dim,
-            max_partitions=min(
-                work_plan.max_partitions,
-                capacity,
-                max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
-            ),
+            # Not bounded by max_context_length: a task may own more tokens than it.
+            max_partitions=min(work_plan.max_partitions, capacity),
             stream=stream,
             reduce_info=work_plan.reduce_info,
         )

@@ -648,6 +648,18 @@ _MXFP4_CASES = [
         )
         for tag, spec in _MXFP4_POOL_SPECS
     ],
+    # A two-partition plan over 1024 tokens with max_context_length 128: the reducer
+    # must merge both partials, whatever the bound.
+    (
+        "mxfp4-short-bound-np2",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "max_partitions": 2,
+            "max_context": 128,
+            "lengths": (1024,),
+        },
+    ),
     # One task per row three ways: plan-free, a one-partition plan, a strided output (the
     # reducer); the same bytes as uint8 views; a context-0 row is zero-filled.
     (
