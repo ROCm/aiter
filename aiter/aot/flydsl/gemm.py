@@ -128,6 +128,37 @@ def _a8w8_bpreshuffle(job: dict) -> None:
     )
 
 
+def _a8w8_blockscale(job: dict) -> None:
+    """FP32 128x128 block scales, the x_scale row-major (M, K/128)."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
+    from aiter.utility import dtypes
+
+    m, n, k = job["m"], job["n"], job["k"]
+    gemm_a8w8_blockscale(
+        _empty(m, k, dtype=dtypes.fp8),
+        _empty(n, k, dtype=dtypes.fp8),
+        _empty(m, k // 128, dtype=dtypes.fp32),
+        _empty(-(-n // 128), k // 128, dtype=dtypes.fp32),
+        dtype=_dtype(job["outdtype"]),
+    )
+
+
+def _a8w8_blockscale_bpreshuffle(job: dict) -> None:
+    """FP32 128x128 block scales on (16, 16)-preshuffled weights, the x_scale
+    column-major bytes of the same shape."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+    from aiter.utility import dtypes
+
+    m, n, k = job["m"], job["n"], job["k"]
+    gemm_a8w8_blockscale_bpreshuffle(
+        _empty(m, k, dtype=dtypes.fp8),
+        _empty(n, k, dtype=dtypes.fp8),
+        _empty(m, k // 128, dtype=dtypes.fp32),
+        _empty(-(-n // 128), k // 128, dtype=dtypes.fp32),
+        dtype=_dtype(job["outdtype"]),
+    )
+
+
 def _a8w8_blockscale_abpreshuffle(job: dict) -> None:
     from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_abpreshuffle
     from aiter.utility import dtypes
@@ -247,6 +278,18 @@ TABLES = (
         _a8w8_bpreshuffle,
     ),
     Table(
+        "a8w8_blockscale_tuned_gemm",
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+        ("gfx", "cu_num", "N", "K"),
+        _a8w8_blockscale,
+    ),
+    Table(
+        "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+        ("gfx", "cu_num", "N", "K"),
+        _a8w8_blockscale_bpreshuffle,
+    ),
+    Table(
         "a8w8_blockscale_abpreshuffle_tuned_gemm",
         "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
         ("gfx", "cu_num", "N", "K"),
@@ -364,10 +407,14 @@ def parse_csv(csv_path: str) -> list[dict]:
 def _variants(table: Table, job: dict) -> list[dict]:
     """Caller-side choices a row leaves open: the x_scale block of an e8m0
     blockscale GEMM, which pairs with the weight's (1x128 blockscale with
-    128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones)."""
+    128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones), and the output
+    dtype of an FP32-scale blockscale GEMM, whose rows serve bf16 and fp16
+    alike and whose FlyDSL kernels specialize on it."""
     if table.caller is _a8w8_blockscale_mxscale_bpreshuffle:
         _, cols = _blocks(job["w_scale_block"], "128x128")
         return [{"x_block": 128 if cols == 128 else 32}]
+    if table.caller in (_a8w8_blockscale, _a8w8_blockscale_bpreshuffle):
+        return [{"outdtype": f"torch.{name}"} for name in ("bfloat16", "float16")]
     return [{}]
 
 

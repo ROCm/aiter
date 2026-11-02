@@ -110,10 +110,13 @@ public entry, as FakeTensors, and `replay.py` calls that entry inside
 and launches them; every FlyDSL launch is compiled into the cache instead.
 
 - `gemm.py` replays one public entry per tuned table (`TABLES`):
-  `gemm_a8w8_bpreshuffle`, `gemm_a8w8_blockscale_abpreshuffle`,
-  `gemm_a8w8_mxfp8_bpreshuffle`, `gemm_a8w8_blockscale_bpreshuffle` (e8m0
-  scales), `batched_gemm_a8w8_mxscale_bpreshuffle`, `gemm_a16w16` and
-  `gemm_a4w4`. A row tuned at M also serves the M down to the previous tuned M
+  `gemm_a8w8_bpreshuffle`, `gemm_a8w8_blockscale` and
+  `gemm_a8w8_blockscale_bpreshuffle` with FP32 scales (each with bf16 and
+  fp16 output, which their rows leave open),
+  `gemm_a8w8_blockscale_abpreshuffle`, `gemm_a8w8_mxfp8_bpreshuffle`,
+  `gemm_a8w8_blockscale_bpreshuffle` with e8m0 scales,
+  `batched_gemm_a8w8_mxscale_bpreshuffle`, `gemm_a16w16` and `gemm_a4w4`.
+  A row tuned at M also serves the M down to the previous tuned M
   of its shape. On gfx1250 (`SCAN_ARCHS`) every one of those M is identified
   first: replayed with each FlyDSL launch stopped at its cache key, so nothing
   compiles. Then one M per set of kernels the row's own replay did not build
