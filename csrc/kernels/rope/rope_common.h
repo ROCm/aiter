@@ -7826,7 +7826,8 @@ template <typename T,
           bool IS_INTERLEAVED,
           int M,
           typename KVT,
-          bool HAS_Q_FP8 = false>
+          bool HAS_Q_FP8     = false,
+          bool HAS_K_UNQUANT = false>
 __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           const T* q_w,
                                           const T* k_w,
@@ -8119,15 +8120,20 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 }
                 out_kv_vec.store(k_cache + offset);
             }
-            if(k_out != nullptr || k_out_unquantized != nullptr)
+            if(k_out != nullptr)
             {
                 const int64_t k_out_offset =
                     (static_cast<int64_t>(token_id) * num_heads_k + head_id_k) * HEAD_SIZE +
                     access_id_in_head;
-                if(k_out != nullptr)
-                    out_kv_vec.store(k_out + k_out_offset);
-                if(k_out_unquantized != nullptr)
-                    out_vec.store(k_out_unquantized + k_out_offset);
+                out_kv_vec.store(k_out + k_out_offset);
+            }
+            // Compile-time gate: a runtime null check here changed fp16 rounding of the off path.
+            if constexpr(HAS_K_UNQUANT)
+            {
+                const int64_t k_out_offset =
+                    (static_cast<int64_t>(token_id) * num_heads_k + head_id_k) * HEAD_SIZE +
+                    access_id_in_head;
+                out_vec.store(k_out_unquantized + k_out_offset);
             }
         }
     }
@@ -8417,11 +8423,11 @@ void fused_rope_rms_set_kv(const T* qkv,
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8)                                  \
+#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8, HAS_K_UNQUANT)                   \
     if(is_neox_style)                                                        \
     {                                                                        \
         fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT,  \
-                                  HAS_Q_FP8>                                 \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8463,7 +8469,7 @@ void fused_rope_rms_set_kv(const T* qkv,
     else                                                                     \
     {                                                                        \
         fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT, \
-                                  HAS_Q_FP8>                                 \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8503,27 +8509,47 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_out_unquantized);  \
     }
 
-    if(q_out_fp8 != nullptr)
+#define DISPATCH_HEAD_SIZE(HAS_Q_FP8, HAS_K_UNQUANT)              \
+    switch(head_size)                                             \
+    {                                                             \
+    case 64: DISPATCH_NEOX(64, HAS_Q_FP8, HAS_K_UNQUANT) break;   \
+    case 128: DISPATCH_NEOX(128, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    case 256: DISPATCH_NEOX(256, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    case 512: DISPATCH_NEOX(512, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    }
+
+    // HAS_K_UNQUANT=true is only instantiated for fp8 caches; the host rejects others.
+    if constexpr(!std::is_same_v<KVT, T>)
     {
-        switch(head_size)
+        if(k_out_unquantized != nullptr)
         {
-        case 64: DISPATCH_NEOX(64, true) break;
-        case 128: DISPATCH_NEOX(128, true) break;
-        case 256: DISPATCH_NEOX(256, true) break;
-        case 512: DISPATCH_NEOX(512, true) break;
+            if(q_out_fp8 != nullptr)
+            {
+                DISPATCH_HEAD_SIZE(true, true)
+            }
+            else
+            {
+                DISPATCH_HEAD_SIZE(false, true)
+            }
+            return;
         }
     }
     else
     {
-        switch(head_size)
-        {
-        case 64: DISPATCH_NEOX(64, false) break;
-        case 128: DISPATCH_NEOX(128, false) break;
-        case 256: DISPATCH_NEOX(256, false) break;
-        case 512: DISPATCH_NEOX(512, false) break;
-        }
+        AITER_CHECK(k_out_unquantized == nullptr,
+                    "k_out_unquantized requires an fp8 KV cache; with a same-dtype cache "
+                    "k_out is already unquantized");
+    }
+    if(q_out_fp8 != nullptr)
+    {
+        DISPATCH_HEAD_SIZE(true, false)
+    }
+    else
+    {
+        DISPATCH_HEAD_SIZE(false, false)
     }
 
+#undef DISPATCH_HEAD_SIZE
 #undef DISPATCH_NEOX
 }
 
