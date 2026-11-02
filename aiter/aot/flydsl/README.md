@@ -13,6 +13,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
+| `pa_decode_plan.py` | `PA_DECODE_PLAN` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit (see below) |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 | `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
@@ -157,6 +158,23 @@ python -m aiter.aot.flydsl.fmha_fp8
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
+The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
+clipped to `max_batch_size` and the arch's LDS), block size (64 to 1024
+threads, from the plan's task capacity) and dense/windowed mode; batch,
+capacity, partition cap and window are passed at launch. `run_aot` compiles
+the whole set for `max_batch_size=81792`, gfx1250's LDS limit; each arch clips
+the final bucket to its own limit (16256 on gfx942, 40832 on gfx950). That set
+serves every power-of-two cap, including the default 4096, and every cap at or
+above the arch's limit. Another cap's final bucket (e.g. 5000) needs its own
+run.
+
+```bash
+# every planner kernel up to each arch's LDS limit, as the wheel build does
+python -m aiter.aot.flydsl.pa_decode_plan
+# a non-power-of-two cap, one arch
+python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 5000 --arch gfx950
+```
+
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
 installed wheel ships it. Built for gfx1250, the module needs a HIP that
 declares the cluster launch API, which ROCm 7.2.4's does not; there, build it
@@ -232,7 +250,7 @@ correctness nor precompiled replay acceptance.
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, and `moe.py` and `mega_moe.py` (`GPU_ARCHS` only) before they start their replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, `pa_decode_plan.py` when it collects jobs, and `moe.py` and `mega_moe.py` (`GPU_ARCHS` only) before they start their replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained
