@@ -220,6 +220,14 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(timeout 60m python3 "$file")
             ;;
+        op_tests/test_moe_2stage.py)
+            {
+                echo "Running representative correctness subset in standard CI;" \
+                     "full dtype/quant/token/activation matrix moved to a" \
+                     "dedicated perf job"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m python3 "$file" -t 1 32 1024 4096)
+            ;;
     esac
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
