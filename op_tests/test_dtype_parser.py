@@ -110,8 +110,48 @@ def test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device():
     subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
 
 
+def _triton_only_env_without_utils_path():
+    # _test_env() puts aiter/jit/utils on PYTHONPATH, which hides a chip_info
+    # that cannot import its siblings on its own.
+    env = os.environ.copy()
+    env["AITER_TRITON_ONLY"] = "1"
+    return env
+
+
+def test_triton_only_import_binds_dtypes():
+    script = textwrap.dedent("""
+        import aiter
+        from aiter.utility import dtypes
+
+        assert aiter.dtypes is dtypes
+        """)
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        env=_triton_only_env_without_utils_path(),
+    )
+
+
+def test_chip_info_imports_without_jit_core():
+    script = textwrap.dedent("""
+        import sys
+
+        from aiter.jit.utils import chip_info
+
+        assert "aiter.jit.core" not in sys.modules
+        assert chip_info.GFX_MAP
+        """)
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        env=_triton_only_env_without_utils_path(),
+    )
+
+
 if __name__ == "__main__":
     test_str2dtype_base_types_do_not_import_native_enum()
     test_get_dtype_fp8_delegates_to_shared_runtime_detector()
     test_get_dtype_fp8_skips_runtime_detection_without_hip_device()
     test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device()
+    test_triton_only_import_binds_dtypes()
+    test_chip_info_imports_without_jit_core()
