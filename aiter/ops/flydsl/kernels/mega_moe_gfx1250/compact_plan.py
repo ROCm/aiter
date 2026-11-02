@@ -373,8 +373,12 @@ def compile_tdm_compact_plan(
     modulo the block (:func:`compact_dense_comb_slots` bounds the total). The
     plan writes ``comb_slot[route]`` for the reduce, and the run table of
     :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
-    The hist matrix lives in block 0's LDS, so ``dense_comb`` requires
-    ``plan_blocks == 1``. The matrix row pitch is ``hist_dwords``.
+    The hist matrix lives in block 0's LDS. With ``plan_blocks > 1`` block 0
+    still builds that prefix and publishes each segment's slot of intra 0
+    (the exclusive padded prefix of this rank's row plus the first compact
+    row's residue) in ``block_hist[seg]``; the other blocks add their
+    exclusive route offset and the route's own intra. The matrix row pitch
+    is ``hist_dwords``.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -395,8 +399,6 @@ def compile_tdm_compact_plan(
     if not 1 <= plan_blocks <= PLAN_MAX_BLOCKS:
         raise ValueError(f"plan_blocks={plan_blocks} not in [1, {PLAN_MAX_BLOCKS}]")
     dense_comb = bool(dense_comb)
-    if dense_comb and plan_blocks != 1:
-        raise ValueError("dense_comb reads the hist matrix from block 0's LDS")
     default_waves = compact_plan_waves(npes=npes, max_routes=max_routes)
     if plan_waves is None:
         plan_waves = default_waves
@@ -494,7 +496,15 @@ def compile_tdm_compact_plan(
     stage_send = emit_runs and merge_routes
     # S1F without tok_map: the other blocks need only the send offsets, which
     # block 0 has before X1, so they are released then (barrier[3]).
-    early_release = emit_runs and stage_send and not write_tok_map and plan_blocks > 1
+    # local_base is published only after the scan, so a dense combine cannot
+    # release the other blocks before the exchange.
+    early_release = (
+        emit_runs
+        and stage_send
+        and not write_tok_map
+        and plan_blocks > 1
+        and not dense_comb
+    )
     # Per-wave ranges of run-order positions (le outer, destination rotated
     # inner) or segments for the send offsets / copies: each wave owns
     # pos_per_wave consecutive ones and sums the prefix before them itself
@@ -1339,6 +1349,27 @@ def compile_tdm_compact_plan(
                     tab = fx.Int32(epr) + item * fx.Int32(2)
                     buffer_store(row_start, rsrc_psum, tab)
                     buffer_store(local_base - row_start, rsrc_psum, tab + fx.Int32(1))
+                if const_expr(plan_blocks > 1):
+                    # Slot of intra 0 for this rank. Row 0 of block_hist held
+                    # this block's counts; the merge rewrites only the other
+                    # rows, and those are read after barrier[1], so row 0
+                    # carries slot0 out on the same release as send_base.
+                    # lds_pref is free after the scan and holds this block's
+                    # exclusive offset (0 here) for the comb_slot walk.
+                    for seg in range(tid, segs, plan_threads):
+                        send = comm_ops.load_i32_lds(
+                            lds_hist + fx.Int64(seg) * fx.Int64(4)
+                        )
+                        slot0 = excl_at(fx.Int32(rank), seg) + (
+                            send & fx.Int32(_a - 1)
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_segstart + fx.Int64(seg) * fx.Int64(4), slot0
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_pref + fx.Int64(seg) * fx.Int64(4), fx.Int32(0)
+                        )
+                        buffer_store(slot0, rsrc_bhist, seg)
 
         if const_expr(plan_blocks > 1):
             if const_expr(early_release):
@@ -1372,10 +1403,18 @@ def compile_tdm_compact_plan(
                         vec_width=1,
                         dtype=T.i32,
                     )
-                    if const_expr(write_tok_map):
+                    if const_expr(write_tok_map or dense_comb):
                         base = buffer_load(rsrc_base, s, vec_width=1, dtype=T.i32)
                         comm_ops.store_i32_lds(
                             lds_hist + fx.Int64(s) * fx.Int64(4), base + off
+                        )
+                    if const_expr(dense_comb):
+                        comm_ops.store_i32_lds(
+                            lds_segstart + fx.Int64(s) * fx.Int64(4),
+                            buffer_load(rsrc_bhist, s, vec_width=1, dtype=T.i32),
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_pref + fx.Int64(s) * fx.Int64(4), off
                         )
                     if const_expr(emit_runs):
                         comm_ops.store_i32_lds(
@@ -1536,7 +1575,7 @@ def compile_tdm_compact_plan(
                             fx.Int32(run_hdr + 2 * run_cap) + r,
                         )
 
-        if const_expr(write_tok_map or not stage_send):
+        if const_expr(write_tok_map or dense_comb or not stage_send):
             for local in range(tid, r_n, plan_threads):
                 route = r0 + local
                 if const_expr(merge_routes):
@@ -1565,19 +1604,30 @@ def compile_tdm_compact_plan(
                     )
                 if const_expr(dense_comb):
                     own_seg = valid.select(segment, fx.Int32(0))
-                    has_prev = own_seg > fx.Int32(0)
-                    local_base = comm_ops.load_i32_lds(
-                        lds_matrix
-                        + (
-                            fx.Int64(rank * hist_dwords)
-                            + fx.Int64(has_prev.select(own_seg - 1, fx.Int32(0)))
+                    if const_expr(plan_blocks == 1):
+                        has_prev = own_seg > fx.Int32(0)
+                        local_base = comm_ops.load_i32_lds(
+                            lds_matrix
+                            + (
+                                fx.Int64(rank * hist_dwords)
+                                + fx.Int64(has_prev.select(own_seg - 1, fx.Int32(0)))
+                            )
+                            * fx.Int64(4)
                         )
-                        * fx.Int64(4)
-                    )
-                    # send_base is this run's first compact row on dest.
-                    local_base = has_prev.select(local_base, fx.Int32(0)) + (
-                        send_base & fx.Int32(COMBINE_SLOT_ALIGN - 1)
-                    )
+                        # send_base is this run's first compact row on dest.
+                        local_base = has_prev.select(local_base, fx.Int32(0)) + (
+                            send_base & fx.Int32(COMBINE_SLOT_ALIGN - 1)
+                        )
+                    else:
+                        # intra counts only this block's routes. slot0 is the
+                        # segment's intra-0 slot; lds_pref is the block offset.
+                        # The residue stays on the segment's first compact row,
+                        # which is not lds_hist once the offset has been added.
+                        local_base = comm_ops.load_i32_lds(
+                            lds_segstart + fx.Int64(own_seg) * fx.Int64(4)
+                        ) + comm_ops.load_i32_lds(
+                            lds_pref + fx.Int64(own_seg) * fx.Int64(4)
+                        )
                     buffer_store(
                         arith.select(
                             valid & in_cap, local_base + intra, arith.constant(dropped)

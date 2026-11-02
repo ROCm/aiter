@@ -749,9 +749,6 @@ class _CompactDispatch(_Dispatch):
                 else int(token_count) * int(self.config.topk)
             )
             blocks = compact_plan_blocks(routes)
-            # The per-rank run table is built from block 0's LDS hist matrix.
-            if self.config.per_rank_scatter:
-                blocks = 1
             key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f, qb)
         else:
             waves, blocks = None, None
