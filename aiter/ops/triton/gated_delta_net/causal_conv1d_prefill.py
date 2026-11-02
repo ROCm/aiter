@@ -427,8 +427,7 @@ def _causal_conv1d_split_qkv_window(
     # Smallest sequence-start vector that fits, up to SEQ_VEC
     config["SEQ_VEC"] = min(config["SEQ_VEC"], max(16, triton.next_power_of_2(n_seq)))
     block_r, block_d = config["R"], config["BD"]
-    # 16 B per lane unless the config sets num_warps
-    num_warps = config.pop("num_warps", max(1, block_r * block_d // (8 * _warp_size())))
+    num_warps = config.pop("num_warps")
     num_xcds = get_num_xcds()
     n_blocks = dim // block_d
     n_tiles = triton.cdiv(cu_seqlen, block_r * config["BC"])

@@ -22,6 +22,7 @@ import types
 import torch
 import triton
 
+import aiter.ops.triton.gated_delta_net.causal_conv1d_prefill as conv_prefill
 from aiter import logger
 from aiter.ops.prefill_batch_metadata import build_causal_conv_prefill_metadata
 from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_triton_tile_fn
@@ -109,6 +110,13 @@ def run(args):
             seqlens, has_init, args.k_dim, args.v_dim, max(row_stride, dim)
         )
         old_us = _time_us(inputs, window=False)
+        os.environ["AITER_CONV1D_SPLIT_QKV_WINDOW"] = "1"
+        window_config = conv_prefill._window_config(
+            inputs["x"], inputs["weight"], inputs["conv_states"], args.k_dim, args.v_dim
+        )
+        if window_config is None:
+            logger.info("%-40s %12.2f %12s", name, old_us, "n/a (2D)")
+            continue
         new_us = _time_us(inputs, window=True)
         # x read once and q/k/v written once; weights and conv states are small.
         nbytes = 2 * sum(seqlens) * dim * DTYPE.itemsize
