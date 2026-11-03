@@ -223,7 +223,7 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
-    if architecture == "gfx1250":
+    if architecture in ("gfx1250", "gfx1250-strict"):
         if query_splits is None:
             # Split the measured spilling BF16 specialization into one Q tile
             # per CTA. Other shapes retain fused queries and their KV reuse.
