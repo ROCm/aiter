@@ -27,6 +27,8 @@ Usage Example:
     python bench_fused_qk_cat_and_cache_mla.py --metric bandwidth -M 1,32,256
 """
 
+import functools
+
 import torch
 import triton
 
@@ -37,10 +39,14 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -70,6 +76,59 @@ def get_x_vals(args):
     return [(M, args.QH, args.D_lora, args.D_pe) for M in m_vals]
 
 
+def _generate_inputs(
+    M: int,
+    QH: int,
+    D_lora: int,
+    D_pe: int,
+    num_kv_cache_tokens: int,
+    cache_dtype: torch.dtype,
+    max_pos: int,
+):
+    KH = 1  # MLA: a single latent KV head
+    dtype = torch.bfloat16
+
+    # Layouts as sglang hands them over; see the module docstring.
+    q_nope = torch.randn((QH, M, D_lora), dtype=dtype, device="cuda").transpose(0, 1)
+    q_pe = torch.randn((M, QH, DEFAULT_D_QK_NOPE + D_pe), dtype=dtype, device="cuda")[
+        ..., DEFAULT_D_QK_NOPE:
+    ]
+    latent = torch.randn((M, D_lora + D_pe), dtype=dtype, device="cuda")
+    k_nope = latent[:, :D_lora].contiguous().unsqueeze(1)
+    k_pe = latent[:, D_lora:].unsqueeze(1)
+
+    # Each pool entry gets its own freshly-generated cache/slot_mapping: both
+    # providers scatter-write into kv_cache at slot_mapping row indices, so
+    # sharing a single buffer across rotations would make repeated in-place
+    # writes to the exact same rows, which is not representative.
+    kv_cache = torch.zeros(
+        (num_kv_cache_tokens, KH, D_lora + D_pe), dtype=cache_dtype, device="cuda"
+    )
+    slot_mapping = torch.randperm(num_kv_cache_tokens, device="cuda")[:M]
+
+    k_scale = torch.ones([1], dtype=torch.float32, device="cuda")[0]
+
+    # Generated for both providers (kept provider-agnostic); only used by the
+    # "rope" line.
+    freqs = torch.randn((max_pos, D_pe // 2), dtype=dtype, device="cuda")
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    positions = torch.randint(0, max_pos, (M,), device="cuda")
+
+    return (
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        k_scale,
+        cos,
+        sin,
+        positions,
+    )
+
+
 def bench_cat_and_cache_mla_fn(
     M,
     QH,
@@ -82,7 +141,8 @@ def bench_cat_and_cache_mla_fn(
 ):
     cache_dtype = CACHE_DTYPES[args.cache_dtype]
     num_kv_cache_tokens = args.num_kv_cache_tokens
-    KH = 1  # MLA: a single latent KV head
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     assert DEVICE_ARCH != "gfx1250", "Only triton kernel tested/supported"
     assert (
@@ -92,22 +152,7 @@ def bench_cat_and_cache_mla_fn(
     torch.cuda.empty_cache()
 
     dtype = torch.bfloat16
-
-    # Layouts as sglang hands them over; see the module docstring.
-    q_nope = torch.randn((QH, M, D_lora), dtype=dtype, device="cuda").transpose(0, 1)
-    q_pe = torch.randn((M, QH, DEFAULT_D_QK_NOPE + D_pe), dtype=dtype, device="cuda")[
-        ..., DEFAULT_D_QK_NOPE:
-    ]
-    latent = torch.randn((M, D_lora + D_pe), dtype=dtype, device="cuda")
-    k_nope = latent[:, :D_lora].contiguous().unsqueeze(1)
-    k_pe = latent[:, D_lora:].unsqueeze(1)
-
-    kv_cache = torch.zeros(
-        (num_kv_cache_tokens, KH, D_lora + D_pe), dtype=cache_dtype, device="cuda"
-    )
-    slot_mapping = torch.randperm(num_kv_cache_tokens, device="cuda")[:M]
-
-    k_scale = torch.ones([1], dtype=torch.float32, device="cuda")[0]
+    KH = 1  # MLA: a single latent KV head
     apply_scale = cache_dtype != dtype
 
     # sglang's rule: the aiter gluon MLA decode needs bf16 q with 12 heads.
@@ -116,44 +161,36 @@ def bench_cat_and_cache_mla_fn(
     else:
         q_out_dtype = CACHE_DTYPES[args.q_out_dtype]
 
-    if provider == "nope":
-        fn = lambda: fused_qk_cat_and_cache_mla(
-            q_nope,
-            q_pe,
-            k_nope,
-            k_pe,
-            kv_cache,
-            slot_mapping,
-            k_scale,
-            apply_scale=apply_scale,
-            q_out_dtype=q_out_dtype,
-        )
-    else:
-        max_pos = args.max_pos
-        freqs = torch.randn((max_pos, D_pe // 2), dtype=dtype, device="cuda")
-        cos = torch.cos(freqs)
-        sin = torch.sin(freqs)
-        positions = torch.randint(0, max_pos, (M,), device="cuda")
-        fn = lambda: fused_qk_rope_cat_and_cache_mla(
-            q_nope,
-            q_pe,
-            k_nope,
-            k_pe,
-            kv_cache,
-            slot_mapping,
-            positions,
-            cos,
-            sin,
-            k_scale,
-            False,
-            apply_scale=apply_scale,
-            q_out_dtype=q_out_dtype,
-        )
+    _p_gen = functools.partial(
+        _generate_inputs,
+        M,
+        QH,
+        D_lora,
+        D_pe,
+        num_kv_cache_tokens,
+        cache_dtype,
+        args.max_pos,
+    )
+    _out_val_keys = [
+        "q_nope",
+        "q_pe",
+        "k_nope",
+        "k_pe",
+        "kv_cache",
+        "slot_mapping",
+        "k_scale",
+        "cos",
+        "sin",
+        "positions",
+    ]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
 
-    ms = triton.testing.do_bench_cudagraph(fn, return_mode="median")
-
-    elem = q_nope.element_size()
-    cache_elem = kv_cache.element_size()
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+    elem = sample["q_nope"].element_size()
+    cache_elem = sample["kv_cache"].element_size()
 
     # q_nope + q_pe + k_nope + k_pe
     mem_read = M * QH * (D_lora + D_pe) * elem + M * KH * (D_lora + D_pe) * elem
@@ -165,6 +202,40 @@ def bench_cat_and_cache_mla_fn(
         + M * KH * (D_lora + D_pe) * cache_elem
     )
     mem = mem_read + mem_write
+
+    def _run(
+        q_nope, q_pe, k_nope, k_pe, kv_cache, slot_mapping, k_scale, cos, sin, positions
+    ):
+        if provider == "nope":
+            fused_qk_cat_and_cache_mla(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                k_scale,
+                apply_scale=apply_scale,
+                q_out_dtype=q_out_dtype,
+            )
+        else:
+            fused_qk_rope_cat_and_cache_mla(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                positions,
+                cos,
+                sin,
+                k_scale,
+                False,
+                apply_scale=apply_scale,
+                q_out_dtype=q_out_dtype,
+            )
+
+    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
     if metric == "time":
         return ms
@@ -212,6 +283,9 @@ def parse_int_or_list(value):
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="fused_qk_cat_and_cache_mla")
     override_parser_action(parser, action="--metric", default="time")
+    # The KV cache is a large paged allocation (num_kv_cache_tokens can be
+    # ~2.6e5), so default to a smaller rotation target than the shared 256 MB.
+    override_parser_action(parser, action="--rot-bufs-target-mb", default=64)
     parser.add_argument(
         "-M",
         type=parse_int_or_list,

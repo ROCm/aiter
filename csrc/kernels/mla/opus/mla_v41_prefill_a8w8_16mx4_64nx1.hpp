@@ -967,8 +967,8 @@ __device__ inline void store_o_split(G& g_po, const VO& v_o, int warp_id, int la
 // ------------------------------------------------------------------------------------ driver
 
 template<class T, class QI, class QR>
-__device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
-                                  const void* kv_ptr, const void* kv_scale_ptr,
+__device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
+                                  int stride_kv_page, int stride_kv_scale_page,
                                   const int* kv_indices, int page_idx_begin, int valid_kv_len, char* smem,
                                   const QI& issue_q, const QR& read_q, const v_q_t<T>& v_q, int scale_q, v_o_t<T>& v_o,
                                   typename T::D_ACC& m_row, typename T::D_ACC& l_row,
@@ -1043,9 +1043,9 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
     auto make_dma = [&](auto slot) {
         constexpr int SLOT = decltype(slot)::value;
         auto kv_lds   = kv_lds_base<T, SLOT>(smem, u_skv);
-        auto kv_gmem  = page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
+        auto kv_gmem  = page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, stride_kv_page);
         auto scl_lds  = scale_lds_bases<T, SLOT>(smem, u_sk_scale);
-        auto scl_gmem = page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page);
+        auto scl_gmem = page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, stride_kv_scale_page);
         return [=](auto idx) {
             constexpr int i = decltype(idx)::value;
             constexpr int SCALE_STEPS = QK_STEPS<T> / T::scale_async_load_insts;
@@ -1232,7 +1232,8 @@ __device__ inline void opus_mla_v41_prefill_a8w8_16mx4_64nx1_fwd(Args args) {
             page_idx_begin += rows.prefix_begin;
             valid_kv_len = rows.prefix_len;
         }
-        attention_segment<T>(kargs, kargs.unified_kv_ptr, kargs.unified_kv_scale_ptr,
+        attention_segment<T>(kargs.unified_kv_ptr, kargs.unified_kv_scale_ptr,
+                             kargs.stride_unified_kv_page, kargs.stride_unified_kv_scale_page,
                              kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, smem,
                              issue_q, read_q, v_q, scale_q, v_o, m_row, l_row, temperature_scale);
     }
@@ -1244,7 +1245,8 @@ __device__ inline void opus_mla_v41_prefill_a8w8_16mx4_64nx1_fwd(Args args) {
             page_idx_begin += rows.extend_begin;
             valid_kv_len = rows.extend_len;
         }
-        attention_segment<T>(kargs, kargs.kv_ptr, kargs.kv_scale_ptr,
+        attention_segment<T>(kargs.kv_ptr, kargs.kv_scale_ptr,
+                             kargs.stride_kv_page, kargs.stride_kv_scale_page,
                              kargs.kv_indices_extend, page_idx_begin, valid_kv_len, smem,
                              issue_q, read_q, v_q, scale_q, v_o, m_row, l_row, temperature_scale);
     }
