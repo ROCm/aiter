@@ -199,9 +199,9 @@ def _seq_errors(o, o_ref, pool, final_ref, cu, idx, rows):
 def _assert_accurate(tag, o_errs, s_errs, max_abs):
     for what, errs in (("o", o_errs), ("state", s_errs)):
         worst = max(errs, key=errs.get)
-        assert errs[worst] < SEQ_REL_L2_TOL, (
-            f"{tag}: {what} rel_l2 {errs[worst]:.3e} on sequence {worst}"
-        )
+        assert (
+            errs[worst] < SEQ_REL_L2_TOL
+        ), f"{tag}: {what} rel_l2 {errs[worst]:.3e} on sequence {worst}"
     assert max_abs < MAX_ABS_TOL, f"{tag}: o max abs error {max_abs:.3e}"
 
 
@@ -239,18 +239,16 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     torch.cuda.synchronize()
 
     assert torch.isfinite(o).all(), f"{name}: non-finite output"
-    o_errs, s_errs, max_abs = _seq_errors(
-        o, o_ref, pool, final_ref, cu, idx, range(n)
-    )
+    o_errs, s_errs, max_abs = _seq_errors(o, o_ref, pool, final_ref, cu, idx, range(n))
     _assert_accurate(name, o_errs, s_errs, max_abs)
     track_errs = [
         _rel_l2(track[i], track_ref[i]) for i in range(n) if track_ref[i] is not None
     ]
     # NaN when no sequence tracks a chunk.
     err_track = max(track_errs, default=float("nan"))
-    assert all(e < SEQ_REL_L2_TOL for e in track_errs), (
-        f"{name}: track rel_l2 {err_track:.3e}"
-    )
+    assert all(
+        e < SEQ_REL_L2_TOL for e in track_errs
+    ), f"{name}: track rel_l2 {err_track:.3e}"
     opted_out = [i for i in range(n) if track_ref[i] is None]
     assert torch.isnan(track[opted_out]).all(), f"{name}: wrote opted-out track rows"
     untouched = torch.ones(SLOTS, dtype=torch.bool)

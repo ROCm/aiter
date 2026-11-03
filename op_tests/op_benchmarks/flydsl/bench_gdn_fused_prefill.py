@@ -77,9 +77,12 @@ def make_inputs(h, hg, t, n, seed=2026):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     mixed = torch.randn(t, 2 * hg * K + h * V, dtype=torch.bfloat16, generator=gen)
     q, k, v = torch.split(mixed, [hg * K, hg * K, h * V], dim=-1)
-    g = -torch.nn.functional.softplus(
-        torch.randn(1, t, h, dtype=torch.float32, generator=gen)
-    ) * 0.5
+    g = (
+        -torch.nn.functional.softplus(
+            torch.randn(1, t, h, dtype=torch.float32, generator=gen)
+        )
+        * 0.5
+    )
     beta = torch.randn(1, t, h, dtype=torch.float32, generator=gen).sigmoid()
     seq_lens = [t // n] * n
     cu = torch.arange(0, t + 1, t // n, dtype=torch.int32)
@@ -136,9 +139,10 @@ def chunked_reference(q, k, v, g, beta, cu, pool, idx):
                 + ((qc @ kc.transpose(-1, -2)) * decay) @ vnew
             )
             g_last = gc[:, -1:]
-            state = g_last.exp()[..., None] * state + (
-                vnew * (g_last - gc).exp()[..., None]
-            ).transpose(-1, -2) @ kc
+            state = (
+                g_last.exp()[..., None] * state
+                + (vnew * (g_last - gc).exp()[..., None]).transpose(-1, -2) @ kc
+            )
         finals.append(state)
     return out.transpose(0, 1).unsqueeze(0), torch.stack(finals)
 
@@ -196,9 +200,7 @@ def bench_shape(h, hg, t, n, backends):
         "N": n,
         "T": t,
         "fused WGs": (V // _pick_bv(n, h, q.device)) * n * h,
-        "gate": gdn_fused_prefill_supported(
-            q, k, v, g, beta, pool0, max_seqlen=t // n
-        ),
+        "gate": gdn_fused_prefill_supported(q, k, v, g, beta, pool0, max_seqlen=t // n),
         "fused us": fu[0],
         "opt_vk us": bu[0],
         "opt_vk h": best,

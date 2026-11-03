@@ -5,19 +5,19 @@ FlyDSL kernels. Each module derives the runtime-reachable jobs from aiter's
 tuned CSV configs—including ABI/cache variants that share a kernel name—and
 compiles them up front so the runtime JIT path hits the cache.
 
-| Module | OpKind | Description |
-| --- | --- | --- |
-| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
-| `gemm.py` | `GEMM` | GEMM kernels |
-| `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
-| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `gdn_fused_prefill.py` | `GDN_FUSED_PREFILL` | gfx950 single-kernel GDN prefill, every BV/track/init variant per head shape in `DEFAULT_SHAPES` |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
-| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
-| `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
-| `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
+| Module | Description |
+| --- | --- |
+| `moe.py` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
+| `gemm.py` | Every FlyDSL kernel the tuned GEMM tables reach, by replaying each table's public GEMM entry (see below) |
+| `conv.py` | conv3d implicit-GEMM kernels and the NCDHW->NDHWC pre-transpose, by replaying `flydsl_conv_implicit` |
+| `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
+| `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
+| `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
+| `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
+| `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
-| `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
+| `dry_run.py` | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
 
 ### How `moe.py` works
 
@@ -102,10 +102,11 @@ variant of the profile's bundle plan.
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
-for `fmha_fp8.py`, a configured head shape) into what a caller passes the op's
+for `gdn_fused_prefill.py` and `fmha_fp8.py`, a configured head shape) into
+what a caller passes the op's
 public entry, as FakeTensors, and `replay.py` calls that entry inside
 `dry_run`. The runtime looks the row up, picks and parameterizes its kernels
 and launches them; every FlyDSL launch is compiled into the cache instead.
@@ -135,6 +136,9 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
 - `chunk_gdn_h.py` replays each row at its batch shape, with `g` head- and
   token-major and a dense and indexed initial state, and each of those layouts
   over batch sizes the table never measured, where the BV rule decides.
+- `gdn_fused_prefill.py` replays each head shape with and without
+  `track_state` and `has_initial_state` (compile-time flags), over batch
+  sizes from 1 sequence up, bisected where the wrapper's BV rule switches.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
   Between grid points of the batch and query length the wrapper can still

@@ -20,31 +20,6 @@ from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_RETRIES = 2
-_MAX_ERRORS_IN_MSG = 10
-
-
-class OpKind(enum.Enum):
-    """FlyDSL AOT kernel categories -- enum so typos at call sites become
-    construction errors instead of silently routing to the wrong code path."""
-
-    MOE = "moe"
-    GEMM = "gemm"
-    CONV = "conv"
-    CHUNK_GDN_H = "chunk_gdn_h"
-    GDN_FUSED_PREFILL = "gdn_fused_prefill"
-    MEGA_MOE = "mega_moe"
-    FMHA_FP8 = "fmha_fp8"
-
-
-@dataclass(frozen=True)
-class JobLabel:
-    """Diagnostic label attached to a submitted future."""
-
-    kind: OpKind
-    kernel_name: str
-
-    def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
 
 
 _CU_NUM_TO_ARCH = {
@@ -176,47 +151,6 @@ def check_replay_process(arch: str) -> None:
             f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
             f"{arch} needs {expected}"
         )
-
-
-def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
-    if kind is OpKind.FMHA_FP8:
-        from .fmha_fp8 import default_jobs
-
-        return default_jobs()
-    if kind is OpKind.GDN_FUSED_PREFILL:
-        from .gdn_fused_prefill import default_jobs
-
-        return default_jobs()
-    if kind is OpKind.GEMM:
-        from .gemm import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.CONV:
-        from .conv import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
-
-
-def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.FMHA_FP8:
-        from .fmha_fp8 import compile_one_config
-    elif kind is OpKind.GDN_FUSED_PREFILL:
-        from .gdn_fused_prefill import compile_one_config
-    elif kind is OpKind.GEMM:
-        from .gemm import compile_one_config
-    elif kind is OpKind.CONV:
-        from .conv import compile_one_config
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import compile_one_config
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return compile_one_config
 
 
 def _run_one_to_file(
@@ -454,6 +388,7 @@ AOT_MODULES = (
     "aiter.aot.flydsl.gemm",
     "aiter.aot.flydsl.conv",
     "aiter.aot.flydsl.chunk_gdn_h",
+    "aiter.aot.flydsl.gdn_fused_prefill",
     "aiter.aot.flydsl.fmha_fp8",
 )
 

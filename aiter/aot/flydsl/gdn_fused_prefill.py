@@ -6,16 +6,19 @@
 """AOT pre-compilation for the gfx950 single-kernel FlyDSL GDN prefill.
 
 ``gdn_fused_prefill_fwd`` compiles one kernel per (H, Hg, BV, HAS_TRACK,
-HAS_INIT_FLAG, scale). BV is picked per batch from N * H and the CU count, and
-the two flags follow the optional ``track_state`` / ``has_initial_state``
-arguments, so a serving process can reach every combination of a head shape
-and would JIT it on the request path. They are enumerated here for each head
-shape in ``DEFAULT_SHAPES``, at the default scale only.
+HAS_INIT_FLAG, scale): BV follows the batch's sequence count and the CU count,
+and the two flags follow the optional ``track_state`` / ``has_initial_state``
+arguments, so a serving process would JIT each new combination on the request
+path. This module replays the wrapper itself on FakeTensors inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` (see ``replay.py``) for each head
+shape in ``DEFAULT_SHAPES``, with and without each optional argument, over
+batches of 1 to ``_MAX_SEQUENCES`` sequences, bisected where the BV rule
+switches. Only the default scale is covered.
 
 Usage:
     python -m aiter.aot.flydsl.gdn_fused_prefill               # DEFAULT_SHAPES
     python -m aiter.aot.flydsl.gdn_fused_prefill --shape 48:16  # ad hoc H:Hg
-    python -m aiter.aot.flydsl.gdn_fused_prefill --list
+    python -m aiter.aot.flydsl.gdn_fused_prefill --check
 """
 
 from __future__ import annotations
@@ -23,28 +26,27 @@ from __future__ import annotations
 import argparse
 import itertools
 import sys
-import time
 
-import flydsl.expr as fx
+from aiter.aot.flydsl import replay as _replay
+from aiter.aot.flydsl.common import dedupe_jobs
 
-from aiter.aot.flydsl.common import (
-    compile_only_env,
-    dedupe_jobs,
-    override_env,
-    run_jobs_parallel,
-)
-from aiter_worker_limits import adopt_legacy_max_jobs
-
-AOT_ARCH = "gfx950"
-# Value/key head counts per rank, (H, Hg), at TP1/2/4/8. Jobs dedupe by kernel
-# name, so two models may share a head shape.
+LABEL = "GDN_FUSED_PREFILL"
+# No tuned table: the jobs come from DEFAULT_SHAPES or --shape.
+DEFAULT_CSVS: list[str] = []
+AOT_ARCH_DEFAULT = "gfx950"
+_CU_NUM = 256
+# Value/key head counts per rank, (H, Hg), at TP1/2/4/8. Jobs dedupe, so two
+# models may share a head shape.
 DEFAULT_SHAPES = {
     "qwen3_8_flash_next": [(48, 16), (24, 8), (12, 4), (6, 2)],
     "qwen3_5_397b": [(64, 16), (32, 8), (16, 4), (8, 2)],
     "qwen3_5_35b": [(32, 16), (16, 8), (8, 4), (4, 2)],
 }
-# Every BV ``_pick_bv`` can return.
-_BV_CANDIDATES = (16, 32)
+# Largest batch the BV rule is bisected over: past it the grid never fits in
+# one pass over the CUs, so every batch picks the wide BV.
+_MAX_SEQUENCES = 1024
+_KD = _VD = 128
+_BT = 64
 
 
 def parse_shape(spec: str) -> tuple[int, int]:
@@ -61,26 +63,25 @@ def unsupported_reason(h: int, hg: int) -> str | None:
 
 
 def jobs_for_shape(h: int, hg: int) -> list[dict]:
+    """A job per optional argument pair, over the BV rule's range of batches."""
     return [
         {
-            "kernel_name": (
-                f"gdn_fused_prefill_bv{bv}_h{h}_hg{hg}"
-                f"_t{int(has_track)}_i{int(has_init_flag)}"
-            ),
+            "kernel_name": f"gdn_fused_prefill_h{h}_hg{hg}",
+            "gfx": AOT_ARCH_DEFAULT,
+            "cu_num": _CU_NUM,
             "H": h,
             "Hg": hg,
-            "BV": bv,
             "has_track": has_track,
-            "has_init_flag": has_init_flag,
+            "has_init": has_init,
+            "m": _MAX_SEQUENCES,
+            "m_low": 1,
         }
-        for bv, has_track, has_init_flag in itertools.product(
-            _BV_CANDIDATES, (False, True), (False, True)
-        )
+        for has_track, has_init in itertools.product((False, True), (False, True))
     ]
 
 
-def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
-    """Every variant ``DEFAULT_SHAPES`` can reach; unsupported shapes warn."""
+def shape_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
+    """Every job of ``shapes``; an unsupported shape warns and is skipped."""
     jobs = []
     for model, entries in shapes.items():
         for h, hg in entries:
@@ -92,114 +93,77 @@ def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
     return dedupe_jobs(jobs)
 
 
-def _compile_to_cache(*, H, Hg, BV, has_track, has_init_flag):
+def replay(job: dict) -> None:
     import torch
 
-    from aiter.ops.flydsl.gdn_fused_prefill import _KD, _VD
-    from aiter.ops.flydsl.kernels.gdr_prefill import compile_gdn_fused_prefill
-    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from aiter.ops.flydsl import gdn_fused_prefill as op
 
-    exe = compile_gdn_fused_prefill(
-        H=H,
-        Hg=Hg,
-        BV=BV,
-        HAS_TRACK=has_track,
-        HAS_INIT_FLAG=has_init_flag,
-        scale=_KD**-0.5,
+    # Per-process caches of the device the wrapper reads: a worker may replay
+    # jobs of several cu_num in turn.
+    op._num_cus.cache_clear()
+    op._is_gfx950.cache_clear()
+
+    def empty(*shape, dtype):
+        return torch.empty(shape, dtype=dtype, device="cuda")
+
+    h, hg, n = job["H"], job["Hg"], job["m"]
+    t = n * _BT
+    # q/k/v as views of one packed projection, as serving stacks pass them.
+    mixed = empty(t, 2 * hg * _KD + h * _VD, dtype=torch.bfloat16)
+    q, k, v = torch.split(mixed, [hg * _KD, hg * _KD, h * _VD], dim=-1)
+    kwargs = {}
+    if job["has_track"]:
+        kwargs["track_state"] = empty(n, h, _VD, _KD, dtype=torch.float32)
+        kwargs["track_chunk_idx"] = empty(n, dtype=torch.int32)
+    if job["has_init"]:
+        kwargs["has_initial_state"] = empty(n, dtype=torch.bool)
+    op.gdn_fused_prefill_fwd(
+        q.view(1, t, hg, _KD),
+        k.view(1, t, hg, _KD),
+        v.view(1, t, h, _VD),
+        empty(1, t, h, dtype=torch.float32),
+        empty(1, t, h, dtype=torch.float32),
+        ssm_states=empty(n, h, _VD, _KD, dtype=torch.bfloat16),
+        cache_indices=empty(n, dtype=torch.int32),
+        cu_seqlens=empty(n + 1, dtype=torch.int32),
+        **kwargs,
     )
 
-    # Mirror the launch at the end of gdn_fused_prefill_fwd: flat tensors of
-    # the same dtypes in the same slots. Sizes and the int values never reach
-    # the cache key; a wrong dtype silently would.
-    cpu = torch.device("cpu")
 
-    def t(n, dtype):
-        return torch.empty(n, dtype=dtype, device=cpu)
-
-    bf16, f32, i32 = torch.bfloat16, torch.float32, torch.int32
-    N, T = 1, 64
-    q_stride = 2 * Hg * _KD + H * _VD
-    pool = t(N * H * _VD * _KD, bf16)
-    idx = t(N, i32)
-    # Without tracking the launcher passes the pool and cache indices in the
-    # track slots, and the indices again for has_initial_state.
-    trs = t(N * H * _VD * _KD, f32) if has_track else pool
-    tri = t(N, i32) if has_track else idx
-    init = t(N, i32) if has_init_flag else idx
-    with compile_only_env():
-        _run_compiled(
-            exe,
-            t(T * q_stride, bf16),  # q
-            t(T * q_stride, bf16),  # k
-            t(T * q_stride, bf16),  # v
-            t(T * H, f32),  # g
-            t(T * H, f32),  # beta
-            t(N + 1, i32),  # cu_seqlens
-            idx,
-            pool,
-            t(T * H * _VD, bf16),  # o
-            trs,
-            tri,
-            init,
-            q_stride,
-            q_stride,
-            q_stride,
-            H,
-            H,
-            T,
-            N * H,
-            fx.Stream(0),
-        )
+def describe(job: dict) -> str:
+    flags = " ".join(name for name in ("has_track", "has_init") if job[name])
+    return f"{job['kernel_name']} {job['m']} sequences {flags}".rstrip()
 
 
-def compile_one_config(**job) -> dict:
-    result = {**job, "compile_time": None}
-    params = {k: v for k, v in job.items() if k != "kernel_name"}
-    from torch._subclasses.fake_tensor import FakeTensorMode
+def collect_jobs(_csv_paths: list[str], args: argparse.Namespace | None) -> list:
+    if args is None or not args.shape:
+        return shape_jobs()
+    jobs = []
+    for spec in args.shape:
+        h, hg = parse_shape(spec)
+        reason = unsupported_reason(h, hg)
+        if reason:
+            print(f"Error: {spec} is unsupported: {reason}")
+            sys.exit(1)
+        jobs.extend(jobs_for_shape(h, hg))
+    return dedupe_jobs(jobs)
 
-    started = time.time()
-    try:
-        with override_env("FLYDSL_GPU_ARCH", AOT_ARCH), FakeTensorMode():
-            _compile_to_cache(**params)
-        result["compile_time"] = time.time() - started
-    except Exception as error:  # noqa: BLE001
-        print(f"  [FAIL] {job['kernel_name']}: {error}")
-    return result
 
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--shape",
         action="append",
         default=[],
         help="H:Hg, repeatable; replaces DEFAULT_SHAPES",
     )
-    parser.add_argument("--list", action="store_true", help="print the jobs and exit")
-    args = parser.parse_args()
-    if args.shape:
-        jobs = []
-        for spec in args.shape:
-            h, hg = parse_shape(spec)
-            reason = unsupported_reason(h, hg)
-            if reason:
-                print(f"Error: {spec} is unsupported: {reason}")
-                sys.exit(1)
-            jobs.extend(jobs_for_shape(h, hg))
-        jobs = dedupe_jobs(jobs)
-    else:
-        jobs = default_jobs()
-    if args.list:
-        for job in jobs:
-            print(job["kernel_name"])
-        print(f"{len(jobs)} jobs")
-        return
-    results = run_jobs_parallel(compile_one_config, jobs)
-    failed = sum(result["compile_time"] is None for result in results)
-    print(f"Compiled: {len(results) - failed} ok, {failed} failed")
-    raise SystemExit(1 if failed else 0)
+
+
+def main() -> None:
+    _replay.main(
+        "aiter.aot.flydsl.gdn_fused_prefill",
+        "AOT pre-compile the gfx950 single-kernel FlyDSL GDN prefill",
+    )
 
 
 if __name__ == "__main__":
-    adopt_legacy_max_jobs()
     main()

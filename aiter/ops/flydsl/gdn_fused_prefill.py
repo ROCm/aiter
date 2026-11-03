@@ -113,9 +113,7 @@ def gdn_fused_prefill_supported(
     # chunk whatever H is; the multi-kernel path spreads all chunks over the
     # GPU and serializes only its state scan. Thresholds measured on MI355X
     # against chunk_gated_delta_rule_opt_vk (op_tests/test_gdn_fused_prefill.py).
-    if max_seqlen is not None and not (
-        max_seqlen <= 1024 or H * T >= 24 * max_seqlen
-    ):
+    if max_seqlen is not None and not (max_seqlen <= 1024 or H * T >= 24 * max_seqlen):
         return False
     tensors = (q, k, v, g, beta, ssm_states)
     return (
@@ -248,9 +246,7 @@ def gdn_fused_prefill_fwd(
     has_init_flag = has_initial_state is not None
     if has_init_flag:
         if has_initial_state.dim() != 1 or has_initial_state.numel() < N:
-            raise ValueError(
-                f"has_initial_state must be 1-D with at least {N} entries"
-            )
+            raise ValueError(f"has_initial_state must be 1-D with at least {N} entries")
         init = has_initial_state[:N].to(torch.int32).contiguous()
     else:
         # Not dereferenced when HAS_INIT_FLAG is off.
