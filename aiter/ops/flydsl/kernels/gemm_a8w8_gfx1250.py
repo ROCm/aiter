@@ -247,6 +247,7 @@ def launch_gemm_a8w8(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
+        kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -327,18 +328,17 @@ def launch_gemm_a8w8(
             "workgroup_mask",
             a_mask,
         )
-        gB = _gv(gB_base, b_off0, (tile_n // 16, tile_k * 16), (tile_k * 16, 1))
-        atomB = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gB,
-                [None, None],
-                strides=[k64 * 16, None],
-                num_warps=1,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            b_mask,
+        B_TILE = (tile_n // 16, tile_k * 16)
+        gB = _gv(gB_base, b_off0, (tile_n // 16, i32_k * 16), (k64 * 16, 1))
+        atomB, coordB = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gB,
+            fx.make_layout(B_TILE, (B_LDS_ROW, 1)),
+            B_TILE,
+            num_warps=1,
         )
+        atomB = fx.atom_set_value(atomB, "workgroup_mask", b_mask)
+        blkB = fx.zipped_divide(coordB, B_TILE)[None, (0, None)]
         W_SA = W_SB = gSA = atomSA = gSB = atomSB = sa_imm = sb_imm = None
         if const_expr(is_mxscale):
 
@@ -435,17 +435,20 @@ def launch_gemm_a8w8(
                 _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
                 ktg * A_TDM_ROW,
             )
-            _wcopy(
-                W_B,
-                _tail(atomB, tile_k * 16, K_REM * 16 if k_tail else 0, kt),
-                gB,
+            ktb = fx.Int32(kt) if kt_base is None else fx.Int32(kt) + kt_base_i32
+            bBs, bBg = fx.rocdl.cdna5.tdm_partition(
+                atomB,
+                0,
+                fx.make_layout(1, 1),
                 _lv(
                     fx.add_offset(pa, STAGE_A),
-                    (tile_n // 16, tile_k * 16),
-                    (B_LDS_ROW, 1),
+                    (B_TILE, 1),
+                    ((B_LDS_ROW, 1), (tile_n // 16) * B_LDS_ROW),
                 ),
-                ktg * (tile_k * 16),
+                blkB,
             )
+            if wave == W_B:
+                fx.copy(atomB, bBg[None, ktb], bBs[None, 0])
             if const_expr(is_mxscale and not preload):
                 _wcopy(
                     W_SA,
@@ -918,20 +921,26 @@ def launch_gemm_a8w8(
             c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
         if const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-        gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
-        atomC = fx.rocdl.make_tdm_atom(
+        C_TILE = (tile_m, C_LDS_ROW)
+        gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+        atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorStore(),
             gtC,
-            [mn_oob, tile_n if C_PAD else None],
-            strides=[ldc64, None],
+            fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+            C_TILE,
             num_warps=num_waves,
-            early_timeout=False,
         )
-        fx.copy(
-            atomC,
-            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
-            gtC,
+        blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+        sC = _lv(
+            fx.recast_iter(out_cls, base_ptr),
+            (C_TILE, 1),
+            ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
         )
-        tdm_ops.tensor_wait(0)
+        tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+            atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+        )
+        fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+        rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
