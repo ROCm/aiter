@@ -72,9 +72,15 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 _S1F_MAX_RECV = 4096
 #: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
 #: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
-#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Past
+#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
+#: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
-_S1F_MAX_RECV_BY_SHAPE: dict = {(2, 6): 1 << 30, (4, 6): 1 << 30}
+_S1F_MAX_RECV_BY_SHAPE: dict = {
+    (2, 6): 1 << 30,
+    (4, 6): 1 << 30,
+    (2, 7): 1 << 30,
+    (4, 7): 1 << 30,
+}
 
 
 def s1f_max_recv(world_size: int, topk: int) -> int:
