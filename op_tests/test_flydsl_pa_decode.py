@@ -271,11 +271,11 @@ def _mxfp4_views(pool):
     return data.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
 
 
-# (tag, (query exponent, K e8m0 byte, K e2m1 bytes per token, V e2m1 bytes per token,
-# V e8m0 byte, tokens)). Each logit stays inside f32; what is extreme is the query and
-# K scale on their own. With ``tokens`` K = 0 and Q = 0: every token has weight 1, so
-# the output is the mean of V (the bytes cycle over the tokens), a power of two or a
-# short sum of them: exactly representable in bf16, and checked bit for bit.
+# (tag, (q exponent, K e8m0 byte, K e2m1 bytes, V e2m1 bytes[, V e8m0 byte, tokens])).
+# V byte and tokens default to 127 and len(k_codes). Logits stay inside f32; the query
+# and K scale alone are extreme. With tokens, Q = K = 0: every token has weight 1, the
+# codes cycle over the tokens, and the output is the mean of V, exact in bf16 and
+# checked bitwise.
 _MXFP4_POOL_SPECS = [
     ("mxfp4-tiny-query", (-80, 207, (0x22, 0xAA), (0x22, 0xAA))),
     ("mxfp4-tiny-query-k2e120", (-80, 247, (0x22, 0xAA), (0x22, 0xAA))),
@@ -284,22 +284,21 @@ _MXFP4_POOL_SPECS = [
     ("mxfp4-huge-query-k2e-120", (120, 7, (0x22, 0xAA), (0x22, 0xAA))),
     # Logits 0.35, 0.71, 1.06: the softmax weights depend on the restored scale.
     ("mxfp4-weighted", (-104, 227, (0x11, 0x22, 0x33), (0x22, 0xAA, 0x11))),
-    # Q = K = 0: four equal weights of V = 1.0 * 2**126 (e8m0 byte 253). The output is
-    # 2**126, but an unscaled f32 PV sum reaches 2**128 before it is divided by four.
+    # Four equal weights of V = 2**126 (byte 253): output 2**126, but an unscaled f32 PV
+    # sum reaches 2**128 before the division.
     ("mxfp4-pv-sum-2e128", (None, 127, (0x00,) * 4, (0x22,) * 4, 253)),
-    # Two of four tokens at 2**127 (byte 254), two zeros: sum 2**128, output 2**126.
+    # Two tokens at 2**127 (byte 254), two zeros: sum 2**128, output 2**126.
     (
         "mxfp4-pv-sum-2e127-mixed",
         (None, 127, (0x00,) * 4, (0x22, 0x00, 0x22, 0x00), 254),
     ),
-    # The smallest valid MXFP4 magnitudes (e2m1 0.5 at e8m0 byte 1, 2**-127; byte 0 is
-    # unsupported): the PV sum sits near the f32 subnormal floor once P carries its
-    # 2**-MXFP4_P_EXP_SHIFT, and must still come out exactly (not zero).
+    # Smallest valid magnitudes (e2m1 0.5 at e8m0 byte 1; byte 0 is unsupported): the PV
+    # sum nears the f32 subnormal floor under the P shift and must stay exact, not zero.
     ("mxfp4-pv-1tok-2e-126", (None, 127, (0,), (0x22,), 1, 1)),
     ("mxfp4-pv-1tok-2e-127", (None, 127, (0,), (0x11,), 1, 1)),
     ("mxfp4-pv-4tok-2e-127", (None, 127, (0,), (0x11,), 1, 4)),
     ("mxfp4-pv-4tok-mixed-2e-126", (None, 127, (0,), (0x11, 0x33), 1, 4)),
-    # The largest context one task owns (4096 staged pages) at the largest finite V
+    # Largest context one task owns (4096 staged pages) at the largest finite V
     # (1.5 * 2**127): an unscaled f32 PV sum would reach 1.5 * 2**146.
     ("mxfp4-pv-ctx2e19-v2e127", (None, 127, (0,), (0x33,), 254, 2**19)),
 ]

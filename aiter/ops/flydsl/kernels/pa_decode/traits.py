@@ -20,22 +20,18 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
-# MXFP4 V staging: per wave and 16-token chunk, all 128 dims as bf16 laid out
-# [16 chunks of 8 dims][16 tokens][16 B] (conflict free for the 16 B row writes
-# and the transposed reads).
+# MXFP4 V staging per wave and 16-token chunk: 128 dims as bf16,
+# [16 chunks of 8 dims][16 tokens][16 B] (conflict free for row writes and transposed reads).
 MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
-# MXFP4 PV: P (<= 1) feeds the MFMA times 2**-MXFP4_P_EXP_SHIFT and the epilogue
-# restores it after the softmax normalization. The f32 O accumulator then holds at most
-# tokens * |V| * 2**-20 <= |V| / 2 for the 2**19 tokens one task can own, so it cannot
-# overflow where the normalized output is finite.
-# shortcut: a fixed shift cannot be lossless at both ends. Terms p * |V| below 2**-129
-# (the f32 subnormal floor 2**-149 after the shift) are rounded or lost, and so are
-# weights p below ~2**-113 (bf16 floor 2**-133 after it). The smallest MXFP4 V,
-# 2**-128, is exact. Upgrade to a shift from the task's token count if that matters.
-# shortcut: V is widened to bf16 before the MFMA, so |V| above the bf16 maximum (e8m0
-# byte 254 with e2m1 >= 2, byte 253 with e2m1 >= 4) becomes inf. A 2**-2 pre-shift of V
-# cannot go through the widening scale operand (an e8m0 exponent: bytes 0 and 1 have no
-# 2**-129 / 2**-128) and an f32 widening costs 17-20% on gfx950, so it is not done.
+# MXFP4 PV: P (<= 1) enters the MFMA times 2**-MXFP4_P_EXP_SHIFT; the epilogue restores
+# it after normalization. The f32 O accumulator then stays <= |V| / 2 for the 2**19
+# tokens one task can own, so it cannot overflow where the output is finite.
+# shortcut: a fixed shift is not lossless at both ends: terms p * |V| below 2**-129 and
+# weights p below ~2**-113 are rounded or lost. Upgrade to a token-count shift if needed.
+# shortcut: V is widened to bf16 before the MFMA, so |V| above the bf16 max (e8m0 byte
+# 254 with e2m1 >= 2, byte 253 with e2m1 >= 4) becomes inf. A 2**-2 pre-shift of V cannot
+# go through the e8m0 widening scale (bytes 0 and 1 have no 2**-129 / 2**-128) and f32
+# widening costs 17-20% on gfx950, so it is not done; revisit if larger V must be finite.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024  # gfx950 LDS; MXFP4 stages V wave-privately.

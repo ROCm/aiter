@@ -703,11 +703,10 @@ class PaDecodeKVLoader:
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
         return ops  # N_SUBCHUNKS i64 operands
 
-    # ---- MXFP4 K/V: packed E2M1 data and E8M0 scales (one per 32 dims) are loaded
-    # raw one tile ahead; K stays packed for the scaled MFMA, V is widened to BF16.
-    # A wave owns 64 tokens of the tile; lane (lane16, rgroup) loads, per 16-token
-    # chunk a, token warp*64 + 16a + lane16: 16 B (one 32-dim e8m0 group, dims
-    # 32*rgroup..+31) of K and of V, and the token's scale dword (byte rgroup).
+    # ---- MXFP4 K/V: packed E2M1 data + E8M0 scales (per 32 dims), loaded raw one tile
+    # ahead; K stays packed for the scaled MFMA, V is widened to BF16. Per 16-token
+    # chunk a, lane (lane16, rgroup) loads token warp*64 + 16a + lane16: 16 B of K and V
+    # (dims 32*rgroup..+31) and the token's scale dword (byte rgroup).
 
     def mxfp4_init(self):
         c = self.ctx
@@ -722,8 +721,7 @@ class PaDecodeKVLoader:
             for n, p, al in (
                 ("kd", c.key_cache_ptr, 16),
                 ("vd", c.value_cache_ptr, 16),
-                # Scales are loaded as a token's dword; the byte is picked where it
-                # is used, so no instruction waits for the load early.
+                # Scales load as a token's dword; the byte is picked at use.
                 ("ks", c.key_scale_ptr, 4),
                 ("vs", c.value_scale_ptr, 4),
             )
@@ -763,9 +761,8 @@ class PaDecodeKVLoader:
 
     def mxfp4_load(self, kv, base):
         """Raw K (``kv`` "k") or V ("v") of a tile: per chunk [E8M0 scale dword, 4
-        packed-E2M1 data dwords]. The scales are issued first: a later use of a
-        register that an in-flight scale load targets then waits (vmcnt counts in
-        order) for the scales only, not for the data loaded after them."""
+        packed-E2M1 data dwords]. Scales issue first so a use of them waits (vmcnt
+        counts in order) for the scales only, not the data behind them."""
         # Uniform base + unsigned 32-bit lane offset (the saddr form of the load).
         data = fx.add_offset(self.mxfp4_ptr[kv + "d"], base // 4)
         scale = fx.add_offset(self.mxfp4_ptr[kv + "s"], base // 4)

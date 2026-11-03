@@ -651,27 +651,24 @@ class PaDecodePipeline:
         tile_valid,
         q_ops_all,
     ):
-        """MXFP4 tile, one wave on its own 64 tokens and all 128 dims: QK, an online
-        softmax and PV with P kept in registers, so the tile loop has no barrier.
-        Raw K/V of the next tile are issued early and are in flight across this
-        tile's work; the four waves merge once, after the loop."""
+        """MXFP4 tile: one wave, its own 64 tokens, all 128 dims: QK, online softmax,
+        PV with P in registers (no barrier). Next-tile K/V loads are issued early;
+        the four waves merge once after the loop."""
         t = self.traits
         o_acc = [ostate[t.o_slot(0, vh)] for vh in range_constexpr(t.VHE_CHUNKS)]
         m_prev = ostate[t.m_slot(0)]
         l_prev = ostate[t.l_slot(0)]
         v_raw = ostate[t.V_SLOT]
-        # Unconditional: a branch around the loads makes the compiler's vmcnt
-        # counts assume they were skipped and drain them right after issue. The
-        # last tile re-reads itself (tt1 clamped); nothing consumes the result.
+        # Unconditional: a branch around the loads makes the compiler's vmcnt counts
+        # assume they were skipped and drain them at issue. The last tile re-reads itself.
         base = self.kv.mxfp4_base(
             self.kv.mxfp4_pages(fx.min(tt1, self.ctx.part_end - 1))
         )
         k_scales = [
             self.kv.mxfp4_e8m0_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
         ]
-        # q_scale = 2**e * mantissa, mantissa in [1, 2): 2**e rides on the MFMA's e8m0
-        # scale of Q and the mantissa is applied after it, so the f32 accumulator holds
-        # the logit itself and not the e4m3-normalized (up to 448x larger) product.
+        # q_scale = 2**e * mantissa: 2**e is Q's e8m0 MFMA scale, the mantissa is applied
+        # after, so the accumulator holds the logit, not the e4m3-normalized (up to 448x) one.
         q_bits = self.lds.load(
             self.lds.row_offset(t.sQscale_off, self.ctx.lane16, 1, fx.Float32),
             fx.Int32,
@@ -714,16 +711,14 @@ class PaDecodePipeline:
         l_new = l_prev * alpha
         for a in range_constexpr(t.NCHUNK):
             l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
-        # S^T[token 4g+v][head] is the B operand layout of the PV MFMA: P stays here.
-        # P enters the PV MFMA times 2**-MXFP4_P_EXP_SHIFT (l_new above is unscaled):
-        # the f32 sum then cannot overflow; ``store_mxfp4`` restores it after
-        # normalizing.
+        # S^T[token 4g+v][head] is already the PV B operand layout. P is scaled by
+        # 2**-MXFP4_P_EXP_SHIFT (l_new is not); ``store_mxfp4`` restores it.
         p_shift = fx.full(4, 2.0**-MXFP4_P_EXP_SHIFT, fx.Float32)
         p_ops = [
             (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
             for a in range_constexpr(t.NCHUNK)
         ]
-        # V's loads follow K's by part of a tile so the two bursts do not queue together.
+        # V loads follow K's by part of a tile so the bursts do not queue together.
         v_next = self.kv.mxfp4_load("v", base)
         alpha_b = fx.full(t.OP_ELEMS, alpha, fx.Float32)
         o_acc = [o_acc[vh] * alpha_b for vh in range_constexpr(t.VHE_CHUNKS)]
