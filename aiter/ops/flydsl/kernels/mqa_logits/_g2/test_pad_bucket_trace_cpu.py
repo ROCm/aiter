@@ -20,6 +20,11 @@ os.environ["QSA_BF16_PERSIST"] = "0"
 # default draft kernel (rows <= requests) is covered by the lane-level emulation
 # in test_draft_cpu.py and by GPU correctness. Pin the champion routing here.
 os.environ["QSA_DRAFT_PATH"] = "0"
+# ROUND-DECG2: likewise the decode-group kernel (now default QSA_DECODE_GROUP=all,
+# rows > requests in the r16 regime) is covered by the lane-level emulation and
+# exactly-once store plan in test_decg_cpu.py and by GPU correctness (22/22,
+# root run 2026-11-03). Pin the previous WMMA routing for this trace gate.
+os.environ["QSA_DECODE_GROUP"] = "0"
 
 import torch
 import trace_check_cpu as T

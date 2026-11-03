@@ -72,13 +72,25 @@ class LaunchPathCPU(unittest.TestCase):
         self.calls = []
         self.build_kw = []
 
+        self.kinds = []
+
         def build(*a, **kw):
             self.build_kw.append(kw)
+            self.kinds.append("wmma")
+            return _Launch()
+
+        def build_decg(*a, **kw):
+            # ROUND-DECG2: the default (QSA_DECODE_GROUP=all) routes this decode
+            # fixture (16 rows / 4 requests, r16 regime) to the decode-group kernel;
+            # its launch always carries the KS slot (scale or dummy) -> offset 1.
+            self.build_kw.append(kw)
+            self.kinds.append("decg")
             return _Launch()
 
         self.stack = [patch.object(K, "_run", lambda launch, *a: self.calls.append(a)),
                       patch.object(K, "_build_wmma_kernel", build),
                       patch.object(K, "_build_wmma_fp8_kernel", build),
+                      patch.object(K, "_build_decode_group_kernel", build_decg),
                       patch.object(torch.cuda, "current_stream", lambda dev=None: "STREAM")]
         for s in self.stack:
             s.start()
@@ -91,7 +103,12 @@ class LaunchPathCPU(unittest.TestCase):
         self.calls.clear()
         logits, vis = K.qsa_paged_mqa_logits_page4(*args, **kw)
         (a,) = self.calls
-        off = 1 if fmt == "fp8" else 0
+        off = self.off = 1 if fmt == "fp8" or self.kinds[-1] == "decg" else 0
+        # ROUND-DECG2: default env -> decg, QSA_DECODE_GROUP=0 -> previous wmma route.
+        # (decg also needs a 128 B aligned cache base; CPU allocations are 64 B aligned.)
+        want = K._DECODE_GROUP != "0" and K.decode_group_route(
+            args[0].shape[0], args[5].shape[0], fmt == "fp8", args[1].data_ptr()) is not None
+        self.assertEqual(self.kinds[-1], "decg" if want else "wmma")
         t2r, qp, cl = a[3 + off], a[4 + off], a[5 + off]
         exp_t2r, _, exp_cl = historical_args(args, kw)
         for got, exp, src in ((t2r, exp_t2r, args[3]), (cl, exp_cl, args[5])):
@@ -136,15 +153,15 @@ class LaunchPathCPU(unittest.TestCase):
             vg = torch.empty(shape, dtype=torch.int32)
             rs = torch.empty(shape, dtype=torch.int32)
             a = self._check(args, dict(kw, visible_groups=vg, row_starts=rs), "bf16")
-            self.assertEqual(meta(a[7]), meta(vg.view(-1)))
-            self.assertEqual(meta(a[8]), meta(rs.view(-1)))
+            self.assertEqual(meta(a[7 + self.off]), meta(vg.view(-1)))   # DECG2: +KS slot
+            self.assertEqual(meta(a[8 + self.off]), meta(rs.view(-1)))
 
     def test_strided_and_size1_metadata(self):
         args, kw = fixture()
         args[3] = torch.zeros(32, dtype=torch.int32)[::2]  # strided 1-D t2r
         args[4] = (torch.arange(32, dtype=torch.int64) + 7)[::2]  # strided int64 qp
         a = self._check(args, kw, "bf16")
-        self.assertNotEqual(a[3].data_ptr(), args[3].data_ptr())  # copied, like before
+        self.assertNotEqual(a[3 + self.off].data_ptr(), args[3].data_ptr())  # copied, like before
         # size-1 request with a non-unit stride: historical view(-1) resets the stride
         args, kw = fixture(rows=4, requests=1)
         args[5] = torch.full((1, 3), 128, dtype=torch.int32)[:, 0]

@@ -28,10 +28,11 @@ def plan(rows, cols, requests, width, dtype="bf16", pages=8):
 
 
 def model_run(launch, *args):
-    fp8 = launch.dtype_tag in ("fp8_wmma", "fp8_draft")
+    fp8 = launch.dtype_tag in ("fp8_wmma", "fp8_draft", "fp8_decg")
     # ROUND-MERGE1: the default draft kernel (rows <= requests) takes the fp8
     # argument layout for both dtypes (bf16 passes a dummy scale plane).
-    if fp8 or launch.dtype_tag == "bf16_draft":
+    # ROUND-DECG2: so does the decode-group kernel (default QSA_DECODE_GROUP=all).
+    if fp8 or launch.dtype_tag in ("bf16_draft", "bf16_decg"):
         q, cache, scale, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
     else:
         q, cache, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
@@ -152,8 +153,14 @@ class PadDispatchCPU(unittest.TestCase):
                                         "geometry": geometry, "mode": mode})()
         def fp8(divisor, geometry, mode):
             return type("Launch", (), {"dtype_tag": "fp8_wmma", "geometry": geometry, "mode": mode})()
+        def decg(is_fp8, divisor, wave_cols=32, pos64=False):
+            # ROUND-DECG2: default decode route; stubbed like the other builders
+            # (a cold real build reads FLYDSL_* env and would break the getenv census).
+            return type("Launch", (), {"dtype_tag": ("fp8" if is_fp8 else "bf16") + "_decg",
+                                        "wave_cols": wave_cols})()
         self.stack = [patch.object(K, "_run", run), patch.object(K, "_build_wmma_kernel", bf16),
                       patch.object(K, "_build_wmma_fp8_kernel", fp8),
+                      patch.object(K, "_build_decode_group_kernel", decg),
                       patch.object(torch.cuda, "current_stream", lambda dev: None)]
         for p in self.stack:
             p.start()
@@ -213,7 +220,9 @@ class PadDispatchCPU(unittest.TestCase):
                     self.assertTrue(torch.equal(off[0].view(torch.int32), on[0].view(torch.int32)))
                     self.assertTrue(torch.equal(off[1], on[1]))
                     args = self.records[-1][1]
-                    idx = 3 if dtype == "fp8" else 2
+                    # ROUND-DECG2: the decode-group launch (default for rows >
+                    # requests, r16 regime) always carries the KS slot.
+                    idx = 3 if dtype == "fp8" or self.records[-1][0].dtype_tag.endswith("_decg") else 2
                     pt, t2r, qp, ctx = args[idx:idx + 4]
                     p = plan(rows, cols, reqs, width, dtype)
                     if p["needs_padding"]:
@@ -229,17 +238,23 @@ class PadDispatchCPU(unittest.TestCase):
                         self.assertTrue(bool(torch.isneginf(plogits[:, cols:]).all()))
                         self.assertTrue(bool(torch.isneginf(plogits[rows:]).all()))
                     elif not draft:
-                        self.assertEqual(off_record[0].geometry, self.records[-1][0].geometry)
+                        # ROUND-DECG2: same kernel family (dtype_tag; decg launches
+                        # have no ``geometry``) and geometry on both paths.
+                        def kind(launch):
+                            return launch.dtype_tag, getattr(launch, "geometry", None)
+                        self.assertEqual(kind(off_record[0]), kind(self.records[-1][0]))
 
     def test_exact_bucket_reuses_outputs_and_scalar_override_stays_exact(self):
         data = self.fixture(16, 32, 4, 8, "bf16")
         out, vis = self.call(data, 32, "1")
         args = self.records[-1][1]
-        self.assertIs(args[6], out)
+        # ROUND-DECG2: decg (default for this 16x4 decode bucket) has the KS slot.
+        o = 1 if self.records[-1][0].dtype_tag.endswith("_decg") else 0
+        self.assertIs(args[6 + o], out)
         self.assertEqual(args[0].data_ptr(), data[0].data_ptr())
-        self.assertEqual(args[2].data_ptr(), data[2].data_ptr())
-        self.assertEqual(args[3].data_ptr(), data[3].data_ptr())
-        self.assertEqual(args[4].data_ptr(), data[4].data_ptr())
+        self.assertEqual(args[2 + o].data_ptr(), data[2].data_ptr())
+        self.assertEqual(args[3 + o].data_ptr(), data[3].data_ptr())
+        self.assertEqual(args[4 + o].data_ptr(), data[4].data_ptr())
 
     def test_native_buckets_zero_allocations_syncs_and_cold_calls(self):
         class ViewOnlyCounter(TorchDispatchMode):
@@ -270,6 +285,9 @@ class PadDispatchCPU(unittest.TestCase):
                         # one-time initialization exists on the PAD=0 path.
                         with ViewOnlyCounter():
                             cache.view(torch.uint8)
+                        # ROUND-DECG2: the default bf16 decode route (decg) passes the
+                        # per-device cached dummy KS plane; warm its one-time allocation.
+                        K._dummy_scale(q.device)
                         out = torch.empty((rows, columns), dtype=torch.float32)
                         vis = torch.empty(rows, dtype=torch.int32)
                         rst = torch.empty(rows, dtype=torch.int32)
@@ -293,7 +311,9 @@ class PadDispatchCPU(unittest.TestCase):
                         self.assertEqual(getenv.call_args_list, [(("QSA_PAD_BUCKET", "0"), {})])
                         self.assertIs(result[0], out)
                         launch, args = captured[0]
-                        idx = 3 if dtype == "fp8" else 2
+                        # ROUND-DECG2: default decode routes (64x16, 16x4) launch the
+                        # decode-group kernel, whose layout always has the KS slot.
+                        idx = 3 if dtype == "fp8" or launch.dtype_tag.endswith("_decg") else 2
                         self.assertEqual(tuple(args[-6:-1]), (rows, columns, 8, requests, columns // 4))
                         for actual, original in zip(args[idx:idx + 4], (table, t2r, qp, ctx)):
                             self.assertEqual(actual.data_ptr(), original.data_ptr())

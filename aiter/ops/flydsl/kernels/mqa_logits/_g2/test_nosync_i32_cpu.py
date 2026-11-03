@@ -182,9 +182,12 @@ class SaturationSemanticsCPU(unittest.TestCase):
 
 
 def model_run(records, launch, *args):
-    fp8 = launch.dtype_tag == "fp8_wmma"
-    if fp8:
+    fp8 = launch.dtype_tag in ("fp8_wmma", "fp8_decg")
+    # ROUND-DECG2: the decode-group kernel (default QSA_DECODE_GROUP=all) always
+    # carries the KS slot (bf16: dummy scale plane).
+    if fp8 or launch.dtype_tag == "bf16_decg":
         q, cache, scale, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
+        scale = scale if fp8 else None
     else:
         q, cache, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
         scale = None
@@ -225,10 +228,16 @@ class WrapperCPU(unittest.TestCase):
         def fp8(divisor, geometry, mode, pos64=False):
             return type("Launch", (), {"dtype_tag": "fp8_wmma", "pos64": pos64})()
 
+        def decg(is_fp8, divisor, wave_cols=32, pos64=False):
+            # ROUND-DECG2: default decode route (rows > requests, r16 regime).
+            return type("Launch", (), {"dtype_tag": ("fp8" if is_fp8 else "bf16") + "_decg",
+                                       "pos64": pos64, "wave_cols": wave_cols})()
+
         self.stack = [
             patch.object(K, "_run", lambda launch, *a: model_run(self.records, launch, *a)),
             patch.object(K, "_build_wmma_kernel", bf16),
             patch.object(K, "_build_wmma_fp8_kernel", fp8),
+            patch.object(K, "_build_decode_group_kernel", decg),
             patch.object(torch.cuda, "current_stream", lambda dev=None: None),
             patch.dict(os.environ, {"QSA_PAD_BUCKET": "0"}),
         ]
@@ -292,7 +301,7 @@ class WrapperCPU(unittest.TestCase):
                 data = self.fixture(fmt, table, t2r, qp, ctx, rows)
                 out, vis = self.check_against_golden(data)
                 launch, args = self.records[-1]
-                idx = 3 if fmt == "fp8" else 2
+                idx = 3 if fmt == "fp8" or launch.dtype_tag.endswith("_decg") else 2
                 pt, rt2r, rqp, rctx = args[idx:idx + 4]
                 # ROUND-NATIVE64: raw int64 words, zero-copy, pos64 specialization;
                 # the in-kernel saturation yields the former wrapper values.
@@ -320,7 +329,9 @@ class WrapperCPU(unittest.TestCase):
         self.check_against_golden(data)
         launch, args = self.records[-1]
         self.assertFalse(launch.pos64)   # int32 callers: the unchanged specialization
-        for i, key in zip(range(2, 6), ("page_table", "token_to_request", "query_positions", "context_lens")):
+        # ROUND-DECG2: 4 rows / 1 request now default-routes to decg (KS slot -> +1).
+        base = 3 if launch.dtype_tag.endswith("_decg") else 2
+        for i, key in zip(range(base, base + 4), ("page_table", "token_to_request", "query_positions", "context_lens")):
             self.assertEqual(args[i].data_ptr(), data[key].data_ptr(), key)
 
     def test_dispatch_census_no_sync_one_op_per_int64_tensor(self):
@@ -350,6 +361,10 @@ class WrapperCPU(unittest.TestCase):
             rst = torch.empty(4, dtype=torch.int32)
             data["q"].view(torch.uint8)
             data["compressed_k_cache"].view(torch.uint8)
+            # ROUND-DECG2: 4 rows / 1 request default-routes (when 128 B aligned) to
+            # decg, which passes the per-device cached dummy KS plane (one-time
+            # aten::zeros); warm it like the other one-time caches.
+            K._dummy_scale(data["q"].device)
             K._to_i32_saturated(torch.zeros(1, dtype=torch.int64))  # warm bound cache
             K._to_i32_saturated(torch.zeros(1, dtype=torch.int64), I32_MAX - 1)
             census = Census()

@@ -1,0 +1,71 @@
+{
+    "round":  "ROUND-DECG2",
+    "host":  "heliosr-1b114-a07-3 (no GPU workload)",
+    "image":  "rocm/fw-bringup-mlperf:gfx1250-atom-20261015",
+    "image_id":  "sha256:d1434db7030a8355a332b2a9237598fadb07a8bf7bb6dbbd081567a13d54686a",
+    "docker":  "--network none, no --device (/dev/kfd, /dev/dri absent)",
+    "staging":  "/data/blyu/qsa/work/decg2-cpu-trace-20261103",
+    "kernel_sha256":  "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
+    "base_sha256":  "944a42b81da6b9253066cd8bdd8a9f9e1aeea30b57fd16424eb63c194d328a73 (c45b24e0)",
+    "prev_sha256":  "70e6bed1fad21b7daa813e012483b540baad9b4548996099011aaf4e388be15f (bbe25c33)",
+    "versions":  {
+                     "python":  "3.12.3",
+                     "flydsl":  "0.3.3.dev886",
+                     "torch":  "2.11.0+rocm10.1.0a20260811-bkc.20260820"
+                 },
+    "cpu_default":  {
+                        "env":  "QSA_DECODE_GROUP unset (= all)",
+                        "gates":  {
+                                      "contract":  0,
+                                      "address":  0,
+                                      "q-lds":  0,
+                                      "trace16":  0,
+                                      "trace32":  0,
+                                      "k-tdm":  0,
+                                      "routing":  0,
+                                      "fp8-k-tdm":  0,
+                                      "bm64":  0,
+                                      "persist":  0,
+                                      "fp8-cvt":  0,
+                                      "native64":  0,
+                                      "draft":  0,
+                                      "pad-bucket":  0,
+                                      "pad-bucket-trace":  0,
+                                      "nosync-i32":  0,
+                                      "launch":  0,
+                                      "decg":  0
+                                  },
+                        "all_rc":  0,
+                        "decg_tests":  21
+                    },
+    "cpu_off":  {
+                    "env":  "QSA_DECODE_GROUP=0",
+                    "gates":  {
+                                  "contract":  0,
+                                  "address":  0,
+                                  "q-lds":  0,
+                                  "trace16":  0,
+                                  "trace32":  0,
+                                  "k-tdm":  0,
+                                  "routing":  0,
+                                  "fp8-k-tdm":  0,
+                                  "bm64":  0,
+                                  "persist":  0,
+                                  "fp8-cvt":  0,
+                                  "native64":  0,
+                                  "draft":  0,
+                                  "pad-bucket":  0,
+                                  "pad-bucket-trace":  0,
+                                  "nosync-i32":  0,
+                                  "launch":  0,
+                                  "decg":  0
+                              },
+                    "all_rc":  0,
+                    "decg_tests":  21
+                },
+    "isa":  {
+                "compiles":  150,
+                "summary":  "ALL_DECG2_ISA_OK",
+                "file":  "decg2_isa_evidence.json"
+            }
+}

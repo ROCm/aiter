@@ -208,9 +208,10 @@ class DraftPos64(unittest.TestCase):
         # ROUND-MERGE1 regression: every QP descriptor (incl. kernel_tdm_r16_nobar,
         # whose DRAFT-round body predated the seam) is sized with qp_bytes, and
         # no position is loaded with a raw dword offset.
+        # ROUND-DECG: +1 descriptor (the opt-in decode-group kernel) -> 11.
         src = open(_load.KERNEL_PATH, encoding="utf-8").read()
-        self.assertEqual(src.count("_plane(QP, _plane_bytes(rows, qp_bytes))"), 10)
-        self.assertEqual(src.count("_plane(QP, "), 10)
+        self.assertEqual(src.count("_plane(QP, _plane_bytes(rows, qp_bytes))"), 11)
+        self.assertEqual(src.count("_plane(QP, "), 11)
         self.assertNotIn("(qp_rsrc, safe_row * 4)", src)
         self.assertNotIn("(qp_rsrc, row * 4)", src)
         self.assertNotIn("(qp_rsrc, (t0 + i) * 4)", src)
