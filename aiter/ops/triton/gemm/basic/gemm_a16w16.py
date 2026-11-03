@@ -884,8 +884,6 @@ def gemm_a16w16_gated(
     accumulators round to ``dtype`` before the SiLU, as GEMM + act_and_mul do.
     """
     assert _is_gluon_available(), "gemm_a16w16_gated needs the gfx1250 gluon GEMM"
-    import triton.experimental.gluon.language as gl
-
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
         create_shared_layouts,
         create_wmma_layouts,
@@ -912,14 +910,6 @@ def gemm_a16w16_gated(
             dict(config) if config is not None else None,
             create_shared_layouts,
             create_wmma_layouts,
-        )
-        half = meta["BLOCK_N"] // 2
-        tn = min(32, half)
-        meta["EPI_LAYOUT"] = gl.BlockedLayout(
-            [1, 2], [32 // tn, tn], [num_warps, 1], [1, 0]
-        )
-        meta["OUT_LAYOUT"] = gl.BlockedLayout(
-            [1, 1], [32 // tn, tn], [num_warps, 1], [1, 0]
         )
         plan = (kernel, meta, num_warps, waves_per_eu)
         _GATED_PLANS[pkey] = plan

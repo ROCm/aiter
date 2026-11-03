@@ -99,33 +99,32 @@ def _gated_silu_mul_store(
     pid_n,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    EPI_LAYOUT: gl.constexpr,
-    OUT_LAYOUT: gl.constexpr,
 ):
-    """GATED epilogue: B's rows are gate / up interleaved one to one (row 2j
-    the gate of output column j, row 2j+1 its up), so a tile's accumulator
-    columns pair up in place and C is [M, N // 2] = silu(gate) * up. gate and
-    up round to C's dtype first, as the GEMM + act_and_mul pair rounds them."""
-    acc = gl.convert_layout(accumulator, EPI_LAYOUT)
-    gate, up = gl.split(gl.reshape(acc, [BLOCK_M, BLOCK_N // 2, 2]))
+    """GATED epilogue: B's rows are gate / up interleaved one to one, so a tile's
+    accumulator columns pair up in place and C is [M, N // 2] = silu(gate) * up,
+    stored through LDS by TDM. gate and up round to C's dtype first."""
+    gate, up = gl.split(gl.reshape(accumulator, [BLOCK_M, BLOCK_N // 2, 2]))
     gate = gate.to(c_ptr.type.element_ty).to(gl.float32)
     up = up.to(c_ptr.type.element_ty).to(gl.float32)
-    out = gl.convert_layout(gate / (1.0 + gl.exp(-gate)) * up, OUT_LAYOUT)
+    out = (gate / (1.0 + gl.exp(-gate)) * up).to(c_ptr.type.element_ty)
     HALF: gl.constexpr = BLOCK_N // 2
-    offs_cm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT))
-    offs_cn = gl.arange(0, HALF, layout=gl.SliceLayout(0, OUT_LAYOUT))
-    c_base = (
-        c_ptr
-        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
-        + (pid_n * HALF).to(gl.int64) * stride_cn
+    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[HALF, 8]], [BLOCK_M, HALF], [1, 0]
     )
-    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    mask_c = ((pid_m * BLOCK_M + offs_cm)[:, None] < M) & (
-        (pid_n * HALF + offs_cn)[None, :] < N // 2
+    c_buffer = gl.allocate_shared_memory(
+        c_ptr.type.element_ty, shape=[BLOCK_M, HALF], layout=SHARED_LAYOUT_C
     )
-    gl.amd.gfx1250.buffer_store(
-        out.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
+    c_buffer.store(out)
+    gl.barrier()
+    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M, N // 2),
+        strides=(stride_cm, stride_cn),
+        block_shape=(BLOCK_M, HALF),
+        layout=SHARED_LAYOUT_C,
     )
+    gl.amd.gfx1250.tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * HALF], c_buffer)
+    gl.amd.gfx1250.tdm.async_wait(0)
 
 
 @gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
@@ -157,8 +156,6 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     GATED: gl.constexpr = False,
-    EPI_LAYOUT: gl.constexpr = None,
-    OUT_LAYOUT: gl.constexpr = None,
 ):
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -438,8 +435,6 @@ def _gemm_a16w16_bandwidth_bound_kernel(
             pid_n,
             BLOCK_M,
             BLOCK_N,
-            EPI_LAYOUT,
-            OUT_LAYOUT,
         )
         return
 
@@ -498,8 +493,6 @@ def _gemm_a16w16_compute_bound_kernel(
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     GATED: gl.constexpr = False,
-    EPI_LAYOUT: gl.constexpr = None,
-    OUT_LAYOUT: gl.constexpr = None,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -906,8 +899,6 @@ def _gemm_a16w16_compute_bound_kernel(
             pid_n,
             BLOCK_M,
             BLOCK_N,
-            EPI_LAYOUT,
-            OUT_LAYOUT,
         )
         return
 
