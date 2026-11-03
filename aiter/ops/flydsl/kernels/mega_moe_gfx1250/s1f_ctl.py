@@ -42,8 +42,8 @@ _QUANT_FUSE_BLOCKS = int(os.environ.get("AITER_MEGA_QUANT_FUSE", "128"))
 
 # Smallest m-tile the flag region is sized for (one flag per tile/source).
 _S1F_MIN_TILE_M = 16
-#: The GEMM1 tile n / k every stage-1 variant embeds (M256 uses 2x2 waves;
-#: smaller M tiles use 1x4).
+#: Stage-1 embeds its own GEMM1 n/k tiles and buffers (M256 uses 2x2 waves;
+#: smaller M tiles use 1x4). Only the CSV row tile_m must match.
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m: (pipeline buffers, CTAs per CU).
 #:
@@ -627,7 +627,7 @@ class _Stage1Fusion:
         align_m = int(self.d._step.align_m)
         wire_row = int(self.d.compact.wire_row)
         got = {
-            "tile": (tile_m, tile_n, tile_k),
+            "tile_m": int(tile_m),
             "out_is_f16": int(out_is_f16),
             "a_is_fp4": int(a_is_fp4),
             "bias": bias is not None,
@@ -637,7 +637,7 @@ class _Stage1Fusion:
             "variant": align_m,
         }
         want = {
-            "tile": (align_m, _S1F_TILE_N, _S1F_TILE_K),
+            "tile_m": align_m,
             "out_is_f16": 0,
             "a_is_fp4": 1,
             "bias": False,
