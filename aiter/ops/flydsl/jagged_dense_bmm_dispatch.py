@@ -6,8 +6,8 @@
 Owns every launch default. Picks a config in this order: explicit override,
 then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
 ``(gfx, cu_num, K, N, tiles_log2)``, then the analytic default. The skew path
-takes only ``block_k`` from the row; its XCD remap comes from
-``_skew_compact_xcd`` unless overridden.
+takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w`` from the row; an empty skew
+cell falls back to the analytic skew XCD remap.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
 _KEY_COLS = ["gfx", "cu_num", "K", "N", "tiles_log2"]
 _CFG_KEYS = ("xcd_c", "xcd_w", "block_k", "threads")
+_ROW_KEYS = _CFG_KEYS + ("skew_xcd_c", "skew_xcd_w")
 
 
 @functools.cache
@@ -54,12 +55,16 @@ def _tuned_table() -> dict:
         dtype=str,
         keep_default_na=False,
     )
-    return {
+    table = {
         (r["gfx"], int(r["cu_num"]), int(r["K"]), int(r["N"]), int(r["tiles_log2"])): {
-            k: int(r[k]) if r[k] else None for k in _CFG_KEYS
+            k: int(r[k]) if r[k] else None for k in _ROW_KEYS
         }
         for r in df.to_dict("records")
     }
+    for key, row in table.items():
+        if (row["skew_xcd_c"] is None) != (row["skew_xcd_w"] is None):
+            raise ValueError(f"{key}: set both skew_xcd_c and skew_xcd_w, or neither")
+    return table
 
 
 def tiles_log2(*, n_groups: int, output_n: int, max_seq_len: int) -> int:
@@ -101,13 +106,19 @@ def resolve_config(
         output_n,
         tiles_log2(n_groups=n_groups, output_n=output_n, max_seq_len=max_seq_len),
     )
-    cfg = dict(_tuned_table().get(key) or dict.fromkeys(_CFG_KEYS))
-    if not _config_valid(cfg, reduction_k=reduction_k):
-        cfg = dict.fromkeys(_CFG_KEYS)
+    row = _tuned_table().get(key) or dict.fromkeys(_ROW_KEYS)
+    if not _config_valid(row, reduction_k=reduction_k):
+        row = dict.fromkeys(_ROW_KEYS)
+    cfg = {k: row[k] for k in _CFG_KEYS}
     if block_k is not None:
         cfg["block_k"] = int(block_k)
     if not uniform_seqlen:
-        cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(n_groups, reduction_k, dense_kn)
+        if row["skew_xcd_c"] is not None:
+            cfg["xcd_c"], cfg["xcd_w"] = row["skew_xcd_c"], row["skew_xcd_w"]
+        else:
+            cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(
+                n_groups, reduction_k, dense_kn
+            )
     # Thread counts were tuned on the uniform 2-D layout; 3-D is faster at the default.
     if not uniform_seqlen or dense_kn:
         cfg["threads"] = None
