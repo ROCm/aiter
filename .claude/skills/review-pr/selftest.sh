@@ -184,6 +184,15 @@ printf 'Review (advisory): \342\232\240 NEEDS WORK\n\342\232\240 a reported find
 rc=0; python3 "$S/triage.py" independent "$tmp/independent.txt" "$tmp/card.md" >/dev/null 2>&1 || rc=$?
 t "a silent downgrade is rejected" "$rc" "1"
 
+# Rejected validation evidence must degrade the review, not delete it. The regression this
+# pins happened for real on ATOM's first live auto-validation run: the consumer ran under
+# errexit, so one missing optional import aborted fetch.sh and produced no card at all --
+# indistinguishable, to the human waiting on it, from the bot being down. _degrade_test.sh
+# extracts the real consumer region out of fetch.sh by line markers (not a replica of it)
+# and drives it with a report for the wrong head, which must be refused AND survived.
+t "rejected validation evidence degrades instead of aborting" \
+  "$(bash "$S/_degrade_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
 echo "[watchdog]"
 # The watchdog is the one guard that cannot be tested by running it: `issue_comment` workflows
 # only ever run from the default branch, so GitHub will not execute that job until this merges.
