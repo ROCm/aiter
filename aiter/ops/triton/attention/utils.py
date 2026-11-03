@@ -507,7 +507,9 @@ def _sol_attn_pool_packed_k(
     )
     return (
         *result,
-        *_sol_attn_pack_k(rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N),
+        *_sol_attn_pack_k(
+            rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
+        ),
         rotated_var,
     )
 

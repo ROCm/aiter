@@ -35,7 +35,6 @@ from aiter.ops.mha_v4 import (
     native_fp8_format,
     scale_modes_for_formats,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.mha_v4_quant import (
     MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
     MHA_V4_KV_TILE_ROWS,
@@ -66,6 +65,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,

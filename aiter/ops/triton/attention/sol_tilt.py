@@ -25,8 +25,8 @@ from aiter.ops.triton._triton_kernels.attention.sol_tilt import (
     _sol_q_tile_absmax_kernel,
     _sol_tilt_factor_kernel,
     _sol_tilt_pack_kernel,
-    _sol_tilt_shift_kernel,
     _sol_tilt_scaled_kernel,
+    _sol_tilt_shift_kernel,
     _sol_tilt_stack_kernel,
     _sol_tilt_unit_kernel,
     _sol_tilt_valu_kernel,
@@ -57,7 +57,11 @@ def _rotation_signs(device: torch.device) -> torch.Tensor:
     if signs is None:
         from aiter.ops.mha_v4_quant import rotate_activation_hd128
 
-        eye = torch.eye(128, dtype=torch.bfloat16, device=device).view(1, 128, 1, 128).contiguous()
+        eye = (
+            torch.eye(128, dtype=torch.bfloat16, device=device)
+            .view(1, 128, 1, 128)
+            .contiguous()
+        )
         rows = torch.empty_like(eye)
         rotate_activation_hd128(rows, eye)
         signs = rows.view(128, 128).sign().contiguous()
@@ -83,26 +87,45 @@ def sol_q_abs_max(
     batch, seqlen, heads, d = q.shape
     if rotate and d != 128:
         raise ValueError(f"the packers' rotation is hd128, got head dim {d}")
-    if q_scale is not None and (tuple(q_scale.shape) != (batch, seqlen, heads, d // 32) or q_scale.stride(-1) != 1):
-        raise ValueError(f"q_scale must be ({batch}, {seqlen}, {heads}, {d // 32}) with unit-stride groups")
+    if q_scale is not None and (
+        tuple(q_scale.shape) != (batch, seqlen, heads, d // 32)
+        or q_scale.stride(-1) != 1
+    ):
+        raise ValueError(
+            f"q_scale must be ({batch}, {seqlen}, {heads}, {d // 32}) with unit-stride groups"
+        )
     tiles = -(-seqlen // q_tile)
     out = torch.empty(batch, tiles, heads, d, dtype=torch.bfloat16, device=q.device)
     head = torch.empty(batch, heads, d, dtype=torch.bfloat16, device=q.device)
     scale = q_scale if q_scale is not None else out
     _sol_q_tile_absmax_kernel[(tiles, heads, batch)](
-        q, scale, _rotation_signs(q.device) if rotate else out, out, seqlen, d**-0.5,
-        q.stride(0), q.stride(1), q.stride(2),
+        q,
+        scale,
+        _rotation_signs(q.device) if rotate else out,
+        out,
+        seqlen,
+        d**-0.5,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
         *(scale.stride()[:3] if q_scale is not None else (0, 0, 0)),
-        out.stride(0), out.stride(1), out.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
         HAS_SCALE=q_scale is not None,
         ROTATE=rotate,
         Q_TILE=q_tile,
         HEAD_DIM=d,
     )
     _sol_q_head_absmax_kernel[(heads, batch)](
-        out, head, tiles,
-        out.stride(0), out.stride(1), out.stride(2),
-        head.stride(0), head.stride(1),
+        out,
+        head,
+        tiles,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        head.stride(0),
+        head.stride(1),
         TILE_CHUNK=128,
         HEAD_DIM=d,
     )
@@ -160,20 +183,27 @@ def sol_jensen_cap(
     if var_in.stride(-1) != 1:
         raise ValueError("mean_k_var needs a unit-stride head dim")
     if mean_k_var_pooled is not None and not block_scaled:
-        raise ValueError("mean_k_var_pooled stands in for a packed K's variance; pass its mean_k_var_scale")
+        raise ValueError(
+            "mean_k_var_pooled stands in for a packed K's variance; pass its mean_k_var_scale"
+        )
     if block_scaled:
         if q_descale is not None or k_descale is not None or q_abs_max is None:
-            raise ValueError("a block-scaled K takes no descales and q_abs_max in the kernel's basis")
+            raise ValueError(
+                "a block-scaled K takes no descales and q_abs_max in the kernel's basis"
+            )
         if mean_k_var_pooled is None and mean_k_var.shape[-1] != d:
             raise ValueError("a packed K's variance needs mean_k_var_pooled")
         if mean_k_var_scale.stride(-1) != 1 or mean_k_var_scale.shape[-1] != d // 32:
-            raise ValueError(f"mean_k_var_scale needs {d // 32} unit-stride E8M0 groups")
+            raise ValueError(
+                f"mean_k_var_scale needs {d // 32} unit-stride E8M0 groups"
+            )
     if (q_descale is None) != (k_descale is None):
         raise ValueError("pass both Q/K descales, or neither for an unscaled Q/K")
     if q_descale is not None and (q_descale.numel() != 1 or k_descale.numel() != 1):
         raise ValueError(
             f"the Jensen cap takes per-tensor descales, got {q_descale.numel()} and "
-            f"{k_descale.numel()} elements; pass None for an unscaled Q/K")
+            f"{k_descale.numel()} elements; pass None for an unscaled Q/K"
+        )
     q_tile_max = (q_abs_max if q_abs_max is not None else sol_q_abs_max(q, q_tile))[0]
     tiles, blocks = q_tile_max.shape[1], mean_k_var.shape[1]
     if tiles != -(-seqlen_q // q_tile):
@@ -192,13 +222,21 @@ def sol_jensen_cap(
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
         var, var_scale = mean_k_var, mean_k_var_scale.clone()
     else:
-        per_nat = 0.5 * softmax_scale**2 * (SOL_ATTN_FP8_VAR_DIVISOR if mean_k_var.element_size() == 1 else 1.0)
+        per_nat = (
+            0.5
+            * softmax_scale**2
+            * (SOL_ATTN_FP8_VAR_DIVISOR if mean_k_var.element_size() == 1 else 1.0)
+        )
         var, var_scale = torch.empty_like(mean_k_var), None
     gain = torch.empty(batch, blocks, heads, dtype=torch.float32, device=q.device)
     scale_io = var_scale if block_scaled else gain
     if blocks:
         _sol_jensen_cap_kernel[(blocks, heads, batch)](
-            q_tile_max, var_in, mask, var, gain,
+            q_tile_max,
+            var_in,
+            mask,
+            var,
+            gain,
             q_descale if q_descale is not None else gain,
             k_descale if k_descale is not None else gain,
             mean_k_var_scale if block_scaled else gain,
@@ -206,10 +244,16 @@ def sol_jensen_cap(
             per_nat,
             math.log(kv_tile),
             tiles,
-            q_tile_max.stride(0), q_tile_max.stride(1), q_tile_max.stride(2),
-            var_in.stride(0), var_in.stride(1), var_in.stride(2),
+            q_tile_max.stride(0),
+            q_tile_max.stride(1),
+            q_tile_max.stride(2),
+            var_in.stride(0),
+            var_in.stride(1),
+            var_in.stride(2),
             *mask_strides,
-            gain.stride(0), gain.stride(1), gain.stride(2),
+            gain.stride(0),
+            gain.stride(1),
+            gain.stride(2),
             *(var_scale.stride()[:3] if block_scaled else (0, 0, 0)),
             HAS_MASK=block_attn_mask is not None,
             HAS_DESCALE=q_descale is not None,
@@ -223,7 +267,9 @@ def sol_jensen_cap(
     return var, var_scale, gain
 
 
-def _refill_mxfp6_scale_tails(records: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _refill_mxfp6_scale_tails(
+    records: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
     """A copy of MXFP6 K records whose per-tile scale tails are rebuilt from `scale`.
 
     The MXFP6 K reader takes its scales from each 128-row tile's tail, a gather of the plain
@@ -234,11 +280,17 @@ def _refill_mxfp6_scale_tails(records: torch.Tensor, scale: torch.Tensor) -> tor
     batch, rows, heads, _ = scale.shape
     tiles = -(-rows // 128)
     if not scale.is_contiguous() or records.stride(2) != tiles * fp6._K_TILE_BYTES:
-        raise ValueError("an MXFP6 K scale is a contiguous image of the rows the records were packed from")
+        raise ValueError(
+            "an MXFP6 K scale is a contiguous image of the rows the records were packed from"
+        )
     size = batch * heads * tiles * fp6._K_TILE_BYTES + fp6.FP6_K_BUFFER_SLACK_BYTES
     flat = records.as_strided((size,), (1,)).clone()
     fp6._fill_k_scale_tail_kernel[(batch * heads * tiles,)](
-        scale.view(-1), flat, rows, heads, tiles,
+        scale.view(-1),
+        flat,
+        rows,
+        heads,
+        tiles,
         TILE_BYTES=fp6._K_TILE_BYTES,
         SCALE_TAIL_OFFSET=fp6._K_SCALE_TAIL_OFFSET,
         BLOCK=1024,
@@ -283,23 +335,36 @@ def sol_tilt_factors(
         if x.dtype != torch.float8_e4m3fn:
             raise ValueError(f"the tilt's {name} must be float8_e4m3fn, got {x.dtype}")
     if v.shape[-1] != k.shape[-1]:
-        raise ValueError("the tilt's K and V planes share one stride, so they need one width")
+        raise ValueError(
+            "the tilt's K and V planes share one stride, so they need one width"
+        )
     if q.shape[2] != k.shape[2]:
-        raise ValueError(f"the tilt needs one K/V head per query head, got {q.shape[2]}/{k.shape[2]}")
+        raise ValueError(
+            f"the tilt needs one K/V head per query head, got {q.shape[2]}/{k.shape[2]}"
+        )
     blocks = mean_k.shape[1]
     fmax = torch.finfo(k.dtype).max
     dev = k.device
     q_head_max = (q_abs_max if q_abs_max is not None else sol_q_abs_max(q))[1]
     planes_a, planes_b, peaks = _tilt_factors(
-        k, v, q_head_max, rank, kv_tile, blocks, power_iters, block_gain)
+        k, v, q_head_max, rank, kv_tile, blocks, power_iters, block_gain
+    )
     for name, x in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
         if x.numel() != 1:
-            raise ValueError(f"the tilt takes per-tensor descales, got {x.numel()} for {name}")
+            raise ValueError(
+                f"the tilt takes per-tensor descales, got {x.numel()} for {name}"
+            )
     # In real units a / qd keeps |q . a| <= 1, and b carries the covariance's scale and sm_scale.
     shift = torch.empty(1, dtype=torch.int32, device=dev)
     units = torch.empty(2, dtype=torch.float32, device=dev)
     _sol_tilt_shift_kernel[(1,)](
-        q_descale, k_descale, v_descale, peaks, peaks.numel() // 2, shift, units,
+        q_descale,
+        k_descale,
+        v_descale,
+        peaks,
+        peaks.numel() // 2,
+        shift,
+        units,
         _TILT_LOGIT_UNIT * softmax_scale * fmax,
         softmax_scale / kv_tile,
         _TILT_W_MAX,
@@ -310,7 +375,9 @@ def sol_tilt_factors(
 
     ext_k = torch.empty((1 + rank,) + tuple(mean_k.shape), dtype=k.dtype, device=dev)
     ext_v = torch.empty((1 + rank,) + tuple(mean_v.shape), dtype=v.dtype, device=dev)
-    _pack_planes(planes_a, planes_b, mean_k, mean_v, ext_k, ext_v, units, k.shape[1] // kv_tile)
+    _pack_planes(
+        planes_a, planes_b, mean_k, mean_v, ext_k, ext_v, units, k.shape[1] // kv_tile
+    )
     plane_stride = ext_k.stride(0) * ext_k.element_size()
     return ext_k[0], ext_v[0], (rank, plane_stride, shift)
 
@@ -334,26 +401,42 @@ def _tilt_factors(
     for name, x in (("k", k), ("v", v)):
         _check_unit_stride(name, x)
         if x.dtype not in (torch.float8_e4m3fn, torch.int8, torch.bfloat16):
-            raise ValueError(f"the tilt's factors take fp8, int8 or bf16 {name}, got {x.dtype}")
+            raise ValueError(
+                f"the tilt's factors take fp8, int8 or bf16 {name}, got {x.dtype}"
+            )
     if not 1 <= rank <= d:
         raise ValueError(f"tilt rank must be in [1, {d}], got {rank}")
     full = seqlen_k // kv_tile
     dev = k.device
-    planes_a = torch.empty(rank, batch, blocks, heads, d, dtype=torch.float32, device=dev)
+    planes_a = torch.empty(
+        rank, batch, blocks, heads, d, dtype=torch.float32, device=dev
+    )
     planes_b = torch.empty_like(planes_a)
     if blocks > full:
         planes_a[:, :, full:].zero_()
         planes_b[:, :, full:].zero_()
     peaks = (torch.empty if full else torch.zeros)(
-        batch, heads, max(full, 1), 2, dtype=torch.float32, device=dev)
+        batch, heads, max(full, 1), 2, dtype=torch.float32, device=dev
+    )
     if full:
         gain = block_gain if block_gain is not None else planes_a
         gain_strides = block_gain.stride() if block_gain is not None else (0, 0, 0)
         _sol_tilt_factor_kernel[(full, heads, batch)](
-            k, v, q_head_max, gain, planes_a, planes_b, peaks,
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            q_head_max.stride(0), q_head_max.stride(1),
+            k,
+            v,
+            q_head_max,
+            gain,
+            planes_a,
+            planes_b,
+            peaks,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            q_head_max.stride(0),
+            q_head_max.stride(1),
             *gain_strides,
             *planes_a.stride()[:4],
             HAS_GAIN=block_gain is not None,
@@ -374,11 +457,22 @@ def _pack_planes(planes_a, planes_b, mean_k, mean_v, ext_k, ext_v, units, full) 
     rank, batch, blocks, heads, d = planes_a.shape
     if blocks:
         _sol_tilt_pack_kernel[(blocks, heads, batch)](
-            planes_a, planes_b, mean_k, mean_v, ext_k, ext_v,
-            units, rank, full,
+            planes_a,
+            planes_b,
+            mean_k,
+            mean_v,
+            ext_k,
+            ext_v,
+            units,
+            rank,
+            full,
             *planes_a.stride()[:4],
-            mean_k.stride(0), mean_k.stride(1), mean_k.stride(2),
-            mean_v.stride(0), mean_v.stride(1), mean_v.stride(2),
+            mean_k.stride(0),
+            mean_k.stride(1),
+            mean_k.stride(2),
+            mean_v.stride(0),
+            mean_v.stride(1),
+            mean_v.stride(2),
             *ext_k.stride()[:4],
             *ext_v.stride()[:4],
             ROUND_K=not ext_k.dtype.is_floating_point,
@@ -389,7 +483,11 @@ def _pack_planes(planes_a, planes_b, mean_k, mean_v, ext_k, ext_v, units, full) 
 # A planes are encoded as mean_k is, B planes as mean_v is.
 SOL_TILT_K_FORMATS = ("e4m3", "int8", "bf16", "mxfp8", "mxfp6", "mxfp4")
 SOL_TILT_V_FORMATS = ("e4m3", "bf16", "mxfp6_fp6_p", "mxfp4_fp6_p")
-_PLAIN_DTYPES = {"e4m3": torch.float8_e4m3fn, "int8": torch.int8, "bf16": torch.bfloat16}
+_PLAIN_DTYPES = {
+    "e4m3": torch.float8_e4m3fn,
+    "int8": torch.int8,
+    "bf16": torch.bfloat16,
+}
 
 
 class SolTiltPlanes(NamedTuple):
@@ -414,10 +512,14 @@ class SolTiltPlanes(NamedTuple):
     units: torch.Tensor
 
 
-def _as_descale(x: torch.Tensor | float, name: str, device: torch.device) -> torch.Tensor:
+def _as_descale(
+    x: torch.Tensor | float, name: str, device: torch.device
+) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         if x.numel() != 1:
-            raise ValueError(f"the tilt takes per-tensor descales, got {x.numel()} for {name}")
+            raise ValueError(
+                f"the tilt takes per-tensor descales, got {x.numel()} for {name}"
+            )
         return x.reshape(1)
     return torch.full((1,), float(x), dtype=torch.float32, device=device)
 
@@ -440,9 +542,17 @@ def _stack_planes(
     ext = plane0.new_zeros(shape) if pad else plane0.new_empty(shape)
     block = 1024
     _sol_tilt_stack_kernel[(triton.cdiv(size, block), shape[0])](
-        plane0, planes.to(plane0.dtype).contiguous(), ext, size, shape[1], BLOCK=block,
+        plane0,
+        planes.to(plane0.dtype).contiguous(),
+        ext,
+        size,
+        shape[1],
+        BLOCK=block,
     )
-    return ext.as_strided(plane0.shape, plane0.stride()), ext.stride(0) * ext.element_size()
+    return (
+        ext.as_strided(plane0.shape, plane0.stride()),
+        ext.stride(0) * ext.element_size(),
+    )
 
 
 def _plane0_of_packed(
@@ -497,23 +607,34 @@ def sol_tilt_planes(
     block_gain is as for sol_tilt_factors. Nothing is read back to the host.
     """
     if k_format not in SOL_TILT_K_FORMATS:
-        raise ValueError(f"k_format must be one of {SOL_TILT_K_FORMATS}, got {k_format!r}")
+        raise ValueError(
+            f"k_format must be one of {SOL_TILT_K_FORMATS}, got {k_format!r}"
+        )
     if v_format not in SOL_TILT_V_FORMATS:
-        raise ValueError(f"v_format must be one of {SOL_TILT_V_FORMATS}, got {v_format!r}")
-    batch, _, heads, d = k.shape
+        raise ValueError(
+            f"v_format must be one of {SOL_TILT_V_FORMATS}, got {v_format!r}"
+        )
+    batch, _, heads, _ = k.shape
     if v.shape[2] != heads or q_abs_max[1].shape[1] != heads:
         raise ValueError("the tilt needs one K/V head per query head")
     k_mx = k_format in ("mxfp8", "mxfp6", "mxfp4")
     v_mx = v_format.endswith("_fp6_p")
     if k_mx != (mean_k_scale is not None) or v_mx != (mean_v_scale is not None):
-        raise ValueError("a block-scaled format needs its pooled scale, and only it takes one")
-    if (k_format in ("mxfp6", "mxfp4") and mean_k_pooled is None) or (v_mx and mean_v_pooled is None):
-        raise ValueError("a packed format needs the pooled BF16 rows sol_prepare packed")
+        raise ValueError(
+            "a block-scaled format needs its pooled scale, and only it takes one"
+        )
+    if (k_format in ("mxfp6", "mxfp4") and mean_k_pooled is None) or (
+        v_mx and mean_v_pooled is None
+    ):
+        raise ValueError(
+            "a packed format needs the pooled BF16 rows sol_prepare packed"
+        )
     dev = k.device
     blocks = mean_k.shape[1]
     full = k.shape[1] // kv_tile
     planes_a, planes_b, peaks = _tilt_factors(
-        k, v, q_abs_max[1], rank, kv_tile, blocks, power_iters, block_gain)
+        k, v, q_abs_max[1], rank, kv_tile, blocks, power_iters, block_gain
+    )
 
     units = torch.empty(4, dtype=torch.float32, device=dev)
     k_codes = k_format in ("e4m3", "int8")
@@ -521,7 +642,9 @@ def sol_tilt_planes(
         _as_descale(q_descale, "q", dev),
         _as_descale(k_descale if not k_mx else 1.0, "k", dev),
         _as_descale(v_descale if not v_mx else 1.0, "v", dev),
-        peaks, peaks.numel() // 2, units,
+        peaks,
+        peaks.numel() // 2,
+        units,
         q_multiplier,
         softmax_scale / kv_tile,
         127.0 if k_format == "int8" else torch.finfo(torch.float8_e4m3fn).max,
@@ -534,13 +657,25 @@ def sol_tilt_planes(
     k_scale = v_scale = None
     k_scale_stride = v_scale_stride = 0
     if not k_mx and not v_mx:
-        ext_k = torch.empty((1 + rank,) + tuple(mean_k.shape), dtype=mean_k.dtype, device=dev)
-        ext_v = torch.empty((1 + rank,) + tuple(mean_v.shape), dtype=mean_v.dtype, device=dev)
+        ext_k = torch.empty(
+            (1 + rank,) + tuple(mean_k.shape), dtype=mean_k.dtype, device=dev
+        )
+        ext_v = torch.empty(
+            (1 + rank,) + tuple(mean_v.shape), dtype=mean_v.dtype, device=dev
+        )
         _pack_planes(planes_a, planes_b, mean_k, mean_v, ext_k, ext_v, units, full)
         return SolTiltPlanes(
-            ext_k[0], ext_v[0], None, None, rank,
-            ext_k.stride(0) * ext_k.element_size(), ext_v.stride(0) * ext_v.element_size(),
-            0, 0, units)
+            ext_k[0],
+            ext_v[0],
+            None,
+            None,
+            rank,
+            ext_k.stride(0) * ext_k.element_size(),
+            ext_v.stride(0) * ext_v.element_size(),
+            0,
+            0,
+            units,
+        )
 
     from aiter.ops.triton.attention.utils import (
         _e8m0_quantize,
@@ -551,11 +686,16 @@ def sol_tilt_planes(
     if k_format == "mxfp8":
         data, scale = _e8m0_quantize(planes_a, mean_k.dtype)
         ext_k, k_stride = _stack_planes(mean_k, data)
-        k_scale, k_scale_stride = _stack_planes(mean_k_scale, scale, _TILT_SCALE_ROW_TILE)
+        k_scale, k_scale_stride = _stack_planes(
+            mean_k_scale, scale, _TILT_SCALE_ROW_TILE
+        )
     elif k_mx:
-        x = torch.cat([mean_k_pooled.unsqueeze(0), planes_a.to(torch.bfloat16)]).flatten(0, 1)
+        x = torch.cat(
+            [mean_k_pooled.unsqueeze(0), planes_a.to(torch.bfloat16)]
+        ).flatten(0, 1)
         ext_k, k_scale, k_stride, k_scale_stride = _plane0_of_packed(
-            *_sol_attn_pack_k(x, k_format, kv_tile), batch)
+            *_sol_attn_pack_k(x, k_format, kv_tile), batch
+        )
     else:
         a = planes_a * units[0]
         if k_format == "int8":
@@ -581,8 +721,17 @@ def sol_tilt_planes(
     else:
         ext_v, v_stride = _stack_planes(mean_v, b)
     return SolTiltPlanes(
-        ext_k, ext_v, k_scale, v_scale, rank, k_stride, v_stride,
-        k_scale_stride, v_scale_stride, units)
+        ext_k,
+        ext_v,
+        k_scale,
+        v_scale,
+        rank,
+        k_stride,
+        v_stride,
+        k_scale_stride,
+        v_scale_stride,
+        units,
+    )
 
 
 def sol_tilt_valu_params(
@@ -602,13 +751,20 @@ def sol_tilt_valu_params(
     planes). Pass it as sol_tilt's shift tensor.
     """
     if len(strides) > 3:
-        raise ValueError(f"the tilt's parameter block carries at most three strides, got {len(strides)}")
+        raise ValueError(
+            f"the tilt's parameter block carries at most three strides, got {len(strides)}"
+        )
     dev = planes.units.device
     out = torch.empty(2 + len(strides), dtype=torch.int32, device=dev)
     padded = tuple(int(s) for s in strides) + (0,) * (3 - len(strides))
     _sol_tilt_valu_kernel[(1,)](
-        planes.units, _as_descale(q_descale, "q", dev), _as_descale(k_descale, "k", dev), out,
-        _TILT_W_MAX, *padded, STRIDES=len(strides),
+        planes.units,
+        _as_descale(q_descale, "q", dev),
+        _as_descale(k_descale, "k", dev),
+        out,
+        _TILT_W_MAX,
+        *padded,
+        STRIDES=len(strides),
     )
     return out
 
