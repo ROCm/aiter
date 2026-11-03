@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+﻿# SPDX-License-Identifier: MIT
 """Load the v0/v1 kernel module: direct file load by default.
 
 ``import aiter`` pulls in ``aiter/jit``, which builds ``module_aiter_core`` and
@@ -20,7 +20,8 @@ import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 KERNEL_PATH = os.path.abspath(
-    os.path.join(_HERE, "..", "qsa_paged_mqa_logits_page4_gfx1250.py")
+    os.path.join(_HERE, "..", "..", "..", "aiter", "ops", "flydsl", "kernels", "mqa_logits",
+                 "qsa_paged_mqa_logits_page4_gfx1250.py")
 )
 
 

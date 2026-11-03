@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+﻿# SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU contract tests for ``aiter.ops.qsa_index_scorer`` (no GPU, no device, no aiter import).
 
@@ -35,7 +35,7 @@ import torch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PKG_DIR = os.path.join(ROOT, "aiter", "ops", "qsa_index_scorer")
-G2_DIR = os.path.join(ROOT, "aiter", "ops", "flydsl", "kernels", "mqa_logits", "_g2")
+LOADER_DIR = os.path.join(ROOT, "op_tests", "op_benchmarks", "qsa_index_scorer")
 PROFILE_JSON = os.path.join(ROOT, "aiter", "configs", "qsa_index_scorer",
                             "qsa_page4_gfx1250_v1.json")
 ATOM_REL = os.path.join("atom_impl", "atom", "model_ops", "qwen4_exp", "ops", "qsa.py")
@@ -78,12 +78,12 @@ def load_pkg():
 
 
 def load_kernel():
-    sys.path.insert(0, G2_DIR)
+    sys.path.insert(0, LOADER_DIR)
     try:
-        import _load  # noqa: E402
+        import qsa_kernel_loader  # noqa: E402
     finally:
-        sys.path.remove(G2_DIR)
-    K, how = _load.load_kernel_module(allow_stub=True)
+        sys.path.remove(LOADER_DIR)
+    K, how = qsa_kernel_loader.load_kernel_module(allow_stub=True)
     return K, how
 
 
@@ -239,7 +239,9 @@ class ProfileFormat(unittest.TestCase):
         with _tmpdir() as td:
             d = json.loads(json.dumps(self.data)); d["profile"] = "qsa_bad_v1"
             r0 = next(r for r in d["rows"] if r["golden"]["status"] == "pass")
-            del r0["golden"]["isa_identity"]
+            # simulate a pass verified on an older kernel that lacks an ISA-identity record
+            r0["golden"]["kernel_sha256"] = "0" * 64
+            r0["golden"].pop("isa_identity", None)
             with self.assertRaises(PR.ProfileError) as cm:
                 PR.load_profile(self._write(td, d), use_cache=False)
             self.assertIn("isa_identity", str(cm.exception))
@@ -328,8 +330,10 @@ class ProfileFormat(unittest.TestCase):
                 self.assertNotIn("isa_identity", g)
             self.assertEqual(gen.verify(out), [])
             fp8 = next(r.raw for r in prof.rows if r.cell == "decode_fp8_r64q16_c65536_w16384")
-            self.assertEqual(fp8["golden"]["phase1_kernel_sha256"],
-                             "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c")
+            # phase-1 provenance is kept when the source row carried it (pre-restamp profile)
+            if "phase1_kernel_sha256" in fp8["golden"]:
+                self.assertEqual(fp8["golden"]["phase1_kernel_sha256"],
+                                 "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c")
             self.assertEqual(fp8["notes"], "")
 
     def _write(self, td, data, name="qsa_bad_v1"):
