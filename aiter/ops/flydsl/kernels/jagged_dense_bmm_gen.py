@@ -59,9 +59,9 @@ ARCH_TRAITS = {
         min_block_k=64,
     ),
     "gfx950": ArchTraits(
-        mma_mnk=(16, 16, 16),
-        k_perm_shape=(4, 4, 2),
-        k_perm_stride=(1, 8, 4),
+        mma_mnk=(16, 16, 32),
+        k_perm_shape=(8, 4, 1),
+        k_perm_stride=(1, 8, 0),
         lds_bytes=get_lds_capacity_bytes("gfx950"),
         a_swizzle=(3, 3, 3),
         wave_size=64,
@@ -135,6 +135,7 @@ def _build_launcher(
 ):
     MMA_N = TRAITS.mma_mnk[1]
     K_STEP = TRAITS.k_tile_gran
+    K_ATOMS = K_STEP // TRAITS.mma_mnk[2]
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
     WAVES = THREADS // TRAITS.wave_size
@@ -281,8 +282,9 @@ def _build_launcher(
                 )
                 tv_mma_B = tiled_mma.tv_layout_B_tiled
                 k_in_atom, n_rep, k_rep = 0, 1, 2
+                ring_modes = [n_rep, k_in_atom] + ([k_rep] if K_ATOMS > 1 else [])
                 vals_g2r_B = fx.coalesce(
-                    fx.select(fx.coalesce(tv_mma_B[1]), [n_rep, k_in_atom, k_rep])
+                    fx.select(fx.coalesce(tv_mma_B[1]), ring_modes)
                 )
                 tv_g2r_B = fx.group(
                     fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank
@@ -311,6 +313,10 @@ def _build_launcher(
             mma_frag_C = thr_mma.make_fragment_C(gC)
 
             mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
+
+            def k_coord(kc):
+                return (None, kc) if K_ATOMS > 1 else kc
+
             if fx.const_expr(DENSE_KN):
                 # Ring slots hold (n-rep, k) as loaded; each K32 step shuffles
                 # them into the MFMA's K-packed (k, n-rep) operand.
@@ -330,7 +336,7 @@ def _build_launcher(
 
                 def b_operand(slot, kc):
                     raw = b_ring[slot][None, None, kc].load()
-                    dst = mma_frag_B[None, None, (None, kc)]
+                    dst = mma_frag_B[None, None, k_coord(kc)]
                     dst.store(
                         raw.shuffle(raw, b_shuffle).reshape(dst.shape.to_py_value())
                     )
@@ -344,7 +350,7 @@ def _build_launcher(
                     return mma_frag_B_retile[None, None, None, slot]
 
                 def b_operand(slot, kc):
-                    return mma_frag_B[None, None, (None, kc), slot]
+                    return mma_frag_B[None, None, k_coord(kc), slot]
 
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
@@ -375,7 +381,7 @@ def _build_launcher(
                         thr_sA_s2r[None, None, block_k_iter, a_read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
-                    frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
+                    frag_A_k = mma_frag_A[None, None, k_coord(block_k_iter)]
                     frag_B_k = b_operand(b_read_slot, block_k_iter)
                     fx.gemm(
                         tiled_mma,
