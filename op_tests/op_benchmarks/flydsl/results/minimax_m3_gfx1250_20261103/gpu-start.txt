@@ -1,0 +1,39 @@
+2026-11-03T00:15:31.952822+00:00
+
+
+============================ ROCm System Management Interface ============================
+=============================== Current clock frequencies ================================
+GPU[0]		: fclk clock level: 1: (1950Mhz)
+GPU[0]		: mclk clock level: 0: (1900Mhz)
+GPU[0]		: sclk clock level: 1: (2301Mhz)
+GPU[0]		: socclk clock level: 0: (1350Mhz)
+GPU[1]		: fclk clock level: 1: (1950Mhz)
+GPU[1]		: mclk clock level: 0: (1900Mhz)
+GPU[1]		: sclk clock level: 1: (2234Mhz)
+GPU[1]		: socclk clock level: 0: (1350Mhz)
+GPU[2]		: fclk clock level: 1: (1950Mhz)
+GPU[2]		: mclk clock level: 0: (1900Mhz)
+GPU[2]		: sclk clock level: 1: (2276Mhz)
+GPU[2]		: socclk clock level: 0: (1350Mhz)
+GPU[3]		: fclk clock level: 1: (1950Mhz)
+GPU[3]		: mclk clock level: 0: (1900Mhz)
+GPU[3]		: sclk clock level: 1: (2316Mhz)
+GPU[3]		: socclk clock level: 0: (1350Mhz)
+==========================================================================================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+==========================================================================================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 463856467968
+GPU[0]		: VRAM Total Used Memory (B): 179068928
+GPU[1]		: VRAM Total Memory (B): 463856467968
+GPU[1]		: VRAM Total Used Memory (B): 179068928
+GPU[2]		: VRAM Total Memory (B): 463856467968
+GPU[2]		: VRAM Total Used Memory (B): 179068928
+GPU[3]		: VRAM Total Memory (B): 463856467968
+GPU[3]		: VRAM Total Used Memory (B): 179068928
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

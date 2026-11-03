@@ -129,6 +129,9 @@ source checkout when comparing clean revisions.
 
 ## Effective bandwidth
 
+Measured latency and bandwidth tables, environment and raw samples are in the
+[2026-11-03 gfx1250 report](results/minimax_m3_gfx1250_20261103/README.md).
+
 The benchmark also reports logical IO bytes and effective bandwidth in decimal
 TB/s. Let `N = sum(context_lengths)`, `T = batch * query_length`, `Hkv = 1`,
 `Hq = 16`, and `D = 128`:
