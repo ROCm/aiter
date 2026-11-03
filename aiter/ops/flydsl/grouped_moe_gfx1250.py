@@ -704,6 +704,20 @@ def _grouped_a8w4_tdm_moe(
             contiguous_m = min(_compact_rows, contiguous_m)
         max_m = contiguous_m
 
+    # Compact GEMM1 reads the original pitched wire; only its quantized output
+    # adopts GEMM2's native M16/K32 payload layout. Keep unsupported shapes on
+    # the existing compact output layout.
+    a2_preshuffled = a_preshuffled or bool(
+        _compact
+        and _a_preshuffle_requested
+        and inter_dim % 128 == 0
+        and tile_n % 64 == 0
+        and tile_m % 16 == 0
+        and tile_m2 % 16 == 0
+        and tile_k2 % 128 == 0
+        and contiguous_m % 16 == 0
+    )
+
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
     # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
     # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
@@ -1148,6 +1162,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             stage1_quant_out=1,
+            quant_payload_preshuffled=int(a2_preshuffled),
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
@@ -1217,7 +1232,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
-            payload_preshuffled=a_preshuffled,
+            payload_preshuffled=a2_preshuffled,
             **_a2_activation_kw,
         )
 
@@ -1242,7 +1257,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
-        a_preshuffled=int(a_preshuffled),
+        a_preshuffled=int(a2_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1259,29 +1274,30 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
-        kernel_bench_callable.append(
-            (
-                "quant_a1",
-                functools.partial(
-                    flydsl_moe_fused_quant_preshuffle,
-                    hidden_states.reshape(1, token_num, _src_width),
-                    1,
-                    contiguous_m,
-                    wmma_rep=wmma_rep,
-                    quant_mode=_quant_mode,
-                    masked_m=None,
-                    topids_to_rows=topids_to_rows,
-                    source_topk=topk,
-                    num_valid_routes=_ep_nvr,
-                    prequantized_scale=src_a1_scale if _prequantized else None,
-                    out_payload=a1_payload,
-                    out_scale=a1_scale,
-                    row_to_token=_apre_row_to_token,
-                    row_major_scale=_row_major_a1,
-                    payload_preshuffled=a_preshuffled,
-                ),
+        if not _compact:
+            kernel_bench_callable.append(
+                (
+                    "quant_a1",
+                    functools.partial(
+                        flydsl_moe_fused_quant_preshuffle,
+                        hidden_states.reshape(1, token_num, _src_width),
+                        1,
+                        contiguous_m,
+                        wmma_rep=wmma_rep,
+                        quant_mode=_quant_mode,
+                        masked_m=None,
+                        topids_to_rows=topids_to_rows,
+                        source_topk=topk,
+                        num_valid_routes=_ep_nvr,
+                        prequantized_scale=src_a1_scale if _prequantized else None,
+                        out_payload=a1_payload,
+                        out_scale=a1_scale,
+                        row_to_token=_apre_row_to_token,
+                        row_major_scale=_row_major_a1,
+                        payload_preshuffled=a_preshuffled,
+                    ),
+                )
             )
-        )
         if not _fuse_quant:
             kernel_bench_callable.append(
                 (
@@ -1297,7 +1313,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
-                        payload_preshuffled=a_preshuffled,
+                        payload_preshuffled=a2_preshuffled,
                         **_a2_activation_kw,
                     ),
                 )
@@ -1331,6 +1347,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         stage1_quant_out=1,
+                        quant_payload_preshuffled=int(a2_preshuffled),
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
@@ -1342,6 +1359,8 @@ def _grouped_a8w4_tdm_moe(
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
+                        a_row_stride_bytes=_a1_wire_stride,
+                        a_scale_row_stride_bytes=_a1_wire_stride,
                         rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
@@ -1385,6 +1404,8 @@ def _grouped_a8w4_tdm_moe(
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
+                        a_row_stride_bytes=_a1_wire_stride,
+                        a_scale_row_stride_bytes=_a1_wire_stride,
                         rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
@@ -1412,7 +1433,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
-                    a_preshuffled=int(a_preshuffled),
+                    a_preshuffled=int(a2_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -1425,6 +1446,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
+                    **_ep_gemm2_kwargs,
                 ),
             )
         )

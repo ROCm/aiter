@@ -161,9 +161,11 @@ def _make_combine_fused_reduce(
     gemm2 has already P2P-written each token's WEIGHTED per-expert result into
     this rank's comb_inp[origin_lid*topk + k] (one contiguous topk-block per
     token), so this is an unweighted sum: out[t] = sum_{k<topk} comb_inp[t*topk
-    + k]. The dropless full-topk pipeline overwrites every active (token, k) slot
-    each call. ``_make_combine_fused_sync`` must have run first to make the
-    peers' writes visible.
+    + k]. Source topk IDs mask dropped routes, whose slots are not overwritten
+    by gemm2; an all-dropped token therefore sums to zero without clearing the
+    arena. Callers that omit source IDs retain the dropless full-topk contract.
+    ``_make_combine_fused_sync`` must have run first to make the peers' writes
+    visible.
 
     Both sides move by TDM, staging through LDS. A token's topk slots are
     ``tok*topk + k``, i.e. consecutive row indices a fixed ``slot_stride`` apart,
@@ -296,6 +298,7 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_topk_ids: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -347,6 +350,9 @@ def _make_combine_fused_reduce(
         )
         inp_iter = fx.inttoptr(i8_global, addr_comb_inp)
         out_iter = fx.inttoptr(i16_global, addr_out)
+        rsrc_topk_ids = create_buffer_resource_from_addr(
+            addr_topk_ids, num_records_bytes=cur_rank_num_token * topk * 4
+        )
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -465,11 +471,26 @@ def _make_combine_fused_reduce(
                 )
                 fx.copy(atom_sc, gt_sc, lds_scale_view(buf))
 
-        def reduce_tile(buf):
+        def reduce_tile(work, buf):
             """-- dequantize and sum the topk slots out of LDS --"""
+            tok0, _ = tile_origin(work)
             in_idx = ptr_to_idx(in_buf_ptr(buf))
             out_idx = ptr_to_idx(out_buf_ptr(buf))
             for r in range_constexpr(ROUNDS):
+                tok = tok0 + lane_tok[r]
+                route_valid = []
+                for k_slot in range_constexpr(topk):
+                    valid = fx.Boolean(True)
+                    if addr_topk_ids != 0:
+                        route_id = buffer_load(
+                            rsrc_topk_ids,
+                            tok * topk + k_slot,
+                            vec_width=1,
+                            dtype=T.i32,
+                            mask=tok < cur_rank_num_token,
+                        )
+                        valid = (tok < cur_rank_num_token) & (route_id >= 0)
+                    route_valid.append(valid)
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
                 accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
@@ -497,13 +518,16 @@ def _make_combine_fused_reduce(
                         dw = lds_load_b32(in_idx, sc_dw + k_slot * S_ROW_BYTES)[0]
                         e8m0 = (dw >> sc_sh) & 0xFF
                         for j in range_constexpr(2):
-                            accs[j] = accs[j] + _dequant_pk8(
+                            values = _dequant_pk8(
                                 (
                                     [payload[j * 2], payload[j * 2 + 1]]
                                     if quant_bits == 8
                                     else payload[j]
                                 ),
                                 e8m0,
+                            )
+                            accs[j] = accs[j] + route_valid[k_slot].select(
+                                values, fx.full(8, 0.0, fx.Float32)
                             )
                 else:
                     # No scale plane, so the lane's 16 elements are a plain
@@ -513,7 +537,10 @@ def _make_combine_fused_reduce(
                         row_b = k_slot * P_ROW_BYTES
                         for j in range_constexpr(2):
                             raw = lds_load_b128(in_idx, base_in + row_b + j * 16)
-                            accs[j] = accs[j] + raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            values = raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            accs[j] = accs[j] + route_valid[k_slot].select(
+                                values, fx.full(8, 0.0, fx.Float32)
+                            )
 
                 out_b = (
                     lane_tok[r] * OUT_ROW_BYTES
@@ -583,7 +610,7 @@ def _make_combine_fused_reduce(
             # buffer about to be rewritten.
             tdm_ops.tensor_wait(WAIT_N)
             workgroup_barrier()
-            reduce_tile(buf)
+            reduce_tile(work, buf)
             workgroup_barrier()
             store_tile(work, buf)
         tdm_ops.tensor_wait(0)
@@ -594,11 +621,13 @@ def _make_combine_fused_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         stream=fx.Stream(None),  # noqa: B008
+        addr_topk_ids: Int64 = 0,
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
+            addr_topk_ids,
         ).launch(
             grid=(block_num, 1, 1),
             block=[lanes, 1, 1],

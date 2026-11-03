@@ -146,6 +146,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     gemm_stage=None,
+    quant_payload_preshuffled=None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -169,10 +170,20 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled A requires M and tile_m divisible by 16, K and "
             "tile_k divisible by 128, and no padded A row stride"
         )
-    if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
+    if quant_payload_preshuffled is None:
+        quant_payload_preshuffled = bool(
+            a_preshuffled and stage1_quant_out and stage1_act
+        )
+    if quant_payload_preshuffled and not (
+        a_is_fp4 and stage1_quant_out and stage1_act
+    ):
+        raise ValueError("preshuffled quant output requires fused MXFP4 activation")
+    if quant_payload_preshuffled and (
+        N % 256 or tile_n % 64 or contiguous_m % 16 or tile_m % 16
+    ):
         raise ValueError(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
-            "and tile_n divisible by 64"
+            "and tile_n divisible by 64, with M and tile_m divisible by 16"
         )
     from flydsl.expr import rocdl
 
@@ -204,6 +215,14 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale_tensor = (
         out if quant_scale is None else quant_scale.view(torch.uint8)
     ).view(-1)
+    a_scale_tensor = a_scales.view(torch.int32)
+    if row_major_ascale and a_scale_row_stride_bytes:
+        # Compact dispatch interleaves payload and scale rows in one allocation.
+        # The launcher only needs this base address; the TDM descriptor carries
+        # the source pitch. Preserve the strided storage instead of copying it.
+        a_scale_tensor = a_scale_tensor.as_strided((1,), (1,))
+    else:
+        a_scale_tensor = a_scale_tensor.view(-1)
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
@@ -320,7 +339,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         out.view(-1),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32).view(-1),
+        a_scale_tensor,
         w_scales.view(torch.int32).view(-1),
         contiguous_m,
         stream,
@@ -339,6 +358,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_linear_beta),
         *layout_spec,
         explicit_vgpr_partition,
+        int(quant_payload_preshuffled),
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -347,6 +367,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             ep_spec,
             layout_spec,
             explicit_vgpr_partition,
+            int(quant_payload_preshuffled),
         ),
     )
     return out

@@ -226,6 +226,7 @@ def launch_gemm_a8w4_tdm(
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
     explicit_vgpr_partition: Constexpr[int] = int(SUPPORT_EXPLICIT_VGPR_PARTITION),
+    quant_payload_preshuffled: Constexpr[int] = -1,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -259,6 +260,17 @@ def launch_gemm_a8w4_tdm(
     assert explicit_vgpr_partition in (0, 1)
     explicit_vgpr_partition = bool(
         explicit_vgpr_partition and is_explicit_vgpr_partition_available()
+    )
+    # The compact dispatch input keeps its row-major wire layout. Its fused
+    # quant epilogue can independently write the native payload GEMM2 reads.
+    # Direct callers that omit the flag retain the historical coupled layout.
+    if quant_payload_preshuffled < 0:
+        quant_payload_preshuffled = int(
+            bool(a_preshuffled and stage1_quant_out and stage1_act)
+        )
+    assert quant_payload_preshuffled in (0, 1)
+    assert not quant_payload_preshuffled or (
+        a_is_fp4 and stage1_quant_out and stage1_act
     )
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
@@ -323,6 +335,7 @@ def launch_gemm_a8w4_tdm(
         num_buffers,
         a_is_fp4,
         a_preshuffled,
+        quant_payload_preshuffled,
         n_experts,
         stage1_act,
         has_bias,
@@ -397,6 +410,10 @@ def launch_gemm_a8w4_tdm(
     checked_recip_expert = (pinned_fp4_prefill or
                             (use_spec_prefill_opt and explicit_vgpr_partition
                              and stage1_act == 1 and bool(stage1_quant_out))) and 1 < n_experts <= 65536
+    compact_skip_empty_wave = all((bool(explicit_vgpr_partition), bool(a_is_fp4),
+                                  bool(row_major_ascale), tmnk256_wpmn2_b4,
+                                  cluster_m == 1, stage1_act == 1,
+                                  bool(stage1_quant_out), K == 5120))
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -513,6 +530,8 @@ def launch_gemm_a8w4_tdm(
     _a_layout = "_apre" if a_preshuffled else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
+    if quant_payload_preshuffled and not a_preshuffled:
+        _qout += "_qapre"
     assert has_bias in (0, 1, 2, 3), "has_bias: 0 none, 1 bf16, 2 fp32, 3 fp16"
     _bias = {0: "", 1: "_bias", 2: "_biasf32", 3: "_biasf16"}[has_bias]
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
@@ -1512,6 +1531,10 @@ def launch_gemm_a8w4_tdm(
 
         def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False, active_m_rep=wmma_m_rep):
             """Load one k128 from precomputed LDS bases into ``slot``."""
+            # A wholly invalid wave has no A/B/scale consumers, but still
+            # participates in every owner TDM operation and pipeline fence.
+            if const_expr(active_m_rep == 0):
+                return
             sa_pairs = (active_m_rep + 1) // 2
             SA_WIDTH = max(2, sa_pairs)
             if const_expr(interleaved_m_rows and active_m_rep == 8
@@ -1616,6 +1639,10 @@ def launch_gemm_a8w4_tdm(
                 issue_fn()
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
+            if const_expr(active_m_rep == 0):
+                if const_expr(reuse_cur_rmem):
+                    load_nxt_fn()
+                return
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
             mma_rows(
                 FRONT,
@@ -1666,7 +1693,7 @@ def launch_gemm_a8w4_tdm(
             active_m_rep, rmem_slots, alternate_b1, ring_addresses = state
             compute_n_acc = active_m_rep * wmma_n_rep
             compute_state_ds = (active_m_rep * DS_A + wmma_n_rep * DS_B
-                                + sb_pairs + (active_m_rep + 1) // 2) if use_spec_prefill_opt else STATE_DS
+                                + sb_pairs + (active_m_rep + 1) // 2) if (use_spec_prefill_opt or active_m_rep != wmma_m_rep) else STATE_DS
             lds_addr = (ring_addresses[buf] if const_expr(resident_ring_addresses)
                         else calc_lds_addr(buf))
             next_stage_lds_addr = (
@@ -1694,6 +1721,10 @@ def launch_gemm_a8w4_tdm(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
+                if const_expr(active_m_rep == 0):
+                    if const_expr(prefetch_kt is not None and ksl + 1 == kws):
+                        rocdl.sched_vmem(TDM_PER)
+                    return
                 has_next = ksl + 1 < kws or (
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
@@ -2122,6 +2153,20 @@ def launch_gemm_a8w4_tdm(
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=6)
                 else:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=7)
+            elif const_expr(a_is_fp4 and tmnk256_wpmn2_b4 and cluster_m == 1
+                            and K in (5120, 2304)):
+                # Every wave still executes the full TDM/barrier protocol.
+                # Only 16-row WMMA blocks wholly past the expert end are omitted.
+                if wmb + 4 * M_ROW_STEP >= mn_oob:
+                    if const_expr(compact_skip_empty_wave):
+                        if wmb >= mn_oob:
+                            run_mainloop(bool(interleaved_lds_load_on), m_reps=0)
+                        else:
+                            run_mainloop(bool(interleaved_lds_load_on), m_reps=4)
+                    else:
+                        run_mainloop(bool(interleaved_lds_load_on), m_reps=4)
+                else:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=8)
             else:
                 run_mainloop(bool(interleaved_lds_load_on))
 
@@ -2209,7 +2254,7 @@ def launch_gemm_a8w4_tdm(
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
 
                 def quant_byte_offset(row, col):
-                    if const_expr(a_preshuffled):
+                    if const_expr(quant_payload_preshuffled):
                         # TDM reads dense LDS tiles. Stage each K32 slab as
                         # contiguous M16 x 16B, without row padding.
                         return (
@@ -2700,7 +2745,7 @@ def launch_gemm_a8w4_tdm(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
-                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                if const_expr(quant_payload_preshuffled and stage1_quant_out and stage1_act):
                     # M is allocated in complete M16 blocks. The final block's
                     # padding rows are unused, so transfer whole K32/M16 slabs.
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
@@ -2846,8 +2891,8 @@ def launch_gemm_a8w4_tdm(
     launch_kernel = kernel if persistent_workers else gemm_task
     launch_args = kargs if persistent_workers else kargs + (0, 0)
     if cluster_m > 1 or cluster_n > 1:
-        # Geometry must reach BOTH the definition and the launch site, or the
-        # cluster never forms and the TDM loads silently fall back to per-load.
+        # Fixed cluster dimensions are embedded in the kernel metadata. Use the
+        # normal launch path so clustered kernels participate in HIP graph capture.
         launch_kernel(
             *launch_args,
             value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
@@ -2855,7 +2900,6 @@ def launch_gemm_a8w4_tdm(
             grid=grid,
             block=(block, 1, 1),
             stream=stream,
-            cluster=(cluster_n, cluster_m, 1),
         )
     else:
         launch_kernel(*launch_args).launch(

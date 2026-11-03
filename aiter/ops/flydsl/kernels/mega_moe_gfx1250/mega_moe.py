@@ -539,6 +539,7 @@ class MegaMoEConfig:
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    source_topk_ids: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -1740,6 +1741,7 @@ class MegaMoEGfx1250:
         routing = Routing(
             token_count=token_count,
             reverse_source_view=reverse_source_view,
+            source_topk_ids=topk_ids,
         )
         return (
             self._recv_tokens(),
@@ -1805,6 +1807,9 @@ class MegaMoEGfx1250:
             self._combine_output.data_ptr(),
             routing.token_count,
             stream,
+            routing.source_topk_ids.data_ptr()
+            if routing.source_topk_ids is not None
+            else 0,
         )
         count = routing.token_count
         return (
