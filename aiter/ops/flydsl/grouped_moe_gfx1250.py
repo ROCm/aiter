@@ -1817,8 +1817,10 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
-            _tdm_kw["k_waves1"] = _as_int(cfg_row.get("k_waves1"), 1)
-            _tdm_kw["k_waves2"] = _as_int(cfg_row.get("k_waves2"), 1)
+            # The model_configs/ merge fills a column an older table lacks
+            # (e.g. kimik3tp8) with 0, so a k_waves below 1 means unset.
+            _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("k_waves1"), 1))
+            _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("k_waves2"), 1))
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)

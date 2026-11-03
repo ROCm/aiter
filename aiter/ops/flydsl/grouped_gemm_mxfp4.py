@@ -186,7 +186,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
-    k_waves = int(k_waves)
+    k_waves = max(1, int(k_waves))
     if k_waves > 1 and (k_tiles % k_waves or K % tile_k or stage2_scatter is not None):
         k_waves = 1
     num_buffers = min(num_buffers, max(1, k_tiles // k_waves))
