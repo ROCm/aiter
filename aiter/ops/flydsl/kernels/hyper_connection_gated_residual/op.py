@@ -4,9 +4,12 @@
 """Two-stage Gated-Residual ``combine_and_mix`` op.
 
 The fused two-stage kernel uses ``K1`` for combine + grouped-RMSNorm + down GEMM
-(:func:`~.k1.flydsl_k1_combine_norm_down`) and ``K2`` for SiLU + up GEMM + gated
-mean (:func:`~.k2.flydsl_up_gate_mix_norm`). K2 re-forms ``xn`` from stored
-``r2``, so ``xn`` never touches HBM.
++ SiLU (:func:`~.k1.flydsl_k1_combine_norm_down`) and ``K2`` for the up GEMM +
+gated mean (:func:`~.k2.flydsl_up_gate_mix_norm`). K2 re-forms ``xn`` from
+stored ``r2``, so ``xn`` never touches HBM.
+
+Every entry point accepts an optional ``stream``. All temporaries, including a
+merged/folded weight built on the fly, are created on that stream.
 """
 
 from __future__ import annotations
@@ -16,14 +19,22 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .common import merge_down_inject, split_down_inject
+from .common import (
+    check_norm_weight,
+    check_tensor,
+    merge_down_inject,
+    split_down_inject,
+    stream_scope,
+)
 from .k1 import (
     DECODE_MAX_M,
     _build_combine_rms,
-    flydsl_k1_combine_norm_down,
+    _k1_combine_norm_down,
     flydsl_k1k2_skinny_decode,
+    skinny_decode_supported,
+    validate_k1_inputs,
 )
-from .k2 import _validate_w_up, flydsl_up_gate_mix_norm
+from .k2 import _up_gate_mix_norm, _validate_w_up
 
 
 def _merged_pad(width: int) -> int:
@@ -42,7 +53,9 @@ def merge_gr_two_stage_weight(
     weight is just ``w_down`` zero-padded to a 64-multiple. A model stores this
     once and passes it as ``w_down_merged`` to keep the merge off the timed path.
     """
-    lowrank = w_down.shape[0]
+    if w_down.ndim != 2:
+        raise ValueError("w_down must be 2-D [lowrank, hidden]")
+    lowrank, hidden = w_down.shape
     if w_inject is None:
         n_pad = _merged_pad(lowrank)
         merged = torch.zeros(
@@ -50,7 +63,15 @@ def merge_gr_two_stage_weight(
         )
         merged[:lowrank] = w_down
         return merged
-    return merge_down_inject(w_down, w_inject, _merged_pad(lowrank + w_inject.shape[0]))
+    check_tensor(
+        "w_inject",
+        w_inject,
+        (hc_count, hidden),
+        w_down.device,
+        dtype=w_down.dtype,
+        contiguous=False,
+    )
+    return merge_down_inject(w_down, w_inject, _merged_pad(lowrank + hc_count))
 
 
 def fold_norm_weight(
@@ -63,6 +84,9 @@ def fold_norm_weight(
     (shared across streams) or the full ``[hidden]``.
     """
     hidden = w_down_merged.shape[1]
+    if hc_count <= 0 or hidden % hc_count:
+        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
+    check_norm_weight(norm_weight, hidden // hc_count, hidden, w_down_merged.device)
     w = norm_weight.reshape(-1).float()
     w_full = w.repeat(hidden // w.numel()) if w.numel() != hidden else w
     return (
@@ -88,10 +112,33 @@ def _resolve_merged(w_down, w_inject, w_down_merged, norm_weight, hc_count, fold
     return fold_norm_weight(merged, norm_weight, hc_count) if fold_w else merged
 
 
+def _validate_mix_inputs(
+    residual,
+    block_output,
+    injection,
+    norm_weight,
+    w_up,
+    merged,
+    lowrank,
+    hc_count,
+    need_inj,
+):
+    """Validate every tensor before dispatch so skinny and tiled paths agree."""
+    validate_k1_inputs(
+        residual, block_output, injection, norm_weight, merged, lowrank, hc_count
+    )
+    _validate_w_up(w_up, residual.shape[1], lowrank, residual.device)
+    if need_inj and merged.shape[0] < lowrank + hc_count:
+        raise ValueError(
+            f"w_down_merged has {merged.shape[0]} rows; the inject columns need "
+            f"lowrank + hc_count = {lowrank + hc_count}"
+        )
+
+
 def _k1_then_k2(
     residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection: torch.Tensor,
+    block_output: torch.Tensor | None,
+    injection: torch.Tensor | None,
     norm_weight: torch.Tensor,
     w_up: torch.Tensor,
     w_down_merged: torch.Tensor,
@@ -99,7 +146,7 @@ def _k1_then_k2(
     hc_count: int,
     eps: float,
     need_inj: bool,
-    stream: torch.cuda.Stream | None,
+    stream: int,
     fold_w: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Fully-fused two-stage: K1 (combine+norm+down) then K2 (up + gated mean),
@@ -107,13 +154,24 @@ def _k1_then_k2(
 
     K1 emits ``(r2, packed)`` plus the per-stream ``rrms``; K2 rebuilds
     ``xn = r2*rrms*(1+w)`` on the fly -- so neither ``xn`` nor an interim
-    norm-rebuild launch ever exists.
+    norm-rebuild launch ever exists. ``block_output=None`` skips the combine.
+
+    Inputs are validated and ``stream`` is current; see the public entry points.
     """
-    tokens = residual.shape[0]
-    _validate_w_up(w_up, residual.shape[1], lowrank, residual.device)
+    tokens, hidden = residual.shape
+    if tokens == 0:
+        r2 = residual if block_output is None else residual.new_empty(0, hidden)
+        block_input = residual.new_empty(0, hidden // hc_count)
+        inj_next = residual.new_empty(0, hc_count) if need_inj else None
+        return r2, block_input, inj_next
     # The skinny path avoids row padding and requires the folded down weight.
-    # Limit it to DECODE_MAX_M because each lane holds one accumulator per row.
-    if fold_w and 1 <= tokens <= DECODE_MAX_M:
+    # Limit it to DECODE_MAX_M because each lane holds one accumulator per row;
+    # shapes its builders cannot tile use the tiled path.
+    if (
+        fold_w
+        and tokens <= DECODE_MAX_M
+        and skinny_decode_supported(hidden, w_down_merged.shape[0], hc_count, lowrank)
+    ):
         return flydsl_k1k2_skinny_decode(
             residual,
             block_output,
@@ -133,21 +191,20 @@ def _k1_then_k2(
     pad_tokens = ((tokens + PAD - 1) // PAD) * PAD
     gemm_pad = None if pad_tokens == tokens else pad_tokens
     rrms = residual.new_empty((pad_tokens, hc_count), dtype=torch.float32)
-    r2, packed = flydsl_k1_combine_norm_down(
+    # K1 reads a strided injection (the previous layer's inj_next view) directly.
+    r2, packed = _k1_combine_norm_down(
         residual,
         block_output,
-        # The skinny path returns inj_next as a strided view; K1 reads it
-        # contiguous.
-        injection.contiguous(),
+        injection,
         norm_weight,
         w_down_merged,
         lowrank,
         hc_count,
         eps,
+        stream,
         rrms_out=rrms,
         fold_w=fold_w,
         gemm_pad=gemm_pad,
-        stream=stream,
     )
     # Views, not copies: K2 reads lora with K1's packed row stride (only the
     # inner lowrank dim must be contiguous), and the next layer's prologue reads
@@ -157,9 +214,7 @@ def _k1_then_k2(
         lora, inj_next = split_down_inject(packed, lowrank, hc_count)
     else:
         lora, inj_next = packed[:, :lowrank], None
-    block_input = flydsl_up_gate_mix_norm(
-        lora, r2, rrms, norm_weight, w_up, hc_count, stream=stream
-    )
+    block_input = _up_gate_mix_norm(lora, r2, rrms, norm_weight, w_up, hc_count, stream)
     if gemm_pad is not None:
         r2, block_input = r2[:tokens], block_input[:tokens]
         inj_next = inj_next[:tokens] if inj_next is not None else None
@@ -191,23 +246,37 @@ def flydsl_gr_two_stage_combine_and_mix(
     build it. ``fold_w=False`` (default) applies the affine inside K1.
     """
     lowrank = w_down.shape[0]
-    merged = _resolve_merged(
-        w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
-    )
-    return _k1_then_k2(
-        residual,
-        block_output,
-        injection,
-        norm_weight,
-        w_up,
-        merged,
-        lowrank,
-        hc_count,
-        eps,
-        w_inject is not None,
-        stream,
-        fold_w=fold_w,
-    )
+    need_inj = w_inject is not None
+    ctx, stream = stream_scope(stream, residual.device)
+    with ctx:
+        merged = _resolve_merged(
+            w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
+        )
+        _validate_mix_inputs(
+            residual,
+            block_output,
+            injection,
+            norm_weight,
+            w_up,
+            merged,
+            lowrank,
+            hc_count,
+            need_inj,
+        )
+        return _k1_then_k2(
+            residual,
+            block_output,
+            injection,
+            norm_weight,
+            w_up,
+            merged,
+            lowrank,
+            hc_count,
+            eps,
+            need_inj,
+            stream,
+            fold_w=fold_w,
+        )
 
 
 def flydsl_gr_two_stage_mix(
@@ -224,31 +293,33 @@ def flydsl_gr_two_stage_mix(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """No pending combine: normalize ``residual`` directly, then mix.
 
-    Returns ``(residual, block_input, inj_next)``. A zero block output lets the
-    fused path normalize and mix without changing the residual.
+    Returns ``(residual, block_input, inj_next)``. The kernels skip the combine,
+    so no block output or injection is read and no ``r2`` copy is written.
     """
     lowrank = w_down.shape[0]
-    tokens, hidden = residual.shape
-    stream_dim = hidden // hc_count
-    zero_y = residual.new_zeros((tokens, stream_dim))
-    zero_inj = residual.new_zeros((tokens, hc_count))
-    merged = _resolve_merged(
-        w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
-    )
-    _r2, block_input, inj_next = _k1_then_k2(
-        residual,
-        zero_y,
-        zero_inj,
-        norm_weight,
-        w_up,
-        merged,
-        lowrank,
-        hc_count,
-        eps,
-        w_inject is not None,
-        stream,
-        fold_w=fold_w,
-    )
+    need_inj = w_inject is not None
+    ctx, stream = stream_scope(stream, residual.device)
+    with ctx:
+        merged = _resolve_merged(
+            w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
+        )
+        _validate_mix_inputs(
+            residual, None, None, norm_weight, w_up, merged, lowrank, hc_count, need_inj
+        )
+        _r2, block_input, inj_next = _k1_then_k2(
+            residual,
+            None,
+            None,
+            norm_weight,
+            w_up,
+            merged,
+            lowrank,
+            hc_count,
+            eps,
+            need_inj,
+            stream,
+            fold_w=fold_w,
+        )
     return residual, block_input, inj_next
 
 
@@ -266,31 +337,33 @@ def flydsl_gr_two_stage_combine(
     Runs K1's combine+RMS prologue and keeps only ``r2``. ``norm_weight`` is
     unused because the combine result is not normalized.
     """
+    if residual.ndim != 2 or residual.dtype != torch.bfloat16:
+        raise ValueError("residual must be a 2-D bf16 tensor")
+    if not residual.is_contiguous():
+        raise ValueError("residual must be row-major contiguous")
     tokens, hidden = residual.shape
+    if hc_count <= 0 or hidden % hc_count:
+        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
     stream_dim = hidden // hc_count
-    if injection.dtype != torch.bfloat16 or injection.stride(-1) != 1:
-        raise ValueError("injection must be bf16 with a contiguous inner dimension")
-    if injection.shape != (tokens, hc_count):
-        raise ValueError(
-            f"injection must have shape ({tokens}, {hc_count}), "
-            f"got {tuple(injection.shape)}"
+    dev = residual.device
+    check_tensor("block_output", block_output, (tokens, stream_dim), dev)
+    check_tensor("injection", injection, (tokens, hc_count), dev, contiguous=False)
+    if injection.stride(-1) != 1:
+        raise ValueError("injection must have a contiguous inner dimension")
+    ctx, stream = stream_scope(stream, dev)
+    with ctx:
+        r2 = torch.empty_like(residual)
+        if tokens == 0:
+            return r2
+        rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
+        inj_stride = injection.stride(0) if tokens > 1 else hc_count
+        launch = _build_combine_rms(
+            hc_count,
+            stream_dim,
+            float(eps),
+            0 if inj_stride == hc_count else inj_stride,
         )
-    if injection.device != residual.device:
-        raise ValueError(
-            f"injection must be on {residual.device}, got {injection.device}"
+        _run_compiled(
+            launch, residual, block_output, injection, r2, rrms, fx.Stream(stream)
         )
-    if stream is None:
-        stream = torch.cuda.current_stream()
-    r2 = torch.empty_like(residual)
-    rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=residual.device)
-    inj_stride = injection.stride(0) if tokens > 1 else hc_count
-    launch = _build_combine_rms(
-        hc_count,
-        stream_dim,
-        float(eps),
-        0 if inj_stride == hc_count else inj_stride,
-    )
-    _run_compiled(
-        launch, residual, block_output, injection, r2, rrms, fx.Stream(stream)
-    )
     return r2

@@ -23,6 +23,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import (
     flydsl_gr_two_stage_combine_and_mix,
     flydsl_gr_two_stage_mix,
     flydsl_k1_combine_norm_down,
+    flydsl_up_gate_mix_norm,
     fold_norm_weight,
     gr_combine,
     gr_combine_and_mix,
@@ -42,15 +43,38 @@ EPS = 1e-6
 _FAILURES = []
 
 
-def _check(ref, out, label, atol=0.06, rtol=0.05, max_err_ratio=0.03):
+def _check(ref, out, label, atol=0.06, rtol=0.05):
+    """Every element must be within ``atol + rtol * |ref|``.
+
+    No mismatch budget: a wrong row or column is a small fraction of a large
+    output and would hide inside a ratio threshold.
+    """
+    if out.shape != ref.shape:
+        print(f"[FAIL] {label}: shape {tuple(out.shape)} != {tuple(ref.shape)}")
+        _FAILURES.append(label)
+        return
     if out.isnan().any() or out.isinf().any():
         print(f"[FAIL] {label}: output has NaN/Inf")
         _FAILURES.append(label)
         return
     err = checkAllclose(ref, out, msg=label, atol=atol, rtol=rtol)
-    if not (err == 0 or err <= max_err_ratio):
-        print(f"[FAIL] {label}: mismatch ratio {err} > {max_err_ratio}")
+    if err != 0:
+        bad = (out.float() - ref.float()).abs() > atol + rtol * ref.float().abs()
+        rows = bad.reshape(bad.shape[0], -1).any(-1).nonzero().flatten()
+        print(
+            f"[FAIL] {label}: mismatch ratio {err} in {rows.numel()} row(s), "
+            f"first {rows[:8].tolist()}"
+        )
         _FAILURES.append(label)
+
+
+def _expect_value_error(label, fn):
+    try:
+        fn()
+    except ValueError:
+        return
+    print(f"[FAIL] {label}: expected ValueError")
+    _FAILURES.append(label)
 
 
 def _make_inputs(tokens, *, with_inject=True, full_norm=False, seed=0):
@@ -239,8 +263,9 @@ def _run_w_up_validation():
         "noncontiguous": inp["w_up"].t().contiguous().t(),
     }
     for label, w_up in bad_weights.items():
-        try:
-            flydsl_gr_two_stage_combine_and_mix(
+        _expect_value_error(
+            f"w_up_validation[{label}]",
+            lambda w_up=w_up: flydsl_gr_two_stage_combine_and_mix(
                 inp["residual"],
                 inp["block_output"],
                 inp["injection"],
@@ -250,11 +275,226 @@ def _run_w_up_validation():
                 inp["w_inject"],
                 HC,
                 EPS,
+            ),
+        )
+
+
+def _cmix_call(inp, **overrides):
+    args = dict(inp)
+    args.update(overrides)
+    fold_w = args.pop("fold_w", True)
+    return lambda: flydsl_gr_two_stage_combine_and_mix(
+        args["residual"],
+        args["block_output"],
+        args["injection"],
+        args["norm_weight"],
+        args["w_down"],
+        args["w_up"],
+        args["w_inject"],
+        HC,
+        EPS,
+        fold_w=fold_w,
+    )
+
+
+def _run_input_validation():
+    """Malformed shapes must raise before any kernel reads past a buffer."""
+    for tokens in (1, 64):  # skinny decode and tiled dispatch
+        inp = _make_inputs(tokens, seed=21)
+        cases = {
+            # One inject row short: the old merge zero-filled it silently.
+            "short_w_inject": {"w_inject": inp["w_inject"][: HC - 1]},
+            "w_inject_dtype": {"w_inject": inp["w_inject"].float()},
+            # Neither HS (shared) nor HC*HS (per stream).
+            "norm_2xHS": {"norm_weight": inp["norm_weight"].repeat(2)},
+            "block_output_short": {"block_output": inp["block_output"][:, :-8]},
+            "injection_narrow": {"injection": inp["injection"][:, : HC - 1]},
+            "residual_rows": {"residual": inp["residual"][:-1]},
+        }
+        for name, overrides in cases.items():
+            for fold_w in (False, True):
+                _expect_value_error(
+                    f"validation[{name}][M={tokens}][fold={fold_w}]",
+                    _cmix_call(inp, fold_w=fold_w, **overrides),
+                )
+        merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+        _expect_value_error(
+            f"validation[fold_norm_2xHS][M={tokens}]",
+            lambda m=merged, w=inp["norm_weight"]: fold_norm_weight(m, w.repeat(2), HC),
+        )
+    inp = _make_inputs(1, seed=22)
+    _expect_value_error(
+        "validation[merge_short_w_inject]",
+        lambda: merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"][:1], HC),
+    )
+
+
+def _run_zero_tokens():
+    """``M=0`` returns correctly shaped empty outputs without launching."""
+    inp = _make_inputs(0, seed=23)
+    hidden = HC * HS
+    for fold_w in (False, True):
+        r2, x, inj = _cmix_call(inp, fold_w=fold_w)()
+        mr2, mx, minj = flydsl_gr_two_stage_mix(
+            inp["residual"],
+            inp["norm_weight"],
+            inp["w_down"],
+            inp["w_up"],
+            inp["w_inject"],
+            HC,
+            EPS,
+            fold_w=fold_w,
+        )
+        got = [t.shape for t in (r2, x, inj, mr2, mx, minj)]
+        want = [(0, hidden), (0, HS), (0, HC)] * 2
+        if got != [torch.Size(s) for s in want]:
+            print(f"[FAIL] zero_tokens[fold={fold_w}]: shapes {got}")
+            _FAILURES.append(f"zero_tokens[fold={fold_w}]")
+    r2 = flydsl_gr_two_stage_combine(
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        HC,
+        EPS,
+    )
+    if r2.shape != (0, hidden):
+        print(f"[FAIL] zero_tokens[combine]: shape {tuple(r2.shape)}")
+        _FAILURES.append("zero_tokens[combine]")
+
+
+def _run_k2_override_limits():
+    """Explicit K2 tiles beyond workgroup/LDS limits must be rejected."""
+    tokens = 256
+    lora = torch.randn(tokens, LOWRANK, device="cuda").bfloat16()
+    r2 = torch.randn(tokens, HC * HS, device="cuda").bfloat16()
+    rrms = torch.ones(tokens, HC, device="cuda")
+    norm_weight = torch.zeros(HS, device="cuda").bfloat16()
+    w_up = torch.randn(HC * HS, LOWRANK, device="cuda").bfloat16()
+    cases = {
+        "threads": {"block_m": 256, "block_n": 64, "m_waves": 8, "n_waves": 4},
+        "lds": {"block_m": 256, "block_n": 256, "m_waves": 1, "n_waves": 1},
+        "tiling": {"block_m": 64, "block_n": 24, "m_waves": 1, "n_waves": 1},
+    }
+    for name, cfg in cases.items():
+        _expect_value_error(
+            f"k2_override[{name}]",
+            lambda cfg=cfg: flydsl_up_gate_mix_norm(
+                lora, r2, rrms, norm_weight, w_up, HC, **cfg
+            ),
+        )
+
+
+def _run_side_stream_pressure():
+    """Temporaries must belong to the launch stream, not the ambient stream.
+
+    The side stream is held behind a busy kernel, then the ambient stream
+    allocates and poisons memory. Temporaries mistakenly owned by the ambient
+    stream are recycled into the poison buffers, which the delayed kernels then
+    overwrite. The ambient stream is not the legacy default stream, which would
+    implicitly wait for the side stream and hide the race.
+    """
+    ambient, side = torch.cuda.Stream(), torch.cuda.Stream()
+    for tokens in (4, 64):  # skinny decode and tiled K1/K2
+        inp = _make_inputs(tokens, seed=24)
+        merged = _merged(inp, True)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(ambient):
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(50_000_000)
+            out = flydsl_gr_two_stage_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                HC,
+                EPS,
+                w_down_merged=merged,
+                fold_w=True,
+                stream=side,
             )
-        except ValueError:
-            continue
-        print(f"[FAIL] w_up_validation[{label}]: expected ValueError")
-        _FAILURES.append(f"w_up_validation[{label}]")
+            poison = [
+                torch.full((n,), float("nan"), device="cuda")
+                for n in (1 << k for k in range(4, 23))
+                for _ in range(4)
+            ]
+        torch.cuda.synchronize()
+        label = f"side_stream[M={tokens}]"
+        if not all(p.isnan().all() for p in poison):
+            print(f"[FAIL] {label}: launch-stream writes hit recycled memory")
+            _FAILURES.append(f"{label} recycled")
+        del poison
+        r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+        r2, x, inj = out
+        _check(r2_ref.to(r2.dtype), r2, f"{label} r2", atol=0.05, rtol=0.02)
+        _check(x_ref.to(x.dtype), x, f"{label} x")
+        _check(inj_ref.to(inj.dtype), inj.contiguous(), f"{label} inj", atol=0.05)
+
+
+def _make_shape_inputs(tokens, hc_count, stream_dim, seed):
+    torch.manual_seed(seed)
+    hidden = hc_count * stream_dim
+
+    def _rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device="cuda") * scale).bfloat16()
+
+    return {
+        "residual": _rand(tokens, hidden),
+        "block_output": _rand(tokens, stream_dim),
+        "injection": _rand(tokens, hc_count),
+        "norm_weight": _rand(stream_dim, scale=0.1),
+        "w_down": _rand(LOWRANK, hidden, scale=hidden**-0.5),
+        "w_up": _rand(hidden, LOWRANK, scale=LOWRANK**-0.5),
+        "w_inject": _rand(hc_count, hidden, scale=hidden**-0.5),
+    }
+
+
+def _run_untuned_hidden():
+    """Tuned plans are keyed by tokens only; another hidden must still work.
+
+    ``hidden = 2 * 2560`` hits entries measured for ``hidden = 4 * 2560``; any
+    plan that cannot tile it must fall back to the heuristic.
+    """
+    hc_count = 2
+    for tokens in (1, 64, 512):
+        inp = _make_shape_inputs(tokens, hc_count, HS, seed=25)
+        for fold_w in (False, True):
+            merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], hc_count)
+            if fold_w:
+                merged = fold_norm_weight(merged, inp["norm_weight"], hc_count)
+            r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                hc_count,
+                EPS,
+                w_down_merged=merged,
+                fold_w=fold_w,
+            )
+            torch.cuda.synchronize()
+            r2_ref, x_ref, inj_ref = gr_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                hc_count,
+                EPS,
+                round_bf16=True,
+            )
+            label = f"hc2[fold={fold_w}][M={tokens}]"
+            _check(r2_ref.to(r2.dtype), r2, f"{label} r2", atol=0.05, rtol=0.02)
+            _check(x_ref.to(x.dtype), x, f"{label} x")
+            _check(inj_ref.to(inj.dtype), inj.contiguous(), f"{label} inj", atol=0.05)
 
 
 def _make_hc_inputs(tokens, hc_count, seed):
@@ -545,6 +785,11 @@ def main():
     _run_combine(64)
     _run_strided_combine()
     _run_w_up_validation()
+    _run_input_validation()
+    _run_zero_tokens()
+    _run_k2_override_limits()
+    _run_side_stream_pressure()
+    _run_untuned_hidden()
     _run_counter_hc_isolation()
     for m in args.decode_tokens:
         # Unfolded decode uses the padded tail because skinny K1 requires folding.

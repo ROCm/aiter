@@ -25,33 +25,68 @@ import torch
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
+    check_norm_weight,
+    check_tensor,
     mfma_bf16,
     norm_weight_f32,
+    stream_scope,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
     up_gate_mix_config,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
 
+VEC = 8
+# Per-lane register file on CDNA3/CDNA4 (256 arch VGPRs + 256 AGPRs).
+_MAX_REGS_PER_LANE = 512
+_MAX_BLOCK_THREADS = 1024
+
 
 def _validate_w_up(
     w_up: torch.Tensor, hidden: int, lowrank: int, device: torch.device
 ) -> None:
-    """Reject tensors the generated row-major bf16 view cannot represent."""
-    if w_up.device != device:
-        raise ValueError(f"w_up must be on {device}, got {w_up.device}")
-    if w_up.dtype != torch.bfloat16:
-        raise ValueError(f"w_up must have dtype torch.bfloat16, got {w_up.dtype}")
-    if w_up.ndim != 2 or w_up.shape != (hidden, lowrank):
-        raise ValueError(
-            f"w_up must have shape ({hidden}, {lowrank}), got {tuple(w_up.shape)}"
-        )
-    if not w_up.is_contiguous():
-        raise ValueError("w_up must be row-major contiguous")
+    check_tensor("w_up", w_up, (hidden, lowrank), device)
+
+
+@lru_cache(maxsize=256)
+def _k2_tile_error(
+    arch, stream_dim, lowrank, block_m, block_n, m_waves, n_waves
+) -> str | None:
+    """Why a K2 tile cannot be built or launched for this shape, else ``None``.
+
+    Covers tiling divisibility plus the workgroup, LDS and register limits.
+    """
+    if min(block_m, block_n, m_waves, n_waves) <= 0:
+        return "tile sizes and wave counts must be positive"
+    mma = mfma_bf16(arch)
+    block_threads = m_waves * n_waves * 64
+    if block_m % (m_waves * mma.mma_m) or block_n % (n_waves * mma.mma_n):
+        return "block_m/block_n must be multiples of waves * MFMA tile"
+    if lowrank % mma.mma_k or stream_dim % block_n or block_n % VEC:
+        return "lowrank, stream_dim and block_n must tile evenly"
+    if (block_m * (block_n // VEC)) % block_threads:
+        return "the gated-mean tile must divide evenly across threads"
+    if block_threads > _MAX_BLOCK_THREADS:
+        return f"{block_threads} threads exceed {_MAX_BLOCK_THREADS}"
+    lds_bytes = block_m * block_n * 4
+    lds_cap = get_lds_capacity_bytes(arch)
+    if lds_bytes > lds_cap:
+        return f"the gate tile needs {lds_bytes} B LDS > {lds_cap} B"
+    # Each lane holds its A and B fragments (bf16, two per register), its gate
+    # fragment and the gated-mean accumulators (f32).
+    a_regs = block_m * lowrank // (m_waves * 64) // 2
+    b_regs = block_n * lowrank // (n_waves * 64) // 2
+    gate_regs = block_m * block_n // block_threads
+    acc_regs = (block_m * (block_n // VEC) // block_threads) * VEC
+    regs = a_regs + b_regs + gate_regs + acc_regs
+    if regs > _MAX_REGS_PER_LANE:
+        return f"~{regs} registers per lane > {_MAX_REGS_PER_LANE}"
+    return None
 
 
 @lru_cache(maxsize=16)
@@ -88,7 +123,6 @@ def _build_up_gate_mix_norm(
     assert lowrank % mma_k == 0
     assert stream_dim % block_n == 0
     n_cblocks = stream_dim // block_n
-    VEC = 8
     assert block_n % VEC == 0
     assert (block_m * (block_n // VEC)) % block_threads == 0
 
@@ -294,14 +328,73 @@ def flydsl_up_gate_mix_norm(
     hidden = r2.shape[1]
     stream_dim = hidden // hc_count
     _validate_w_up(w_up, hidden, lowrank, lora.device)
+    check_norm_weight(norm_weight, stream_dim, hidden, lora.device)
     assert rrms.shape == (tokens, hc_count)
+    ctx, stream = stream_scope(stream, lora.device)
+    with ctx:
+        return _up_gate_mix_norm(
+            lora,
+            r2,
+            rrms,
+            norm_weight,
+            w_up,
+            hc_count,
+            stream,
+            block_input,
+            block_m,
+            block_n,
+            m_waves,
+            n_waves,
+            _skip_norm,
+            _skip_gemm,
+        )
+
+
+def _up_gate_mix_norm(
+    lora: torch.Tensor,
+    r2: torch.Tensor,
+    rrms: torch.Tensor,
+    norm_weight: torch.Tensor,
+    w_up: torch.Tensor,
+    hc_count: int,
+    stream: int,
+    block_input: torch.Tensor | None = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    m_waves: int | None = None,
+    n_waves: int | None = None,
+    _skip_norm: bool = False,
+    _skip_gemm: bool = False,
+) -> torch.Tensor:
+    """K2 body for validated inputs; ``stream`` is the raw handle of the current stream."""
+    tokens, lowrank = lora.shape
+    hidden = r2.shape[1]
+    stream_dim = hidden // hc_count
+    if block_input is None:
+        block_input = torch.empty(
+            tokens, stream_dim, dtype=torch.bfloat16, device=lora.device
+        )
+    if tokens == 0:
+        return block_input
     w_bf16 = norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
     w = norm_weight.reshape(-1) if w_bf16 else norm_weight_f32(norm_weight)
     w_len = w.numel()
-    assert w_len in (stream_dim, hidden)
 
     arch = arch_name(lora.device)
+    mma = mfma_bf16(arch)
     tuned = up_gate_mix_config(arch, tokens, lora.stride(0))
+    # The table is keyed by token count and packed width only; drop entries
+    # whose tile does not fit this stream width, low rank or the device limits.
+    if tuned and _k2_tile_error(
+        arch,
+        stream_dim,
+        lowrank,
+        tuned["block_m"],
+        tuned["block_n"],
+        tuned["m_waves"],
+        tuned["n_waves"],
+    ):
+        tuned = None
     block_m, block_n, m_waves, n_waves = _resolve_up_gate_cfg(
         tuned,
         tokens,
@@ -311,14 +404,10 @@ def flydsl_up_gate_mix_norm(
         n_waves,
     )
     assert tokens % block_m == 0
-    if block_input is None:
-        block_input = torch.empty(
-            tokens, stream_dim, dtype=torch.bfloat16, device=lora.device
-        )
-    if stream is None:
-        stream = torch.cuda.current_stream()
+    err = _k2_tile_error(arch, stream_dim, lowrank, block_m, block_n, m_waves, n_waves)
+    if err is not None:
+        raise ValueError(f"invalid K2 tile {block_m}x{block_n}: {err}")
 
-    mma = mfma_bf16(arch)
     launch = _build_up_gate_mix_norm(
         hc_count,
         stream_dim,

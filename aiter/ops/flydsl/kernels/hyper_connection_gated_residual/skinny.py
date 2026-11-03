@@ -29,12 +29,16 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
-from aiter.ops.flydsl.kernels.communication_ops_utils import atomic_add_agent
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    atomic_add_agent,
+    fence_acquire,
+    fence_release,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     GTensor,
     _run_compiled,
@@ -73,7 +77,10 @@ def _build_down_fused(
     waves_per_block: int,
     cols_per_wave: int,
     m_groups: int = 1,
+    combine: bool = True,
 ):
+    # combine=False normalizes the residual as-is: block_output/injection are
+    # unread and r2 is not written (the up kernel then reads the residual).
     stream_dim = hidden // hc_count
     cols_per_block = waves_per_block * cols_per_wave
     per_iter = WAVE * DOWN_VEC
@@ -99,7 +106,8 @@ def _build_down_fused(
 
     @flyc.kernel(
         name=f"gr_skinny_down_hc{hc_count}_h{hidden}_np{n_pad}_m{m_rows}"
-        f"_g{m_groups}_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}",
+        f"_g{m_groups}_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}"
+        f"{'' if combine else '_nocomb'}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -135,10 +143,13 @@ def _build_down_fused(
         is_n0 = n0 == fx.Int32(0)
 
         gate = []
-        for m in range_constexpr(m_rows):
-            gm = m_base + m
-            iv = fx.BFloat16(inj_g.load(gm * inj_stride + s, vec_size=1)).to(fx.Float32)
-            gate.append(fx.Float32(2.0) * sigmoid_f32(iv * fx.Float32(inv_hc)))
+        if const_expr(combine):
+            for m in range_constexpr(m_rows):
+                gm = m_base + m
+                iv = fx.BFloat16(inj_g.load(gm * inj_stride + s, vec_size=1)).to(
+                    fx.Float32
+                )
+                gate.append(fx.Float32(2.0) * sigmoid_f32(iv * fx.Float32(inv_hc)))
 
         # One r2 re-form feeds cols_per_wave weight rows.
         acc = [
@@ -172,7 +183,7 @@ def _build_down_fused(
                 y_g.load((m_base + m) * stream_dim + ks[i], vec_size=DOWN_VEC)
                 for m in range_constexpr(m_rows)
             ]
-            for i in range_constexpr(iters)
+            for i in range_constexpr(iters if combine else 0)
         ]
         for i in range_constexpr(iters):
             k = ks[i]
@@ -183,17 +194,20 @@ def _build_down_fused(
             for m in range_constexpr(m_rows):
                 gm = m_base + m
                 off = gm * hidden + s * stream_dim + k
-                rv = fx.Vector(r_raw[i][m]).to(fx.Float32)
-                yv = fx.Vector(y_raw[i][m]).to(fx.Float32)
-                comb = [rv[e] + yv[e] * gate[m] for e in range_constexpr(DOWN_VEC)]
-                cb = fx.Vector.from_elements(comb, dtype=fx.Float32).to(fx.BFloat16)
-                buf_copy_store(
-                    r2_t,
-                    is_n0.select(off, fx.Int32(r2_elems)),
-                    cb,
-                    elem=fx.BFloat16,
-                    unit_elems=DOWN_VEC,
-                )
+                if const_expr(combine):
+                    rv = fx.Vector(r_raw[i][m]).to(fx.Float32)
+                    yv = fx.Vector(y_raw[i][m]).to(fx.Float32)
+                    comb = [rv[e] + yv[e] * gate[m] for e in range_constexpr(DOWN_VEC)]
+                    cb = fx.Vector.from_elements(comb, dtype=fx.Float32).to(fx.BFloat16)
+                    buf_copy_store(
+                        r2_t,
+                        is_n0.select(off, fx.Int32(r2_elems)),
+                        cb,
+                        elem=fx.BFloat16,
+                        unit_elems=DOWN_VEC,
+                    )
+                else:
+                    cb = fx.Vector(r_raw[i][m])
                 cf = cb.to(fx.Float32)
                 for e in range_constexpr(DOWN_VEC):
                     sq[m] = sq[m] + cf[e] * cf[e]
@@ -236,8 +250,14 @@ def _build_down_fused(
                     unit_elems=PART_M,
                     cache_modifier=CPOL_COHERENT,
                 )
-        # Publish the partial before incrementing its arrival counter.
+        # Cross-XCD visibility comes from the hardware protocol: sc0|sc1 partial
+        # stores and loads bypass the non-coherent L2, s_waitcnt drains them
+        # before/after the device-scope atomic. The workgroup fences only stop
+        # the compiler from moving the partial accesses across the atomic.
+        # Agent-scope fences would add buffer_wbl2/buffer_inv and cost 2-4x
+        # decode latency on MI300X.
         rocdl.s_waitcnt(0)
+        fence_release("workgroup")
 
         # One counter per lane of a column, so lanes don't contend on an address.
         # Every lane of the last-arriving wave sees hc-1 (mod hc) on its own slot.
@@ -246,6 +266,7 @@ def _build_down_fused(
         ) * fx.Int64(4)
         arrival = fx.Int32(atomic_add_agent(slot, fx.Int32(1)))
         rocdl.s_waitcnt(0)
+        fence_acquire("workgroup")
         is_last = (arrival & fx.Int32(hc_count - 1)) == fx.Int32(hc_count - 1)
         writer = is_last & (lane == fx.Int32(0))
 
@@ -447,6 +468,25 @@ def _build_up_mix_grouped(
 # Temporary diagnostic override for comparing skinny schedules. It is not a
 # supported tuning knob and may be removed once the schedule is finalized.
 _COLS_PER_WAVE = int(os.environ.get("AITER_GR_SKINNY_COLS_PER_WAVE", "2"))
+
+
+@lru_cache(maxsize=64)
+def skinny_supported(
+    hidden: int, n_pad: int, hc_count: int, lowrank: int, waves_per_block: int = 4
+) -> bool:
+    """Whether both skinny builders accept this shape (mirrors their asserts)."""
+    stream_dim = hidden // hc_count
+    pow2 = hc_count > 0 and hc_count & (hc_count - 1) == 0
+    return (
+        pow2
+        and WAVE % hc_count == 0
+        and stream_dim % (WAVE * DOWN_VEC) == 0
+        and n_pad % (waves_per_block * _COLS_PER_WAVE) == 0
+        and lowrank % ((WAVE // hc_count) * UP_VEC) == 0
+        and stream_dim % waves_per_block == 0
+    )
+
+
 _COUNTERS: dict[tuple[int | None, int, int, int, int], torch.Tensor] = {}
 
 
@@ -454,19 +494,18 @@ def _counters(
     device: torch.device,
     n_pad: int,
     hc_count: int,
-    stream: torch.cuda.Stream,
+    stream: int,
     m_groups: int = 1,
 ) -> torch.Tensor:
     # Counters advance modulo hc_count, so phases from different HC values must
     # never mix. Calls on one stream are serialized; separate streams need
     # separate storage so concurrently active invocations cannot race.
-    key = (device.index, n_pad, m_groups, hc_count, stream.cuda_stream)
+    # ``stream`` is the raw handle of the current stream (see ``stream_scope``),
+    # so the zero-fill is ordered before the first launch that uses it.
+    key = (device.index, n_pad, m_groups, hc_count, stream)
     c = _COUNTERS.get(key)
     if c is None:
-        # Initialize on the launch stream. Allocating on the ambient stream can
-        # otherwise race the first kernel use on a caller-provided side stream.
-        with torch.cuda.stream(stream):
-            c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
+        c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
         _COUNTERS[key] = c
     return c
 
@@ -482,7 +521,7 @@ def skinny_two_kernel(
     lowrank: int,
     hc_count: int,
     eps: float,
-    stream: torch.cuda.Stream,
+    stream: int,
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -491,7 +530,12 @@ def skinny_two_kernel(
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
     dev = residual.device
-    r2 = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+    combine = block_output is not None
+    r2 = (
+        torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+        if combine
+        else residual
+    )
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
     n_chunks = (tokens + PART_M - 1) // PART_M
     partial = torch.empty(
@@ -512,6 +556,7 @@ def skinny_two_kernel(
         inj_stride,
         waves_per_block,
         cols_per_wave,
+        combine=combine,
     )
     up = _build_up_mix_grouped(
         hidden,
@@ -527,8 +572,8 @@ def skinny_two_kernel(
     _run_compiled(
         down,
         residual,
-        block_output,
-        injection,
+        block_output if combine else residual,
+        injection if combine else residual,
         w_down_merged,
         r2,
         rrms,
@@ -552,7 +597,7 @@ def skinny_chunked_two_kernel(
     lowrank: int,
     hc_count: int,
     eps: float,
-    stream: torch.cuda.Stream,
+    stream: int,
     chunk_m: int = 4,
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
@@ -568,7 +613,12 @@ def skinny_chunked_two_kernel(
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
     dev = residual.device
-    r2 = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+    combine = block_output is not None
+    r2 = (
+        torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+        if combine
+        else residual
+    )
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
     n_chunks = (chunk_m + PART_M - 1) // PART_M
     partial = torch.empty(
@@ -595,6 +645,7 @@ def skinny_chunked_two_kernel(
         waves_per_block,
         cols_per_wave,
         m_groups,
+        combine=combine,
     )
     up = _build_up_mix_grouped(
         hidden,
@@ -611,8 +662,8 @@ def skinny_chunked_two_kernel(
     _run_compiled(
         down,
         residual,
-        block_output,
-        injection,
+        block_output if combine else residual,
+        injection if combine else residual,
         w_down_merged,
         r2,
         rrms,

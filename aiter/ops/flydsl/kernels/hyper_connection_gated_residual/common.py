@@ -17,6 +17,7 @@ gfx950 (CDNA4) uses the bf16 ``16x16x32`` matrix core; gfx942 (CDNA3) exposes
 the per-instruction K packing expected by the tiled-MMA layout.
 """
 
+import contextlib
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -94,6 +95,63 @@ def ab_k_perm(mma_k: int, *, dtype_width: int = 16, copy_bits: int = 128):
     return fx.make_layout((k_group, 4, num_frgv), (1, num_elems, k_group))
 
 
+_NO_SCOPE = contextlib.nullcontext()
+
+
+def stream_scope(stream: torch.cuda.Stream | int | None, device: torch.device):
+    """Return ``(context, raw_stream)`` for launching on ``stream``.
+
+    Tensors created inside ``context`` are allocated on, and ordered against,
+    ``stream``. Without this, the caching allocator associates temporaries with
+    the ambient stream and may recycle them while the launch stream still uses
+    them. ``None`` selects ``device``'s current stream; an ``int`` is a raw
+    handle already resolved by an enclosing scope. The raw handle avoids
+    constructing a ``torch.cuda.Stream`` per call on the latency-bound path.
+    """
+    if isinstance(stream, int):
+        return _NO_SCOPE, stream
+    current = torch._C._cuda_getCurrentRawStream(device.index)
+    if stream is None:
+        return _NO_SCOPE, current
+    raw = stream.cuda_stream
+    if raw == current:
+        return _NO_SCOPE, raw
+    return torch.cuda.stream(stream), raw
+
+
+def check_tensor(
+    name: str,
+    t: torch.Tensor,
+    shape: tuple[int, ...],
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    contiguous: bool = True,
+) -> None:
+    """Reject tensors the kernels' fixed row-major views cannot represent."""
+    if t.device != device:
+        raise ValueError(f"{name} must be on {device}, got {t.device}")
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
+    if t.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(t.shape)}")
+    if contiguous and not t.is_contiguous():
+        raise ValueError(f"{name} must be row-major contiguous")
+
+
+def check_norm_weight(
+    norm_weight: torch.Tensor, stream_dim: int, hidden: int, device: torch.device
+) -> None:
+    """``norm_weight`` is either one shared stream or one weight per channel."""
+    if norm_weight.device != device:
+        raise ValueError(f"norm_weight must be on {device}, got {norm_weight.device}")
+    if norm_weight.numel() not in (stream_dim, hidden):
+        raise ValueError(
+            f"norm_weight must have {stream_dim} (shared) or {hidden} elements, "
+            f"got {norm_weight.numel()}"
+        )
+
+
 def norm_weight_f32(norm_weight: torch.Tensor) -> torch.Tensor:
     """``norm_weight`` as a flat contiguous f32 buffer for the norm kernels.
 
@@ -114,10 +172,20 @@ def merge_down_inject(
     Rows ``[0, lowrank)`` are ``w_down``, ``[lowrank, lowrank+hc)`` are
     ``w_inject``, the remainder is zero padding so ``n_pad`` is MFMA-friendly.
     """
+    if w_down.ndim != 2 or w_inject.ndim != 2:
+        raise ValueError("w_down and w_inject must be 2-D")
     lowrank, hidden = w_down.shape
     hc = w_inject.shape[0]
-    assert w_inject.shape == (hc, hidden)
-    assert n_pad >= lowrank + hc
+    check_tensor(
+        "w_inject",
+        w_inject,
+        (hc, hidden),
+        w_down.device,
+        dtype=w_down.dtype,
+        contiguous=False,
+    )
+    if n_pad < lowrank + hc:
+        raise ValueError(f"n_pad={n_pad} must be >= lowrank + hc = {lowrank + hc}")
     merged = torch.zeros(n_pad, hidden, dtype=w_down.dtype, device=w_down.device)
     merged[:lowrank] = w_down
     merged[lowrank : lowrank + hc] = w_inject
