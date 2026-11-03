@@ -645,6 +645,24 @@ void gfx1250_launch(const std::string& name,
         launch(kargs);
 }
 
+// Launches `<name>_cluster_kernel` of `co`: a token's num_splits workgroups as one cluster along x.
+template <class Kargs>
+void gfx1250_launch_cluster(const std::string& name,
+                            const char* co,
+                            const Kargs& kargs,
+                            const opus_mla_prefill_split_args& split,
+                            int grid_y,
+                            hipStream_t stream)
+{
+    static SynchronizedCache<std::string, PrebuiltKernel> kernels;
+    const std::string sym = name + "_cluster_kernel";
+    PrebuiltKernel& impl  = kernels.get_or_create(sym, [&] { return PrebuiltKernel(sym.c_str(), co); });
+    opus_mla_prefill_split_kargs<Kargs> args{kargs, split};
+    size_t arg_size = sizeof(args);
+    impl.launch_kernel({&args, &arg_size, kargs.N * split.num_splits, grid_y, 1, kGfx1250BlockSize, 1, 1,
+                        stream, split.num_splits, 1, 1});
+}
+
 // 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
 template <class Kargs>
 void gfx1250_dispatch(const char* co_16mx1,
@@ -1341,12 +1359,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
-    if(H <= kV41Gfx1250NarrowH)
-        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx1_16nx4", kV41Gfx1250Co16mx1, kargs, split,
-                       ceil_div(H, kV41Gfx1250Heads16mx1), 1, stream);
-    else
-        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx4_64nx1", kV41Gfx1250Co16mx4, kargs, split,
-                       ceil_div(H, kV41Gfx1250Heads16mx4), 1, stream);
+    const bool narrow = H <= kV41Gfx1250NarrowH;
+    const char* name  = narrow ? "opus_mla_v41_prefill_a8w8_16mx1_16nx4" : "opus_mla_v41_prefill_a8w8_16mx4_64nx1";
+    const char* co    = narrow ? kV41Gfx1250Co16mx1 : kV41Gfx1250Co16mx4;
+    const int grid_y  = ceil_div(H, narrow ? kV41Gfx1250Heads16mx1 : kV41Gfx1250Heads16mx4);
+    if(opus_mla_prefill_cluster_size_ok(num_splits))
+        return gfx1250_launch_cluster(name, co, kargs, split, grid_y, stream);
+    gfx1250_launch(name, co, kargs, split, grid_y, 1, stream);
     if(num_splits > 1)
         opus_mla_prefill_split_reduce<__hip_bfloat16>(
             split, kargs.attn_sink_ptr, out, N, H, stream);

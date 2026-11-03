@@ -4,7 +4,7 @@
 // Split-K for the opus MLA sparse prefill kernels. grid.z cuts each token's prefix rows, then its
 // extend rows, into num_splits chunks of whole KV tiles. A split writes its O normalized by its own
 // sum, its max (natural log units of the scaled scores) and that sum; pa_decode_ps_reduce_hip_kernel
-// folds the splits and the sink.
+// folds the splits and the sink, or a gfx1250 v4.1 cluster folds them in-kernel.
 
 #pragma once
 
@@ -39,18 +39,33 @@ struct opus_mla_prefill_split_rows
 { int prefix_begin, prefix_len, extend_begin, extend_len; };
 
 template <int KV_TILE>
+__device__ inline int opus_mla_prefill_split_chunk(int prefix_len, int extend_len, int num_splits)
+{ return ((prefix_len + extend_len + num_splits - 1) / num_splits + KV_TILE - 1) / KV_TILE * KV_TILE; }
+
+template <int KV_TILE>
 __device__ inline opus_mla_prefill_split_rows
 opus_mla_prefill_split_rows_of(int prefix_len, int extend_len, int num_splits, int split)
 {
     auto clamp = [](int x, int hi) { return x < 0 ? 0 : (x > hi ? hi : x); };
-    const int chunk =
-        ((prefix_len + extend_len + num_splits - 1) / num_splits + KV_TILE - 1) / KV_TILE * KV_TILE;
+    const int chunk = opus_mla_prefill_split_chunk<KV_TILE>(prefix_len, extend_len, num_splits);
     const int lo = split * chunk;
     const int hi = lo + chunk;
     const int pb = clamp(lo, prefix_len);
     const int eb = clamp(lo - prefix_len, extend_len);
     return {pb, clamp(hi, prefix_len) - pb, eb, clamp(hi - prefix_len, extend_len) - eb};
 }
+
+// The leading splits that get rows
+template <int KV_TILE>
+__device__ inline int opus_mla_prefill_split_count(int prefix_len, int extend_len, int num_splits)
+{
+    const int chunk = opus_mla_prefill_split_chunk<KV_TILE>(prefix_len, extend_len, num_splits);
+    return chunk > 0 ? (prefix_len + extend_len + chunk - 1) / chunk : 0;
+}
+
+// Split counts a cluster folds in-kernel
+__host__ __device__ constexpr bool opus_mla_prefill_cluster_size_ok(int s)
+{ return s == 2 || s == 4 || s == 8 || s == 16; }
 
 __device__ inline int64_t opus_mla_prefill_split_row(
     const opus_mla_prefill_split_args& split, int token, int split_idx, int H, int head)
