@@ -385,8 +385,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-mllvm --amdgpu-mfma-vgpr-form'",
-            "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
-            "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+            "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() in ('gfx1250', 'gfx1250-strict') or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+            "('-mllvm -enable-post-misched=1' if (get_gfx() in ('gfx1250', 'gfx1250-strict') or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
             "f'-DOPUS_GEN_CO_DIR=\\\\\"{AITER_CSRC_DIR}/opus_gemm/gen_co\\\\\"'"
         ],
         "flags_extra_hip_per_source": {
@@ -714,6 +714,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_a8w4_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",
@@ -2043,7 +2044,8 @@
     "module_mega_mhc_stream_h5120": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2060,7 +2062,8 @@
     "module_mega_mhc_stream_h7168": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2077,7 +2080,8 @@
     "module_mega_mhc_stream_generic": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2103,6 +2107,20 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_mhc_seam_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mhc_seam.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m mhc_seam --output_dir {{}}'"
+        ]
     },
     "module_causal_conv1d_update": {
         "srcs": [
