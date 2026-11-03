@@ -964,6 +964,7 @@ if __name__ == "__main__":
             (128, 128),
             (160, 160),
             (192, 192),
+            (192, 128),
         ],
         help="""Dimension of query and key. Default is None.
         e.g.: -qk_v 256,256""",
