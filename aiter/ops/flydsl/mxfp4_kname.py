@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 import re
 
 _MXMOE_NUMERIC_TOKENS = {
@@ -188,6 +189,26 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
         "bf16_lds": True if m.group("bf16lds") else None,
         "spart": int(m.group("sp")) if m.group("sp") else None,
     }
+
+
+def deterministic_v2_gemm2_name(name):
+    """Return the ``reduce`` sibling of a layout-v2 ``atomic`` GEMM2 name.
+
+    Returns ``None`` for any other name family or epilogue.
+    """
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
+    if m is None or m.group("epilog") != "atomic":
+        return None
+    return f"{name[: m.start('epilog')]}reduce{name[m.end('epilog') :]}"
+
+
+# Launch-order-dependent rollback switch for the stage2 epilogue policy.
+ATOMIC_STAGE2_ENV = "AITER_MXFP4_ATOMIC_STAGE2"
+
+
+def atomic_stage2_opt_in() -> bool:
+    """True when the caller opted back into the atomic stage2 epilogue."""
+    return os.environ.get(ATOMIC_STAGE2_ENV, "0") == "1"
 
 
 def parse_g2_kname_any(kname) -> dict:

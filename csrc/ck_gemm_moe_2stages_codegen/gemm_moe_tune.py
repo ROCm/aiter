@@ -7558,6 +7558,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             block_m=BM,
             sorted_weights=sw,
             topk_weights=data["topk_weights"],
+            topk_ids=data["topk_ids"],
             kernelName2=kn2,
             reverse_sorted=reverse_sorted,
         )

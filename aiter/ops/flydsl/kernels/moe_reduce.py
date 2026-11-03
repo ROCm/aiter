@@ -3,16 +3,14 @@
 
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
-``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
-(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
-``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
-with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
-``Constexpr`` so flyc specializes per shape/dtype.
+``Y[t, d] = sum_k X[t, k, d]``, dropping invalid routes: negative
+``topk_ids``, ``expert_mask`` rejects under ``use_mask``, and token rows at or
+past the device-side ``valid_tokens`` count. Stage2 ``mode="reduce"`` epilogue
+for every dtype; build a cached per-shape launcher with
+``compile_moe_reduction``.
 
-``dtype_str="fp8"`` reduces MXFP8 route-out rows (a flat uint8 buffer of
-``[model_dim fp8 bytes | model_dim/scale_blk e8m0 scale bytes]`` per row): each fp8
-value is scaled by its e8m0 microscale, accumulated in f32 and written to
-``out_dtype_str`` (bf16/f16). The dense (f32/f16/bf16) path reduces a
+``dtype_str="fp8"`` reduces MXFP8 route-out rows (``[model_dim fp8 bytes |
+model_dim/scale_blk e8m0 scale bytes]`` per row); the dense path reduces a
 contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
 
@@ -37,11 +35,14 @@ def _moe_reduction_body(
     expert_mask: fx.Pointer,
     topk_ids: fx.Pointer,
     topk_weights: fx.Pointer,
+    valid_tokens: fx.Pointer,
     i32_m_tokens: fx.Int32,
     topk: fx.Constexpr[int],
     model_dim: fx.Constexpr[int],
     dtype_str: fx.Constexpr[str],
     use_mask: fx.Constexpr[bool],
+    skip_invalid_ids: fx.Constexpr[bool],
+    has_valid_tokens: fx.Constexpr[bool],
     num_experts: fx.Constexpr[int],
     out_dtype_str: fx.Constexpr[str],
     use_weight: fx.Constexpr[bool],
@@ -105,14 +106,25 @@ def _moe_reduction_body(
             fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
         )
         sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
-    if const_expr(use_mask):
+    if const_expr(use_mask or skip_invalid_ids or has_valid_tokens):
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
+    if const_expr(use_mask or skip_invalid_ids):
         tk_ptr = fx.inttoptr(
             i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
         )
+    if const_expr(use_mask):
+        # The EP mask is global-expert indexed; a garbage padded id can point
+        # past it, so only rows below valid_tokens may gather it (below).
         em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
+    if const_expr(has_valid_tokens):
+        nvalid_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(valid_tokens)))
+        # Device-side per-call token count: a CUDA graph replay with a smaller
+        # batch must not reduce the padded rows.
+        row_valid = nvalid_ptr[0]
+    else:
+        row_valid = i32_m_tokens
     if const_expr(use_weight):
         # Route weights deferred from the stage2 epilogue: scale each expert's
         # contribution here instead, so the GEMM stores unweighted rows.
@@ -147,36 +159,47 @@ def _moe_reduction_body(
         p_dst = thr_store.partition_D(
             fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
         )
-        # topk rows share one per-thread voffset via a uniform scalar
-        # soffset = k*row_stride, so the loads issue back-to-back.
-        frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
-        for k in range_constexpr(topk):
-            fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
-        if const_expr(is_fp8):
-            sc_col = (
-                fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
-            ) // fx.Int32(scale_blk)
-            scales = []
-            for k in range_constexpr(topk):
-                e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << 23).bitcast(fx.Float32))
-
         acc = fx.full(V, 0.0, fx.Float32)
-        for k in range_constexpr(topk):
+        # Guard the loads as well as the sum. Graph padding can contain stale
+        # ids, weights and route values, including when the valid count is zero.
+        if fx.Int32(token) < row_valid:
+            # topk rows share one per-thread voffset via a uniform scalar
+            # soffset = k*row_stride, so the loads issue back-to-back.
+            frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
+            for k in range_constexpr(topk):
+                fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
             if const_expr(is_fp8):
-                vk = _decode_fp8(frags[k], scales[k])
-            else:
-                vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
-            if const_expr(use_weight):
-                wk = tw_ptr[k]
-                vk = fx.Vector.from_elements(
-                    [vk[i] * wk for i in range_constexpr(V)], fx.Float32
-                )
-            if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.full(V, 0.0, fx.Float32)
-                )
-            acc = acc + vk
+                sc_col = (
+                    fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
+                ) // fx.Int32(scale_blk)
+                scales = []
+                for k in range_constexpr(topk):
+                    e8m0 = fx.Uint32(
+                        fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)])
+                    )
+                    scales.append((e8m0 << 23).bitcast(fx.Float32))
+
+            for k in range_constexpr(topk):
+                if const_expr(is_fp8):
+                    vk = _decode_fp8(frags[k], scales[k])
+                else:
+                    vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
+                if const_expr(use_weight):
+                    wk = tw_ptr[k]
+                    vk = fx.Vector.from_elements(
+                        [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                    )
+                if const_expr(use_mask or skip_invalid_ids):
+                    route_id = tk_ptr[k]
+                    valid = route_id >= fx.Int32(0)
+                    if const_expr(use_mask):
+                        # Invalid ids must not reach the mask gather.
+                        valid = valid & (route_id < fx.Int32(num_experts))
+                        valid = valid & (
+                            em_ptr[valid.select(route_id, fx.Int32(0))] != fx.Int32(0)
+                        )
+                    vk = valid.select(vk, fx.full(V, 0.0, fx.Float32))
+                acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)
         fx.copy(store_atom, ofrag, p_dst)
@@ -206,18 +229,20 @@ def compile_moe_reduction(
     model_dim: int,
     dtype_str: str = "f16",
     use_mask: bool = False,
+    skip_invalid_ids: bool = False,
     num_experts: int = 0,
     out_dtype_str: str | None = None,
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    valid_tokens: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
     Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
-    i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
-    launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
-    stays correct.
+    valid_tokens, i32_m_tokens, stream)``; dispatch it through
+    ``moe_kernels._run_compiled``. The launcher is a distinct object per shape,
+    so the shim's per-exe ``_cf`` cache stays correct.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     block = _pick_reduce_block(model_dim, V)
@@ -237,6 +262,8 @@ def compile_moe_reduction(
     kernel_name = (
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
         f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
+        f"_i{int(skip_invalid_ids)}"
+        f"_v{int(valid_tokens)}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
     )
 
@@ -247,6 +274,7 @@ def compile_moe_reduction(
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         topk_weights: fx.Pointer,
+        valid_tokens_ptr: fx.Pointer,
         i32_m_tokens: fx.Int32,
     ):
         _moe_reduction_body(
@@ -255,11 +283,14 @@ def compile_moe_reduction(
             expert_mask,
             topk_ids,
             topk_weights,
+            valid_tokens_ptr,
             i32_m_tokens,
             topk,
             model_dim,
             dtype_str,
             use_mask,
+            skip_invalid_ids,
+            valid_tokens,
             num_experts,
             out_tag,
             use_weight,
@@ -275,6 +306,7 @@ def compile_moe_reduction(
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         topk_weights: fx.Pointer,
+        valid_tokens_ptr: fx.Pointer,
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -284,6 +316,7 @@ def compile_moe_reduction(
             expert_mask,
             topk_ids,
             topk_weights,
+            valid_tokens_ptr,
             i32_m_tokens,
         ).launch(
             grid=(fx.Int64(i32_m_tokens), gy, 1), block=(block, 1, 1), stream=stream

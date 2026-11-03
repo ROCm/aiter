@@ -773,29 +773,50 @@ class TestGlm53TunedArtifact(unittest.TestCase):
         self.assertGreater(float(token_one["err1"]), 0.0)
         self.assertGreater(float(token_one["err2"]), 0.0)
 
-    def test_in_memory_jobs_match_file_parser(self):
+    def test_in_memory_jobs_keep_the_candidate_kernel(self):
+        from aiter.aot.flydsl import mxfp4_moe
         from aiter.aot.flydsl.mxfp4_moe import _job_key, jobs_from_rows, parse_csv
 
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
 
-        file_jobs = parse_csv(str(config))
-        row_jobs = jobs_from_rows(rows)
+        with mock.patch.object(mxfp4_moe, "_ATOMIC_STAGE2", False):
+            file_jobs = parse_csv(str(config))
+            row_jobs = jobs_from_rows(rows)
+        with mock.patch.object(mxfp4_moe, "_ATOMIC_STAGE2", True):
+            self.assertEqual(jobs_from_rows(rows), row_jobs)
+            self.assertEqual(parse_csv(str(config)), row_jobs)
 
-        # The tuner feeds candidate rows through jobs_from_rows instead of a CSV
-        # file, so the in-memory path must select exactly the jobs the shipped
-        # file parser selects, stage-2 bias variants included.
+        # The file parser precompiles what the runtime dispatches (the
+        # deterministic ``reduce`` sibling of a tuned atomic v2 row), while the
+        # tuner compiles its candidates under the names it launches itself.
+        file_keys = {_job_key(job) for job in file_jobs}
+        row_keys = {_job_key(job) for job in row_jobs}
+        self.assertNotEqual(row_keys, file_keys)
+        self.assertTrue(
+            any(
+                "_atomic" in job["kernel_name"] for job in row_jobs if job["stage"] == 2
+            )
+        )
+        self.assertFalse(
+            any(
+                "_atomic" in job["kernel_name"]
+                for job in file_jobs
+                if job.get("v2_stage2")
+            )
+        )
+        # Stage 1 and the bias variants are shared; only the v2 epilogue differs.
         self.assertEqual(
-            [_job_key(job) for job in row_jobs],
-            [_job_key(job) for job in file_jobs],
+            {key for key in row_keys if key[0] == 1},
+            {key for key in file_keys if key[0] == 1},
+        )
+        self.assertEqual(
+            {key[:6] for key in row_keys if key[0] == 2},
+            {key[:6] for key in file_keys if key[0] == 2},
         )
         no_bias_jobs = jobs_from_rows(rows, include_bias_variants=False)
-        self.assertLess(len(no_bias_jobs), len(file_jobs))
-        self.assertLessEqual(
-            {_job_key(job) for job in no_bias_jobs},
-            {_job_key(job) for job in file_jobs},
-        )
+        self.assertLess(len(no_bias_jobs), len(row_jobs))
 
 
 class TestParallelMxfp4Precompile(unittest.TestCase):
