@@ -15,11 +15,13 @@ and no reduction.
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
+from aiter.ops.triton._gluon_kernels.common.utils import swizzled_tile_coords
+from aiter.ops.triton._gluon_kernels.gfx1250.tdm_pipeline import (
+    compute_tile,
+    tokens_per_step,
+)
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd_aid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-from ....common.utils import swizzled_tile_coords
-from ...tdm_pipeline import compute_tile, tokens_per_step
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",
