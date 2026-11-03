@@ -24,14 +24,19 @@ def _skip_unsupported_gluon(
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     if "gfx950" in (get_arch() or ""):
-        # gfx950 has one gluon a16w16 kernel: compute_bound, TN layout.
-        if kernel_type != "compute_bound":
-            pytest.skip("gfx950 gluon a16w16 has only the compute_bound kernel")
+        # gfx950 has two gluon a16w16 kernels, compute_bound and streamk, TN layout.
+        if kernel_type not in ("compute_bound", "streamk"):
+            pytest.skip("gfx950 gluon a16w16 has only compute_bound and streamk")
         if layout != "TN":
             pytest.skip("gfx950 gluon a16w16 supports the TN layout only")
-        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
-            unsupported_reason,
-        )
+        if kernel_type == "streamk":
+            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+                unsupported_reason,
+            )
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+                unsupported_reason,
+            )
 
         reason = unsupported_reason(M, N, K, activation=activation)
         if reason:
@@ -458,3 +463,238 @@ def test_gemm_a16_w16_gluon_tuned_gemm(kernel_name):
     )
     out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+
+
+def _streamk_plan(policy, fixup="owner", split_n=None, exchange="wt"):
+    return {
+        "STREAMK_POLICY": policy,
+        "STREAMK_FIXUP": fixup,
+        "SPLIT_N": split_n,
+        "STREAMK_EXCHANGE": exchange,
+    }
+
+
+def _run_streamk(
+    M, N, K, config, dtype=torch.bfloat16, bias=False, persistent_partials=True
+):
+    """The gfx950 gluon Stream-K kernel against F.linear, through the public
+    wrapper, into an output pre-filled with NaN so an unwritten element shows.
+    Skips a config the kernel rejects for this shape on this device (the tail tile
+    count depends on the CU count)."""
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        unsupported_reason,
+        with_default_tile,
+    )
+
+    reason = unsupported_reason(M, N, K, config=with_default_tile(config))
+    if reason:
+        pytest.skip(f"gfx950 gluon a16w16 streamk: {reason}")
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, dtype, output=False)
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    y = torch.full((M, N), float("nan"), dtype=dtype, device="cuda")
+    out = gemm_a16w16(
+        x,
+        w,
+        b,
+        dtype,
+        y,
+        backend="gluon",
+        kernel_type="streamk",
+        config=config,
+        persistent_partials=persistent_partials,
+    )
+    assert not torch.isnan(out).any(), "the Stream-K kernel left elements unwritten"
+    torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=1e-1, rtol=1e-2)
+
+
+# Shapes in units of a 128x128 tile with K = 512 (four K-pairs), sized for 256 CUs:
+# 16x16 tiles are one full wave, 17x16 leave a tail of 16 tiles after it, 16x28 a
+# tail of 192 (more than half a wave), and 3x11 = 33 tiles fall short of one wave.
+# On another CU count a case its config cannot run is skipped.
+_STREAMK_CASES = {
+    "dp": ((2048, 2048, 512), _streamk_plan("dp")),
+    "owner": ((2176, 2048, 512), _streamk_plan("one_tile", "owner", 4)),
+    "rs": ((2176, 2048, 512), _streamk_plan("one_tile", "rs", 4)),
+    "l2": ((2176, 2048, 512), _streamk_plan("one_tile", "rs", 4, "l2")),
+    "two_tile": ((2176, 2048, 512), _streamk_plan("two_tile")),
+    "spread": ((2048, 3584, 512), _streamk_plan("spread")),
+    "default_plan": ((2176, 2048, 512), {}),
+    "compact_owner": ((384, 1408, 512), _streamk_plan("one_tile", "owner", 2)),
+    # Extra readers: the programs the tail leaves idle read slices too.
+    "compact_rs": ((384, 1408, 512), _streamk_plan("one_tile", "rs", 2)),
+    "compact_l2": ((384, 1408, 512), _streamk_plan("one_tile", "rs", 4, "l2")),
+    "dp_single": ((128, 128, 512), _streamk_plan("dp")),
+    # Ragged M, N and K: clamped loads, masked stores, the K tail run first.
+    "ragged_rs": ((2160, 2032, 496), _streamk_plan("one_tile", "rs", 2)),
+    "ragged_n_owner": ((2176, 2032, 512), _streamk_plan("one_tile", "owner", 4)),
+    "ragged_wave_dp": ((368, 1392, 496), _streamk_plan("dp")),
+    # K_RES > BLOCK_K: the last pair's first K-step is masked too.
+    "kres_gt_rs": ((2176, 2048, 432), _streamk_plan("one_tile", "rs", 4)),
+}
+
+
+@pytest.mark.parametrize("case", list(_STREAMK_CASES))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_streamk(case, dtype, bias):
+    """Every Stream-K policy and ending (dp, one_tile with the owner and the
+    reduce-scatter over wt and l2, two_tile, spread, the default plan), below one
+    wave and after it, on aligned and ragged shapes."""
+    (M, N, K), plan = _STREAMK_CASES[case]
+    config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, **plan}
+    _run_streamk(M, N, K, config, dtype=dtype, bias=bias)
+
+
+@pytest.mark.parametrize(
+    "tile", [(256, 256, 64), (128, 256, 64), (64, 256, 64), (64, 64, 128)]
+)
+@pytest.mark.parametrize("ragged", [False, True])
+def test_gemm_a16_w16_gluon_streamk_tiles(tile, ragged):
+    """Other tiles, with the default plan, on a shape with a Stream-K tail."""
+    bm, bn, bk = tile
+    M, N, K = 17 * bm, 16 * bn, 8 * bk
+    if ragged:
+        M, N, K = M - bm // 8, N - bn // 8, K - 16
+    _run_streamk(M, N, K, {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk}, bias=True)
+
+
+def test_gemm_a16_w16_gluon_streamk_default_tile():
+    """Without a config the kernel runs DEFAULT_TILE with the default plan."""
+    _run_streamk(1000, 2048, 1024, None)
+
+
+def test_gemm_a16_w16_gluon_streamk_candidates():
+    """Every config the tuner times for a shape runs correctly, and its kernelName
+    round-trips to the same config through tuned_gemm."""
+    M, N, K = 1024, 1024, 512
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        kernel_name,
+        tuning_candidates,
+    )
+    from aiter.tuned_gemm import parse_gluon_kernel_name
+
+    candidates = tuning_candidates(M, N, K)
+    assert candidates, "no Stream-K candidate for a shape every tile fits"
+    names = [kernel_name(c) for c in candidates]
+    assert len(set(names)) == len(names), "two candidates share a kernelName"
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=False)
+    torch_out = F.linear(x, w)
+    for config, name in zip(candidates, names):
+        assert parse_gluon_kernel_name(name) == ("streamk", config), name
+        out = gemm_a16w16(
+            x,
+            w,
+            None,
+            torch.bfloat16,
+            None,
+            backend="gluon",
+            kernel_type="streamk",
+            config=config,
+        )
+        torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2, msg=name)
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "gluon_streamk_256x256x64_g4_dp",
+        "gluon_streamk_128x128x64_g4_one_tile_owner_n2_wt",
+        "gluon_streamk_128x128x64_g4_one_tile_rs_n2_l2",
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_tuned_gemm(kernel_name):
+    """tuned_gemm's gluon libtype runs the Stream-K config a tuned row names."""
+    M, N, K = 1024, 2048, 512
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+
+
+def test_gemm_a16_w16_gluon_streamk_fit_tuned_config():
+    """A tuned plan is kept where it fits the shape and otherwise replaced by the
+    tile alone (the default plan)."""
+    tuned_M, N, K = 2176, 2048, 512  # 17x16 128x128 tiles: a tail of 16 on 256 CUs
+    _skip_unsupported_gluon("gluon", "streamk", tuned_M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        fit_tuned_config,
+        unsupported_reason,
+    )
+
+    tile = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}
+    config = {**tile, **_streamk_plan("one_tile", "owner", 4)}
+    reason = unsupported_reason(tuned_M, N, K, config=config)
+    if reason:
+        pytest.skip(f"gfx950 gluon a16w16 streamk: {reason}")
+    assert fit_tuned_config(config, tuned_M, N, K) is config
+    assert fit_tuned_config(config, 2100, N, K) is config
+    # 16x16 tiles: one full wave, no tail for one_tile.
+    assert fit_tuned_config(config, 2048, N, K) == tile
+
+
+@pytest.mark.parametrize(
+    "kernel_name, M, N",
+    [
+        # Tuned at M = 2176 (a tail of 16 tiles); M = 2048 leaves none.
+        ("gluon_streamk_128x128x64_g4_one_tile_owner_n4_wt", 2048, 2048),
+        ("gluon_streamk_128x128x64_g4_one_tile_rs_n4_l2", 2048, 2048),
+        # Tuned at M = 2048 (a tail of 192); M = 2560 leaves 48, too few for spread.
+        ("gluon_streamk_128x128x64_g4_spread", 2560, 3584),
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_tuned_gemm_other_m(kernel_name, M, N):
+    """A tuned row reached through the padded-M lookup runs at an M its plan cannot
+    run, with the row's tile and the default plan."""
+    K = 512
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize("case", ["owner", "rs", "l2", "compact_rs"])
+@pytest.mark.parametrize("persistent_partials", [True, False])
+def test_gemm_a16_w16_gluon_streamk_persistent_partials(case, persistent_partials):
+    """Per-call and persistent partials, with launches of two tiles interleaved so
+    the shared persistent buffer is sliced for each and the flags are reused."""
+    (M, N, K), plan = _STREAMK_CASES[case]
+    config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, **plan}
+    big = {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64}
+    for shape, cfg in [((M, N, K), config), ((4352, 4096, 512), big)] * 2:
+        _run_streamk(*shape, cfg, persistent_partials=persistent_partials)
+
+
+@pytest.mark.parametrize("tile", [(256, 256, 64), (64, 64, 64)])
+def test_gemm_a16_w16_gluon_streamk_schedule(tile):
+    """The compiled Stream-K kernel carries the MFMA scheduler's sched.barriers.
+    K is a compile-time constant here, so K must be long enough that LLVM keeps
+    the K loop (at 8 K-steps it unrolls it whole and the barriers go)."""
+    M, N, K = 2048, 2048, 4096
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        _gemm_a16w16_streamk_kernel,
+    )
+
+    bm, bn, bk = tile
+    _gemm_a16w16_streamk_kernel.device_caches.clear()  # inspect this compile only
+    _run_streamk(M, N, K, {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk})
+    # device_caches[device] = (kernel_cache, key_cache, target, backend, binder)
+    compiled = [
+        kernel
+        for entry in _gemm_a16w16_streamk_kernel.device_caches.values()
+        for kernel in entry[0].values()
+    ]
+    assert compiled, "the gluon Stream-K kernel was not compiled"
+    for kernel in compiled:
+        assert "llvm.amdgcn.sched.barrier" in kernel.asm["llir"]
+        assert "sched_barrier" in kernel.asm["amdgcn"]

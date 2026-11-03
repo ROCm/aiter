@@ -1,0 +1,7 @@
+{
+    "DEFAULT_TILE": {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64},
+    "GROUP_SIZE_M": 4,
+    "STREAMK_PLAN": {"m_ow": 3, "c_ow": 1.5, "pairs_ow": 10, "b": 6, "gain": 6},
+    "OWNER_SPLITS": [2, 3, 4, 6, 8, 12, 16],
+    "RS_SPLITS": [2, 4, 6, 8, 12, 16, 32, 64]
+}

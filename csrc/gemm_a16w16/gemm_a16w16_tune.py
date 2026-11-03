@@ -839,9 +839,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         """One candidate per tile of the gfx950 gluon compute-bound kernel that
-        fits the shape; the winning row's kernelName carries the tile."""
+        fits the shape, then one per Stream-K config (tuning_candidates) when the
+        output dtype is the input's; the winning row's kernelName carries the
+        tile, or the whole Stream-K config."""
         if scaleAB or is_shuffle or indtype != dtypes.bf16 or get_gfx() != "gfx950":
             return []
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
+            gemm_a16w16_streamk as streamk,
+        )
         from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
             unsupported_reason,
         )
@@ -851,11 +856,17 @@ class GemmA16W16Tuner(GemmCommonTuner):
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, _ = _default_tol(outdtype)
         config, _ = get_gemm_config("GEMM-A16W16", M, backend="gluon")
+        kernelNames = [
+            gluon_kernel_name("compute_bound", (bm, bn))
+            for bm, bn in config["TILES"]
+            if unsupported_reason(M, N, K, tile=(bm, bn)) is None
+        ]
+        if outdtype == indtype:
+            kernelNames += [
+                streamk.kernel_name(c) for c in streamk.tuning_candidates(M, N, K)
+            ]
         tasks = []
-        for solidx, (bm, bn) in enumerate(config["TILES"], start=1):
-            if unsupported_reason(M, N, K, tile=(bm, bn)) is not None:
-                continue
-            kernelName = gluon_kernel_name("compute_bound", (bm, bn))
+        for solidx, kernelName in enumerate(kernelNames, start=1):
             info = (info_keys, solidx, 0, kernelName, "gluon", is_shuffle)
             tasks.append(
                 (
