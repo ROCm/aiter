@@ -954,7 +954,12 @@ def _iter_csv_cases():
         kwargs["check_aot_cache"] = (
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
-        kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        # Only Swiglu callers pass an expert bias; the AOT cache has no bias
+        # variant for other activations.
+        kwargs["disable_stage1_bias"] = kwargs["actType"] != aiter.ActivationType.Swiglu
+        kwargs["disable_stage2_bias"] = (
+            kernel_name2.startswith("opus_") or kwargs["disable_stage1_bias"]
+        )
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
