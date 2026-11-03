@@ -1575,6 +1575,72 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
+def test_relu2_gate_only_regression():
+    """Relu2 stays on the gate-only no-g1u1 path for multi-expert dispatch."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip Relu2 gate-only regression on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, E, topk = 6144, 512, 129, 5
+    for token in (1, 16, 32, 64, 128):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Relu2,
+            False,
+            0,
+            0,
+            True,
+            GateMode.SEPARATED.value,
+            has_stage1_bias=False,
+            has_stage2_bias=False,
+            gate_up_interleave=None,
+        )
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        assert stage1_func is cktile_moe_stage1, (
+            f"{token=}: expected CK-Tile stage1 for gate-only Relu2, got "
+            f"{stage1_func!r}"
+        )
+        assert "relu2" in metadata.stage1.keywords["kernelName"].lower(), (
+            f"{token=}: expected a Relu2 gate-only kernel name, got "
+            f"{metadata.stage1.keywords['kernelName']!r}"
+        )
+        assert metadata.has_bias is False
+        assert metadata.stage2_has_bias is False
+
+        torch.manual_seed(0)
+        test_fmoe(
+            dtype=torch.bfloat16,
+            token=token,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            E=E,
+            topk=topk,
+            actType=aiter.ActivationType.Relu2,
+            gateMode=GateMode.SEPARATED.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.bf16,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=False,
+            strict_accuracy=True,
+            check_aot_cache=False,
+            disable_stage1_bias=True,
+            disable_stage2_bias=True,
+        )
+    aiter.logger.info(
+        "moe_2stage: Relu2 gate-only multi-expert regression test passed"
+    )
+
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
