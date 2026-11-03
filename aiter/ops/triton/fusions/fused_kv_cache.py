@@ -605,6 +605,14 @@ def fused_qk_rope_reshape_and_cache(
     - else:
     -     key_cache: shape (T_cache, KH, D // x, block_size, x).
     -     value_cache: shape (T_cache, KH, D, block_size).
+    - KV cache dtype uint8 (NVFP4, always the shuffled layout; block_size 64, 128 or a multiple of 128):
+    -     key_cache: shape (T_cache, KH, block_size, D // 2 + D // 16).
+    -     value_cache: same as key_cache (NVFP4 V), or, for A8K4V8 (NVFP4 K, FP8 V),
+    -         FP8 (e4m3) in the shuffled layout (T_cache, KH, block_size // 16, D, 16).
+    -     A8K4V8 is selected by the dtypes (uint8 key_cache, FP8 value_cache). K is
+    -     NVFP4-quantized per 16 values after dividing by k_scale; V is divided by
+    -     v_scale and cast to FP8, so the attention side reads it with v_descale = v_scale
+    -     and k_descale = 1 (pass k_scale=None or 1).
     - slot_mapping: shape (T_slot, ).
 
     T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
@@ -642,13 +650,29 @@ def fused_qk_rope_reshape_and_cache(
     SCALE_K_WIDTH = 4
     x_cache = 8
     value_shuffle_layout = False
+    # A8K4V8: NVFP4 K, FP8 V
+    k4v8 = kv_cache_dtype == torch.uint8 and value_cache.dtype != torch.uint8
     max_embd_pos = cos.shape[0]
     d_freq = cos.shape[-1]
     if kv_cache_dtype == torch.uint8:
         # always shuffled
         t_cache, kh_cache, block_size, d_cache = key_cache.shape
-        t_cache_v, vh_cache, block_size_v, d_cache_v = value_cache.shape
+        if k4v8:
+            assert value_cache.dtype == e4m3_dtype and value_cache.ndim == 5, (
+                "A8K4V8 (uint8 key_cache) needs an FP8 value_cache in the shuffled layout "
+                f"(T_cache, KH, block_size // 16, D, 16), got {value_cache.dtype} {tuple(value_cache.shape)}"
+            )
+            t_cache_v, vh_cache, slot_chunk_v, d_cache_v, x_cache = value_cache.shape
+            assert x_cache == 16 // value_cache.element_size()
+            block_size_v = slot_chunk_v * x_cache
+            value_shuffle_layout = True
+        else:
+            t_cache_v, vh_cache, block_size_v, d_cache_v = value_cache.shape
         assert block_size == block_size_v
+        # the scales are preshuffled in min(128, page)-row groups, the data in 16-row tiles
+        assert block_size >= 64 and (
+            block_size <= 128 or block_size % 128 == 0
+        ), f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
         SCALE_K = dk // 16
         SCALE_K_WIDTH = (
             min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
@@ -688,9 +712,12 @@ def fused_qk_rope_reshape_and_cache(
     ), "Number of tokens should be identical for key_cache, and value_cache"
     if kv_cache_dtype == torch.uint8:
         assert d == dk == dv, "D dimension should be identical for q, k, and v"
-        assert (
-            d_cache == d_cache_v
-        ), "D dimension should be identical for key_cache and value_cache"
+        if k4v8:
+            assert d_cache_v == dv, "D dimension of the FP8 value_cache should be dv"
+        else:
+            assert (
+                d_cache == d_cache_v
+            ), "D dimension should be identical for key_cache and value_cache"
         assert (
             dk // 2 + dk // 16 == d_cache
         ), "D dimension of key_cache should be (dk // 2 + dk // 16) for FP4 KV cache"
@@ -744,12 +771,20 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_t = value_cache.stride(0)
         value_cache_stride_h = value_cache.stride(1)
         value_cache_stride_d = value_cache.stride(3)
-        value_cache_stride_b = value_cache.stride(2)
-        value_cache_stride_slot_chunk = 0
-        value_cache_stride_x = 0
-        assert (
-            key_cache_stride_d == value_cache_stride_d == 1
-        ), "The stride of the last dimension of key_cache and value_cache must be 1"
+        if k4v8:
+            value_cache_stride_b = 0
+            value_cache_stride_slot_chunk = value_cache.stride(2)
+            value_cache_stride_x = value_cache.stride(4)
+            assert (
+                key_cache_stride_d == 1
+            ), "The stride of the last dimension of key_cache must be 1"
+        else:
+            value_cache_stride_b = value_cache.stride(2)
+            value_cache_stride_slot_chunk = 0
+            value_cache_stride_x = 0
+            assert (
+                key_cache_stride_d == value_cache_stride_d == 1
+            ), "The stride of the last dimension of key_cache and value_cache must be 1"
     elif value_shuffle_layout:
         key_cache_stride_t = key_cache.stride(0)
         key_cache_stride_h = key_cache.stride(1)
@@ -814,6 +849,8 @@ def fused_qk_rope_reshape_and_cache(
         _extra_args = {
             "BLOCK_H": BLOCK_H,
             "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
+            # NVFP4 scale preshuffle group (rows), as the attention kernels unshuffle it
+            "SCALE_PRESHUFFLE": min(128, block_size),
         }
     grid = (n_pid, 1, 1)
     _kernel[grid](
@@ -864,7 +901,7 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_D_pe=d,
         BLOCK_D_HALF_pe=d // 2,
         BLOCK_SIZE=block_size,
-        X_SIZE=x_cache if not flash_layout else 0,
+        X_SIZE=x_cache if (not flash_layout or k4v8) else 0,
         SCALE_K_WIDTH=SCALE_K_WIDTH,
         FLASH_LAYOUT=flash_layout,
         VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
