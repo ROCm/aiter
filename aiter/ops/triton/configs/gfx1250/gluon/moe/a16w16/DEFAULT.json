@@ -4,34 +4,64 @@
         "block_k": 128,
         "num_buffers": 3,
         "num_warps": 4,
-        "num_subtiles": 1
+        "num_subtiles": 1,
+        "group_m": 1,
+        "num_ctas": 1,
+        "cluster_split": "auto",
+        "xcd_swizzle": 1,
+        "split_k": 1,
+        "waves_per_eu": 0
     },
     "bm32_any": {
         "block_n": 256,
         "block_k": 64,
         "num_buffers": 3,
         "num_warps": 4,
-        "num_subtiles": 1
+        "num_subtiles": 1,
+        "group_m": 1,
+        "num_ctas": 1,
+        "cluster_split": "auto",
+        "xcd_swizzle": 1,
+        "split_k": 1,
+        "waves_per_eu": 0
     },
     "bm64_any": {
         "block_n": 256,
         "block_k": 64,
         "num_buffers": 3,
         "num_warps": 4,
-        "num_subtiles": 1
+        "num_subtiles": 1,
+        "group_m": 1,
+        "num_ctas": 1,
+        "cluster_split": "auto",
+        "xcd_swizzle": 1,
+        "split_k": 1,
+        "waves_per_eu": 0
     },
     "bm128_any": {
         "block_n": 256,
         "block_k": 64,
         "num_buffers": 2,
         "num_warps": 8,
-        "num_subtiles": 1
+        "num_subtiles": 1,
+        "group_m": 1,
+        "num_ctas": 1,
+        "cluster_split": "auto",
+        "xcd_swizzle": 1,
+        "split_k": 1,
+        "waves_per_eu": 0
     },
     "bm128_swiglu_any": {
         "block_n": 256,
         "block_k": 64,
         "num_buffers": 4,
         "num_warps": 8,
-        "num_subtiles": 1
+        "num_subtiles": 1,
+        "group_m": 1,
+        "num_ctas": 1,
+        "cluster_split": "auto",
+        "xcd_swizzle": 1,
+        "split_k": 1,
+        "waves_per_eu": 0
     }
 }

@@ -123,7 +123,18 @@ def _build_moe_a16w16_layouts(
 
 _moe_gemm_a16w16_repr = make_kernel_repr(
     "_moe_gemm_a16w16",
-    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M", "NUM_BUFFERS", "XCD_SWIZZLE"],
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "NUM_BUFFERS",
+        "NUM_SUBTILES",
+        "XCD_SWIZZLE",
+        "APPLY_SWIGLU",
+        "num_warps",
+        "num_ctas",
+    ],
 )
 
 
@@ -215,7 +226,8 @@ def _moe_gemm_a16w16(
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
-    start_m = gl.load(ExptOffs + expt_id)
+    # Upcast before the X and Y stride products, which overflow int32 at large M.
+    start_m = gl.load(ExptOffs + expt_id).to(index_type)
     expt_id = expt_id.to(index_type)
 
     # X / gather offsets
@@ -417,7 +429,7 @@ def _moe_gemm_a16w16(
         )
         out *= gammas[:, None]
 
-    out = out.to(gl.bfloat16)
+    out = out.to(Y.type.element_ty)
 
     # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m * stride_y_m
