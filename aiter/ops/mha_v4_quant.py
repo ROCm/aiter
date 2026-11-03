@@ -38,11 +38,13 @@ MHA_V4_MXFP4_V_TILE_TOKENS = FP4_V_TILE_TOKENS
 MHA_V4_MXFP4_V_PACKED_ROW_BYTES = FP4_V_PACKED_BYTES_PER_TOKEN
 MHA_V4_MXFP4_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
-# Dense kernels speculatively gather the overlapping final K-scale dword and two lookahead V-scale
-# tiles. Keep those reads mapped and zero without changing either scale tensor's logical shape.
-# Measured on gfx950: 1023 trailing V-scale bytes still fault, 1024 do not, whatever the shape.
+# Kernels speculatively gather the overlapping final K-scale dword, and the 64x64 sparse kernels
+# gather V scales through a raw pointer that reads up to 256 bytes past the last tile. Keep those
+# reads mapped and zero without changing either scale tensor's logical shape. The dense and
+# 256-row kernels bound their V-scale gather with a buffer descriptor; the launcher requires this
+# slack on the 64x64 rows only.
 MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
-MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = 1024
 # The ASM Q-scale gather is an unguarded global load covering a whole 256-row query tile, so a
 # partial final tile addresses rows past the logical sequence.
 MHA_V4_QUERY_TILE_ROWS = 256
@@ -55,9 +57,9 @@ MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
 MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
-# The FP6-P block-sparse kernels gather each V-scale tile one tile ahead through a raw pointer
-# with no record bound, so the last tile of the last (batch, head) reads past the image. A short
-# V is small enough for that read to leave its allocation, so it lands on zeroed slack.
+# The 64x64 FP6-P sparse kernels gather V scales through a raw pointer with no record bound, which
+# reads up to 256 bytes past the last tile of the last (batch, head). The launcher requires this
+# slack on those rows, as for MXFP4.
 MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES = 1024
 
 

@@ -322,9 +322,13 @@ constexpr int64_t kQueryScaleTileRows       = 256;
 constexpr int64_t kKvScaleTileRows          = 128;
 constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
 constexpr int64_t kKvScaleTrailingDwordSlack = 4;
-// MXFP4 V scales are gathered two 512-byte tiles ahead of the tile being run, so the last tiles
-// address bytes past the final one whatever the sequence length. Mirrors FP4_V_SCALE_SLACK_BYTES.
-constexpr int64_t kMxFp4VScaleSlackBytes = 2 * 512;
+// The 64x64 sparse MX-V objects gather V scales through a raw pointer, 512 bytes from the first
+// token of each 64-token block. For a block in the second half of a 128-token scale tile that
+// ends 256 bytes past the tile, so the last (batch, head) reads past the tensor. The dense and
+// 256-row objects bound the gather with a buffer descriptor and need nothing. Mirrors the
+// producers' MHA_V4_MXFP4_V_SCALE_SLACK_BYTES and MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES.
+constexpr int64_t kMxVScaleSlackBytes = 1024;
+constexpr int64_t kMxVUnboundedKvTile = 64;
 
 void check_scale_backing_storage(const at::Tensor& descale,
                                  int64_t sequence,
@@ -345,6 +349,30 @@ void check_scale_backing_storage(const at::Tensor& descale,
                 " descale needs ",
                 required,
                 " mapped bytes so the kernel's speculative tile gather stays in bounds, but only ",
+                backed,
+                " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
+                "zeroed slack");
+}
+
+void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
+                                      const MhaV4Recipe& recipe,
+                                      const at::Tensor& v_descale)
+{
+    const bool mx_v = recipe.v_format == format_id(AttentionFormat::Fp6E2M3) ||
+                      recipe.v_format == format_id(AttentionFormat::Fp4E2M1);
+    if(!mx_v || cfg.ts_kv != kMxVUnboundedKvTile)
+        return;
+    const int64_t required = v_descale.numel() + kMxVScaleSlackBytes;
+    const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
+                           v_descale.storage_offset() * v_descale.element_size();
+    TORCH_CHECK(backed >= required,
+                "MX V descale needs ",
+                required,
+                " mapped bytes so the ",
+                cfg.ts_qo,
+                "x",
+                cfg.ts_kv,
+                " kernel's speculative tile gather stays in bounds, but only ",
                 backed,
                 " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
                 "zeroed slack");
@@ -941,20 +969,6 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(v_descale.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.nhead_k, tiles * 512}),
                     "MX V descale must have shape [batch, key_heads, tiles * 512]");
-        if(recipe.v_format == format_id(AttentionFormat::Fp4E2M1))
-        {
-            const int64_t required = v_descale.numel() + kMxFp4VScaleSlackBytes;
-            const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
-                                   v_descale.storage_offset() * v_descale.element_size();
-            TORCH_CHECK(backed >= required,
-                        "MX V descale needs ",
-                        required,
-                        " mapped bytes so the kernel's speculative tile gather stays in bounds, "
-                        "but only ",
-                        backed,
-                        " are backed; allocate it with the aiter.ops.mha_v4_quant producers, "
-                        "which reserve zeroed slack");
-        }
     }
     else if(mx_qk_format)
     {
@@ -1121,6 +1135,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     const auto arch = get_gpu_arch();
     const auto& cfg = find_config(arch, recipe, /*mode=*/1, q_tile, kv_tile);
+    check_mx_v_scale_backing_storage(cfg, recipe, v_descale);
     TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 row ",
                 cfg.knl_name,

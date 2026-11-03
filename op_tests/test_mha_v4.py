@@ -34,6 +34,7 @@ from aiter.ops.mha_v4 import (
     native_fp8_format,
     scale_modes_for_formats,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.mha_v4_quant import (
     MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
     MHA_V4_KV_TILE_ROWS,
@@ -41,6 +42,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
+    MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
@@ -1181,25 +1183,26 @@ def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
 @skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
 @parametrize("sequence", [1, 128, 129, 257, 512])
 @parametrize(
-    "quantize",
-    [quantize_v_mxfp4_fp6_p],
-    ids=["fp6_p"],
+    ("quantize", "slack"),
+    [
+        param(quantize_v_mxfp4_fp6_p, MHA_V4_MXFP4_V_SCALE_SLACK_BYTES, id="mxfp4"),
+        param(
+            quantize_v_mxfp6_fp6_p, MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES, id="mxfp6"
+        ),
+    ],
 )
-def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
-    quantize, sequence
+def test_mha_v4_mx_v_scale_backing_storage_covers_the_64x64_gather(
+    quantize, slack, sequence
 ):
-    """The MXFP4 Q/K rows gather V scales two 512-byte tiles ahead of the running tile.
-
-    The lead does not shrink at the end of the sequence, so the last tiles address scale bytes
-    past the final one whatever the length. Measured on gfx950: 1023 trailing mapped bytes still
-    fault, 1024 do not.
+    """The 64x64 sparse MX-V rows gather V scales through a raw pointer, 512 bytes from the first
+    token of each 64-token block. A block in the second half of a 128-token scale tile reads 256
+    bytes past it, so the producers back the last tile with zeroed slack.
     """
     heads = 3
     value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
     _, scale = quantize(value)
 
-    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
-    assert slack == 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    assert slack >= MHA_V4_MXFP4_V_SCALE_TILE_BYTES // 2
     assert scale.is_contiguous()
     assert scale.untyped_storage().nbytes() == scale.numel() + slack
     assert torch.equal(
@@ -1579,12 +1582,13 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
-def test_mha_v4_packed_rejects_unbacked_mx_scales():
-    """An external caller passing exact-size scales would fault the speculative gathers.
+def test_mha_v4_packed_rejects_unbacked_mxfp4_k_scales():
+    """An external caller passing an exact-size MXFP4 K scale would fault the speculative gather.
 
     clone() keeps the logical shape the size checks look at but drops the producer's
     zeroed slack, which is exactly the shape of a caller-supplied tensor. Q is not checked:
-    its gather is bounded by a buffer descriptor, so it needs no slack.
+    its gather is bounded by a buffer descriptor, so it needs no slack. V is checked on the
+    64x64 rows only; see test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows.
     """
     torch.manual_seed(5)
     value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -1592,7 +1596,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
     mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4_fp6_p(value)
-    with expect_raises(RuntimeError, match="speculative tile gather"):
+    with expect_raises(RuntimeError, match="MX K descale needs"):
         mha_v4_packed(
             mxfp4_q,
             mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
@@ -1608,21 +1612,83 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
             AttentionScaleMode.E8M0_PER_1X32,
         )
 
-    with expect_raises(RuntimeError, match="MX V descale needs"):
-        mha_v4_packed(
-            mxfp4_q,
-            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
-            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
-            mxfp4_q_scale,
-            mxfp4_k_scale,
-            mxfp4_v_scale.clone(),
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
+
+def _mx_fp6_p_packed_operands(fmt, queries, keys):
+    """Producer-built (q, k, v, q_descale, k_descale, v_descale) for an MX FP6-P recipe."""
+    batch, sequence, heads, _ = keys.shape
+    if fmt == AttentionFormat.MXFP4:
+        q, q_scale = quantize_mxfp4_q(queries, 1.0)
+        k_raw, k_scale = quantize_mxfp4_k(keys)
+        v_raw, v_scale = quantize_v_mxfp4_fp6_p(keys)
+        k, v = mxfp4_k_view(k_raw, k_scale), mxfp4_v_view(v_raw, v_scale, sequence)
+        return q, k, v, q_scale, k_scale, v_scale
+    q, q_scale = quantize_mxfp6_q(queries, 1.0)
+    k_raw, k_scale_raw = quantize_mxfp6_k(keys)
+    k, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    v, v_scale = quantize_v_mxfp6_fp6_p(keys)
+    return q, k, v, q_scale, k_scale, v_scale
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+@parametrize("fmt", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows(fmt):
+    """Only the 64x64 sparse rows gather V scales through a raw pointer.
+
+    A 64-token block reads the 512 scale bytes from its first token, so with one 128-token tile
+    and only the second block selected the gather ends 256 bytes past the tensor. clone() keeps
+    the logical shape and drops the producer's slack, which is the shape of a caller-supplied
+    tensor. The dense and 256x128 rows bound the gather with a buffer descriptor, so the compact
+    scale is the same launch to them.
+    """
+    torch.manual_seed(5)
+    keys = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    queries = torch.randn((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
+    q, k, v, q_scale, k_scale, v_scale = _mx_fp6_p_packed_operands(fmt, queries, keys)
+    compact = v_scale.clone()
+    assert compact.untyped_storage().nbytes() == compact.numel()
+    modes = (AttentionScaleMode.E8M0_PER_1X32,) * 3
+
+    def launch(v_descale, **sparse):
+        out = mha_v4_packed(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_descale,
+            fmt,
+            fmt,
+            fmt,
+            *modes,
+            v_pack=AttentionPack.V_FOR_FP6_P,
+            **sparse,
         )
+        torch.cuda.synchronize()
+        return out
+
+    def lut(q_tile, kv_tile, blocks):
+        mask = torch.zeros(
+            (1, 1, 256 // q_tile, 128 // kv_tile), device="cuda", dtype=torch.bool
+        )
+        mask[..., blocks] = True
+        indices, start, count = block_attn_mask_to_ragged_lut(
+            mask, num_heads=1, return_none_if_dense=False
+        )
+        return {
+            "kv_block_indices": indices,
+            "lut_start": start,
+            "lut_count": count,
+            "block_tile": (q_tile, kv_tile),
+        }
+
+    assert torch.equal(launch(compact), launch(v_scale))
+    default = lut(256, 128, [0])
+    assert torch.equal(launch(compact, **default), launch(v_scale, **default))
+
+    fine = lut(64, 64, [1])
+    assert torch.isfinite(launch(v_scale, **fine)).all()
+    with expect_raises(RuntimeError, match="64x64 kernel's speculative tile gather"):
+        launch(compact, **fine)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
