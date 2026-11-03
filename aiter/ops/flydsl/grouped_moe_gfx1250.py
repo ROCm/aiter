@@ -173,7 +173,18 @@ def _find_grouped_config(
     # as a value that matches nothing.
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
-        return "" if value.lower() in ("nan", "none") else value
+        if value.lower() in ("nan", "none"):
+            return ""
+        # Merging model config CSVs through pandas can turn integer-valued
+        # keys such as ep_fused=0 into "0.0". Normalize those values so older
+        # runtime branches can match newer tuned tables such as PR #7295.
+        try:
+            number = float(value)
+            if number == int(number):
+                return str(int(number))
+        except ValueError:
+            pass
+        return value
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
