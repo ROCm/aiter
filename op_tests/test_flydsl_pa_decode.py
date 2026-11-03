@@ -306,7 +306,7 @@ _NONCAUSAL_CASES = [
             "max_partitions": 8,
         },
     ),
-    # One query row: the same kernels as causal, so the same output.
+    # One query row sees the same keys either way, so both modes share a kernel.
     (
         "noncausal-q1",
         {"causal": False, "group_size": 8, "block_size": 64, "max_partitions": 2},

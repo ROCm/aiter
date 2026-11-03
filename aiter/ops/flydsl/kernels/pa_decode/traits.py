@@ -99,7 +99,7 @@ def resolve_causal(causal, query_length):
     """Validate ``causal``; one query row sees the same keys either way."""
     if not isinstance(causal, bool):
         raise TypeError("causal must be a bool")
-    return causal or query_length == 1
+    return causal and query_length > 1
 
 
 @dataclass(frozen=True)
