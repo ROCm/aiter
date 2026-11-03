@@ -1430,7 +1430,15 @@ def test_asymmetric_multihead_large_address(kv_dtype, device):
     expected = torch.empty_like(output)
     expected[:, :8].fill_(2)
     expected[:, 8:].fill_(4)
-    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    err = checkAllclose(
+        output,
+        expected,
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg=f"asymmetric-large-address-{kv_dtype}",
+    )
+    assert err == 0, f"mismatch ratio={err}"
 
 
 def _poison_unowned(cache, scale, owned, fill):
