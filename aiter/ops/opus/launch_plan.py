@@ -302,6 +302,16 @@ def _build_a16w16_launch_plan(
     instance = get_kernel_instance(
         registry_arch, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
     )
+    if instance is None and registry_arch == "gfx1250-strict":
+        # The OPUS CO kernels are pre-compiled gfx1250 images, and the CO
+        # loader does not distinguish the strict runtime id. Resolve only CO
+        # kids through the base family; every other kernel keeps the real id.
+        candidate = get_kernel_instance(
+            GFX1250, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
+        )
+        if candidate is not None and candidate.kernel_tag in _GFX1250_CO_TAGS:
+            instance = candidate
+            registry_arch = GFX1250
     if instance is None:
         if (
             get_kernel_instance(registry_arch, "a16w16", resolved_kid, cu_num=cu_num)

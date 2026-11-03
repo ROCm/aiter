@@ -810,7 +810,7 @@ def _default_co_output_dir(arch, offload_arch):
     if arch == "gfx950":
         return os.path.join(_HERE, arch)
     if offload_arch == "gfx1250-strict":
-        return os.path.join(_HERE, arch + "-a0")
+        return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
 
 
@@ -860,7 +860,7 @@ def main():
         "--out-dir",
         default="",
         help="default: <this dir>/named_reg/<arch>; with gfx1250-strict: "
-        "<this dir>/<arch>-a0. Pass an explicit output for production rebuilds",
+        "<this dir>/<arch>-strict. Pass an explicit output for production rebuilds",
     )
     p.add_argument(
         "--no-asm",
@@ -981,7 +981,7 @@ def main():
         "arch": args.arch,
         "offload_arch": args.offload_arch,
         "target_profile": (
-            "a0-strict" if args.offload_arch == "gfx1250-strict" else "regular"
+            "strict" if args.offload_arch == "gfx1250-strict" else "regular"
         ),
         "hipcc": args.hipcc,
         "device_clang": ver,
