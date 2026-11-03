@@ -436,11 +436,11 @@ def av_store_b128(addr_i64, val, syncscope="agent"):
 def atomic_add_agent_acq_rel_av_none(addr_i64, val):
     """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
 
-    ``!mmra !{"amdgcn-av", "none"}`` tells the AMDGPU memory legalizer that the
-    payload accesses ordered by this RMW make themselves available/visible at
-    agent scope (e.g. ``sc1`` loads and stores), so it emits only the
-    ``s_waitcnt`` ordering and no ``buffer_wbl2``/``buffer_inv``. Payload
-    accesses that rely on ordinary caching are not synchronized by this RMW.
+    ``!mmra !{"amdgcn-av", "none"}`` removes the release's make-available and
+    the acquire's make-visible steps (no ``buffer_wbl2``/``buffer_inv``); the
+    RMW still synchronizes. Callers must provide payload availability and
+    visibility independently through AV accesses or a documented
+    target-specific cache-policy protocol.
     """
     op = _llvm_d.AtomicRMWOp(
         _llvm_d.AtomicBinOp.add,
