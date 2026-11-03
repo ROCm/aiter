@@ -102,7 +102,7 @@ class PaDecodeQueryLoader:
         self.gemm = gemm
 
     def init_loaders(self):
-        q_dtype = fx.Uint8 if self.traits.QFP8 else self.traits.Q_DTYPE
+        q_dtype = self.traits.FP8 if self.traits.QFP8 else self.traits.Q_DTYPE
         _q_copy_op = (
             fx.rocdl.BufferCopy128b()
             if self.traits.QLOAD_UNIT == 8 and not self.traits.QFP8

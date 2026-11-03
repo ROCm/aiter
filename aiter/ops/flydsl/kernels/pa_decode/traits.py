@@ -890,7 +890,7 @@ class Gfx1250Traits:
 
     @property
     def kv_dtype(self):
-        return fx.BFloat16 if self.bf16 else fx.Uint8
+        return fx.BFloat16 if self.bf16 else fx.Float8E4M3FN
 
     @property
     def rows(self):
