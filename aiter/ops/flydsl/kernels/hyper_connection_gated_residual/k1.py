@@ -40,6 +40,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
@@ -957,7 +958,8 @@ def _decode_reduce_params(total: int):
     return 1, 1
 
 
-# Select the two-kernel skinny implementation unless diagnostics disable it.
+# Temporary rollback switch for diagnosing the two-kernel skinny implementation.
+# It is not a supported tuning knob and may be removed once the path is proven.
 _SKINNY_TWO_KERNEL = os.environ.get("AITER_GR_SKINNY_TWO_KERNEL", "1") == "1"
 # Chunked partial stores keep the two-kernel path within its register budget
 # through M=8. The unchunked fallback is limited to M=4.
@@ -1452,7 +1454,8 @@ def flydsl_k1_combine_norm_down(
         block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
     # gfx942 uses 32-bit async loads, so split-K uses register prefetch to avoid
     # multiplying load instructions. Other architectures use the async pipeline.
-    # GR_FORCE_PIPE enables the gfx942 pipeline for diagnostics.
+    # GR_FORCE_PIPE is a temporary diagnostic rollback switch, not a supported
+    # tuning knob.
     _gfx942_regp_partial = arch == "gfx942" and not os.environ.get("GR_FORCE_PIPE")
     _plan_sk_block_m = None
     if plan is not None:
@@ -1486,6 +1489,11 @@ def flydsl_k1_combine_norm_down(
             sk_block_m = 32
         else:
             sk_block_m = block_m
+    # Split-K stores are not row-masked. A nearest-neighbour tuned plan can
+    # select a tile height that does not divide a direct caller's token count.
+    if gemm_tokens % sk_block_m:
+        sk_block_m = 64 if gemm_tokens % 64 == 0 else block_m
+    assert gemm_tokens % sk_block_m == 0
     if split_k == "auto":
         split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles)
     use_splitk = isinstance(split_k, int) and split_k > 1
@@ -1637,7 +1645,7 @@ def flydsl_k1_combine_norm_down(
             aux_lds += ((_dn_bm * hc_count * 4 + 15) // 16) * 16
             fixed_lds = stages * _dn_bm * block_k * 2 + aux_lds
             bytes_per_n = stages * block_k * 2
-            max_block_n = (64 * 1024 - fixed_lds) // bytes_per_n
+            max_block_n = (get_lds_capacity_bytes(arch) - fixed_lds) // bytes_per_n
             if _dn_bn > max_block_n:
                 _dn_bn = _decouple_block_n(n_pad, min(_dn_bn, max_block_n))
             assert _dn_bn <= max_block_n, "decoupled K1 exceeds gfx942 LDS capacity"

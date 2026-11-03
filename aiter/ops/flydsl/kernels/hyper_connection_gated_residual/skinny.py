@@ -444,15 +444,29 @@ def _build_up_mix_grouped(
     return launch
 
 
+# Temporary diagnostic override for comparing skinny schedules. It is not a
+# supported tuning knob and may be removed once the schedule is finalized.
 _COLS_PER_WAVE = int(os.environ.get("AITER_GR_SKINNY_COLS_PER_WAVE", "2"))
-_COUNTERS: dict[tuple[int, int, int], torch.Tensor] = {}
+_COUNTERS: dict[tuple[int | None, int, int, int, int], torch.Tensor] = {}
 
 
-def _counters(device: torch.device, n_pad: int, m_groups: int = 1) -> torch.Tensor:
-    key = (device.index, n_pad, m_groups)
+def _counters(
+    device: torch.device,
+    n_pad: int,
+    hc_count: int,
+    stream: torch.cuda.Stream,
+    m_groups: int = 1,
+) -> torch.Tensor:
+    # Counters advance modulo hc_count, so phases from different HC values must
+    # never mix. Calls on one stream are serialized; separate streams need
+    # separate storage so concurrently active invocations cannot race.
+    key = (device.index, n_pad, m_groups, hc_count, stream.cuda_stream)
     c = _COUNTERS.get(key)
     if c is None:
-        c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
+        # Initialize on the launch stream. Allocating on the ambient stream can
+        # otherwise race the first kernel use on a caller-provided side stream.
+        with torch.cuda.stream(stream):
+            c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
         _COUNTERS[key] = c
     return c
 
@@ -472,11 +486,7 @@ def skinny_two_kernel(
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns ``(r2, block_input, packed)``; see the module docstring.
-
-    Two calls must not run concurrently on different streams: they share the
-    per-column arrival counters.
-    """
+    """Returns ``(r2, block_input, packed)``; see the module docstring."""
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
@@ -524,7 +534,7 @@ def skinny_two_kernel(
         rrms,
         partial,
         packed,
-        _counters(dev, n_pad),
+        _counters(dev, n_pad, hc_count, stream),
         fxs,
     )
     _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)
@@ -608,7 +618,7 @@ def skinny_chunked_two_kernel(
         rrms,
         partial,
         packed,
-        _counters(dev, n_pad, m_groups),
+        _counters(dev, n_pad, hc_count, stream, m_groups),
         fxs,
     )
     _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)

@@ -26,7 +26,7 @@ import torch
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor
 
@@ -52,13 +52,10 @@ _MFMA_BF16 = {
 def arch_name(device=None) -> str:
     """Normalized GCN arch string (e.g. ``"gfx942"``) used as the routing key.
 
-    Prefers the tensor's own ``device`` when given (correct under multi-GPU or a
-    non-current device); falls back to the live device otherwise. Centralizes the
-    ``gcnArchName`` parsing so every kernel keys off the same value.
+    Runtime dispatch follows the shared chip-info policy. ``device`` is accepted
+    for call-site compatibility; supported ROCm nodes are homogeneous.
     """
-    if device is not None:
-        return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    return get_gfx()
+    return get_gfx_runtime()
 
 
 def mfma_bf16(arch: str | None = None) -> MfmaConfig:

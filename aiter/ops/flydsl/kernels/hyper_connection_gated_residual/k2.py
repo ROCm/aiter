@@ -38,6 +38,22 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
 
 
+def _validate_w_up(
+    w_up: torch.Tensor, hidden: int, lowrank: int, device: torch.device
+) -> None:
+    """Reject tensors the generated row-major bf16 view cannot represent."""
+    if w_up.device != device:
+        raise ValueError(f"w_up must be on {device}, got {w_up.device}")
+    if w_up.dtype != torch.bfloat16:
+        raise ValueError(f"w_up must have dtype torch.bfloat16, got {w_up.dtype}")
+    if w_up.ndim != 2 or w_up.shape != (hidden, lowrank):
+        raise ValueError(
+            f"w_up must have shape ({hidden}, {lowrank}), got {tuple(w_up.shape)}"
+        )
+    if not w_up.is_contiguous():
+        raise ValueError("w_up must be row-major contiguous")
+
+
 @lru_cache(maxsize=16)
 def _build_up_gate_mix_norm(
     hc_count: int,
@@ -277,7 +293,7 @@ def flydsl_up_gate_mix_norm(
     tokens, lowrank = lora.shape
     hidden = r2.shape[1]
     stream_dim = hidden // hc_count
-    assert w_up.shape == (hidden, lowrank)
+    _validate_w_up(w_up, hidden, lowrank, lora.device)
     assert rrms.shape == (tokens, hc_count)
     w_bf16 = norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
     w = norm_weight.reshape(-1) if w_bf16 else norm_weight_f32(norm_weight)

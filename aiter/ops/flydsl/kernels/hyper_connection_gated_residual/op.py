@@ -23,7 +23,7 @@ from .k1 import (
     flydsl_k1_combine_norm_down,
     flydsl_k1k2_skinny_decode,
 )
-from .k2 import flydsl_up_gate_mix_norm
+from .k2 import _validate_w_up, flydsl_up_gate_mix_norm
 
 
 def _merged_pad(width: int) -> int:
@@ -110,6 +110,7 @@ def _k1_then_k2(
     norm-rebuild launch ever exists.
     """
     tokens = residual.shape[0]
+    _validate_w_up(w_up, residual.shape[1], lowrank, residual.device)
     # The skinny path avoids row padding and requires the folded down weight.
     # Limit it to DECODE_MAX_M because each lane holds one accumulator per row.
     if fold_w and 1 <= tokens <= DECODE_MAX_M:
@@ -267,11 +268,28 @@ def flydsl_gr_two_stage_combine(
     """
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
+    if injection.dtype != torch.bfloat16 or injection.stride(-1) != 1:
+        raise ValueError("injection must be bf16 with a contiguous inner dimension")
+    if injection.shape != (tokens, hc_count):
+        raise ValueError(
+            f"injection must have shape ({tokens}, {hc_count}), "
+            f"got {tuple(injection.shape)}"
+        )
+    if injection.device != residual.device:
+        raise ValueError(
+            f"injection must be on {residual.device}, got {injection.device}"
+        )
     if stream is None:
         stream = torch.cuda.current_stream()
     r2 = torch.empty_like(residual)
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=residual.device)
-    launch = _build_combine_rms(hc_count, stream_dim, float(eps))
+    inj_stride = injection.stride(0) if tokens > 1 else hc_count
+    launch = _build_combine_rms(
+        hc_count,
+        stream_dim,
+        float(eps),
+        0 if inj_stride == hc_count else inj_stride,
+    )
     _run_compiled(
         launch, residual, block_output, injection, r2, rrms, fx.Stream(stream)
     )
