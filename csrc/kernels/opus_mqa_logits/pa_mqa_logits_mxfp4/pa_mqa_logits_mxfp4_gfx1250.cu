@@ -275,9 +275,10 @@ struct h32_traits : mqa_logits_traits<W_, 32, STAGES_, SCALE_TDM_> {
 
 }  // namespace opus_logits::gfx1250
 
-// The device pass on gfx1250 gets the kernels; every other pass gets empty stubs so the launch
-// symbols resolve. Both halves of the guard are load-bearing: the host pass reports warp size 64.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
+// The device pass on gfx1250 (or its gfx1250-strict variant) gets the kernels; every other pass
+// gets empty stubs so the launch symbols resolve. Both halves of the guard are load-bearing: the
+// host pass reports warp size 64.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__))
 #include "pa_mqa_logits_mxfp4_gfx1250_h64.cuh"
 #include "pa_mqa_logits_mxfp4_gfx1250_h32.cuh"
 #else

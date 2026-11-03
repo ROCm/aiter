@@ -42,6 +42,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus import pa_mqa_logits_mxfp4 as M
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
@@ -1023,7 +1024,7 @@ def summarize(name, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if base_gfx_arch(get_gfx()) not in SUPPORTED_GFX:
         aiter.logger.warning(
             "mqa_logits_mxfp4 has no instances on %s; skipping", get_gfx()
         )

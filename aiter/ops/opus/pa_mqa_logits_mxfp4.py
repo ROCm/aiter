@@ -66,6 +66,7 @@ from dataclasses import dataclass
 import torch
 
 from ...jit.core import compile_ops
+from ...jit.utils.build_targets import base_gfx_arch
 from ...jit.utils.torch_guard import torch_compile_guard
 from ._arch import GFX950, GFX1250, _device_arch
 
@@ -625,7 +626,7 @@ def _config(
             f"max_seq_len must be under {_MAX_SEQ_LEN} (a row's logits are addressed in 32 "
             f"bits), got {max_seq_len}"
         )
-    arch = _device_arch(dev)
+    arch = base_gfx_arch(_device_arch(dev))  # gfx1250-strict runs the gfx1250 kernels
     if _PERMUTE_ROWS.get(arch, page_size) % page_size:
         raise ValueError(
             f"{arch}'s KV plane is permuted {_PERMUTE_ROWS[arch]} rows at a time, which a page "
