@@ -604,7 +604,7 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
-    # Four 16-row query tiles at D128 over page128 caches: on gfx1250, wave
+    # Four 16-row query tiles at D64/D128 over page128 caches: on gfx1250, wave
     # pairs share two tiles and split every page, in each output mode. One
     # task per sequence runs window-masked, unmasked and causal pages in turn;
     # one slot per sequence merges the long rows' tasks across replays.
@@ -663,6 +663,58 @@ _BF16_CASES = _COMMON_CASES + [
         {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
     ),
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
+    # D64 takes the same wave-pair pipeline with V chunks 1 KiB apart.
+    *[
+        (f"{name}-d64", dict(geometry, head_dim=64))
+        for name, geometry in (
+            (
+                "mtp4-g16-page128-direct",
+                {"query_length": 4, "group_size": 16, "block_size": 128},
+            ),
+            (
+                "mtp4-g16-page128-cluster",
+                {
+                    "query_length": 4,
+                    "kv_heads": 2,
+                    "group_size": 16,
+                    "block_size": 128,
+                    "max_partitions": 7,
+                },
+            ),
+            (
+                "mtp4-g16-page128-merge",
+                {
+                    "query_length": 4,
+                    "group_size": 16,
+                    "block_size": 128,
+                    "lengths": (0, 0, 1027, 4100),
+                    "max_partitions": 4,
+                    "budget": 1,
+                    "capture": True,
+                },
+            ),
+            (
+                "mtp4-g16-page128-window",
+                {
+                    "query_length": 4,
+                    "group_size": 16,
+                    "block_size": 128,
+                    "lengths": (65, 300, 1027, 4100),
+                    "window": 700,
+                    "sink_dtype": torch.float32,
+                },
+            ),
+            (
+                "mtp5-g12-page128",
+                {
+                    "query_length": 5,
+                    "group_size": 12,
+                    "block_size": 128,
+                    "max_partitions": 7,
+                },
+            ),
+        )
+    ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
     (
         "loose-bound",

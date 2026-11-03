@@ -943,13 +943,10 @@ class Gfx1250Traits:
 
     @property
     def bf16_wave_query_tiles(self):
-        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # Four query tiles over BF16 page128 caches: wave pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
-        return (
-            self.bf16_page128_packed
-            and self.m_tiles == self.NWARP
-            and self.head_dim == 128
-        )
+        # Packed page128 limits D256 to 32 rows, so this selects D64 and D128.
+        return self.bf16_page128_packed and self.m_tiles == self.NWARP
 
     @property
     def async_page(self):

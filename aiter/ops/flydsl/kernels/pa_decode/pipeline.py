@@ -907,6 +907,9 @@ class Gfx1250Bf16WavePipeline:
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
+        # Bytes between eight-element chunks: K's eight dims span a page's
+        # 128 tokens, V's eight tokens span the head. Both are 2048 at D128.
+        self.k_chunk, self.v_chunk = 128 * 16, self.t.head_dim * 16
 
     @flyc.jit
     def _stage_next(self, token_base, begin, end, buffer):
@@ -923,15 +926,15 @@ class Gfx1250Bf16WavePipeline:
         else:
             tdm_ops.tensor_wait(0)
 
-    def _operand(self, base, offset):
+    def _operand(self, base, offset, chunk_bytes):
         # Half-wave h holds eight-element chunks h and h + 2 of a 32-wide
-        # contraction slice; packed K and transposed V both space chunks
-        # 2048 bytes apart.
+        # contraction slice. Packed K spaces chunks a 128-token page apart
+        # (2048 bytes); transposed V spaces them a head row apart (16 D bytes).
         words = []
         for j in range_constexpr(2):
             pointer = fx.recast_iter(
                 fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16),
-                fx.add_offset(self.mem.base, base + offset + 4096 * j),
+                fx.add_offset(self.mem.base, base + offset + 2 * chunk_bytes * j),
             )
             fragment = fx.Vector(
                 fx.ptr_load(pointer, result_type=fx.Vector.make_type(4, fx.Int32))
@@ -960,7 +963,7 @@ class Gfx1250Bf16WavePipeline:
         ]
         for i in range_constexpr(4):
             for d in range_constexpr(t.head_dim // 32):
-                k = self._operand(kbase, 8192 * d + 256 * i)
+                k = self._operand(kbase, 4 * self.k_chunk * d + 256 * i, self.k_chunk)
                 for m in range_constexpr(2):
                     tiles[m][i] = Gfx1250Gemm.mma(
                         k, q_operands[m][d], tiles[m][i], 32, True
@@ -1043,7 +1046,11 @@ class Gfx1250Bf16WavePipeline:
             )
         for d in range_constexpr(t.head_dim // 16):
             for s in range_constexpr(2):
-                v = self._operand(vbase, t.k_bytes + 8192 * s + 256 * d)
+                v = self._operand(
+                    vbase,
+                    t.k_bytes + 4 * self.v_chunk * s + 256 * d,
+                    self.v_chunk,
+                )
                 for m in range_constexpr(2):
                     outs[m][d] = Gfx1250Gemm.mma(
                         v, p_operands[m][s], outs[m][d], 32, True
@@ -1112,9 +1119,10 @@ class Gfx1250Bf16WavePipeline:
             begin
             + fx.max(fx.min((unmasked_end - begin) // 128, pages), fx.Int32(0)) * 128
         )
-        lanes = t.q_bytes + ctx.half * 2048 + ctx.lane16 * 16
-        kbase = lanes + part * 64 * 16
-        vbase = lanes + part * 8 * 2048
+        k_lanes = t.q_bytes + ctx.half * self.k_chunk + ctx.lane16 * 16
+        v_lanes = t.q_bytes + ctx.half * self.v_chunk + ctx.lane16 * 16
+        kbase = k_lanes + part * 64 * 16
+        vbase = v_lanes + part * 8 * self.v_chunk
         bases = ((kbase, kbase + t.kv_stride), (vbase, vbase + t.kv_stride))
         initial = []
         for _ in range_constexpr(2):
