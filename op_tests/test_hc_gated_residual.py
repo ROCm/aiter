@@ -437,8 +437,8 @@ def _run_side_stream_pressure():
 def _run_skinny_publication_stress(reps=300):
     """Repeat skinny decode; the last-arriving wave must never read stale partials.
 
-    Workgroups of one column group land on different XCDs, whose L2s are not
-    coherent. The cross-wave sum is accumulated in a fixed order, so every
+    Workgroups of one column group may land on different XCDs, whose L2s are
+    not coherent. The cross-wave sum is accumulated in a fixed order, so every
     replay must be bit-identical to the first oracle-checked result.
     """
     for tokens in (1, 3, 8):

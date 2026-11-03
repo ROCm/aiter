@@ -36,6 +36,7 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent_acq_rel_av_none,
+    av_store_b128,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     GTensor,
@@ -46,8 +47,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 WAVE = 64
-# sc1: agent-visible partials. They are written and read across XCDs, which
-# do not share L2.
+# sc1: agent-visible partial loads. Partials are read across XCDs, which do
+# not share L2.
 CPOL_AGENT = 0x10
 DOWN_VEC = 8  # bf16 per 16-byte load
 UP_VEC = 4
@@ -136,6 +137,11 @@ def _build_down_fused(
         r2_t = _bounded(r2_out, fx.BFloat16, r2_elems, DOWN_VEC)
         rrms_t = _bounded(rrms_out, fx.Float32, rrms_elems)
         part_t = _bounded(partial, fx.Float32, part_elems, PART_M)
+        part_base = fx.Int64(fx.ptrtoint(fx.get_iter(partial)))
+
+        def part_addr(elem_off):
+            return part_base + fx.Int64(elem_off) * fx.Int64(4)
+
         packed_t = _bounded(packed, fx.BFloat16, packed_elems)
 
         # Column 0 of each stream writes that stream's r2 and rrms.
@@ -240,19 +246,19 @@ def _build_down_fused(
                 ]
                 for _ in range_constexpr(PART_M - len(dots)):
                     dots.append(fx.Float32(0.0))
-                buf_copy_store(
-                    part_t,
-                    mg * part_group_elems
-                    + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M,
+                av_store_b128(
+                    part_addr(
+                        mg * part_group_elems
+                        + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M
+                    ),
                     fx.Vector.from_elements(dots, dtype=fx.Float32),
-                    elem=fx.Float32,
-                    unit_elems=PART_M,
-                    cache_modifier=CPOL_AGENT,
                 )
 
-        # Partials use agent-visible (sc1) stores and loads; the acq_rel arrival
-        # RMW orders them, and its amdgcn-av:none MMRA skips cache-wide L2
-        # maintenance because the partials are visible per access.
+        # Partials are written with agent-scope AV stores, and the acq_rel
+        # arrival RMW is tagged amdgcn-av:none, so it orders them without L2
+        # maintenance. The partial loads below are raw sc1 buffer loads rather
+        # than AV loads: visibility on that side relies on the gfx942/gfx950
+        # cache policy, not on the LLVM memory model.
         #
         # One counter per lane of a column, so lanes don't contend on an address.
         # Every lane of the last-arriving wave sees hc-1 (mod hc) on its own slot.

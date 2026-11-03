@@ -409,6 +409,30 @@ def atomic_add_agent(addr_i64, val):
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
 
 
+def _av_scope(syncscope):
+    return _llvm_d.MetadataAsValueOp(
+        ir.Attribute.parse(f'#llvm.md_node<#llvm.md_string<"{syncscope}">>')
+    ).result
+
+
+def av_store_b128(addr_i64, val, syncscope="agent"):
+    """Store-available 128-bit global store at ``syncscope``.
+
+    ``llvm.amdgcn.av.store.b128`` makes the payload available at the given
+    scope by itself, which is what an ``amdgcn-av:none`` release relies on.
+    The scope operand must be an MD node wrapping the scope string.
+    """
+    v4i32 = ir.VectorType.get([4], T.i32)
+    data = _llvm_d.BitcastOp(v4i32, arith.unwrap(val)).res
+    _llvm_d.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_to_ptr_global(addr_i64), data, _av_scope(syncscope)],
+        [],
+        [],
+    )
+
+
 def atomic_add_agent_acq_rel_av_none(addr_i64, val):
     """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
 
