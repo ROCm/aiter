@@ -5,6 +5,7 @@
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
 import os
+import re
 
 GFX_MAP = {
     0: "native",
@@ -26,6 +27,7 @@ GFX_MAP = {
     16: "gfx1200",
     17: "gfx1201",
     18: "gfx1250",
+    19: "gfx1250-strict",
 }
 
 # Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
@@ -39,8 +41,60 @@ GFX_MAP = {
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350
+    "gfx1100": 96,  # Radeon RX 7900 XTX
+    "gfx1101": 60,  # Radeon RX 7800 XT
+    "gfx1102": 32,  # Radeon RX 7600
+    "gfx1103": 12,  # Radeon 780M
+    "gfx1150": 16,  # Radeon 890M; set CU_NUM=12 for Radeon 880M
+    "gfx1151": 40,  # Strix Halo / Radeon 8060S
+    "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
+    "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
+    "gfx1250-strict": 256,  # MI450 A0; binary-incompatible with gfx1250 (B0)
 }
+
+
+# gfx1250-strict (MI450 A0) and gfx1250 (B0) are distinct build/code-object
+# identities (strict ELF mach 0xeb vs 0x149) and MUST stay separate for build
+# targets, caches, tuned configs, prebuilt .co/.hsaco, and JIT rebuild checks.
+# The map below is ONLY for sharing source / kernel families at explicitly
+# validated dispatch sites. It is NOT a statement of binary compatibility.
+GFX_BASE_ARCH = {
+    "gfx1250-strict": "gfx1250",
+}
+
+
+def base_gfx_arch(gfx: str) -> str:
+    """Kernel-family base arch for ``gfx`` (gfx1250-strict -> gfx1250; identity otherwise).
+
+    Use only to select shared source / kernel definitions at validated dispatch
+    sites. NEVER for build targets, cache keys, tuned-config keys, or prebuilt
+    binary paths -- those stay keyed by the exact gfx identity.
+    """
+    return GFX_BASE_ARCH.get(gfx, gfx)
+
+
+def is_gfx1250_family(gfx: str) -> bool:
+    """True for gfx1250 and its variants (gfx1250-strict).
+
+    A kernel-family predicate, not a binary-compatibility claim.
+    """
+    return base_gfx_arch(gfx) == "gfx1250"
+
+
+def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
+    """Return physical CUs from HIP's mode-dependent processor count."""
+    gfx = gfx.split(":", 1)[0].lower()
+    rdna = gfx.startswith("gfx11") or gfx in ("gfx1200", "gfx1201")
+    if rdna:
+        wgp_mode = os.getenv("GPU_ENABLE_WGP_MODE", "1")
+        numeric_mode = re.match(r"\s*([+-]?[0-9]+)", wgp_mode)
+        wgp_enabled = wgp_mode == "true" or (
+            numeric_mode is not None and int(numeric_mode.group(1)) != 0
+        )
+        if wgp_enabled:
+            return processor_count * 2
+    return processor_count
 
 
 def _parse_gpu_archs_env(gfx_env: str) -> list[str]:

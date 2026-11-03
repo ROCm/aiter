@@ -15,7 +15,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.tensor_shim import ptr_arg
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 SCALE_GROUP_SIZE = 32
 WMMA_K_GFX1250 = 128
@@ -55,7 +55,7 @@ def flydsl_batched_gemm_mxfp4(
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"[FlyDSL] unsupported out dtype {dtype}")
 
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         return _run_gfx1250(
             a,
             w,
@@ -368,7 +368,7 @@ def flydsl_batched_gemm_a8w4_v2(
     )
 
     gfx = get_gfx()
-    if gfx != "gfx1250":
+    if gfx not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(f"[FlyDSL] batched a8w4 v2 requires gfx1250, got {gfx}")
     if layout not in ("bmn", "mbn"):
         raise ValueError(f"[FlyDSL] layout must be 'bmn' or 'mbn'; got {layout!r}")
@@ -437,12 +437,13 @@ def flydsl_batched_gemm_a8w4_v2(
     )
 
     a_c = a.contiguous()
-    _launch_v2(
-        out_phys,
+    _run_compiled(
+        _launch_v2,
+        out_phys.view(-1),
         ptr_arg(a_c),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        a_scales.view(torch.int32).view(-1),
+        w_scales.view(torch.int32).view(-1),
         M,
         torch.cuda.current_stream(),
         N,
@@ -459,5 +460,19 @@ def flydsl_batched_gemm_a8w4_v2(
         a_is_fp4,
         cluster_m,
         cluster_n,
+        specialization_key=(
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            out_is_f16,
+            B,
+            layout_mbn,
+            num_buffers,
+            a_is_fp4,
+            cluster_m,
+            cluster_n,
+        ),
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

@@ -1054,13 +1054,19 @@ def derive(files, title="", raw_diff=""):
     INFRA = (".github/", "docs/", "3rdparty/", "third_party/", ".gitignore",
              "requirements", "README", "CONTRIBUTING", ".gitmodules",
              "setup.py", "conftest.py", "pyproject.toml", "hsa/")
+    # 3rdparty/ is INFRA, so a repin has to be seen before either shortcut below: otherwise a
+    # standalone repin, or one that only touches docs alongside, returns NONE and HK20 never runs.
+    repin = any(p.startswith("3rdparty/") and any(l.startswith("Subproject commit") for l in f["add"])
+                for p, f in files.items())
+    if repin:
+        hit("submodule-repin", "HK20")
     if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
                      or "/docs/" in p for p in paths):
-        return [("infra-only", "NONE")]
+        return t or [("infra-only", "NONE")]
     # Pure submodule / version-pointer bump: subproject commit lines and nothing else
     if add and all(re.match(r"^(Subproject commit|[0-9a-f]{40}$|.*version.*=)", l.strip())
                    for l in add.splitlines() if l.strip()):
-        return [("version-bump", "NONE")]
+        return t or [("version-bump", "NONE")]
 
     if any(f["new"] and (p.startswith("csrc/kernels/") or "/triton/" in p or "_gluon_kernels/" in p)
            for p, f in files.items()):
@@ -1070,25 +1076,25 @@ def derive(files, title="", raw_diff=""):
         return p.endswith((".cu", ".cuh", ".hip", ".h", ".hpp")) or \
                (p.endswith(".py") and any(k in p for k in KERNEL_PY))
     if any(not f["new"] and is_kernel(p) and (f["add"] or f["del"]) for p, f in files.items()):
-        hit("modified-kernel", "A1 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
+        hit("modified-kernel", "A1 A4 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
-        hit("new-routing-value", "B4 C4")
+        hit("new-routing-value", "A4 B4 C4")
     if any(p.endswith((".csv", ".yaml", ".yml")) or
            (p.endswith(".json") and ("config" in p or "tuned" in p)) for p in paths):
         hit("tuning-config", "D3 HK4")
-    if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend)", add, re.M):
-        hit("dispatch-change", "B1 B3 B4 A3")
+    if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend|activation)", add, re.M):
+        hit("dispatch-change", "A4 B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
-        hit("tier1-import-chain", "STEP4 E5")
+        hit("tier1-import-chain", "STEP4 E5 C5")
     # Tier-2 backbone: dispatch shared across model families; needs an owner's sign-off
     elif any(p in TIER for p in paths):
-        hit("tier2-dispatch", "E5 E4")
+        hit("tier2-dispatch", "E5 E4 C5")
     # Any other op wrapper: confirm the exported symbols still resolve; no full Step 4
     elif any(p.startswith(("aiter/ops/", "aiter/jit/")) or
              (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))
              for p in paths):
-        hit("ops-wrapper", "B6")
+        hit("ops-wrapper", "B6 C5")
     if (re.search(r"^\s*(def |void |template)", dele, re.M)
             and re.search(r"^\s*(def |void |template)", add, re.M)) or \
             dropped_parameter(raw_diff):
@@ -1102,7 +1108,7 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"cuda\.Stream|stream=|wait_stream", add):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
-        hit("flydsl", "D10 D10b D12")
+        hit("flydsl", "D10 D10b D12 C5")
     # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
     # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
     # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
@@ -1111,7 +1117,7 @@ def derive(files, title="", raw_diff=""):
     # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
     if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
            for p, f in files.items()):
-        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6")
+        hit("flydsl-kernel", "A1 A4 B8 D1 D8 D12 P6 C5")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
@@ -1220,9 +1226,9 @@ UNREACHABLE_BY_DESIGN = {
     "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
-ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
+ALL_RULES = ("A1 A2 A3 A4 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b STEP4")
+             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b HK20 STEP4")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
@@ -2267,7 +2273,7 @@ def audit_core_files(text, diff_text, root=None):
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
-                   r"nullptr|None\b|2\^\d+", re.I)
+                   r"nullptr|None\b|2\^\d+|\b[0-9a-f]{7,40}\b", re.I)
 IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
 
 
@@ -2380,6 +2386,11 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
+            # CITATION needs an extension, so a submodule (3rdparty/composable_kernel) is
+            # never a citation and an HK20 FIRE could not be matched to its own finding.
+            fire_paths[m.group(1)] += [p for p in touched if "." not in p.rsplit("/", 1)[-1]
+                                       and re.search(rf"(?<![\w/]){re.escape(p)}(?![\w/])",
+                                                     m.group(2))]
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
@@ -2590,7 +2601,7 @@ if __name__ == "__main__":
                   file=sys.stderr)
             raise SystemExit(1)
         if not want:
-            print(f"CORE FILES: none in this diff, declared")
+            print("CORE FILES: none in this diff, declared")
         else:
             print(f"CORE FILES ASSESSED: {len(want)}/{len(want)} backbone files "
                   f"({sum(1 for _, t in want if t == '1')} tier-1), "
@@ -2657,9 +2668,9 @@ if __name__ == "__main__":
             print(f"PINNED-LAYOUT: {name} gains or loses a field")
             print(f"  {n} assertion(s) in {where} fix its size and field offsets, and this"
                   f" diff changes none of them")
-            print(f"  appending at the end shifts nothing; inserting anywhere else shifts"
-                  f" every offset after it, and the code objects those assertions guard"
-                  f" must be rebuilt")
+            print("  appending at the end shifts nothing; inserting anywhere else shifts"
+                  " every offset after it, and the code objects those assertions guard"
+                  " must be rebuilt")
         raise SystemExit(0)
 
     if mode == "perfclaims":
@@ -2697,8 +2708,8 @@ if __name__ == "__main__":
         for new, old, ratio in pairs:
             print(f"TWIN: {new}")
             print(f"  {ratio:.0%} of its substantive lines already appear in {old}")
-            print(f"  diff the two and look for the asymmetry: dtype width, a mask on one"
-                  f" side only, a flipped stride order, a bound the copy did not adapt")
+            print("  diff the two and look for the asymmetry: dtype width, a mask on one"
+                  " side only, a flipped stride order, a bound the copy did not adapt")
         raise SystemExit(0)
 
     if mode == "testquality":

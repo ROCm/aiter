@@ -16,8 +16,10 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def cdiv(x: int, y: int) -> int:
@@ -219,15 +221,12 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         # varctx schedule to the base kernel breaks compile (signature mismatch).
         EnableVarCtxOpt = var_ratio > 0.0 and args.kv_preshuffle and not args.no_varctx
 
-        context_lens = (
-            torch.randint(
-                int((1 - var_ratio) * avg_kv_length),
-                int(((1 + var_ratio)) * avg_kv_length) + 1,
-                (batch_size,),
-            )
-            .cuda()
-            .to(torch.int32)
-        )
+        context_lens = torch.randint(
+            int((1 - var_ratio) * avg_kv_length),
+            int(((1 + var_ratio)) * avg_kv_length) + 1,
+            (batch_size,),
+            device="cuda",
+        ).to(torch.int32)
         prefix_sum_context_lens = torch.zeros(
             (batch_size + 1,), device="cuda", dtype=torch.int32
         )
@@ -422,6 +421,8 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             if (
                 not args.kv_preshuffle
                 and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
+            ) or (
+                EnableVarCtxOpt and max_addressable_bytes(kv_cache_fp8) >= 2**31 - 1
             ):
                 aot_name += "_kv64"
 
@@ -458,7 +459,7 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = get_parser(kernel_name="DeepGEMM Attention")
     parser.add_argument("-B", "--batch", type=int, default=128, help="Batch size.")
     parser.add_argument(
         "-hq",

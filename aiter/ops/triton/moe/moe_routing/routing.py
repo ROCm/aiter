@@ -67,6 +67,11 @@ class RoutingData:
     n_expts_tot: int = field()
     n_expts_act: int = field()
     expt_data: ExptData = None
+    # Per-token selected expert ids [n_tokens, n_expts_act] (int16, as produced by
+    # topk), in the original topk order (matches scatter_indx grouping). Used by
+    # callers to build an expert-parallel gate-validity mask, e.g.
+    # `expert_map[topk_ids.long()] >= 0`.
+    topk_ids: torch.Tensor = None
 
     def n_blocks(self, n_rows, block_m):
         if n_rows <= self.n_expts_tot:
@@ -352,6 +357,7 @@ def routing(
                 n_expts_tot,
                 n_expts_act,
                 expt_data,
+                topk_ids=expt_indx,
             ),
             topk_indx,
             gate_indx,
@@ -430,6 +436,7 @@ def routing(
         n_expts_tot=n_expts_tot,
         n_expts_act=n_expts_act,
         expt_data=expt_data,
+        topk_ids=expt_indx,
     )
     return routing_data, topk_indx, gate_indx
 
@@ -492,6 +499,7 @@ def routing_from_hash(
         n_expts_tot=n_expts_tot,
         n_expts_act=n_expts_act,
         expt_data=expt_data,
+        topk_ids=expt_indx,
     )
     return routing_data, topk_indx, gate_indx
 
@@ -691,7 +699,9 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # offset for each experts
     device = hist.device
     token_offs_raw = torch.cumsum(hist, dim=0)
-    token_offs_raw = torch.cat((torch.zeros(1, device=device), token_offs_raw))
+    token_offs_raw = torch.cat(
+        (torch.zeros(1, dtype=torch.float32, device=device), token_offs_raw)
+    )
     token_offs_raw = token_offs_raw.int()
     # maximum number of tiles for all values of `block_m` considered
     if n_gates <= n_expts_tot:
@@ -703,10 +713,12 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # fill up tile offset/infos for each block
     n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
     token_offs_pad = torch.cumsum(n_tiles, dim=0)
-    token_offs_pad = torch.cat((torch.zeros(1, device=device), token_offs_pad))
+    token_offs_pad = torch.cat(
+        (torch.zeros(1, dtype=torch.float32, device=device), token_offs_pad)
+    )
     token_offs_pad = token_offs_pad.int()
     # compute data required to drive ragged batch matmul
-    block_pid_map = -torch.ones(max_n_tiles, device=device)
+    block_pid_map = -torch.ones(max_n_tiles, dtype=torch.float32, device=device)
     for e in range(n_expts_tot):
         offset = token_offs_pad[e]
         for b in range(n_tiles[e]):

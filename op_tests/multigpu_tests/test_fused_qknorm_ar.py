@@ -25,7 +25,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 
@@ -47,42 +47,64 @@ def barrier_before_teardown():
     torch.cuda.synchronize()
 
 
-def qknorm_allreduce(
-    tp_size,
-    pp_size,
-    rankID,
-    qkv_in,
-    q_w,
-    k_w,
-    cos_sin_cache,
-    position_ids,
-    head_dim,
-    rotary_dim,
-    withGraph=False,
-    distributed_init_method: str | None = None,
-):
-    device = torch.device(f"cuda:{rankID}")
-    torch.cuda.set_device(device)
-    # init
-    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-    qkv_in = qkv_in.to(device)
-    q_w = q_w.to(device)
-    k_w = k_w.to(device)
-    cos_sin_cache = cos_sin_cache.to(device)
-    position_ids = position_ids.to(device)
-    # dist.barrier(device_ids=[i for i in range(tp_size)])
+COS_SIN_MAX_POS = 16384
 
-    # warmup and align all gpu
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
+
+def _run_qknorm_case(
+    rankID,
+    tp_size,
+    case_idx,
+    shape,
+    dtype,
+    head_size,
+    rotary_dim,
+    withGraph,
+    graphs,
+):
+    """Run one fused qknorm all-reduce case on an initialized rank and check
+    its q/k/v outputs against the host reference.
+
+    Each rank regenerates every rank's inputs from the same ``case_idx`` seed,
+    because the reference norm needs the variance summed over all ranks; the
+    reference is computed on the device and only scalars go back to the
+    parent. In graph mode the captured graph and every tensor it reads or
+    writes are appended to ``graphs`` and must outlive the whole sweep: custom
+    all-reduce caches peer IPC addresses by local pointer, so freeing one and
+    capturing a later case at the same address would replay with stale peers.
+    """
+    token_num, hidden_dim_q, hidden_dim_k, hidden_dim_v = shape
+    hidden_dim = hidden_dim_q + hidden_dim_k + hidden_dim_v
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    cos_sin_cache = torch.randn(
+        (COS_SIN_MAX_POS, rotary_dim), dtype=dtype, device="cuda", generator=gen
+    )
+    positions = torch.arange(token_num - 1, -1, -1, dtype=torch.long, device="cuda")
+    qkv_ins = []
+    q_ws = []
+    k_ws = []
+    for _ in range(tp_size):
+        qkv_ins.append(
+            torch.randn(
+                (token_num, hidden_dim), dtype=dtype, device="cuda", generator=gen
+            )
+        )
+        q_ws.append(
+            torch.randn((hidden_dim_q,), dtype=dtype, device="cuda", generator=gen)
+        )
+        k_ws.append(
+            torch.randn((hidden_dim_k,), dtype=dtype, device="cuda", generator=gen)
+        )
+    q_refs, k_refs, v_refs = qknorm_allreduce_host(qkv_ins, q_ws, k_ws)
+    q_ref = apply_neox_rope_host(
+        q_refs[rankID], cos_sin_cache, positions, head_size, rotary_dim
+    )
+    k_ref = apply_neox_rope_host(
+        k_refs[rankID], cos_sin_cache, positions, head_size, rotary_dim
+    )
+    v_ref = v_refs[rankID]
+    qkv_in = qkv_ins[rankID]
+    q_w = q_ws[rankID]
+    k_w = k_ws[rankID]
 
     method = (
         tensor_model_parallel_fused_qknorm_allreduce_rope
@@ -98,21 +120,23 @@ def qknorm_allreduce(
                 q_w,
                 k_w,
                 cos_sin_cache,
-                position_ids,
-                head_dim,
+                positions,
+                head_size,
                 rotary_dim,
                 1e-6,
             )
         q_out.fill_(0)
         k_out.fill_(0)
         v_out.fill_(0)
+        graphs.append(
+            (graph, qkv_in, q_w, k_w, cos_sin_cache, positions, q_out, k_out, v_out)
+        )
 
         @perftest()
         def run_ca():
             graph.replay()
 
         _, us = run_ca()
-        out = ((q_out, k_out, v_out), us)
     else:
 
         @perftest()
@@ -122,21 +146,85 @@ def qknorm_allreduce(
                 q_w,
                 k_w,
                 cos_sin_cache,
-                position_ids,
-                head_dim,
+                positions,
+                head_size,
                 rotary_dim,
                 1e-6,
             )
 
-        out = run_ca(qkv_in, q_w, k_w)
+        (q_out, k_out, v_out), us = run_ca(qkv_in, q_w, k_w)
+
+    msg = (
+        f"test_qknorm_allreduce: rank={rankID} {shape=} {dtype=} {withGraph=} "
+        f"{us:>8.2f}"
+    )
+    err = max(
+        checkAllclose(q_ref, q_out.to(q_ref), msg=msg),
+        checkAllclose(k_ref, k_out.to(k_ref), msg=msg),
+        checkAllclose(v_ref, v_out.to(v_ref), msg=msg),
+    )
+    return {"us": us, "err": err}
+
+
+def qknorm_allreduce_sweep(
+    tp_size,
+    pp_size,
+    rankID,
+    cases,
+    head_size,
+    rotary_dim,
+    withGraph=False,
+    distributed_init_method: str | None = None,
+):
+    """Run every ``(shape, dtype)`` case on one rank inside a single
+    distributed init.
+
+    Setting up the TP group dominates a single case (~30 s at TP8 vs.
+    microseconds of kernel time), so the group is created and torn down once.
+    Results are returned rather than asserted here: every rank must walk the
+    full case list so the collectives stay aligned across ranks.
+    """
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    # init
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+
+    # warmup and align all gpu
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    graphs = []
+    results = [
+        _run_qknorm_case(
+            rankID,
+            tp_size,
+            case_idx,
+            shape,
+            dtype,
+            head_size,
+            rotary_dim,
+            withGraph,
+            graphs,
+        )
+        for case_idx, (shape, dtype) in enumerate(cases)
+    ]
 
     # destroy
     if dist.is_initialized():
         barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
+        graphs.clear()
         torch.cuda.empty_cache()
-    return out
+    return results
 
 
 def apply_neox_rope_host(x, cos_sin_cache, positions, head_size, rotary_dim):
@@ -183,8 +271,9 @@ def qknorm_allreduce_host(qkv_ins, q_ws, k_ws, eps=1e-6):
         k_var = k.pow(2).mean(dim=-1, keepdim=True)
         q_vars.append(q_var)
         k_vars.append(k_var)
-    q_var_all = torch.zeros((token_num, 1), dtype=torch.float32)
-    k_var_all = torch.zeros((token_num, 1), dtype=torch.float32)
+    device = qkv_ins[0].device
+    q_var_all = torch.zeros((token_num, 1), dtype=torch.float32, device=device)
+    k_var_all = torch.zeros((token_num, 1), dtype=torch.float32, device=device)
     for i in range(tp_size):
         q_var_all += q_vars[i]
         k_var_all += k_vars[i]
@@ -204,85 +293,45 @@ def qknorm_allreduce_host(qkv_ins, q_ws, k_ws, eps=1e-6):
     return q_outs, k_outs, vs
 
 
-@benchmark()
-def test_qknorm_allreduce(
-    tp_size,
-    pp_size,
-    shape,
-    head_size,
-    rotary_dim,
-    dtype,
-    withGraph=False,
-    distributed_init_method: str | None = None,
-):
-    token_num = shape[0]
-    hidden_dim_q = shape[1]
-    hidden_dim_k = shape[2]
-    hidden_dim_v = shape[3]
-    hidden_dim = hidden_dim_q + hidden_dim_k + hidden_dim_v
+def test_qknorm_allreduce(tp_size, pp_size, cases, head_size, rotary_dim, withGraph):
+    """Sweep ``(shape, dtype)`` ``cases`` on one TP group and return one
+    summary row per case."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    qkv_ins = []
-    q_ws = []
-    k_ws = []
-    COS_SIN_MAX_POS = 16384
-    cos_sin_cache = torch.randn((COS_SIN_MAX_POS, rotary_dim), dtype=dtype)
-    positions = torch.arange(token_num - 1, -1, -1, dtype=torch.long)
-    rets = []
-    for i in range(tp_size):
-        qkv_in = torch.randn((token_num, hidden_dim), dtype=dtype)
-        q_w = torch.randn((hidden_dim_q,), dtype=dtype)
-        k_w = torch.randn((hidden_dim_k,), dtype=dtype)
-        qkv_ins.append(qkv_in)
-        q_ws.append(q_w)
-        k_ws.append(k_w)
-        rets.append(
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
             pool.apply_async(
-                qknorm_allreduce,
+                qknorm_allreduce_sweep,
                 args=(
                     tp_size,
                     pp_size,
-                    i,
-                    qkv_in,
-                    q_w,
-                    k_w,
-                    cos_sin_cache,
-                    positions,
+                    rank,
+                    cases,
                     head_size,
                     rotary_dim,
                     withGraph,
-                    distributed_init_method,
+                    init_method,
                 ),
             )
+            for rank in range(tp_size)
+        ]
+        per_rank = [el.get() for el in rets]
+    rows = []
+    for i, (shape, dtype) in enumerate(cases):
+        all_us = [results[i]["us"] for results in per_rank]
+        rows.append(
+            {
+                "tp_size": tp_size,
+                "shape": shape,
+                "dtype": dtype,
+                "withGraph": withGraph,
+                "min_us": min(all_us),
+                "max_us": max(all_us),
+                "err": max(results[i]["err"] for results in per_rank),
+            }
         )
-    pool.close()
-    pool.join()
-    rets = [el.get() for el in rets]
-    all_us = [us for _, us in rets]
-    q_outs, k_outs, v_outs = qknorm_allreduce_host(qkv_ins, q_ws, k_ws)
-    for i in range(tp_size):
-        q_outs[i] = apply_neox_rope_host(
-            q_outs[i], cos_sin_cache, positions, head_size, rotary_dim
-        )
-        k_outs[i] = apply_neox_rope_host(
-            k_outs[i], cos_sin_cache, positions, head_size, rotary_dim
-        )
-
-    max_err = 0.0
-    for ii, (outs, us) in enumerate(rets):
-        msg = f"test_qknorm_allreduce: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        err_q = checkAllclose(q_outs[ii], outs[0].to(q_outs[ii]), msg=msg)
-        err_k = checkAllclose(k_outs[ii], outs[1].to(k_outs[ii]), msg=msg)
-        err_v = checkAllclose(v_outs[ii], outs[2].to(v_outs[ii]), msg=msg)
-        max_err = max(max_err, err_q)
-        max_err = max(max_err, err_k)
-        max_err = max(max_err, err_v)
-    return {
-        "min_us": min(all_us),
-        "max_us": max(all_us),
-        "err": max_err,
-    }
+    return rows
 
 
 l_dtype = ["fp16", "bf16"]
@@ -349,17 +398,8 @@ try:
     def test_widen_multi_t(tp, shape, dtype_str):
         if torch.cuda.device_count() < tp:
             pytest.skip(f"requires >= {tp} GPUs (have {torch.cuda.device_count()})")
-        ret = test_qknorm_allreduce(
-            tp,
-            1,
-            shape,
-            128,
-            64,
-            dtypes.d_dtypes[dtype_str],
-            withGraph=True,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
+        (ret,) = test_qknorm_allreduce(
+            tp, 1, [(shape, dtypes.d_dtypes[dtype_str])], 128, 64, withGraph=True
         )
         assert (
             ret["err"] < 1e-2
@@ -376,6 +416,7 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
     else:
         l_dtype = [dtypes.d_dtypes[args.dtype]]
+    # One TP group per tp size; every (dtype, shape) is swept inside it.
     df = []
     for tp in args.tp_sizes:
         if args.shape is not None:
@@ -384,21 +425,10 @@ if __name__ == "__main__":
             shapes = l_shape
         else:
             shapes = SHAPE_BY_TP.get(tp, l_shape)
-        for dtype in l_dtype:
-            for shape in shapes:
-                ret = test_qknorm_allreduce(
-                    tp,
-                    1,
-                    shape,
-                    128,
-                    64,
-                    dtype,
-                    withGraph=args.with_graph,
-                    distributed_init_method=get_distributed_init_method(
-                        get_ip(), get_open_port()
-                    ),
-                )
-                df.append(ret)
+        cases = [(shape, dtype) for dtype in l_dtype for shape in shapes]
+        df.extend(
+            test_qknorm_allreduce(tp, 1, cases, 128, 64, withGraph=args.with_graph)
+        )
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",

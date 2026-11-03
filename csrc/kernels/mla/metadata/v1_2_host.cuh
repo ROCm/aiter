@@ -319,6 +319,7 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                                const bool is_causal,
                                const bool need_lse)
 {
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -339,18 +340,22 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
     std::vector<int32_t> p_pages_kv_indptr(batch_size + 1);
     std::vector<int32_t> p_context_lens(batch_size);
 
-    HIP_CALL(hipMemcpy(p_seqlens_qo_indptr.data(),
-                       seqlens_qo_indptr.data_ptr(),
-                       (batch_size + 1) * sizeof(int32_t),
-                       hipMemcpyDefault));
-    HIP_CALL(hipMemcpy(p_pages_kv_indptr.data(),
-                       pages_kv_indptr.data_ptr(),
-                       (batch_size + 1) * sizeof(int32_t),
-                       hipMemcpyDefault));
-    HIP_CALL(hipMemcpy(p_context_lens.data(),
-                       context_lens.data_ptr(),
-                       batch_size * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(p_seqlens_qo_indptr.data(),
+                            seqlens_qo_indptr.data_ptr(),
+                            (batch_size + 1) * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
+    HIP_CALL(hipMemcpyAsync(p_pages_kv_indptr.data(),
+                            pages_kv_indptr.data_ptr(),
+                            (batch_size + 1) * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
+    HIP_CALL(hipMemcpyAsync(p_context_lens.data(),
+                            context_lens.data_ptr(),
+                            batch_size * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
+    HIP_CALL(hipStreamSynchronize(stream));
 
     std::vector<int32_t> work_indptr_vec(work_indptr.numel(), 0);
     std::vector<WorkInfo> work_info_vec(work_info.numel() / kSizeWorkInfoInDw, WorkInfo());
@@ -392,30 +397,37 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                          p_seqlens_qo_indptr.back());
 
     // H2D (copy host result buffers back into the caller-provided device tensors)
-    HIP_CALL(hipMemcpy(work_indptr.data_ptr(),
-                       work_indptr_vec.data(),
-                       work_indptr.numel() * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(work_indptr.data_ptr(),
+                            work_indptr_vec.data(),
+                            work_indptr.numel() * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
 
-    HIP_CALL(hipMemcpy(work_info.data_ptr(),
-                       work_info_vec.data(),
-                       work_info.numel() * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(work_info.data_ptr(),
+                            work_info_vec.data(),
+                            work_info.numel() * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
 
-    HIP_CALL(hipMemcpy(reduce_indptr.data_ptr(),
-                       reduce_indptr_vec.data(),
-                       reduce_indptr.numel() * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(reduce_indptr.data_ptr(),
+                            reduce_indptr_vec.data(),
+                            reduce_indptr.numel() * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
 
-    HIP_CALL(hipMemcpy(reduce_final_map.data_ptr(),
-                       reduce_final_map_vec.data(),
-                       reduce_final_map.numel() * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(reduce_final_map.data_ptr(),
+                            reduce_final_map_vec.data(),
+                            reduce_final_map.numel() * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
 
-    HIP_CALL(hipMemcpy(reduce_partial_map.data_ptr(),
-                       reduce_partial_map_vec.data(),
-                       reduce_partial_map.numel() * sizeof(int32_t),
-                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpyAsync(reduce_partial_map.data_ptr(),
+                            reduce_partial_map_vec.data(),
+                            reduce_partial_map.numel() * sizeof(int32_t),
+                            hipMemcpyDefault,
+                            stream));
+
+    HIP_CALL(hipStreamSynchronize(stream));
 
 #if PRINT_DBG
     // print_metadata(work_indptr_vec, work_info_vec);

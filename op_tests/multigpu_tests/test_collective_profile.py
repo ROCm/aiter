@@ -45,6 +45,7 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from aiter.dist.utils import get_open_port
 
 
 def barrier_before_teardown():
@@ -184,6 +185,9 @@ def main():
             return
 
         print(f"Spawning {world_size} processes for {world_size} GPUs...")
+        # A free port instead of the fixed 29500 fallback in run_worker, which
+        # fails with EADDRINUSE whenever anything else on the host holds it.
+        os.environ.setdefault("MASTER_PORT", str(get_open_port()))
         mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
 
 

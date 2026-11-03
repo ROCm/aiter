@@ -41,6 +41,15 @@ New dispatch condition (e.g., `if is_deepseek():`) enables a kernel for more arc
 Real example (vLLM#16435): FusedMoE activated for wrong model families → follow-up restrict PR needed.
 → `⚠️ A3: activation condition [X] enables more than validated scope [Y]`
 
+**A4 — New feature branch in existing kernel without regression test** ⚠️/🔴
+A PR adds a new dispatch branch (new activation type, new dtype, new quant path) to an existing kernel but does not test that existing operators' correctness and performance are preserved. Adding a branch often touches shared code: widening a template condition, narrowing a guard, refactoring a shared lambda, changing a scale computation. These side-effects can silently regress every pre-existing path.
+Trigger: the diff adds a new `if/elif/else` branch or a new template specialization to an existing kernel, and the new branch shares code (constants, scale logic, store paths, bias conditions) with pre-existing branches.
+What to check: (1) every shared constant or condition the PR changes — does the change preserve the old value for old inputs? (2) are existing paths tested in the PR's test plan, or only the new path? (3) for perf-sensitive kernels, is there a before/after benchmark on old paths?
+Severity: 🔴 if a shared constant or condition provably changes behavior for existing inputs (wrong scale, skipped reciprocal, dropped bias). ⚠️ if the shared path change is theoretically safe but untested on old inputs.
+FP self-check: a new branch that is fully gated by `if constexpr(NewFeature)` and touches no shared code is exempt — it cannot affect old paths. Only fire when the diff modifies code that old paths also execute.
+Real examples: PR#5708 narrowed `enable_bias` from `_needs_swiglu_bias_support()` to `activation == Swiglu && _needs_swiglu_bias_support()` — could have regressed Situv2 bias on Opus/FlyDSL paths (analyzed as safe, but not tested). PR#5985 widened `kStoreTakesDivisor` to include `fp16_t` — broke the reciprocal scale on gfx942 fp16 MXFP8 quant (scale_err=55/56 groups), because the software convert path expected the reciprocal but received the raw divisor. PR#5914 added optional fp8 Q output to fused_qk_norm_rope kernel using a runtime pointer check (`if (q_out_fp8 != nullptr)`) instead of a template parameter — VGPR usage rose from 96 to 98 at head_size=512, crossing an allocation granule and dropping occupancy from 5 to 4 waves/SIMD for every existing caller passing nullptr; fixed by introducing a `HAS_Q_FP8` template parameter so the non-fp8 instantiation is byte-identical to the original.
+→ `🔴/⚠️ A4: new [feature] branch added to [kernel] — shared [code/constant] changed, verify existing [paths] are not regressed`
+
 ---
 
 ### B — Silent Bypass
@@ -143,7 +152,17 @@ Real examples: ATOM#1423 "not always bf16"; ATOM#1458 "hard code to fp8_e8m0?"
 Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx1250':`, `if 'gfx950' in arch_name:`), rather than routing through the central kernel registry or a named constant.
 Also exempt: arch strings used only in comments, docstrings, or directory path strings; arch strings imported from a central registry module; arch strings used as **capability guards inside a kernel-specific wrapper function** (not in the centralized dispatch layer) — e.g., `get_gfx() == 'gfx1250'` inside `flydsl_flash_attn_batch_func` determines whether the FlyDSL variant is available; that check belongs in the wrapper, not in the central registry, and does not trigger C4 (aiter#3870).
 Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style); `get_gfx() == "gfx1250"` inside FlyDSL wrapper `flydsl_flash_attn_batch_func` (aiter#3870 → skip, capability guard not centralized dispatch).
+C4 judges only the arch literal. Which helper a runtime wrapper calls is C5's question: a newly added runtime `get_gfx()` like the aiter#3870 guard fires C5, even though it skips C4.
 → `⚠️ C4: new arch string '[gfxNNNN]' hardcoded in dispatch — route through arch registry or named constant`
+
+**C5 — Shared chip_info helpers are the ISA gate** ⚠️
+Policy: `.github/instructions/aiter-ops-flydsl.instructions.md`. Do not invent a mixed-device, process-global, or first-`rocminfo`-agent finding against `get_gfx_runtime()` / `get_gfx()`.
+The context picks the helper. Runtime dispatch (wrappers, launchers, kernel or tuned-config selection) uses `get_gfx_runtime()`, which detects the live GPU. Tests and build-time codegen (`gen_instances`, AOT, module-level `csrc` selection) use `get_gfx()`, which follows `GPU_ARCHS` and returns its last entry when that lists several targets, so on a multi-target build it can name an ISA other than the one installed.
+**FP self-check first:** only `+` lines count. `get_gfx()` or `gcnArchName` on unchanged lines is pre-existing style, not a new violation.
+FIRE when a `+` line adds (a) a local ISA probe instead of the helpers (`gcnArchName`, `get_device_properties` read for architecture, a `rocminfo` parse), or (b) `get_gfx()` in a runtime dispatch path. One such line fires even when other added lines use the right helper.
+CLEAR only when every added architecture check uses the helper that fits its context.
+Real examples (synthetic): `torch.cuda.get_device_properties(0).gcnArchName` added to `aiter/ops/mha.py` → fire (a); `get_gfx() == "gfx950"` added to kernel selection in an `aiter/ops/flydsl/` launcher → fire (b); `get_gfx()` added to `main()` of `op_tests/test_flydsl_<op>.py` → clear; `get_gfx_runtime()` added to a wrapper plus a new `gcnArchName` read in another file of the same PR → fire (a).
+→ `⚠️ C5: new local ISA probe or runtime get_gfx() — use get_gfx_runtime() for dispatch, get_gfx() for tests and codegen`
 
 ---
 
@@ -427,6 +446,7 @@ Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf w
 | Test logs its verdict instead of asserting it | `if <ok>: log("...pass") else: log("...fail")` with no assert on the same condition | `⚠️ HK19: [test] cannot fail — assert the condition; the log is not a check` |
 | `print()` for diagnostics in new test code | `print(` on a `+` line in `op_tests/**/test_*.py` | `📝 HK16: [location] prints — assert instead, or route it through the aiter logger with % placeholders` |
 | Root logger reconfigured at import | `logging.basicConfig(` on a `+` line outside `__main__` | `⚠️ HK17: basicConfig at import puts the whole process's root logger at that level — use the aiter logger` |
+| Submodule pinned to non-upstream commit | Diff changes a `3rdparty/*` submodule pin. Check only against the canonical upstream, never `git branch -r` (it includes forks and stale refs): (1) take the URL from the **base** `.gitmodules` (a head-side URL change is itself a finding); (2) `git -C <sub> fetch --prune --no-tags <url> '+refs/heads/*:refs/hk20/heads/*'` (`--prune`, or a branch deleted upstream since the last review still clears the pin); (3) `git -C <sub> cat-file -e <new-hash>^{commit}`; (4) `git -C <sub> for-each-ref --contains <new-hash> refs/hk20/heads/`. 🔴 only when (2)–(3) succeeded, the repo is not shallow (`rev-parse --is-shallow-repository` is `false`) and (4) is empty. A failed fetch, a shallow repo or a missing object is **inconclusive**, not clean and not 🔴 | `🔴 HK20: [submodule] pinned to [hash] which is not on any [canonical-url] branch — personal/local commits can be gc'd or become unfetchable, breaking all downstream git submodule update. Merge the commit into upstream (e.g. CK develop) first, then repin to the official commit. Ref: PR#5708 pinned composable_kernel to a personal commit (1f66d862) not on CK develop, while PR#4620 correctly pinned to a develop commit (af9e1d1f).` / inconclusive: `⚠️ HK20: could not verify [hash] against [canonical-url] ([fetch failed / shallow / object missing]) — confirm it is on an upstream branch before merge` |
 
 ---
 

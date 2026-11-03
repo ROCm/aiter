@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 _mha_v4_per_tensor_amax_repr = make_kernel_repr(
     "mha_v4_per_tensor_amax_kernel",
@@ -225,6 +225,10 @@ def sage_quant_v_kernel(
     stride_kh,
     stride_kn,
     stride_kd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_vsz,
     stride_vsh,
     BATCH,
@@ -249,9 +253,15 @@ def sage_quant_v_kernel(
         + offs_kn[:, None] * stride_kn
         + offs_d[None, :] * stride_kd
     )
+    v_out_offs = (
+        off_b * stride_voz
+        + off_h * stride_voh
+        + offs_kn[:, None] * stride_von
+        + offs_d[None, :] * stride_vod
+    )
 
     v_input_ptrs = V_Input + v_offs
-    v_output_ptrs = V_Output + v_offs
+    v_output_ptrs = V_Output + v_out_offs
 
     # just apply the per channel v_scales that have been computed outside
     v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
@@ -395,84 +405,6 @@ def _e2m1_pack_native(value_lo, value_hi):
         is_pure=True,
         pack=1,
     ).to(tl.uint8)
-
-
-@triton.jit
-def sage_quant_v_fp4_colmajor_kernel(
-    v_ptr,  # V [b, h_kv, S, D] (any strides -- a permuted view is fine, no copy needed)
-    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major fp4 operand blocks
-    desc_ptr,  # fp32 [b, h_kv, D]  per-channel descale = amax_over_S / 6
-    kperm_ptr,  # int32 [64]  'meas' kv-col permutation (col kk holds token kperm[kk])
-    stride_vb,
-    stride_vh,
-    stride_vs,
-    stride_vd,
-    stride_ob,
-    stride_oh,
-    stride_db,
-    stride_dh,
-    h_kv,
-    nT,
-    S,
-):
-    """Pack per-channel fp4 (E2M1) V into the f4f4 kernel's col-major LDS operand layout:
-    per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
-    64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
-    chan -> high nibble). One program packs one 1024 B block. Cosine-equivalent to the numpy
-    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral).
-    """
-    pid = tl.program_id(0)
-    u = pid % 8
-    t = (pid // 8) % nT
-    bh = pid // (8 * nT)
-    bb = bh // h_kv
-    hh = bh % h_kv
-    n = u // 2  # head-dim 32-block
-    k = u % 2  # kv 64-half
-
-    kk = tl.arange(0, 64)
-    tok_in_half = tl.load(kperm_ptr + kk)  # [64]
-    token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
-    jj = tl.arange(0, 16)
-    chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
-    chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
-
-    vbase = v_ptr + bb * stride_vb + hh * stride_vh
-    dbase = desc_ptr + bb * stride_db + hh * stride_dh
-    row = token[:, None] * stride_vs  # [64,1]
-
-    token_mask = token[:, None] < S
-    v_lo = tl.load(
-        vbase + row + chan_lo[None, :] * stride_vd,
-        mask=token_mask,
-        other=0.0,
-    ).to(tl.float32)
-    v_hi = tl.load(
-        vbase + row + chan_hi[None, :] * stride_vd,
-        mask=token_mask,
-        other=0.0,
-    ).to(tl.float32)
-    d_lo = tl.load(dbase + chan_lo)  # [16]
-    d_hi = tl.load(dbase + chan_hi)
-
-    y_lo = v_lo / d_lo[None, :]
-    y_hi = v_hi / d_hi[None, :]
-
-    code_lo = _e2m1_code(y_lo)
-    code_hi = _e2m1_code(y_hi)
-    byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
-
-    block_bytes: tl.constexpr = 1024
-    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * block_bytes
-    ooff = kk[:, None] * 16 + jj[None, :]
-    tl.store(obase + ooff, byte)
-
-    slack = tl.arange(0, 64)
-    tl.store(
-        out_ptr + tl.num_programs(0) * block_bytes + slack,
-        0,
-        mask=(pid == 0) & (slack < 64),
-    )
 
 
 @triton.jit
@@ -1380,9 +1312,27 @@ def sage_quant_kernel(
     stride_qz,
     stride_qh,
     stride_qn,
+    stride_qd,
+    stride_qoz,
+    stride_qoh,
+    stride_qon,
+    stride_qod,
     stride_kz,
     stride_kh,
     stride_kn,
+    stride_kd,
+    stride_koz,
+    stride_koh,
+    stride_kon,
+    stride_kod,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_qsz,
     stride_qsh,
     stride_ksz,
@@ -1421,11 +1371,17 @@ def sage_quant_kernel(
             off_b * stride_qz
             + off_h * stride_qh
             + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_qd
+        )
+        q_out_offs = (
+            off_b * stride_qoz
+            + off_h * stride_qoh
+            + offs_qn[:, None] * stride_qon
+            + offs_d[None, :] * stride_qod
         )
 
         q_input_ptrs = Q_Input + q_offs
-        q_output_ptrs = Q_Output + q_offs
+        q_output_ptrs = Q_Output + q_out_offs
         q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
 
         _general_quant_kernel(
@@ -1447,11 +1403,17 @@ def sage_quant_kernel(
             off_b * stride_kz
             + off_h * stride_kh
             + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_kd
+        )
+        k_out_offs = (
+            off_b * stride_koz
+            + off_h * stride_koh
+            + offs_kn[:, None] * stride_kon
+            + offs_d[None, :] * stride_kod
         )
 
         k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
+        k_output_ptrs = K_Output + k_out_offs
         k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
 
         _general_quant_kernel(
@@ -1468,14 +1430,20 @@ def sage_quant_kernel(
         offs_kn = off_blk * BLK_K + offs_blk_k
 
         v_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            off_b * stride_vz
+            + off_h * stride_vh
+            + offs_kn[:, None] * stride_vn
+            + offs_d[None, :] * stride_vd
+        )
+        v_out_offs = (
+            off_b * stride_voz
+            + off_h * stride_voh
+            + offs_kn[:, None] * stride_von
+            + offs_d[None, :] * stride_vod
         )
 
         v_input_ptrs = V_Input + v_offs
-        v_output_ptrs = V_Output + v_offs
+        v_output_ptrs = V_Output + v_out_offs
 
         # just apply the per channel v_scales that have been computed outside
         v_scale_ptrs = (

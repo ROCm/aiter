@@ -12,6 +12,7 @@ the packed API; the work table is built inside the sparse custom op.
 import csv
 import functools
 import os
+from collections.abc import Callable
 from enum import IntEnum
 from typing import NamedTuple, Optional, Union
 
@@ -22,24 +23,32 @@ from aiter.jit.core import AITER_ROOT_DIR, compile_ops
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     MHA_V4_LOG2E,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
+    quantize_mxfp4_k_hd256,
     quantize_mxfp4_q,
+    quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
+    quantize_mxfp6_k_hd256,
     quantize_mxfp6_q,
+    quantize_mxfp6_q_hd256,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
+    quantize_v_mxfp6_fp6_p_hd256,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
@@ -52,26 +61,34 @@ __all__ = (
     "AttentionScaleMode",
     "mha_v4",
     "mha_v4_kv_tile",
+    "mha_v4_mx_producers",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
     "mha_v4_sparse_work_table",
     "mxfp4_k_view",
     "mxfp4_v_view",
     "mxfp6_k_view",
+    "mxfp6_k_view_hd256",
     "native_fp8_format",
     "quantize_fp8",
     "quantize_fp8_rotated",
     "quantize_int8",
     "quantize_mxfp4_k",
+    "quantize_mxfp4_k_hd256",
     "quantize_mxfp4_q",
+    "quantize_mxfp4_q_hd256",
     "quantize_mxfp6_k",
+    "quantize_mxfp6_k_hd256",
     "quantize_mxfp6_q",
+    "quantize_mxfp6_q_hd256",
     "quantize_mxfp8_k",
     "quantize_mxfp8_q",
     "quantize_v_fp8",
     "quantize_v_mxfp4_fp6_p",
+    "quantize_v_mxfp4_fp6_p_hd256",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
+    "quantize_v_mxfp6_fp6_p_hd256",
     "rotate_activation_hd128",
     "rotate_activation_mxfp6_quant",
     "scale_modes_for_formats",
@@ -183,6 +200,80 @@ _PACKED_QK_WIDTH = {
     AttentionFormat.FP6_E2M3: 96,
     AttentionFormat.FP4_E2M1: 64,
 }
+_MHA_V4_BASE_HEAD_DIM = 128
+
+
+def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
+    """Packed last-dim size of a Q/K tensor. The table above is the hd128 row; every format's
+    width is linear in the head dim, so scaling it is exact rather than a second table.
+    """
+    return _PACKED_QK_WIDTH[q_format] * head_dim // _MHA_V4_BASE_HEAD_DIM
+
+
+# (Q/K format, V format) pairs with a head-dim 256 object. All are dense-only.
+_HD256_QV = frozenset(
+    {
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+    }
+)
+
+
+def _check_head_dim(
+    head_dim: int,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+    sparse: bool,
+    operation: str,
+) -> None:
+    if head_dim == _MHA_V4_BASE_HEAD_DIM:
+        return
+    if head_dim != MHA_V4_HD256:
+        raise ValueError(
+            f"{operation} supports head dimension 128 or 256, got {head_dim}"
+        )
+    if (q_format, v_format) not in _HD256_QV:
+        raise ValueError(
+            f"{operation} head dimension 256 is all-MXFP4 or all-MXFP6 only, got "
+            f"{q_format.name} Q/K with {v_format.name} V"
+        )
+    if sparse:
+        raise ValueError(f"{operation} head dimension 256 is dense-only")
+
+
+# hd256 runs the hd128 HIP producers on a [b, s, 2h, 128] view through separate custom ops; the
+# Hadamard is then block-diagonal over the two halves, still orthogonal, so Q.K^T holds.
+_MX_PRODUCERS = {
+    (AttentionFormat.MXFP4, 128): (
+        quantize_mxfp4_q,
+        quantize_mxfp4_k,
+        quantize_v_mxfp4_fp6_p,
+    ),
+    (AttentionFormat.MXFP4, 256): (
+        quantize_mxfp4_q_hd256,
+        quantize_mxfp4_k_hd256,
+        quantize_v_mxfp4_fp6_p_hd256,
+    ),
+    (AttentionFormat.MXFP6, 128): (
+        quantize_mxfp6_q,
+        quantize_mxfp6_k,
+        quantize_v_mxfp6_fp6_p,
+    ),
+    (AttentionFormat.MXFP6, 256): (
+        quantize_mxfp6_q_hd256,
+        quantize_mxfp6_k_hd256,
+        quantize_v_mxfp6_fp6_p_hd256,
+    ),
+}
+_MXFP6_K_VIEWS = {128: mxfp6_k_view, 256: mxfp6_k_view_hd256}
+
+
+def mha_v4_mx_producers(
+    qk_format: AttentionFormat, head_dim: int
+) -> tuple[Callable, Callable, Callable]:
+    """(Q, K, same-format FP6-P V) production quantizers for an MX Q/K format and head dim."""
+    return _MX_PRODUCERS[(qk_format, head_dim)]
+
 
 _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
@@ -422,9 +513,11 @@ def _resolve_raw_recipe(
         kind = _RawRecipeKind.FP8
     elif q_format == AttentionFormat.MXFP4:
         if v_format != AttentionFormat.MXFP4:
+            # Retired, not pending: the MXFP4-Q/FP8-V row was dropped from the manifest, and no
+            # other V has ever had one.
             raise NotImplementedError(
-                "raw preprocessing is not implemented yet for "
-                f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+                "MHA v4 MXFP4 Q/K requires MXFP4 V; no other V row exists "
+                f"(got Q={q_format.name}, K={k_format.name}, V={v_format.name})"
             )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:
@@ -655,11 +748,12 @@ def _fmha_v4_fwd_sparse_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
     del out
 
 
@@ -687,10 +781,11 @@ def _fmha_v4_fwd_sparse(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out", "lse"))
 def _mha_v4_fwd_sparse_launch(
     q: Tensor,
     k: Tensor,
@@ -710,6 +805,7 @@ def _mha_v4_fwd_sparse_launch(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd_sparse(
         q,
@@ -730,6 +826,7 @@ def _mha_v4_fwd_sparse_launch(
         kv_block_indices,
         lut_start,
         lut_count,
+        lse,
     )
 
 
@@ -753,11 +850,12 @@ def _mha_v4_fwd_sparse_launch_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
 
 
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
@@ -771,8 +869,8 @@ _LSE_CAPABLE_QV = frozenset(
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
         (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
         (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP8_E4M3_FNUZ),
-        (AttentionFormat.FP8_E4M3, AttentionFormat.FP6_E2M3),
-        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP6_E2M3),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.MXFP6),
+        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.MXFP6),
         (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
         (AttentionFormat.INT8, AttentionFormat.FP8_E4M3_FNUZ),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
@@ -784,14 +882,8 @@ _LSE_CAPABLE_QV = frozenset(
 )
 
 
-def _check_lse_capable(
-    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
-) -> None:
+def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject LSE where the exported value has not been measured."""
-    if sparse:
-        raise NotImplementedError(
-            "MHA v4 does not produce LSE on the sorted-sparse path yet"
-        )
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
@@ -808,11 +900,20 @@ def _check_lse_capable(
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
+# Ordered to mirror _LSE_CAPABLE_QV above so the two diff by eye. (FP8, FP8) covers both the fp8
+# and mxfp8 objects, which differ only by scale mode.
 _VARLEN_CAPABLE_QV = frozenset(
     {
         (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8_E4M3),
     }
 )
 
@@ -820,10 +921,14 @@ _VARLEN_CAPABLE_QV = frozenset(
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
-    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if arch != "gfx950":
+        raise NotImplementedError(
+            f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
+        )
+    if (q_format, v_format) not in _VARLEN_CAPABLE_QV:
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
-            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+            f"Q={q_format.name} V={v_format.name} yet"
         )
 
 
@@ -883,11 +988,18 @@ def mha_v4_packed(
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     if return_lse:
-        _check_lse_capable(q_format, v_format, lut is not None)
+        _check_lse_capable(q_format, v_format)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -907,18 +1019,20 @@ def mha_v4_packed(
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Q, K, and V must have contiguous last dimensions")
 
-    logical_head_dim = 128
-    expected_q_width = _PACKED_QK_WIDTH[q_format]
+    # V is the only operand carrying the logical head dim in its last axis; Q/K carry packed ones.
+    logical_head_dim = v.shape[-1]
+    _check_head_dim(logical_head_dim, q_format, v_format, lut is not None, "MHA v4")
+    expected_q_width = _packed_qk_width(q_format, logical_head_dim)
     if q.shape[-1] != expected_q_width or k.shape[-1] != expected_q_width:
         raise ValueError(
             f"{q_format.name} Q/K must have packed width {expected_q_width}"
         )
-    if v.shape[-1] != logical_head_dim:
-        raise ValueError("MHA v4 currently requires logical V head dimension 128")
     if q_format == AttentionFormat.MXFP4:
+        # The MXFP4 K producer tiles 128 tokens whatever KV tile the kernel runs.
         tiles = (k.shape[1] + 127) // 128
-        head_stride = tiles * 8192
-        expected_k_stride = (k.shape[2] * head_stride, 64, head_stride, 1)
+        row_bytes = logical_head_dim // 2
+        head_stride = tiles * 128 * row_bytes
+        expected_k_stride = (k.shape[2] * head_stride, row_bytes, head_stride, 1)
         if k.stride() != expected_k_stride:
             raise ValueError("MXFP4 K must use the coalesced MHA v4 tile layout")
 
@@ -978,7 +1092,7 @@ def mha_v4_packed(
                 "sorted-sparse MHA v4 requires key length padded to a "
                 f"multiple of {kv_tile}"
             )
-        _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+        _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse)
     if return_lse:
         return out, lse
     return out
@@ -998,6 +1112,7 @@ def _launch_mxfp4_coalesced(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
@@ -1029,6 +1144,7 @@ def _launch_mxfp4_coalesced(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1044,21 +1160,11 @@ def _launch_mxfp4_coalesced_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    del (
-        q,
-        q_descale,
-        k_data,
-        k_descale,
-        v_data,
-        v_descale,
-        v_format,
-        v_pack,
-        softmax_scale,
-        lse,
-    )
-    del out
+    del q, q_descale, k_data, k_descale, v_data, v_descale, out
+    del v_format, v_pack, softmax_scale, seqlens_k, lse
 
 
 @torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out", "lse"))
@@ -1075,11 +1181,18 @@ def _launch_mxfp6(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
     resolved_v_pack = AttentionPack(v_pack)
-    k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
+    # Q is always FP6 here, so its packed width names the head dim; MXFP4 V arrives as a flat buffer.
+    head_dim = (
+        _MHA_V4_BASE_HEAD_DIM * q.shape[-1] // _PACKED_QK_WIDTH[AttentionFormat.MXFP6]
+    )
+    k, k_descale = _MXFP6_K_VIEWS[head_dim](
+        k_raw, k_descale_raw, q.shape[0], sequence_k, heads
+    )
     v = (
         mxfp4_v_view(v_data, v_descale, sequence_k)
         if resolved_v_format == AttentionFormat.MXFP4
@@ -1106,6 +1219,7 @@ def _launch_mxfp6(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1123,10 +1237,11 @@ def _launch_mxfp6_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
-    del sequence_k, heads, v_format, v_pack, softmax_scale, lse
+    del sequence_k, heads, v_format, v_pack, softmax_scale, seqlens_k, lse
     del out
 
 
@@ -1175,6 +1290,10 @@ def _restore_k_mean_in_lse(
     if lse is None or k_mean is None:
         return lse
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    # k_mean carries one row per KV head, and under GQA query head j reads KV head j // ratio.
+    heads_q, heads_k = q.shape[2], k_mean.shape[1]
+    if heads_q != heads_k:
+        k_mean = k_mean.repeat_interleave(heads_q // heads_k, dim=1)
     lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
     return lse
 
@@ -1194,8 +1313,8 @@ def _validate_mha_v4_raw_inputs(
         or v.dtype != torch.bfloat16
     ):
         raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError(f"{operation} currently supports head dimension 128 only")
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        raise ValueError(f"{operation} requires one head dimension across Q, K, and V")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
@@ -1241,12 +1360,18 @@ def mha_v4(
     uses the GQA ratio. A row may select nothing: an all-False row is a no-op
     that writes a zero output tile.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
     """
     if return_lse:
-        _check_lse_capable(q_format, v_format, block_mask is not None)
-    # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
-    # own launchers, which never forward seqlens_k.
+        _check_lse_capable(q_format, v_format)
+    # Checked before quantization so the MX paths fail here, not inside their own launcher.
     if seqlens_k is not None:
         if block_mask is not None:
             raise NotImplementedError(
@@ -1255,6 +1380,7 @@ def mha_v4(
         _check_varlen_capable(q_format, v_format)
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
+    _check_head_dim(q.shape[-1], q_format, v_format, sparse, "mha_v4")
     recipe = _resolve_raw_recipe(
         q_format,
         k_format,
@@ -1317,10 +1443,13 @@ def mha_v4(
             v_quantized, v_descale = quantize_v_mxfp6(v)
     elif recipe.kind == _RawRecipeKind.MXFP4:
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
-        v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            softmax_scale = q.shape[-1] ** -0.5
+        quant_q, quant_k, quant_v = mha_v4_mx_producers(
+            AttentionFormat.MXFP4, q.shape[-1]
+        )
+        q_quantized, q_descale = quant_q(q, mha_v4_q_multiplier(softmax_scale))
+        k_quantized, k_descale = quant_k(k, k_mean)
+        v_quantized, v_descale = quant_v(v)
         if lut_indices is None:
             launch = functools.partial(
                 _launch_mxfp4_coalesced,
@@ -1334,6 +1463,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view = mxfp4_k_view(k_quantized, k_descale)
@@ -1342,13 +1472,16 @@ def mha_v4(
             v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
+            softmax_scale = q.shape[-1] ** -0.5
+        quant_q, quant_k, quant_v = mha_v4_mx_producers(
+            AttentionFormat.MXFP6, q.shape[-1]
+        )
+        q_quantized, q_descale = quant_q(q, mha_v4_q_multiplier(softmax_scale))
+        k_quantized, k_descale = quant_k(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:
-            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            v_quantized, v_descale = quant_v(v)
         else:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
@@ -1366,6 +1499,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view, k_descale_view = mxfp6_k_view(

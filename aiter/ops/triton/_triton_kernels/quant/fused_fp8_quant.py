@@ -832,7 +832,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
         if HAVE_SECOND_INPUT:
             n2_offs = tl.arange(0, BLOCK_SIZE_N2)
             if N_MASK2:
-                mask2 = n2_offs < inp1_n_cols
+                mask2 = n2_offs < inp2_n_cols
                 other2 = 0.0
             else:
                 mask2 = None
