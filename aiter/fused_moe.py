@@ -1148,9 +1148,9 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
-    mxfp4_scale_round_mode: int | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    mxfp4_scale_round_mode: int | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
