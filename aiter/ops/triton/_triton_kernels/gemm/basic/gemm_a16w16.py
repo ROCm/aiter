@@ -147,12 +147,12 @@ def _gemm_a16_w16_kernel(
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
-                )
+                # Async copy ignores a mask that has no lower bound.
+                k_mask = (offs_k >= 0) & (offs_k < k_span - k * BLOCK_SIZE_K)
+                a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
                 b = tl.load(
                     b_ptrs,
-                    mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
+                    mask=k_mask[:, None],
                     other=0.0,
                     cache_modifier=cache_modifier,
                 )
