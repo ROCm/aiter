@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import logging
+import statistics
 import time
 from multiprocessing import TimeoutError, get_context
 
@@ -52,6 +53,8 @@ TARGET_KERNELS = (
     "ar_rmsnorm_gfx1250",
     "end_sync_kernel",
 )
+TIMING_WARMUP = 5
+TIMING_ITERS = 50
 
 
 def _is_gfx1250(device: torch.device) -> bool:
@@ -131,12 +134,29 @@ def _capture(ca, fn):
     return graph, outputs
 
 
-def _profile_kernel_count(fn) -> dict[str, int]:
+def _time_us(fn) -> float:
+    for _ in range(TIMING_WARMUP):
+        fn()
+    torch.cuda.synchronize()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(TIMING_ITERS)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(TIMING_ITERS)]
+    for start, end in zip(starts, ends):
+        start.record()
+        fn()
+        end.record()
+    torch.cuda.synchronize()
+    return statistics.median(
+        start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)
+    )
+
+
+def _profile_kernel_count(fn) -> tuple[dict[str, int], dict[str, float]]:
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         fn()
         torch.cuda.synchronize()
-    names = [event.name for event in prof.events()]
+    events = list(prof.events())
+    names = [event.name for event in events]
     counts = {
         needle: sum(needle in name for name in names) for needle in TARGET_KERNELS
     }
@@ -153,7 +173,20 @@ def _profile_kernel_count(fn) -> dict[str, int]:
         raise AssertionError(
             f"target kernel count {counts}, expected {expected}; events={matching}"
         )
-    return counts
+    kernel_us = {}
+    for needle in TARGET_KERNELS:
+        kernel_us[needle] = sum(
+            float(
+                getattr(
+                    event,
+                    "device_time_total",
+                    getattr(event, "cuda_time_total", 0.0),
+                )
+            )
+            for event in events
+            if needle in event.name
+        )
+    return counts, kernel_us
 
 
 def _run_case(
@@ -241,10 +274,42 @@ def _run_case(
         )
     _assert_all_rank_bits(f"graph M={rows}", fused_graph_out, TP)
 
+    # All timing blocks run without the deliberate host skew. Report every
+    # rank: the spread captures residual rank-arrival wait in start_sync and is
+    # not counted as removable F6 work.
+    dist.barrier()
+    eager_reference_us = _time_us(
+        lambda: _call(
+            ca,
+            x,
+            residual,
+            weight,
+            eager_ref,
+            use_1stage=True,
+            quant=quant,
+        )
+    )
+    dist.barrier()
+    eager_fused_us = _time_us(
+        lambda: _call(
+            ca,
+            x,
+            residual,
+            weight,
+            eager_fused,
+            use_1stage=False,
+            quant=quant,
+        )
+    )
+    dist.barrier()
+    graph_reference_us = _time_us(reference_graph.replay)
+    dist.barrier()
+    graph_fused_us = _time_us(fused_graph.replay)
+
     # Profile an eager two-stage call. Extra copy/setup kernels are allowed;
     # the F6 sequence itself must contain exactly these three targeted kernels.
     dist.barrier()
-    counts = _profile_kernel_count(
+    counts, kernel_us = _profile_kernel_count(
         lambda: _call(
             ca,
             x,
@@ -264,6 +329,15 @@ def _run_case(
         "graph_replays": graph_iters,
         "bitwise": True,
         "kernel_counts": counts,
+        "kernel_us": kernel_us,
+        "counter_inclusive_stage_us": (
+            kernel_us["ar_rmsnorm_reduce_scatter_gfx1250"]
+            + kernel_us["ar_rmsnorm_gfx1250"]
+        ),
+        "eager_reference_us": eager_reference_us,
+        "eager_fused_us": eager_fused_us,
+        "graph_reference_us": graph_reference_us,
+        "graph_fused_us": graph_fused_us,
     }
 
 
