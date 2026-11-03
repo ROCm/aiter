@@ -60,6 +60,19 @@ def _has_scaled_downcast() -> bool:
     return callable(getattr(cdna4, "scaled_downcast", None))
 
 
+@functools.lru_cache(maxsize=1)
+def _has_cdna5_scaled_downcast() -> bool:
+    # The gfx1250 Gluon quant kernels call gl.amd.cdna5.scaled_downcast, which
+    # Triton release/3.8 lacks; without it they fail to compile.
+    try:
+        from triton.experimental.gluon import language as gl
+    except ImportError:
+        return False
+
+    cdna5 = getattr(getattr(gl, "amd", None), "cdna5", None)
+    return callable(getattr(cdna5, "scaled_downcast", None))
+
+
 def _use_gluon(backend: str | None, supported: bool, requirement: str) -> bool:
     # None picks Gluon where supported; "triton" and "gluon" force that kernel.
     if backend not in (None, "triton", "gluon"):
@@ -315,8 +328,12 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # Every gfx1250 input has a Gluon kernel; the call only validates `backend`.
-    if arch_info.get_arch() == "gfx1250" and _use_gluon(backend, True, "gfx1250"):
+    # Every gfx1250 input has a Gluon kernel, given Triton's cdna5.scaled_downcast.
+    if arch_info.get_arch() == "gfx1250" and _use_gluon(
+        backend,
+        _has_cdna5_scaled_downcast(),
+        "gfx1250 and Triton gl.amd.cdna5.scaled_downcast",
+    ):
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx1250,
         )
@@ -567,8 +584,10 @@ def dynamic_mxfp8_quant(
     if arch_info.get_arch() == "gfx1250" and _use_gluon(
         backend,
         x2d.dtype in (torch.bfloat16, torch.float16)
-        and quant_dtype == torch.float8_e4m3fn,
-        "gfx1250, bf16 or fp16 input and quant_dtype=torch.float8_e4m3fn",
+        and quant_dtype == torch.float8_e4m3fn
+        and _has_cdna5_scaled_downcast(),
+        "gfx1250, bf16 or fp16 input, quant_dtype=torch.float8_e4m3fn and "
+        "Triton gl.amd.cdna5.scaled_downcast",
     ):
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
             gluon_dynamic_mxfp8_quant_kernel_gfx1250,
