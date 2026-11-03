@@ -789,6 +789,8 @@ _MXFP4_INVALID_CASES = [
     ("table-rows-mismatch", ValueError, r"query.shape\[0\] .* must match"),
     ("query-stride-2", ValueError, "contiguous head_dim axis"),
     ("output-stride-2", ValueError, "contiguous head_dim axis"),
+    ("query-span", ValueError, "query must span at most"),
+    ("output-span", ValueError, "output must span at most"),
     ("output-on-cpu", ValueError, "output must be on the query device"),
     ("scratch-on-cpu", ValueError, "exp_sums must be contiguous .* on cuda"),
     ("key-scale-none", TypeError, "key_scale must be a uint8 torch.Tensor"),
@@ -906,6 +908,15 @@ def _check_unsupported_mxfp4(invalid, error, match, device):
         query = strided.copy_(query)
     elif invalid == "output-stride-2":
         output = torch.empty(4, 16, 256, dtype=torch.bfloat16, device=device)[..., ::2]
+    elif invalid == "query-span":
+        # Just over 2**31 - 1 bytes between the first and the last row's end.
+        rows = query.shape[0] - 1
+        base = torch.empty(rows * 720_000_000 + 2048, dtype=query.dtype, device=device)
+        query = base.as_strided(query.shape, (720_000_000, *query.stride()[1:]))
+    elif invalid == "output-span":
+        rows = output.shape[0] - 1
+        base = torch.empty(rows * 400_000_000 + 2048, dtype=output.dtype, device=device)
+        output = base.as_strided(output.shape, (400_000_000, *output.stride()[1:]))
     elif invalid == "output-on-cpu":
         output = output.cpu()
     elif invalid == "scratch-on-cpu":

@@ -227,6 +227,15 @@ def _pa_decode_mxfp4(
             "MXFP4 pa_decode needs 16 B query and output row/head strides and a "
             "contiguous head_dim axis"
         )
+    # The kernel adds row and head offsets in i32 (query bytes, output elements);
+    # keep the end of the last head_dim chunk within 2**31 - 1 bytes for both.
+    for name, t in (("query", query), ("output", output)):
+        if (
+            (t.shape[0] - 1) * t.stride(0) + (t.shape[1] - 1) * t.stride(1) + t.shape[2]
+        ) * t.element_size() > 2**31 - 1:
+            raise ValueError(
+                f"MXFP4 pa_decode {name} must span at most 2**31 - 1 bytes"
+            )
     # K and V are data views [pages, kv_heads, 128, 64] and e8m0 scale views
     # [pages, kv_heads, 128, 4] of one page; the four share page and head strides.
     page_head_strides = k_data.stride()[:2]
