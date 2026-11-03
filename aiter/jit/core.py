@@ -41,15 +41,18 @@ AITER_DISABLE_KERNARG_PRELOAD = (
 )
 
 
+@functools.lru_cache(maxsize=256)
+def _atoi_flag(raw: str) -> bool:
+    m = re.match(r"\s*([+-]?\d+)", raw)
+    return m is not None and int(m.group(1)) != 0
+
+
+def env_flag_atoi(name: str, default: str = "") -> bool:
+    return _atoi_flag(os.environ.get(name, default))
+
+
 def is_experimental_enabled() -> bool:
-    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
-    # any other integer value as enabled. Non-numeric strings are treated as
-    # disabled to avoid accidentally turning on experimental code paths.
-    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
-    try:
-        return int(val) != 0
-    except ValueError:
-        return False
+    return env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
 
 
 aiter_lib = None
@@ -179,6 +182,11 @@ AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
@@ -237,9 +245,26 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+AITER_CONFIG_IQ2R_GLM53 = os.getenv(
+    "AITER_CONFIG_IQ2R_GLM53",
+    f"{AITER_ROOT_DIR}/aiter/configs/iq2r_glm53_tuned.csv",
+)
+
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
+# MegaMoE TP (aiter/ops/flydsl/mega_moe_tp.py): the small-batch engine's launch configs and
+# the big-M kernel's chunk plans
+AITER_CONFIG_MEGA_MOE_TP = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
 
@@ -351,6 +376,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE,
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
@@ -395,11 +428,31 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_IQ2R_GLM53_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_IQ2R_GLM53", AITER_CONFIG_IQ2R_GLM53, "iq2r_glm53_tuned"
+        )
+
+    @property
     def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+            AITER_CONFIG_MEGA_MOE_TP_BIGM,
+            "mega_moe_tp_bigm_tuned",
         )
 
     @property
@@ -466,7 +519,15 @@ class AITER_CONFIG:
         dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
         if not dedup_keys:
             return
-        duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+
+        def as_numbers(column):
+            values = pd.to_numeric(column, errors="coerce")
+            written = column.astype(str).str.strip() != ""
+            return values if values[written].notna().all() else column
+
+        # Numeric columns compare as numbers, so 256 and 256.0 are one shape.
+        comparable = merge_df.apply(as_numbers)
+        duplicated_mask = comparable.duplicated(subset=dedup_keys, keep=False)
         if not duplicated_mask.any():
             return
 
@@ -489,9 +550,13 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape
+        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
+        # unparseable us cell (e.g. nan) leaves the column textual in
+        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
+        us = pd.to_numeric(merge_df["us"], errors="coerce")
         best_row_index = set(
-            merge_df.sort_values("us", kind="stable")
+            comparable.assign(us=us)
+            .sort_values("us", kind="stable")
             .drop_duplicates(subset=dedup_keys, keep="first")
             .index
         )
@@ -559,7 +624,9 @@ class AITER_CONFIG:
             single = path_list[0] if path_list else None
             if single and os.path.exists(single):
                 try:
-                    df = pd.read_csv(single)
+                    # As text, like the merge below, so a dedup rewrite keeps
+                    # every cell as written.
+                    df = pd.read_csv(single, dtype=str, keep_default_na=False)
                 except (OSError, UnicodeError, ValueError, pd.errors.ParserError):
                     # This path previously handed the file back unread, so an
                     # unparseable CSV surfaced from the op's own loader. Keep
@@ -585,7 +652,10 @@ class AITER_CONFIG:
                 logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
-            df = pd.read_csv(path)
+            # Kept as text so the merged file reproduces every cell as written:
+            # parsed, a column with a blank cell turns 64 into 64.0, which
+            # readers that take integers from the text reject.
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
             source_pairs.append((path, df))
 
         if not source_pairs:
@@ -610,9 +680,10 @@ class AITER_CONFIG:
                         # a cu_num stay distinguishable after the merge.
                         from aiter.jit.utils.chip_info import gfx_from_cu_num
 
-                        df[c] = df["cu_num"].map(gfx_from_cu_num)
+                        cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
+                        df[c] = cu_num.map(gfx_from_cu_num)
                     else:
-                        df[c] = _FILL_DEFAULTS.get(c, 0)
+                        df[c] = str(_FILL_DEFAULTS.get(c, 0))
             source_pairs[i] = (path, df[all_cols])
 
         non_empty = [df for _, df in source_pairs if not df.empty]
@@ -735,7 +806,9 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
-# over the macro, so an explicit user override still wins.
+# over the macro. The CO loader resolves the current HIP device's ASIC Revision:
+# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
@@ -884,31 +957,6 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
-
-
-def check_and_set_ninja_worker():
-    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-    import psutil
-
-    # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
-    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
-
-    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env is not None:
-        try:
-            max_processes = int(max_jobs_env)
-            # too large value
-            if max_processes > max_jobs:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # error value
-        except ValueError:
-            os.environ["MAX_JOBS"] = str(max_jobs)
-    # none value
-    else:
-        os.environ["MAX_JOBS"] = str(max_jobs)
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1407,8 +1455,6 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
-        check_and_set_ninja_worker()
-
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
         staged_token = None
@@ -1787,6 +1833,29 @@ def _is_union(origin):
 ) = range(7)
 
 
+def build_ctypes_module(md_name: str) -> str:
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
+        d_args = get_args_of_build(md_name)
+        d_args["torch_exclude"] = True
+        build_module(
+            md_name,
+            d_args["srcs"],
+            d_args["flags_extra_cc"],
+            d_args["flags_extra_hip"],
+            d_args["blob_gen_cmd"],
+            d_args["extra_include"],
+            d_args["extra_ldflags"],
+            d_args["verbose"],
+            d_args["is_python_module"],
+            d_args["is_standalone"],
+            d_args["torch_exclude"],
+            d_args.get("third_party", []),
+            flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+        )
+    return so_path
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1832,25 +1901,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
-        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
-            d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
-            build_module(
-                md_name,
-                d_args["srcs"],
-                d_args["flags_extra_cc"],
-                d_args["flags_extra_hip"],
-                d_args["blob_gen_cmd"],
-                d_args["extra_include"],
-                d_args["extra_ldflags"],
-                d_args["verbose"],
-                d_args["is_python_module"],
-                d_args["is_standalone"],
-                d_args["torch_exclude"],
-                d_args.get("third_party", []),
-                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
-            )
+        so_path = build_ctypes_module(md_name)
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
@@ -2139,6 +2190,16 @@ def _pybind_develop_hooks():
     return _pybind_develop_hooks_cache
 
 
+def _develop_arg(a, convert, tensor_cls):
+    """`a` as a develop=True pybind op takes it: a tensor converted, and so is
+    every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
+    if isinstance(a, tensor_cls):
+        return convert(a)
+    if isinstance(a, (list, tuple)) and any(isinstance(x, tensor_cls) for x in a):
+        return [convert(x) if isinstance(x, tensor_cls) else x for x in a]
+    return a
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2243,7 +2304,6 @@ def compile_ops(
                     return None
 
                 def check_args():
-                    get_asm_dir()
                     import inspect
                     import re
 
@@ -2445,12 +2505,10 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(
-                        convert(a) if isinstance(a, tensor_cls) else a for a in args
-                    )
+                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
-                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            k: _develop_arg(v, convert, tensor_cls)
                             for k, v in kwargs.items()
                         }
 

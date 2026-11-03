@@ -8,6 +8,7 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -30,6 +31,159 @@ ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
 
 
+@pytest.mark.parametrize(
+    "seqlen, tail_logit, causal, later_max, sparse, v_dtype",
+    [
+        pytest.param(4096, 0, False, False, False, torch.float8_e4m3fnuz, id="uniform"),
+        pytest.param(
+            4096, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-full"
+        ),
+        pytest.param(
+            4117, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-tail"
+        ),
+        pytest.param(
+            4117, -7, False, False, False, torch.float8_e4m3fnuz, id="tail-minus7"
+        ),
+        pytest.param(4117, -8, True, False, False, torch.float8_e4m3fnuz, id="causal"),
+        pytest.param(
+            4117, -8, False, True, False, torch.float8_e4m3fnuz, id="later-max"
+        ),
+        pytest.param(
+            4096, -8, False, False, True, torch.float8_e4m3fnuz, id="sparse-full"
+        ),
+        pytest.param(
+            4117, -8, False, True, True, torch.float8_e4m3fnuz, id="sparse-tail"
+        ),
+        pytest.param(4117, -8, False, False, False, torch.bfloat16, id="bf16-v"),
+        pytest.param(
+            4096,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-full",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-tail",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            True,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-causal",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-later-max",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            True,
+            torch.float8_e4m3fnuz,
+            id="spread-sparse-tail",
+        ),
+    ],
+)
+def test_sage_small_probabilities(
+    seqlen, tail_logit, causal, later_max, sparse, v_dtype
+):
+    """Constant V must remain constant when many small probabilities contribute."""
+    if v_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() != "gfx942":
+        pytest.skip("E4M3 FNUZ regression requires gfx942")
+
+    config = get_sage_fwd_configs()
+    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+    seqlen_q = seqlen if causal else block_m + 1
+    num_q_blocks = (seqlen_q + block_m - 1) // block_m
+    num_k_blocks = (seqlen + block_n - 1) // block_n
+    q = torch.zeros((1, seqlen_q, 1, 128), dtype=torch.int8, device="cuda")
+    k = torch.zeros((1, seqlen, 1, 128), dtype=torch.int8, device=q.device)
+    max_position = seqlen - 1 if later_max else 0
+    if tail_logit == "spread":
+        # Encode logits -7 - code/64 exactly using integer dot products.
+        q[..., :7] = torch.tensor([64, 32, 16, 8, 4, 2, 1], device=q.device)
+        codes = (
+            torch.linspace(0, 128, seqlen - 1, device=q.device, dtype=torch.float32)
+            .round()
+            .int()
+        )
+        shifts = torch.arange(5, -1, -1, device=q.device)
+        encoded_k = torch.cat(
+            (-7 - codes[:, None] // 64, -((codes[:, None] >> shifts) & 1)), dim=1
+        ).to(torch.int8)
+        tail_start = 0 if later_max else 1
+        k[:, tail_start : tail_start + seqlen - 1, 0, :7] = encoded_k
+        logit_scale = 1 / 64
+    else:
+        q[..., 0] = 1
+        k[..., 0] = tail_logit
+        k[:, max_position, :, 0] = 0
+        logit_scale = 1
+    head_dim_v = 64 if v_dtype == torch.bfloat16 else 128
+    v = torch.ones((1, seqlen, 1, head_dim_v), dtype=torch.float32, device=q.device).to(
+        v_dtype
+    )
+    # QK descaling includes the conversion from natural logits to exp2 units.
+    q_descale = torch.full(
+        (1, 1, num_q_blocks),
+        math.log2(math.e) * logit_scale,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    k_descale = torch.ones((1, 1, num_k_blocks), device=q.device, dtype=torch.float32)
+    v_descale = torch.ones((1, 1, head_dim_v), device=q.device, dtype=torch.float32)
+    sparse_args = {}
+    if sparse:
+        block_mask = torch.ones(
+            (1, num_q_blocks, num_k_blocks), dtype=torch.bool, device=q.device
+        )
+        indices, starts, counts = block_attn_mask_to_ragged_lut(block_mask, num_heads=1)
+        sparse_args = {
+            "kv_block_indices": indices,
+            "lut_start": starts,
+            "lut_count": counts,
+            "use_block_sparse": True,
+        }
+
+    out, lse = fav3_sage_func(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        causal=causal,
+        return_lse=True,
+        **sparse_args,
+    )
+    atol = 0.05 if v_dtype == torch.float8_e4m3fnuz and tail_logit != 0 else 0.01
+    torch.testing.assert_close(out, torch.ones_like(out), atol=atol, rtol=0)
+    logits = (k[0, :, 0].float() @ q[0, 0, 0].float()) * logit_scale
+    if causal:
+        expected_lse = torch.logcumsumexp(logits, dim=0)
+    else:
+        expected_lse = torch.logsumexp(logits, dim=0).expand(seqlen_q)
+    torch.testing.assert_close(lse[0, 0], expected_lse, atol=2e-5, rtol=2e-5)
+
+
 def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     block_attn_mask = torch.tensor(
         [[[[True, False, True], [False, True, True]]]],
@@ -47,6 +201,19 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     torch.testing.assert_close(
         lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
     )
+
+
+def test_tiebreak_keeps_its_own_reference_bound():
+    """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
+
+    Reusing a neighbouring distribution's bound here would report breakage on the property the
+    generator is built to create.
+    """
+    bound = fp8_max_diff_percentage("tiebreak")
+    others = [
+        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
+    ]
+    assert bound > max(others), f"tiebreak {bound} vs {others}"
 
 
 def compare_accuracy(current, reference):
@@ -112,7 +279,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -204,6 +373,24 @@ def check_attention_outputs(
             atol=atol or 1e-2,
             rtol=rtol or 1e-2,
         )
+
+
+def fp8_max_diff_percentage(input_distribution: str) -> float:
+    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
+    # property under test; this bound is only a backstop against gross breakage.
+    if input_distribution == "tiebreak":
+        return 25.0
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(
+        input_distribution
+    ).startswith("dump:"):
+        return 2.0
+    return 0.5
 
 
 def input_helper(

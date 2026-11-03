@@ -341,7 +341,11 @@ __quickreduce_device_inline__ float T2float_cast(__hip_bfloat16 a) { return __bf
 template <typename T>
 __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 {
+#if defined(__gfx1250__)
+    const int group_leader = ((threadIdx.x % warpSize) / kThreadGroupSize) * kThreadGroupSize;
+#else
     const int group_leader = (threadIdx.x / kThreadGroupSize) * kThreadGroupSize;
+#endif
 
     int wmax, wmin, wblockmax;
     int a, b;
@@ -374,12 +378,20 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 
 __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__)
+    __scoped_atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+#else
     __atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE);
+#endif
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__)
+    while(__scoped_atomic_load_n(flag_ptr, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) != flag) {}
+#else
     while(__atomic_load_n(flag_ptr, __ATOMIC_RELAXED) != flag) {}
+#endif
 }
 
 } // namespace aiter

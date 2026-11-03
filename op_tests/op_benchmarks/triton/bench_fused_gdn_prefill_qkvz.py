@@ -19,7 +19,6 @@ default sweep hits all four tiles. Usage:
     python3 bench_fused_gdn_prefill_qkvz.py --shapes 1x1024,4x2048,8x1600
 """
 
-import argparse
 import sys
 
 import torch
@@ -29,6 +28,7 @@ from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
     fused_gdn_prefill_qkvz,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Peak theoretical HBM bandwidth, bytes/s.
 _PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
@@ -128,7 +128,7 @@ def bench_one(batch, seqlen, num_k_heads, head_dim, iters, warmup=25):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = get_parser(kernel_name="Fused GDN Prefill QKVZ")
     ap.add_argument(
         "--shapes",
         default=_DEFAULT_SHAPES,

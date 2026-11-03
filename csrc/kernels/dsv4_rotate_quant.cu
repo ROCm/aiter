@@ -11,6 +11,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "dsv4_rotate_quant.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 
 namespace aiter {
@@ -1012,12 +1013,12 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
     }
 
     // per-(row, 1xGROUP) e4m3 quant, matching dynamic_per_group_scaled_quant:
-    //   absMax = max(1e-10f, group_max|x|); scale = absMax / fp8_max;
+    //   absMax = max(kAmaxFloor, group_max|x|); scale = absMax / fp8_max;
     //   out_fp8 = round_to_nearest(af / scale). finfo<fp8_t>::max() is
     //   arch-correct (448 e4m3fn gfx950, 240 e4m3fnuz gfx942).
     constexpr float fp8_max      = static_cast<float>(opus::finfo<opus::fp8_t>::max());
     const float inverted_fp8_max = 1.0 / fp8_max;
-    float absMax                 = 1e-10f;
+    float absMax                 = aiter::kAmaxFloor;
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
     {

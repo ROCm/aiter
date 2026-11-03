@@ -1,7 +1,10 @@
 // ps denotes persistent scheduling, not page size. page_size=0 keeps the legacy dispatch.
-// The explicit page_size=64 row uses the dedicated QH128 launcher, not legacy dispatch.
+// page_size=64 selects shuffled storage: QH64 uses packed CSR, QH128 uses dense tables.
 // page64 is kv_shuffled=1: 16-token x 16-dimension tiles in separate NoPE/RoPE planes.
-// Its 88-byte ABI supports O-only and optional FP32 LSE through a nullable pointer.
+// QH64 keeps the 120-byte split-K ABI; QH128 uses the dedicated 88-byte ABI.
+// Shuffled QH64 qSeqLen=1 is the per-workgroup query count; grid.x carries max_seqlen_q.
+// QH64 causal=0 is the canonical lookup; decode_flags bit1 selects either causal mode.
+// QH64 decode_flags bit2 selects token CSR (page64 slot IDs); default is page CSR.
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,page_size,kv_shuffled,knl_name,co_name
 fp8,fp8,8,0,1,0,0,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx1_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx1_32nx4_np_3p.co
 fp8,fp8,8,0,2,0,0,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx2_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx2_32nx4_np_3p.co
@@ -14,3 +17,4 @@ fp8,fp8,16,0,4,0,0,0,0,0,_ZN5aiter31mla_a8w8_qh16_1tg_16mx4_64nx1_npE,mla_a8w8_q
 fp8,fp8,64,0,1,0,0,0,0,0,_ZN5aiter31mla_a8w8_qh64_1tg_16mx4_64nx1_npE,mla_a8w8_qh64_1tg_16mx4_64nx1_np.co
 fp8,fp8,128,0,1,0,0,0,0,0,_ZN5aiter32mla_a8w8_qh128_1tg_16mx4_64nx1_npE,mla_a8w8_qh128_1tg_16mx4_64nx1_np.co
 fp8,fp8,128,0,1,0,0,0,64,1,_ZN5aiter35mla_a8w8_qh128_1tg_32mx4_64nx1_ps64E,mla_a8w8_qh128_1tg_32mx4_64nx1_ps64.co
+fp8,fp8,64,0,1,0,0,0,64,1,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_np_kvsE,mla_a8w8_qh64_1tg_16mx4_64nx1_np_kvs.co

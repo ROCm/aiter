@@ -713,7 +713,10 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
 
 @triton.jit
 def _mxfp8_quant_op(
-    x_grouped, QUANT_AXIS: tl.constexpr, LOG2_DTYPE_MAX: tl.constexpr = 8
+    x_grouped,
+    QUANT_AXIS: tl.constexpr,
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
+    AMAX_FLOOR: tl.constexpr = 0.0,
 ):
     """Shared MXFP8 (1x32 e8m0) scale derivation.
 
@@ -721,8 +724,11 @@ def _mxfp8_quant_op(
     returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
     matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
     so they broadcast against the input for in-place quantization.
+    AMAX_FLOOR > 0 floors each group's amax (none by default).
     """
     amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
+    if AMAX_FLOOR > 0:
+        amax = tl.maximum(amax, AMAX_FLOOR)
     amax_i32 = amax.to(tl.int32, bitcast=True)
     amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax_p2 = amax_i32.to(tl.float32, bitcast=True)

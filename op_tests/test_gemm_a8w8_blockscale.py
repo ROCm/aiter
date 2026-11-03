@@ -20,12 +20,7 @@ from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import (
-    shuffle_mxfp8fp4_a,
-    shuffle_scale_blockscale_a,
-    shuffle_scale_blockscale_b,
-    shuffle_weight,
-)
+from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -157,17 +152,9 @@ def test_gemm(
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    if use_flydsl_fp8_scale and get_gfx() == "gfx950":
-        gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
-        gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
-    elif use_flydsl_fp8_scale:
-        gemm_x_scale = x_scale_t if get_gfx() == "gfx1250" else x_scale
-        gemm_w_scale = w_scale
-    else:
-        gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
-        gemm_w_scale = w_scale
+    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
     if ck_preshuffle and not use_flydsl_fp8_scale:

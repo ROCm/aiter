@@ -12,6 +12,8 @@ Flow:  load_winners    fastest ok record per M; the installed baseline competes 
                        put the previous file back if the loader disagrees
 
 sweep_configs.py runs this when a sweep finishes; run it by hand to re-install from results.
+--cu-dir: every step above happens in the <arch>/<cu_num>cu/ tree of this device's CU count,
+with only the records timed on that count.
 """
 
 import argparse
@@ -34,7 +36,7 @@ from _utils import (
     specialized_filename,
 )
 from kernels import ensure_repo_on_path, get_spec, resolve_installed, seed_table
-from space import load_defaults
+from space import config_tree, load_defaults
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,22 +45,27 @@ Winner = namedtuple(
 )  # baseline: the installed config's record or None
 
 
-def load_winners(runs_dir, arch, backend, spec, shape_nk):
+def load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num=None):
     """M -> Winner from every per-M result file of this (kernel, backend, N, K[, B]).
 
     When several GPUs swept an M, only the final round (<results>.final.jsonl, timed on one
     GPU) counts. When the M's plan file is present only its candidates (and the baseline) can win,
-    so records of candidates that are no longer in the search space are ignored.
+    so records of candidates that are no longer in the search space are ignored. With cu_num,
+    only records timed on a device with that CU count count; records without one are skipped.
     """
     winners = {}
     for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
-        records = read_records(path)
+        records = read_records(path, cu_num)
         ok = [r for r in records.values() if r["status"] == "ok"]
         if not ok:
+            if cu_num is not None and read_records(path):
+                print(
+                    f"  {os.path.basename(path)}: no record timed on {cu_num} CUs; skipped"
+                )
             continue
         M = ok[0]["shape"]["M"]
         if os.path.exists(final_results_path(path)):
-            records = read_records(final_results_path(path))
+            records = read_records(final_results_path(path), cu_num)
             ok = [r for r in records.values() if r["status"] == "ok"]
         elif (
             len({r.get("gpu") for r in ok} - {None}) > 1
@@ -143,23 +150,28 @@ def ordered(table):
     return {k: table[k] for k in sorted(table, key=rank)}
 
 
-def install(spec, backend, shape_nk, runs_dir):
+def install(spec, backend, shape_nk, runs_dir, cu_dir=False):
     ensure_repo_on_path()
     from aiter.ops.triton.utils import gemm_config_utils
     from aiter.ops.triton.utils._triton import arch_info
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num, load_config_json
 
     arch = arch_info.get_arch()
     backend = backend or spec.default_backend(arch)
-    winners = load_winners(runs_dir, arch, backend, spec, shape_nk)
+    cu_num = None
+    if cu_dir:
+        cu_num = get_config_cu_num()
+        if cu_num is None:
+            sys.exit("--cu-dir: the CU count of this device cannot be read")
+    winners = load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num)
     if not winners:
         sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
 
-    seed_path, seed = seed_table(spec, backend, shape_nk)
+    seed_path, seed = seed_table(spec, backend, shape_nk, cu_num)
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
     bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
-    keys, default_buckets, _ = load_defaults(spec, backend)
+    keys, default_buckets, _ = load_defaults(spec, backend, cu_num)
     assignments = assign_buckets(winners, bounds)
     if not assignments:
         sys.exit(
@@ -176,7 +188,7 @@ def install(spec, backend, shape_nk, runs_dir):
             f"  M={winner.M:<6} {bucket:<12} {winner.record['us']:10.3f} us  {gain:<36} {json.dumps(table[bucket])}"
         )
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    config_dir = config_tree(spec, backend, cu_num)
     target = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
     previous = Path(target).read_text() if os.path.exists(target) else None
     with open(target, "w") as f:
@@ -188,7 +200,9 @@ def install(spec, backend, shape_nk, runs_dir):
     load_config_json.cache_clear()
     gemm_config_utils._get_gemm_config_cached.cache_clear()
     for bucket, winner in assignments.items():
-        got, is_tuned = resolve_installed(spec, dict(shape_nk, M=winner.M), backend)
+        got, is_tuned = resolve_installed(
+            spec, dict(shape_nk, M=winner.M), backend, cu_num=cu_num
+        )
         if got != table[bucket] or not is_tuned:
             if previous is None:  # never leave a bad file in the tree
                 os.remove(target)
@@ -210,12 +224,19 @@ def main(argv=None):
     add_shape_args(parser, with_m=False)
     parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
+    parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="install into <arch>/<cu_num>cu/, the tree of this device's CU count, from the "
+        "records timed on it; only on a partition whose CU count is not the arch's default",
+    )
     args = parser.parse_args(argv)
     install(
         args.kernel,
         args.backend,
         shape_from_args(args, args.kernel.dims),
         args.runs_dir,
+        cu_dir=args.cu_dir,
     )
     return 0
 

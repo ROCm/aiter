@@ -1,9 +1,11 @@
-import argparse
-
 import triton
 
 from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -112,11 +114,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FusedRMSNormAdd",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="FusedRMSNormAdd")
     parser.add_argument(
         "--shape",
         type=int,
@@ -124,12 +122,11 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="user-defined shape to benchmark",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["time", "bandwidth", "throughput"],
         default="bandwidth",
-        help="metric to plot",
     )
     parser.add_argument(
         "--add-residual",

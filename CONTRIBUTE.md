@@ -319,27 +319,21 @@ When integrating CK tiles:
 
 ### Triton Kernel Development
 
-For Triton kernels:
+Triton and Gluon kernels follow the rules in
+[aiter/ops/triton/README.md](aiter/ops/triton/README.md#rules). The most
+important rules:
 
-1. **Use Appropriate Block Sizes**:
-   ```python
-   @triton.jit
-   def kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
-       # Use BLOCK_SIZE between 128-1024 for AMD GPUs
-       pass
-   ```
-
-2. **Enable Software Pipelining**:
-   ```python
-   for blk_idx in tl.range(0, n_blocks, num_stages=2):  # Enable pipelining
-       data = tl.load(ptr + blk_idx * BLOCK_SIZE)
-   ```
-
-3. **Use Cache Modifiers**:
-   ```python
-   # For data that will be reused
-   x = tl.load(input_ptr, cache_modifier=".cg")  # Cache globally
-   ```
+1. Before you add a kernel, find kernels with the same or almost the same
+   function. Do not add a duplicate.
+2. Each kernel has a public wrapper, a unit test and a benchmark.
+3. Each launchable kernel has `repr=make_kernel_repr(...)`.
+4. Each kernel is in the correct folder, and its tuning values are in JSON
+   files in `aiter/ops/triton/configs/`, not in Python.
+5. Common code, such as activations, shuffles and config loading, comes from
+   the shared modules. Do not write local copies.
+6. Comments are short: one or two sentences.
+7. Docs, comments and PR descriptions use
+   [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English).
 
 ---
 

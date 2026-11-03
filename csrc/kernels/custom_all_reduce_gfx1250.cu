@@ -93,10 +93,15 @@ void dispose(fptr_t _fa)
 // region is zero-initialized by the caller (which also resets the LL flags).
 // Takes world_size because the LL scratch is sized by it. Reserving
 // kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks' worth.
+// Groups above kLLMaxRanks are allgather-only and never route to LL, so they
+// get no scratch (it would be 1 GiB per rank at 64).
 int64_t meta_size(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
-    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes((int)world_size));
+    size_t ll_bytes = world_size <= aiter::kLLMaxRanks
+                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes
+                          : 0;
+    return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
 }
 
 // ---- Internal dispatch helper ----
@@ -460,7 +465,8 @@ void all_reduce(fptr_t _fa,
 
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
-    if(reg_inp_ptr != 0)
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(reg_inp_ptr != 0 && !fa->use_ll(data_bytes))
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
@@ -473,6 +479,153 @@ void all_reduce(fptr_t _fa,
                 use_new, is_broadcast_reg_outptr);
 }
 
+// ---- Fused allreduce + RMSNorm ----
+
+static void _validate_fused_allreduce_rmsnorm(const aiter_tensor_t& inp,
+                                              const aiter_tensor_t& res_inp,
+                                              const aiter_tensor_t& res_out,
+                                              const aiter_tensor_t& w)
+{
+    if(inp.dim() == 0 || res_inp.dim() == 0 || res_out.dim() == 0 ||
+       w.numel() == 0)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires non-empty input and weight");
+    const size_t hidden = w.numel();
+    if(inp.numel() % hidden != 0 || inp.size(-1) != (int64_t)hidden ||
+       res_inp.numel() != inp.numel() || res_out.numel() != inp.numel() ||
+       res_inp.size(-1) != (int64_t)hidden || res_out.size(-1) != (int64_t)hidden)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires matching dense input, residual, "
+            "output and weight shapes");
+    if(inp.dtype() != res_inp.dtype() || inp.dtype() != res_out.dtype() ||
+       inp.dtype() != w.dtype())
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires matching input, residual, "
+            "output and weight dtypes");
+    if(!inp.is_contiguous() || !res_inp.is_contiguous() || !res_out.is_contiguous() ||
+       !w.is_contiguous())
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires contiguous tensors");
+    if(inp.device_id != res_inp.device_id || inp.device_id != res_out.device_id ||
+       inp.device_id != w.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires tensors on the same device");
+}
+
+static void _fused_allreduce_rmsnorm(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& res_inp,
+                                     const aiter_tensor_t& res_out,
+                                     void* out,
+                                     const aiter_tensor_t& w,
+                                     float* scale_out,
+                                     void* bf16_out,
+                                     double eps,
+                                     int64_t reg_ptr,
+                                     int64_t reg_bytes,
+                                     bool gemma_norm,
+                                     bool use_1stage)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    _validate_fused_allreduce_rmsnorm(inp, res_inp, res_out, w);
+    const int hidden   = (int)w.numel();
+    const int tokens   = (int)(inp.numel() / hidden);
+
+    void* actual_inp = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        const int64_t data_bytes = inp.numel() * inp.element_size();
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_ptr, actual_inp, data_bytes, hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_ptr;
+    }
+
+#define AR_RMS_DISPATCH(T)                                                                \
+    if(scale_out == nullptr)                                                              \
+        fa->fused_allreduce_rmsnorm<T, T>(stream,                                         \
+                                          reinterpret_cast<T*>(actual_inp),               \
+                                          reinterpret_cast<const T*>(res_inp.data_ptr()), \
+                                          reinterpret_cast<T*>(res_out.data_ptr()),       \
+                                          reinterpret_cast<T*>(out),                      \
+                                          reinterpret_cast<const T*>(w.data_ptr()),       \
+                                          nullptr, nullptr, tokens, hidden, (float)eps,   \
+                                          gemma_norm, use_1stage);                         \
+    else                                                                                  \
+        fa->fused_allreduce_rmsnorm<T, opus::fp8_t>(                                      \
+            stream,                                                                       \
+            reinterpret_cast<T*>(actual_inp),                                             \
+            reinterpret_cast<const T*>(res_inp.data_ptr()),                               \
+            reinterpret_cast<T*>(res_out.data_ptr()),                                     \
+            reinterpret_cast<opus::fp8_t*>(out),                                          \
+            reinterpret_cast<const T*>(w.data_ptr()),                                     \
+            scale_out, reinterpret_cast<T*>(bf16_out), tokens, hidden, (float)eps,        \
+            gemma_norm, use_1stage);                                                       \
+    break
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_bf16: AR_RMS_DISPATCH(opus::bf16_t);
+    case AITER_DTYPE_fp16: AR_RMS_DISPATCH(opus::fp16_t);
+    default:
+        throw std::runtime_error("gfx1250 fused allreduce rmsnorm only supports bf16 and fp16");
+    }
+#undef AR_RMS_DISPATCH
+}
+
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& res_inp,
+                             const aiter_tensor_t& res_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& w,
+                             double eps,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
+                             bool use_1stage,
+                             bool gemma_norm)
+{
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() ||
+       !out.is_contiguous() || out.device_id != inp.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires a matching contiguous output");
+    _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
+                             nullptr, nullptr, eps, reg_ptr, reg_bytes, gemma_norm,
+                             use_1stage);
+}
+
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   const aiter_tensor_t& inp,
+                                   const aiter_tensor_t& res_inp,
+                                   const aiter_tensor_t& res_out,
+                                   const aiter_tensor_t& out,
+                                   const aiter_tensor_t& scale_out,
+                                   const aiter_tensor_t& w,
+                                   double eps,
+                                   int64_t reg_ptr,
+                                   int64_t reg_bytes,
+                                   bool use_1stage,
+                                   bool gemma_norm,
+                                   int64_t bf16_out_ptr)
+{
+    const size_t hidden = w.numel();
+    const size_t tokens = hidden == 0 ? 0 : inp.numel() / hidden;
+    if(out.numel() != inp.numel() || out.dtype() != AITER_DTYPE_fp8 ||
+       !out.is_contiguous() || out.device_id != inp.device_id ||
+       scale_out.numel() != tokens || scale_out.dtype() != AITER_DTYPE_fp32 ||
+       !scale_out.is_contiguous() || scale_out.device_id != inp.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused quantized allreduce rmsnorm requires contiguous FP8 output "
+            "and one contiguous FP32 scale per token");
+    _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
+                             reinterpret_cast<float*>(scale_out.data_ptr()),
+                             reinterpret_cast<void*>(bf16_out_ptr), eps, reg_ptr, reg_bytes,
+                             gemma_norm, use_1stage);
+}
+
 // ---- Sync latency measurement kernels ----
 
 void start_sync_latency(fptr_t _fa, int64_t blocks)
@@ -482,9 +635,9 @@ void start_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_START_SYNC(NG) \
-    aiter::start_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::start_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_START_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_START_SYNC);
 #undef LAUNCH_START_SYNC
 }
 
@@ -495,9 +648,9 @@ void end_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_END_SYNC(NG) \
-    aiter::end_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::end_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_END_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_END_SYNC);
 #undef LAUNCH_END_SYNC
 }
 
@@ -508,9 +661,9 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
     int ws = fa->world_size_;
     constexpr int threads = 256;
 #define LAUNCH_TWO_SYNC(NG) \
-    aiter::two_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+    aiter::two_sync_kernel<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
 #undef LAUNCH_TWO_SYNC
 }
 

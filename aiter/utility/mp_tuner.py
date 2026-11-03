@@ -10,9 +10,25 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
+# rocprofiler-sdk exports these (setenv, so os.environ doesn't see them) when this
+# process initializes the GPU runtime. Spawned workers inherit them, and then the
+# torch profiler there records no GPU kernels, so every candidate times as 0 us.
+_ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TOOLS")
+
+
+def _new_pool(parallel_num, task_start_times, task_pids):
+    for name in _ROCPROFILER_ENV:
+        os.environ.pop(name, None)
+        os.unsetenv(name)
+    return mp.Pool(
+        processes=parallel_num,
+        initializer=_init_task_start_times,
+        initargs=(task_start_times, task_pids),
+    )
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
@@ -25,6 +41,7 @@ def _is_accelerator_error(exc: BaseException) -> bool:
 
 def _init_task_start_times(task_start_times, task_pids=None):
     global _TASK_START_TIMES, _TASK_PIDS
+    configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
 
@@ -487,11 +504,7 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
     task_pids = mp.RawArray("i", len(task_group))
-    pool = mp.Pool(
-        processes=parallel_num,
-        initializer=_init_task_start_times,
-        initargs=(task_start_times, task_pids),
-    )
+    pool = _new_pool(parallel_num, task_start_times, task_pids)
     pid_delay = 0 if mp_num == 1 else 3
     pids = [
         pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
@@ -682,11 +695,7 @@ def mp_tuner(
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
-            pool = mp.Pool(
-                processes=parallel_num,
-                initializer=_init_task_start_times,
-                initargs=(task_start_times, task_pids),
-            )
+            pool = _new_pool(parallel_num, task_start_times, task_pids)
 
             # Recreate gpu_map for new processes (new PIDs)
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]

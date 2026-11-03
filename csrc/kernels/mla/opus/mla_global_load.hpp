@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <opus/opus.hpp>
+#include <type_traits>
 
 // --- global->LDS async copy on a 64-bit flat address (GLOBAL_LOAD_LDS) ---
 //
@@ -87,4 +89,54 @@ global_load(const D* g_base, void* smem_base, const LayoutG&, const LayoutS& u_s
             *reinterpret_cast<const opus::vector_t<D, VEC>*>(src + g_delta);
 #endif
     });
+}
+
+// global -> VGPR, one issue per y-position of the layout (drop-in for opus::load(gmem, layout)).
+template <opus::index_t VEC,
+          class D,
+          class Layout,
+          std::enable_if_t<opus::is_layout_v<Layout>, bool> = true>
+__device__ inline auto global_load(const D* g_base, const Layout& u)
+{
+    constexpr opus::index_t N = opus::layout_load_traits<Layout, VEC>::r_elem.value;
+    const auto os             = opus::layout_to_offsets<VEC>(u);
+    opus::vector_t<D, VEC * N> r;
+    opus::static_for<N>([&](auto i) {
+        opus::set_slice(r,
+                        *reinterpret_cast<const opus::vector_t<D, VEC>*>(
+                            reinterpret_cast<const char*>(g_base) +
+                            static_cast<int64_t>(os[i.value]) * static_cast<int64_t>(sizeof(D))),
+                        opus::number<i.value * VEC>{},
+                        opus::number<(i.value + 1) * VEC>{});
+    });
+    return r;
+}
+
+// global -> VGPR at a plain element offset.
+template <opus::index_t VEC, class D>
+__device__ inline auto global_load(const D* g_base, opus::index_t os)
+{
+    return *reinterpret_cast<const opus::vector_t<D, VEC>*>(reinterpret_cast<const char*>(g_base) +
+                                                            static_cast<int64_t>(os) *
+                                                                static_cast<int64_t>(sizeof(D)));
+}
+
+__device__ void llvm_amdgcn_global_load_lds(__attribute__((address_space(1))) void* gptr,
+                                            OPUS_LDS_ADDR void* lptr,
+                                            unsigned size,
+                                            unsigned offset,
+                                            unsigned aux) __asm("llvm.amdgcn.global.load.lds");
+
+template <opus::index_t VEC, int M0_IMM, int G_IMM, class D, class S>
+__device__ inline void global_load_lds(const D* src, const S* lds_base)
+{
+    constexpr unsigned BYTES = VEC * sizeof(D);
+    static_assert((BYTES == 16 || BYTES == 12 || BYTES == 4 || BYTES == 2 || BYTES == 1) &&
+                  G_IMM >= 0 && G_IMM < 4096 && G_IMM % 4 == 0 && M0_IMM >= 0 && M0_IMM % 4 == 0);
+    llvm_amdgcn_global_load_lds(
+        (__attribute__((address_space(1))) void*)(const_cast<D*>(src)),
+        (OPUS_LDS_ADDR void*)(reinterpret_cast<__UINTPTR_TYPE__>(lds_base) + M0_IMM),
+        BYTES,
+        G_IMM,
+        0);
 }
