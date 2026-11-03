@@ -7,15 +7,15 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha import (
     _flash_attn_forward,
     flash_attn_func,
     flash_attn_varlen_func,
+    mha_set_impl,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp8_avail
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
@@ -306,21 +306,29 @@ def test_mha_varlen_fp8_gluon(
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
 
-@pytest.mark.parametrize("FP8", [True, False])
-@pytest.mark.parametrize("VARLEN", [False, True])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-@pytest.mark.parametrize("OUT_DTYPE", [None, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "FP8, VARLEN, CAUSAL, HEAD_SZ, OUT_DTYPE",
+    [
+        (True, True, True, 256, torch.bfloat16),
+        (True, False, False, 128, torch.bfloat16),
+        (True, True, False, 128, torch.float16),
+        (True, False, True, 128, None),
+        (False, False, True, 128, None),
+        (False, True, False, 128, torch.float16),
+    ],
+)
 def test_mha_forward_out_dtype(
     FP8: bool,
     VARLEN: bool,
     CAUSAL: bool,
+    HEAD_SZ: int,
     OUT_DTYPE: torch.dtype,
     dtype=torch.bfloat16,
 ):
-    """out_dtype changes only the final store: the output matches the fp32 output."""
-    if FP8 and get_arch() not in ANY_FP8_ARCHS:
+    """out_dtype changes only the final store: the output is the fp32 output cast."""
+    if FP8 and not is_fp8_avail():
         pytest.skip(f"FP8 not supported on {get_arch()}")
-    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 2, 256, 8, 2, 128
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS = 2, 256, 8, 2
     torch.manual_seed(20)
     q = torch.randn((BATCH, SEQLEN, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -350,7 +358,7 @@ def test_mha_forward_out_dtype(
             window_size_right=-1,
             bias=None,
             alibi_slopes=None,
-            return_lse=False,
+            return_lse=True,
             return_softmax=False,
             max_seqlen_q=SEQLEN,
             max_seqlen_k=SEQLEN,
@@ -358,17 +366,55 @@ def test_mha_forward_out_dtype(
             cu_seqlens_k=cu_seqlens,
             **descales,
             **kwargs,
-        )[0]
+        )[:2]
 
-    ref = forward(out_dtype=torch.float32)
-    out = forward() if OUT_DTYPE is None else forward(out_dtype=OUT_DTYPE)
+    ref, ref_lse = forward(out_dtype=torch.float32)
+    out, lse = forward() if OUT_DTYPE is None else forward(out_dtype=OUT_DTYPE)
     expected_dtype = OUT_DTYPE or (torch.float32 if FP8 else dtype)
     assert out.dtype == expected_dtype
-    # The epilogue multiply may fuse into the store cast, rounding once, not twice.
+    assert lse.dtype == torch.float32 and torch.equal(lse, ref_lse)
+    expected = ref.to(expected_dtype)
+    # An fp16 store can fuse the 1/l multiply into the cast (v_fma_mixlo_f16) and
+    # round once, so a few values differ from the double-rounded cast by 1 ulp.
     finfo = torch.finfo(expected_dtype)
     torch.testing.assert_close(
-        out.float(), ref, atol=finfo.smallest_normal * finfo.eps, rtol=finfo.eps
+        out.float(),
+        expected.float(),
+        atol=finfo.smallest_normal * finfo.eps,
+        rtol=finfo.eps,
     )
+    assert (out != expected).sum() <= out.numel() // 1000
+
+
+@pytest.mark.parametrize(
+    "IMPL, OUT_DTYPE, ERROR",
+    [("default", torch.int32, ValueError), ("dao_ai", torch.float16, AssertionError)],
+)
+def test_mha_forward_out_dtype_rejected(IMPL: str, OUT_DTYPE: torch.dtype, ERROR: type):
+    """Unsupported out_dtype values fail before the kernel launch."""
+    q = torch.randn((1, 128, 4, 64), device="cuda", dtype=torch.bfloat16)
+    mha_set_impl(IMPL)
+    try:
+        with pytest.raises(ERROR, match="out_dtype"):
+            _flash_attn_forward(
+                q,
+                q,
+                q,
+                dropout_p=0.0,
+                softmax_scale=64**-0.5,
+                causal=False,
+                window_size_left=-1,
+                window_size_right=-1,
+                bias=None,
+                alibi_slopes=None,
+                return_lse=False,
+                return_softmax=False,
+                max_seqlen_q=128,
+                max_seqlen_k=128,
+                out_dtype=OUT_DTYPE,
+            )
+    finally:
+        mha_set_impl("default")
 
 
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])

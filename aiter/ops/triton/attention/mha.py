@@ -600,6 +600,10 @@ def _flash_attn_forward(
 
     if out_dtype is None:
         out_dtype = torch.float32 if IS_FP8 else q.dtype
+    if out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"out_dtype must be float32, bfloat16 or float16, got {out_dtype}"
+        )
     o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=out_dtype, device=q.device)
     if is_varlen:
         # Layout is thd.
@@ -697,6 +701,9 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
+        assert (
+            out_dtype == q.dtype
+        ), f"Output and input must have the same dtype, got out_dtype={out_dtype} and q.dtype={q.dtype}."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,
