@@ -21,6 +21,7 @@ import torch
 
 from aiter import QuantType, dtypes, get_hip_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.kernels.pa_decode_plan import _lds_max_batch
 
 
 @pytest.fixture
@@ -37,7 +38,11 @@ def device():
 @pytest.mark.parametrize(
     "mode,rows,max_partitions",
     [
+        ("cluster8", 1, 8),
+        ("cluster8", 4, 8),
         ("cluster8", 16, 8),  # bs=4, Eagle3 verifies four tokens per request
+        ("cluster8", 64, 8),
+        ("direct", 2517, 1),
         ("direct", 4536, 1),  # traced sparse-prefill token count
     ],
 )
@@ -74,12 +79,20 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
     value_cache = (
         value.reshape(pages, 1, 1, 16, 128).permute(0, 1, 2, 4, 3).contiguous()
     )
+    # Production ATOM raises the default 4096 cap to the planner's gfx1250 LDS
+    # limit for sparse prefill. Use the same explicit capacity so rows=4536
+    # exercises the 8192 runtime/AOT bucket instead of shrinking the real shape.
+    max_batch_size = _lds_max_batch(
+        torch.cuda.get_device_properties(device).shared_memory_per_block
+    )
     plan = pa.plan_pa_decode(
         context,
         1,
         max_partitions=max_partitions,
+        max_batch_size=max_batch_size,
         query_length=1,
     )
+    assert plan.max_batch_size == max_batch_size
     scalar_shape = (1, plan.capacity, 16)
     workspace = {
         "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
