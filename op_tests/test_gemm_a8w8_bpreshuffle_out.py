@@ -23,8 +23,7 @@ from aiter.ops import gemm_op_a8w8
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-# gfx1250 is excluded on purpose: gemm_a8w8_bpreshuffle_out rejects it at runtime.
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # get_gfx is get_gfx_runtime: gemm_op_a8w8 dispatches and looks up tuned rows
 # with it, so the gates below and the selected backends always agree.
@@ -229,7 +228,7 @@ def test_input_on_another_device_rejected_before_launch(cpu_arg):
     assert torch.all(out == 3.0)
 
 
-@pytest.mark.parametrize("arch", ["gfx1250", "gfx1201", "gfx9999"])
+@pytest.mark.parametrize("arch", ["gfx1201", "gfx9999"])
 def test_unsupported_arch_rejected_before_launch(monkeypatch, arch):
     # Outside gfx942/gfx950 the shared dispatch reaches backends this op does not
     # support (gfx1250 WMMA, the CK MFMA fallback on RDNA); the arch is patched

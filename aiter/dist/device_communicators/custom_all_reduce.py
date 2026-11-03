@@ -990,6 +990,90 @@ class _SymmMemBufferProxy:
         )
 
 
+class _DevicePointerBytes:
+    """A non-owning torch-compatible view of raw device bytes.
+
+    The allocation remains owned by the custom-allreduce pool.  Keeping this
+    object beside the resulting tensor also keeps the CUDA array-interface
+    producer alive for runtimes that retain it as the tensor's deleter context.
+    """
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "data": (ptr, False),
+            "shape": (nbytes,),
+            "strides": None,
+            "typestr": "|u1",
+            "version": 3,
+        }
+
+
+class RegisteredInputBufferLease:
+    """Exclusive, owner-backed lease of custom all-reduce's input arena.
+
+    Callers receive a stable ``uint8`` tensor, never an internal integer
+    pointer.  Views beginning at byte zero can be used as producer ``out=``
+    buffers; the next custom all-reduce recognizes them as already registered
+    and skips its staging copy.
+
+    One communicator grants at most one lease.  The lease keeps the
+    communicator (and, during teardown, its pool) alive until ``release`` so a
+    raw VMM/hipMalloc-backed tensor cannot dangle.  The tensor is valid only
+    while the lease is held.
+    """
+
+    def __init__(
+        self,
+        owner: "CustomAllreduce",
+        buffer: torch.Tensor,
+        generation: int,
+    ):
+        self._owner: CustomAllreduce | None = owner
+        self._buffer: torch.Tensor | None = buffer
+        self._generation = generation
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        if self._owner is None or self._buffer is None:
+            raise RuntimeError("registered input-buffer lease has been released")
+        if getattr(self._owner, "_closed", False):
+            raise RuntimeError(
+                "custom all-reduce was closed while its buffer was leased"
+            )
+        return self._buffer
+
+    @property
+    def max_size(self) -> int:
+        return self.buffer.numel()
+
+    def view_like(self, like: torch.Tensor) -> torch.Tensor:
+        """Return a contiguous byte-zero view with ``like``'s metadata."""
+        nbytes = like.numel() * like.element_size()
+        if nbytes > self.max_size:
+            raise ValueError(
+                f"registered input buffer has {self.max_size} bytes, "
+                f"but {tuple(like.shape)} {like.dtype} needs {nbytes}"
+            )
+        return self.buffer.narrow(0, 0, nbytes).view(like.dtype).view(like.shape)
+
+    def release(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        self._owner = None
+        self._buffer = None
+        owner._release_registered_input_buffer_lease(self._generation)
+
+    def __enter__(self) -> "RegisteredInputBufferLease":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def __del__(self):
+        self.release()
+
+
 class CustomAllreduce:
     defers_capture_registration = True
 
@@ -1088,6 +1172,12 @@ class CustomAllreduce:
         self._register_for_capturing_init = False
         self._register_for_capturing_requested = False
         self._register_for_capturing_opt_out = False
+        self._closed = False
+        self._registered_input_lease_generation = 0
+        self._registered_input_lease_active = False
+        self._registered_input_tensor = None
+        self._registered_input_array_interface = None
+        self._deferred_pool = None
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
@@ -1594,6 +1684,95 @@ class CustomAllreduce:
             offsets,
         )
 
+    def _input_buffer_tensor(self) -> torch.Tensor:
+        """Return one stable uint8 tensor over the registered input arena."""
+        cached = self._registered_input_tensor
+        if cached is not None:
+            return cached
+        entry = self._pool["input"]
+        nbytes = min(int(self.max_size), int(entry.max_size))
+        try:
+            tensor = entry.tensor
+        except (AttributeError, RuntimeError):
+            interface = _DevicePointerBytes(entry.data_ptr, nbytes)
+            tensor = torch.as_tensor(interface, device=self.device)
+            if tensor.data_ptr() != entry.data_ptr:
+                raise RuntimeError(
+                    "custom all-reduce could not make a zero-copy tensor view "
+                    "of its registered input buffer"
+                )
+            self._registered_input_array_interface = interface
+        tensor = tensor.view(torch.uint8).narrow(0, 0, nbytes)
+        self._registered_input_tensor = tensor
+        return tensor
+
+    def lease_registered_input_buffer(self) -> RegisteredInputBufferLease | None:
+        """Exclusively lease the registered input arena to a direct producer.
+
+        Currently gfx1250-only. ``None`` is a normal capability miss (another
+        architecture, custom AR disabled, already leased, or torn down);
+        callers must allocate their ordinary output and let the collective
+        stage it in that case.
+        """
+        if (
+            self.disabled
+            or not self._is_gfx1250
+            or getattr(self, "_closed", False)
+            or getattr(self, "_registered_input_lease_active", False)
+            or not hasattr(self, "_pool")
+        ):
+            return None
+        try:
+            tensor = self._input_buffer_tensor()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "custom all-reduce registered input buffer cannot be exposed "
+                "as a stable tensor; direct producer output is disabled: %s",
+                e,
+            )
+            return None
+        self._registered_input_lease_generation += 1
+        generation = self._registered_input_lease_generation
+        self._registered_input_lease_active = True
+        return RegisteredInputBufferLease(self, tensor, generation)
+
+    def _release_registered_input_buffer_lease(self, generation: int) -> None:
+        if generation != self._registered_input_lease_generation:
+            return
+        self._registered_input_lease_active = False
+        if self._closed:
+            self._registered_input_tensor = None
+            self._registered_input_array_interface = None
+            pool, self._deferred_pool = self._deferred_pool, None
+            if pool is not None and hasattr(pool, "close"):
+                pool.close()
+
+    def is_registered_input_buffer(self, inp: torch.Tensor) -> bool:
+        """Whether ``inp`` is a byte-zero view of this registered arena."""
+        if (
+            self.disabled
+            or getattr(self, "_closed", False)
+            or not hasattr(self, "_pool")
+        ):
+            return False
+        entry = self._pool["input"]
+        return (
+            inp.device == self.device
+            and inp.is_contiguous()
+            and inp.data_ptr() == entry.data_ptr
+            and inp.numel() * inp.element_size() <= min(self.max_size, entry.max_size)
+        )
+
+    def _registered_input_for_call(
+        self, inp: torch.Tensor, *, capturing: bool
+    ) -> bool:
+        # The named input arena was registered at communicator initialization
+        # on every transport, including VMM/symm_mem where arbitrary graph
+        # tensors cannot be exported. It therefore bypasses capture registration.
+        if self.is_registered_input_buffer(inp):
+            return True
+        return self._capture_registered(inp) if capturing else False
+
     @property
     def enable_register_for_capturing(self) -> bool:
         """Whether a collective captured now binds its input directly (the
@@ -1959,10 +2138,16 @@ class CustomAllreduce:
                 return self.all_reduce_residual(
                     input,
                     residual,
-                    registered_input=self._capture_registered(input),
+                    registered_input=self._registered_input_for_call(
+                        input, capturing=True
+                    ),
                 )
             return torch.zeros_like(input)
-        return self.all_reduce_residual(input, residual, registered_input=False)
+        return self.all_reduce_residual(
+            input,
+            residual,
+            registered_input=self._registered_input_for_call(input, capturing=False),
+        )
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
@@ -1976,7 +2161,9 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=self._capture_registered(input),
+                    registered_input=self._registered_input_for_call(
+                        input, capturing=True
+                    ),
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -1991,7 +2178,9 @@ class CustomAllreduce:
                 input,
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
-                registered_input=False,
+                registered_input=self._registered_input_for_call(
+                    input, capturing=False
+                ),
             )
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
@@ -2428,7 +2617,9 @@ class CustomAllreduce:
                     out=out,
                     w=weight,
                     eps=eps,
-                    registered=self._capture_registered(input),
+                    registered=self._registered_input_for_call(
+                        input, capturing=True
+                    ),
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -2465,7 +2656,7 @@ class CustomAllreduce:
                 out=out,
                 w=weight,
                 eps=eps,
-                registered=False,
+                registered=self._registered_input_for_call(input, capturing=False),
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
@@ -2547,7 +2738,9 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self._capture_registered(input),
+                    registered=self._registered_input_for_call(
+                        input, capturing=True
+                    ),
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -2572,7 +2765,7 @@ class CustomAllreduce:
                 residual_inp,
                 w=weight,
                 eps=eps,
-                registered=False,
+                registered=self._registered_input_for_call(input, capturing=False),
                 use_1stage=use_1stage,
                 post_per_token_quant=True,
                 gemma_norm=gemma_norm,
@@ -3026,6 +3219,9 @@ class CustomAllreduce:
         )
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if not self.disabled and getattr(self, "_ptr", 0):
             try:
                 self._ops_dispose(self._ptr)
@@ -3034,9 +3230,16 @@ class CustomAllreduce:
             self._ptr = 0
         # Free the meta + input (max_size, up to 1 GB) buffers deterministically
         # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
+        # A raw VMM/hipMalloc tensor leased by a model is non-owning, so defer
+        # pool teardown until that lease is released rather than dangling it.
         pool = getattr(self, "_pool", None)
-        if pool is not None and hasattr(pool, "close"):
-            pool.close()
+        if getattr(self, "_registered_input_lease_active", False):
+            self._deferred_pool = pool
+        else:
+            self._registered_input_tensor = None
+            self._registered_input_array_interface = None
+            if pool is not None and hasattr(pool, "close"):
+                pool.close()
 
     def __del__(self):
         self.close()

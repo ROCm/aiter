@@ -141,6 +141,19 @@ def _assert_has_custom_group():
 # ============================================================
 
 
+def tensor_model_parallel_lease_registered_input_buffer():
+    """Lease the TP custom-allreduce input arena for producer ``out=``.
+
+    The lease exposes an owner-backed uint8 tensor, not an internal pointer.
+    ``None`` means the optimization is unavailable or already leased; callers
+    must keep their normal output allocation in that case. This API is meant
+    for model setup. The stable tensor may then be viewed inside eager,
+    compiled, or graph-captured forwards.
+    """
+    _assert_no_custom_group("tensor_model_parallel_lease_registered_input_buffer")
+    return get_tp_group().lease_registered_input_buffer()
+
+
 def tensor_model_parallel_all_reduce(
     input_: torch.Tensor,
     use_new: bool = True,
