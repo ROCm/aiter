@@ -102,17 +102,16 @@ class PaDecodeQueryLoader:
         self.gemm = gemm
 
     def init_loaders(self):
-        q_dtype = self.traits.FP8 if self.traits.QFP8 else self.traits.Q_DTYPE
         _q_copy_op = (
             fx.rocdl.BufferCopy128b()
-            if self.traits.QLOAD_UNIT == 8 and not self.traits.QFP8
+            if self.traits.QLOAD_UNIT == 8
             else fx.rocdl.BufferCopy64b()
         )
-        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, q_dtype)
+        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, self.traits.Q_DTYPE)
         self.q_tiled = fx.logical_divide(self.q_buf, fx.make_layout(1, 1))
-        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, q_dtype)
+        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, self.traits.Q_DTYPE)
         self.q_reg = fx.make_rmem_tensor(
-            fx.make_layout(self.traits.QLOAD_UNIT, 1), q_dtype
+            fx.make_layout(self.traits.QLOAD_UNIT, 1), self.traits.Q_DTYPE
         )
 
     def load_chunk(self, elem_idx):
@@ -121,15 +120,14 @@ class PaDecodeQueryLoader:
 
     def load_row(self, qi, gs_head):
         qh0 = self.ctx.kv_h * self.traits.query_group_size + gs_head
-        qb = 1 if self.traits.QFP8 else 2  # bytes per query element
         row_byte0 = (
             (self.ctx.seq * self.traits.query_length + self.ctx.query_begin + qi)
             * self.ctx.stride_q_row
             + qh0 * self.ctx.stride_q_head
-        ) * qb
+        ) * 2  # 16-bit float = 2B/elem
         base_elem = (
-            row_byte0 + self.ctx.lane16 * (self.traits.QCHUNK * qb)
-        ) // qb  # byte offset -> element index
+            row_byte0 + self.ctx.lane16 * (self.traits.QCHUNK * 2)
+        ) // 2  # byte offset -> element index
         return [
             self.load_chunk(base_elem + u * self.traits.QLOAD_UNIT)
             for u in range_constexpr(self.traits.N_QLOADS)
@@ -210,20 +208,6 @@ class PaDecodeQueryLoader:
                     + u * self.traits.QLOAD_UNIT
                 )
                 self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
-        elif const_expr(self.traits.QFP8):
-            # Already e4m3: copy the bytes, scale 1.
-            self.lds.store_words(
-                q_row_off
-                + self.ctx.qh_local * self.traits.head_dim
-                + self.ctx.lane16 * self.traits.QCHUNK,
-                q_units[0].bitcast(fx.Int32),
-            )
-            if self.ctx.lane16 == 0:
-                self.lds.store_scalar(
-                    self.traits.sQscale_off,
-                    self.ctx.qh_local * self.traits.M_TILES + m,
-                    fx.Float32(1.0),
-                )
         else:
             self.quantize_row(m, q_row_off, q_units)
 

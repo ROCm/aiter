@@ -593,10 +593,9 @@ _PIPE_CASES = [
         },
     ),
 ]
-# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row, an e4m3 or a
-# bf16 query. Plan-free runs one task per row; unequal 32-element blocks make a
+# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row, a bf16 query.
+# Plan-free runs one task per row; unequal 32-element blocks make a
 # block/scale mix-up visible.
-_E4M3 = torch.float8_e4m3fn
 _MXFP4_SWEEP = (1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048)
 _MXFP4_BASE = {
     "kv_dtype": "mxfp4",
@@ -608,35 +607,31 @@ _MXFP4_BASE = {
 _MXFP4_CASES = [
     *[
         (
-            f"mxfp4-g{group}-{'e4m3' if dtype == _E4M3 else 'bf16'}-q",
+            f"mxfp4-g{group}-bf16-q",
             {
                 **_MXFP4_BASE,
                 "group_size": group,
-                "query_dtype": dtype,
+                "query_dtype": torch.bfloat16,
                 "lengths": _MXFP4_SWEEP,
             },
         )
         for group in (16, 8)
-        for dtype in (torch.bfloat16, _E4M3)
     ],
-    *[
-        (
-            f"mxfp4-plan-free-{'e4m3' if dtype == _E4M3 else 'bf16'}-q",
-            {
-                **_MXFP4_BASE,
-                "query_dtype": dtype,
-                "plan_free": True,
-                "lengths": (1, 16, 255, 256, 257, 1000, 2048, 4097, 5000),
-            },
-        )
-        for dtype in (torch.bfloat16, _E4M3)
-    ],
+    (
+        "mxfp4-plan-free-bf16-q",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "plan_free": True,
+            "lengths": (1, 16, 255, 256, 257, 1000, 2048, 4097, 5000),
+        },
+    ),
     *[
         (
             f"mxfp4-kv{kv_heads}-g{group}",
             {
                 **_MXFP4_BASE,
-                "query_dtype": _E4M3,
+                "query_dtype": torch.bfloat16,
                 "kv_heads": kv_heads,
                 "group_size": group,
                 "lengths": (1, 17, 300, 1025),
@@ -649,7 +644,7 @@ _MXFP4_CASES = [
             f"mxfp4-np{partitions}",
             {
                 **_MXFP4_BASE,
-                "query_dtype": _E4M3,
+                "query_dtype": torch.bfloat16,
                 "max_partitions": partitions,
                 "lengths": (16, 255, 1000, 4097, 5000),
             },
@@ -661,7 +656,7 @@ _MXFP4_CASES = [
             f"mxfp4-{pattern}-128k{'-plan-free' if free else ''}",
             {
                 **_MXFP4_BASE,
-                "query_dtype": _E4M3,
+                "query_dtype": torch.bfloat16,
                 "pattern": pattern,
                 "max_partitions": 8,
                 "plan_free": free,
@@ -678,7 +673,7 @@ _MXFP4_CASES = [
         "mxfp4-one-task-per-row",
         {
             **_MXFP4_BASE,
-            "query_dtype": _E4M3,
+            "query_dtype": torch.bfloat16,
             "max_partitions": 1,
             "lengths": (2048, 1, 129, 777, 1000, 17, 2048, 300) * 8,
         },
@@ -718,7 +713,7 @@ _MXFP4_CASES = [
         "mxfp4-short-bound-np2",
         {
             **_MXFP4_BASE,
-            "query_dtype": _E4M3,
+            "query_dtype": torch.bfloat16,
             "max_partitions": 2,
             "max_context": 128,
             "lengths": (1024,),
@@ -730,7 +725,7 @@ _MXFP4_CASES = [
         "mxfp4-one-task-variants",
         {
             **_MXFP4_BASE,
-            "query_dtype": _E4M3,
+            "query_dtype": torch.bfloat16,
             "max_partitions": 1,
             "plan_free": True,
             "variants": True,
@@ -746,7 +741,7 @@ _MXFP4_CASES = [
             f"mxfp4-short-bound-{mode}",
             {
                 **_MXFP4_BASE,
-                "query_dtype": _E4M3,
+                "query_dtype": torch.bfloat16,
                 "max_partitions": 1,
                 "max_context": 128,
                 "pattern": "pool",
@@ -772,7 +767,7 @@ _INVALID_CASES = [
 ]
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
-    ("fp16-query", TypeError, "e4m3 or bf16 query"),
+    ("fp16-query", TypeError, "bf16 query"),
     ("page-64", ValueError, "uint8 .* view"),
     ("17-heads", NotImplementedError, "1..16 query heads"),
     ("sinks", NotImplementedError, "no sinks"),
@@ -802,13 +797,9 @@ _MXFP4_INVALID_CASES = [
 # name -> (arch FlyDSL reports, kv_dtype, query_dtype) of a PaDecodeSchedule.select call.
 _SELECT_INVALID = {
     "mxfp4-on-gfx942": ("gfx942", "mxfp4", "bf16"),
-    "fp8-query-fp8-kv": ("gfx950", "fp8", "fp8"),
-    "fp8-query-bf16-kv": ("gfx950", "bf16", "fp8"),
 }
 _SELECT_INVALID_CASES = [
     ("mxfp4-on-gfx942", ValueError, "MXFP4 PA decode requires gfx950"),
-    ("fp8-query-fp8-kv", ValueError, "An FP8 query needs MXFP4 KV"),
-    ("fp8-query-bf16-kv", ValueError, "BF16 KV requires a BF16 query"),
 ]
 
 
@@ -851,12 +842,11 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
 
 
 def _mxfp4_inputs(device, lengths=(300, 1, 2048, 5)):
-    """e4m3 query, MXFP4 K/V views and the dequantized reference, one query token."""
+    """bf16 query, MXFP4 K/V views and the dequantized reference, one query token."""
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         1, 1, 16, 128, 128, torch.bfloat16, "block_scales", device, lengths
     )
-    query = query.to(torch.float8_e4m3fn)
     (key_pool, logical_key), (value_pool, logical_value) = (
         _mxfp4_pages(key),
         _mxfp4_pages(value),
@@ -1136,18 +1126,13 @@ def test_pa_decode(case, device, monkeypatch):
         )
     )
     torch.manual_seed(0)
-    # An e4m3 query is the bf16 one rounded.
     query, key, value, table, context = _make_inputs(
         query_length,
         kv_heads,
         group_size,
         dim,
         page,
-        (
-            torch.bfloat16
-            if case["query_dtype"] == torch.float8_e4m3fn
-            else case["query_dtype"]
-        ),
+        case["query_dtype"],
         case["pattern"],
         device,
         case["lengths"],
@@ -1252,11 +1237,7 @@ def test_pa_decode(case, device, monkeypatch):
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
-    output = torch.full_like(
-        query,
-        float("nan"),
-        dtype=torch.bfloat16 if query.dtype == torch.float8_e4m3fn else query.dtype,
-    )
+    output = torch.full_like(query, float("nan"))
     if case["strided_output"]:
         # Rows of a wider tensor: the output cannot be written directly (the reducer).
         output = torch.full(
@@ -1296,8 +1277,8 @@ def test_pa_decode(case, device, monkeypatch):
             assert torch.equal(out[0, 0], expected), (out[0, 0, :4], expected[:4])
             return
         reference = _reference(
-            # The kernel quantizes a bf16 query; an e4m3 query is used as stored (a
-            # hand-built pool's query is used as given, its logits are what is extreme).
+            # The kernel quantizes a bf16 query (a hand-built pool's query is used as
+            # given, its logits are what is extreme).
             (
                 _round_query_e4m3(query)
                 if case["kv_dtype"] == "mxfp4"
