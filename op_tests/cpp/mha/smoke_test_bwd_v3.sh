@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #!/bin/sh
-EXE="$(find . -name bwd.exe -type f | head -n 1)"
+BWD="$(find . -name bwd.exe -type f | head -n 1)"
+EXE=run_case
 KNAME=1
 
 export CK_WARMUP=0
 export CK_REPEAT=1
 
 COMMON_ARGS='-v=1'
+
+# bwd.exe exits nonzero when a case fails or has no kernel; such cases are printed and counted
+FAILED=0
+run_case() {
+    "$BWD" "$@" || { FAILED=$((FAILED + 1)); echo "FAILED: $BWD $*"; }
+}
 
 run_batch_mode_tests() {
     for prec in "fp16" "bf16" ; do
@@ -219,3 +226,8 @@ case "$ARCH" in
         exit 1
         ;;
 esac
+
+if [ $FAILED -gt 0 ]; then
+    echo "$FAILED case(s) failed"
+    exit 1
+fi

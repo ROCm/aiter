@@ -20,7 +20,7 @@ bash build_mha.sh bwd
 # this will build full fwd+bwd
 bash build_mha.sh
 ```
-Device library `libmha_fwd.so` and `libmha_bwd.so` will be built under current folder, and corresponding executables `benchmark_mha_fwd` and/or `benchmark_mha_bwd` will also be built. You can type `./benchmark_mha_fwd -?` to list all the supported arguments. You can also refer to the `smoke_test_*` script under this folder for a list of quick test. `sh smoke_test_bwd_v3.sh [gfx942|gfx950]` runs the bwd v3 cases of that arch, taking the arch of the first GPU from `rocminfo` when none is given; on gfx950 it also runs the gfx950-only sections, including the sliding window ones.
+Device library `libmha_fwd.so` and `libmha_bwd.so` will be built under current folder, and corresponding executables `benchmark_mha_fwd` and/or `benchmark_mha_bwd` will also be built. You can type `./benchmark_mha_fwd -?` to list all the supported arguments. You can also refer to the `smoke_test_*` script under this folder for a list of quick test. `sh smoke_test_bwd_v3.sh [gfx942|gfx950]` runs the bwd v3 cases of that arch, taking the arch of the first GPU from `rocminfo` when none is given; on gfx950 it also runs the gfx950-only sections, including the sliding window ones. It prints every case that fails, including a case without a kernel, and exits with 1 if any did.
 
 To benchmark asm kernel, try following commands:
 ```
