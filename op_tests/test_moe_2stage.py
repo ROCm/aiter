@@ -1578,9 +1578,7 @@ def test_output_buffer_contract():
 def test_relu2_gate_only_regression():
     """Relu2 stays on the gate-only no-g1u1 path for multi-expert dispatch."""
     if get_gfx() != "gfx950":
-        aiter.logger.info(
-            "skip Relu2 gate-only regression on %s", get_gfx()
-        )
+        aiter.logger.info("skip Relu2 gate-only regression on %s", get_gfx())
         return
     model_dim, inter_dim, E, topk = 6144, 512, 129, 5
     for token in (1, 16, 32, 64, 128):
@@ -1636,9 +1634,7 @@ def test_relu2_gate_only_regression():
             disable_stage1_bias=True,
             disable_stage2_bias=True,
         )
-    aiter.logger.info(
-        "moe_2stage: Relu2 gate-only multi-expert regression test passed"
-    )
+    aiter.logger.info("moe_2stage: Relu2 gate-only multi-expert regression test passed")
 
 
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
