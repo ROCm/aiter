@@ -13,6 +13,7 @@ import re
 import runpy
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -29,6 +30,7 @@ from unittest import mock
 JIT_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils" / "jit_cache.py"
 )
+_IS_LINUX = sys.platform.startswith("linux")
 
 
 def _load_module(path, name):
@@ -74,6 +76,36 @@ def _transaction_artifacts(directory):
         for name in os.listdir(directory)
         if name.startswith((".blob-publish-", ".blob-backup-", ".blob-reset-"))
     ]
+
+
+class _Zombie:
+    """A child process that is killed and deliberately left unreaped.
+
+    That state is the regression: a zombie still answers ``kill(pid, 0)``, so
+    the plain liveness probe treated it as an active codegen owner.
+    """
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+
+    def kill(self):
+        self.proc.send_signal(signal.SIGKILL)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                with open(f"/proc/{self.proc.pid}/stat", "rb") as stat_file:
+                    data = stat_file.read()
+            except FileNotFoundError:
+                break
+            if data[data.rfind(b")") + 1 :].split()[0] == b"Z":
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"pid {self.proc.pid} never reached zombie state")
+
+    def reap(self):
+        self.proc.wait()
 
 
 def _load_functions(path, names, namespace):
@@ -752,6 +784,28 @@ class TestJitCacheRecovery(unittest.TestCase):
         # marker at the stable path after its rollback copy also fails.
         self.assertFalse(os.path.lexists(self.staging_dir))
         self._assert_complete_retry()
+
+    @unittest.skipUnless(_IS_LINUX, "/proc is Linux only")
+    def test_zombie_codegen_owner_is_recovered(self):
+        zombie = _Zombie()
+        try:
+            zombie.kill()
+            marker = os.path.join(self.staging_dir, jit_cache.CODEGEN_INCOMPLETE_MARKER)
+            _write(marker, f"{zombie.proc.pid}\n{socket.gethostname()}\ntoken\n")
+            self.assertFalse(jit_cache._pid_alive(zombie.proc.pid))
+            self.assertFalse(jit_cache._marker_owner_is_active(marker))
+            # A killed builder must not block the next build of this module
+            # with "blob code generation is already active".
+            staging = jit_cache.stage_blob_sources(
+                self.generator, self.op_dir, sys.executable
+            )
+            self.assertEqual(_read(os.path.join(staging, "first.cpp")), "// first\n")
+            self.assertTrue(
+                os.path.exists(os.path.join(staging, jit_cache.CODEGEN_COMPLETE_MARKER))
+            )
+            self.assertEqual(_transaction_artifacts(self.op_dir), [])
+        finally:
+            zombie.reap()
 
     def test_abrupt_restore_owner_exit_is_recovered_and_reclaimed(self):
         worker = """import importlib.util
