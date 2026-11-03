@@ -172,7 +172,7 @@ def test_mla_verify_hk_graph(bs, ctx, kv_scale_val):
 
 
 def check_selection():
-    for bs in (1, 2, 3, 4, 8, 12, 16, 24, 32, 48, 64, 96):
+    for bs in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 32, 48, 64, 96):
         thresh = mla_verify_hk_threshold(bs)
         assert thresh is not None and thresh > 0
         below = -(-thresh // bs) - 1
