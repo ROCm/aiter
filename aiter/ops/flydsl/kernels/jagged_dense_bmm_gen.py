@@ -42,6 +42,7 @@ class ArchTraits:
     a_swizzle: tuple[int, int, int]
     wave_size: int
     min_block_k: int
+    a_lds_dma: bool
 
     @property
     def k_tile_gran(self) -> int:
@@ -57,6 +58,7 @@ ARCH_TRAITS = {
         a_swizzle=(3, 3, 3),
         wave_size=64,
         min_block_k=64,
+        a_lds_dma=False,
     ),
     "gfx950": ArchTraits(
         mma_mnk=(16, 16, 32),
@@ -66,6 +68,7 @@ ARCH_TRAITS = {
         a_swizzle=(3, 3, 3),
         wave_size=64,
         min_block_k=64,
+        a_lds_dma=True,
     ),
 }
 
@@ -296,10 +299,9 @@ def _build_launcher(
                 b_copy = buffer_copy_128b
                 thr_copy_g2r_B = fx.make_tiled_copy_B(b_copy, tiled_mma).get_slice(tid)
 
-            composed_layout_A = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(*TRAITS.a_swizzle)),
-                fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
-            )
+            a_swizzle = fx.static(fx.SwizzleType.get(*TRAITS.a_swizzle))
+            a_smem = fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2))
+            composed_layout_A = fx.make_composed_layout(a_swizzle, a_smem)
             sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)
 
             thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)
@@ -355,17 +357,84 @@ def _build_launcher(
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
+            if fx.const_expr(TRAITS.a_lds_dma):
+                dma_bits = 128
+                dma_vec = dma_bits // fx.BFloat16.width
+                dma_rounds = BLOCK_M * BLOCK_K // (THREADS * dma_vec)
+                dma_atom = fx.make_copy_atom(
+                    fx.rocdl.cdna4.BufferLoadAsyncLDS(dma_bits), dma_bits
+                )
+                unit = fx.make_layout(1, 1)
+                # LDS DMA writes lane i's chunk at a wave-uniform base + i * dma_bits/8.
+                a_phys = fx.make_ordered_layout(
+                    (dma_vec, THREADS, dma_rounds, STAGES_A), (0, 1, 2, 3)
+                )
+                # The XOR swizzle is its own inverse: slot p holds logical swizzle(p).
+                a_slot_to_global = fx.make_composed_layout(
+                    fx.composition(
+                        fx.make_layout((BLOCK_M, BLOCK_K), (K, 1)),
+                        fx.left_inverse(fx.slice(a_smem, (None, None, 0))),
+                    ),
+                    fx.make_composed_layout(a_swizzle, a_phys),
+                )
+                a_dma_src = fx.add_offset(fx.get_iter(A_buf), start_m * K)
+                a_dma_off = [
+                    fx.get_scalar(fx.crd2idx((0, tid, rnd, 0), a_slot_to_global))
+                    for rnd in fx.range_constexpr(dma_rounds)
+                ]
+                a_dma_wave = fx.Int32(
+                    fx.rocdl.readfirstlane(T.i32, tid // TRAITS.wave_size)
+                )
+
+                def a_load(k_tile, stage):
+                    for rnd in fx.range_constexpr(dma_rounds):
+                        lds_off = fx.crd2idx(
+                            (0, a_dma_wave * TRAITS.wave_size, rnd, stage), a_phys
+                        )
+                        fx.copy(
+                            dma_atom,
+                            fx.make_view(
+                                fx.add_offset(
+                                    a_dma_src, a_dma_off[rnd] + k_tile * BLOCK_K
+                                ),
+                                unit,
+                            ),
+                            fx.make_view(
+                                fx.add_offset(
+                                    fx.get_dyn_shared(fx.BFloat16),
+                                    fx.get_scalar(lds_off),
+                                ),
+                                unit,
+                            ),
+                        )
+                    fx.rocdl.asyncmark()
+
+                def a_commit(stage):
+                    fx.rocdl.wait_asyncmark(0)
+
+            else:
+
+                def a_load(k_tile, stage):
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gA_k[None, None, None, 0],
+                        copy_frag_A,
+                        soffset=fx.Int32(k_tile) * gA_k_stride,
+                    )
+
+                def a_commit(stage):
+                    fx.copy(
+                        uni_copy_128b,
+                        copy_frag_A,
+                        thr_sA[None, None, None, stage],
+                    )
+
             def run_pipeline_stage(
                 a_read_stage, b_read_slot, a_next_k=None, b_next_k=None
             ):
                 a_write_stage = a_read_stage ^ 1
                 if fx.const_expr(a_next_k is not None):
-                    fx.copy(
-                        buffer_copy_128b,
-                        thr_gA_k[None, None, None, 0],
-                        copy_frag_A,
-                        soffset=fx.Int32(a_next_k) * gA_k_stride,
-                    )
+                    a_load(a_next_k, a_write_stage)
                 if fx.const_expr(b_next_k is not None):
                     b_fetch_slot = (b_read_slot + B_STAGES - 1) % B_STAGES
                     fx.copy(
@@ -393,11 +462,7 @@ def _build_launcher(
                     )
 
                 if fx.const_expr(a_next_k is not None):
-                    fx.copy(
-                        uni_copy_128b,
-                        copy_frag_A,
-                        thr_sA[None, None, None, a_write_stage],
-                    )
+                    a_commit(a_write_stage)
                 fx.gpu.barrier()
 
             mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
@@ -415,7 +480,7 @@ def _build_launcher(
             )
 
             n_tiles = K // BLOCK_K
-            fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
+            a_load(0, 0)
             fx.copy(
                 b_copy,
                 thr_gB_k[None, None, None, 0],
@@ -429,7 +494,7 @@ def _build_launcher(
                     soffset=fx.Int32(1) * gB_k_stride,
                 )
             mma_frag_C.store(bias_frag.load().to(fx.Float32))
-            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+            a_commit(0)
             fx.gpu.barrier()
 
             for k_tile in fx.range_constexpr(n_tiles):
@@ -582,6 +647,8 @@ def jagged_dense_bmm(
             f"block_k must be a positive multiple of {traits.k_tile_gran}, "
             f"got {block_k}"
         )
+    if traits.a_lds_dma and block_k & (block_k - 1):
+        raise ValueError(f"A LDS DMA needs a power-of-two block_k, got {block_k}")
     if block_k < traits.min_block_k:
         mma = "x".join(map(str, traits.mma_mnk))
         raise ValueError(
