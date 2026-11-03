@@ -13,6 +13,8 @@ enum class ActivationType : int
     Situv2   = 3,
     GeluTanh = 4,
     Relu2    = 5,
+    // min(silu(gate), limit) * clamp(up, -limit, limit)
+    SwigluStep = 6,
 };
 
 enum class QuantType : int

@@ -18,6 +18,32 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.quant import per_group_quant_hip
+
+_ACTIVATIONS = {
+    ActivationType.Silu: "silu",
+    ActivationType.Swiglu: "swiglu",
+    ActivationType.SwigluStep: "swiglustep",
+}
+
+# Block-scaled FP8: weight scales per (output row, K group) in [E, K // scale_k, N]
+# FP32, activations dynamically quantized per (token, K group) for prefill.
+_BLOCK_QUANT_TYPES = (QuantType.per_1x128, QuantType.per_128x128)
+
+
+def flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n=128, block_k=128):
+    """Expand checkpoint block scales [E, ceil(rows/block_n), ceil(k/block_k)] to the
+    FlyDSL block layout [E, k // scale_k, rows]. Values are copied, never requantized,
+    so the scale_k groups must not straddle checkpoint K blocks."""
+    if block_k % scale_k != 0 or k % scale_k != 0:
+        raise ValueError(
+            f"scale_k={scale_k} must divide both block_k={block_k} and k={k}"
+        )
+    expanded = block_scale.float().repeat_interleave(block_n, dim=1)[:, :rows]
+    expanded = expanded.repeat_interleave(block_k // scale_k, dim=2)[
+        :, :, : k // scale_k
+    ]
+    return expanded.transpose(1, 2).contiguous()
 
 
 @dataclass
@@ -96,7 +122,7 @@ class Config:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
             # The native tuner's empty quant_type is a shape-only probe. The
             # runtime wrapper checks actual FP8 weight and activation support.
-            if problem.quant_type not in ("", "ptpc", "per_tensor"):
+            if problem.quant_type not in ("", "ptpc", "per_tensor", "block"):
                 return "specialized Down paths require FP8 weights"
             if self.down_path == "8x1_compact":
                 if problem.inter_dim not in (192, 256, 384, 512, 640):
@@ -105,9 +131,18 @@ class Config:
                     return "compact Down requires model_dim >= 512"
                 if not 0 < problem.experts <= 2048:
                     return "compact Down requires 1 to 2048 experts"
-            scale_bytes = 0 if problem.quant_type == "per_tensor" else 256 * 4
+            scale_bytes = 256 * 4 if problem.quant_type == "ptpc" else 0
             if 64 * problem.inter_dim + scale_bytes + 4 * 16 * 64 * 2 > 64 * 1024:
                 return "specialized M64 Down exceeds the 64 KiB LDS capacity"
+        if problem.quant_type == "block" and self.use_prefill:
+            if self.down_path != "1x4_64x256":
+                return "block-scaled prefill requires the 1x4_64x256 Down path"
+            # The prefill kernel tiles K in groups of 64 (TILE_K); the scale group
+            # must divide evenly into TILE_K so each MFMA pair uses one group.
+            if 64 % problem.scale_k1 != 0:
+                return "block-scaled Gate/Up scale group must divide the 64-wide K tile"
+            if problem.scale_k2 != (128 if problem.inter_dim % 128 == 0 else 64):
+                return "block-scaled Down needs one scale group per 1x4_64x256 K core"
         if self.use_prefill and problem.quant_type == "no":
             if self.BLOCK_K not in (64, 128):
                 return "BF16 prefill requires Gate/Up BLOCK_K=64 or 128"
@@ -148,6 +183,8 @@ class _Problem:
     inter_dim: int
     topk: int
     quant_type: str
+    scale_k1: int = 0
+    scale_k2: int = 0
 
     @classmethod
     def from_inputs(
@@ -157,10 +194,34 @@ class _Problem:
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
         quant_type: QuantType,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ):
         experts, gateup_dim, hidden_dim = w1.shape
         model_dim, inter_dim = w2.shape[1], w2.shape[2]
         assert gateup_dim == 2 * inter_dim
+        scale_k1 = scale_k2 = 0
+        if quant_type in _BLOCK_QUANT_TYPES:
+            if (
+                w1_scale is None
+                or w2_scale is None
+                or w1_scale.dtype != torch.float32
+                or w2_scale.dtype != torch.float32
+                or w1_scale.dim() != 3
+                or w2_scale.dim() != 3
+                or tuple(w1_scale.shape[::2]) != (experts, gateup_dim)
+                or tuple(w2_scale.shape[::2]) != (experts, model_dim)
+                or hidden_dim % w1_scale.shape[1] != 0
+                or inter_dim % w2_scale.shape[1] != 0
+            ):
+                raise ValueError(
+                    "block-scaled FP8 needs FP32 scales w1 [E, K1 // g1, 2 * inter_dim] "
+                    "and w2 [E, inter_dim // g2, model_dim] (see flydsl_block_weight_scale)"
+                )
+            scale_k1 = hidden_dim // w1_scale.shape[1]
+            scale_k2 = inter_dim // w2_scale.shape[1]
+            if scale_k1 not in (64, 128) or scale_k2 not in (64, 128):
+                raise ValueError(f"unsupported scale groups {scale_k1=} {scale_k2=}")
         return cls(
             batch=int(hidden_states.shape[0]),
             experts=experts,
@@ -173,7 +234,11 @@ class _Problem:
                 QuantType.No: "no",
                 QuantType.per_Token: "ptpc",
                 QuantType.per_Tensor: "per_tensor",
+                QuantType.per_1x128: "block",
+                QuantType.per_128x128: "block",
             }[quant_type],
+            scale_k1=scale_k1,
+            scale_k2=scale_k2,
         )
 
 
@@ -214,6 +279,7 @@ def _get_compiled_kernel(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    scale_k=None,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -236,7 +302,14 @@ def _get_compiled_kernel(
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
+        scale_k=scale_k,
     )
+
+
+def _scale_k(problem: _Problem, stage: str):
+    if problem.quant_type != "block":
+        return None
+    return problem.scale_k1 if stage == "gateup" else problem.scale_k2
 
 
 def _launch(kernel_fn, *args):
@@ -321,11 +394,17 @@ def _run_prefill(
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
-    quant_func = (
-        aiter.get_hip_quant(aiter.QuantType.per_Token)
-        if quant_type == QuantType.per_Token
-        else _quant_per_tensor
-    )
+    if problem.quant_type == "block":
+        quant_func = per_group_quant_hip
+    elif quant_type == QuantType.per_Token:
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    else:
+        quant_func = _quant_per_tensor
+
+    def group_kwargs(stage):
+        if problem.quant_type != "block":
+            return {}
+        return {"group_size": _scale_k(problem, stage)}
 
     if weight_dtype_str == "fp8":
         gateup_in, a_scale = quant_func(
@@ -333,6 +412,7 @@ def _run_prefill(
             scale=None,
             quant_dtype=w1.dtype,
             num_rows=None,
+            **group_kwargs("gateup"),
         )
         a_scale = a_scale.to(torch.float32).contiguous()
     else:
@@ -353,6 +433,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_N=config.BLOCK_N,
         BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
+        scale_k=_scale_k(problem, "gateup"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -381,6 +462,7 @@ def _run_prefill(
             scale=None,
             quant_dtype=w2.dtype,
             num_rows=None,
+            **group_kwargs("down"),
         )
     else:
         down_in = gemm1_out
@@ -404,6 +486,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=128,
         stage="down",
+        scale_k=_scale_k(problem, "down"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -487,6 +570,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=32,
         stage="gateup",
+        scale_k=_scale_k(problem, "gateup"),
         alg="batch1",
         E=None,
         activation_str=activation_str,
@@ -513,6 +597,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=64,
         stage="down",
+        scale_k=_scale_k(problem, "down"),
         alg="batch1",
         E=None,
     )
@@ -572,6 +657,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="gateup",
+        scale_k=_scale_k(problem, "gateup"),
         alg="splitk",
         E=problem.experts,
         activation_str=activation_str,
@@ -600,6 +686,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="down",
+        scale_k=_scale_k(problem, "down"),
         alg="splitk",
         E=problem.experts,
     )
@@ -661,12 +748,13 @@ def run_flydsl_moe_gfx942(
     is_fp8 = (
         w1.dtype == torch.float8_e4m3fnuz
         and w2.dtype == torch.float8_e4m3fnuz
-        and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
+        and quant_type
+        in (QuantType.per_Token, QuantType.per_Tensor, *_BLOCK_QUANT_TYPES)
     )
     if (
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
-        or activation not in (ActivationType.Silu, ActivationType.Swiglu)
+        or activation not in _ACTIVATIONS
         or not (is_bf16 or is_fp8)
     ):
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
@@ -675,8 +763,17 @@ def run_flydsl_moe_gfx942(
     if is_bf16 and (w1_scale is not None or w2_scale is not None):
         raise NotImplementedError("BF16 weights do not support weight scales")
 
-    activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    if activation == ActivationType.SwigluStep and (
+        not isinstance(swiglu_limit, (int, float)) or swiglu_limit <= 0
+    ):
+        raise ValueError(
+            f"SwigluStep requires a positive swiglu_limit, got {swiglu_limit!r}"
+        )
+
+    activation_str = _ACTIVATIONS[activation]
+    problem = _Problem.from_inputs(
+        hidden_states, w1, w2, topk_ids, quant_type, w1_scale, w2_scale
+    )
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(

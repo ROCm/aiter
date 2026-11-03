@@ -3963,7 +3963,11 @@ def get_2stage_cfgs(
             unsupported = "hidden/intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:
             unsupported = f"gate mode {gate_mode.value!r}"
-        elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        elif activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.SwigluStep,
+        ):
             unsupported = f"activation {activation}"
         if unsupported is not None:
             cfg = None
@@ -5557,6 +5561,14 @@ def torch_moe_stage1(
             out = swiglu(gate, up, limit=swiglu_limit)
         elif use_situv2:
             out = situv2(gate, up, beta=situ_beta, linear_beta=situ_linear_beta)
+        elif activation == aiter.ActivationType.SwigluStep:
+            if not swiglu_limit or swiglu_limit <= 0:
+                raise ValueError(
+                    f"SwigluStep requires a positive swiglu_limit, got {swiglu_limit!r}"
+                )
+            out = torch.nn.functional.silu(gate).clamp(max=swiglu_limit) * up.clamp(
+                min=-swiglu_limit, max=swiglu_limit
+            )
         else:
             if swiglu_limit:
                 gate = gate.clamp(min=None, max=swiglu_limit)
