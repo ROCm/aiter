@@ -297,6 +297,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def lease_registered_input_buffer(self):
+        """Lease custom AR's registered input arena for producer ``out=``.
+
+        Returns ``None`` when custom all-reduce is unavailable or another
+        direct producer already owns the arena. Callers must preserve their
+        ordinary allocation path on that capability miss.
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.lease_registered_input_buffer()
+
     def fused_allreduce_rmsnorm(
         self,
         input_,
