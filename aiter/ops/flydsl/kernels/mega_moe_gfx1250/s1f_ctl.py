@@ -50,11 +50,13 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #:   of 398 VGPRs a SIMD.
 #: * 256 rows: ~800 VGPRs leave one wave per SIMD, so the CTA has the CU to
 #:   itself; 3 buffers (221,184 B) beat 4 at tpr 1536.
+#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
+#:   tiles are 32 rows (``s1f_flag_m``).
 #:
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
-_S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
+_S1F_VARIANTS = {64: (3, 2), 96: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
@@ -263,7 +265,7 @@ class _Stage1Fusion:
 
     def tile_reasons(self, align_m: int) -> list:
         """Why a step aligned to ``align_m`` cannot run the stage-1 kernel."""
-        from .s1f_stage1 import FLAG_M
+        from .s1f_stage1 import s1f_flag_m
 
         reasons = []
         if int(align_m) not in _S1F_VARIANTS:
@@ -273,7 +275,9 @@ class _Stage1Fusion:
                 f"stage-1 tile {align_m} does not fit model_dim "
                 f"{self.d.config.hidden_dim} on {self.cu} CUs"
             )
-        elif int(align_m) > FLAG_M and self.d.config.world_size > 4:
+        elif (
+            int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4
+        ):
             reasons.append(
                 f"step tile_m {align_m} with {self.d.config.world_size} ranks > 4"
             )
