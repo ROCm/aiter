@@ -60,6 +60,7 @@ install_triton_from_wheelhouse() {
     return 0
 }
 
+# Triton 3.9.0 (git65ee8992) is validated from the temporary release_tmp channel.
 TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
 TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}' || true)
