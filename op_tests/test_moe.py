@@ -7,7 +7,7 @@ import torch
 
 from aiter import ActivationType, dtypes, get_gfx, pertoken_quant
 from aiter.fused_moe import fused_topk, torch_moe
-from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.fused_moe_bf16 import asm_moe
 from aiter.int4_utils import *
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest

@@ -140,7 +140,27 @@ else:
     from .ops.quick_all_reduce import *
     from .ops.moe_op import *
     from .ops.moe_sorting import *
-    from .ops.moe_sorting_opus import *
+
+    # Backend-suffixed public names are deprecated aliases of their backend
+    # module entries; the neutral entry is the `moe_sorting` dispatcher in
+    # aiter.fused_moe (#7150).
+    from .ops.moe_sorting_opus import mxfp4_moe_sort_quant_fwd  # noqa: F401
+    from .ops.moe_sorting_opus import (
+        moe_sorting_opus_fwd as _moe_sorting_opus_fwd,
+        moe_sorting_opus_get_workspace_size as _moe_sorting_opus_get_workspace_size,
+    )
+    from ._deprecation import deprecated_alias
+
+    moe_sorting_opus_fwd = deprecated_alias(
+        _moe_sorting_opus_fwd,
+        "moe_sorting_opus_fwd",
+        "aiter.fused_moe.moe_sorting",
+    )
+    moe_sorting_opus_get_workspace_size = deprecated_alias(
+        _moe_sorting_opus_get_workspace_size,
+        "moe_sorting_opus_get_workspace_size",
+        "aiter.fused_moe.moe_sorting",
+    )
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *

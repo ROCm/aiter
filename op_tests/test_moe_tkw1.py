@@ -7,7 +7,7 @@ import torch
 
 from aiter import ActivationType, dtypes, pertoken_quant
 from aiter.fused_moe import fused_topk
-from aiter.fused_moe_bf16_asm import (
+from aiter.fused_moe_bf16 import (
     asm_moe_tkw1,
     torch_moe_tkw1,
 )

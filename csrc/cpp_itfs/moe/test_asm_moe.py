@@ -5,7 +5,7 @@ import torch
 from aiter.fused_moe_gelu import fused_experts
 
 from aiter import ActivationType
-from aiter.fused_moe_bf16_asm import torch_moe
+from aiter.fused_moe_bf16 import torch_moe
 from aiter.test_common import perftest
 from csrc.cpp_itfs.moe.asm_moe import asm_moe
 

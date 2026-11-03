@@ -12,6 +12,7 @@ import aiter.fused_moe as fm
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.moe_sorting_opus import moe_sorting_opus_get_workspace_size
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -23,8 +24,8 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 def test_moe_sorting_opus_host_dispatch_boundaries():
     if get_gfx() != "gfx950":
         device_id = torch.cuda.current_device()
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 512, 8, 0, device_id) > 0
+        assert moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
+        assert moe_sorting_opus_get_workspace_size(1, 512, 8, 0, device_id) > 0
         return
 
     device_id = torch.cuda.current_device()
@@ -37,13 +38,13 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
         385: tokens,
     }
     for E, token in itertools.product(multi_tokens, tokens):
-        auto_workspace = aiter.moe_sorting_opus_get_workspace_size(
+        auto_workspace = moe_sorting_opus_get_workspace_size(
             token, E, 8, 0, device_id
         )
-        oneshot_workspace = aiter.moe_sorting_opus_get_workspace_size(
+        oneshot_workspace = moe_sorting_opus_get_workspace_size(
             token, E, 8, 1, device_id
         )
-        multi_workspace = aiter.moe_sorting_opus_get_workspace_size(
+        multi_workspace = moe_sorting_opus_get_workspace_size(
             token, E, 8, 2, device_id
         )
         expect_auto_multi = token in multi_tokens[E]
@@ -62,7 +63,7 @@ def test_moe_sorting_opus_workspace_uses_explicit_device():
         else original
     )
     try:
-        workspace = aiter.moe_sorting_opus_get_workspace_size(8, 256, 8, 0, target)
+        workspace = moe_sorting_opus_get_workspace_size(8, 256, 8, 0, target)
         assert torch.cuda.current_device() == original
         if _device_arch(target) == "gfx950":
             assert workspace > 0
@@ -81,9 +82,9 @@ def test_moe_sorting_opus_workspace_switches_arch_policy():
     original = torch.cuda.current_device()
     try:
         torch.cuda.set_device(other)
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, gfx950) > 0
+        assert moe_sorting_opus_get_workspace_size(1, 385, 8, 0, gfx950) > 0
         torch.cuda.set_device(gfx950)
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, other) == 0
+        assert moe_sorting_opus_get_workspace_size(1, 385, 8, 0, other) == 0
     finally:
         torch.cuda.set_device(original)
 
