@@ -14,7 +14,11 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16_streamk import (
     gemm_a16w16_streamk,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
+)
 
 
 def is_supported():
@@ -27,14 +31,33 @@ pytestmark = pytest.mark.skipif(
 
 
 def generate_inputs(M, N, K, dtype, layout="TN"):
-    """layout[1] == 'T' gives an N-major weight, which takes the native-B path."""
-    torch.manual_seed(0)
-    x = torch.randn((M, K), dtype=dtype, device="cuda")
-    if layout[1] == "T":
-        w = torch.randn((K, N), dtype=dtype, device="cuda").T
-    else:
-        w = torch.randn((N, K), dtype=dtype, device="cuda")
+    """x and w only, from the shared gemm_a16w16 generator.
+
+    layout[1] == 'T' gives an N-major weight, which takes the native-B path. This kernel makes
+    its own output, so the generator runs with output=False.
+    """
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        M, N, K, dtype, layout=layout, output=False
+    )
     return x, w
+
+
+#: The CU count that the shipped DEFAULT.json buckets were tuned for. gfx1250 also has a 96cu
+#: config tree, which selects other tiles and gives another worker count.
+_TUNED_CU_NUM = 256
+
+
+def skip_unless_tuned_cu_count():
+    """The coverage guards pin fixed shapes to the buckets of the tuned CU count.
+
+    The shapes stay correct on any CU count, and the correctness tests still run them there.
+    Only the guards, which assert which path a shape takes, depend on the config tree.
+    """
+    if get_num_sms() != _TUNED_CU_NUM:
+        pytest.skip(
+            f"coverage shapes are picked for the {_TUNED_CU_NUM}-CU config tree, "
+            f"this device reports {get_num_sms()}"
+        )
 
 
 def assert_matches_torch(out, x, w):
@@ -65,8 +88,28 @@ def get_x_vals():
     x_vals += [(3000, 2048, 2048)]  # M not a multiple of the cluster tile
     x_vals += [(3000, 2880, 2048)]  # M and N both ragged
     x_vals += get_small_k_x_vals()
+    x_vals += get_k_tail_x_vals()
     x_vals += get_remainder_x_vals()
     return x_vals
+
+
+def get_k_tail_x_vals():
+    """A K that does not divide BLOCK_K, on the fused single-CTA path.
+
+    One CTA has no multicast, so it issues a fused load and moves the descriptor itself. That
+    update must keep the descriptor bounds, or the last K tile reads past K instead of
+    zero-filling. Every one of these shapes was wrong before `clamp_bounds=True`.
+
+    The suite could not see it: the only single-CTA shapes had a K that divides BLOCK_K, or one
+    K tile, where the descriptor is still at its own bounds.
+    """
+    return [
+        (64, 64, 288),  # one tail step after a whole step
+        (64, 64, 320),
+        (64, 64, 1056),  # several whole steps, then a tail
+        (64, 4096, 4128),  # a wide N with a tail
+        (32, 64, 288),  # M below the tile
+    ]
 
 
 def get_small_k_x_vals():
@@ -169,6 +212,25 @@ def test_gemm_a16w16_streamk_rejects_bad_inputs():
         gemm_a16w16_streamk(x, w.half())
 
 
+@pytest.mark.parametrize("M, N, K", get_k_tail_x_vals())
+def test_gemm_a16w16_streamk_k_tail_uses_the_fused_path(M: int, N: int, K: int):
+    """Each K-tail shape must really take the fused single-CTA path, and really have a tail.
+
+    The fused path runs only at a cluster of one CTA. If a config change gives these shapes a
+    larger cluster, they stop covering the descriptor-bounds bug and nothing else fails.
+    """
+    skip_unless_tuned_cu_count()
+    config, _ = plan_for(M, N, K)
+
+    assert (
+        config["CTAS_M"] * config["CTAS_N"] == 1
+    ), "not the single-CTA path, so the fused load is not covered"
+    assert K % config["BLOCK_K"], f"K={K} divides BLOCK_K, so there is no tail to clamp"
+    assert (
+        K > config["BLOCK_K"]
+    ), f"K={K} is one tile, where the bounds are still its own"
+
+
 @pytest.mark.parametrize("M, N, K", get_small_k_x_vals())
 def test_gemm_a16w16_streamk_small_k_empties_the_steady_loop(M: int, N: int, K: int):
     """Each small-K shape must really leave the steady loop empty.
@@ -177,6 +239,7 @@ def test_gemm_a16w16_streamk_small_k_empties_the_steady_loop(M: int, N: int, K: 
     trip count is above 0. Their result is correct on any path, so without this assert a config
     change can take them off that path and the coverage goes away unnoticed.
     """
+    skip_unless_tuned_cu_count()
     config, _ = plan_for(M, N, K)
     _, _, steady_nonempty = _plan_k_pipeline(
         K, config["BLOCK_K"], config["NUM_BUFFERS"]
@@ -195,6 +258,7 @@ def test_gemm_a16w16_streamk_remainder_runs(M: int, N: int, K: int):
     computes every whole tile. A config change can therefore take the remainder out of the test
     coverage and no other test fails. This test holds the coverage.
     """
+    skip_unless_tuned_cu_count()
     config, (num_tiles, num_sms, streamk_tiles, split_m, split_n) = plan_for(M, N, K)
 
     assert (

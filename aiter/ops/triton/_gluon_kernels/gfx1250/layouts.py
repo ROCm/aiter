@@ -48,6 +48,26 @@ def plan_warps(BM, BN, num_warps):
 
 
 @constexpr_function
+def cga_bases(ctas_m, ctas_n):
+    """Pure-python ``make_cga_layout([m, n], [m, n], [0, 1])``.
+
+    Deliberately not a call into libtriton's ``make_cga_layout``: gluon's dependency walker
+    inspects the globals of every function a kernel body references and rejects nanobind
+    builtins outright ("Unsupported function referenced"), so even a constexpr_function wrapper
+    around it cannot be used from inside a kernel. Equivalence is asserted in the op test.
+    """
+    bases = []
+    for dim, ctas in ((0, ctas_m), (1, ctas_n)):
+        bit = 1
+        while bit < ctas:
+            basis = [0, 0]
+            basis[dim] = bit
+            bases.append(basis)
+            bit *= 2
+    return bases
+
+
+@constexpr_function
 def warp_bases_from_grid(wpc):
     """Warp basis vectors for a [wpcM, wpcN] grid, N bases first then M bases."""
     bases = []
@@ -66,16 +86,7 @@ def warp_bases_from_grid(wpc):
 def wmma_layout(shape_per_cta, ctas_per_cga, num_warps):
     """Accumulator layout for a per-CTA tile. The accumulator splits across the whole cluster."""
     wpc = plan_warps(shape_per_cta[0], shape_per_cta[1], num_warps)
-    # Block bases of make_cga_layout([m, n], [m, n], [0, 1]), built in python so no nanobind
-    # builtin is referenced from a kernel body.
-    cga = []
-    for dim, ctas in ((0, ctas_per_cga[0]), (1, ctas_per_cga[1])):
-        bit = 1
-        while bit < ctas:
-            basis = [0, 0]
-            basis[dim] = bit
-            cga.append(basis)
-            bit *= 2
+    cga = cga_bases(ctas_per_cga[0], ctas_per_cga[1])
     return gl.amd.AMDWMMALayout(
         WMMA_VERSION,
         True,
