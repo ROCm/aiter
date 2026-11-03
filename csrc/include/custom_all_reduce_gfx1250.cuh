@@ -206,7 +206,7 @@ constexpr size_t arRmsShardOffset(int ngpus)
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__) &&                   \
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
     __has_builtin(__builtin_amdgcn_global_store_b128) &&                         \
     __has_builtin(__builtin_amdgcn_global_load_b128)
 #define AITER_GFX1250_HAVE_B128 1
@@ -712,6 +712,101 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
     }
     if constexpr(!TWO_STAGE)
         end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// LL all-gather: ar_ll_gfx1250's publish, then every peer's lines polled from
+// this rank's scratch together and written to their place in the output. Rank
+// r's packet pk of row y = pk / row_pk lands at output packet
+// (y * ngpus + r) * row_pk + pk % row_pk: row_pk = nPk gathers along dim 0,
+// the last dim's packets along the last dim. Shares ar_ll_gfx1250's epoch and
+// banks, so the two interleave freely. ALIGNED: input and output 8-byte
+// aligned; otherwise their packets move byte by byte (same protocol).
+template <typename T, int ngpus, bool ALIGNED>
+__global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    T* __restrict__ result,
+    const T* __restrict__ sendbuff,
+    uint32_t nPk,    // 8-byte packets a rank sends
+    uint32_t row_pk, // 8-byte packets of a gathered row
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u;
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const uint32_t gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const auto out_at     = [&](int r, uint32_t pk) {
+        const uint32_t y = pk / row_pk;
+        return ((size_t)y * ngpus + r) * row_pk + (pk - y * row_pk);
+    };
+    const auto load = [&](uint32_t pk) {
+        uint2 d;
+        if constexpr(ALIGNED)
+            d = reinterpret_cast<const uint2*>(sendbuff)[pk];
+        else
+            __builtin_memcpy(&d, reinterpret_cast<const uint8_t*>(sendbuff) + (size_t)pk * 8, 8);
+        return d;
+    };
+    const auto store = [&](size_t at, uint2 d) {
+        if constexpr(ALIGNED)
+            reinterpret_cast<uint2*>(result)[at] = d;
+        else
+            __builtin_memcpy(reinterpret_cast<uint8_t*>(result) + at * 8, &d, 8);
+    };
+
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint2 d = load(pk);
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d.x, flag, d.y, flag);
+        }
+        store(out_at(rank, pk), d);
+    }
+
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+        while(pending)
+        {
+            uint32_t line[ngpus][4];
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if(pending & (1u << r))
+                    ll_load_b128(
+                        reinterpret_cast<const uint32_t*>(&myBase[(size_t)r * slot + pk]),
+                        line[r][0], line[r][1], line[r][2], line[r][3]);
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if((pending & (1u << r)) && line[r][1] == flag && line[r][3] == flag)
+                {
+                    store(out_at(r, pk), make_uint2(line[r][0], line[r][2]));
+                    pending &= ~(1u << r);
+                }
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1440,51 @@ public:
 #undef LAUNCH_LL
     }
 
+    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250: whole 8-byte
+    // packets, a row's too along the last dim. The shape alone decides, so
+    // every rank of the collective takes the same protocol.
+    bool use_ll_ag(size_t bytes, size_t row_bytes) const
+    {
+        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0;
+    }
+
+    // Whether ag_ll_gfx1250 may read this rank's input in place: clear of the
+    // output it writes while still publishing the input, or a dim-0 gather into
+    // the output's own slice (that slice is rewritten with the same bytes).
+    bool ll_ag_reads_in_place(const void* input, const void* output, size_t bytes, size_t row_bytes) const
+    {
+        const auto in  = reinterpret_cast<uintptr_t>(input);
+        const auto out = reinterpret_cast<uintptr_t>(output);
+        return out >= in + bytes || in >= out + bytes * world_size_ ||
+               (row_bytes == bytes && in == out + bytes * rank_);
+    }
+
+    // LL all-gather (see ag_ll_gfx1250); row_bytes == bytes gathers along dim 0.
+    template <typename T>
+    void allgather_ll(hipStream_t stream, const T* input, T* output, size_t bytes, size_t row_bytes)
+    {
+        ensure_ll_tables_();
+        const uint32_t nPk = bytes >> 3;
+        const int threads  = (bytes < 65536) ? 512 : 256;
+        int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads)));
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
+        // a rank-local choice of kernel, not of protocol: both move the same packets
+        const bool aligned = (reinterpret_cast<uintptr_t>(input) & 7) == 0 &&
+                             (reinterpret_cast<uintptr_t>(output) & 7) == 0;
+#define LAUNCH_AG_LL(NG)                                                              \
+        if(aligned)                                                                   \
+            ag_ll_gfx1250<T, NG, true><<<blocks, threads, 0, stream>>>(               \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_);                                                   \
+        else                                                                          \
+            ag_ll_gfx1250<T, NG, false><<<blocks, threads, 0, stream>>>(              \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL);
+#undef LAUNCH_AG_LL
+    }
+
     // gfx1250: return raw device pointers (no hipIpc handles).
     std::vector<int64_t> get_graph_buffer_ptrs()
     {
@@ -1357,6 +1497,28 @@ public:
         for(size_t i = 0; i < num_output_buffers; i++)
             ptrs[num_input_buffers + i] = (int64_t)graph_unreg_output_buffers_[i];
         return ptrs;
+    }
+
+    // IPC transport: the same buffers as hipIpc handles plus offsets. A handle
+    // covers the whole allocation that contains the pointer, so the offset
+    // into that allocation travels alongside.
+    std::pair<std::vector<uint8_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta()
+    {
+        auto ptrs      = get_graph_buffer_ptrs();
+        auto handle_sz = sizeof(hipIpcMemHandle_t);
+        std::vector<uint8_t> handles(handle_sz * ptrs.size(), 0);
+        std::vector<int64_t> offsets(ptrs.size());
+        for(size_t i = 0; i < ptrs.size(); i++)
+        {
+            void* base_ptr;
+            if(hipPointerGetAttribute(&base_ptr,
+                                      HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      (hipDeviceptr_t)ptrs[i]) != hipSuccess)
+                throw std::runtime_error("failed to get the allocation of a graph buffer");
+            HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+            offsets[i] = ptrs[i] - (int64_t)base_ptr;
+        }
+        return {handles, offsets};
     }
 
     void check_rank_data_capacity(size_t num = 1)
@@ -1456,25 +1618,6 @@ public:
                                  " is not registered!");
     }
 
-    RankData* get_output_buffer_RD(hipStream_t stream, void* output)
-    {
-        auto it = output_buffers_.find(output);
-        if(it != output_buffers_.end())
-            return it->second;
-        hipStreamCaptureStatus status;
-        HIP_CALL(hipStreamIsCapturing(stream, &status));
-        if(status == hipStreamCaptureStatusActive)
-        {
-            auto ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                        graph_unreg_output_buffers_.size();
-            graph_unreg_output_buffers_.push_back(output);
-            return ptrs;
-        }
-        throw std::runtime_error("output buffer address " +
-                                 std::to_string(reinterpret_cast<uint64_t>(output)) +
-                                 " is not registered!");
-    }
-
     // gfx1250: receive direct device pointers per rank per buffer.
     // ptrs_per_rank[rank_j] points to a flat array of int64_t device pointers,
     // one per buffer (inputs first, then outputs), in the same order as
@@ -1508,6 +1651,30 @@ public:
         d_rank_data_base_ += total_buffers;
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
+    }
+
+    // IPC transport overload: handles_per_rank[j] and offsets_per_rank[j] are
+    // rank j's get_graph_buffer_ipc_meta output. Each peer handle is opened
+    // once (open_ipc_handle caches it) and resolved to a pointer here.
+    void register_graph_buffers(const void* const* handles_per_rank,
+                                const int64_t* const* offsets_per_rank)
+    {
+        auto total_buffers =
+            graph_unreg_input_buffers_.size() + graph_unreg_output_buffers_.size();
+        check_rank_data_capacity(total_buffers);
+        std::vector<std::vector<int64_t>> ptrs(world_size_,
+                                               std::vector<int64_t>(total_buffers));
+        std::vector<const int64_t*> ptrs_per_rank(world_size_);
+        for(int j = 0; j < world_size_; j++)
+        {
+            for(size_t i = 0; j != rank_ && i < total_buffers; i++)
+            {
+                auto* handle = (const hipIpcMemHandle_t*)handles_per_rank[j] + i;
+                ptrs[j][i]   = (int64_t)(open_ipc_handle(handle) + offsets_per_rank[j][i]);
+            }
+            ptrs_per_rank[j] = ptrs[j].data();
+        }
+        register_graph_buffers(ptrs_per_rank.data());
     }
 
     template <typename T>
@@ -1628,16 +1795,15 @@ public:
                    T* input,
                    T* output,
                    int size,
-                   bool use_new                 = true,
-                   bool is_broadcast_reg_outptr = false)
+                   bool use_new = true)
     {
         auto d = 16 / sizeof(T);
         if(size % d != 0)
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-        // LL small-message fast lane: bytes <= kLLArMaxBytes (128 KiB) route to
-        // the flag-in-data kernel, which reads input locally and pushes to the
+        // LL small-message fast lane: bytes <= kLLArMaxBytes route to the
+        // flag-in-data kernel, which reads input locally and pushes to the
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
@@ -1647,10 +1813,9 @@ public:
             return;
         }
 
+        // The kernel reads the peers' inputs and writes only this rank's output,
+        // so a captured all-reduce registers its input alone.
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        RankData* output_ptrs = nullptr;
-        if(is_broadcast_reg_outptr)
-            output_ptrs = get_output_buffer_RD(stream, output);
 
         size /= d;
 
@@ -1659,7 +1824,7 @@ public:
                               (size + threads * 4 - 1) / (threads * 4));
 #define LAUNCH_AR(NG) \
         ar_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
+            input_ptrs, nullptr, sg_, self_sg_, output, rank_, size)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
 #undef LAUNCH_AR
     }
