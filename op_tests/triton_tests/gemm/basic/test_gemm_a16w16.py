@@ -347,3 +347,38 @@ def test_gemm_a16w16_gfx1250_store_env_override(monkeypatch):
     monkeypatch.delenv("AITER_GFX1250_A16W16_STORE")
     with pytest.raises(ValueError):
         gemm_a16w16(x, w, config=dict(_STORE_CONFIG, REGISTER_STORE=5), backend="gluon")
+
+
+# The gpt-oss entries are tuned on a 96-CU DPX partition and live in configs/gfx1250/96cu/: a 96-CU device must pick
+# them (not the 96cu DEFAULT's bandwidth_bound rows), and every bucket they select must compute the right result.
+_GPTOSS_SHAPES = [
+    (5120, 2880),  # TP1 QKV
+    (2880, 4096),  # TP1 O
+    (128, 2880),  # router
+    (2560, 2880),  # TP2 QKV
+    (2880, 2048),  # TP2 O
+]
+
+
+@pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
+def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K):
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    for M in (4096, 8192, 16384, 32768):
+        config, tuned = get_gemm_config(
+            "GEMM-A16W16", M, N, K, backend="gluon", cu_num=96
+        )
+        assert tuned and config["kernel_type"] == "compute_bound", (M, N, K, config)
+
+
+@pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
+@pytest.mark.parametrize("M", [1, 64, 1000, 2049, 3073, 8192])
+def test_gemm_a16w16_gfx1250_gptoss_tuned(M, N, K):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn((N, K), dtype=torch.bfloat16, device="cuda") / K**0.5
+    torch.testing.assert_close(
+        gemm_a16w16(x, w, backend="gluon"), F.linear(x, w), atol=1e-1, rtol=1e-2
+    )
