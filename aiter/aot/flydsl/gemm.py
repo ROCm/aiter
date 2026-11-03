@@ -445,7 +445,9 @@ def parse_csv(csv_path: str):
             if params is not None:
                 params = dict(params)
                 params["kind"] = (
-                    "a16w16_gfx1250" if params["target_gfx"] == "gfx1250" else "hgemm"
+                    "a16w16_gfx1250"
+                    if params["target_gfx"] in ("gfx1250", "gfx1250-strict")
+                    else "hgemm"
                 )
         else:
             params = None
@@ -641,7 +643,7 @@ def _compile_a16w16_gfx1250_to_cache(
 
     import torch
 
-    if target_gfx != "gfx1250":
+    if target_gfx not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"The FlyDSL gfx1250 A16W16 kernel only supports gfx1250, got {target_gfx}"
         )
@@ -819,6 +821,8 @@ def _compile_mxscale_preshuffle_to_cache(
     a_scale_layout: str,
     b_scale_layout: str,
     fused_split_k: bool = False,
+    prefetch: bool = False,
+    b_nt: bool = False,
     **kwargs,
 ):
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
@@ -874,28 +878,35 @@ def _compile_mxscale_preshuffle_to_cache(
         scales.append(torch.empty(shape, device=dev, dtype=torch.uint8))
     a_scale, b_scale = scales
 
+    # The fused split-K reduce picks its grid (l2_reduce) from M per launch: a
+    # runtime M off the CSV row's can take the other one, so compile both.
+    fused = fused_split_k and split_k > 1
     with compile_only_env():
-        flydsl_mxscale_preshuffle_gemm(
-            a,
-            b,
-            a_scale,
-            b_scale,
-            out,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            waves_per_eu=waves_per_eu,
-            xcd_swizzle=xcd_swizzle,
-            split_k=split_k,
-            stream=fx.Stream(0),
-            a_scale_block=a_scale_block,
-            b_scale_block=b_scale_block,
-            a_scale_layout=a_scale_layout,
-            b_scale_layout=b_scale_layout,
-            fused_split_k=fused_split_k,
-        )
+        for l2_reduce in (False, True) if fused else (None,):
+            flydsl_mxscale_preshuffle_gemm(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                waves_per_eu=waves_per_eu,
+                xcd_swizzle=xcd_swizzle,
+                split_k=split_k,
+                stream=fx.Stream(0),
+                a_scale_block=a_scale_block,
+                b_scale_block=b_scale_block,
+                a_scale_layout=a_scale_layout,
+                b_scale_layout=b_scale_layout,
+                fused_split_k=fused_split_k,
+                prefetch=prefetch,
+                b_nt=b_nt,
+                l2_reduce=l2_reduce,
+            )
 
 
 def _compile_8wave_to_cache(
