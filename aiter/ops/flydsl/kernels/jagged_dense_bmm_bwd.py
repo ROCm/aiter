@@ -20,7 +20,7 @@
 # SHAPE GENERALIZATION: the square dense dim D (= K = N) and every
 # D-derived tiling constant are baked in as closure constants by a memoized
 # factory `build_backward(D, split, gj_stages_a, coarsen_m)` (mirrors the forward).
-# Each distinct (D, knobs) memoizes its own compiled kernels, so ONE process can serve MULTIPLE D — no module-global
+# Each distinct (D, knobs) memoizes its own compiled kernels, so ONE process can serve MULTIPLE D -- no module-global
 # snapshot, no single-D-per-process constraint. The legacy module-level
 # `configure_dim` / `grad_jagged` / `grad_dense_bias` remain as a thin single-D
 # facade over the factory (for the profiler / example timing path); the production
@@ -36,7 +36,11 @@ import flydsl.expr as fx
 from flydsl.expr.derived import make_layout_tv
 from flydsl.expr.typing import full
 
-from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.jit.utils.chip_info import (
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+    get_num_xcds,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import buf_scalar_load
 
 # Forward tile/shape constants. Imported dual-path so this module works both as
@@ -66,8 +70,11 @@ THREADS = 256
 # m at a time: each m-tile is staged transposed into LDS (J -> sJ as (k, m), dOut
 # -> sD as (n, m), so m ends up contiguous and feeds the MFMA K-fragment), then a
 # bf16 MFMA accumulates into one fp32 accumulator fragment carried across the whole
-# (dynamic, split-strided) m-tile loop. Output-tiling keeps LDS fixed at 32 KB and
+# (dynamic, split-strided) m-tile loop. Output-tiling keeps one stage at 32 KB and
 # the accumulator at one MFMA C-fragment per thread regardless of D = K = N.
+# gfx950 D=256, D=384 and D=512 instead stage 128 m per step (64 KB), keep both tiles out_dim-
+# contiguous and feeds a 32x32x16 MFMA through ds_read_tr16; see
+# ``_dense_gfx950_128_tile_for``.
 DDENSE_BM = 64  # m-contraction tile staged per step (the MFMA K dimension)
 DDENSE_BK = 128  # output K-tile per workgroup (MFMA M dimension)
 DDENSE_BN = 128  # output N-tile per workgroup (MFMA N dimension)
@@ -118,6 +125,11 @@ GJ_STAGES_A = 1
 _DEFAULT_STREAM = fx.Stream(None)
 
 
+def _dense_gfx950_128_tile_for(D, arch):
+    """Whether the gfx950 D=256/384/512 dense/bias kernel uses the CDNA4 tile."""
+    return arch == "gfx950" and int(D) in (256, 384, 512)
+
+
 def _split_for(D):
     """Default SPLIT over the jagged (m) axis for the dDense / dBias reductions.
 
@@ -155,7 +167,7 @@ Backward = collections.namedtuple(
 
 
 # maxsize=None (unbounded) is intentional: the key space is the handful of
-# distinct (D, split, gj_stages_a, coarsen_m, num_xcds) tuples a process
+# distinct (D, split, gj_stages_a, coarsen_m, num_xcds, arch) tuples a process
 # actually launches (typically 1-2 D x a couple of knob sets), and each entry
 # is a set of compiled kernels we WANT to keep resident for the process
 # lifetime. No eviction needed.
@@ -164,7 +176,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None, num_xcds=Non
 
     D (= K = N) and every D-derived tiling constant are baked in as closure
     constants, so FlyDSL memoizes one compiled kernel set per (D, split,
-    gj_stages_a, coarsen_m, num_xcds) and MULTIPLE can coexist in one process
+    gj_stages_a, coarsen_m, num_xcds, arch) and MULTIPLE can coexist in one process
     (mirrors the forward gen kernel's factory). Returns a ``Backward`` namedtuple
     of the two host launchers plus the resolved SPLIT.
 
@@ -177,13 +189,16 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None, num_xcds=Non
     """
     if num_xcds is None:
         num_xcds = get_num_xcds()
-    return _build_backward(D, split, gj_stages_a, coarsen_m, int(num_xcds))
+    return _build_backward(
+        D, split, gj_stages_a, coarsen_m, int(num_xcds), get_gfx_runtime()
+    )
 
 
 @functools.cache
-def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
+def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds, arch):
     D = int(D)
     num_xcds = int(num_xcds)
+    arch = str(arch)
     if num_xcds < 1:
         raise ValueError(f"num_xcds must be >= 1, got {num_xcds}")
     if D % DDENSE_BK or D % DDENSE_BN or D % BLOCK_N or D % BLOCK_K:
@@ -202,12 +217,31 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
     # guard col < N, so a partial last tile is correct -- no divisibility gate is
     # imposed here (rejecting it would forbid an otherwise-valid forced split).
     NRED_COL_TILES = (N + NRED_BLK - 1) // NRED_BLK
-    KOUT_BLOCKS = K // BLOCK_N  # column-tiles of the (M, K) dJagged output
-    NRED_TILES = N // BLOCK_K  # contraction tiles over N
+    # CDNA4 follows Triton's 128x256x32 dJagged tile.  The existing wave layout
+    # supplies its 128 output columns through four 32x32 MFMA waves; the extra
+    # output repeat is represented by the MMA K-mode tile layout below.
+    gj_gfx950_tile = arch == "gfx950" and D in (256, 512)
+    GJ_BLOCK_N = 256 if gj_gfx950_tile else BLOCK_N
+    GJ_BLOCK_K = 32 if gj_gfx950_tile else BLOCK_K
+    KOUT_BLOCKS = K // GJ_BLOCK_N  # column-tiles of the (M, K) dJagged output
+    NRED_TILES = N // GJ_BLOCK_K  # contraction tiles over N
     NK_TILES = K // DDENSE_BK  # dDense output K-tiles per group
     NN_TILES = N // DDENSE_BN  # dDense output N-tiles per group
     COARSEN_M = COARSEN_M_default if coarsen_m is None else int(coarsen_m)
     GJ_STAGES_A = GJ_STAGES_A_default if gj_stages_a is None else int(gj_stages_a)
+    GJ_STAGES = 2 if gj_gfx950_tile else GJ_STAGES_A
+    dense_gfx950_128_tile = _dense_gfx950_128_tile_for(D, arch)
+    gj_mfma32 = arch == "gfx950"
+    dense_bm = 128 if dense_gfx950_128_tile else DDENSE_BM
+    dense_row_passes = dense_bm // _D_LANE_ROWS
+    dense_smem_bytes = (DDENSE_BK * dense_bm + DDENSE_BN * dense_bm) * 2
+    if dense_row_passes * _D_LANE_ROWS != dense_bm:
+        raise ValueError(f"dense m-tile {dense_bm} does not match the staging map")
+    if dense_smem_bytes > get_lds_capacity_bytes(arch):
+        raise ValueError(
+            f"{arch} LDS is {get_lds_capacity_bytes(arch)} bytes; dense/bias "
+            f"staging for D={D} needs {dense_smem_bytes}"
+        )
 
     @flyc.kernel
     def grad_jagged_kernel(
@@ -261,8 +295,8 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                 # Rebase A (dOut, N cols/row) and C (dJagged, K cols/row) to this group's
                 # local row 0; select B's (K, N) slice for group off_b.
                 # int64 element offsets: at the largest deployment shape (B=1024, Mi=7680)
-                # seq_start reaches ~L ≈ 7.86M, so seq_start*K (or *N) ≈ 4G overflows
-                # int32 once K/N ≥ 512, silently wrapping the (d)Jagged/dOut base pointer
+                # seq_start reaches ~L ? 7.86M, so seq_start*K (or *N) ? 4G overflows
+                # int32 once K/N >= 512, silently wrapping the (d)Jagged/dOut base pointer
                 # (the masked store then writes to a wrong/read-only page). seq_start*K
                 # at K=256 squeaks under 2^31, which is why 256 shapes never tripped it.
                 # Mirrors the int64 base_byte_offset in grad_dense_partials_kernel.
@@ -304,13 +338,13 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                     num_records_bytes=fx.Int64(M_b * fx.Int32(K * 2)),
                 )
 
-                gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
+                gA_k = fx.flat_divide(A_buf, (BLOCK_M, GJ_BLOCK_K))[
                     None, None, block_m_idx, None
                 ]  # (BM, BK, n)
-                gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[
+                gB_k = fx.flat_divide(B_buf, (GJ_BLOCK_N, GJ_BLOCK_K))[
                     None, None, block_n_idx, None
                 ]  # (BN, BK, n)
-                gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[
+                gC = fx.flat_divide(C_buf, (BLOCK_M, GJ_BLOCK_N))[
                     None, None, block_m_idx, block_n_idx
                 ]  # (BM, BN)
 
@@ -325,31 +359,101 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                 thr_copy_s2r_A = fx.make_tiled_copy_A(
                     buffer_copy_128b, tiled_mma
                 ).get_slice(tid)
+                if fx.const_expr(gj_gfx950_tile):
+                    copy_s2r_B = uni_copy_128b
+                    thr_copy_s2r_B = fx.make_tiled_copy_B(
+                        copy_s2r_B, tiled_mma
+                    ).get_slice(tid)
+                else:
+                    copy_s2r_B = buffer_copy_128b
+                    thr_copy_s2r_B = fx.make_tiled_copy_B(
+                        buffer_copy_128b, tiled_mma
+                    ).get_slice(tid)
                 thr_copy_g2r_B = fx.make_tiled_copy_B(
                     buffer_copy_128b, tiled_mma
                 ).get_slice(tid)
 
                 composed_layout_A = fx.make_composed_layout(
                     fx.static(fx.SwizzleType.get(3, 3, 3)),
-                    fx.make_ordered_layout((BLOCK_M, BLOCK_K, GJ_STAGES_A), (1, 0, 2)),
+                    fx.make_ordered_layout((BLOCK_M, GJ_BLOCK_K, GJ_STAGES), (1, 0, 2)),
                 )
                 sA = fx.make_view(
                     fx.get_dyn_shared(fx.BFloat16), composed_layout_A
-                )  # (BM, BK, GJ_STAGES_A)
+                )  # (BM, BK, GJ_STAGES)
+                composed_layout_B = fx.make_composed_layout(
+                    fx.static(fx.SwizzleType.get(2, 4, 4)),
+                    fx.make_ordered_layout(
+                        (GJ_BLOCK_N, GJ_BLOCK_K, GJ_STAGES), (1, 0, 2)
+                    ),
+                )
+                smem_b = fx.add_offset(
+                    fx.get_dyn_shared(fx.BFloat16),
+                    fx.make_int_tuple(BLOCK_M * GJ_BLOCK_K * GJ_STAGES),
+                )
+                sB = fx.make_view(smem_b, composed_layout_B)  # (BN, BK, stages)
 
                 thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, n)
-                thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, GJ_STAGES_A)
-                thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, GJ_STAGES_A)
+                thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, stages)
+                thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, stages)
+                thr_sB_s2r = thr_copy_s2r_B.partition_S(sB)  # (VB, VN, VK, stages)
                 thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, n)
 
                 copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
+                b_frags = [
+                    fx.make_rmem_tensor(_D_VEC, fx.BFloat16)
+                    for _ in fx.range_constexpr(4)
+                ]
+                gB_full = fx.make_view(
+                    fx.add_offset(
+                        fx.get_iter(B_buf),
+                        fx.make_int_tuple(block_n_idx * fx.Int32(GJ_BLOCK_N * N)),
+                    ),
+                    fx.make_layout((GJ_BLOCK_N, N), (N, 1)),
+                )
+
+                def load_b_tile(k_tile):
+                    for p in fx.range_constexpr(4):
+                        chunk = tid + fx.Int32(p * THREADS)
+                        row = chunk // fx.Int32(4)
+                        vec = chunk % fx.Int32(4)
+                        row_div = fx.logical_divide(
+                            fx.slice(gB_full, (row, None)),
+                            fx.make_layout(_D_VEC, 1),
+                        )
+                        fx.copy(
+                            buffer_copy_128b,
+                            fx.slice(
+                                row_div,
+                                (None, k_tile * fx.Int32(4) + vec),
+                            ),
+                            b_frags[p],
+                        )
+
+                def store_b_tile(stage):
+                    for p in fx.range_constexpr(4):
+                        chunk = tid + fx.Int32(p * THREADS)
+                        row = chunk // fx.Int32(4)
+                        vec = chunk % fx.Int32(4)
+                        row_div = fx.logical_divide(
+                            fx.slice(sB, (row, None, stage)),
+                            fx.make_layout(_D_VEC, 1),
+                        )
+                        fx.copy(
+                            uni_copy_128b,
+                            b_frags[p],
+                            fx.slice(row_div, (None, vec)),
+                        )
 
                 mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
-                mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
+                if fx.const_expr(gj_gfx950_tile):
+                    mma_frag_B = thr_mma.make_fragment_B(sB[None, None, 0])
+                    mma_frag_B_retile = thr_copy_s2r_B.retile(mma_frag_B)
+                else:
+                    mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
+                    mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
                 mma_frag_C = thr_mma.make_fragment_C(gC)
 
                 mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
-                mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
 
                 gA_k_stride = fx.get_scalar(gA_k.stride[2])
                 gB_k_stride = fx.get_scalar(gB_k.stride[2])
@@ -374,13 +478,13 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                     mma_frag_A=mma_frag_A,
                     mma_frag_B=mma_frag_B,
                     thr_sA=thr_sA,
+                    thr_sB_s2r=thr_sB_s2r,
                 ):
                     write_stage = read_stage ^ 1
-                    # B stays register-double-buffered (no LDS cost) on read/write_stage.
-                    # A's LDS stage folds modulo GJ_STAGES_A: 2 stages ping-pong across
+                    # A's LDS stage folds modulo GJ_STAGES: 2 stages ping-pong across
                     # two buffers; 1 stage collapses to a single buffer.
-                    a_read = read_stage % GJ_STAGES_A
-                    a_write = write_stage % GJ_STAGES_A
+                    a_read = read_stage % GJ_STAGES
+                    a_write = write_stage % GJ_STAGES
                     if fx.const_expr(read_next):
                         next_k = fx.Int32(next_k)
                         fx.copy(
@@ -389,46 +493,85 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                             copy_frag_A,
                             soffset=next_k * gA_k_stride,
                         )
-                        fx.copy(
-                            buffer_copy_128b,
-                            thr_gB_k[None, None, None, 0],
-                            mma_frag_B_retile[None, None, None, write_stage],
-                            soffset=next_k * gB_k_stride,
-                        )
+                        if fx.const_expr(gj_gfx950_tile):
+                            load_b_tile(next_k)
+                        else:
+                            fx.copy(
+                                buffer_copy_128b,
+                                thr_gB_k[None, None, None, 0],
+                                mma_frag_B_retile[None, None, None, write_stage],
+                                soffset=next_k * gB_k_stride,
+                            )
 
-                    for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
+                    for block_k_iter in fx.range_constexpr(
+                        GJ_BLOCK_K // (16 if gj_mfma32 else 32)
+                    ):
                         fx.copy(
                             uni_copy_128b,
                             thr_sA_s2r[None, None, block_k_iter, a_read],
                             mma_frag_A_retile[None, None, block_k_iter],
                         )
-                        fx.gemm(
-                            tiled_mma,
-                            mma_frag_C,
-                            mma_frag_A[None, None, (None, block_k_iter)],
-                            mma_frag_B[None, None, (None, block_k_iter), read_stage],
-                            mma_frag_C,
-                            traversal_order=fx.GemmTraversalOrder.KNM,
-                        )
+                        if fx.const_expr(gj_mfma32):
+                            if fx.const_expr(gj_gfx950_tile):
+                                fx.copy(
+                                    copy_s2r_B,
+                                    thr_sB_s2r[None, None, block_k_iter, a_read],
+                                    mma_frag_B_retile[None, None, block_k_iter],
+                                )
+                                fx.gemm(
+                                    tiled_mma,
+                                    mma_frag_C,
+                                    mma_frag_A[None, None, block_k_iter],
+                                    mma_frag_B[None, None, block_k_iter],
+                                    mma_frag_C,
+                                    traversal_order=fx.GemmTraversalOrder.KNM,
+                                )
+                            else:
+                                fx.gemm(
+                                    tiled_mma,
+                                    mma_frag_C,
+                                    mma_frag_A[None, None, block_k_iter],
+                                    mma_frag_B[None, None, block_k_iter, read_stage],
+                                    mma_frag_C,
+                                    traversal_order=fx.GemmTraversalOrder.KNM,
+                                )
+                        else:
+                            fx.gemm(
+                                tiled_mma,
+                                mma_frag_C,
+                                mma_frag_A[None, None, (None, block_k_iter)],
+                                mma_frag_B[
+                                    None, None, (None, block_k_iter), read_stage
+                                ],
+                                mma_frag_C,
+                                traversal_order=fx.GemmTraversalOrder.KNM,
+                            )
 
-                    # Single-buffer (GJ_STAGES_A==1): the next-k write reuses the buffer we
+                    # Single-buffer (GJ_STAGES==1): the next-k write reuses the buffer we
                     # just read, so all threads must finish their s2r reads before any write.
-                    if fx.const_expr(GJ_STAGES_A == 1):
+                    if fx.const_expr(GJ_STAGES == 1):
                         fx.gpu.barrier()
                     fx.copy(
                         uni_copy_128b, copy_frag_A, thr_sA[None, None, None, a_write]
                     )
+                    if fx.const_expr(gj_gfx950_tile):
+                        store_b_tile(a_write)
                     fx.gpu.barrier()
 
                 # Prologue: load contraction-tile 0 into the read buffer.
                 fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
-                fx.copy(
-                    buffer_copy_128b,
-                    thr_gB_k[None, None, None, 0],
-                    mma_frag_B_retile[None, None, None, 0],
-                )
+                if fx.const_expr(gj_gfx950_tile):
+                    load_b_tile(fx.Int32(0))
+                else:
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gB_k[None, None, None, 0],
+                        mma_frag_B_retile[None, None, None, 0],
+                    )
                 mma_frag_C.fill(0)
                 fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+                if fx.const_expr(gj_gfx950_tile):
+                    store_b_tile(fx.Int32(0))
                 fx.gpu.barrier()
 
                 # Main loop over the N contraction (double-buffered over N // BLOCK_K tiles).
@@ -469,27 +612,33 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
         Contraction is over the static N axis, so this is a clean per-row GEMM that
         reuses the forward kernel's MFMA + double-buffered pipeline (N == K == 128).
         """
-        tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
-            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
-        )
+        if fx.const_expr(gj_mfma32):
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fx.BFloat16)),
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((4, 4), (1, 4))),
+            )
+        else:
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+            )
         val_per_thr = 8  # 16B / bf16
-        thrs_col = BLOCK_K // val_per_thr
+        thrs_col = GJ_BLOCK_K // val_per_thr
         thrs_row = THREADS // thrs_col
         tiled_copy_g2s_A = fx.make_tiled_copy_tv(
             fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
             fx.make_layout((thrs_row, thrs_col), (thrs_col, 1)),
             fx.make_layout((1, val_per_thr), (1, 1)),
         )
-
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
         bm_coarse = (bm + COARSEN_M - 1) // COARSEN_M  # M row-tiles per WG = COARSEN_M
         tiles_per_group = bm_coarse * KOUT_BLOCKS
         xcd_rounds = (n_groups + num_xcds - 1) // num_xcds
-        gj_smem = (
-            BLOCK_M * BLOCK_K * GJ_STAGES_A * 2
-        )  # bf16 sA staging (32 KB at 2 stages)
+        gj_smem = BLOCK_M * GJ_BLOCK_K * GJ_STAGES * 2
+        if fx.const_expr(gj_gfx950_tile):
+            gj_smem = gj_smem + GJ_BLOCK_N * GJ_BLOCK_K * GJ_STAGES * 2
         grad_jagged_kernel(
             dJagged,
             dOut,
@@ -598,9 +747,9 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
         # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
         # (CDNA OOB-load == 0), so tail rows contribute 0 to the contraction.
         # base_byte_offset MUST be computed in int64: at the largest deployment shape seq_start
-        # reaches ~L ≈ 7.86M rows, so seq_start*K*2 ≈ 4 GB overflows int32 (silently
+        # reaches ~L ? 7.86M rows, so seq_start*K*2 ? 4 GB overflows int32 (silently
         # wrapping the descriptor base). num_records_bytes stays in-range (per-group,
-        # M_b ≤ Mi) so an int32 product is fine there.
+        # M_b <= Mi) so an int32 product is fine there.
         J_g = fx.make_view(
             fx.add_offset(
                 fx.get_iter(JAGGED),
@@ -628,30 +777,49 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
         )
         d_row = (tid % fx.Int32(64)) // fx.Int32(_D_LANE_CHUNKS)
 
-        # LDS staging tiles, both (out_dim, m) with m (the contraction) contiguous so
-        # the s2r feed lands m on the MFMA K-fragment. Same swizzle as the forward sA.
-        composed_J = fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(3, 3, 3)),
-            fx.make_ordered_layout((DDENSE_BK, DDENSE_BM), (1, 0)),
-        )
-        composed_D = fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(3, 3, 3)),
-            fx.make_ordered_layout((DDENSE_BN, DDENSE_BM), (1, 0)),
-        )
+        if fx.const_expr(dense_gfx950_128_tile):
+            # Both tiles keep their global orientation, (out_dim, m) with out_dim
+            # contiguous, so 128-bit row loads store straight to LDS and
+            # ds_read_tr16 transposes m onto the MFMA K-fragment. Swizzle(2,4,3)
+            # keeps the 16-element groups ds_read_tr16 needs and XORs low m bits
+            # into out_dim bits [4:6] (same as gemm_a16w16_gfx950's 128-row tile).
+            composed_J = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(2, 4, 3)),
+                fx.make_ordered_layout((DDENSE_BK, dense_bm), (0, 1)),
+            )
+            composed_D = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(2, 4, 3)),
+                fx.make_ordered_layout((DDENSE_BN, dense_bm), (0, 1)),
+            )
+        else:
+            # LDS staging tiles, both (out_dim, m) with m (the contraction) contiguous so
+            # the s2r feed lands m on the MFMA K-fragment. Same swizzle as the forward sA.
+            composed_J = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                fx.make_ordered_layout((DDENSE_BK, dense_bm), (1, 0)),
+            )
+            composed_D = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                fx.make_ordered_layout((DDENSE_BN, dense_bm), (1, 0)),
+            )
         smem = fx.get_dyn_shared(fx.BFloat16)
         sJ = fx.make_view(smem, composed_J)  # (k, m)
-        smem_d = fx.add_offset(smem, fx.make_int_tuple(DDENSE_BK * DDENSE_BM))
+        smem_d = fx.add_offset(smem, fx.make_int_tuple(DDENSE_BK * dense_bm))
         sD = fx.make_view(smem_d, composed_D)  # (n, m)
 
         thr_mma = tiled_mma.thr_slice(tid)
         uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
         buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(
-            tid
-        )
-        thr_copy_s2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(
-            tid
-        )
+        if fx.const_expr(dense_gfx950_128_tile):
+            s2r_tiled_atom = fx.make_copy_atom(
+                fx.rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16
+            )
+            s2r_copy_atom = s2r_tiled_atom
+        else:
+            s2r_tiled_atom = buffer_copy_128b
+            s2r_copy_atom = uni_copy_128b
+        thr_copy_s2r_A = fx.make_tiled_copy_A(s2r_tiled_atom, tiled_mma).get_slice(tid)
+        thr_copy_s2r_B = fx.make_tiled_copy_B(s2r_tiled_atom, tiled_mma).get_slice(tid)
         buffer_copy_16b = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
         thr_copy_g2s_J = tiled_copy_g2s_J.get_slice(tid)
         thr_copy_s2s_J = tiled_copy_s2s_J.get_slice(tid)
@@ -681,7 +849,7 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
         mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
         mma_frag_B_retile = thr_copy_s2r_B.retile(mma_frag_B)
 
-        num_tiles = (M_b + fx.Int32(DDENSE_BM - 1)) // fx.Int32(DDENSE_BM)
+        num_tiles = (M_b + fx.Int32(dense_bm - 1)) // fx.Int32(dense_bm)
 
         # fp32 MFMA accumulator carried in place across the dynamic, split-strided
         # m-tile loop (AGPR accumulate; no SSA carry needed). The fused dBias column
@@ -697,35 +865,55 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
         ):
             bias_acc = fx.Vector(_carry[0])
             mt = fx.Int32(m_tile)
-            # Transpose-stage J for this m-tile via tiled g2s. Global J is viewed in
-            # logical (k, m) order for the workgroup's K sub-tile; partition_D lands in
-            # swizzled sJ (k, m). The global m stride is K so the load stays scalar b16,
-            # but each thread owns 32 contiguous m at one k, so the LDS store is 128-bit
-            # (4 writes, conflict-free in the same Swizzle(3,3,3) as the forward sA)
-            # instead of 32 scalar b16 writes that scatter across banks.
-            j_tile_off = fx.Int64(mt) * fx.Int64(DDENSE_BM) * fx.Int64(K) + fx.Int64(
+            j_tile_off = fx.Int64(mt) * fx.Int64(dense_bm) * fx.Int64(K) + fx.Int64(
                 k_off
             )
-            gJ_tile = fx.make_view(
-                fx.add_offset(fx.get_iter(J_buf), fx.make_int_tuple(j_tile_off)),
-                fx.make_layout((DDENSE_BK, DDENSE_BM), (1, K)),
-            )
-            thr_gJ = thr_copy_g2s_J.partition_S(gJ_tile)
-            thr_sJ_g2s = thr_copy_s2s_J.partition_D(sJ)
-            copy_frag_J = fx.make_fragment_like(thr_gJ)
-            fx.copy(buffer_copy_16b, thr_gJ, copy_frag_J)
-            fx.copy(uni_copy_128b, thr_copy_s2s_J.retile(copy_frag_J), thr_sJ_g2s)
-            # dOut is row-major (m, n) in global but sD is (n, m), so the 128-bit row
-            # loads are scattered into sD one element at a time. Tail rows (m >= M_b)
-            # zero-fill via the bounded descriptor, so they add 0 to the bias sums.
-            d_tile_off = fx.Int64(mt) * fx.Int64(DDENSE_BM) * fx.Int64(N) + fx.Int64(
+            if fx.const_expr(dense_gfx950_128_tile):
+                # J rows are k-contiguous in global and in sJ, so J reuses the
+                # dOut row map: one 128-bit load and one 128-bit LDS store per pass.
+                gJ_rows = fx.make_view(
+                    fx.add_offset(fx.get_iter(J_buf), fx.make_int_tuple(j_tile_off)),
+                    fx.make_layout((dense_bm, DDENSE_BK), (K, 1)),
+                )
+                for p in fx.range_constexpr(dense_row_passes):
+                    m_local = d_row + fx.Int32(p * _D_LANE_ROWS)
+                    row_div = fx.logical_divide(
+                        fx.slice(gJ_rows, (m_local, None)),
+                        fx.make_layout(_D_VEC, 1),
+                    )
+                    frag_j = fx.make_rmem_tensor(_D_VEC, fx.BFloat16)
+                    fx.copy(copy_d_128b, fx.slice(row_div, (None, d_chunk)), frag_j)
+                    s_div = fx.logical_divide(
+                        fx.slice(sJ, (None, m_local)), fx.make_layout(_D_VEC, 1)
+                    )
+                    fx.copy(uni_copy_128b, frag_j, fx.slice(s_div, (None, d_chunk)))
+            else:
+                # Transpose-stage J for this m-tile via tiled g2s. Global J is viewed in
+                # logical (k, m) order for the workgroup's K sub-tile; partition_D lands in
+                # swizzled sJ (k, m). The global m stride is K so the load stays scalar b16,
+                # but each thread owns 32 contiguous m at one k, so the LDS store is 128-bit
+                # (4 writes, conflict-free in the same Swizzle(3,3,3) as the forward sA)
+                # instead of 32 scalar b16 writes that scatter across banks.
+                gJ_tile = fx.make_view(
+                    fx.add_offset(fx.get_iter(J_buf), fx.make_int_tuple(j_tile_off)),
+                    fx.make_layout((DDENSE_BK, dense_bm), (1, K)),
+                )
+                thr_gJ = thr_copy_g2s_J.partition_S(gJ_tile)
+                thr_sJ_g2s = thr_copy_s2s_J.partition_D(sJ)
+                copy_frag_J = fx.make_fragment_like(thr_gJ)
+                fx.copy(buffer_copy_16b, thr_gJ, copy_frag_J)
+                fx.copy(uni_copy_128b, thr_copy_s2s_J.retile(copy_frag_J), thr_sJ_g2s)
+            # Tail rows (m >= M_b) zero-fill via the bounded descriptor, so they add
+            # 0 to the bias sums. On the default path sD is (n, m) with m contiguous,
+            # so the 128-bit row loads are scattered into sD one element at a time.
+            d_tile_off = fx.Int64(mt) * fx.Int64(dense_bm) * fx.Int64(N) + fx.Int64(
                 n_off
             )
             gD_tile = fx.make_view(
                 fx.add_offset(fx.get_iter(D_buf), fx.make_int_tuple(d_tile_off)),
-                fx.make_layout((DDENSE_BM, DDENSE_BN), (N, 1)),
+                fx.make_layout((dense_bm, DDENSE_BN), (N, 1)),
             )
-            for p in fx.range_constexpr(_D_ROW_PASSES):
+            for p in fx.range_constexpr(dense_row_passes):
                 m_local = d_row + fx.Int32(p * _D_LANE_ROWS)
                 row_div = fx.logical_divide(
                     fx.slice(gD_tile, (m_local, None)), fx.make_layout(_D_VEC, 1)
@@ -733,32 +921,52 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
                 frag_d = fx.make_rmem_tensor(_D_VEC, fx.BFloat16)
                 fx.copy(copy_d_128b, fx.slice(row_div, (None, d_chunk)), frag_d)
                 dvec = fx.Vector(fx.memref_load_vec(frag_d))
-                for j in fx.range_constexpr(_D_VEC):
-                    fx.memref_store(
-                        dvec[j], sD, (d_chunk * fx.Int32(_D_VEC) + fx.Int32(j), m_local)
+                if fx.const_expr(dense_gfx950_128_tile):
+                    s_div = fx.logical_divide(
+                        fx.slice(sD, (None, m_local)), fx.make_layout(_D_VEC, 1)
                     )
+                    fx.copy(uni_copy_128b, frag_d, fx.slice(s_div, (None, d_chunk)))
+                else:
+                    for j in fx.range_constexpr(_D_VEC):
+                        fx.memref_store(
+                            dvec[j],
+                            sD,
+                            (d_chunk * fx.Int32(_D_VEC) + fx.Int32(j), m_local),
+                        )
                 bias_acc = bias_acc + dvec.to(fx.Float32)
             fx.gpu.barrier()
 
-            for block_k_iter in fx.range_constexpr(DDENSE_BM // 32):
+            for block_k_iter in fx.range_constexpr(
+                dense_bm // (16 if dense_gfx950_128_tile else 32)
+            ):
                 fx.copy(
-                    uni_copy_128b,
+                    s2r_copy_atom,
                     thr_sJ_s2r[None, None, block_k_iter],
                     mma_frag_A_retile[None, None, block_k_iter],
                 )
                 fx.copy(
-                    uni_copy_128b,
+                    s2r_copy_atom,
                     thr_sD_s2r[None, None, block_k_iter],
                     mma_frag_B_retile[None, None, block_k_iter],
                 )
-                fx.gemm(
-                    tiled_mma,
-                    mma_frag_C,
-                    mma_frag_A[None, None, (None, block_k_iter)],
-                    mma_frag_B[None, None, (None, block_k_iter)],
-                    mma_frag_C,
-                    traversal_order=fx.GemmTraversalOrder.KNM,
-                )
+                if fx.const_expr(dense_gfx950_128_tile):
+                    fx.gemm(
+                        tiled_mma,
+                        mma_frag_C,
+                        mma_frag_A[None, None, block_k_iter],
+                        mma_frag_B[None, None, block_k_iter],
+                        mma_frag_C,
+                        traversal_order=fx.GemmTraversalOrder.KNM,
+                    )
+                else:
+                    fx.gemm(
+                        tiled_mma,
+                        mma_frag_C,
+                        mma_frag_A[None, None, (None, block_k_iter)],
+                        mma_frag_B[None, None, (None, block_k_iter)],
+                        mma_frag_C,
+                        traversal_order=fx.GemmTraversalOrder.KNM,
+                    )
             fx.gpu.barrier()
             _carry_out = yield [bias_acc]
         bias_acc_final = _carry_out
@@ -918,21 +1126,28 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
             fp32 (K, N) dDense partials and fp32 (N,) dBias partials per (group, split), then
             two light reduce passes sum the SPLIT partials into bf16 dDense and dBias.
         """
-        # Same MFMA atom + tiling as the forward GEMM: 16x16x16 bf16, 4 N-atoms per
-        # 256-thread workgroup, natural (4,4,2) K-fragment ordering. Here the operands
-        # are the transposed J / dOut tiles and the contraction is the jagged axis m.
-        tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
-            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
-        )
+        # gfx950 D=512 uses its native 32x32x16 bf16 MFMA across a 2x2-wave
+        # 128x128 tile. The remaining paths retain the gfx942-compatible 16x16
+        # atom and layout.
+        if fx.const_expr(dense_gfx950_128_tile):
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fx.BFloat16)),
+                fx.make_layout((2, 2, 1), (2, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((4, 4), (1, 4))),
+            )
+        else:
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+            )
         # One TV layout shared by two copy atoms: the global J load is strided in m
         # (stride K) so it stays scalar b16, but each thread owns 32 contiguous m at one
         # k, so the swizzled sJ store is 128-bit. partition_S/partition_D retile the
         # value mode to the atom width, so the store needs its own 128b tiled copy.
         j_g2s_tiler_mn, j_g2s_tv = make_layout_tv(
             fx.make_layout((128, 2), (2, 1)),
-            fx.make_layout((1, 32), (1, 1)),
+            fx.make_layout((1, dense_bm // 2), (1, 1)),
         )
         tiled_copy_g2s_J = fx.make_tiled_copy(
             fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
@@ -964,7 +1179,7 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
             ).launch(
                 grid=partials_grid,
                 block=(DDENSE_THREADS, 1, 1),
-                smem=_DDENSE_SMEM_BYTES,
+                smem=dense_smem_bytes,
                 stream=stream,
             )
         else:
@@ -981,7 +1196,7 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
             ).launch(
                 grid=partials_grid,
                 block=(DDENSE_THREADS, 1, 1),
-                smem=_DDENSE_SMEM_BYTES,
+                smem=dense_smem_bytes,
                 stream=stream,
             )
             grad_dense_reduce_kernel(dDense, partials).launch(

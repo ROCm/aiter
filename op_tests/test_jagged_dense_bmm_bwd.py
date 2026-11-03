@@ -581,6 +581,29 @@ _SYNTHETIC_JDBBA_BWD_DISPATCH = {
 }
 
 
+def test_jdbba_bwd_dense_tile_keeps_gfx942():
+    """gfx950 D=256/384/512 use the 128-row CDNA4 dense tile (2x the default LDS)."""
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels.jagged_dense_bmm_bwd import (
+        _DDENSE_SMEM_BYTES,
+        _dense_gfx950_128_tile_for,
+    )
+
+    assert not _dense_gfx950_128_tile_for(256, "gfx942")
+    assert not _dense_gfx950_128_tile_for(512, "gfx942")
+    assert _dense_gfx950_128_tile_for(256, "gfx950")
+    assert _dense_gfx950_128_tile_for(384, "gfx950")
+    assert _dense_gfx950_128_tile_for(512, "gfx950")
+    for arch, dim in (
+        ("gfx942", 512),
+        ("gfx950", 256),
+        ("gfx950", 384),
+        ("gfx950", 512),
+    ):
+        scale = 2 if _dense_gfx950_128_tile_for(dim, arch) else 1
+        assert _DDENSE_SMEM_BYTES * scale <= get_lds_capacity_bytes(arch)
+
+
 @pytest.mark.skipif(not _HAS_FLYDSL, reason="needs aiter.ops.flydsl dispatch module")
 def test_jdbba_bwd_resolve_config_precedence(monkeypatch):
     """Host-only: kwarg > JSON winner > D-bucket fallback."""
@@ -625,7 +648,7 @@ def test_jdbba_bwd_int64_rebase_production_L():
     """grad_jagged / grad_dense_bias seq_start*D rebase at deployment L (P2).
 
     Mi=512 headline cases keep L*D < 2^31; uniform B=1024 Mi=7680 D=512 gives
-    L≈7.86M and seq_start*D≈4G on the last group, which wrapped int32 bases
+    L?7.86M and seq_start*D?4G on the last group, which wrapped int32 bases
     before the Int64 rebase. Needs ~16 GiB device memory for jagged/dOut.
     """
     B, Mi, D = _INT64_REBASE_CASE
