@@ -56,6 +56,12 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_sorting_opus import (
+    moe_sorting_opus_fwd as _moe_sorting_opus_fwd,
+)
+from aiter.ops.moe_sorting_opus import (
+    moe_sorting_opus_get_workspace_size as _moe_sorting_opus_get_workspace_size,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -661,7 +667,7 @@ def _moe_sorting_impl(
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+        ws_size = _moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
         workspace = (
@@ -669,7 +675,7 @@ def _moe_sorting_impl(
             if ws_size > 0
             else None
         )
-        aiter.moe_sorting_opus_fwd(
+        _moe_sorting_opus_fwd(
             topk_ids,
             topk_weights,
             sorted_ids,

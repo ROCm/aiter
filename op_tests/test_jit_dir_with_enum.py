@@ -23,7 +23,7 @@ def test_aiter_jit_dir_with_enum():
     ):
         # Import aiter only after we set AITER_JIT_DIR
         from aiter import ActivationType, QuantType
-        from aiter.fused_moe_bf16_asm import moe_sorting_ck
+        from aiter.fused_moe_bf16 import moe_sorting_ck
 
         # Using moe_stage1_g1u1 as an example of a compiled function with enum types in its signature
         from aiter.ops.moe_op import moe_stage1_g1u1

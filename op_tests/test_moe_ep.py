@@ -16,7 +16,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.fused_moe_bf16 import asm_moe
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import (
