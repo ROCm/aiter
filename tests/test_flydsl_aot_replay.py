@@ -5,6 +5,7 @@ the command line its per-arch processes get.
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
 
+import csv
 import os
 import pathlib
 import sys
@@ -122,3 +123,36 @@ def test_per_arch_replays_get_the_command_line(monkeypatch):
         replay.main("aiter.aot.flydsl.fmha_fp8", "FP8 FMHA AOT")
     assert exited.value.code == 0
     assert forwarded == [argv]
+
+
+def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
+    from aiter.aot.flydsl import gemm
+    from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+    path = (
+        _REPO_ROOT
+        / "aiter/configs/model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv"
+    )
+    with path.open(newline="") as source:
+        rows = list(csv.DictReader(source))
+    expected = {
+        (int(row["M"]), int(row["N"]), int(row["K"]), row["kernelName"])
+        for row in rows
+        if row["kernelName"].startswith("flydsl_")
+    }
+    jobs = gemm.parse_csv(str(path))
+    assert len(jobs) == len(expected) == 21
+    assert {(j["m"], j["n"], j["k"], j["kernel_name"]) for j in jobs} == expected
+
+    monkeypatch.setenv("AITER_CONFIG_GEMM_A4W4", str(path))
+    monkeypatch.delattr(get_GEMM_config, "gemm_dict", raising=False)
+    monkeypatch.delattr(get_GEMM_config, "has_gfx", raising=False)
+    get_GEMM_config.cache_clear()
+    try:
+        with dry_run("gfx950", 256, python_ops=True):
+            for job in jobs:
+                with replay.identified_kernels() as kernels:
+                    gemm.replay(job)
+                assert kernels, job
+    finally:
+        get_GEMM_config.cache_clear()

@@ -31,6 +31,8 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 Add `--backends ck,asm,triton,flydsl -k` to the existing tuner command to compare
 all four backends. The default remains `ck,asm`. Winners use the same CSV schema;
 `triton_preshuffle_*` and `flydsl_mxpsh_*` kernel names encode their launch settings.
+Triton cache modifiers are explicit: `_cmcg` selects `.cg`, `_cmca` selects `.ca`,
+and `_cmnone` or no `_cm` suffix uses the Triton default (`None`).
 
 `aiter/configs/model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv` contains the
 qualified narrow-N rows. These select the new backends only at exact M, with

@@ -171,7 +171,7 @@ def preshuffle_candidates(M, N, K, backends, split_k):
         ):
             if tm <= M:
                 names.append(
-                    f"triton_preshuffle_bm{tm}_bn{tn}_bk256_ks{sk}_w4_wpe2_s{stages}_g1_mi16"
+                    f"triton_preshuffle_bm{tm}_bn{tn}_bk256_ks{sk}_w4_wpe2_s{stages}_g1_mi16_cmcg"
                 )
     return names
 

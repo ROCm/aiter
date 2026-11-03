@@ -25,7 +25,7 @@ _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 def _a4w4_fallback_config(row):
     # Optional CSV columns retain the old choice for unsupported calls / padded M.
     name = row.get("fallbackKernelName", "")
-    name = name if isinstance(name, str) else ""
+    name = name if isinstance(name, str) and name != "0" else ""
     if name.startswith(("triton_", "flydsl_")):
         raise ValueError("A4W4 fallbackKernelName must select CK or ASM")
     split = row.get("fallbackSplitK", 0)
@@ -87,7 +87,7 @@ def _parse_triton_a4w4_kernel(name):
             ),
             values,
         ),
-        cache_modifier=None if cache == "none" else f".{cache or 'cg'}",
+        cache_modifier=f".{cache}" if cache in ("cg", "ca") else None,
     )
 
 
