@@ -349,16 +349,21 @@ def build_unified_attention_fp8_gfx942_module(
     ):
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
         tiled = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
-        # Lane ownership of the atom's A (m, k), B (n, k) and C (m, n) tiles.
+        # Lane ownership of the atom's A (m, k), B (n, k) and C (m, n) tiles. Not a
+        # thr_slice: in FlyDSL 0.4.1, one made here fails if called in a runtime `if`.
         tv_a, tv_b, tv_c = (
             tiled.tv_layout_A_tiled,
             tiled.tv_layout_B_tiled,
             tiled.tv_layout_C_tiled,
         )
         tid = fx.Int32(gpu.thread_id("x"))
+        # One atom per wave, on its own tokens or split: lanes index its layouts.
         lane = tid % 64
         wave = tid // 64
-        c = lane % 16
+        # The lane's column of the C tile.
+        c = _owned(fx.make_layout((16, 16), (0, 1)), tv_c, lane)
+        # The V transpose swaps words with the lanes 16 and 32 away and picks bytes by
+        # the lane's group g; FlyDSL 0.4.1 has register shuffles only as value ops.
         g = lane // 16
         kvh = fx.Int32(gpu.block_id("x"))
         y = fx.Int32(gpu.block_id("y"))
@@ -585,23 +590,41 @@ def build_unified_attention_fp8_gfx942_module(
                                 )
                         transpose_store(words, pvt, key4s, depths, pn)
 
+                    # K is QK's A tile: the lane reads key pk_key of each 16-key block,
+                    # 8 depths from pk_depth of each 32-depth step.
+                    pk_key = _owned(fx.make_layout((16, 32), (1, 0)), tv_a, lane)
+                    pk_depth = _owned(fx.make_layout((16, 32), (0, 1)), tv_a, lane)
+                    # V^T is PV's A tile: row m is depth 16 db + m, and its reduction
+                    # runs over keys in S^T's row order, read here as dwords of 4 keys.
+                    pv_depth = _owned(fx.make_layout((16, 32), (1, 0)), tv_a, lane)
+                    pv_key4 = fx.make_layout((16, (4, 2, 4)), (0, (0, 4, 1)))
+                    # S^T is the C tile: row m of each 16-key block is a key. The value's
+                    # part (lane 0's) is added last: fused with the lane's, it costs VGPRs.
+                    ps_key = fx.make_layout((16, 16), (1, 0))
+
                     def p_read_k(kb, ks):
                         return _load(
                             buf,
-                            _k_offset(kb * 16 + c, ks * 32 + g * 8, dim),
+                            _k_offset(kb * 16 + pk_key, ks * 32 + pk_depth, dim),
                             fx.Int64,
                             8,
                         )
 
                     def p_read_v(db, h):
-                        # PV MFMA h covers keys 32h..32h+31: key4 8h+g, then 8h+4+g.
-                        depth = db * 16 + c
-                        w0 = _load(
-                            buf, pvt + _vt_offset(depth, 8 * h + g, pn), fx.Int32, 4
-                        )
-                        w1 = _load(
-                            buf, pvt + _vt_offset(depth, 8 * h + 4 + g, pn), fx.Int32, 4
-                        )
+                        # PV MFMA h covers keys 32h..32h+31.
+                        depth = db * 16 + pv_depth
+                        w0, w1 = [
+                            _load(
+                                buf,
+                                pvt
+                                + _vt_offset(
+                                    depth, 8 * h + _owned(pv_key4, tv_a, lane, v), pn
+                                ),
+                                fx.Int32,
+                                4,
+                            )
+                            for v in (0, 4)
+                        ]
                         return fx.Vector.from_elements([w0, w1], fx.Int32).bitcast(
                             fx.Int64
                         )[0]
@@ -676,7 +699,12 @@ def build_unified_attention_fp8_gfx942_module(
                         ):
                             p_masked = []
                             for r in range_constexpr(nsc):
-                                col = block * pn + (r // 4) * 16 + g * 4 + r % 4
+                                col = (
+                                    block * pn
+                                    + (r // 4) * 16
+                                    + _owned(ps_key, tv_c, lane)
+                                    + _owned(ps_key, tv_c, 0, r % 4)
+                                )
                                 valid = (col <= pqpos) & (col >= pqpos - wleft)
                                 p_masked.append(
                                     valid.select(p_sv[r], fx.Float32(float("-inf")))
@@ -781,7 +809,9 @@ def build_unified_attention_fp8_gfx942_module(
                                     plane + db * 16 + pdepth,
                                     fx.Vector(presult[db + 2]) * vs4,
                                 )
-                            if g == 0:
+                            # A row's four lanes hold the same m and l; the one
+                            # at depth 0 writes them.
+                            if pdepth == 0:
                                 ml = [fx.Float32(presult[0]), fx.Float32(presult[1])]
                                 _buffer_store(
                                     pp_rows,
@@ -848,6 +878,9 @@ def build_unified_attention_fp8_gfx942_module(
                 # its reduction runs over keys in S^T's row order.
                 dv_key = fx.make_layout((16, (4, 2, 4)), (0, (1, 16, 4)))
                 dv_depth = _owned(fx.make_layout((16, 32), (16, 0)), tv_a, lane)
+                # S^T is the C tile: row m of each 16-key half is a key. The value's
+                # part (lane 0's) is added last: fused with the lane's, it costs VGPRs.
+                ds_key = fx.make_layout((16, 16), (1, 0))
 
                 # Decode-only launches load K and V non-temporal (each key is
                 # read once); in a unified launch the hint measured slower
@@ -902,8 +935,8 @@ def build_unified_attention_fp8_gfx942_module(
 
                 def d_scores(block, kc):
                     """QK for one tile, masked to keys [dlow, dklen): the query
-                    sits at dklen - 1. Score r is key 16 * (r // 4) + 4g + r % 4
-                    of the tile."""
+                    sits at dklen - 1. Score r is the lane's value r % 4 of half
+                    r // 4."""
                     d_acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
                     for j in range_constexpr(kchunks):
                         for half in range_constexpr(2):
@@ -918,7 +951,12 @@ def build_unified_attention_fp8_gfx942_module(
                     d_s = [d_acc[0] + d_acc[1], d_acc[2] + d_acc[3]]
                     d_sv = []
                     for r in range_constexpr(8):
-                        col = block * NK + (r // 4) * 16 + g * 4 + r % 4
+                        col = (
+                            block * NK
+                            + (r // 4) * 16
+                            + _owned(ds_key, tv_c, lane)
+                            + _owned(ds_key, tv_c, 0, r % 4)
+                        )
                         valid = (col < dklen) & (col >= dlow)
                         d_sv.append(
                             valid.select(
@@ -1066,7 +1104,9 @@ def build_unified_attention_fp8_gfx942_module(
                             dlane + depth,
                             fx.Vector.from_elements(vals, fx.Float32),
                         )
-                    if g == 0:
+                    # A row's four lanes hold the same m and l; the one at
+                    # depth 0 writes them.
+                    if _owned(d_out, tv_c, lane) == 0:
                         ml = [fx.Float32(dresult[0]), fx.Float32(dresult[1])]
                         _buffer_store(
                             dp_rows,
