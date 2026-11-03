@@ -871,7 +871,8 @@ def _gemm_a16w16_compute_bound_kernel(
         accumulator = activation(accumulator)
 
     gl.static_assert(
-        (REGISTER_STORE >= 0) & (REGISTER_STORE <= 2), "REGISTER_STORE must be 0, 1 or 2"
+        (REGISTER_STORE >= 0) & (REGISTER_STORE <= 2),
+        "REGISTER_STORE must be 0, 1 or 2",
     )
     if REGISTER_STORE == 2:
         # Register store, coalesced: convert the tile to STORE_LAYOUT (16-byte vectors along N; the layout
@@ -881,14 +882,30 @@ def _gemm_a16w16_compute_bound_kernel(
         _store_tile_from_registers(
             c_ptr,
             gl.convert_layout(accumulator.to(c_ptr.type.element_ty), STORE_LAYOUT),
-            pid_m, pid_n, M, N, stride_cm, stride_cn, BLOCK_M, BLOCK_N, STORE_LAYOUT,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_cm,
+            stride_cn,
+            BLOCK_M,
+            BLOCK_N,
+            STORE_LAYOUT,
         )
     elif REGISTER_STORE == 1:
         # Register store straight from the WMMA layout (as the bandwidth_bound kernel does).
         _store_tile_from_registers(
             c_ptr,
             accumulator.to(c_ptr.type.element_ty),
-            pid_m, pid_n, M, N, stride_cm, stride_cn, BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_cm,
+            stride_cn,
+            BLOCK_M,
+            BLOCK_N,
+            WMMA_LAYOUT,
         )
     else:
         # TDM Store: accumulator → shared memory → global memory
