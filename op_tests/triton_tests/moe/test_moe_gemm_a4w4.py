@@ -70,10 +70,6 @@ def alloc_rand(shape, device, dtype):
     return torch.randn(shape, device=device, dtype=dtype)
 
 
-def alloc_rand_like(x):
-    return alloc_rand(x.shape, x.device, x.dtype)
-
-
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
@@ -303,11 +299,9 @@ def test_op(
 
 
 # ---------------
-# In-kernel gather correctness: in-kernel gather must match pre-gathered for all
-# block sizes, including block_m=128 where a layout bug caused the gather index
-# tensor to repeat only 32 unique values instead of covering all 128 rows, and
-# block_m=64 where multi-block experts triggered a modular wrap-around in the
-# clamp used to guard OOB GatherIndx reads.
+# Gluon gather and SwiGLU correctness: kernel output (both in-kernel gather
+# and pre-gathered) must match the fp32 torch reference from
+# scripts/test_moe_gather.py for all block sizes.
 # ---------------
 
 _SKIP_GATHER = pytest.mark.skipif(
@@ -315,53 +309,32 @@ _SKIP_GATHER = pytest.mark.skipif(
     reason="In-kernel gather via gluon prefill kernel is gfx1250-only",
 )
 
-
-def _ep_routing(M, E, E_LOCAL, TOPK, block_m_cap, device):
-    """Compute EP routing with a fixed random seed; returns (rd, gidx, sidx, gvalid, dst)."""
-    g = torch.Generator(device=device).manual_seed(7)
-    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
-    ids = ids.to(torch.int32).contiguous()
-    wts = torch.softmax(vals, -1).contiguous()
-
-    emap = torch.full((E + 1,), -1, dtype=torch.int32, device=device)
-    emap[0:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=device)
-
-    n_gates = M * TOPK
-    block_m = max(16, min(triton.next_power_of_2(max(1, n_gates // E)), block_m_cap))
-    bufs = _compute_expt_data_internal(E_LOCAL, n_gates, block_m, device)
-    geo = EpScatterGeometry(
-        src_token_map=torch.arange(M, dtype=torch.int32, device=device),
-        max_tokens_per_rank=M,
-        peer_rows=n_gates,
-    )
-    hist, gidx, sidx, gscal, gvalid, dst = ep_sort_routing(
-        wts,
-        ids,
-        emap,
-        E_LOCAL,
-        torch.full((1,), M, dtype=torch.int32, device=device),
-        M,
-        TOPK,
-        n_gates,
-        bufs,
-        ep_scatter_geometry=geo,
-    )
-    h = hist[:E_LOCAL]
-    rd = RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2]))
-    return rd, gidx, sidx, gvalid, dst
+E2M1 = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    device="cuda",
+)
 
 
-def _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device):
-    """Run the full GEMM1 → GEMM2 pipeline in both modes and compare the final output.
+def _dequant(q, s):
+    v = torch.stack((E2M1[(q & 0xF).long()], E2M1[(q >> 4).long()]), -1).flatten(-2)
+    return v * torch.exp2(s.float() - 127.0).repeat_interleave(32, -1)
 
-    Uses the preshuffled MXFP4 W4A4, SwiGLU, out_mx_quant (GEMM1) and
-    preshuffled MXFP4 W4A4 (GEMM2) configuration, matching the shape used by
-    DeepSeek-style models on gfx1250.  GEMM1 emits MXFP4-quantised intermediates
-    (out_mx_quant=True), which GEMM2 consumes directly.  The final bfloat16
-    output is what the test compares.
+
+def _gemm1_gemm2_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device):
+    """Run the full GEMM1 → GEMM2 pipeline and compare against a torch reference.
+
+    The torch reference follows scripts/test_moe_gather.py: dequant the
+    MX-quantised inputs, run fp32 GEMM1 + SwiGLU, requant + dequant the
+    intermediate, then fp32 GEMM2. Both in-kernel gather and pre-gathered
+    kernel outputs must match this reference with cos > 0.999.
     """
     g = torch.Generator(device=device).manual_seed(0)
     x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    vals, ids = torch.topk(
+        torch.randn(M, E, generator=g, device=device), TOPK, dim=-1,
+    )
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
     xq, xs = mxfp4_quant(x)
 
     def _make_weight(n_out, n_in, seed):
@@ -370,15 +343,46 @@ def _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, devi
         q, s = mxfp4_quant(w.reshape(-1, n_in))
         q = q.view(E_LOCAL, n_out, n_in // 2)
         s = s.view(E_LOCAL, n_out, n_in // 32)
+        ref = _dequant(q, s)
         wk = moe_weight_decode_view(moe_shuffle_weight(q.contiguous()).contiguous())
         sk = moe_shuffle_scale(s.contiguous()).transpose(-1, -2)
-        return wk, sk
+        return wk, sk, ref
 
-    w1k, s1k = _make_weight(2 * I, D, seed=1)
-    w2k, s2k = _make_weight(D, I, seed=2)
+    w1k, s1k, w1r = _make_weight(2 * I, D, seed=1)
+    w2k, s2k, w2r = _make_weight(D, I, seed=2)
 
-    rd, gidx, sidx, gvalid, dst = _ep_routing(M, E, E_LOCAL, TOPK, block_m_cap, device)
+    # routing — use the same ids/wts so gate indices map back correctly
+    emap = torch.full((E + 1,), -1, dtype=torch.int32, device=device)
+    emap[0:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=device)
+    n_gates = M * TOPK
+    block_m = max(16, min(triton.next_power_of_2(max(1, n_gates // E)), block_m_cap))
+    bufs = _compute_expt_data_internal(E_LOCAL, n_gates, block_m, device)
+    geo = EpScatterGeometry(
+        src_token_map=torch.arange(M, dtype=torch.int32, device=device),
+        max_tokens_per_rank=M, peer_rows=n_gates,
+    )
+    hist, gidx, sidx, gscal, gvalid, dst = ep_sort_routing(
+        wts, ids, emap, E_LOCAL,
+        torch.full((1,), M, dtype=torch.int32, device=device),
+        M, TOPK, n_gates, bufs, ep_scatter_geometry=geo,
+    )
+    h = hist[:E_LOCAL]
+    rd = RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2]))
     assert rd.block_m == block_m_cap, f"routing chose block_m={rd.block_m}, expected {block_m_cap}"
+
+    # torch reference (same logic as scripts/test_moe_gather.py::reference)
+    lo = 0
+    loc = (ids >= lo) & (ids < lo + E_LOCAL)
+    t, k = loc.nonzero(as_tuple=True)
+    e = (ids[t, k] - lo).long()
+    xd = _dequant(xq, xs)
+    ref = torch.empty(t.numel(), D, device=device)
+    for ex in e.unique().tolist():
+        sel = (e == ex).nonzero(as_tuple=True)[0]
+        h_val = xd[t[sel]] @ w1r[ex].T
+        a = h_val[:, ::2] * torch.sigmoid(h_val[:, ::2]) * h_val[:, 1::2]
+        aq, asc = mxfp4_quant(a.to(torch.bfloat16))
+        ref[sel] = _dequant(aq, asc) @ w2r[ex].T
 
     gemm1_kw = dict(
         swizzle_mx_scale="GFX1250_SCALE",
@@ -407,15 +411,13 @@ def _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, devi
         )
         return raw.view(M, TOPK, D)
 
-    out_ikg = _run(in_kernel_gather=True)
-    out_pg = _run(in_kernel_gather=False)
-
-    cos = torch.nn.functional.cosine_similarity(
-        out_ikg.float().flatten(), out_pg.float().flatten(), dim=0
-    ).item()
-    assert cos > 0.999, (
-        f"in-kernel gather vs pre-gathered cosine={cos:.6f} (block_m={rd.block_m})"
-    )
+    for mode, in_kernel_gather in [("in-kernel gather", True), ("pre-gathered", False)]:
+        out = _run(in_kernel_gather)
+        got = out[t, k].float().flatten()
+        cos = torch.nn.functional.cosine_similarity(got, ref.flatten(), dim=0).item()
+        assert cos > 0.999, (
+            f"{mode} vs torch reference cosine={cos:.6f} (block_m={rd.block_m})"
+        )
 
 
 @_SKIP_GATHER
@@ -432,32 +434,18 @@ def _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, devi
         (8192, 128),
     ],
 )
-def test_gluon_in_kernel_gather_matches_pregathered(M, block_m_cap, device="cuda"):
-    """In-kernel gather must equal pre-gathered for all block sizes on gfx1250.
-
-    Covers two distinct bugs fixed together:
-    - block_m=128: GATHER_IDX_LAYOUT covered only 32 elements, so arange(128)
-      repeated [0..31] four times, loading the same 32 activation rows for all
-      128 rows of the tile.
-    - block_m=64 (multi-block experts): gather indices were clamped with ``% M``
-      instead of ``min(..., M-1)``, causing block_id >= 1 to wrap to wrong rows.
-    """
+def test_gluon_gather_matches_torch_ref(M, block_m_cap, device="cuda"):
+    """GEMM1+GEMM2 output must match the fp32 torch reference for all block sizes on gfx1250."""
     E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
-    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
+    _gemm1_gemm2_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
 
 
 @_SKIP_GATHER
-def test_gluon_in_kernel_gather_multiblock_experts(device="cuda"):
-    """Verify correct gather output for experts whose token count exceeds block_m.
-
-    Uses block_m=64 and M=2048 so most experts have more than 64 tokens each
-    (histogram: min~43, max~83), exercising block_id=1 for the majority of
-    experts. The % M clamp bug caused block_id=1 to re-read rows 0..M_e-1
-    again instead of rows 64..M_e-1.
-    """
+def test_gluon_gather_multiblock_experts_matches_torch_ref(device="cuda"):
+    """GEMM1+GEMM2 with multi-block experts (block_m=64) must match the fp32 torch reference."""
     E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
     M, block_m_cap = 2048, 64
-    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
+    _gemm1_gemm2_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
 
 
 # ---------------
@@ -469,17 +457,6 @@ def test_gluon_in_kernel_gather_multiblock_experts(device="cuda"):
 # fp32 torch reference with per-row cosine, following repro_row12_gemm1.py.
 # ---------------
 
-E2M1 = torch.tensor(
-    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-    device="cuda",
-)
-
-
-def _upcast_e2m1(q, s):
-    v = torch.stack((E2M1[(q & 0xF).long()], E2M1[(q >> 4).long()]), -1).flatten(-2)
-    return v * torch.exp2(s.float() - 127.0).repeat_interleave(32, -1)
-
-
 def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gather, device):
     """GEMM1 with SwiGLU vs fp32 torch reference. 0 bad rows required."""
     g = torch.Generator(device=device).manual_seed(0)
@@ -490,17 +467,15 @@ def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gat
     ids = ids.to(torch.int32).contiguous()
     wts = torch.softmax(vals, -1).contiguous()
 
-    # weight: (E_LOCAL, 2*I, D) -> MXFP4 kernel weight + fp32 dequant ref
     g_w = torch.Generator(device=device).manual_seed(1)
     w = torch.randn(E_LOCAL, 2 * I, D, generator=g_w, device=device, dtype=torch.bfloat16) / D**0.5
     wq, ws = mxfp4_quant(w.reshape(-1, D))
     wq = wq.view(E_LOCAL, 2 * I, D // 2)
     ws = ws.view(E_LOCAL, 2 * I, D // 32)
-    w_ref = _upcast_e2m1(wq, ws)
+    w_ref = _dequant(wq, ws)
     wk = moe_weight_decode_view(moe_shuffle_weight(wq.contiguous()).contiguous())
     sk = moe_shuffle_scale(ws.contiguous()).transpose(-1, -2)
 
-    # routing — use the same ids/wts so gate indices map back correctly
     emap = torch.full((E + 1,), -1, dtype=torch.int32, device=device)
     emap[0:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=device)
     n_gates = M * TOPK
@@ -518,11 +493,9 @@ def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gat
     rd = RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2]))
     assert rd.block_m == block_m
 
-    # quantize activation, build fp32 reference
     xq, xs = mxfp4_quant(x)
-    xr = _upcast_e2m1(xq, xs)
+    xr = _dequant(xq, xs)
 
-    # fp32 torch reference: GEMM then SwiGLU then MX requant (GEMM1 only)
     n = int(rd.expt_data.hist.sum())
     gate = gidx.long()[:n]
     tok = gate // TOPK
@@ -530,11 +503,10 @@ def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gat
     ref = torch.empty(n, I, device=device)
     for e in exp.unique().tolist():
         sel = (exp == e).nonzero(as_tuple=True)[0]
-        h = xr[tok[sel]] @ w_ref[e].T
-        ref[sel] = h[:, ::2] * torch.sigmoid(h[:, ::2]) * h[:, 1::2]
-    ref_rq = _upcast_e2m1(*mxfp4_quant(ref.bfloat16()))
+        h_val = xr[tok[sel]] @ w_ref[e].T
+        ref[sel] = h_val[:, ::2] * torch.sigmoid(h_val[:, ::2]) * h_val[:, 1::2]
+    ref_rq = _dequant(*mxfp4_quant(ref.bfloat16()))
 
-    # kernel GEMM1
     if in_kernel_gather:
         y, ys = moe_gemm_a4w4(
             xq, wk, xs, sk, None, rd, gather_indx=gidx,
@@ -550,7 +522,7 @@ def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gat
             swiglu_add_residual=False,
         )
 
-    got = _upcast_e2m1(y[:n], ys[:n])
+    got = _dequant(y[:n], ys[:n])
     rc = torch.nn.functional.cosine_similarity(got, ref_rq, dim=1)
     bad = ~(rc > 0.99)
     n_bad = int(bad.sum())
