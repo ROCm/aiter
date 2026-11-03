@@ -158,6 +158,9 @@ def _length_aware_split(config, params: _UAParams):
     num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])
     if per_cu is None or num_segments == 1 or params.skip_reduce:
         return None
+    # the sliding-window carve is not tuned for length-aware segment counts
+    if params.sliding_window > 0:
+        return None
     # The dtype tag also covers fp16, and the config matches the wider head.
     if (
         params.q_dtype != torch.bfloat16
