@@ -101,7 +101,8 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = {"N" if self.is_split_k else f'KBatch > 1 ? N : N / {2 if (k.stage == 1 and k.ActOP != "relu2") else 1}'}; //gemm1 gate+up need / 2; relu2 is gate-only (non-gated), needs full-width N; split-k writes raw gate|up at any k_batch.
+    // gemm1 gate+up writes N / 2; split-k writes raw gate|up, relu2 is gate-only and gemm2 is not gated, so they write N.
+    int stride_C = {"N / 2" if (k.stage == 1 and k.ActOP != "relu2" and not self.is_split_k) else "N"};
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
@@ -681,6 +682,8 @@ if __name__ == "__main__":
                 has_bias,
                 is_split_k,
             )
+            # aiter.fused_moe._cktile_gemm1_k_batch picks k_batch for this K tile.
+            assert all(k.KPerBlock == 256 for k in gemm1_kernel_list.values())
             tag, gemm2_kernel_list = get_gemm2_kernels_list(
                 a_type,
                 b_type,

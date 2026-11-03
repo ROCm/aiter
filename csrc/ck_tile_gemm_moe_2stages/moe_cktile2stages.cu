@@ -316,7 +316,17 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     // The output width picks the kernel kind: N wide is the raw gate|up split-k
     // workspace (also at k_batch == 1), N/2 is the fused gate/up epilogue.
     // Relu2 is non-gated, so its N-wide output is not split-k.
-    const bool split_k_kind = act_op != static_cast<int>(ActivationType::Relu2) && Y.size(-1) == N;
+    const bool gate_only = act_op == static_cast<int>(ActivationType::Relu2);
+    TORCH_CHECK(Y.size(-1) == N || (!gate_only && 2 * Y.size(-1) == N),
+                "cktile_moe_gemm1: Y.size(-1)=",
+                Y.size(-1),
+                gate_only ? " must be N="
+                          : " must be N (split-k workspace) or N/2 (gate/up) for N=",
+                N);
+    const bool split_k_kind = !gate_only && Y.size(-1) == N;
+    TORCH_CHECK(k_batch == 1 || !gate_only,
+                "cktile_moe_gemm1: Relu2 (gate-only) has no split-k kernel, got k_batch=",
+                k_batch);
     TORCH_CHECK(k_batch == 1 || split_k_kind,
                 "cktile_moe_gemm1: k_batch=",
                 k_batch,
@@ -473,6 +483,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     bool has_bias = exp_bias.has_value();
     int act_op    = activation.has_value() ? activation.value() : -1;
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
+    // moe_gemm checks the per-split K of gemm1 only.
+    TORCH_CHECK(k_batch == 1, "cktile_moe_gemm2: split-k is not supported, got k_batch=", k_batch);
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
 
