@@ -190,8 +190,13 @@ def check_dispatches_shipped_row():
     if row is None:
         return
     seq_len, seq_len_kv, expected = row
+    q = torch.empty((seq_len, HEADS, HEAD_DIM), dtype=dtypes.fp8)
+    kv = torch.empty((seq_len_kv, HEAD_DIM), dtype=dtypes.fp8)
+    if not mql.flydsl_supports(q, kv, expected["variant"]):
+        # No FlyDSL, or a registry built for other GPU_ARCHS: Triton is correct.
+        expected = dict(mql.DEFAULT_CONFIG)
     got = _dispatched_config(seq_len, seq_len_kv)
-    assert got == expected, f"dispatched {got}, shipped row {expected}"
+    assert got == expected, f"dispatched {got}, expected {expected}"
 
 
 def check_flydsl_fallback_uses_triton():
