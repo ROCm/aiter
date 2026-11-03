@@ -31,6 +31,7 @@ from .conv3d_gfx1250_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
+    LDS_PAD,
     OOB_SENTINEL_ELEM,
     TILE_K,
     WAVE_SIZE,
@@ -524,8 +525,25 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         ) * Cp + fx.Int64(gi) * cgp
         row_stride = param.sh * Wp * Cp
         col_stride = param.sw * Cp
+        # Keep the N-D atom to reuse its descriptor across tap offsets;
+        # migrate the input-gather side separately from the weight tile.
+        gA = fx.Tensor(
+            fx.make_view(
+                fx.add_offset(fx.get_iter(x), a_base),
+                fx.make_layout((R, C, TILE_K), (row_stride, col_stride, 1)),
+            )
+        )
         ho_left = fx.Int32(fx.Int64(ho_v) - oh0)
         wo_left = fx.Int32(fx.Int64(wo_v) - ow0)
+        atom_a = fx.rocdl.make_tdm_atom(
+            gA,
+            [ho_left, wo_left, None],
+            strides=[row_stride, col_stride, None],
+            num_warps=num_warps,
+            pad_interval=TILE_K,
+            pad_amount=LDS_PAD,
+            early_timeout=True,
+        )
 
         # Weights are K-tile aligned: one descriptor covers the whole channel
         # range, the tail is clamped by the view extent, and each round indexes
@@ -569,51 +587,32 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             kt_i = t2 // param.kh
             return kt_i, kh_i, kw_i, cc
 
+        def imm_a(kt_i, kh_i, kw_i, cc):
+            elems = (
+                (kt_i * param.dt * Hp + kh_i * param.dh) * Wp + kw_i * param.dw
+            ) * Cp + cc * TILE_K
+            return elems * BF16_BYTES
+
         def issue_tdm(buf_idx, abs_k):
             kt_i, kh_i, kw_i, cc = _decode_k(abs_k)
-            # A tap shifts the base by whole rows/cols, which is not a multiple of
-            # the tile, so the tiled descriptor is built per issue from a shifted
-            # base instead of reusing one atom with an immediate offset.
-            a_off = (
-                a_base
-                + (kt_i * fx.Int64(param.dt) * Hp + kh_i * fx.Int64(param.dh))
-                * Wp
-                * Cp
-                + kw_i * fx.Int64(param.dw) * Cp
-                + fx.Int64(cc) * TILE_K
-            )
-            gA = fx.Tensor(
-                fx.make_view(
-                    fx.add_offset(fx.get_iter(x), a_off),
-                    fx.make_layout(
-                        (ho_left, wo_left, TILE_K), (row_stride, col_stride, 1)
-                    ),
-                )
-            )
-            atom_a, coord_a = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(),
-                gA,
-                fx.make_layout((R, C, TILE_K), (C * lds_k, lds_k, 1)),
-                (R, C, TILE_K),
-                num_warps=num_warps,
-            )
-            blk_a = fx.zipped_divide(coord_a, (R, C, TILE_K))[None, (0, 0, None)]
             lds_a = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(big_a_mem, slot_a(buf_idx)),
                     fx.make_layout((R, C, TILE_K), (C * lds_k, lds_k, 1)),
                 )
             )
+            # Partition mode 0 is the complete box; the singleton rest mode
+            # lets the copy select this already-offset pipeline slot with 0.
             lds_b = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(big_b_mem, slot_b(buf_idx)),
-                    fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1)),
+                    fx.make_layout(
+                        ((cfg.tile_n, TILE_K), 1),
+                        ((lds_k, 1), cfg.tile_n * lds_k),
+                    ),
                 )
             )
-            ts_a, tg_a = fx.rocdl.cdna5.tdm_partition(
-                atom_a, wave, warp_layout, lds_a, blk_a
-            )
-            fx.copy(atom_a, tg_a[None, 0], ts_a[None, 0])
+            fx.copy(atom_a, gA, lds_a, imm_offset=imm_a(kt_i, kh_i, kw_i, cc))
             ts_b, tg_b = fx.rocdl.cdna5.tdm_partition(
                 atom_b, wave, warp_layout, lds_b, blk_b
             )
