@@ -110,12 +110,19 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    policy=None,
 ):
     from aiter.test_common import run_perftest
+    from aiter.utility.selection_policy import LATENCY
+    from aiter.utility.tune_result import TuneResult
+
+    policy = LATENCY if policy is None else policy
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
     max_err_ratio = 0.0
+    watts = float("nan")
+    res = None
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -225,10 +232,23 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
-    return info, us, round(max_err_ratio, 4)
+    if us not in (-1, 0) and us != float("inf") and res is not None:
+        watts = policy.measure_timed(
+            func, args, kwargs, device_index=gpu_id, kernel_us=us
+        )
+
+    return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
+def work_group(
+    GPUIDMap,
+    fast_mode,
+    err_ratio,
+    in_data,
+    tasks,
+    verbose=False,
+    policy=None,
+):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
@@ -378,6 +398,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                policy,
             )
 
             # Run worker with explicit GPU ID
@@ -414,6 +436,8 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    policy=None,
+    final_timing=None,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -429,13 +453,32 @@ def mp_tuner(
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
         timeout: Timeout in seconds for each task group (None = no timeout)
+        policy: SelectionPolicy for the run; None uses the one the tuner activated
+        final_timing: whether these times pick the winner (default: not fast_mode).
+            Only a final timing pass is power-sampled.
 
     Returns:
         List of (info, latency, error_ratio) tuples
     """
+    from aiter.utility.selection_policy import LATENCY, active_policy
+
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
+    if policy is None:
+        policy = active_policy()
+    if final_timing is None:
+        # fast_mode is the hipblaslt latency screen. The MoE tuner also sets it,
+        # and passes final_timing because that call is its only timing pass.
+        final_timing = not fast_mode
+    if not final_timing:
+        policy = LATENCY
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
+    if policy.measures_power and mp_num > 1:
+        from aiter.utility.package_power import shared_power_override_rejected
+
+        rejected = shared_power_override_rejected()
+        if rejected:
+            raise ValueError(rejected)
     parallel_num = mp_num
     start_idx = 0
     if not tasks:
@@ -495,6 +538,7 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
+                        policy,
                     ),
                 ),
             )

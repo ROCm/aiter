@@ -27,6 +27,7 @@ GFX_MAP = {
     16: "gfx1200",
     17: "gfx1201",
     18: "gfx1250",
+    19: "gfx1250-strict",
 }
 
 # Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
@@ -49,7 +50,36 @@ GFX_CU_NUM_MAP = {
     "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
     "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
+    "gfx1250-strict": 256,  # MI450 A0; binary-incompatible with gfx1250 (B0)
 }
+
+
+# gfx1250-strict (MI450 A0) and gfx1250 (B0) are distinct build/code-object
+# identities (strict ELF mach 0xeb vs 0x149) and MUST stay separate for build
+# targets, caches, tuned configs, prebuilt .co/.hsaco, and JIT rebuild checks.
+# The map below is ONLY for sharing source / kernel families at explicitly
+# validated dispatch sites. It is NOT a statement of binary compatibility.
+GFX_BASE_ARCH = {
+    "gfx1250-strict": "gfx1250",
+}
+
+
+def base_gfx_arch(gfx: str) -> str:
+    """Kernel-family base arch for ``gfx`` (gfx1250-strict -> gfx1250; identity otherwise).
+
+    Use only to select shared source / kernel definitions at validated dispatch
+    sites. NEVER for build targets, cache keys, tuned-config keys, or prebuilt
+    binary paths -- those stay keyed by the exact gfx identity.
+    """
+    return GFX_BASE_ARCH.get(gfx, gfx)
+
+
+def is_gfx1250_family(gfx: str) -> bool:
+    """True for gfx1250 and its variants (gfx1250-strict).
+
+    A kernel-family predicate, not a binary-compatibility claim.
+    """
+    return base_gfx_arch(gfx) == "gfx1250"
 
 
 def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:

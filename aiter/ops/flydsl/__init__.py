@@ -63,6 +63,7 @@ _LAZY_IMPORTS = {
         ".fmha_kernels",
         "flydsl_flash_attn_paged_prefill_func",
     ),
+    "flydsl_fp8_quant": (".fp8_quant", "flydsl_fp8_quant"),
     "flydsl_fp8_mqa_logits": (
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
@@ -168,9 +169,21 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "work_map_size",
     ),
+    "minimax_m3_index_score_fp4_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl_fp4",
+    ),
+    "minimax_m3_index_score_fp4_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported_fp4",
+    ),
     "minimax_m3_index_score_prefill_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
+    ),
+    "minimax_m3_index_score_prefill_fp4_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl_fp4",
     ),
     # Its own, not the decode scorer's: prefill's output is
     # [heads, total_q, max_block] and is sized from the ragged batch.
@@ -199,6 +212,7 @@ __all__ = [
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_fp8_paged_mqa_logits_gfx1250",
+    "flydsl_fp8_quant",
     "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
@@ -221,8 +235,11 @@ __all__ = [
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
     "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_fp4_flydsl",
+    "minimax_m3_index_score_fp4_flydsl_supported",
     "minimax_m3_index_score_prefill_alloc",
     "minimax_m3_index_score_prefill_flydsl",
+    "minimax_m3_index_score_prefill_fp4_flydsl",
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
