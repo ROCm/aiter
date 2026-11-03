@@ -3296,9 +3296,13 @@ def _gen_small_mxscale_bpreshuffle_instance(
         elif grid_kind == "xcd":
             grid = "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
         lds = "Traits::lds_bytes(k)" if entry.get("dynamic_lds") else "0"
+        arguments = "args"
+        if entry.get("m_repeat_schedule") == "staged":
+            abi += ", opus::bf16_t*, unsigned*"
+            arguments += ", nullptr, nullptr"
         body = f"""    const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
     const unsigned tiles_n = {n_tiles}, tiles = tiles_m * tiles_n;
-    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), {lds}, stream>>>(args);"""
+    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), {lds}, stream>>>({arguments});"""
 
     declarations = _bpreshuffle_declaration(kernel, "class Traits", abi)
     device_decl = f"template __global__ void {kernel}<{alias}>({abi});\n"

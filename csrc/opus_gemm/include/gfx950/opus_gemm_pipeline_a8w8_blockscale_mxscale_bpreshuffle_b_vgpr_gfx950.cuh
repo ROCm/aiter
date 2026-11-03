@@ -6,10 +6,10 @@
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
-#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
+#include "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-namespace opus_gemm_prefetch_b_vgpr_detail {
+namespace opus_gemm_bpreshuffle_b_vgpr_detail {
 
 // Global A copies preserve the row-dependent XOR permutation used by the LDS ring.
 template<class T>
@@ -295,26 +295,43 @@ __device__ inline auto make_layout_gc_copy(int lane_id, int wave_id_n, int strid
 
 template<class T, bool ContiguousWaveN>
 __device__ inline auto make_layout_gc_packed(int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
-    constexpr int lanes_per_packed_group = (T::VEC_OUTPUT / T::VEC_C) * T::W_M;
-    constexpr auto gc_packed_block_shape = opus::make_tuple(
-        opus::number<T::E_M>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        opus::number<T::E_N>{},
-        opus::number<T::T_N>{},
-        opus::number<T::WARP_SIZE / lanes_per_packed_group>{},
-        opus::number<T::VEC_OUTPUT>{});
+    if constexpr (T::B_PANEL_PREFETCH) {
+        // Calculate panel offsets on demand; retaining an array increases spills.
+        struct OutputLayout {
+            struct Offsets {
+                int lane, wm, wn, stride;
+                __device__ __forceinline__ int operator[](int ci) const {
+                    const int m = ci / T::E_N, n = ci % T::E_N;
+                    const int rr = (m * T::T_M + wm) * 16 + lane % 16;
+                    const int nn = (ContiguousWaveN ? n + wn * T::E_N : n * T::T_N + wn) * 16
+                        + (lane / 32) * 8;
+                    return rr * stride + nn;
+                }
+            } offsets;
+        };
+        return OutputLayout{{lane_id, wave_id_m, wave_id_n, stride_c}};
+    } else {
+        constexpr int lanes_per_packed_group = (T::VEC_OUTPUT / T::VEC_C) * T::W_M;
+        constexpr auto gc_packed_block_shape = opus::make_tuple(
+            opus::number<T::E_M>{},
+            opus::number<T::T_M>{},
+            opus::number<T::W_M>{},
+            opus::number<T::E_N>{},
+            opus::number<T::T_N>{},
+            opus::number<T::WARP_SIZE / lanes_per_packed_group>{},
+            opus::number<T::VEC_OUTPUT>{});
 
-    constexpr auto gc_packed_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        constexpr auto gc_packed_block_dim = opus::make_tuple(
+            opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+            opus::make_tuple(opus::y_dim{}),
+            opus::make_tuple(opus::p_dim{}),
+            opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
-    return opus::make_layout<T::VEC_OUTPUT>(
-        gc_packed_block_shape,
-        opus::unfold_x_stride(gc_packed_block_dim, gc_packed_block_shape, opus::tuple{stride_c, opus::number<(ContiguousWaveN ? 1 : T::T_N) * T::W_N>{}, opus::number<(ContiguousWaveN ? T::E_N : 1) * T::W_N>{}, opus::number<1>{}}),
-        opus::unfold_p_coord(gc_packed_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M, wave_id_n, lane_id / lanes_per_packed_group}));
+        return opus::make_layout<T::VEC_OUTPUT>(
+            gc_packed_block_shape,
+            opus::unfold_x_stride(gc_packed_block_dim, gc_packed_block_shape, opus::tuple{stride_c, opus::number<(ContiguousWaveN ? 1 : T::T_N) * T::W_N>{}, opus::number<(ContiguousWaveN ? T::E_N : 1) * T::W_N>{}, opus::number<1>{}}),
+            opus::unfold_p_coord(gc_packed_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M, wave_id_n, lane_id / lanes_per_packed_group}));
+    }
 }
 
 // Read an A fragment directly from LDS into its assigned AGPRs.
@@ -378,11 +395,6 @@ __device__ __forceinline__ void store_mfma16_packed(
     }
 }
 
-// Choose an output stripe that fits the LDS allocation reused by the epilogue.
-__device__ inline constexpr int output_rows(int bm, int bn, int pipeline_bytes) {
-    return opus_gemm_blockscale_mxscale_bpreshuffle_output_rows(bm, bn, pipeline_bytes);
-}
-
 // Fixed-shape entries use contiguous matrix and scale strides.
 #if defined(OPUS_BP_FIXED_M) && defined(OPUS_BP_FIXED_N) && defined(OPUS_BP_FIXED_K)
 __device__ __forceinline__ void apply_fixed_args(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950& a) {
@@ -407,7 +419,7 @@ __device__ __forceinline__ void apply_fixed_args(opus_gemm_blockscale_mxscale_bp
 template<class Traits, int PublishM = -1>
 __device__ __forceinline__ void fragment_prefetch_body(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
 #if defined(OPUS_BP_FIXED_M) && defined(OPUS_BP_FIXED_N) && defined(OPUS_BP_FIXED_K)
-    opus_gemm_prefetch_b_vgpr_detail::apply_fixed_args(args);
+    opus_gemm_bpreshuffle_b_vgpr_detail::apply_fixed_args(args);
 #endif
     using namespace opus;
 
@@ -466,7 +478,7 @@ __device__ __forceinline__ void fragment_prefetch_body(opus_gemm_blockscale_mxsc
 
     constexpr int F = KS * NR;
     constexpr int MAX_ROWS = BM;
-    constexpr int C_ROWS = output_rows(BM, BN, T::PIPELINE_BYTES);
+    constexpr int C_ROWS = opus_gemm_blockscale_mxscale_bpreshuffle_output_rows(BM, BN, T::PIPELINE_BYTES);
     constexpr int STEADY = P - T::INITIAL_A;
     constexpr int START = T::INITIAL_A < STEADY ? T::INITIAL_A : STEADY;
     constexpr int PERIOD = []() constexpr {
@@ -751,7 +763,7 @@ __device__ __forceinline__ void fragment_prefetch_body(opus_gemm_blockscale_mxsc
     // ===== Output writeback =====
     // Pack BF16 directly or reuse LDS for contiguous stripes.
     if constexpr (T::OUTPUT == 2) {
-        opus_gemm_prefetch_b_vgpr_detail::store_mfma16_packed<T, true>(r_c, g_c, lane_id, 0, wave_id_n, stride_c);
+        opus_gemm_bpreshuffle_b_vgpr_detail::store_mfma16_packed<T, true>(r_c, g_c, lane_id, 0, wave_id_n, stride_c);
     } else {
         static_for<(MAX_ROWS + C_ROWS - 1) / C_ROWS>([&](auto parti) {
             constexpr int part = decltype(parti)::value;
@@ -795,20 +807,9 @@ __device__ __forceinline__ void fragment_prefetch_body(opus_gemm_blockscale_mxsc
     s_waitcnt_vmcnt(0_I);
 }
 
-template<class Traits>
-__device__ __forceinline__ void bulk_panel_overlap_body(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
-    fragment_prefetch_body<Traits, Traits::PUBLISH_M>(args);
-}
+} // namespace opus_gemm_bpreshuffle_b_vgpr_detail
 
-} // namespace opus_gemm_prefetch_b_vgpr_detail
-
-namespace opus_gemm_prefetch_b_vgpr_detail {
-template<class Traits, int PublishM = -1>
-__device__ __forceinline__ void bulk_panel_body(
-    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args);
-} // namespace opus_gemm_prefetch_b_vgpr_detail
-
-namespace opus_gemm_b_direct_detail {
+namespace opus_gemm_bpreshuffle_b_vgpr_panel_layout {
 using opus::operator""_I;
 
 // The ring pipelines count DMA groups, rather than individual VMEM operations.
@@ -894,50 +895,6 @@ __device__ __forceinline__ Fragment load_operand_fragment(Memory& memory, const 
     return result;
 }
 
-template<class T, bool ContiguousWaveN = false, class Accumulators, class Gmem>
-__device__ __forceinline__ void store_mfma16_packed(const Accumulators& c, Gmem gc, int lane,
-                                                    int wm, int wn, int stride_c) {
-    using namespace opus;
-    static_assert(T::W_M == 16 && T::W_N == 16);
-    const int side = (lane / 16) % 2;
-    static_for<T::E_M * T::E_N / 2>([&](auto pair) {
-        constexpr int ci = decltype(pair)::value * 2;
-        const auto first = __builtin_bit_cast(vector_t<unsigned, 2>, cast<bf16_t>(c[ci]));
-        const auto second = __builtin_bit_cast(vector_t<unsigned, 2>, cast<bf16_t>(c[ci + 1]));
-        const unsigned own0 = side ? second[0] : first[0];
-        const unsigned own1 = side ? second[1] : first[1];
-        const unsigned src0 = side ? first[0] : second[0];
-        const unsigned src1 = side ? first[1] : second[1];
-        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, src0);
-        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, src1);
-        vector_t<unsigned, 4> packed;
-        packed[0] = side ? other0 : own0;
-        packed[1] = side ? other1 : own1;
-        packed[2] = side ? own0 : other0;
-        packed[3] = side ? own1 : other1;
-        const int m = (ci + side) / T::E_N, n = (ci + side) % T::E_N;
-        const int rr = (m * T::T_M + wm) * 16 + lane % 16;
-        const int nn = (ContiguousWaveN ? n + wn * T::E_N : n * T::T_N + wn) * 16 + (lane / 32) * 8;
-        store<8>(gc, __builtin_bit_cast(vector_t<bf16_t, 8>, packed), rr * stride_c + nn, 0,
-                 number<T::STORE_CACHE>{});
-    });
-    if constexpr (T::E_M * T::E_N % 2 != 0) {
-        constexpr int ci = T::E_M * T::E_N - 1;
-        const auto words = __builtin_bit_cast(vector_t<unsigned, 2>, cast<bf16_t>(c[ci]));
-        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, words[0]);
-        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, words[1]);
-        if (side == 0) {
-            vector_t<unsigned, 4> packed{words[0], words[1], other0, other1};
-            const int rr = ((ci / T::E_N) * T::T_M + wm) * 16 + lane % 16;
-            const int nn =
-                (ContiguousWaveN ? (ci % T::E_N) + wn * T::E_N : (ci % T::E_N) * T::T_N + wn) * 16 +
-                (lane / 32) * 8;
-            store<8>(gc, __builtin_bit_cast(vector_t<bf16_t, 8>, packed), rr * stride_c + nn, 0,
-                     number<T::STORE_CACHE>{});
-        }
-    }
-}
-
 using namespace opus;
 
 template<class T, int Vec, class Copy>
@@ -1014,7 +971,7 @@ __device__ inline constexpr auto make_layout_ra_scale(int row, int lane_id, int 
                                                        (lane_id / 16) ^ (swizzle % 4)})) +
                   base + (swizzle & 4) * 16;
     if constexpr (VectorOffsets)
-        return opus_gemm_b_direct_detail::vectorize_layout_offsets(layout);
+        return opus_gemm_bpreshuffle_b_vgpr_panel_layout::vectorize_layout_offsets(layout);
     else
         return layout;
 }
@@ -1057,7 +1014,7 @@ __device__ inline auto make_layout_gsfa_scale(Copy copy, int tid, int row, int m
                       opus::unfold_x_stride(block_dim, block_shape, opus::tuple{stride_sfa, 1_I}),
                       opus::unfold_p_coord(block_dim, opus::tuple{scale_column, scale_row / Vec})) +
                   scale_row % Vec;
-    return opus_gemm_b_direct_detail::vectorize_layout_offsets(layout);
+    return opus_gemm_bpreshuffle_b_vgpr_panel_layout::vectorize_layout_offsets(layout);
 }
 
 template<class T, class Copy>
@@ -1168,21 +1125,21 @@ template<class T> __device__ inline constexpr auto make_layout_gc(int row, int c
     return make_layout_matrix_vector<8, T::B_M, T::B_N>(row, column, stride);
 }
 
-} // namespace opus_gemm_b_direct_detail
+} // namespace opus_gemm_bpreshuffle_b_vgpr_panel_layout
 
 namespace opus {
-template<class D> struct is_gmem<opus_gemm_b_direct_detail::async_gmem<D>> : true_type {};
+template<class D> struct is_gmem<opus_gemm_bpreshuffle_b_vgpr_panel_layout::async_gmem<D>> : true_type {};
 } // namespace opus
 
 template<class Traits>
-__device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_b_direct(
+__device__ __forceinline__ void opus_gemm_bpreshuffle_b_vgpr_panel_body(
     opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs) {
 #if defined(OPUS_BP_FIXED_M) && defined(OPUS_BP_FIXED_N) && defined(OPUS_BP_FIXED_K)
-    opus_gemm_prefetch_b_vgpr_detail::apply_fixed_args(kargs);
+    opus_gemm_bpreshuffle_b_vgpr_detail::apply_fixed_args(kargs);
 #endif
     using namespace opus;
-    using namespace opus_gemm_b_direct_detail;
-    namespace layout = opus_gemm_b_direct_detail;
+    using namespace opus_gemm_bpreshuffle_b_vgpr_panel_layout;
+    namespace layout = opus_gemm_bpreshuffle_b_vgpr_panel_layout;
     using T = opus::remove_cvref_t<Traits>;
     constexpr bool native_c = [] {
         if constexpr (requires { T::NATIVE_C; })
@@ -1394,8 +1351,8 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_b_direc
             });
         });
     } else if constexpr (T::OUTPUT == 2) {
-        opus_gemm_b_direct_detail::store_mfma16_packed<T, true>(c, g_c, lane_id, 0, wave_id_n,
-                                                                stride_c);
+        opus_gemm_bpreshuffle_b_vgpr_detail::store_mfma16_packed<T, true>(
+            c, g_c, lane_id, 0, wave_id_n, stride_c);
     } else {
         // Stage C in LDS and gather contiguous BF16 stores.
         auto s_c = make_smem(reinterpret_cast<bf16_t*>(arena));
@@ -1447,52 +1404,38 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_b_direc
     s_waitcnt_vmcnt(0_I);
 }
 
-// Existing generated CO stubs retain their registered compute entry.
-namespace opus_gemm_b_direct_detail {
+namespace opus_gemm_bpreshuffle_b_vgpr_detail {
+// Select the prefetch unit and A publication point at compile time.
 template<class Traits>
-__device__ __forceinline__ void
-bulk_panel_body(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs) {
-    opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body<Traits>(kargs);
-}
-} // namespace opus_gemm_b_direct_detail
-
-namespace opus_gemm_prefetch_b_vgpr_detail {
-// Select the prefetch unit from traits; no runtime shape-dependent branch.
-template<class Traits, int PublishM>
-__device__ __forceinline__ void
-bulk_panel_body(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
-    if constexpr (Traits::B_PANEL_PREFETCH)
-        opus_gemm_blockscale_mxscale_bpreshuffle_b_direct<Traits>(args);
+__device__ __forceinline__ void body(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
+    if constexpr (requires { Traits::OPERAND_POLICY; })
+        opus_gemm_bpreshuffle_m_repeat_stage_body<Traits>(
+            args, reinterpret_cast<opus::bf16_t*>(args.ptr_c), nullptr);
+    else if constexpr (Traits::B_PANEL_PREFETCH)
+        opus_gemm_bpreshuffle_b_vgpr_panel_body<Traits>(args);
     else
-        fragment_prefetch_body<Traits, PublishM>(args);
+        fragment_prefetch_body<Traits, Traits::PUBLISH_M>(args);
 }
-} // namespace opus_gemm_prefetch_b_vgpr_detail
+} // namespace opus_gemm_bpreshuffle_b_vgpr_detail
 
 #endif
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
-void opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_bulk_panel_kernel(
-    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
+void opus_gemm_bpreshuffle_b_vgpr_kernel(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-    opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body<Traits>(args);
+    opus_gemm_bpreshuffle_b_vgpr_detail::body<Traits>(args);
 #endif
 }
 
+// Fused split-K direct-B configurations retain the tile-partial workspace ABI.
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
-void opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_bulk_panel_kernel(
-    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
+void opus_gemm_bpreshuffle_b_vgpr_kernel(
+    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args,
+    opus::bf16_t* final_output, unsigned* counters) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-    opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body<Traits>(args);
-#endif
-}
-
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
-void opus_gemm_blockscale_mxscale_bpreshuffle_b_direct_bulk_panel_kernel(
-    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs) {
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-    opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body<Traits>(kargs);
+    static_assert(Traits::B_DIRECT && Traits::SPLIT_K > 1);
+    opus_gemm_bpreshuffle_m_repeat_stage_body<Traits>(args, final_output, counters);
 #endif
 }

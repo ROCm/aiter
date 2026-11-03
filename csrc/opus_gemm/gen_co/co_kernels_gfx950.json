@@ -990,7 +990,8 @@
       ]
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd2_loops3_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -999,10 +1000,10 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "128", "4", "2", "0", "true", "384", "4", "1", "0", "2", "0", "128", "true", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
@@ -1011,7 +1012,8 @@
       "kid": 40
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [64, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1020,10 +1022,10 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["64", "128", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1032,7 +1034,8 @@
       "kid": 41
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1041,10 +1044,10 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1053,7 +1056,8 @@
       "kid": 42
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1062,10 +1066,10 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1074,7 +1078,8 @@
       "kid": 43
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1083,10 +1088,10 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1095,7 +1100,8 @@
       "kid": 44
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1104,10 +1110,10 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1116,7 +1122,8 @@
       "kid": 45
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops8_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1125,10 +1132,10 @@
       "max_k": 1024,
       "fixed_k": 1024,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1024", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1137,7 +1144,8 @@
       "kid": 46
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops8_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1146,10 +1154,10 @@
       "max_k": 1024,
       "fixed_k": 1024,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1024", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1158,7 +1166,8 @@
       "kid": 47
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1167,10 +1176,10 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1179,7 +1188,8 @@
       "kid": 48
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1188,10 +1198,10 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1200,7 +1210,8 @@
       "kid": 49
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1209,10 +1220,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1221,7 +1232,8 @@
       "kid": 50
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1230,10 +1242,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1242,7 +1254,8 @@
       "kid": 51
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1251,10 +1264,10 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1263,7 +1276,8 @@
       "kid": 52
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1272,10 +1286,10 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1284,7 +1298,8 @@
       "kid": 53
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1293,10 +1308,10 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1305,7 +1320,8 @@
       "kid": 54
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1314,10 +1330,10 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1326,7 +1342,8 @@
       "kid": 55
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1335,10 +1352,10 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1347,7 +1364,8 @@
       "kid": 56
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1356,10 +1374,10 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1368,7 +1386,8 @@
       "kid": 57
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1377,10 +1396,10 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1389,7 +1408,8 @@
       "kid": 58
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1398,10 +1418,10 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1410,7 +1430,8 @@
       "kid": 59
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1419,10 +1440,10 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1431,7 +1452,8 @@
       "kid": 60
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1440,10 +1462,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1452,7 +1474,8 @@
       "kid": 61
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1461,10 +1484,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1473,7 +1496,8 @@
       "kid": 62
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1482,10 +1506,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1494,7 +1518,8 @@
       "kid": 63
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1502,10 +1527,10 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1514,7 +1539,8 @@
       "kid": 64
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1522,10 +1548,10 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1534,7 +1560,8 @@
       "kid": 65
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1542,10 +1569,10 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1554,7 +1581,8 @@
       "kid": 66
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1563,10 +1591,10 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1575,7 +1603,8 @@
       "kid": 67
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1584,10 +1613,10 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1596,7 +1625,8 @@
       "kid": 68
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops32_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1605,10 +1635,10 @@
       "max_k": 4096,
       "fixed_k": 4096,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "4096", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1617,7 +1647,8 @@
       "kid": 69
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops32_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1626,10 +1657,10 @@
       "max_k": 4096,
       "fixed_k": 4096,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "4096", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1638,7 +1669,8 @@
       "kid": 70
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1647,10 +1679,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1659,7 +1691,8 @@
       "kid": 71
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1668,10 +1701,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1680,7 +1713,8 @@
       "kid": 72
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [128, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1689,10 +1723,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["128", "128", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
@@ -1701,7 +1735,8 @@
       "kid": 73
     },
     {
-      "pipeline": "prefetch_b_vgpr",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "fragment",
       "tile": [96, 128, 256],
       "wave_layout": [1, 4],
       "variant": "p2_bd1_loops28_pinA0C0_xcd1_contig0_ca17cb1_wg1_pub0_sa1_sb0_compact0_aheadauto_out0",
@@ -1710,10 +1745,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_traits",
         "args": ["96", "128", "2", "1", "1", "true", "7168", "4", "1", "17", "2", "0", "256", "false", "false", "false", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["opus_gemm_bpreshuffle_b_pipeline_traits<CoTraits, true, false, -1, false>"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
@@ -1725,7 +1760,8 @@
       ]
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd2_loops56_pinA0C1_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1734,20 +1770,21 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "2", "0", "true", "7168", "4", "1", "0", "2", "0", "128", "true", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 75
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd2_loops3_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1756,20 +1793,21 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "128", "4", "2", "0", "true", "384", "4", "1", "0", "2", "0", "128", "true", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 76
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [64, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1778,20 +1816,21 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["64", "128", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 77
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1800,20 +1839,21 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 78
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops3_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1822,20 +1862,21 @@
       "max_k": 384,
       "fixed_k": 384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "384", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 79
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1844,20 +1885,21 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 80
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops6_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1866,20 +1908,21 @@
       "max_k": 768,
       "fixed_k": 768,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "768", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 81
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1888,20 +1931,21 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 82
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops12_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1910,20 +1954,21 @@
       "max_k": 1536,
       "fixed_k": 1536,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "1536", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 83
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1932,20 +1977,21 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 84
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [96, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1954,20 +2000,21 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["96", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 85
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1976,20 +2023,21 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 86
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -1998,20 +2046,21 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 87
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops16_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2020,20 +2069,21 @@
       "max_k": 2048,
       "fixed_k": 2048,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "2048", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 5,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 88
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2042,20 +2092,21 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 89
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2064,20 +2115,21 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 90
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops24_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2086,20 +2138,21 @@
       "max_k": 3072,
       "fixed_k": 3072,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "3072", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 5,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 91
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops32_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2108,20 +2161,21 @@
       "max_k": 4096,
       "fixed_k": 4096,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "4096", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 92
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops32_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2130,20 +2184,21 @@
       "max_k": 4096,
       "fixed_k": 4096,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "4096", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 93
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops32_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2152,20 +2207,21 @@
       "max_k": 4096,
       "fixed_k": 4096,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "4096", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 5,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 94
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2174,20 +2230,21 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 95
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2196,20 +2253,21 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 96
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops56_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2218,20 +2276,21 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "7168", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 5,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 97
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2239,20 +2298,21 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 98
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA0C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2260,20 +2320,21 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "false", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 4,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 99
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 256, 128],
       "wave_layout": [1, 4],
       "variant": "p4_bd1_loops128_pinA1C1_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2281,20 +2342,21 @@
       "wide_output": true,
       "fixed_k": 16384,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "256", "4", "1", "0", "false", "16384", "4", "1", "0", "2", "0", "128", "false", "true", "true", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_body",
-      "body_args": ["CoTraits", "CoTraits::PUBLISH_M"],
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
+      "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "linear",
       "pin_variant": true,
       "pin_mask": 5,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 100
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [128, 128, 128],
       "wave_layout": [1, 4],
       "variant": "p3_bd2_loops56_pinA1C0_xcd1_contig1_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0",
@@ -2303,16 +2365,16 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["128", "128", "3", "2", "0", "true", "7168", "4", "1", "0", "2", "0", "128", "true", "true", "false", "0", "0"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["CoTraits"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
       "pin_variant": true,
       "pin_mask": 1,
-      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
+      "traits_header": "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "kid": 101,
       "supported_shapes": [
         [1088, 768, 7168],
@@ -2397,7 +2459,8 @@
       ]
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [64, 128, 256],
       "wave_layout": [1, 2],
       "launch_bounds": [128, 2],
@@ -2407,10 +2470,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["64", "128", "4", "2", "17", "true", "7168", "2", "2", "1", "2", "0", "256", "false", "false", "false", "0", "1"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["opus_gemm_bpreshuffle_b_pipeline_traits<CoTraits, false, true, -1, false>"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",
@@ -2422,7 +2485,8 @@
       ]
     },
     {
-      "pipeline": "prefetch_b_vgpr_overlap",
+      "pipeline": "b_vgpr",
+      "b_vgpr_schedule": "overlap",
       "tile": [64, 64, 256],
       "wave_layout": [1, 2],
       "variant": "p4_bd2_loops28_pinA0C0_xcd1_contig0_ca17cb1_wg1_pub2_sa1_sb1_compact1_ahead7_out0",
@@ -2431,10 +2495,10 @@
       "max_k": 7168,
       "fixed_k": 7168,
       "traits": {
-        "name": "opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits",
+        "name": "opus_gemm_bpreshuffle_b_vgpr_overlap_traits",
         "args": ["64", "64", "4", "2", "1", "true", "7168", "2", "1", "17", "2", "0", "256", "false", "false", "false", "0", "2"]
       },
-      "body_func": "opus_gemm_prefetch_b_vgpr_detail::bulk_panel_overlap_body",
+      "body_func": "opus_gemm_bpreshuffle_b_vgpr_detail::body",
       "body_args": ["opus_gemm_bpreshuffle_b_pipeline_traits<opus_gemm_bpreshuffle_b_queue_traits<CoTraits, 7>, true, true, 0, true>"],
       "pipeline_header": "opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
       "grid_layout": "xcd",

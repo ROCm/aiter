@@ -3,7 +3,7 @@
 
 #include <opus/hip_minimal.hpp>
 
-#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
 
 // Choose a BF16 output stripe that fits the reused matrix/scale LDS storage.
 __host__ __device__ constexpr int opus_gemm_blockscale_mxscale_bpreshuffle_output_rows(
@@ -19,7 +19,7 @@ template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
     int Output = 0, int BlockK = 256, bool Contiguous = false,
     bool PinA = false, bool PinC = false, int GroupM = 0,
     int SplitK = 1, bool PanelPrefetch = false, bool ByteScale = false>
-struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
+struct opus_gemm_bpreshuffle_b_vgpr_traits {
     // Workgroup launch and cache policy.
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = WN * WARP_SIZE;
@@ -76,6 +76,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr bool PIN_C = PinC;
     static constexpr int GROUPED_M = GroupM;
     static constexpr bool B_PANEL_PREFETCH = PanelPrefetch;
+    static constexpr int PUBLISH_M = -1;
     static_assert(SplitK > 0 && (SplitK == 1 || PanelPrefetch));
 
     // Bound tile grouping and pinned fragments to the supported AGPR ranges.
@@ -148,6 +149,21 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static_assert(MR * NR * 4 <= 256);
 };
 
+template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
+    int FixedK = 7168, int WN = 4, int WGPerCU = 1, int ACache = 0, int StoreCache = 2,
+    int Output = 0, int BlockK = 256, bool Contiguous = false,
+    bool PinA = false, bool PinC = false, int GroupM = 0, int PublishM = 0>
+struct opus_gemm_bpreshuffle_b_vgpr_overlap_traits
+    : opus_gemm_bpreshuffle_b_vgpr_traits<
+        BM, BN, NB, BD, BC, XCD, FixedK, WN, WGPerCU, ACache, StoreCache,
+        Output, BlockK, Contiguous, PinA, PinC, GroupM> {
+    // Select the M repeat that issues the next A-stage prefetch.
+    static constexpr int PUBLISH_M = PublishM;
+
+    // Publish before the final M repeat without changing the fragment queue.
+    static_assert(PublishM >= 0 && PublishM < BM / 16 - 1);
+};
+
 template<class Base, int Ahead>
 struct opus_gemm_bpreshuffle_b_queue_traits : Base {
     static_assert(Ahead >= 1 && Ahead <= Base::B_MAX_AHEAD);
@@ -171,11 +187,11 @@ template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false, int Fixed
          int WN = 4, int WGPerCU = 1, int ACache = 0, int StoreCache = 2, int Output = 0,
          int BlockK = 256, bool Contiguous = false, bool PinA = false, bool PinC = false,
          bool Grid2D = false, int SplitK = 1, bool ByteScale = false>
-struct opus_gemm_blockscale_mxscale_bpreshuffle_b_direct_traits
-    : opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits<
+struct opus_gemm_bpreshuffle_b_vgpr_panel_traits
+    : opus_gemm_bpreshuffle_b_vgpr_traits<
           BM, BN, NB, BD, BC, XCD, FixedK, WN, WGPerCU, ACache, StoreCache, Output, BlockK,
           Contiguous, false, false, 0, SplitK, true, ByteScale> {
-    using Base = opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits<
+    using Base = opus_gemm_bpreshuffle_b_vgpr_traits<
         BM, BN, NB, BD, BC, XCD, FixedK, WN, WGPerCU, ACache, StoreCache, Output, BlockK,
         Contiguous, false, false, 0, SplitK, true, ByteScale>;
 
@@ -265,4 +281,12 @@ template<class Base>
 struct opus_gemm_bpreshuffle_native_c_traits : Base {
     static constexpr bool NATIVE_C = true;
     static_assert(!Base::PIN_A && !Base::PIN_C);
+};
+
+// The shared stage planner omits B LDS storage for this prefetch policy.
+template<class Geometry, class Policy>
+struct opus_gemm_bpreshuffle_b_vgpr_operand_traits
+    : opus_gemm_bpreshuffle_stage_traits<Geometry, Policy>
+{
+    static_assert(Policy::B_DIRECT);
 };

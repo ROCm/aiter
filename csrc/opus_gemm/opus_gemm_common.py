@@ -2887,6 +2887,11 @@ def _load_gfx950_co_kernels(path, require_image=True):
     entries = {}
     for record in document["gfx950"]:
         entry = {**document.get("defaults", {}), **record}
+        if entry["pipeline"] == "pingpong_lds":
+            # Read existing CO manifests while exposing the current family name.
+            entry["pipeline"] = "m_repeat"
+            entry["traits"] = {**entry["traits"], "name": entry["traits"]["name"].replace("pingpong_lds", "m_repeat")}
+            entry["body_func"] = entry["body_func"].replace("pingpong_lds", "m_repeat")
         kid = entry["kid"]
         if kid in entries:
             raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
@@ -2908,10 +2913,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
         )
         family = {
             "pin_agpr": "4wave_pin_agpr_co",
-            "prefetch_b_vgpr": "b_vgpr_co",
-            "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
+            "b_vgpr": "b_vgpr_overlap_co" if entry.get("b_vgpr_schedule") == "overlap" else "b_vgpr_co",
             "wave_interleave": "interleave_co",
-            "pingpong_lds": "m_repeat_co",
+            "m_repeat": "m_repeat_co",
         }[entry["pipeline"]]
         name = "_".join(
             ("opus_gemm", "gfx950", family)
@@ -2920,8 +2924,13 @@ def _load_gfx950_co_kernels(path, require_image=True):
         suffix = entry["variant"]
         symbol = name + (f"_{suffix}" if suffix else "")
         entry["symbol"] = symbol
-        entry["name"] = _bpreshuffle_name(symbol)
-        entry["image"] = entry["name"] + ".co"
+        entry["image"] = _bpreshuffle_name(symbol) + ".co"
+        public_name = symbol
+        if entry["pipeline"] == "b_vgpr":
+            public_name = public_name.replace("b_vgpr_overlap_co", "b_vgpr_co", 1)
+            if entry.get("b_vgpr_schedule") != "overlap":
+                public_name = public_name.replace("_pub0_", "_pubnone_", 1)
+        entry["name"] = _bpreshuffle_name(public_name)
         config = {key: value for key, value in entry.items()
                   if key not in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask")}
         if image_configs.setdefault(entry["image"], config) != config:
@@ -2995,7 +3004,7 @@ def _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, suffix):
             f"_16x16x128_1x128x128_{suffix}")
 
 
-def _bpreshuffle_b_jit_suffix(bk, fixed_k, stages, bd, wg, ca, cb, output, pub=0):
+def _bpreshuffle_b_jit_suffix(bk, fixed_k, stages, bd, wg, ca, cb, output, pub="none"):
     # Match CO labels: stages, prefetch distance, BK loops, pin/address/cache,
     # residency, publication, stream/static/compact flags, queue override, output.
     return (f"p{stages}_bd{bd}_loops{fixed_k // bk}_pinA0C0_xcd1_contig0"
@@ -3100,9 +3109,9 @@ for _bk, (_fixed_k, _bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _
         _args += (2, _output)
     _register_bpreshuffle_jit(
         {
-            "pipeline": "prefetch_b_vgpr",
-            "kernel": _BP_ROOT + "prefetch_b_vgpr_bulk_panel_kernel",
-            "traits": _bpreshuffle_cpp_traits(_BP_ROOT + "prefetch_b_vgpr_traits", _args),
+            "pipeline": "b_vgpr", "b_vgpr_schedule": "fragment",
+            "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
+            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_b_vgpr_traits", _args),
             "config_name": _bpreshuffle_jit_name(
                 "b_vgpr", _bm, _bn, _bk, 1, _wn,
                 _bpreshuffle_b_jit_suffix(_bk, _fixed_k, _stages, _ahead,
@@ -3120,9 +3129,9 @@ for (_bm, _bn, _wm, _panel, _fixed_k, _gm, _ca, _cb,
              _fragments, False, _bounded, 0, _gn)
     _register_bpreshuffle_jit(
         {
-            "pipeline": "pingpong_lds",
-            "kernel": "opus_gemm_bpreshuffle_pingpong_lds_kernel",
-            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_pingpong_lds_traits", _args),
+            "pipeline": "m_repeat",
+            "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
+            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_m_repeat_traits", _args),
             # sp=scale panel, loops=FixedK/BK (auto means runtime K),
             # gm/gn=tile grouping, ca/cb=cache, frag=fragment mode, bound=guard.
             "config_name": _bpreshuffle_jit_name(
@@ -3145,15 +3154,14 @@ for (_fixed_k, _bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _bpres
                  2, _output, 256, False, False, False, 0, _publish)
         _register_bpreshuffle_jit(
             {
-                "pipeline": "prefetch_b_vgpr_overlap",
-                "kernel": _BP_ROOT + "prefetch_b_vgpr_overlap_bulk_panel_kernel",
-                "traits": _bpreshuffle_cpp_traits(_BP_ROOT + "prefetch_b_vgpr_overlap_traits", _args),
+                "pipeline": "b_vgpr", "b_vgpr_schedule": "overlap",
+                "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
+                "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_b_vgpr_overlap_traits", _args),
                 "config_name": _bpreshuffle_jit_name(
-                    "b_vgpr_overlap", _bm, _bn, 256, 1, _wn,
+                    "b_vgpr", _bm, _bn, 256, 1, _wn,
                     _bpreshuffle_b_jit_suffix(256, _fixed_k, _stages, _ahead,
                                              _wg, _ca, _cb, _output, _publish)),
                 "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
-                "traits_header": "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh",
                 "m_align": 16,
             },
             _bm, _bn, 256, 1, _wn, _fixed_k, fixed_k=_fixed_k, wg=_wg, ca=_ca, cb=_cb,
@@ -3220,9 +3228,15 @@ def _bpreshuffle_traits(name, *args):
 
 # Additional Wk=1 operand-ring configurations. M remains a runtime dimension;
 # these geometry/policy tuples are not restricted to the tuning shapes.
-def _bpreshuffle_register_ring(kid, geometry, traits, entry, *, fixed_k=0,
+def _register_bpreshuffle_small(kid, geometry, traits, entry, *, fixed_k=0,
                               max_k=16384, split_k=1, wg=1, ca=0, cb=0):
     bm, bn, bk, wm, wn = geometry
+    variant = entry["pipeline"]
+    if variant in ("m_repeat_scale", "m_repeat_stage"):
+        entry = {**entry, "pipeline": "m_repeat",
+                 "m_repeat_schedule": "staged" if variant == "m_repeat_stage" else "double_buffer",
+                 "scale_on_read": variant == "m_repeat_scale"}
+        entry["config_name"] = entry["config_name"].replace(variant + "_", "m_repeat_", 1)
     if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
         raise ValueError(f"duplicate bpreshuffle ID {kid}")
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
@@ -3239,147 +3253,147 @@ def _bpreshuffle_register_ring(kid, geometry, traits, entry, *, fixed_k=0,
 
 # Local IDs append after the existing large-shape JIT bank.
 # M remains a runtime dimension for every configuration below.
-_BPRESHUFFLE_B_DIRECT_CONFIGS = (
+_BPRESHUFFLE_B_VGPR_PANEL_CONFIGS = (
     (47632, (48, 64, 4, 2, 1, True, 1536, 4, 2, 17),
-     'b_direct_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA17cB1_k1536_nt0', 16, '', 'xcd'),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
     (47633, (64, 64, 4, 2, 1, True, 1536, 4, 1, 17),
-     'b_direct_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA17cB1_k1536_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
     (47634, (96, 64, 3, 1, 1, True, 1536, 4, 2, 17),
-     'b_direct_96x64x256_w1x4x1_p3_o0_ba1_sk1_wg2_cA17cB1_k1536_nt0', 16, '', 'xcd'),
+     'b_vgpr_96x64x256_w1x4x1_p3_o0_ba1_sk1_wg2_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
     (47635, (32, 64, 4, 2, 0, True, 7168, 4, 1, 0),
-     'b_direct_32x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_32x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47636, (48, 64, 4, 2, 17, True, 7168, 4, 2, 1),
-     'b_direct_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA1cB17_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47637, (64, 64, 4, 2, 0, True, 7168, 2, 1, 0),
-     'b_direct_64x64x256_w1x2x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x64x256_w1x2x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47638, (64, 128, 3, 1, 17, True, 7168, 8, 1, 1),
-     'b_direct_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA1cB17_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47639, (64, 128, 3, 1, 1, True, 7168, 8, 1, 17),
-     'b_direct_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA17cB1_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA17cB1_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47640, (64, 128, 3, 1, 0, True, 7168, 8, 2, 0),
-     'b_direct_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47641, (64, 128, 3, 1, 17, True, 7168, 8, 2, 1),
-     'b_direct_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA1cB17_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47642, (64, 128, 4, 2, 0, True, 7168, 8, 1, 0),
-     'b_direct_64x128x256_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
     (47643, (64, 64, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47644, (64, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, False),
-     'b_direct_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0', 16, '', 'xcd'),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
     (47645, (64, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47646, (96, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, False),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0', 16, '', 'xcd'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
     (47647, (96, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47648, (128, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, False),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0', 16, '', 'xcd'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
     (47649, (64, 128, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_64x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47650, (128, 64, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x64x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x64x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47651, (128, 128, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47652, (64, 32, 4, 2, 0, False, 3072, 2, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47653, (64, 64, 5, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47654, (96, 64, 5, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47655, (96, 128, 4, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47656, (128, 128, 4, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47657, (160, 128, 3, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47658, (192, 128, 3, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47659, (128, 256, 3, 2, 0, False, 3072, 8, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47660, (48, 128, 3, 2, 0, False, 7168, 4, 1, 0, 2, 0, 256, True, False, False, False),
-     'b_direct_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d0', 16, '', 'xcd'),
+     'b_vgpr_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
     (47661, (48, 128, 3, 2, 0, False, 7168, 4, 1, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47662, (96, 128, 4, 2, 0, False, 7168, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47663, (96, 128, 5, 2, 0, False, 7168, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x128x128_w1x4x1_p5_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p5_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47664, (128, 256, 4, 2, 0, False, 7168, 8, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47665, (16, 32, 4, 2, 0, False, 7168, 2, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_16x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_16x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47666, (48, 64, 4, 2, 0, False, 7168, 4, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47667, (96, 64, 5, 2, 0, False, 7168, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47668, (96, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47669, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47670, (160, 128, 3, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47671, (192, 128, 3, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47672, (128, 256, 3, 2, 0, False, 16384, 8, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47673, (128, 256, 4, 2, 0, False, 16384, 8, 1, 0, 2, 0, 128, True, False, False, True, 1),
-     'b_direct_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47674, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 2),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk2_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', None),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk2_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', None),
     (47675, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 4),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk4_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1', 16, '', None),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk4_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', None),
     (47676, (32, 64, 4, 2, 0, False, 1536, 2, 2, 0, 2, 0, 256, False, False, False, True),
-     'b_direct_32x64x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg0_grid2d1', 16, '', 'nm'),
+     'b_vgpr_32x64x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg0_grid2d1_pfpanel', 16, '', 'nm'),
     (47677, (64, 128, 3, 2, 0, False, 1536, 4, 1, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47678, (96, 128, 4, 2, 0, False, 1536, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47679, (64, 128, 4, 2, 0, False, 1536, 4, 1, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47680, (128, 128, 4, 2, 0, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47681, (128, 256, 4, 2, 0, False, 1536, 8, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47682, (16, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_16x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_16x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47683, (32, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47684, (64, 64, 5, 2, 0, False, 7168, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47685, (64, 128, 3, 2, 0, False, 1024, 4, 1, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47686, (128, 128, 4, 2, 0, False, 1024, 4, 1, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1', 16, '', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
     (47687, (128, 256, 4, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
-     'b_direct_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0', 16, '', 'nm'),
+     'b_vgpr_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
     (47688, (192, 256, 3, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
-     'b_direct_192x256x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0', 16, '', 'nm'),
+     'b_vgpr_192x256x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
     (47689, (224, 256, 2, 1, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
-     'b_direct_224x256x128_w1x4x1_p2_o0_ba1_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0', 16, '', 'nm'),
+     'b_vgpr_224x256x128_w1x4x1_p2_o0_ba1_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
     (47690, (128, 256, 4, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
-     'b_direct_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_bounded_threads', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
+     'b_vgpr_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
     (47691, (128, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, True),
-     'b_direct_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_bounded_threads', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
     (47692, (64, 128, 3, 1, 0, True, 7168, 8, 2, 0),
-     'b_direct_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0_bounded_threads', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'xcd'),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'xcd'),
     (47693, (48, 64, 4, 2, 0, False, 7168, 4, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail_pfpanel', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
     (47694, (32, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
-     'b_direct_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
+     'b_vgpr_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail_pfpanel', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
 )
 
-for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_DIRECT_CONFIGS:
+for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_VGPR_PANEL_CONFIGS:
     _values = list(_args)
     _defaults = (0, False, 7168, 4, 1, 0, 2, 0, 256, False, False, False, False, 1, False)
     _values.extend(_defaults[len(_values) - 4:])
     _bm, _bn, _stages, _ahead, _bc, _xcd, _k, _wn, _wg, _ca = _values[:10]
     _bk, _sk = _values[12], _values[17]
-    _traits = _bpreshuffle_traits(_BP_ROOT + "b_direct_traits", *_args)
+    _traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_b_vgpr_panel_traits", *_args)
     if _wrapper:
         _traits = _bpreshuffle_traits(_wrapper, _traits)
     _entry = {
-        "pipeline": "b_direct",
-        "kernel": _BP_ROOT + "b_direct_bulk_panel_kernel",
+        "pipeline": "b_vgpr", "b_vgpr_schedule": "panel",
+        "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
         "config_name": _name,
         "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
         "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
@@ -3393,255 +3407,256 @@ for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_DIRECT_CONFI
     if _sk > 1:
         _entry["headers"] = ("gfx950/splitk_reduce_gfx950.cuh", *_entry["headers"])
         _entry["reduce_kernel"] = "splitk_reduce_kernel"
-    _bpreshuffle_register_ring(
+    _register_bpreshuffle_small(
         _kid, (_bm, _bn, _bk, 1, _wn), _traits, _entry,
         fixed_k=_k, max_k=_k, split_k=_sk, wg=_wg, ca=_ca, cb=_bc,
     )
 
-_BPRESHUFFLE_COMPOSABLE_CONFIGS = (
+_BPRESHUFFLE_OPERAND_CONFIGS = (
     (47695, (16, 16, 1, 1, 256, 6, 7168, 4), (False, True, False, 1, 2, True, True, False, True, 0, 1, False),
-     'composable_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'xcd_split'),
+     'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'xcd_split'),
     (47696, (16, 16, 1, 1, 256, 6, 7168, 4), (True, False, False, 1, 2, True, True, False, True, 0, 1, False),
-     'composable_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47697, (32, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, True, True, 0, 1, False),
-     'composable_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
     (47698, (48, 32, 1, 2, 256, 4, 7168, 4), (True, True, False, 1, 0, True, True, True, True, 3, 1, False),
-     'composable_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal1_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
     (47699, (64, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47700, (64, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47701, (48, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47702, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, True, True, 3, 1, True),
-     'composable_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd1', 4, False, 'xcd_split'),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd1_operand', 4, False, 'xcd_split'),
     (47703, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1', 4, False, 'xcd_split'),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47704, (48, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1', 4, False, 'xcd_split'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47705, (96, 64, 2, 2, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, True, True, 3, 1, True),
-     'composable_96x64x128_w2x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_96x64x128_w2x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd1_operand', 4, False, 'xcd_split'),
     (47706, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47707, (64, 64, 4, 1, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x128_w4x1x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_64x64x128_w4x1x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47708, (64, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1', 4, False, 'xcd_split'),
+     'b_vgpr_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47709, (64, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, True, True, 3, 1, False),
-     'composable_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'xcd_split'),
     (47710, (128, 64, 4, 2, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_128x64x128_w4x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47711, (48, 64, 1, 4, 256, 5, 7168, 2), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1', 4, False, 'xcd_split'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47712, (48, 64, 1, 4, 256, 5, 7168, 2), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47713, (64, 64, 4, 2, 256, 4, 7168, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47714, (64, 64, 4, 2, 128, 5, 7168, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x128_w4x2x1_p5_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_64x64x128_w4x2x1_p5_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47715, (48, 64, 1, 4, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47716, (48, 64, 1, 2, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_48x64x256_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1', 4, False, 'xcd'),
+     'b_vgpr_48x64x256_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd'),
     (47717, (16, 32, 1, 1, 128, 4, 384, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
     (47718, (16, 32, 1, 2, 256, 4, 768, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
     (47719, (16, 32, 1, 2, 128, 9, 1024, 1), (False, False, False, 1, 2, True, True, True, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp0_ps0_bd0_normal1_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp0_ps0_bd0_normal1_xcd0_operand', 1, False, 'nm'),
     (47720, (16, 32, 1, 1, 128, 5, 1536, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
     (47721, (16, 32, 1, 2, 128, 6, 1536, 1), (False, False, True, 3, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0', 1, False, 'nm'),
+     'b_vgpr_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_operand', 1, False, 'nm'),
     (47722, (16, 32, 1, 2, 128, 11, 1536, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
     (47723, (16, 32, 1, 2, 128, 5, 1536, 1), (False, False, True, 2, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0', 1, False, 'nm'),
+     'b_vgpr_16x32x128_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_operand', 1, False, 'nm'),
     (47724, (16, 32, 1, 2, 128, 4, 384, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47725, (16, 32, 1, 2, 256, 4, 768, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
-     'composable_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
     (47726, (16, 32, 1, 2, 128, 9, 1024, 1), (True, False, False, 1, 2, True, True, True, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps0_bd0_normal1_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'nm'),
     (47727, (16, 32, 1, 2, 128, 10, 7168, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p10_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p10_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47728, (32, 64, 2, 2, 128, 6, 1536, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_32x64x128_w2x2x1_p6_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_32x64x128_w2x2x1_p6_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47729, (16, 32, 1, 2, 128, 8, 1024, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p8_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p8_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47730, (16, 32, 1, 2, 128, 6, 1536, 1), (True, False, True, 3, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47731, (16, 32, 1, 2, 512, 6, 3072, 1), (True, True, True, 3, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k3072_nt0_cp1_ps1_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_16x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k3072_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47732, (16, 32, 1, 1, 128, 5, 1536, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
-     'composable_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal1_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
     (47733, (16, 32, 1, 2, 128, 5, 1536, 1), (True, False, True, 3, 2, True, True, True, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p5_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal1_xcd0', 4, False, 'nm'),
+     'b_vgpr_16x32x128_w1x2x1_p5_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
     (47734, (32, 32, 1, 1, 128, 4, 384, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_32x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_32x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47735, (32, 32, 1, 2, 256, 4, 1024, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_32x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_32x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47736, (48, 32, 1, 2, 128, 4, 384, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_48x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_48x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47737, (48, 32, 1, 2, 256, 4, 768, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
-     'composable_48x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0', 4, False, 'nm'),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
     (47738, (64, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 4, 2, True, True, False, True, 3, 1, False),
-     'composable_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47739, (64, 128, 1, 4, 128, 4, 1536, 1), (True, False, True, 2, 2, True, True, False, True, 3, 1, False),
-     'composable_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47740, (64, 32, 1, 2, 128, 4, 384, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_64x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_64x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47741, (64, 32, 1, 2, 256, 4, 768, 1), (True, True, True, 2, 2, True, True, False, True, 3, 1, False),
-     'composable_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47742, (64, 32, 1, 2, 256, 4, 1024, 1), (True, True, True, 2, 2, True, True, False, True, 3, 1, False),
-     'composable_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47743, (64, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 3, 2, True, True, False, True, 3, 1, False),
-     'composable_64x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47744, (96, 64, 2, 2, 128, 5, 16384, 2), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_96x64x128_w2x2x1_p5_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_96x64x128_w2x2x1_p5_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47745, (96, 128, 1, 4, 128, 4, 1536, 1), (True, False, True, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_96x128x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47746, (48, 64, 1, 4, 256, 5, 3072, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47747, (96, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 3, 2, True, True, True, True, 3, 1, False),
-     'composable_96x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal1_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_96x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'xcd_split'),
     (47748, (128, 64, 1, 4, 128, 6, 7168, 2), (True, False, True, 3, 0, True, True, False, True, 3, 1, False),
-     'composable_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'xcd_split'),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47749, (128, 128, 4, 2, 128, 4, 16384, 4), (True, False, False, 1, 2, True, True, False, True, 3, 1, True),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47750, (64, 64, 1, 4, 256, 4, 1024, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_64x64x256_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB0_k1024_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_64x64x256_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB0_k1024_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47751, (96, 64, 1, 4, 128, 6, 768, 1), (True, False, True, 2, 0, True, True, True, True, 3, 1, False),
-     'composable_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal1_xcd0', 4, False, 'nm'),
+     'b_vgpr_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
     (47752, (96, 64, 1, 4, 128, 4, 384, 1), (True, False, True, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_96x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_96x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47753, (128, 64, 4, 2, 128, 5, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47754, (128, 64, 4, 2, 128, 5, 768, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47755, (128, 128, 4, 2, 128, 4, 16384, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
     (47756, (128, 64, 2, 2, 128, 4, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_128x64x128_w2x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_128x64x128_w2x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47757, (192, 128, 4, 2, 128, 3, 16384, 2), (True, False, False, 1, 0, True, True, True, True, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
     (47758, (192, 128, 4, 2, 128, 3, 1536, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k1536_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k1536_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47759, (192, 128, 4, 2, 128, 3, 16384, 2), (True, False, False, 1, 0, True, True, True, True, 3, 1, True),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd1', 4, False, 'xcd_split'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd1_operand', 4, False, 'xcd_split'),
     (47760, (128, 128, 4, 2, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1', 4, False, 'xcd'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd'),
     (47761, (128, 128, 2, 4, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_128x128x128_w2x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_128x128x128_w2x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47762, (128, 128, 4, 2, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47763, (128, 128, 1, 4, 128, 4, 7168, 1), (True, False, True, 3, 0, True, True, True, True, 3, 1, False),
-     'composable_128x128x128_w1x4x1_p4_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0', 4, False, 'nm'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
     (47764, (192, 128, 4, 2, 128, 3, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47765, (192, 128, 4, 2, 128, 3, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47766, (64, 64, 1, 4, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst', 4, True, 'mn'),
+     'm_repeat_64x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
     (47767, (64, 64, 4, 1, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x128_w4x1x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst', 4, True, 'mn'),
+     'm_repeat_64x64x128_w4x1x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
     (47768, (64, 64, 2, 2, 128, 5, 768, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_64x64x128_w2x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps1_bd0_normal0_mfirst', 4, True, 'mn'),
+     'm_repeat_64x64x128_w2x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
     (47769, (96, 64, 1, 4, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_96x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst', 4, True, 'mn'),
+     'm_repeat_96x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
     (47770, (96, 64, 1, 4, 128, 6, 768, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst', 4, True, 'mn'),
+     'b_vgpr_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
     (47771, (128, 64, 1, 4, 128, 4, 384, 1), (True, True, True, 1, 0, True, True, False, True, 3, 1, True),
-     'composable_128x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd1_normal0_mfirst', 4, True, 'mn'),
+     'b_vgpr_128x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd1_normal0_mfirst_operand', 4, True, 'mn'),
     (47772, (128, 64, 2, 2, 128, 5, 768, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
-     'composable_128x64x128_w2x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst', 4, True, 'mn'),
+     'b_vgpr_128x64x128_w2x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
     (47773, (48, 64, 1, 4, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
-     'composable_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_mfirst', 4, True, 'mn'),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
     (47774, (16, 32, 1, 2, 128, 8, 7168, 4), (False, True, False, 1, 2, True, True, False, True, 0, 1, False),
-     'composable_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'xcd_split'),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'xcd_split'),
     (47775, (16, 32, 1, 2, 128, 8, 7168, 4), (True, True, False, 1, 0, True, True, False, True, 0, 1, False),
-     'composable_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47776, (16, 32, 1, 2, 256, 7, 7168, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x256_w1x2x1_p7_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0', 1, False, 'nm'),
+     'm_repeat_16x32x256_w1x2x1_p7_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
     (47777, (16, 32, 1, 2, 128, 11, 1536, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
-     'composable_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal0_xcd0', 4, False, 'nm'),
+     'm_repeat_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
     (47778, (32, 32, 1, 2, 512, 6, 7168, 1), (True, False, True, 3, 0, True, True, False, True, 3, 1, False),
-     'composable_32x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0', 4, False, 'nm'),
+     'b_vgpr_32x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
     (47779, (192, 128, 4, 2, 128, 3, 16384, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd0', 4, False, 'xcd_split'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
     (47780, (128, 64, 1, 4, 128, 6, 7168, 2), (False, False, True, 3, 2, True, True, False, False, 3, 1, False),
-     'composable_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47781, (128, 128, 4, 2, 128, 4, 16384, 4), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47782, (64, 32, 2, 2, 256, 4, 7168, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47783, (128, 64, 4, 1, 128, 4, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_128x64x128_w4x1x1_p4_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_128x64x128_w4x1x1_p4_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47784, (16, 32, 1, 1, 128, 5, 1536, 1), (False, True, False, 1, 2, True, True, False, False, 0, 1, False),
-     'composable_16x32x128_w1x1x1_p5_o0_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'nm'),
+     'm_repeat_16x32x128_w1x1x1_p5_o0_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47785, (192, 128, 4, 2, 128, 3, 16384, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47786, (16, 32, 1, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
-     'composable_16x32x256_w1x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_16x32x256_w1x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47787, (128, 64, 4, 1, 128, 4, 7168, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_128x64x128_w4x1x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_128x64x128_w4x1x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47788, (128, 128, 1, 4, 128, 4, 7168, 2), (False, False, True, 3, 0, True, True, False, False, 3, 1, False),
-     'composable_128x128x128_w1x4x1_p4_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'b_vgpr_128x128x128_w1x4x1_p4_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47789, (128, 128, 4, 2, 128, 4, 7168, 2), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47790, (64, 64, 4, 2, 256, 4, 7168, 2), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47791, (128, 64, 1, 4, 128, 6, 768, 1), (False, False, True, 3, 0, True, True, False, False, 3, 1, False),
-     'composable_128x64x128_w1x4x1_p6_o3_ba3_sk1_wg1_cA0cB0_k768_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk1_wg1_cA0cB0_k768_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47792, (16, 32, 1, 2, 256, 6, 3072, 1), (False, True, False, 1, 2, True, True, False, False, 0, 1, False),
-     'composable_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'nm'),
+     'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47793, (32, 64, 2, 2, 128, 6, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_32x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_32x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47794, (32, 64, 2, 2, 128, 4, 16384, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_32x64x128_w2x2x1_p4_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_32x64x128_w2x2x1_p4_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47795, (32, 32, 1, 2, 512, 6, 3072, 1), (False, False, True, 3, 0, True, True, False, False, 0, 1, False),
-     'composable_32x32x512_w1x2x1_p6_o0_ba3_sk1_wg1_cA0cB0_k3072_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_32x32x512_w1x2x1_p6_o0_ba3_sk1_wg1_cA0cB0_k3072_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47796, (16, 32, 1, 2, 256, 5, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
-     'composable_16x32x256_w1x2x1_p5_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_16x32x256_w1x2x1_p5_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47797, (64, 64, 1, 4, 128, 8, 1536, 1), (False, False, True, 4, 2, True, True, False, False, 3, 1, False),
-     'composable_64x64x128_w1x4x1_p8_o3_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47798, (48, 32, 1, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47799, (64, 64, 2, 2, 128, 6, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_64x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_64x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47800, (16, 32, 1, 2, 128, 8, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
-     'composable_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47801, (16, 32, 1, 2, 128, 6, 1536, 1), (False, False, True, 4, 2, True, True, False, False, 0, 1, False),
-     'composable_16x32x128_w1x2x1_p6_o0_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_16x32x128_w1x2x1_p6_o0_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47802, (128, 128, 4, 2, 128, 4, 7168, 1), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived', 1, False, 'nm'),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47803, (64, 128, 1, 4, 128, 4, 1536, 1), (False, False, True, 2, 2, True, True, False, False, 3, 1, False),
-     'composable_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
     (47804, (64, 64, 1, 4, 128, 8, 7168, 2), (False, False, True, 4, 2, True, True, False, False, 3, 1, False),
-     'composable_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47805, (96, 32, 2, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 3, 1, False),
-     'composable_96x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'm_repeat_96x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47806, (96, 64, 1, 4, 256, 4, 7168, 2), (False, False, True, 2, 0, True, True, False, False, 3, 1, False),
-     'composable_96x64x256_w1x4x1_p4_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'xcd_split'),
+     'b_vgpr_96x64x256_w1x4x1_p4_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
     (47807, (96, 128, 1, 4, 128, 3, 1536, 1), (False, False, True, 1, 2, True, True, False, False, 3, 1, False),
-     'composable_96x128x128_w1x4x1_p3_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived', 1, False, 'nm'),
+     'b_vgpr_96x128x128_w1x4x1_p3_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
 )
 
-for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_COMPOSABLE_CONFIGS:
+for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_OPERAND_CONFIGS:
     _bm, _bn, _wm, _wn, _bk, _stages, _k, _sk = _geometry[:8]
+    _family = "b_vgpr" if _policy[2] else "m_repeat"
     _traits = _bpreshuffle_traits(
-        "opus_gemm_composable_traits",
-        _bpreshuffle_traits("opus_gemm_composable_geometry", *_geometry),
-        _bpreshuffle_traits("opus_gemm_composable_policy", *_policy),
+        f"opus_gemm_bpreshuffle_{_family}_operand_traits",
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_geometry", *_geometry),
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_policy", *_policy),
     )
     if _m_first:
-        _traits = _bpreshuffle_traits("opus_gemm_composable_mfirst_traits", _traits)
+        _traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_mfirst_traits", _traits)
     _entry = {
-        "pipeline": "composable",
-        "kernel": "opus_gemm_composable_split_kernel" if _sk > 1 else "opus_gemm_composable_direct_kernel",
+        "pipeline": _family, f"{_family}_schedule": "operand",
+        "kernel": f"opus_gemm_bpreshuffle_{_family}_kernel",
         "config_name": _name,
-        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_composable_gfx950.cuh",),
-        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_composable_gfx950.cuh",),
+        "headers": (f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{_family}_gfx950.cuh",),
+        "host_traits_headers": (f"gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_{_family}_gfx950.cuh",),
         "host_kind": "xcd_ring" if _sk > 1 else "tile",
         "m_align": _m_align,
         "workspace_rule": ["tiles", 4 * _sk, _bm, _bn, 4] if _sk > 1 else ["none"],
@@ -3649,67 +3664,68 @@ for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_C
     }
     if _grid is not None:
         _entry["grid_kind"] = _grid
-    _bpreshuffle_register_ring(
+    _register_bpreshuffle_small(
         _kid, (_bm, _bn, _bk, _wm, _wn), _traits, _entry,
         fixed_k=_k, max_k=_k, split_k=_sk, cb=_policy[4],
     )
 
-_BPRESHUFFLE_XCD_RING_CONFIGS = (
-    (47808, 'xcd_ring',
-     (16, 32, 2, 256, 6, 7168, 4), 'xcd_ring_16x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0', 1),
-    (47809, 'xcd_ring',
-     (32, 32, 2, 256, 6, 7168, 4), 'xcd_ring_32x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0', 1),
-    (47810, 'xcd_ring',
-     (32, 32, 2, 256, 4, 7168, 4, 2, False, 0), 'xcd_ring_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_compact0', 1),
-    (47811, 'xcd_ring',
-     (16, 16, 1, 256, 6, 7168, 4, 1, False, 2), 'xcd_ring_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact0', 1),
-    (47812, 'xcd_ring',
-     (16, 16, 1, 256, 6, 7168, 4, 1, True, 2), 'xcd_ring_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact1', 4),
-    (47813, 'stream_ring',
-     (16, 32, 2, 128, 12, 3072, 1, 1, False, 2), 'stream_ring_16x32x128_w1x2x1_p12_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0', 1),
-    (47814, 'stream_ring',
-     (16, 32, 2, 128, 10, 7168, 1, 1, False, 2), 'stream_ring_16x32x128_w1x2x1_p10_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0', 1),
-    (47815, 'stream_ring',
-     (16, 32, 2, 256, 7, 7168, 1, 1, False, 2), 'stream_ring_16x32x256_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0', 1),
-    (47816, 'stream_ring',
-     (16, 32, 2, 256, 6, 16384, 1, 1, False, 2), 'stream_ring_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0', 1),
-    (47817, 'stream_ring',
-     (32, 32, 2, 256, 5, 7168, 1, 2, False, 2), 'stream_ring_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0', 1),
-    (47818, 'stream_ring',
-     (64, 32, 2, 256, 4, 7168, 1, 2, False, 2), 'stream_ring_64x32x256_w2x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0', 1),
-    (47819, 'stream_ring',
-     (32, 32, 2, 256, 5, 16384, 1, 2, False, 2), 'stream_ring_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0', 1),
-    (47820, 'resident_ring',
-     (32, 32, 2, 128, 7, 768, 1, 1, False, 2), 'resident_ring_32x32x128_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k768_nt0', 1),
-    (47821, 'resident_ring',
-     (48, 32, 2, 128, 4, 384, 1, 1, False, 2), 'resident_ring_48x32x128_w1x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k384_nt0', 1),
+_BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS = (
+    (47808, 'unrolled',
+     (16, 32, 2, 256, 6, 7168, 4), 'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_loop_unrolled', 1),
+    (47809, 'unrolled',
+     (32, 32, 2, 256, 6, 7168, 4), 'm_repeat_32x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_loop_unrolled', 1),
+    (47810, 'unrolled',
+     (32, 32, 2, 256, 4, 7168, 4, 2, False, 0), 'm_repeat_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_compact0_loop_unrolled', 1),
+    (47811, 'unrolled',
+     (16, 16, 1, 256, 6, 7168, 4, 1, False, 2), 'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact0_loop_unrolled', 1),
+    (47812, 'unrolled',
+     (16, 16, 1, 256, 6, 7168, 4, 1, True, 2), 'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact1_loop_unrolled', 4),
+    (47813, 'rolled',
+     (16, 32, 2, 128, 12, 3072, 1, 1, False, 2), 'm_repeat_16x32x128_w1x2x1_p12_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0_loop_rolled', 1),
+    (47814, 'rolled',
+     (16, 32, 2, 128, 10, 7168, 1, 1, False, 2), 'm_repeat_16x32x128_w1x2x1_p10_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47815, 'rolled',
+     (16, 32, 2, 256, 7, 7168, 1, 1, False, 2), 'm_repeat_16x32x256_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47816, 'rolled',
+     (16, 32, 2, 256, 6, 16384, 1, 1, False, 2), 'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0_loop_rolled', 1),
+    (47817, 'rolled',
+     (32, 32, 2, 256, 5, 7168, 1, 2, False, 2), 'm_repeat_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47818, 'rolled',
+     (64, 32, 2, 256, 4, 7168, 1, 2, False, 2), 'm_repeat_64x32x256_w2x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47819, 'rolled',
+     (32, 32, 2, 256, 5, 16384, 1, 2, False, 2), 'm_repeat_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0_loop_rolled', 1),
+    (47820, 'unrolled',
+     (32, 32, 2, 128, 7, 768, 1, 1, False, 2), 'm_repeat_32x32x128_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k768_nt0_loop_unrolled', 1),
+    (47821, 'unrolled',
+     (48, 32, 2, 128, 4, 384, 1, 1, False, 2), 'm_repeat_48x32x128_w1x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k384_nt0_loop_unrolled', 1),
 )
 
-for _kid, _pipeline, _args, _name, _m_align in _BPRESHUFFLE_XCD_RING_CONFIGS:
+for _kid, _loop, _args, _name, _m_align in _BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS:
     _bm, _bn, _wn, _bk, _stages, _k, _sk = _args[:7]
     _wm = _args[7] if len(_args) > 7 else 1
     _bc = _args[9] if len(_args) > 9 else 0
     _entry = {
-        "pipeline": _pipeline,
-        "kernel": _BP_ROOT + _pipeline + "_kernel",
+        "pipeline": "m_repeat_stage", "loop": _loop,
+        "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
         "config_name": _name,
-        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_xcd_ring_gfx950.cuh",),
-        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_xcd_ring_gfx950.cuh",),
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
         "host_kind": "xcd_ring" if _sk > 1 else "tile",
         "grid_kind": "xcd_split" if _sk > 1 else "nm",
         "m_align": _m_align,
         "workspace_rule": ["tiles", 4 * _sk, _bm, _bn, 4] if _sk > 1 else ["none"],
         "workspace_zero_init": _sk > 1,
     }
-    _bpreshuffle_register_ring(
+    _register_bpreshuffle_small(
         _kid, (_bm, _bn, _bk, _wm, _wn),
-        _bpreshuffle_traits("opus_gemm_bpreshuffle_xcd_ring_traits", *_args), _entry,
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_stage_traits",
+                            *_args, *(1, False, 0)[len(_args) - 7:], _loop == "rolled"), _entry,
         fixed_k=_k, max_k=_k, split_k=_sk, cb=_bc,
     )
 
 
 # These panel configurations use JIT instantiation; no new CO images are needed.
-_BPRESHUFFLE_LDS_PANEL_CONFIGS = (
+_BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS = (
     (47822, ('192', '256', '16', '0', '4', '0', '0', '0'), (192, 256, 128, 4, 2), 0, 2048),
     (47823, ('128', '128', '64', '0', '2', '0', '0', '0'), (128, 128, 128, 2, 2), 0, 8192),
     (47824, ('192', '256', '16', '1536', '4', '0', '0', '0', 'false', 'false', 'false', 'false', 'true'), (192, 256, 128, 4, 2), 1536, 2048),
@@ -3718,7 +3734,7 @@ _BPRESHUFFLE_LDS_PANEL_CONFIGS = (
     (47827, ('256', '256', '16', '1536', '4', '0', '0', '2', 'true', 'false', 'false', 'false', 'false'), (256, 256, 128, 4, 2), 1536, 1536),
 )
 
-for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_LDS_PANEL_CONFIGS:
+for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS:
     _bm, _bn, _bk, _wm, _wn = _geometry
     _panel, _gm, _ca, _cb = map(int, (_args[2], *_args[5:8]))
     _flags = (*_args[8:], *("false",) * (13 - len(_args)))
@@ -3728,18 +3744,18 @@ for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_LDS_PANEL_CONFIGS:
     _suffix = (f"sp{_panel}_k{_fixed_k}_gm{_gm}_ca{_ca}cb{_cb}"
                f"_frag{_fragment}_pinA{_pin_a}B{_pin_b}C{_pin_c}_xcd{_xcd}")
     _entry = {
-        "pipeline": "lds_panel",
-        "kernel": _BP_ROOT + "lds_panel_kernel",
+        "pipeline": "m_repeat_scale",
+        "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
         "config_name": _bpreshuffle_jit_name(
-            "lds_panel", _bm, _bn, _bk, _wm, _wn, _suffix),
+            "m_repeat_scale", _bm, _bn, _bk, _wm, _wn, _suffix),
         "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
         "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
         "host_kind": "tile", "grid_kind": "nm", "m_align": 16,
         "workspace_rule": ["none"], "workspace_zero_init": False,
     }
-    _bpreshuffle_register_ring(
+    _register_bpreshuffle_small(
         _kid, _geometry,
-        _bpreshuffle_traits("opus_gemm_bpreshuffle_lds_panel_traits", *_args), _entry,
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_scale_traits", *_args), _entry,
         fixed_k=_fixed_k, max_k=_max_k, ca=_ca, cb=_cb,
     )
 
@@ -3751,7 +3767,7 @@ _BPRESHUFFLE_SMALL_FIXED_K = (384, *_BPRESHUFFLE_JIT_FIXED_K)
 _BPRESHUFFLE_SMALL_SCHEDULES = ((2, 1), (3, 1), (3, 2), (4, 2))
 
 
-def _bpreshuffle_b_direct_legal(args):
+def _bpreshuffle_b_vgpr_panel_legal(args):
     (bm, bn, stages, ahead, cb, xcd, fixed_k, wn, wg, ca,
      _store, output, bk, _contiguous, pin_a, pin_c, grid2d, split, byte_scale) = args
     threads = wn * 64
@@ -3779,7 +3795,7 @@ def _bpreshuffle_b_direct_legal(args):
             and (split > 1 or output != 0 or 16 * (bn + 8) * 2 <= lds))
 
 
-def _bpreshuffle_small_b_direct_configs():
+def _bpreshuffle_small_b_vgpr_panel_configs():
     for bm, bn, wn, bk, fixed_k, split, schedule, wg, caches, output in product(
         (16, 32, 48, 64, 96, 128), (32, 64, 128), (1, 2, 4, 8),
         (128, 256), _BPRESHUFFLE_SMALL_FIXED_K, (1, 2, 4),
@@ -3797,11 +3813,11 @@ def _bpreshuffle_small_b_direct_configs():
         for contiguous, xcd, grid2d, byte_scale in modes:
             args = (bm, bn, stages, ahead, cb, xcd, fixed_k, wn, wg, ca,
                     2, output, bk, contiguous, False, False, grid2d, split, byte_scale)
-            if _bpreshuffle_b_direct_legal(args):
+            if _bpreshuffle_b_vgpr_panel_legal(args):
                 yield args
 
 
-def _bpreshuffle_composable_legal(geometry, policy):
+def _bpreshuffle_operand_legal(geometry, policy):
     bm, bn, wm, wn, bk, stages, total_k, split, fixed_n = geometry
     compact, perstage, direct, ahead, cb, async_groups, _contiguous, _normal, _simple, output, address, _xcd = policy
     if (min(bm, bn, wm, wn, total_k, split) <= 0 or wm * wn > 8
@@ -3828,7 +3844,7 @@ def _bpreshuffle_composable_legal(geometry, policy):
     return max(main, bm * (bn + 8) * 2) + 16 <= 160 * 1024
 
 
-def _bpreshuffle_small_composable_configs():
+def _bpreshuffle_small_operand_configs():
     # Explore shared/direct operands and resident/per-stage scales as policies,
     # rather than retaining only the configurations that previously won.
     load_policies = ((False, True, False), (True, True, False),
@@ -3846,11 +3862,11 @@ def _bpreshuffle_small_composable_configs():
         ):
             policy = (compact, perstage, direct, 2 if direct else 1, cb,
                       True, True, normal, False, 3, 1, False)
-            if _bpreshuffle_composable_legal(geometry, policy):
+            if _bpreshuffle_operand_legal(geometry, policy):
                 yield geometry, policy
 
 
-def _bpreshuffle_small_ring_configs():
+def _bpreshuffle_small_m_repeat_stage_configs():
     for bm, bn, waves, bk, stages, total_k, split, compact, cb in product(
         (16, 32, 48, 64, 96, 128), (16, 32, 64, 128),
         ((1, 1), (1, 2), (1, 4), (2, 2)), (128, 256),
@@ -3870,15 +3886,12 @@ def _bpreshuffle_small_ring_configs():
         if sc > threads or lds + 4 > 160 * 1024:
             continue
         args = (bm, bn, wn, bk, stages, total_k, split, wm, compact, cb)
-        if split > 1:
-            yield "xcd_ring", args
-        else:
-            yield "resident_ring", args
-            if not compact:
-                yield "stream_ring", args
+        yield "unrolled", args
+        if split == 1 and not compact:
+            yield "rolled", args
 
 
-def _bpreshuffle_small_lds_panel_configs():
+def _bpreshuffle_small_m_repeat_scale_configs():
     for bm, bn, wm, panel, fixed_k, gm, caches, fragments, xcd in product(
         (64, 96, 128, 192, 256), (64, 128, 256), (2, 4), (16, 32, 64, 128),
         (0, *_BPRESHUFFLE_SMALL_FIXED_K), (0, 4, 8),
@@ -3898,19 +3911,19 @@ def _bpreshuffle_small_lds_panel_configs():
 
 
 _small_config_signatures = set()
-for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_DIRECT_CONFIGS:
+for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_VGPR_PANEL_CONFIGS:
     _values = list(_args)
     _defaults = (0, False, 7168, 4, 1, 0, 2, 0, 256, False, False, False, False, 1, False)
     _values.extend(_defaults[len(_values) - 4:])
-    _small_config_signatures.add(("b_direct", tuple(_values), _wrapper))
-for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_COMPOSABLE_CONFIGS:
-    _small_config_signatures.add(("composable", (*_geometry, *((0,) if len(_geometry) == 8 else ())), _policy, _m_first))
-for _kid, _pipeline, _args, _name, _m_align in _BPRESHUFFLE_XCD_RING_CONFIGS:
+    _small_config_signatures.add(("b_vgpr_panel", tuple(_values), _wrapper))
+for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_OPERAND_CONFIGS:
+    _small_config_signatures.add(("operand", (*_geometry, *((0,) if len(_geometry) == 8 else ())), _policy, _m_first))
+for _kid, _loop, _args, _name, _m_align in _BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS:
     _defaults = (1, False, 0)
-    _small_config_signatures.add((_pipeline, (*_args, *_defaults[len(_args) - 7:])))
-for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_LDS_PANEL_CONFIGS:
+    _small_config_signatures.add(("m_repeat_stage", (*_args, *_defaults[len(_args) - 7:]), f"loop_{_loop}"))
+for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS:
     _values = tuple(int(v) if v not in ("true", "false") else v == "true" for v in _args)
-    _small_config_signatures.add(("lds_panel", (*_values, *((False,) * (13 - len(_values))))))
+    _small_config_signatures.add(("m_repeat_scale", (*_values, *((False,) * (13 - len(_values))))))
 
 _next_small_kid = max(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list) + 1
 
@@ -3926,8 +3939,15 @@ def _register_generated_small(signature, traits, geometry, entry, *, fixed_k,
     params = signature[1:]
     token = "_".join(str(v).lower() for group in params
                      for v in (group if isinstance(group, tuple) else (group,)))
-    entry["config_name"] = _bpreshuffle_jit_name(signature[0], bm, bn, bk, wm, wn, token)
-    _bpreshuffle_register_ring(
+    family = signature[0]
+    if family in ("b_vgpr_panel", "b_vgpr_panel_native_c"):
+        token += "_pfpanel" + ("_native_c" if family.endswith("_native_c") else "")
+        family = "b_vgpr"
+    elif family == "operand":
+        family = entry["pipeline"]
+        token += "_operand"
+    entry["config_name"] = _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, token)
+    _register_bpreshuffle_small(
         _next_small_kid, geometry, traits, entry,
         fixed_k=fixed_k, max_k=fixed_k if max_k is None else max_k,
         split_k=split_k, wg=wg, ca=ca, cb=cb,
@@ -3936,7 +3956,7 @@ def _register_generated_small(signature, traits, geometry, entry, *, fixed_k,
 
 
 def _small_pipeline_entry(pipeline, header, kernel, *, split=1, bm=0, bn=0, m_align=1):
-    header = {"b_direct": "b_vgpr", "lds_panel": "m_repeat"}.get(header, header)
+    header = {"m_repeat_scale": "m_repeat", "m_repeat_stage": "m_repeat"}.get(header, header)
     host_kind = "xcd_ring" if split > 1 else "tile"
     return {
         "pipeline": pipeline, "kernel": kernel,
@@ -3949,14 +3969,15 @@ def _small_pipeline_entry(pipeline, header, kernel, *, split=1, bm=0, bn=0, m_al
     }
 
 
-def _register_b_direct_config(args, *, native_c=False):
+def _register_b_vgpr_panel_config(args, *, native_c=False):
     bm, bn, _stages, _ahead, cb, _xcd, fixed_k, wn, wg, ca = args[:10]
     bk, split = args[12], args[17]
-    traits = _bpreshuffle_traits(_BP_ROOT + "b_direct_traits", *args)
+    traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_b_vgpr_panel_traits", *args)
     if native_c:
         traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_native_c_traits", traits)
     entry = _small_pipeline_entry(
-        "b_direct", "b_direct", _BP_ROOT + "b_direct_bulk_panel_kernel", m_align=16)
+        "b_vgpr", "b_vgpr", "opus_gemm_bpreshuffle_b_vgpr_kernel", m_align=16)
+    entry["b_vgpr_schedule"] = "panel"
     entry["grid_kind"] = "nm" if args[16] else "xcd"
     if split > 1:
         entry.update(host_kind="reduce",
@@ -3964,41 +3985,45 @@ def _register_b_direct_config(args, *, native_c=False):
                      reduce_kernel="splitk_reduce_kernel",
                      workspace_rule=["mn", 4 * split, 0])
     _register_generated_small(
-        ("b_direct_native_c" if native_c else "b_direct", args, ""), traits,
+        ("b_vgpr_panel_native_c" if native_c else "b_vgpr_panel", args, ""), traits,
         (bm, bn, bk, 1, wn), entry, fixed_k=fixed_k, split_k=split,
         wg=wg, ca=ca, cb=cb)
 
 
-for _args in _bpreshuffle_small_b_direct_configs():
-    _register_b_direct_config(_args)
+for _args in _bpreshuffle_small_b_vgpr_panel_configs():
+    _register_b_vgpr_panel_config(_args)
 
-for _geometry, _policy in _bpreshuffle_small_composable_configs():
+for _geometry, _policy in _bpreshuffle_small_operand_configs():
     _bm, _bn, _wm, _wn, _bk, _st, _k, _sk, _fn = _geometry
-    _traits = _bpreshuffle_traits("opus_gemm_composable_traits",
-                                _bpreshuffle_traits("opus_gemm_composable_geometry", *_geometry),
-                                _bpreshuffle_traits("opus_gemm_composable_policy", *_policy))
-    _entry = _small_pipeline_entry("composable", "composable", "opus_gemm_composable_split_kernel" if _sk > 1 else "opus_gemm_composable_direct_kernel",
+    _family = "b_vgpr" if _policy[2] else "m_repeat"
+    _traits = _bpreshuffle_traits(f"opus_gemm_bpreshuffle_{_family}_operand_traits",
+                                _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_geometry", *_geometry),
+                                _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_policy", *_policy))
+    _entry = _small_pipeline_entry(_family, _family, f"opus_gemm_bpreshuffle_{_family}_kernel",
                                    split=_sk, bm=_bm, bn=_bn, m_align=4 if _policy[0] else 1)
-    _register_generated_small(("composable", _geometry, _policy, False), _traits,
+    _entry[f"{_family}_schedule"] = "operand"
+    _register_generated_small(("operand", _geometry, _policy, False), _traits,
                               (_bm, _bn, _bk, _wm, _wn), _entry, fixed_k=_k, split_k=_sk, cb=_policy[4])
 
-for _pipeline, _args in _bpreshuffle_small_ring_configs():
+for _loop, _args in _bpreshuffle_small_m_repeat_stage_configs():
     _bm, _bn, _wn, _bk, _st, _k, _sk, _wm, _compact, _cb = _args
-    _entry = _small_pipeline_entry(_pipeline, "xcd_ring", _BP_ROOT + _pipeline + "_kernel",
+    _entry = _small_pipeline_entry("m_repeat_stage", "m_repeat_stage", "opus_gemm_bpreshuffle_m_repeat_kernel",
                                    split=_sk, bm=_bm, bn=_bn, m_align=4 if _compact else 1)
-    _register_generated_small((_pipeline, _args), _bpreshuffle_traits("opus_gemm_bpreshuffle_xcd_ring_traits", *_args),
+    _entry["loop"] = _loop
+    _register_generated_small(("m_repeat_stage", _args, f"loop_{_loop}"),
+                              _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_stage_traits", *_args, _loop == "rolled"),
                               (_bm, _bn, _bk, _wm, _wn), _entry, fixed_k=_k, split_k=_sk, cb=_cb)
 
-for _args in _bpreshuffle_small_lds_panel_configs():
+for _args in _bpreshuffle_small_m_repeat_scale_configs():
     _bm, _bn, _panel, _k, _wm, _gm, _ca, _cb = _args[:8]
-    _entry = _small_pipeline_entry("lds_panel", "lds_panel", _BP_ROOT + "lds_panel_kernel", m_align=16)
-    _register_generated_small(("lds_panel", _args), _bpreshuffle_traits("opus_gemm_bpreshuffle_lds_panel_traits", *_args),
+    _entry = _small_pipeline_entry("m_repeat_scale", "m_repeat_scale", "opus_gemm_bpreshuffle_m_repeat_kernel", m_align=16)
+    _register_generated_small(("m_repeat_scale", _args), _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_scale_traits", *_args),
                               (_bm, _bn, 128, _wm, 2), _entry, fixed_k=_k, max_k=_panel * 128, ca=_ca, cb=_cb)
 
 
 # Append experimental candidates after the complete existing bank. Keep the
 # original enumeration order so saved exact-kid measurements remain replayable.
-def _bpreshuffle_wide_b_direct_configs():
+def _bpreshuffle_wide_b_vgpr_panel_configs():
     for bm, wn, bk, fixed_k, split, wg, caches, output in product(
         (96, 128), (4, 8), (128, 256), (16384, 21504), (1, 2),
         (1, 2), _BPRESHUFFLE_JIT_CACHES, (0, 2)
@@ -4008,12 +4033,12 @@ def _bpreshuffle_wide_b_direct_configs():
         ca, cb = caches
         args = (bm, 256, 3, 1, cb, False, fixed_k, wn, wg, ca,
                 2, output, bk, True, False, False, True, split, False)
-        if _bpreshuffle_b_direct_legal(args):
+        if _bpreshuffle_b_vgpr_panel_legal(args):
             yield args
 
 
-for _bpreshuffle_wide_args in _bpreshuffle_wide_b_direct_configs():
-    _register_b_direct_config(_bpreshuffle_wide_args)
+for _bpreshuffle_wide_args in _bpreshuffle_wide_b_vgpr_panel_configs():
+    _register_b_vgpr_panel_config(_bpreshuffle_wide_args)
 
 
 def _bpreshuffle_native_c_configs():
@@ -4025,12 +4050,12 @@ def _bpreshuffle_native_c_configs():
         ca, cb = caches
         args = (bm, bn, 3, 1, cb, False, fixed_k, wn, 1, ca,
                 2, output, 128, True, False, False, True, 1, False)
-        if _bpreshuffle_b_direct_legal(args):
+        if _bpreshuffle_b_vgpr_panel_legal(args):
             yield args
 
 
 for _bpreshuffle_native_args in _bpreshuffle_native_c_configs():
-    _register_b_direct_config(_bpreshuffle_native_args, native_c=True)
+    _register_b_vgpr_panel_config(_bpreshuffle_native_args, native_c=True)
 
 
 

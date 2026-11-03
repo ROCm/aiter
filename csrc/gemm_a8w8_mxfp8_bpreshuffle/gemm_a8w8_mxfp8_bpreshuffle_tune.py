@@ -121,22 +121,22 @@ def opus_kernel_name(kid, *, cu_num):
 _OPUS_B_DEFAULTS = (None,) * 4 + tuple(
     map(str, (0, "false", 7168, 4, 1, 0, 2, 0, 256, "false", "false", "false", 0))
 )
-_OPUS_RING_DEFAULTS = (None,) * 7 + ("1", "false", "0")
+_OPUS_M_REPEAT_STAGE_DEFAULTS = (None,) * 7 + ("1", "false", "0", "false")
 _OPUS_TRAIT_DEFAULTS = {
-    "prefetch_b_vgpr": _OPUS_B_DEFAULTS,
-    "prefetch_b_vgpr_overlap": (*_OPUS_B_DEFAULTS, "0"),
-    "pingpong_lds": tuple(
+    "b_vgpr": _OPUS_B_DEFAULTS,
+    "b_vgpr_overlap": (*_OPUS_B_DEFAULTS, "0"),
+    "m_repeat": tuple(
         map(str, (192, 256, 128, 0, 4, 0, 0, 0, "false", "false", "false", 0, 8))
     ),
     "wave_interleave": tuple(map(str, (256, 0, 4, "true", 0, 0, 4))),
-    "b_direct": (*_OPUS_B_DEFAULTS[:16], "false", "1", "false"),
-    "lds_panel": tuple(
+    "b_vgpr_panel": (*_OPUS_B_DEFAULTS[:16], "false", "1", "false"),
+    "m_repeat_scale": tuple(
         map(
             str,
             (192, 256, 128, 0, 4, 0, 0, 0, "false", "false", "false", "false", "false"),
         )
     ),
-    "composable": (
+    "operand": (
         (None,) * 8 + ("0",),
         tuple(
             map(
@@ -158,21 +158,17 @@ _OPUS_TRAIT_DEFAULTS = {
             )
         ),
     ),
-    "xcd_ring": _OPUS_RING_DEFAULTS,
-    "resident_ring": _OPUS_RING_DEFAULTS,
-    "stream_ring": _OPUS_RING_DEFAULTS,
+    "m_repeat_stage": _OPUS_M_REPEAT_STAGE_DEFAULTS,
 }
 _OPUS_TRAIT_WRAPPERS = {
-    "b_direct": (
+    "b_vgpr_panel": (
         "opus_gemm_bpreshuffle_bounded_thread_traits",
         "opus_gemm_bpreshuffle_simple_tail_traits",
         "opus_gemm_bpreshuffle_native_c_traits",
     ),
-    "composable": ("opus_gemm_composable_mfirst_traits",),
+    "operand": ("opus_gemm_bpreshuffle_mfirst_traits",),
 }
-_OPUS_SMALL_PIPELINES = frozenset(
-    ("b_direct", "lds_panel", "composable", "xcd_ring", "resident_ring", "stream_ring")
-)
+_OPUS_SMALL_PIPELINES = frozenset(("b_vgpr_panel", "m_repeat_scale", "operand", "m_repeat_stage"))
 
 
 # Small-M resource limits used by the shared candidate workflow.
@@ -182,7 +178,7 @@ _OPUS_SMALL_RESIDENT_LDS = 80 * 1024
 _OPUS_SMALL_TILE_COST_RATIO = 4 / 3
 _OPUS_SMALL_PADDED_COST_RATIO = 1.75
 _OPUS_SMALL_PRIMARY_COST_RATIO = 1.1
-_OPUS_SMALL_LIVE_REGISTERS = {"b_direct": 384, "composable": 288}
+_OPUS_SMALL_LIVE_REGISTERS = {"b_vgpr_panel": 384, "operand": 288}
 
 
 @lru_cache(maxsize=65536)
@@ -192,11 +188,11 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
     Shape-dependent A-scale storage is added by opus_candidates. Cache keys
     contain immutable kernel metadata, so this work is reused across shapes.
     """
-    pipeline, bm, bn, bk, wm, wn, split = geometry
+    pipeline, bm, bn, bk, wm, wn, *_, split = geometry
     original_traits, wrappers = traits, []
     while wrapper := re.fullmatch(
         r"\s*(opus_gemm_bpreshuffle_(?:bounded_thread|simple_tail|native_c)_traits"
-        r"|opus_gemm_composable_mfirst_traits)\s*<(.+)>\s*",
+        r"|opus_gemm_bpreshuffle_mfirst_traits)\s*<(.+)>\s*",
         traits,
         re.DOTALL,
     ):
@@ -206,11 +202,11 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
         wrapper not in _OPUS_TRAIT_WRAPPERS.get(pipeline, ()) for wrapper in wrappers
     ):
         raise ValueError(f"Unsupported OPUS traits: {original_traits}")
-    if pipeline == "composable":
+    if pipeline == "operand":
         match = re.fullmatch(
-            r"\s*opus_gemm_composable_traits\s*<\s*"
-            r"opus_gemm_composable_geometry\s*<([^<>]*)>\s*,\s*"
-            r"opus_gemm_composable_policy\s*<([^<>]*)>\s*>\s*",
+            r"\s*opus_gemm_bpreshuffle_(?:m_repeat|b_vgpr)_operand_traits\s*<\s*"
+            r"opus_gemm_bpreshuffle_stage_geometry\s*<([^<>]*)>\s*,\s*"
+            r"opus_gemm_bpreshuffle_stage_policy\s*<([^<>]*)>\s*>\s*",
             traits,
         )
         defaults = _OPUS_TRAIT_DEFAULTS[pipeline]
@@ -229,7 +225,7 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
         ):
             raise ValueError(f"Incomplete OPUS traits: {original_traits}")
         profile.extend(args)
-    if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+    if pipeline in ("b_vgpr", "b_vgpr_overlap"):
         lds = int(profile[2]) * bm * bk + threads * 4
         scale_alignment = threads * 16
         stages, distance = int(profile[2]), int(profile[3])
@@ -247,14 +243,14 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
         ):
             ahead = 3
         profile[3] = f"ahead{min(distance * (bk // 128) * nr, ahead)}"
-    elif pipeline == "pingpong_lds":
+    elif pipeline == "m_repeat":
         packs = math.ceil((bm // (wm * 16)) / 4)
         lds = 264 * (bm + bn) + int(profile[2]) * (packs * wm * 64 + 4)
     elif pipeline == "wave_interleave":
         rows = threads // 8
         a_slot = math.ceil((bm // 2) / rows) * rows * 128
         lds = 2 * (2 * a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
-    elif pipeline == "b_direct":
+    elif pipeline == "b_vgpr_panel":
         # Whole-panel B lookahead is BD itself, unlike the fragment queue above.
         scale_cols = int(profile[6]) // (128 * split)
         scale_rows = math.ceil(bm / 16) * 16
@@ -266,10 +262,10 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
             * (4 if byte_scale else 16)
         )
         lds = int(profile[2]) * bm * bk + scale_bytes + threads * 4
-    elif pipeline == "lds_panel":
+    elif pipeline == "m_repeat_scale":
         # Raw panels retain one byte per M row, rather than packed A-scale rows.
         lds = 264 * (bm + bn) + int(profile[2]) * (bm + 4)
-    elif pipeline == "composable":
+    elif pipeline == "operand":
         stages, total_k = int(profile[5]), int(profile[6])
         compact, per_stage, direct_b = (
             profile[index] == "true" for index in (9, 10, 11)
@@ -292,7 +288,7 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
             profile[12] = "0"
         if int(profile[18]) < 2:
             profile[18] = "0"
-        if split > 1 or "opus_gemm_composable_mfirst_traits" in wrappers:
+        if split > 1 or "opus_gemm_bpreshuffle_mfirst_traits" in wrappers:
             profile[20] = "false"
     else:
         stages, total_k = int(profile[4]), int(profile[5])
@@ -320,12 +316,12 @@ def _opus_select_variants(
         unique = {}
         for kid in sorted(kids):
             unique.setdefault(kernel_profiles[kid], kid)
-        if pipeline not in ("b_direct", "composable"):
+        if pipeline not in ("b_vgpr_panel", "operand"):
             return set(unique.values())
         selected, representatives = set(), {}
         for kid in unique.values():
             profile, launch = kernel_profiles[kid]
-            if pipeline == "b_direct":
+            if pipeline == "b_vgpr_panel":
                 main = (profile[13], profile[5], profile[16]) == (
                     "true",
                     "false",
@@ -364,11 +360,11 @@ def _opus_select_variants(
         mode = "secondary"
     selected = {min(kids, key=lambda kid: (footprints[kid], kid))}
     if mode != "baseline":
-        pipeline, bm, bn, bk, wm, wn, _ = geometry
+        pipeline, bm, bn, bk, wm, wn = geometry[:6]
         unique = {}
         for kid in sorted(kids):
             profile = kernel_profiles[kid]
-            if pipeline == "pingpong_lds" and (
+            if pipeline == "m_repeat" and (
                 int(profile[5]) > 0 or n // bn < 256 or m <= bm
             ):
                 # GroupM overrides GroupN; narrow-N and single-M-tile routes ignore it.
@@ -376,13 +372,13 @@ def _opus_select_variants(
             unique.setdefault(profile, kid)
         profiles = {kid: profile for profile, kid in unique.items()}
         if mode == "primary" and pipeline in (
-            "prefetch_b_vgpr",
-            "prefetch_b_vgpr_overlap",
-            "pingpong_lds",
+            "b_vgpr",
+            "b_vgpr_overlap",
+            "m_repeat",
             "wave_interleave",
         ):
             routes = list(profiles)
-            if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            if pipeline in ("b_vgpr", "b_vgpr_overlap"):
                 routes = [kid for kid in routes if profiles[kid][11] == "0"]
                 if routes:
                     aheads = {kid: int(profiles[kid][3][5:]) for kid in routes}
@@ -393,8 +389,8 @@ def _opus_select_variants(
                         default=max(aheads.values()),
                     )
                     routes = [kid for kid in routes if aheads[kid] <= bound]
-            elif pipeline in ("pingpong_lds", "wave_interleave"):
-                if pipeline == "pingpong_lds":
+            elif pipeline in ("m_repeat", "wave_interleave"):
+                if pipeline == "m_repeat":
                     em = bm // (wm * 16)
                     if not (wm * wn == 8 and 3 <= em <= 4):
                         # Include each variant's scale panel in two-block residency.
@@ -418,7 +414,7 @@ def _opus_select_variants(
                     if int(profiles[kid][group_index]) in (0, smallest)
                 ]
             selected.update(routes)
-        elif pipeline == "prefetch_b_vgpr_overlap":
+        elif pipeline == "b_vgpr_overlap":
             publications = sorted({int(profile[17]) for profile in profiles.values()})
             if len(publications) > 3:
                 midpoint = (publications[0] + publications[-1]) / 2
@@ -432,26 +428,26 @@ def _opus_select_variants(
 
         # Cover individual trait values and resource/execution-route combinations.
         indices = [(index,) for index in range(len(next(iter(profiles.values()))))]
-        if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+        if pipeline in ("b_vgpr", "b_vgpr_overlap"):
             # stage/ahead/WG, A/B cache, store/output, contiguous/pins, XCD/groupM
             indices += [(2, 3, 8), (4, 9), (10, 11), (13, 14, 15), (5, 16)]
-            if pipeline == "prefetch_b_vgpr_overlap":
+            if pipeline == "b_vgpr_overlap":
                 indices += [(2, 17), (11, 17)]
-        elif pipeline == "pingpong_lds":
+        elif pipeline == "m_repeat":
             # panel/fixedK, fragments/cache/guard, launch groups
             indices += [(2, 3), (3, 8), (6, 7, 8, 10), (5, 12), (5, 9)]
         elif pipeline == "wave_interleave":
             indices += [(2, 3), (4, 5)]
-        elif pipeline == "b_direct":
+        elif pipeline == "b_vgpr_panel":
             # Panel/stages/WG, joint WG/cache/scale policies, traversal, output/wrapper.
             indices += [(13, 16, 18), (11, 18), (11, 19)]
             if mode == "primary":
                 indices += [(2, 3, 8), (8, 9, 4, 18), (5, 16)]
-        elif pipeline == "lds_panel":
+        elif pipeline == "m_repeat_scale":
             indices += [(5, 12)]
             if mode == "primary":
                 indices += [(2, 3), (3, 8), (6, 7, 8)]
-        elif pipeline == "composable":
+        elif pipeline == "operand":
             # LDS/ring loading, scale/MFMA layout, cache/output, address/traversal.
             indices += [(10, 11), (11, 16), (17, 19, 21)]
             if mode == "primary":
@@ -462,7 +458,7 @@ def _opus_select_variants(
                     (14, 15, 19),
                     (20, 21),
                 ]
-        elif pipeline in ("xcd_ring", "resident_ring", "stream_ring"):
+        elif pipeline == "m_repeat_stage":
             indices += [(8, 9)]
             if mode == "primary":
                 indices += [(4, 8)]
@@ -485,10 +481,10 @@ def _opus_select_variants(
             uncovered.difference_update(modes.pop(kid))
     if small_m:
         if small_primary:
-            if pipeline == "prefetch_b_vgpr":
+            if pipeline == "b_vgpr":
                 # Keep the full-A direct-store route beyond the large-M clamp.
                 selected.update(kid for kid in kids if kernel_profiles[kid][11] == "0")
-            elif pipeline == "pingpong_lds":
+            elif pipeline == "m_repeat":
                 # Preserve complete ungrouped panel policies, including GroupM.
                 selected.update(kid for kid in kids if kernel_profiles[kid][5] == "0")
         covered = {kernel_profiles[kid] for kid in selected}
@@ -521,13 +517,30 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         instance = registry[kid]
         if instance.bpreshuffle_co is not None:
             continue
+        entry = instance.bpreshuffle_entry
+        pipeline = entry["pipeline"]
+        if entry.get(f"{pipeline}_schedule") == "operand":
+            # Both families share the same operand geometry/resource coverage.
+            pipeline = "operand"
+        elif pipeline == "b_vgpr":
+            schedule = entry.get("b_vgpr_schedule", "fragment")
+            pipeline = "b_vgpr" if schedule == "fragment" else "b_vgpr_" + schedule
+        elif pipeline == "m_repeat":
+            pipeline = ("m_repeat_stage" if entry.get("m_repeat_schedule") == "staged"
+                        else "m_repeat_scale" if entry.get("scale_on_read") else "m_repeat")
         geometry = (
-            instance.bpreshuffle_entry["pipeline"],
+            pipeline,
             instance.B_M,
             instance.B_N,
             instance.B_K,
             instance.T_M,
             instance.T_N,
+            # Loop and publication modes keep their existing resource coverage.
+            *(
+                (instance.bpreshuffle_entry["loop"], instance.bpreshuffle_split_k > 1)
+                if pipeline == "m_repeat_stage"
+                else ()
+            ),
             instance.bpreshuffle_split_k,
         )
         profile, lds, alignment = _opus_kernel_profile(
@@ -538,7 +551,6 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         )
         if alignment:
             lds += math.ceil(instance.B_M * (k // 128) / alignment) * alignment
-        entry = instance.bpreshuffle_entry
         launch = (
             instance.WG_PER_CU,
             instance.BLOCK_SIZE,
@@ -564,7 +576,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
     cu_grid = max(cu_num, 1)
     grids, paddings, costs = {}, {}, {}
     for geometry in groups:
-        _, bm, bn, _, _, _, split = geometry
+        bm, bn, split = geometry[1], geometry[2], geometry[-1]
         grid = math.ceil(m / bm) * math.ceil(n / bn) * split
         padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
         occupancy = grid / cu_grid
@@ -581,7 +593,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         # Small-M ranges bound fragments, grid supply and execution resources.
         tile_resources, layouts = {}, defaultdict(list)
         for geometry in groups:
-            pipeline, bm, bn, bk, wm, wn, split = geometry
+            pipeline, bm, bn, bk, wm, wn, *_, split = geometry
             em, en = bm // (16 * wm), bn // (16 * wn)
             tile_resources[geometry] = (
                 em,
@@ -604,13 +616,13 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                 key=lambda g: (costs[g], g),
             )
             for geometry in ranked[:_OPUS_SMALL_TILES_PER_LAYOUT]:
-                pipeline, bm, _, bk, wm, wn, _ = geometry
+                pipeline, bm, _, bk, wm, wn = geometry[:6]
                 native = (
-                    pipeline == "prefetch_b_vgpr"
+                    pipeline == "b_vgpr"
                     and wm * wn <= 4
                     and (bk // 128) * (bm // 16) < 16
                 ) or (
-                    pipeline == "pingpong_lds"
+                    pipeline == "m_repeat"
                     and wm * wn == 8
                     and 3 <= bm // (wm * 16) <= 4
                 )
@@ -638,12 +650,13 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                         )
                         for kid in kids
                     )
-                    previous = fallbacks.get(geometry[0])
+                    family = (geometry[0], *geometry[6:-1])
+                    previous = fallbacks.get(family)
                     if previous is None or fallback < previous:
-                        fallbacks[geometry[0]] = fallback
-            available = {geometry[0] for geometry in result}
-            for pipeline, (_, _, kid, geometry) in fallbacks.items():
-                if pipeline not in available:
+                        fallbacks[family] = fallback
+            available = {(geometry[0], *geometry[6:-1]) for geometry in result}
+            for family, (_, _, kid, geometry) in fallbacks.items():
+                if family not in available:
                     result.setdefault(geometry, set()).add(kid)
             return result
 
@@ -662,33 +675,33 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         }
 
         def family_eligible(geometry, kid):
-            pipeline, _, _, _, wm, wn, split = geometry
+            pipeline, _, _, _, wm, wn, *_, split = geometry
             if pipeline not in _OPUS_SMALL_PIPELINES:
                 return True
             em, en, *_ = tile_resources[geometry]
             profile = profiles[kid][0]
             if split > 1 and grids[geometry] > 2 * cu_grid * max(1, 4 / (wm * wn)):
                 return False
-            if pipeline == "b_direct":
+            if pipeline == "b_vgpr_panel":
                 return (
                     wn >= 2
                     and em >= 2
                     and (profile[13], profile[5], profile[16])
                     == ("true", "false", "true")
                 )
-            if pipeline == "composable":
+            if pipeline == "operand":
                 return (
                     en <= 2 and (wm == 1 or (split > 1 and em <= 4))
                     if profile[11] == "true"
                     else em <= 4 and en <= 4
                 )
-            if pipeline in ("resident_ring", "stream_ring", "xcd_ring"):
+            if pipeline == "m_repeat_stage":
                 return em <= 4 and en <= 2 and (wm, wn) in ((1, 1), (1, 2), (2, 2))
             return profile[5] == "0"  # Ungrouped LDS panels.
 
         def resident_eligible(geometry, kid):
             return family_eligible(geometry, kid) and (
-                geometry[0] not in ("b_direct", "composable")
+                geometry[0] not in ("b_vgpr_panel", "operand")
                 or grids[geometry] <= 2 * cu_grid
                 or footprints[kid] <= _OPUS_SMALL_RESIDENT_LDS
             )
@@ -696,45 +709,45 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         pools = narrow(pools, resident_eligible, prefer=family_eligible)
         stage_counts = {
             kid: int(
-                profiles[kid][0][{"b_direct": 2, "composable": 5}.get(geometry[0], 4)]
+                profiles[kid][0][{"b_vgpr_panel": 2, "operand": 5}.get(geometry[0], 4)]
             )
             for geometry, kids in pools.items()
-            if geometry[0] in _OPUS_SMALL_PIPELINES and geometry[0] != "lds_panel"
+            if geometry[0] in _OPUS_SMALL_PIPELINES and geometry[0] != "m_repeat_scale"
             for kid in kids
         }
         min_panels, live_registers = {}, {}
         for geometry, kids in pools.items():
             pipeline, _, _, bk, *_ = geometry
-            if pipeline == "lds_panel":
+            if pipeline == "m_repeat_scale":
                 min_panels[geometry] = min(int(profiles[kid][0][2]) for kid in kids)
-            elif pipeline in ("b_direct", "composable"):
+            elif pipeline in ("b_vgpr_panel", "operand"):
                 em, en, _, _, c_registers, _ = tile_resources[geometry]
                 for kid in kids:
-                    ahead = int(profiles[kid][0][3 if pipeline == "b_direct" else 12])
+                    ahead = int(profiles[kid][0][3 if pipeline == "b_vgpr_panel" else 12])
                     live_registers[kid] = (
                         c_registers + 8 * (bk // 128) * (em + (ahead + 1) * en) + 48
                     )
 
         def resource_eligible(geometry, kid):
-            pipeline, bm, _, _, wm, wn, split = geometry
+            pipeline, bm, _, _, wm, wn, *_, split = geometry
             grid = grids[geometry]
             waves = wm * wn
             em, en, panels, work, c_registers, supply = tile_resources[geometry]
             profile, _ = profiles[kid]
-            if pipeline in ("resident_ring", "stream_ring", "xcd_ring"):
+            if pipeline == "m_repeat_stage":
                 # Resident/streaming rings cover grids that cannot sustain the
                 # bulk operand paths; avoid repeating them across many CU grids.
                 return grid <= 2 * cu_grid
-            if pipeline == "lds_panel":
+            if pipeline == "m_repeat_scale":
                 return int(profile[2]) == min_panels[geometry]
-            if pipeline not in ("b_direct", "composable"):
+            if pipeline not in ("b_vgpr_panel", "operand"):
                 return True
 
             stages = stage_counts[kid]
-            ahead = int(profile[3 if pipeline == "b_direct" else 12])
+            ahead = int(profile[3 if pipeline == "b_vgpr_panel" else 12])
             if live_registers[kid] > _OPUS_SMALL_LIVE_REGISTERS[pipeline]:
                 return False
-            if pipeline == "b_direct":
+            if pipeline == "b_vgpr_panel":
                 if grid > cu_grid and footprints[kid] > _OPUS_SMALL_RESIDENT_LDS:
                     return False
                 # A steady whole-panel B ring needs an additional A stage and
@@ -787,8 +800,8 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         # must contain a full ring before extra splits can improve steady supply.
         split_levels = defaultdict(set)
         for geometry, kids in pools.items():
-            pipeline, _, _, bk, _, _, split = geometry
-            if pipeline not in _OPUS_SMALL_PIPELINES or pipeline == "lds_panel":
+            pipeline, _, _, bk, _, _, *_, split = geometry
+            if pipeline not in _OPUS_SMALL_PIPELINES or pipeline == "m_repeat_scale":
                 continue
             for kid in kids:
                 stages = stage_counts[kid]
@@ -810,7 +823,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
             pools,
             lambda geometry, kid: geometry[-1] == 1
             or geometry[0] not in _OPUS_SMALL_PIPELINES
-            or geometry[0] == "lds_panel"
+            or geometry[0] == "m_repeat_scale"
             or geometry[-1] == split_targets.get((geometry[:-1], stage_counts[kid]), 1),
         )
 
@@ -839,19 +852,19 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         }
         variant_modes, covered = {}, {}
         for geometry, kids in pools.items():
-            pipeline, bm, bn, bk, wm, wn, split = geometry
+            pipeline, bm, bn, bk, wm, wn, *_, split = geometry
             supply = tile_resources[geometry][5]
             mode = "primary"
-            if pipeline in ("b_direct", "composable"):
+            if pipeline in ("b_vgpr_panel", "operand"):
                 layout = pipeline, *geometry[3:]
                 if not (
                     k // (split * bk) <= 4
                     or costs[geometry]
                     <= _OPUS_SMALL_PRIMARY_COST_RATIO * best_costs[layout]
                     or 1 / bm + 1 / bn <= best_reuse[layout]
-                ) or (pipeline == "b_direct" and m < bm):
+                ) or (pipeline == "b_vgpr_panel" and m < bm):
                     mode = "secondary"
-            elif pipeline == "prefetch_b_vgpr":
+            elif pipeline == "b_vgpr":
                 if not (
                     wm * wn <= 4
                     and (bk // 128) * (bm // 16) < 16
@@ -859,12 +872,12 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                     and supply >= 2 * cu_grid
                 ):
                     mode = "baseline"
-            elif pipeline in ("lds_panel", "pingpong_lds"):
+            elif pipeline in ("m_repeat_scale", "m_repeat"):
                 if not (
                     wm * wn == 8 and 3 <= bm // (wm * 16) <= 4 and supply >= 2 * cu_grid
                 ):
                     mode = "baseline"
-            elif pipeline in ("prefetch_b_vgpr_overlap", "wave_interleave"):
+            elif pipeline in ("b_vgpr_overlap", "wave_interleave"):
                 mode = "baseline"
             variant_modes[geometry] = mode
             covered[geometry] = (
@@ -878,7 +891,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
 
         def execution_eligible(geometry, kid, *, refine=False):
             """Bound steady loops and wave supply with one execution check."""
-            pipeline, bm, bn, bk, wm, wn, split = geometry
+            pipeline, bm, bn, bk, wm, wn, *_, split = geometry
             profile, launch = profiles[kid]
             _, _, panels, work, c_registers, supply = tile_resources[geometry]
             stages = stage_counts.get(kid, 0)
@@ -888,19 +901,19 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                     grids[geometry] > cu_grid
                     or publication * m * n > (m + n) / 2
                     or publication * bm * bn > (bm + bn) / 12
-                    or (pipeline == "b_direct" and work < 8)
+                    or (pipeline == "b_vgpr_panel" and work < 8)
                 ):
                     return False
-            if pipeline in ("resident_ring", "stream_ring", "xcd_ring"):
+            if pipeline == "m_repeat_stage":
                 return (panels <= 4 or stages >= 4) and (
                     stages <= 4 or panels <= stages or work <= 4
                 )
-            if pipeline not in ("b_direct", "composable"):
+            if pipeline not in ("b_vgpr_panel", "operand"):
                 return True
             waves = wm * wn
             if waves > 4 and grids[geometry] * waves > 8 * cu_grid:
                 return False
-            if pipeline == "b_direct":
+            if pipeline == "b_vgpr_panel":
                 if work < 4 or (profile[11] == "2" and work < 12):
                     return False
                 if stages >= 4 and launch[0] == 1 and work < 8:
@@ -955,9 +968,9 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         )
         final_primary, final_secondary, baselines = 0, 0, 0
         for geometry, kids in pools.items():
-            pipeline, bm, _, _, _, wn, _ = geometry
+            pipeline, bm, _, _, _, wn = geometry[:6]
             mode = variant_modes[geometry]
-            if pipeline == "prefetch_b_vgpr" and math.ceil(m / bm) < max(8, 2 * wn):
+            if pipeline == "b_vgpr" and math.ceil(m / bm) < max(8, 2 * wn):
                 # Complete full-A queues amortize their preload over repeated M
                 # tiles. Other shapes keep a legal representative of that tile.
                 retained.update(
@@ -988,16 +1001,16 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         min_lds, by_pipeline = {}, defaultdict(list)
         for geometry, kids in groups.items():
             min_lds[geometry] = min(footprints[kid] for kid in kids)
-            by_pipeline[geometry[0]].append(geometry)
+            by_pipeline[(geometry[0], *geometry[6:-1])].append(geometry)
         primary, secondary, small_baselines = set(), set(), set()
-        for pipeline, tiles in by_pipeline.items():
+        for (pipeline, *_), tiles in by_pipeline.items():
             layouts = defaultdict(list)
             for geometry in tiles:
                 layouts[geometry[3:]].append(geometry)
             ranked = {
                 min(layout, key=lambda g: (costs[g], g)) for layout in layouts.values()
             }
-            if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            if pipeline in ("b_vgpr", "b_vgpr_overlap"):
                 native = any(
                     wm * wn == 4 and (bk // 128) * (bm // 16) < 16
                     for _, bm, _, bk, wm, wn, _ in tiles
@@ -1030,7 +1043,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                     if rotated:
                         # Cover the changed A live set, LDS waits, and B queue clamp.
                         secondary.add(min(rotated, key=lambda g: (costs[g], g)))
-            elif pipeline == "pingpong_lds":
+            elif pipeline == "m_repeat":
                 # Fill the A ring with E_M=3..4; add two-resident-block tiles if needed.
                 core = [
                     g
@@ -1070,7 +1083,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                     defaultdict(list),
                 )
                 for geometry in tiles:
-                    _, bm, bn, bk, wm, wn, split = geometry
+                    _, bm, bn, bk, wm, wn, *_, split = geometry
                     waves = wm * wn
                     em, en = bm // (16 * wm), bn // (16 * wn)
                     padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
@@ -1093,11 +1106,11 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                     axes[("split", split)].append(geometry)
                     for kid in groups[geometry]:
                         profile = profiles[kid]
-                        if pipeline == "b_direct":
+                        if pipeline == "b_vgpr_panel":
                             routes[("load", profile[18], profile[11])].append(geometry)
                             if profile[19]:
                                 routes[("wrapper", profile[19])].append(geometry)
-                        elif pipeline == "composable":
+                        elif pipeline == "operand":
                             routes[("load", profile[10], profile[11])].append(geometry)
                             if profile[21]:
                                 routes[("wrapper", profile[21])].append(geometry)
@@ -1129,8 +1142,8 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
         # Tighten primary ranges by relative work and grid supply, retaining modes.
         dropped, core_costs, by_layout = set(), {}, defaultdict(list)
         for geometry in primary:
-            _, bm, bn, _, wm, wn, _ = geometry
-            if geometry[0] == "pingpong_lds" and wm * wn == 8 and bm // (wm * 16) >= 3:
+            _, bm, bn, _, wm, wn = geometry[:6]
+            if geometry[0] == "m_repeat" and wm * wn == 8 and bm // (wm * 16) >= 3:
                 em, en = bm // (16 * wm), bn // (16 * wn)
                 mfma = em * en * 32 * wm * wn / 4
                 transfer = (bm + bn) * 128 / 512
@@ -1139,7 +1152,7 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
                 occupancy = grids[geometry] / cu_grid
                 tail = 1 + 0.1 * (math.ceil(occupancy) / occupancy - 1)
                 core_costs[geometry] = grids[geometry] * body * tail / (m * n * k)
-            elif geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            elif geometry[0] in ("b_vgpr", "b_vgpr_overlap"):
                 by_layout[(geometry[0], *geometry[3:])].append(geometry)
             if (
                 geometry[0] not in _OPUS_SMALL_PIPELINES

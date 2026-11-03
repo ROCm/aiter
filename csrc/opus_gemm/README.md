@@ -69,8 +69,7 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& x_scale,
     aiter_tensor_t& w_scale,
     aiter_tensor_t& Y,
-    int kid,
-    std::optional<aiter_tensor_t> workspace = std::nullopt);
+    int kid);
 
 void opus_gemm_a8w8_mxscale_bmm_launch(
     aiter_tensor_t& XQ,
@@ -83,13 +82,6 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
     int split_k);
 ```
 
-The bpreshuffle entry handles both direct output and gfx950 Split-K kids.
-Python allocates FP32 workspace when required, or forwards a caller-supplied
-workspace for reuse. Direct-output kids require `workspace=None`. The split
-count remains a compile-time property of the selected kid; the public
-bpreshuffle call keeps `split_k=0`. The trailing optional workspace preserves
-the existing argument order and calls that omit it.
-
 ## Registry and capability
 
 | Family | gfx942 | gfx950 | gfx1250 |
@@ -97,7 +89,7 @@ the existing argument order and calls that omit it.
 | `a16w16` | direct + two-stage | direct + two-stage | two-stage + pre-built BF16 direct; fused source retained but unregistered |
 | `a8w8` | empty | kid 2, FP32 Y | empty |
 | `a8w8_blockscale` | empty | kid 1, FP32 Y | empty |
-| `a8w8_blockscale_bpreshuffle` | kid 11000, BF16 Y | direct + FP32-workspace Split-K, BF16 Y | empty |
+| `a8w8_blockscale_bpreshuffle` | kid 11000, BF16 Y | empty | empty |
 | `a8w8_mxscale_bmm` | empty | registered BMM ids, including compact ids 8470--8484; BF16/FP32 Y | empty |
 
 Empty tables are explicit capability states. `kernels_list` is the source of

@@ -225,7 +225,7 @@ def _launch_a8w8_backend(
             w_scale,
             Y,
             kid,
-            workspace,
+            *((workspace,) if workspace is not None else ()),
         )
         return
 
@@ -329,82 +329,6 @@ def _launch_a8w8_blockscale_gemm(
     return Y
 
 
-def _validate_a8w8_blockscale_bpreshuffle_workspace_tensors(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Y: Tensor,
-    instance: object,
-    route_arch: str | None,
-) -> int:
-    """Validate small-shape metadata before allocating FP32 workspace."""
-    entry = "opus_gemm_a8w8_blockscale_bpreshuffle_launch"
-    tensors = (XQ, WQ, Y, x_scale, w_scale)
-    if any(not isinstance(tensor, Tensor) for tensor in tensors):
-        raise TypeError(f"{entry}: XQ/WQ/Y/x_scale/w_scale must be Tensors")
-    if any(tensor.dim() != 2 for tensor in tensors):
-        raise ValueError(f"{entry}: XQ/WQ/Y/x_scale/w_scale must be logical 2D")
-    device = XQ.device
-    if device.type != "cuda" or any(tensor.device != device for tensor in tensors[1:]):
-        raise ValueError(f"{entry}: all tensors must be on one CUDA device")
-    if torch.cuda.current_device() != device.index:
-        raise ValueError(
-            f"{entry}: current CUDA device must match tensor device {device}"
-        )
-    device_arch, _ = _device_arch_and_cu(device)
-    if (
-        device_arch != "gfx950"
-        or (route_arch is not None and route_arch != device_arch)
-        or instance.arch_prefix != "gfx950"
-        or instance.kernel_tag != "a8w8_blockscale_mxscale_gemm_bpreshuffle"
-    ):
-        raise ValueError(f"{entry}: small-shape workspace requires native gfx950")
-    if XQ.dtype != torch.float8_e4m3fn or WQ.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"{entry}: XQ and WQ must be float8_e4m3fn")
-    if Y.dtype != torch.bfloat16:
-        raise ValueError(f"{entry}: Y must be BF16")
-    if x_scale.dtype not in _E8M0_DTYPES or w_scale.dtype not in _E8M0_DTYPES:
-        raise ValueError(
-            f"{entry}: x_scale and w_scale must contain one-byte E8M0 values"
-        )
-
-    M, K = map(int, XQ.shape)
-    N, w_K = map(int, WQ.shape)
-    int32_max = (1 << 31) - 1
-    if min(M, N, K) <= 0 or max(M, N, K) > int32_max:
-        raise ValueError(f"{entry}: M, N and K must be positive INT32 dimensions")
-    if w_K != K or tuple(Y.shape) != (M, N):
-        raise ValueError(f"{entry}: expected WQ [{N},{K}] and Y [{M},{N}]")
-    if any(not tensor.is_contiguous() for tensor in (XQ, WQ, Y)):
-        raise ValueError(f"{entry}: XQ, WQ and Y must be contiguous")
-    if (
-        K % 128
-        or tuple(x_scale.shape) != (M, K // 128)
-        or not (x_scale.is_contiguous() or x_scale.stride() == (1, M))
-        or tuple(w_scale.shape) != (N // 128, K // 128)
-        or not w_scale.is_contiguous()
-    ):
-        raise ValueError(f"{entry}: scale shape or layout differs")
-    if (
-        not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K)
-        or max(M * K, N * K) > min(int32_max, instance.max_tensor_bytes)
-        or (
-            instance.bpreshuffle_entry.get("host_kind") == "reduce"
-            and M * N > int32_max
-        )
-    ):
-        raise ValueError(f"{entry}: shape exceeds this pipeline configuration")
-    required_bytes = bpreshuffle_workspace_bytes(instance, M, N, K)
-    if (
-        required_bytes <= 0
-        or required_bytes % 4
-        or required_bytes > instance.max_tensor_bytes
-    ):
-        raise ValueError(f"{entry}: invalid FP32 workspace extent")
-    return required_bytes // 4
-
-
 def _launch_a8w8_blockscale_bpreshuffle_gemm(
     XQ: Tensor,
     WQ: Tensor,
@@ -450,15 +374,20 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     workspace_rule = (instance.bpreshuffle_entry or {}).get("workspace_rule", ("none",))
     launch_workspace = workspace
     if workspace_rule[0] != "none":
-        required_numel = _validate_a8w8_blockscale_bpreshuffle_workspace_tensors(
-            XQ, WQ, x_scale, w_scale, Y, instance, route_arch
-        )
         if launch_workspace is None:
+            # Bound automatic allocation using the existing shape/resource rule.
+            M, K = map(int, XQ.shape)
+            N = int(WQ.shape[0])
+            if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
+                raise ValueError(
+                    f"OPUS bpreshuffle kid {resolved_kid}: "
+                    "shape exceeds this pipeline configuration"
+                )
+            required_bytes = bpreshuffle_workspace_bytes(instance, M, N, K)
             launch_workspace = torch.empty(
-                (required_numel,), dtype=torch.float32, device=XQ.device
+                (required_bytes // 4,), dtype=torch.float32, device=XQ.device
             )
-        # The checked C++ entry validates supplied workspace dtype, device,
-        # capacity and alignment. Generated launchers reset counters per launch.
+        # C++ validates tensor layouts and workspace; launchers reset counters.
     elif launch_workspace is not None:
         raise ValueError(f"OPUS bpreshuffle kid {resolved_kid} does not use workspace")
     _launch_a8w8_backend(
