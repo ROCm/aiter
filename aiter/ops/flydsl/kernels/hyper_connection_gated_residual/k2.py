@@ -30,6 +30,7 @@ from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
+    check_no_overlap,
     check_norm_weight,
     check_streams,
     check_tensor,
@@ -318,7 +319,7 @@ def flydsl_up_gate_mix_norm(
 
     Takes K1's stored combined residual and per-stream reciprocal RMS instead of
     a materialized ``xn``. Returns ``block_input`` [M, stream_dim] bf16, written
-    into ``block_input`` when given.
+    into ``block_input`` when given; it must not overlap any input.
 
     Stores are not row-masked: ``M`` must be a multiple of the tile height
     (64 by default, or ``block_m``). Callers with a row tail pad every input to
@@ -343,6 +344,16 @@ def flydsl_up_gate_mix_norm(
     check_norm_weight(norm_weight, stream_dim, hidden, dev)
     if block_input is not None:
         check_tensor("block_input", block_input, (tokens, stream_dim), dev)
+        check_no_overlap(
+            {"block_input": block_input},
+            {
+                "lora": lora,
+                "r2": r2,
+                "rrms": rrms,
+                "norm_weight": norm_weight,
+                "w_up": w_up,
+            },
+        )
     ctx, stream = stream_scope(stream, dev)
     with ctx:
         return _up_gate_mix_norm(

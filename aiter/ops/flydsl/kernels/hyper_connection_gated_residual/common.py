@@ -187,6 +187,37 @@ def check_tensor(
         raise ValueError(f"{name} must be row-major contiguous")
 
 
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """Half-open address range covering every element of ``t``."""
+    start = t.data_ptr()
+    if t.is_contiguous():
+        return start, start + t.numel() * t.element_size()
+    last = sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return start, start + (last + 1) * t.element_size()
+
+
+def check_no_overlap(
+    outputs: dict[str, torch.Tensor | None], inputs: dict[str, torch.Tensor | None]
+) -> None:
+    """Reject caller outputs whose memory overlaps an input or another output.
+
+    Kernels write outputs while later stages still read inputs and earlier
+    outputs, so no alias is safe. The check compares address ranges, so a
+    strided view that interleaves another tensor without sharing an element is
+    rejected too.
+    """
+    outs = [
+        (k, _byte_span(t)) for k, t in outputs.items() if t is not None and t.numel()
+    ]
+    if not outs:
+        return
+    ins = [(k, _byte_span(t)) for k, t in inputs.items() if t is not None and t.numel()]
+    for i, (name, (lo, hi)) in enumerate(outs):
+        for other, (olo, ohi) in outs[i + 1 :] + ins:
+            if lo < ohi and olo < hi:
+                raise ValueError(f"{name} must not overlap {other} in memory")
+
+
 def check_norm_weight(
     norm_weight: torch.Tensor, stream_dim: int, hidden: int, device: torch.device
 ) -> None:

@@ -1018,6 +1018,8 @@ def _run_direct_k2():
         "out_shape": block_input[:-1],
         "out_dtype": block_input.float(),
         "out_strided": torch.empty(128, 2 * HS, device="cuda").bfloat16()[:, ::2],
+        "out_in_r2": args[1].view(-1)[: 128 * HS].view(128, HS),
+        "out_in_w_up": args[4].view(-1)[-128 * HS :].view(128, HS),
     }.items():
         _expect_value_error(
             f"direct_k2[{name}]",
@@ -1083,6 +1085,31 @@ def _run_direct_k1_buffers():
         "gemm_pad": {"gemm_pad": tokens - 1},
         "stages": {"stages": 1},
     }
+    # Outputs aliasing an input or each other: the prologue would overwrite
+    # operands the GEMM still reads.
+    r2_buf = bf16(tokens, hidden)
+    out_buf = bf16(tokens, n_pad)
+    bad.update(
+        {
+            "r2_is_weight": {"r2_out": merged[:tokens]},
+            "r2_is_residual": {"r2_out": inp["residual"]},
+            "out_in_block_output": {
+                "out": inp["block_output"]
+                .view(-1)[: tokens * n_pad]
+                .view(tokens, n_pad)
+            },
+            "out_in_r2": {
+                "r2_out": r2_buf,
+                "out": r2_buf.view(-1)[-tokens * n_pad :].view(tokens, n_pad),
+            },
+            "rrms_in_out": {
+                "out": out_buf,
+                "rrms_out": out_buf.view(torch.float32)
+                .view(-1)[: tokens * HC]
+                .view(tokens, HC),
+            },
+        }
+    )
     for name, kwargs in bad.items():
         _expect_value_error(f"k1_buffers[{name}]", lambda kwargs=kwargs: call(**kwargs))
     empty = _make_inputs(0, seed=42)
@@ -1095,7 +1122,10 @@ def _run_direct_k1_buffers():
             lambda kwargs=kwargs: call(src=empty, **kwargs),
         )
 
-    r2_out, out = bf16(tokens, hidden), bf16(tokens, n_pad)
+    # Adjacent but disjoint outputs in one allocation are accepted.
+    flat = bf16(tokens * (hidden + n_pad))
+    r2_out = flat[: tokens * hidden].view(tokens, hidden)
+    out = flat[tokens * hidden :].view(tokens, n_pad)
     rrms_out = torch.empty(tokens, HC, device="cuda")
     r2, packed = call(r2_out=r2_out, out=out, rrms_out=rrms_out)
     torch.cuda.synchronize()

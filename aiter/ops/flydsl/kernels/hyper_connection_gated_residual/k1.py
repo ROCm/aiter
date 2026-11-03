@@ -46,6 +46,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
     check_hidden,
+    check_no_overlap,
     check_norm_weight,
     check_tensor,
     mfma_bf16,
@@ -1595,8 +1596,8 @@ def flydsl_k1_combine_norm_down(
 
     Caller-provided ``r2_out`` (bf16 ``[P, hidden]``), ``out`` (bf16
     ``[P, n_pad]``) and ``rrms_out`` (f32 ``[P, hc_count]``) must be contiguous
-    on the input device, where ``P`` is ``gemm_pad`` (default: ``M``).
-    ``stages`` must be at least 2.
+    on the input device, where ``P`` is ``gemm_pad`` (default: ``M``), and
+    must not overlap the inputs or each other. ``stages`` must be at least 2.
     """
     require_supported_arch()
     validate_k1_inputs(
@@ -1616,6 +1617,16 @@ def flydsl_k1_combine_norm_down(
     ):
         if t is not None:
             check_tensor(name, t, shape, dev, dtype=dtype)
+    check_no_overlap(
+        {"r2_out": r2_out, "out": out, "rrms_out": rrms_out},
+        {
+            "residual": residual,
+            "block_output": block_output,
+            "injection": injection,
+            "norm_weight": norm_weight,
+            "w_dn_merged": w_dn_merged,
+        },
+    )
     ctx, stream = stream_scope(stream, residual.device)
     with ctx:
         return _k1_combine_norm_down(
