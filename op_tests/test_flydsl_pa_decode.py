@@ -292,12 +292,13 @@ _MXFP4_POOL_SPECS = [
         "mxfp4-pv-sum-2e127-mixed",
         (None, 127, (0x00,) * 4, (0x22, 0x00, 0x22, 0x00), 254),
     ),
-    # The smallest MXFP4 magnitudes: the PV sum sits at the f32 subnormal floor once P
-    # carries its 2**-MXFP4_P_EXP_SHIFT, and must still come out exactly (not zero).
+    # The smallest valid MXFP4 magnitudes (e2m1 0.5 at e8m0 byte 1, 2**-127; byte 0 is
+    # unsupported): the PV sum sits near the f32 subnormal floor once P carries its
+    # 2**-MXFP4_P_EXP_SHIFT, and must still come out exactly (not zero).
     ("mxfp4-pv-1tok-2e-126", (None, 127, (0,), (0x22,), 1, 1)),
-    ("mxfp4-pv-1tok-2e-128", (None, 127, (0,), (0x11,), 0, 1)),
-    ("mxfp4-pv-4tok-2e-128", (None, 127, (0,), (0x11,), 0, 4)),
-    ("mxfp4-pv-4tok-mixed-2e-127", (None, 127, (0,), (0x11, 0x33), 0, 4)),
+    ("mxfp4-pv-1tok-2e-127", (None, 127, (0,), (0x11,), 1, 1)),
+    ("mxfp4-pv-4tok-2e-127", (None, 127, (0,), (0x11,), 1, 4)),
+    ("mxfp4-pv-4tok-mixed-2e-126", (None, 127, (0,), (0x11, 0x33), 1, 4)),
     # The largest context one task owns (4096 staged pages) at the largest finite V
     # (1.5 * 2**127): an unscaled f32 PV sum would reach 1.5 * 2**146.
     ("mxfp4-pv-ctx2e19-v2e127", (None, 127, (0,), (0x33,), 254, 2**19)),
