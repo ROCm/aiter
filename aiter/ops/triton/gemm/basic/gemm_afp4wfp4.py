@@ -31,8 +31,14 @@ _LOGGER = AiterTritonLogger()
 _USE_GEMM_SPLITK_BF16 = False
 
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
-_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
-_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_PRESHUFFLE_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+_GLUON_DEFAULT_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def set_use_gemm_splitk_bf16(value: bool):
