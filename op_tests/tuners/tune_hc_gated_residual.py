@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import os
+import sys
 
 import torch
 
@@ -230,12 +231,14 @@ args = ap.parse_args()
 
 arch = get_gfx()
 results = {}
+invalid = []
 for M in args.tokens:
     inp = make_inputs(M)
     ref_r2, ref_packed = k1(inp)  # trusted heuristic default (use_tuned=False)
     torch.cuda.synchronize()
     if not (ref_r2.isfinite().all() and ref_packed.isfinite().all()):
         print(f"\nM={M}: heuristic reference is non-finite; skipping")
+        invalid.append(M)
         continue
     t_def = timeit(lambda inp=inp: k1(inp))
     print(f"\nM={M}  heuristic-default={t_def:.1f}u")
@@ -268,11 +271,16 @@ for M in args.tokens:
         print(f"   -> M={M}: best {bt:.1f}u ({t_def / bt:.2f}x vs default) {bc}")
         results[str(M)] = _entry_from_cfg(bc, bt)
 
+if args.export and invalid:
+    # A partial update would leave the existing entries for these counts live.
+    sys.exit(f"\nnot exporting: non-finite heuristic reference at M={invalid}")
 if args.export and results:
     with open(TABLE) as f:
         tbl = json.load(f)
     tbl.setdefault(arch, {}).setdefault("k1", {}).update(results)
-    with open(TABLE, "w") as f:
+    tmp = f"{TABLE}.tmp"
+    with open(tmp, "w") as f:
         json.dump(tbl, f, indent=2)
         f.write("\n")
+    os.replace(tmp, TABLE)
     print(f"\nexported {len(results)} entries to {TABLE} under {arch}/k1")

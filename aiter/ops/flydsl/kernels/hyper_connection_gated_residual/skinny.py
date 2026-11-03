@@ -496,12 +496,15 @@ def skinny_supported(
 
 
 # Arrival-counter sets, least recently used first. Sets referenced by a captured
-# CUDA graph are pinned; the others are bounded by _MAX_COUNTER_SETS.
+# CUDA graph are pinned for the process lifetime, since a graph may be replayed
+# at any time; at most _MAX_PINNED_SETS are pinned. Unpinned sets are bounded by
+# _MAX_COUNTER_SETS.
 _COUNTERS: OrderedDict[tuple[int | None, int, int, int, int], torch.Tensor] = (
     OrderedDict()
 )
 _PINNED_COUNTERS: set[tuple[int | None, int, int, int, int]] = set()
 _MAX_COUNTER_SETS = 64
+_MAX_PINNED_SETS = 64
 
 
 def _counters(
@@ -519,30 +522,39 @@ def _counters(
     # evicted set returns to the allocator in that stream's order: no launch
     # still in flight can see it reused.
     key = (device.index, n_pad, m_groups, hc_count, stream)
+    capturing = torch.cuda.is_current_stream_capturing()
+    size = m_groups * n_pad * COUNTER_STRIDE
+    if (
+        capturing
+        and key not in _PINNED_COUNTERS
+        and len(_PINNED_COUNTERS) >= _MAX_PINNED_SETS
+    ):
+        # The zero-fill is captured with the launch, and the graph's pool owns
+        # the buffer, as for the op's other temporaries.
+        return torch.zeros(size, dtype=torch.int32, device=device)
     c = _COUNTERS.get(key)
     if c is None:
-        c = torch.zeros(
-            m_groups * n_pad * COUNTER_STRIDE, dtype=torch.int32, device=device
-        )
+        c = torch.zeros(size, dtype=torch.int32, device=device)
         _COUNTERS[key] = c
         unpinned = [k for k in _COUNTERS if k not in _PINNED_COUNTERS]
         for old in unpinned[: max(0, len(unpinned) - _MAX_COUNTER_SETS)]:
             del _COUNTERS[old]
     else:
         _COUNTERS.move_to_end(key)
-    if torch.cuda.is_current_stream_capturing():
+    if capturing:
         _PINNED_COUNTERS.add(key)
     return c
 
 
 def release_counters() -> None:
-    """Drop every cached arrival-counter set, including graph-pinned ones.
+    """Drop the counter sets no captured graph references.
 
-    Call only when no skinny launch is in flight and no captured graph that
-    used the skinny decode will be replayed.
+    Graph-pinned sets are kept: a graph can be replayed at any time. Unpinned
+    sets are freed in their stream's order, so this is safe with launches in
+    flight.
     """
-    _COUNTERS.clear()
-    _PINNED_COUNTERS.clear()
+    for key in [k for k in _COUNTERS if k not in _PINNED_COUNTERS]:
+        del _COUNTERS[key]
 
 
 def skinny_two_kernel(

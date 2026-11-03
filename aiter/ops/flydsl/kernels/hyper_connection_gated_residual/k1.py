@@ -1592,11 +1592,30 @@ def flydsl_k1_combine_norm_down(
     columns ``[0, lowrank)`` the SiLU'd bottleneck and ``[lowrank, lowrank+hc)``
     the raw next-injection logits (slice with
     :func:`~...common.split_down_inject`).
+
+    Caller-provided ``r2_out`` (bf16 ``[P, hidden]``), ``out`` (bf16
+    ``[P, n_pad]``) and ``rrms_out`` (f32 ``[P, hc_count]``) must be contiguous
+    on the input device, where ``P`` is ``gemm_pad`` (default: ``M``).
+    ``stages`` must be at least 2.
     """
     require_supported_arch()
     validate_k1_inputs(
         residual, block_output, injection, norm_weight, w_dn_merged, lowrank, hc_count
     )
+    tokens, hidden = residual.shape
+    if gemm_pad is not None and gemm_pad < tokens:
+        raise ValueError(f"gemm_pad={gemm_pad} must be >= tokens={tokens}")
+    if stages is not None and stages < 2:
+        raise ValueError(f"stages={stages} must be >= 2 (async-LDS pipeline)")
+    rows = tokens if gemm_pad is None else gemm_pad
+    dev = residual.device
+    for name, t, shape, dtype in (
+        ("r2_out", r2_out, (rows, hidden), torch.bfloat16),
+        ("out", out, (rows, w_dn_merged.shape[0]), torch.bfloat16),
+        ("rrms_out", rrms_out, (rows, hc_count), torch.float32),
+    ):
+        if t is not None:
+            check_tensor(name, t, shape, dev, dtype=dtype)
     ctx, stream = stream_scope(stream, residual.device)
     with ctx:
         return _k1_combine_norm_down(
@@ -1748,10 +1767,11 @@ def _k1_combine_norm_down(
     )
     if stages is None:
         stages = int(plan.get("stages", 2)) if plan is not None else 2
+    if stages < 2:
+        raise ValueError(f"stages={stages} must be >= 2 (async-LDS pipeline)")
     # Async-LDS loads require at least 32 rows for whole-thread coverage.
-    # The single-buffer fallback uses 16 rows for smaller token grids.
     if block_m is None:
-        block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
+        block_m = 32
     # gfx942 uses 32-bit async loads, so split-K uses register prefetch to avoid
     # multiplying load instructions. Other architectures use the async pipeline.
     # GR_FORCE_PIPE is a temporary diagnostic rollback switch, not a supported
@@ -1857,12 +1877,9 @@ def _k1_combine_norm_down(
     )
 
     # K2 needs per-stream reciprocal RMS values to reconstruct xn from r2.
+    # Caller buffers are validated by the public entry point.
     def _rrms_buf():
         if rrms_out is not None:
-            assert (
-                rrms_out.shape == (gemm_tokens, hc_count)
-                and rrms_out.dtype == torch.float32
-            )
             return rrms_out
         return torch.empty(
             gemm_tokens, hc_count, dtype=torch.float32, device=residual.device

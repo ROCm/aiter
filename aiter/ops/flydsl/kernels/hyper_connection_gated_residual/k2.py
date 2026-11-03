@@ -30,8 +30,8 @@ from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
-    check_hidden,
     check_norm_weight,
+    check_streams,
     check_tensor,
     mfma_bf16,
     norm_weight_f32,
@@ -336,7 +336,7 @@ def flydsl_up_gate_mix_norm(
     if r2.ndim != 2 or r2.shape[0] != tokens:
         raise ValueError(f"r2 must be 2-D with {tokens} rows")
     hidden = r2.shape[1]
-    stream_dim = check_hidden(hidden, hc_count)
+    stream_dim = check_streams(hidden, hc_count)
     check_tensor("r2", r2, (tokens, hidden), dev)
     check_tensor("rrms", rrms, (tokens, hc_count), dev, dtype=torch.float32)
     _validate_w_up(w_up, hidden, lowrank, dev)

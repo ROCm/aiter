@@ -849,15 +849,19 @@ def _run_stream_device_mismatch():
 
 
 def _run_counter_cache_bound():
-    """Transient streams must not grow the skinny counter cache without bound."""
+    """Distinct streams must not grow the skinny counter cache without bound.
+
+    PyTorch pools 32 streams per device and priority, so the limits are lowered
+    to make eviction and the graph-pinned bound reachable with distinct handles.
+    """
     from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import skinny
 
     inp = _make_inputs(2, seed=37)
     merged = _merged(inp, True)
-    out = None
-    for _ in range(skinny._MAX_COUNTER_SETS + 16):
-        stream = torch.cuda.Stream()
-        out = flydsl_gr_two_stage_combine_and_mix(
+    _, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+
+    def run(stream=None):
+        return flydsl_gr_two_stage_combine_and_mix(
             inp["residual"],
             inp["block_output"],
             inp["injection"],
@@ -871,16 +875,58 @@ def _run_counter_cache_bound():
             fold_w=True,
             stream=stream,
         )
-        stream.synchronize()
-    unpinned = [k for k in skinny._COUNTERS if k not in skinny._PINNED_COUNTERS]
-    if len(unpinned) > skinny._MAX_COUNTER_SETS:
-        print(f"[FAIL] counter_cache: {len(unpinned)} unpinned sets retained")
-        _FAILURES.append("counter_cache")
-    _, x_ref, inj_ref = _ref(inp, "combine_and_mix")
-    _check(x_ref.to(out[1].dtype), out[1], "counter_cache x")
-    _check(
-        inj_ref.to(out[2].dtype), out[2].contiguous(), "counter_cache inj", atol=0.05
-    )
+
+    def check(out, label):
+        _check(x_ref.to(out[1].dtype), out[1], f"{label} x")
+        _check(inj_ref.to(out[2].dtype), out[2].contiguous(), f"{label} inj", atol=0.05)
+
+    limits = (skinny._MAX_COUNTER_SETS, skinny._MAX_PINNED_SETS)
+    try:
+        skinny._MAX_COUNTER_SETS = 4
+        streams, handles = [], set()
+        while len(streams) < 12:
+            stream = torch.cuda.Stream()
+            if stream.cuda_stream not in handles:
+                handles.add(stream.cuda_stream)
+                streams.append(stream)
+        for stream in streams:
+            run(stream)
+            stream.synchronize()
+        unpinned = [k for k in skinny._COUNTERS if k not in skinny._PINNED_COUNTERS]
+        kept = {k[-1] for k in unpinned}
+        if len(unpinned) > 4 or streams[0].cuda_stream in kept:
+            print(f"[FAIL] counter_cache: {len(unpinned)} unpinned sets, no eviction")
+            _FAILURES.append("counter_cache evict")
+        # The first stream's set was evicted; a fresh one must work.
+        out = run(streams[0])
+        streams[0].synchronize()
+        check(out, "counter_cache[reused]")
+
+        # At most one more graph-pinned set; later captures own their counters.
+        skinny._MAX_PINNED_SETS = len(skinny._PINNED_COUNTERS) + 1
+        graphs = []
+        for stream in streams[:3]:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out = run()
+            graphs.append((graph, out))
+        if len(skinny._PINNED_COUNTERS) > skinny._MAX_PINNED_SETS:
+            print(f"[FAIL] counter_cache: {len(skinny._PINNED_COUNTERS)} pinned sets")
+            _FAILURES.append("counter_cache pinned")
+        for rep in range(3):
+            for index, (graph, out) in enumerate(graphs):
+                graph.replay()
+                torch.cuda.synchronize()
+                check(out, f"counter_cache[graph{index}][replay{rep}]")
+        skinny.release_counters()
+        if any(k not in skinny._PINNED_COUNTERS for k in skinny._COUNTERS):
+            print("[FAIL] counter_cache: release kept unpinned sets")
+            _FAILURES.append("counter_cache release")
+        graphs[0][0].replay()
+        torch.cuda.synchronize()
+        check(graphs[0][1], "counter_cache[graph0][after release]")
+    finally:
+        skinny._MAX_COUNTER_SETS, skinny._MAX_PINNED_SETS = limits
 
 
 def _run_heuristic_marker():
@@ -906,18 +952,18 @@ def _run_heuristic_marker():
         _FAILURES.append("heuristic_marker")
 
 
-def _k2_inputs(tokens, seed):
+def _k2_inputs(tokens, seed, hs=HS):
     """Valid K2 operands and the oracle ``block_input``."""
     torch.manual_seed(seed)
-    hidden = HC * HS
+    hidden = HC * hs
     lora = (torch.randn(tokens, LOWRANK, device="cuda") * 0.5).bfloat16()
     r2 = torch.randn(tokens, hidden, device="cuda").bfloat16()
-    rrms = torch.rsqrt(r2.float().view(tokens, HC, HS).pow(2).mean(-1) + EPS)
-    norm_weight = (torch.randn(HS, device="cuda") * 0.1).bfloat16()
+    rrms = torch.rsqrt(r2.float().view(tokens, HC, hs).pow(2).mean(-1) + EPS)
+    norm_weight = (torch.randn(hs, device="cuda") * 0.1).bfloat16()
     w_up = (torch.randn(hidden, LOWRANK, device="cuda") * LOWRANK**-0.5).bfloat16()
-    xn = r2.float().view(tokens, HC, HS) * rrms.unsqueeze(-1)
+    xn = r2.float().view(tokens, HC, hs) * rrms.unsqueeze(-1)
     xn = (xn * (1.0 + norm_weight.float())).bfloat16().float()
-    gate = (lora.float() @ w_up.float().t()).view(tokens, HC, HS)
+    gate = (lora.float() @ w_up.float().t()).view(tokens, HC, hs)
     ref = (torch.sigmoid(gate) * xn).mean(1)
     return (lora, r2, rrms.contiguous(), norm_weight, w_up), ref
 
@@ -962,6 +1008,74 @@ def _run_direct_k2():
     )
     torch.cuda.synchronize()
     _check(ref.to(padded.dtype), padded[:tail], "direct_k2[padded tail]")
+
+    # K2 has no prologue, so streams narrower than K1's 512 alignment are valid.
+    args, ref = _k2_inputs(64, seed=40, hs=64)
+    narrow = flydsl_up_gate_mix_norm(*args, HC)
+    torch.cuda.synchronize()
+    _check(ref.to(narrow.dtype), narrow, "direct_k2[stream_dim=64]")
+
+
+def _run_direct_k1_buffers():
+    """Caller K1 buffers are validated, also at M=0, and written in place."""
+    tokens = 64
+    inp = _make_inputs(tokens, seed=41)
+    merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+    n_pad = merged.shape[0]
+
+    def call(src=inp, **kwargs):
+        return flydsl_k1_combine_norm_down(
+            src["residual"],
+            src["block_output"],
+            src["injection"],
+            src["norm_weight"],
+            merged,
+            LOWRANK,
+            HC,
+            EPS,
+            **kwargs,
+        )
+
+    def bf16(*shape):
+        return torch.empty(*shape, device="cuda").bfloat16()
+
+    hidden = HC * HS
+    bad = {
+        "r2_cpu": {"r2_out": torch.empty(tokens, hidden, dtype=torch.bfloat16)},
+        "r2_dtype": {"r2_out": torch.empty(tokens, hidden, device="cuda")},
+        "r2_rows": {"r2_out": bf16(tokens - 1, hidden)},
+        "out_dtype": {"out": torch.empty(tokens, n_pad, device="cuda")},
+        "out_strided": {"out": bf16(tokens, 2 * n_pad)[:, ::2]},
+        "rrms_dtype": {"rrms_out": torch.empty(tokens, HC, device="cuda").int()},
+        "rrms_rows": {"rrms_out": torch.empty(tokens + 1, HC, device="cuda")},
+        "gemm_pad": {"gemm_pad": tokens - 1},
+        "stages": {"stages": 1},
+    }
+    for name, kwargs in bad.items():
+        _expect_value_error(f"k1_buffers[{name}]", lambda kwargs=kwargs: call(**kwargs))
+    empty = _make_inputs(0, seed=42)
+    for name, kwargs in {
+        "r2_cpu": {"r2_out": torch.empty(0, hidden)},
+        "out_int": {"out": torch.empty(0, n_pad, dtype=torch.int32)},
+    }.items():
+        _expect_value_error(
+            f"k1_buffers[M=0][{name}]",
+            lambda kwargs=kwargs: call(src=empty, **kwargs),
+        )
+
+    r2_out, out = bf16(tokens, hidden), bf16(tokens, n_pad)
+    rrms_out = torch.empty(tokens, HC, device="cuda")
+    r2, packed = call(r2_out=r2_out, out=out, rrms_out=rrms_out)
+    torch.cuda.synchronize()
+    if r2.data_ptr() != r2_out.data_ptr() or packed.data_ptr() != out.data_ptr():
+        print("[FAIL] k1_buffers: did not write the caller's buffers")
+        _FAILURES.append("k1_buffers in place")
+    _check_direct_k1(inp, merged, HC, r2, packed, "k1_buffers")
+    r2_ref = gr_combine(
+        inp["residual"], inp["block_output"], inp["injection"], HC, round_bf16=True
+    )
+    rr_ref = torch.rsqrt(r2_ref.view(tokens, HC, HS).pow(2).mean(-1) + EPS)
+    _check(rr_ref, rrms_out, "k1_buffers rrms", atol=1e-3, rtol=1e-3)
 
 
 def _run_final_mixer_no_inject(tokens, fold_w):
@@ -1148,6 +1262,7 @@ def main():
     _run_stream_device_mismatch()
     _run_heuristic_marker()
     _run_direct_k2()
+    _run_direct_k1_buffers()
     for m in args.decode_tokens:
         # Unfolded decode uses the padded tail because skinny K1 requires folding.
         for fold_w in (False, True):

@@ -149,11 +149,16 @@ def stream_scope(stream: torch.cuda.Stream | int | None, device: torch.device):
 STREAM_DIM_ALIGN = 64 * 8
 
 
-def check_hidden(hidden: int, hc_count: int) -> int:
-    """Return ``stream_dim``; reject widths the combine/RMS prologue cannot tile."""
+def check_streams(hidden: int, hc_count: int) -> int:
+    """Return ``stream_dim``; ``hidden`` must split into ``hc_count`` streams."""
     if hc_count <= 0 or hidden % hc_count:
         raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
-    stream_dim = hidden // hc_count
+    return hidden // hc_count
+
+
+def check_hidden(hidden: int, hc_count: int) -> int:
+    """Return ``stream_dim``; reject widths the K1 combine/RMS prologue cannot tile."""
+    stream_dim = check_streams(hidden, hc_count)
     if stream_dim % STREAM_DIM_ALIGN:
         raise ValueError(
             f"stream_dim=hidden/hc_count={stream_dim} must be a multiple of "
