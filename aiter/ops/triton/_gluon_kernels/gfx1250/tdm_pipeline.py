@@ -37,16 +37,19 @@ def issue_loads(
         half: gl.constexpr = gl.num_warps() // 2
         hint_a: gl.constexpr = (1 << half) - 1
         hint_b: gl.constexpr = ((1 << gl.num_warps()) - 1) ^ hint_a
+        # clamp_bounds keeps the descriptor bounds with the moved offsets. Without it the last
+        # K tile of a K that does not divide BLOCK_K reads past K instead of zero-filling, and
+        # every such shape is wrong: 64x64x288 gave a relative error of 0.94.
         a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-            a_desc, add_offsets=[off_m, off_k]
+            a_desc, add_offsets=[off_m, off_k], clamp_bounds=True
         )
         if TRANSPOSE_B:
             b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[off_n, off_k]
+                b_desc, add_offsets=[off_n, off_k], clamp_bounds=True
             )
         else:
             b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[off_k, off_n]
+                b_desc, add_offsets=[off_k, off_n], clamp_bounds=True
             )
         gl.amd.cdna5.tdm.async_load_fused(
             [(a_d, a_buffer.index(slot), hint_a), (b_d, b_buffer.index(slot), hint_b)]
