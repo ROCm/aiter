@@ -803,7 +803,7 @@ def _csv_set(args):
 
 
 def _full_set(args):
-    """The cartesian product of every axis -- ~500 cases on the defaults."""
+    """The cartesian product of every axis -- 960 cases on the gfx950 defaults."""
     cases = []
     for (s_q, s_k), nh, hd, qd, kvd, cl, win in itertools.product(
         args.shapes,
@@ -823,7 +823,7 @@ def _full_set(args):
 def _reduced_set(args):
     """One case per (shape, window) pair, with the remaining axes rotated.
 
-    65 cases on the defaults, which is what the CI lane runs. Shape and window
+    80 cases on the defaults, which is what the CI lane runs. Shape and window
     are the axes that reach genuinely distinct kernel paths -- the grid.y split,
     the negative/empty window collapse, the cu_starts clamp -- so they are
     covered exhaustively. num_heads, head_dim, clean_logits and the operand
@@ -892,7 +892,7 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
-        help="sweep the full cartesian product of every axis (~500 cases)\n"
+        help="sweep the full cartesian product of every axis (960 cases on gfx950)\n"
         "instead of the default covering set (one case per shape x window)",
     )
     parser.add_argument(
@@ -956,6 +956,10 @@ def main():
             # leading rows, so these cover the negative-window path end to end.
             (128, 64),
             (1024, 1000),
+            # Long-context indexer prefill (vLLM: s_q 512-2048, s_kv 16k-128k).
+            (512, 32768),
+            (1024, 65536),
+            (2048, 131072),
         ],
     )
     parser.add_argument("--num-heads", type=int, nargs="*", default=[32, 64, 128])

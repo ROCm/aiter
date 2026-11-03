@@ -20,6 +20,11 @@ from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
     _splits_by_wave_cost,
 )
 
+# gfx950 with occupancy unknown: the fixed-oversubscription fallback.
+_GFX950_FIXED = dataclasses.replace(
+    _SPLIT_POLICIES["gfx950"], block_overhead_tiles=None
+)
+
 
 def _cost(splits, grid_x, effective_cus, window_tiles, overhead):
     waves = math.ceil(grid_x * splits / effective_cus)
@@ -93,10 +98,10 @@ class TestWaveCostModel:
 
 
 class TestSplitPolicy:
-    def test_gfx950_is_unchanged(self):
-        """gfx950 stays on the fixed-oversubscription path."""
+    def test_gfx950_is_occupancy_aware(self):
+        """gfx950 uses gfx942's wave-cost model; its gates are its own."""
         policy = _SPLIT_POLICIES["gfx950"]
-        assert policy.block_overhead_tiles is None
+        assert policy.block_overhead_tiles == 8
         assert policy.cu_oversub == 4
         assert policy.min_seq_len_kv == 0
         assert policy.min_tiles_per_split == 2
@@ -119,7 +124,8 @@ class TestSplitPolicy:
 
 
 class TestStreamingSplitTarget:
-    """``_auto_num_splits`` on the gfx950 fixed-oversubscription path.
+    """``_auto_num_splits`` on the gfx950 fixed-oversubscription fallback
+    (``blocks_per_cu`` unknown, or a policy without ``block_overhead_tiles``).
 
     The streaming (aggressive) target is ``residency * blocks_per_cu *
     cu_count``; without ``blocks_per_cu`` it falls back to
@@ -150,7 +156,7 @@ class TestStreamingSplitTarget:
         )
 
     def test_aggressive_target_is_residency_times_occ_times_cu(self, monkeypatch):
-        policy = _SPLIT_POLICIES["gfx950"]  # residency=4
+        policy = _GFX950_FIXED  # residency=4
         grid_x = self.SEQ_LEN // self.RPB  # 2
         splits = self._call(
             monkeypatch, policy=policy, blocks_per_cu=3, aggressive=True
@@ -161,11 +167,11 @@ class TestStreamingSplitTarget:
         """Behaviour-preserving on the ticket: residency=4 * occ=3 == 12x."""
         grid_x = self.SEQ_LEN // self.RPB
         legacy = dataclasses.replace(
-            _SPLIT_POLICIES["gfx950"], streaming_lowh_residency=0
+            _GFX950_FIXED, streaming_lowh_residency=0
         )  # falls back to streaming_lowh_cu_oversub=12
         occ_derived = self._call(
             monkeypatch,
-            policy=_SPLIT_POLICIES["gfx950"],
+            policy=_GFX950_FIXED,
             blocks_per_cu=3,
             aggressive=True,
         )
@@ -189,7 +195,7 @@ class TestStreamingSplitTarget:
         grid_x = self.SEQ_LEN // self.RPB
         splits = self._call(
             monkeypatch,
-            policy=_SPLIT_POLICIES["gfx950"],
+            policy=_GFX950_FIXED,
             blocks_per_cu=3,
             aggressive=False,
         )
@@ -199,10 +205,26 @@ class TestStreamingSplitTarget:
         """A tiny residency*occ must not undercut cu_oversub*cu_count."""
         grid_x = self.SEQ_LEN // self.RPB
         thin = dataclasses.replace(
-            _SPLIT_POLICIES["gfx950"], streaming_lowh_residency=1
+            _GFX950_FIXED, streaming_lowh_residency=1
         )  # 1 * occ(1) * cu = 256 < cu_oversub(4)*cu = 1024
         splits = self._call(monkeypatch, policy=thin, blocks_per_cu=1, aggressive=True)
         assert splits == math.ceil(4 * self.CU / grid_x)
+
+
+class TestGfx950WaveCostSplitTarget:
+    """``_auto_num_splits`` on gfx950 with occupancy known: the wave-cost
+    model under gfx950's own gates (no ``min_seq_len_kv``, 2-tile chunks)."""
+
+    def test_uses_the_wave_cost_model(self, monkeypatch):
+        policy = _SPLIT_POLICIES["gfx950"]
+        monkeypatch.setattr(knl, "_split_policy", lambda: policy)
+        monkeypatch.setattr(knl, "_device_cu_count", lambda _idx: 256)
+        got = _auto_num_splits(128, 8192, 1, 64, 0, 5, aggressive=True)
+        max_splits = (8192 // 64) // policy.min_tiles_per_split
+        expected = _splits_by_wave_cost(
+            128, 256 * 5, 8192 // 64, max_splits, policy.block_overhead_tiles
+        )
+        assert got == expected
 
 
 class TestOccupancyAwareSplitTarget:
@@ -238,3 +260,4 @@ class TestOccupancyAwareSplitTarget:
         assert self._call(monkeypatch, blocks_per_cu=None) == math.ceil(
             4 * 304 / grid_x
         )
+

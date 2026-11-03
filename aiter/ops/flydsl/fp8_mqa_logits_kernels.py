@@ -127,12 +127,16 @@ _SPLIT_POLICIES = {
         fallback_cu=304,
         block_overhead_tiles=8,  # fitted on MI325X
     ),
-    # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
+    # MI355X (256 CU). gfx942's occupancy-aware wave-cost model and overhead;
+    # the gfx950 routes (_GFX950_ROUTES) were selected under it. The streaming
+    # fields serve only a launch that cannot query occupancy (the first one
+    # during graph capture).
     "gfx950": _SplitPolicy(
         min_seq_len_kv=0,
         min_tiles_per_split=2,
         cu_oversub=4,
         fallback_cu=256,
+        block_overhead_tiles=8,
         streaming_lowh_cu_oversub=12,
         streaming_lowh_residency=4,
     ),
@@ -204,12 +208,12 @@ def _auto_num_splits(
 
     Two paths, chosen per-arch by ``_SplitPolicy.block_overhead_tiles``:
 
-    - Occupancy-aware (gfx942): how full the device is depends on the kernel
-      instance, not just the shape -- resident blocks per CU depend on the
-      compiled kernel's register and LDS use. With ``blocks_per_cu`` known,
+    - Occupancy-aware (gfx942, gfx950): how full the device is depends on the
+      kernel instance, not just the shape -- resident blocks per CU depend on
+      the compiled kernel's register and LDS use. With ``blocks_per_cu`` known,
       this path forms ``cu_count * blocks_per_cu`` effective CUs and minimizes
       ``_splits_by_wave_cost`` over them.
-    - Fixed oversubscription (gfx950, or ``blocks_per_cu`` unknown): target
+    - Fixed oversubscription (``blocks_per_cu`` unknown): target
       ``cu_oversub * cu_count`` blocks and return 1 once the row grid alone
       reaches that. ``aggressive`` raises the target for the streaming H<=32
       regime (``_is_streaming_lowh``), which is latency/occupancy-bound and
@@ -425,64 +429,91 @@ def _variant_builder(tag):
 
 @dataclass(frozen=True)
 class _Route:
-    """One tuned dispatch entry: ``tag`` serves ``seq_len <= max_seq_len``
-    (``None``: any longer ``seq_len``) not taken by an earlier entry."""
+    """One tuned dispatch entry: ``tag`` serves ``seq_len <= max_seq_len`` and
+    ``seq_len_kv <= max_seq_len_kv`` (``None``: unbounded) not taken by an
+    earlier entry."""
 
     max_seq_len: int | None
     tag: str
+    max_seq_len_kv: int | None = None
 
 
 # Tuned gfx950 routes, (num_heads, head_size) class -> routes by seq_len,
-# shortest first, the last one unbounded. Each tag is the best geomean time over
-# the tuned problems of its seq_len window -- every (num_heads, head_size) at
-# 128x1024, 256x8192, 1024x1024, 1024x1560 and 4096x4096 (plus 8192x8192 at
-# D128) under causal, misaligned and past-the-end windows, causal weighted 2x
-# as the production window -- out of the winners of a search over the whole
-# builder knob space. See op_tests/tune_flydsl_fp8_mqa_logits.py. A route is
-# tuned at the class's own (num_heads, head_size): other sizes that map to the
-# class run untuned and may spill. Re-tune after a kernel change.
+# shortest first, then by seq_len_kv within one seq_len bound, the last of each
+# unbounded. Each tag is the best geomean time, under the split policy
+# (_auto_num_splits), over the tuned problems of its (seq_len, seq_len_kv)
+# window, out of the winners of searches over the whole builder knob space.
+# The problems: every (num_heads, head_size) at 128x1024,
+# 256x8192, 1024x1024, 1024x1560 and 4096x4096 under causal, misaligned and
+# past-the-end windows, plus causal 256x32768, 1024x{2k,4k,8k,16k,32k,64k},
+# 4096x{8k,16k,32k} and (D128) 8192x8192, clean-logits causal at the first
+# five shapes and 1024x32768 and 4096x16384, and (D128, H32 and H64) the
+# DSv4/GLM block-diagonal batch_causal model shapes. Causal and batch_causal
+# are weighted 2x as the production windows. See
+# op_tests/tune_flydsl_fp8_mqa_logits.py (--auto-split).
+# A route is tuned at the class's own (num_heads, head_size): other sizes that
+# map to the class run untuned and may spill. Re-tune after a kernel or split
+# policy change. The tags carry no _ns: the split policy sizes grid.y per shape.
 _GFX950_ROUTES = {
     (32, 64): (
-        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_swp_rs_hfma_wpe4_ns2"),
-        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1_ns2"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
     ),
     (32, 128): (
-        _Route(256, "mfma16x16x128_bkv64_r1_w1_lds4_swp_rs_ls_hfma_ns4"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_rs_hfma2_wpe3_ns2"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4_ns2"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"),
+        _Route(None, "mfma16x16x128_bkv64_r1_w4_lds2_pd1_swp_rs_ls_hfma2_wpe3", 4096),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma"),
     ),
     (64, 64): (
-        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_pd1_swp_rs_hfma_wpe3_ns4"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_rs_ls_hfma_wpe1_ns2"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds3_pd1_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_swp_rs_hfma_wpe4", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_ts_dg_hfma_wpe1", 4096),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
     ),
     (64, 128): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma2_wpe1"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma2_wpe4_ns2"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_pd1_swp_rs_ls_hfma_wpe3"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r2_w1_lds2_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_ts_hfma_wpe1"),
     ),
     (128, 64): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_wpe1_ns8"),
-        _Route(2048, "mfma32x32x64_bkv128_r1_w4_hfma"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_ls_hfma2_wpe1_ns2"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma_wpe4"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
     ),
     (128, 128): (
-        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma"),
-        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma_wpe3_ns2"),
-        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_ns2"),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_wpe4", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_wpe4", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
     ),
 }
 for _routes in _GFX950_ROUTES.values():
     _bounds = [r.max_seq_len for r in _routes]
-    assert _bounds[-1] is None and _bounds[:-1] == sorted(
-        set(_bounds[:-1])
+    _uniq = list(dict.fromkeys(_bounds))
+    assert _uniq[-1] is None and _uniq[:-1] == sorted(
+        set(_uniq[:-1])
     ), f"routes must have increasing bounds and end unbounded: {_bounds}"
-# The fixed _ns<N> splits were tuned at seq_len_kv <= 8192. Well past that a
-# fixed split under-fills the device for a short seq_len, so the tag's _ns is
-# dropped and the split policy (_auto_num_splits) decides.
-_GFX950_ROUTE_MAX_SEQ_LEN_KV = 16384
-_NS_RE = re.compile(r"_ns\d+$")
+    for _b in _uniq:
+        _kv = [r.max_seq_len_kv for r in _routes if r.max_seq_len == _b]
+        assert _kv[-1] is None and _kv[:-1] == sorted(
+            set(_kv[:-1])
+        ), f"seq_len_kv bounds must increase and end unbounded: {_kv}"
 
 
 def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
@@ -496,7 +527,8 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
     gfx950: the tuned ``_GFX950_ROUTES`` table. ``num_heads`` maps to the
         nearest tuned class (<= 32, 64, >= 128) and ``head_size`` to 64 or
         128 (>= 128); within the class, the first ``_Route`` whose
-        ``max_seq_len`` admits ``seq_len`` wins. Routed tags use the
+        ``max_seq_len`` admits ``seq_len`` and whose ``max_seq_len_kv`` admits
+        ``seq_len_kv`` wins. Routed tags use the
         32x32x64 atom (K=64), except in the 128 head_size class, where a
         16x16x128 atom (K=128) is also allowed: head sizes are powers of two,
         so every head_size >= 128 is a multiple of 128.
@@ -516,12 +548,12 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
     if _ARCH == "gfx950":
         h = 32 if num_heads <= 32 else (128 if num_heads >= 128 else 64)
         routes = _GFX950_ROUTES[(h, 128 if head_size >= 128 else 64)]
-        tag = next(
-            r.tag for r in routes if r.max_seq_len is None or seq_len <= r.max_seq_len
+        return next(
+            r.tag
+            for r in routes
+            if (r.max_seq_len is None or seq_len <= r.max_seq_len)
+            and (r.max_seq_len_kv is None or seq_len_kv <= r.max_seq_len_kv)
         )
-        if seq_len_kv > _GFX950_ROUTE_MAX_SEQ_LEN_KV:
-            tag = _NS_RE.sub("", tag)
-        return tag
     raise NotImplementedError(
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
         "supported: gfx942, gfx950"
@@ -537,7 +569,6 @@ def _auto_variants():
         ]
     elif _ARCH == "gfx950":
         tags = {r.tag for routes in _GFX950_ROUTES.values() for r in routes}
-        tags |= {_NS_RE.sub("", t) for t in tags}
         for t in tags:
             _variant_builder(t)
         return sorted(tags)
@@ -584,6 +615,30 @@ def _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size=128):
             f"MFMA_K={mfma_k} required by variant {tag!r} on arch {_ARCH}"
         )
     return tag
+
+
+def _policy_num_splits(
+    launcher, args, variant, seq_len, seq_len_kv, num_heads, device_index
+):
+    """The split policy's ``num_splits`` for ``launcher``, built from
+    ``variant``; ``args`` are its launch arguments (for occupancy)."""
+    bkv, rows_per_block = _parse_variant(variant)
+    pol = _split_policy()
+    aggressive = _is_streaming_lowh(seq_len, seq_len_kv, num_heads)
+    blocks_per_cu = None
+    if pol.block_overhead_tiles is not None or (
+        aggressive and pol.streaming_lowh_residency
+    ):
+        blocks_per_cu = _max_blocks_per_cu(launcher, args)
+    return _auto_num_splits(
+        seq_len,
+        seq_len_kv,
+        rows_per_block,
+        bkv,
+        device_index,
+        blocks_per_cu,
+        aggressive=aggressive,
+    )
 
 
 @lru_cache(maxsize=32)
@@ -749,23 +804,14 @@ def flydsl_fp8_mqa_logits(
         # A tag's _ns<N> fixes the split; otherwise the arch's split policy.
         _, num_splits = _variant_launch_knobs(variant)
         if num_splits is None:
-            pol = _split_policy()
-            aggressive = _is_streaming_lowh(seq_len, seq_len_kv, num_heads)
-            blocks_per_cu = None
-            if pol.block_overhead_tiles is not None or (
-                aggressive and pol.streaming_lowh_residency
-            ):
-                blocks_per_cu = _max_blocks_per_cu(
-                    launcher, (*tensors, *scalars, 1, stream)
-                )
-            num_splits = _auto_num_splits(
+            num_splits = _policy_num_splits(
+                launcher,
+                (*tensors, *scalars, 1, stream),
+                variant,
                 seq_len,
                 seq_len_kv,
-                _ROWS_PER_BLOCK,
-                _BKV,
+                num_heads,
                 Q.device.index,
-                blocks_per_cu,
-                aggressive=aggressive,
             )
         _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
 

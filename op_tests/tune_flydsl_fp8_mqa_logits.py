@@ -85,7 +85,8 @@ _SPILL_KEYS = ("spill_vgpr", "spill_sgpr", "private_segment_size")
 
 
 def parse_problem(text: str) -> Problem:
-    """``s_q,s_k,num_heads,head_dim,clean_logits,window``."""
+    """``s_q,s_k,num_heads,head_dim,clean_logits,window``; window ``bc<B>`` is
+    the block-diagonal ``batch_causal`` window of ``B`` packed sequences."""
     s_q, s_k, h, d, clean, window = text.split(",")
     return Problem(int(s_q), int(s_k), int(h), int(d), bool(int(clean)), window)
 
@@ -127,10 +128,11 @@ def is_valid(cfg: dict, num_heads: int, head_dim: int) -> bool:
     return nb * (kv_bytes + scale_dmas * 64 * 4) <= _LDS_BYTES
 
 
-def make_space(num_heads: int, head_dim: int) -> SearchSpace:
+def make_space(num_heads: int, head_dim: int, auto_split: bool = False) -> SearchSpace:
     """Builder knobs (LDS-pipe sub-knobs gated on ``lds``), the
     ``waves_per_eu`` hint, and the KV split: ``auto`` (the launcher's policy)
-    or a fixed ``num_splits``."""
+    or a fixed ``num_splits``. ``auto_split`` pins the split to the policy, for
+    tuning tags that are routed without a ``_ns``."""
     params = (
         Param.categorical("mfma", _MFMA_SHAPES),
         Param.ordinal("block_kv", (64, 128, 256)),
@@ -148,7 +150,7 @@ def make_space(num_heads: int, head_dim: int) -> SearchSpace:
         Param.boolean("dma_guard", gate="lds"),
         Param.categorical("head_acc", _HEAD_ACC),
         Param.ordinal("waves_per_eu", (1, 2, 3, 4)),
-        Param.categorical("split", ("auto", "fixed")),
+        Param.categorical("split", ("auto",) if auto_split else ("auto", "fixed")),
         Param.ordinal("num_splits", (1, 2, 4, 8, 16, 32, 64), gate="split"),
     )
     return SearchSpace(
@@ -271,8 +273,11 @@ class Fp8MqaLogitsBackend:
     def _inputs(self, s_q, s_k, window):
         key = (s_q, s_k, window)
         if key not in self.inputs:
+            batch = 1
+            if window.startswith("bc"):
+                window, batch = "batch_causal", int(window[2:])
             self.inputs[key] = self.t._make_inputs(
-                s_q, s_k, self.p.num_heads, self.p.head_dim, "fn", "fn", window
+                s_q, s_k, self.p.num_heads, self.p.head_dim, "fn", "fn", window, batch
             )
         return self.inputs[key]
 
@@ -286,20 +291,15 @@ class Fp8MqaLogitsBackend:
 
         if cfg["split"] == "fixed":
             return int(cfg["num_splits"])
-        s_q, s_k = scalars[0], scalars[1]
-        rows = cfg["rows_per_block"] * (cfg["waves_per_block"] if cfg["lds"] else 1)
-        aggressive = k._is_streaming_lowh(s_q, s_k, self.p.num_heads)
-        bpc = None
-        if aggressive and k._split_policy().streaming_lowh_residency:
-            bpc = k._max_blocks_per_cu(launcher, (*tensors, *scalars, 1, self.stream))
-        return k._auto_num_splits(
-            s_q,
-            s_k,
-            rows,
-            cfg["block_kv"],
+        # The launcher's own policy, on the tag of this config.
+        return k._policy_num_splits(
+            launcher,
+            (*tensors, *scalars, 1, self.stream),
+            config_label(cfg),
+            scalars[0],
+            scalars[1],
+            self.p.num_heads,
             torch.cuda.current_device(),
-            bpc,
-            aggressive=aggressive,
         )
 
     def _runner(self, cfg, launcher, inp, out):
@@ -364,6 +364,9 @@ class Fp8MqaLogitsBackend:
     def _grade(self, cfg, launcher, s_q, s_k, window) -> str | None:
         inp = self._inputs(s_q, s_k, window)
         out = self._out(inp).fill_(float("nan"))
+        # The poison fill runs on the current stream; without this wait it can
+        # land after the kernel and fail a correct config.
+        self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             self._runner(cfg, launcher, inp, out)()
         self.stream.synchronize()
@@ -500,13 +503,15 @@ def tune_problem(p: Problem, opts) -> dict:
     out_dir = Path(opts.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = problem_tag(p)
-    space = make_space(p.num_heads, p.head_dim)
+    space = make_space(p.num_heads, p.head_dim, opts.auto_split)
     backend = Fp8MqaLogitsBackend(p, replays=opts.replays)
     auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads, p.head_dim)
     auto = config_from_tag(auto_tag)
     baseline = space.encode(auto)
     warm = [WarmStart(config_from_tag(t), source="registry") for t in opts.warm]
     warm += _warm_from(opts.warm_from, p)
+    if opts.auto_split:
+        warm = _auto_split_warm(warm)
     cache_dir = Path(opts.cache_dir or out_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -627,6 +632,20 @@ def _warm_from(dirs, p: Problem):
     return warm
 
 
+def _auto_split_warm(warm):
+    """Warm starts with their fixed split replaced by the policy, deduplicated
+    (twins that differed only in ``num_splits`` collapse to one)."""
+    seen, out = set(), []
+    for w in warm:
+        cfg = {k: v for k, v in w.config.items() if k != "num_splits"}
+        cfg["split"] = "auto"
+        key = json.dumps(cfg, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(WarmStart(cfg, source=w.source))
+    return out
+
+
 def evaluate_problem(p: Problem, candidates, opts) -> dict:
     """Time named configs on one problem, interleaved, next to the auto pick
     and the reference kernel. A config that fails the builder, spills or
@@ -634,7 +653,7 @@ def evaluate_problem(p: Problem, candidates, opts) -> dict:
     from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
 
     backend = Fp8MqaLogitsBackend(p, replays=opts.replays)
-    space = make_space(p.num_heads, p.head_dim)
+    space = make_space(p.num_heads, p.head_dim, opts.auto_split)
     auto_tag = _auto_variant(p.s_q, p.s_k, p.num_heads, p.head_dim)
     named = [("auto", config_from_tag(auto_tag)), *candidates]
     items, status = [], {}
@@ -770,6 +789,11 @@ def main(argv=None):
         '{"name": ..., "config": {...}} on every problem',
     )
     ap.add_argument("--gpus", default=None, help="fan problems out over these GPUs")
+    ap.add_argument(
+        "--auto-split",
+        action="store_true",
+        help="pin the KV split to the launcher's policy (no fixed num_splits)",
+    )
     ap.add_argument("--out-dir", default=_DEFAULT_OUT)
     ap.add_argument(
         "--cache-dir", default=None, help="evaluator caches (default: --out-dir)"
