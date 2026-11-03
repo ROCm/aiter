@@ -1118,3 +1118,153 @@ def test_unified_attn_spec_verify_gfx1250(
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def poison_unowned_v(value_cache, block_tables, kv_lens, block_size):
+    """Write NaN, and one +Inf, into V slots no sequence owns.
+
+    The cache is unshuffled: (num_blocks, block_size, kv_heads, dim).
+    generate_data gives each block to one sequence, so the tail of the last
+    used block and every later block in the row are not part of the sequence.
+    """
+    nan = torch.tensor(float("nan"), device=value_cache.device, dtype=value_cache.dtype)
+    pos_inf = torch.tensor(
+        float("inf"), device=value_cache.device, dtype=value_cache.dtype
+    )
+    for i, kv_len in enumerate(kv_lens.tolist()):
+        num_used = (kv_len + block_size - 1) // block_size
+        unused = block_tables[i, num_used:]
+        if unused.numel():
+            value_cache[unused.long()] = nan
+            value_cache[int(unused[0]), 0, 0, 0] = pos_inf
+        tail = kv_len % block_size
+        if tail:
+            block = int(block_tables[i, num_used - 1])
+            value_cache[block, tail:] = nan
+            value_cache[block, tail, 0, 0] = pos_inf
+
+
+@pytest.mark.parametrize(
+    "loop_variant, num_buffers, seq_lens, sliding_window",
+    [
+        # Standard loop. A length that does not fill the last page is the tail
+        # mask; a full page is the control that valid rows stay.
+        (0, 2, ((32, 32), (32, 64), (32, 70), (32, 300)), None),
+        # Variant 1 pads up to 3 tiles and clamps the block id into the row.
+        # Fewer than 3 real tiles is the case that re-reads an unowned block.
+        (1, 2, ((32, 32), (32, 64), (32, 70), (32, 128)), None),
+        (1, 3, ((32, 32), (32, 70), (32, 128)), None),
+        # Variant 2, same padded epilogue, plus a context long enough for the
+        # steady-state loop.
+        (2, 3, ((32, 32), (32, 64), (32, 141), (32, 345)), None),
+        (0, 2, ((32, 70), (32, 200)), 127),
+    ],
+)
+@torch.inference_mode()
+def test_gfx1250_gluon_ua2d_ignores_poisoned_v_tail(
+    loop_variant: int,
+    num_buffers: int,
+    seq_lens: tuple[tuple[int, int], ...],
+    sliding_window: int | None,
+    monkeypatch,
+) -> None:
+    """A NaN or Inf in a V slot the sequence does not own must not change the
+    gfx1250 Gluon 2D output. The bf16 table never selects loop variant 1, so
+    the variant and the buffer count are forced. Query length 32 keeps the
+    launcher from rewriting the variant back to 0."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip(f"gfx1250 Gluon 2D kernel only, not {DEVICE_ARCH}")
+
+    ua = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(ua, "use_2d_kernel", lambda params, backend="triton": True)
+    real_config = ua.get_unified_attention_config
+
+    def force_loop(op, params, backend="triton", arch=None):
+        config = real_config(op, params, backend=backend, arch=arch)
+        if op == "attn_2d" and backend == "gluon":
+            config["LOOP_VARIANT"] = loop_variant
+            config["NUM_BUFFERS"] = num_buffers
+        return config
+
+    monkeypatch.setattr(ua, "get_unified_attention_config", force_loop)
+
+    block_size = 64
+    seq_lens = list(seq_lens)
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_rest,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=4096,
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 1),
+        sliding_window=sliding_window,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    # Unshuffled bf16: the returned cache is the same tensor as the original.
+    clean_value = value_cache.clone()
+    poison_unowned_v(value_cache, block_tables, kv_lens, block_size)
+    assert not torch.isfinite(value_cache).all()
+
+    def run(v_cache):
+        out = torch.empty_like(query)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=v_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            backend="gluon",
+        )
+        return out
+
+    clean = run(clean_value)
+    poisoned = run(value_cache)
+    assert torch.isfinite(clean).all()
+    assert torch.isfinite(poisoned).all(), "poisoned V tail leaked into the output"
+    assert torch.equal(poisoned, clean)
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=clean_value,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        soft_cap=None,
+        sinks=None,
+    )
+    torch.testing.assert_close(clean, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
