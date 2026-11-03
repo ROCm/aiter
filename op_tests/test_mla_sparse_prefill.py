@@ -19,7 +19,7 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v4_fp8``  -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
   ``opus``, ``asm``.
 * ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
-  (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+  (``mla_sparse_prefill_v41``): ``opus``.
 * ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
   scales packed in a 288-byte row: ``opus``, gfx950 only.
 
@@ -676,7 +676,7 @@ def run_mla_sparse_prefill(
         )
         kernel_inputs = data["kernel"]
         ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
-        if "opus" in wanted and _get_gpu_arch() == "gfx950":
+        if "opus" in wanted and (prec == "v41_fp8" or _get_gpu_arch() == "gfx950"):
             candidates.append(
                 (
                     "opus",
@@ -915,7 +915,7 @@ parser.add_argument(
         "precision(s) to sweep (default: [bf16, v4_fp8, v41_fp8, v41_fp4]).\n"
         "  bf16   : single-tensor Q/K/V/O kernel           -> opus, triton\n"
         "  v4_fp8 : split NoPE-fp8 / RoPE-bf16 kernel      -> opus, asm\n"
-        "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus (gfx950)\n"
+        "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus\n"
         "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> opus (gfx950)"
     ),
 )
