@@ -656,9 +656,16 @@ def gluon_kernel_name(kernel_type: str, tile: tuple[int, int]) -> str:
 
 def parse_gluon_kernel_name(name) -> tuple[str, dict | None]:
     """(kernel_type, config with BLOCK_M/BLOCK_N) from a gluon kernelName; the
-    default kernel and tile when the row has no name."""
+    default kernel and tile when the row has no name. A Stream-K name
+    (gluon_streamk_...) gives the complete Stream-K config."""
     if name is None or (isinstance(name, float) and pd.isna(name)) or name == "":
         return "compute_bound", None
+    if str(name).startswith("gluon_streamk_"):
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+            parse_kernel_name,
+        )
+
+        return "streamk", parse_kernel_name(name)
     m = GLUON_KERNEL_NAME.match(str(name))
     assert m, f"unrecognized gluon kernelName {name!r}"
     return m["kernel_type"], {"BLOCK_M": int(m["bm"]), "BLOCK_N": int(m["bn"])}

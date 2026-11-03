@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 
@@ -26,6 +28,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     pick_gemm_tile,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.graph_alloc import persistent_alloc
 
 _LOGGER = AiterTritonLogger()
 
@@ -67,6 +70,200 @@ def gemm_a16w16_fake_tensor(
     return torch.empty((M, N), dtype=dtype, device=x.device)
 
 
+# The host side of the gfx950 gluon Stream-K kernel (kernel_type="streamk"); the
+# kernel, its config and plan are in _gluon_kernels/gfx950/gemm/basic/
+# gemm_a16w16_streamk.py.
+#
+# Workspace. Flags are zeroed once per (device, stream) and every launch hands them
+# back zeroed: owners clear their peers' locks, the last reduce-scatter arrival
+# clears the count, and L2 readers clear their own rows. Generation words only
+# increment, so the flag layout is fixed for every configuration. Buffers come from
+# AITER's persistent pool so they outlive CUDA graph captures; if the flags are first
+# created while capturing, their zero fill is recorded into the graph and runs on
+# every replay, which one eager launch on the capture stream beforehand avoids.
+#
+# Bounded and fixed-size like AITER's FlyDSL split-K buffers, with the same risk:
+# past 128 (device, stream) keys an evicted buffer returns to the pool while a
+# captured CUDA graph may still point at it.
+@functools.lru_cache(maxsize=128)
+def _streamk_flags(device, stream, words):
+    with persistent_alloc(device):
+        return torch.zeros(words, dtype=torch.int32, device=device)
+
+
+@functools.lru_cache(maxsize=128)
+def _streamk_persistent_partials(device, stream, elems):
+    with persistent_alloc(device):
+        return torch.empty(elems, dtype=torch.float32, device=device)
+
+
+def _streamk_workspace(sk, device, num_programs, num_xcds, tile, launch, persistent):
+    """``(partials, locks, sync)`` views for one launch of the Stream-K module ``sk``.
+
+    ``sync`` is the reduce-scatter (count, generation) pairs followed by one
+    programs-per-XCD L2 flag row per program slot (128-byte aligned rows); one
+    owner lock per program follows it. Partial slots are indexed by Stream-K
+    program id, which spans the whole resident grid for the L2 exchange. Partials
+    need no zeroing: every slot is written before it is read.
+    """
+    device = torch.device(device)
+    if device.index is None:
+        device = torch.device(device.type, torch.cuda.current_device())
+    stream = torch.cuda.current_stream(device)
+    sync_words = sk.sync_words(num_programs, num_xcds)
+    flags = _streamk_flags(device, stream, sync_words + num_programs)
+    tile_elems = tile.block_m * tile.block_n
+    if persistent:
+        partials = _streamk_persistent_partials(
+            device, stream, num_programs * sk.MAX_TILE_ELEMS
+        )
+        partials = partials[: num_programs * tile_elems]
+    else:
+        slots = num_programs if launch["L2"] else launch["STREAMK_PROGRAMS"]
+        partials = torch.empty(slots * tile_elems, dtype=torch.float32, device=device)
+    streamk_programs = launch["STREAMK_PROGRAMS"]
+    return (
+        partials,
+        flags[sync_words : sync_words + streamk_programs],
+        flags[:sync_words],
+    )
+
+
+def _validate_streamk_tensors(a, b, c, bias, tile):
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("A and B must be rank-2 tensors")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError("incompatible GEMM dimensions")
+    if c.shape != (a.shape[0], b.shape[1]):
+        raise ValueError(f"y must have shape {(a.shape[0], b.shape[1])}")
+    if a.device != b.device or c.device != a.device:
+        raise ValueError("A, B and C must be on the same device")
+    if a.dtype != b.dtype:
+        raise ValueError("A and B must have the same dtype")
+    if c.dtype != a.dtype:
+        raise ValueError(
+            f"gfx950 gluon a16w16 writes x's dtype {a.dtype}, not {c.dtype}"
+        )
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("gfx950 gluon a16w16 supports fp16 and bf16 inputs")
+    if a.stride(1) != 1:
+        raise ValueError("A must be row-major/K-contiguous")
+    if b.stride(0) != 1:
+        raise ValueError("B must be column-major/K-contiguous")
+    if c.stride(1) != 1:
+        raise ValueError("C must be row-major")
+    if a.stride(0) % 8 or b.stride(1) % 8 or c.stride(0) % 8:
+        raise ValueError("A, B and C leading strides must be multiples of 8 elements")
+    if any(tensor.data_ptr() % 16 for tensor in (a, b, c)):
+        raise ValueError("A, B and C data pointers must be 16-byte aligned")
+    if bias is not None:
+        if bias.device != a.device or bias.dtype != a.dtype:
+            raise ValueError("bias must match A's device and dtype")
+        if bias.shape != (b.shape[1],) or not bias.is_contiguous():
+            raise ValueError("bias must be contiguous with shape (N,)")
+    strides = (*a.stride(), *b.stride(), *c.stride())
+    if any(stride < 0 for stride in strides):
+        raise ValueError("negative strides are unsupported")
+
+    def fits(*spans, tensor):
+        return sum(spans) * tensor.element_size() < 2**31 - 2
+
+    if not fits(tile.block_m * a.stride(0), 2 * tile.block_k * a.stride(1), tensor=a):
+        raise ValueError("A's tile-local 32-bit byte offsets overflow")
+    if not fits(2 * tile.block_k * b.stride(0), tile.block_n * b.stride(1), tensor=b):
+        raise ValueError("B's tile-local 32-bit byte offsets overflow")
+    if not fits(tile.block_m * c.stride(0), c.shape[1] * c.stride(1), tensor=c):
+        raise ValueError("C's tile-local 32-bit byte offsets overflow")
+
+
+def _gemm_a16w16_gfx950_streamk(x, w, y, bias, config, persistent_partials=False):
+    """``y = x @ w.T (+ bias)`` with the gfx950 gluon Stream-K kernel, x (M, K) and
+    w (N, K) both K-contiguous, into y (M, N) of x's dtype. ``config`` names the
+    tile, and the plan too when tuned; without the plan the default plan
+    (streamk_plan) runs, and without a tile DEFAULT_TILE does.
+
+    ``persistent_partials`` keeps one full-grid fp32 partial buffer sized for the
+    largest tile per (device, stream) instead of allocating per call.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
+        gemm_a16w16_streamk as sk,
+    )
+
+    M, K = x.shape
+    N = w.shape[0]
+    num_programs, num_xcds = sk.streamk_topology()
+    reason = sk.unsupported_reason(M, N, K)
+    if reason is None:
+        try:
+            config, launch = sk._launch_constants(
+                M, N, K, sk.with_default_tile(config), num_programs, num_xcds
+            )
+        except (TypeError, ValueError) as error:
+            reason = str(error)
+    if reason is not None:
+        raise ValueError(f"gfx950 gluon a16w16: {reason}")
+    tile = config.tile
+    b = w.T  # (K, N) view, K contiguous: the layout the kernel loads
+    _validate_streamk_tensors(x, b, y, bias, tile)
+
+    # Each ragged dimension specializes its own clamped loads and masked stores.
+    even_m = M % tile.block_m == 0
+    even_n = N % tile.block_n == 0
+    even_k = K == sk.k_pad(K, tile.block_k)
+    partials, locks, sync = _streamk_workspace(
+        sk, x.device, num_programs, num_xcds, tile, launch, persistent_partials
+    )
+    owner_qpb = min(4, 16 // max(1, tile.block_m * tile.block_n // 4096))
+    total_full_tiles = launch["TOTAL_TILES"] - launch["STREAMK_TILES"]
+    has_full = total_full_tiles > 0
+    # The persistent prologue loads program_id's first tile unclamped.
+    assert not has_full or launch["GRID"] <= total_full_tiles
+    sk._KERNEL_MAP["streamk"][(launch["GRID"], 1)](
+        x,
+        b,
+        y,
+        bias,
+        partials,
+        locks,
+        sync,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        b.stride(0),
+        b.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_M=tile.block_m,
+        BLOCK_N=tile.block_n,
+        BLOCK_K=tile.block_k,
+        NUM_PROGRAMS=num_programs,
+        NUM_XCDS=num_xcds,
+        GROUP_SIZE_M=config.group_size_m,
+        ADD_BIAS=bias is not None,
+        EVEN_M=even_m,
+        EVEN_N=even_n,
+        EVEN_K=even_k,
+        STREAMK_TILES=launch["STREAMK_TILES"],
+        SPLIT_N=launch["RESOLVED_SPLIT_N"],
+        REDUCE_SCATTER=config.fixup == "rs",
+        RS_NB=launch["RS_NB"],
+        RS_U=launch["RS_U"],
+        RS_R=launch["RS_R"],
+        END_TO_END=launch["END_TO_END"],
+        L2=launch["L2"],
+        HAS_FULL=has_full,
+        GRID=launch["GRID"] if launch["COMPACT"] else 0,
+        OWNER_QPB=owner_qpb,
+        RS_E=launch["RS_E"],
+        BAR_STRIDE=launch["BAR_STRIDE"],
+        num_warps=sk.NUM_WARPS,
+        schedule_hint=sk.schedule_hint(),
+    )
+    return y
+
+
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
 def gemm_a16w16_(
     x: torch.Tensor,
@@ -90,6 +287,11 @@ def gemm_a16w16_(
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
     runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
     handles ragged M, N and K (N and K multiples of 8, K at least 256).
+    ``kernel_type="streamk"`` runs the gfx950 gluon Stream-K kernel with the
+    whole ``config``: the tile (BLOCK_M, BLOCK_N, BLOCK_K; 256x256x64 when absent)
+    and optionally GROUP_SIZE_M and the Stream-K plan (STREAMK_POLICY,
+    STREAMK_FIXUP, SPLIT_N, STREAMK_EXCHANGE; the kernel's default plan when
+    absent). It writes x's dtype; N a multiple of 8 and K of 16.
 
     Args:
         x (torch.Tensor): Input matrix with shape (M, K).
@@ -102,7 +304,8 @@ def gemm_a16w16_(
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
+        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound",
+            "streamk" on gfx950).
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
         persistent (bool): Use the persistent kernel, NUM_SMS workgroups
 
@@ -138,8 +341,10 @@ def gemm_a16w16_(
             _KERNEL_MAP as _GFX950_KERNEL_MAP,
         )
 
-        assert kernel_type in _GFX950_KERNEL_MAP, (
-            f"gfx950 gluon a16w16 supports kernel_type in {list(_GFX950_KERNEL_MAP)}, "
+        # Stream-K is launched here, not through the compute-bound kernel's map.
+        kernel_types = [*_GFX950_KERNEL_MAP, "streamk"]
+        assert kernel_type in kernel_types, (
+            f"gfx950 gluon a16w16 supports kernel_type in {kernel_types}, "
             f"got '{kernel_type}'"
         )
         assert not skip_reduce, "gfx950 gluon a16w16 has no split-K (skip_reduce)"
@@ -149,6 +354,15 @@ def gemm_a16w16_(
         N, _ = w.shape
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
+        if kernel_type == "streamk":
+            # The whole config goes through: BLOCK_K and the Stream-K plan too.
+            _LOGGER.info(
+                "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=streamk config=%s",
+                x.shape,
+                w.shape,
+                config,
+            )
+            return _gemm_a16w16_gfx950_streamk(x, w, y, bias, config)
         # The tile comes from the config: a tuned one names BLOCK_M/BLOCK_N, the
         # default one carries the candidates and the rule (see pick_gemm_tile).
         if config is None or "BLOCK_M" not in config:
@@ -629,6 +843,11 @@ def gemm_a16w16(
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
     runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
     handles ragged M, N and K (N and K multiples of 8, K at least 256).
+    ``kernel_type="streamk"`` runs the gfx950 gluon Stream-K kernel with the
+    whole ``config``: the tile (BLOCK_M, BLOCK_N, BLOCK_K; 256x256x64 when absent)
+    and optionally GROUP_SIZE_M and the Stream-K plan (STREAMK_POLICY,
+    STREAMK_FIXUP, SPLIT_N, STREAMK_EXCHANGE; the kernel's default plan when
+    absent). It writes x's dtype; N a multiple of 8 and K of 16.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """

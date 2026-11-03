@@ -32,6 +32,7 @@ def bench_gemm_fn(
     activation: str | None = None,
     persistent: bool = False,
     kernel_type: str = "bandwidth_bound",
+    config: dict | None = None,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -89,6 +90,7 @@ def bench_gemm_fn(
                 activation=activation,
                 kernel_type=kernel_type,
                 backend=backend,
+                config=config,
             ),
         )
 
@@ -148,6 +150,7 @@ def run_model_benchmark(args, backend):
             activation=args.activation,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            config=streamk_config(args),
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -173,9 +176,27 @@ def run_shape_benchmark(args, backend):
             atomic=args.atomic,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            config=streamk_config(args),
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
+
+
+def streamk_config(args) -> dict | None:
+    """The config --streamk-config names: a Stream-K kernelName
+    (gluon_streamk_...) or a tile BLOCK_MxBLOCK_NxBLOCK_K. None runs the kernel's
+    default tile and plan."""
+    if args.streamk_config is None:
+        return None
+    assert (
+        args.kernel_type == "streamk"
+    ), "--streamk-config applies to --kernel-type streamk only"
+    if args.streamk_config.startswith("gluon_streamk_"):
+        from aiter.tuned_gemm import parse_gluon_kernel_name
+
+        return parse_gluon_kernel_name(args.streamk_config)[1]
+    bm, bn, bk = (int(side) for side in args.streamk_config.split("x"))
+    return {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk}
 
 
 def run_benchmark(args, defaults):
@@ -240,9 +261,17 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--kernel-type",
         type=str,
-        choices=["bandwidth_bound", "compute_bound"],
+        choices=["bandwidth_bound", "compute_bound", "streamk"],
         default="bandwidth_bound",
-        help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
+        help="Kernel variant to use (gluon only; streamk on gfx950). Default: bandwidth_bound.",
+    )
+    parser.add_argument(
+        "--streamk-config",
+        type=str,
+        default=None,
+        help="With --kernel-type streamk: a tuned kernelName "
+        "(e.g. gluon_streamk_256x256x64_g4_one_tile_rs_n8_wt) or a tile such as "
+        "128x256x64 (the default plan). Default: 256x256x64 with the default plan.",
     )
     return get_ff_args(parser, args=args)
 
