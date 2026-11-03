@@ -457,16 +457,36 @@ class _Stage1Fusion:
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        tdm_b_th=0,
+        tdm_as_in_prologue=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            tdm_b_th,
+            tdm_as_in_prologue,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
             num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
             launch = make_s1f_stage1(
+                tdm_b_th=tdm_b_th,
+                tdm_as_in_prologue=tdm_as_in_prologue,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
@@ -504,7 +524,17 @@ class _Stage1Fusion:
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self,
+        launch_args,
+        *,
+        tile_m,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        tdm_b_th=0,
+        tdm_as_in_prologue=0,
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -534,6 +564,8 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                tdm_b_th=tdm_b_th,
+                tdm_as_in_prologue=tdm_as_in_prologue,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -652,22 +684,31 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
+        # The CSV's GEMM1 TDM knobs the stage-1 kernel can embed.
+        g1_opts = {
+            "tdm_b_th": int(tdm_b_th),
+            "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
+        }
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
-        # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
+        # not JIT-compile there. The precompile launches are collective. A
+        # bound whose CSV row has other GEMM1 knobs builds on its first eager
+        # launch.
+        g1 = tuple(g1_opts.values())
+        keys = {(t, int(stage1_act), q, *g1) for t, q in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1))
         if not keys <= self.precompiled and (
             not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for key in sorted(keys - self.precompiled):
+                self.precompiled.add(key)
                 self._precompile(
                     launch_args,
-                    tile_m=t,
+                    tile_m=key[0],
                     group_m=group_m,
-                    stage1_act=act,
-                    quant_wmma_rep=q,
+                    stage1_act=key[1],
+                    quant_wmma_rep=key[2],
+                    **g1_opts,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -676,6 +717,7 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            **g1_opts,
         )
         self._run(
             launch,

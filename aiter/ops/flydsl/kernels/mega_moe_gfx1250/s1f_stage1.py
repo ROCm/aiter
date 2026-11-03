@@ -531,6 +531,8 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    tdm_b_th=0,
+    tdm_as_in_prologue=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -720,34 +722,9 @@ def make_s1f_stage1(
     def _w1_blk0(nxt_, slot_):
         return _uniform(readlane(T.i32, arith.unwrap(nxt_), 0))
 
-    @flyc.jit
-    def launch(
-        arg_a2: fx.Tensor,
-        arg_a1: fx.Pointer,
-        arg_w1: fx.Pointer,
-        arg_a1_scale: fx.Tensor,
-        arg_w1_scale: fx.Tensor,
-        arg_a2_scale: fx.Tensor,
-        arg_psum: fx.Pointer,
-        arena: fx.Int64,
-        inp_tok: fx.Int64,
-        inp_scale: fx.Int64,
-        inp_wts: fx.Int64,
-        addr_send: fx.Int64,
-        addr_runs: fx.Int64,
-        addr_tile_src: fx.Int64,
-        addr_ctl: fx.Int64,
-        i32_m: fx.Int32,
-        inp_cur_tok: fx.Int32,
-        f32_swiglu_limit: fx.Float32,
-        stream: fx.Stream,
-    ):
+    def _build_g1(asprol, lds_holder, ready_holder, meta_holder, hooks_holder):
         g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
-        lds_holder = [None]
-        ready_holder = [None]
-        meta_holder = [None]
-        hooks_holder = [None]
-        g1_task, block, g1_name, _, lay = build_gemm_a8w4_tdm_task(
+        return build_gemm_a8w4_tdm_task(
             K=model_dim,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -768,8 +745,8 @@ def make_s1f_stage1(
             cluster_m=1,
             next_stage_prefetch=0,
             num_waves_per_tensor_tdm=2,
-            tdm_as_in_prologue=0,
-            tdm_b_th=0,
+            tdm_as_in_prologue=asprol,
+            tdm_b_th=tdm_b_th,
             enable_ep_scatter=0,
             ep_arena_handle=0,
             ep_combine_input_offset=0,
@@ -794,6 +771,51 @@ def make_s1f_stage1(
             # Needs the mid-loop fence the GEMM body only has above 32 rows.
             defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
+        )
+
+    def _g1_asprol():
+        # The resident A-scale region grows the arena; a variant whose CTAs
+        # would no longer share the CU keeps the rotating A-scale stages.
+        if not tdm_as_in_prologue:
+            return 0
+        try:
+            arena_ = int(_build_g1(1, [None], [None], [None], [None])[4]["arena"])
+        except AssertionError:
+            return 0
+        fits = int(ctas_per_cu) * (((arena_ + 256) + 2047) // 2048 * 2048) <= 327680
+        return int(MB_END <= arena_ and fits)
+
+    G1_ASPROL = _g1_asprol()
+
+    @flyc.jit
+    def launch(
+        arg_a2: fx.Tensor,
+        arg_a1: fx.Pointer,
+        arg_w1: fx.Pointer,
+        arg_a1_scale: fx.Tensor,
+        arg_w1_scale: fx.Tensor,
+        arg_a2_scale: fx.Tensor,
+        arg_psum: fx.Pointer,
+        arena: fx.Int64,
+        inp_tok: fx.Int64,
+        inp_scale: fx.Int64,
+        inp_wts: fx.Int64,
+        addr_send: fx.Int64,
+        addr_runs: fx.Int64,
+        addr_tile_src: fx.Int64,
+        addr_ctl: fx.Int64,
+        i32_m: fx.Int32,
+        inp_cur_tok: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
+        stream: fx.Stream,
+    ):
+        lds_holder = [None]
+        ready_holder = [None]
+        meta_holder = [None]
+        hooks_holder = [None]
+
+        g1_task, block, g1_name, _, lay = _build_g1(
+            G1_ASPROL, lds_holder, ready_holder, meta_holder, hooks_holder
         )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
