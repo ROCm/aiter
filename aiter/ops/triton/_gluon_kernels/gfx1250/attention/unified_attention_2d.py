@@ -736,7 +736,10 @@ class TDMKVLoader:
                 .to(gl.float8e4nv, bitcast=True)
             )
         else:
-            return None
+            # unused placeholder: loop variant 1 carries k_scales across iterations, and None cannot be carried
+            return gl.zeros(
+                [1], dtype=gl.int32, layout=gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
+            )
 
     @gluon.jit
     def load_k_from_shared(
@@ -1101,7 +1104,10 @@ class TDMGatherKVLoader:
                 .to(gl.float8e4nv, bitcast=True)
             )
         else:
-            return None
+            # unused placeholder: loop variant 1 carries k_scales across iterations, and None cannot be carried
+            return gl.zeros(
+                [1], dtype=gl.int32, layout=gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
+            )
 
     @gluon.jit
     def load_block_ids(self, i):
