@@ -241,11 +241,12 @@ for file in "${sharded_files[@]}"; do
         op_tests/test_moe_2stage.py)
             {
                 echo "Running representative correctness subset in standard CI" \
-                     "(tokenNum: 1 32 1024 4096); full dtype/quant/token/activation" \
-                     "matrix still available via direct invocation (no -t override)." \
-                     "See PR #7330 for context; dedicated perf job tracked separately."
+                     "(tokenNum: 1 16 32 64 128 256 1024 4096); full dtype/quant/" \
+                     "token/activation matrix still available via direct invocation" \
+                     "(no -t override). FlyDSL/Opus tuned CSV validation is skipped" \
+                     "in this CI path; dedicated perf job tracked separately."
             } | tee -a latest_test.log
-            test_cmd=(timeout 60m python3 "$file" -t 1 32 1024 4096)
+            test_cmd=(timeout 60m python3 "$file" -t 1 16 32 64 128 256 1024 4096 --no-flydsl-csv)
             ;;
     esac
     # Capture start time (nanoseconds since epoch)
