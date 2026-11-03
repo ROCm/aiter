@@ -1,9 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d, MIT License,
-# Copyright (C) 2026, Advanced Micro Devices, Inc.:
-# atom/mono/runtime/peer_memory.py
-# atom/mono/runtime/consensus.py
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d.
+# Source files: atom/mono/runtime/peer_memory.py and atom/mono/runtime/consensus.py.
 """Uncached symmetric peer memory for DCP mailbox kernels."""
 
 import torch

@@ -1,7 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from ROCm/ATOM at a526f0d under the MIT License.
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d.
+# Source files: atom/mono/plan/build_key.py and atom/mono/runtime/abi.py.
 
 """Small build-time and device helpers for the DCP mailbox kernels."""
 
