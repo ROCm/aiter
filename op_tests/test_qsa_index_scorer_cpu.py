@@ -295,6 +295,43 @@ class ProfileFormat(unittest.TestCase):
             gen.make_row(dict(cache_dtype="bf16", rows=6, requests=1, columns=64,
                               table_width=16))
 
+    def test_check_restamp_cpu(self):
+        """`gen_profile check` restamp logic (GPU row check mocked): file-mode standalone API
+        load, every row -> pass on the profiled kernel sha, result loads and verifies."""
+        spec = importlib.util.spec_from_file_location(
+            "qsa_gen_profile_check", os.path.join(PKG_DIR, "gen_profile.py"))
+        gen = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [PKG_DIR] + sys.path):
+            spec.loader.exec_module(gen)
+        seen = []
+
+        def fake_row(row, api, G, S, seed=0, profile=None):
+            self.assertTrue(hasattr(api, "decide"))
+            seen.append(row["cell"])
+            return {"pass_": True, "decision": "ok", "vid": row["vid"]}
+
+        props = types.SimpleNamespace(gcnArchName="gfx1250", multi_processor_count=256)
+        with _tmpdir() as td:
+            out = os.path.join(td, "qsa_page4_gfx1250_v1.json")
+            with mock.patch.object(gen, "check_row", fake_row), \
+                    mock.patch.object(gen, "_golden_modules", lambda: (None, None)), \
+                    mock.patch.object(torch.cuda, "get_device_properties", lambda i: props), \
+                    mock.patch.dict(os.environ, {}), \
+                    mock.patch.object(torch.cuda, "empty_cache", lambda: None):
+                self.assertEqual(gen.check(PROFILE_JSON, out, None), 0)
+            self.assertEqual(len(seen), len(self.data["rows"]))
+            prof = PR.load_profile(out, use_cache=False)
+            self.assertTrue(all(r.verified for r in prof.rows))
+            for r in prof.rows:
+                g = r.raw["golden"]
+                self.assertEqual(g["kernel_sha256"], self.data["kernel"]["sha256"])
+                self.assertNotIn("isa_identity", g)
+            self.assertEqual(gen.verify(out), [])
+            fp8 = next(r.raw for r in prof.rows if r.cell == "decode_fp8_r64q16_c65536_w16384")
+            self.assertEqual(fp8["golden"]["phase1_kernel_sha256"],
+                             "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c")
+            self.assertEqual(fp8["notes"], "")
+
     def _write(self, td, data, name="qsa_bad_v1"):
         path = os.path.join(td, f"{name}.json")
         with open(path, "w") as fh:

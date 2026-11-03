@@ -9,8 +9,9 @@ Modes::
     # CPU: assert the committed profile equals what `emit` would write (drift guard)
     python -m aiter.ops.qsa_index_scorer.gen_profile verify [--profile X.json]
     # GPU: run every row through the public API vs the frozen golden; write status back
+    # (file mode loads the package standalone: no `import aiter`)
     QSA_GOLDEN_DIR=/path/golden_baseline \
-    python -m aiter.ops.qsa_index_scorer.gen_profile check [--profile X.json] [--cells a,b] [--out Y.json]
+    python aiter/ops/qsa_index_scorer/gen_profile.py check [--profile X.json] [--cells a,b] [--out Y.json]
 
 The golden (``qsa_golden.py`` / ``qsa_shapes.py``) is read from ``$QSA_GOLDEN_DIR``
 and is never modified. The comparator and tolerance are the frozen Phase-1 ones:
@@ -329,8 +330,18 @@ def check_row(row: dict, api, G, S, seed: int = 0, profile: str | None = None) -
 def check(path: str, out: str | None, cells: set | None) -> int:
     import torch
     if __package__ in (None, ""):
-        raise SystemExit("run `check` as a module: python -m aiter.ops.qsa_index_scorer.gen_profile")
-    from . import api
+        # file mode: load this package standalone (no `import aiter`, which touches the GPU /
+        # JIT at import time), exactly like op_tests/test_qsa_index_scorer.py does
+        import importlib.util
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qsa_isc_gen", os.path.join(here, "__init__.py"), submodule_search_locations=[here])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["qsa_isc_gen"] = pkg
+        spec.loader.exec_module(pkg)
+        api = sys.modules["qsa_isc_gen.api"]
+    else:
+        from . import api
 
     G, S = _golden_modules()
     os.environ["QSA_PROFILE_PATH"] = os.path.abspath(path)
