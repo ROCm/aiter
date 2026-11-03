@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+import torch.distributed as dist
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
@@ -363,13 +364,29 @@ class CombineWorkspace:
     def __init__(self, group, device, heads, dim, max_tokens):
         self.ranks = group.world_size
         self.rank = group.rank_in_group
+        self.group = group.cpu_group
+        self.device = device
         self.heads = heads
         self.dim = dim
         self.max_tokens = max_tokens
         nbytes = peer_bytes(self.ranks, max_tokens, heads, dim)
-        self.peers = PeerBuffer(nbytes, group.cpu_group, self.rank, self.ranks, device)
-        self.peers.bytes.zero_()
+        self.peers = PeerBuffer(nbytes, self.group, self.rank, self.ranks, device)
         self.state = torch.zeros(2, dtype=torch.int32, device=device)
+
+    def close(self) -> None:
+        """Synchronize outstanding work, then release peer memory."""
+        if self.peers is None:
+            return
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.peers.close()
+        self.peers = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 def dcp_lse_combine(
@@ -395,6 +412,12 @@ def dcp_lse_combine(
     assert lse.shape == (tokens, ws.ranks * heads)
     assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
     assert dim % 4 == 0 and 4 * ws.ranks <= dim <= 4 * MAX_THREADS, dim
+    if tokens > ws.max_tokens:
+        raise ValueError(
+            f"tokens ({tokens}) exceeds workspace capacity ({ws.max_tokens})"
+        )
+    if (seq_lens is None) != (query_start_loc is None):
+        raise ValueError("seq_lens and query_start_loc must be provided together")
     if res is None:
         res = out.new_empty((tokens, heads, dim))
     res_lse = torch.empty(

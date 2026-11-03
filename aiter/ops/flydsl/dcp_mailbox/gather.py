@@ -14,9 +14,11 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+import torch.distributed as dist
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
@@ -239,14 +241,15 @@ class GatherWorkspace:
     def __init__(self, group, device, heads, dim, dtype, pad_heads, max_tokens):
         self.ranks = group.world_size
         self.rank = group.rank_in_group
+        self.group = group.cpu_group
+        self.device = device
         self.heads = heads
         self.dim = dim
         self.words = dim * torch.empty((), dtype=dtype).element_size() // 4
         self.pad_heads = pad_heads
         self.max_tokens = max_tokens
         nbytes = peer_bytes(self.ranks, max_tokens, heads, self.words)
-        self.peers = PeerBuffer(nbytes, group.cpu_group, self.rank, self.ranks, device)
-        self.peers.bytes.zero_()
+        self.peers = PeerBuffer(nbytes, self.group, self.rank, self.ranks, device)
         self.state = torch.zeros(2, dtype=torch.int32, device=device)
         self.gathered = torch.zeros(
             (max_tokens, pad_heads, dim), dtype=dtype, device=device
@@ -264,8 +267,29 @@ class GatherWorkspace:
             self.folded[fold] = buf
         return buf
 
+    def close(self) -> None:
+        """Synchronize outstanding work, then release peer memory."""
+        if self.peers is None:
+            return
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.peers.close()
+        self.peers = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
 
 def _launch(ws, key, args):
+    if key.tokens > ws.max_tokens:
+        raise ValueError(
+            f"tokens ({key.tokens}) exceeds workspace capacity ({ws.max_tokens})"
+        )
+    if key.fold and (key.qlen <= 0 or key.tokens % key.qlen):
+        raise ValueError("folded gather requires qlen > 0 and tokens divisible by qlen")
     out = ws.folded_buffer(key.fold) if key.fold else ws.gathered
     build(key)(
         *args,
@@ -278,7 +302,12 @@ def _launch(ws, key, args):
     if key.phase == 1:
         return None
     if key.fold:
-        return out[: key.tokens * key.fold].view(key.tokens, key.fold * 16, ws.dim)
+        physical = out[: key.tokens * key.fold].view(
+            key.tokens // key.qlen, key.fold, key.qlen, 16, ws.dim
+        )
+        return physical.permute(0, 2, 1, 3, 4).reshape(
+            key.tokens, key.fold * 16, ws.dim
+        )
     return ws.gathered[: key.tokens, : ws.ranks * ws.heads]
 
 
@@ -287,9 +316,10 @@ def dcp_query_gather(
 ):
     """Gather ``query`` [tokens, heads, dim] into [tokens, ranks * heads, dim].
 
-    The result is a view of the workspace buffer. ``plan`` may set ``fold`` and
-    ``qlen`` for the 16-head store layout. ``phase`` is 0 (push and poll),
-    1 (push), or 2 (poll).
+    The plain result is a view of the workspace buffer. A folded result is
+    reordered to token-major layout. ``plan`` may set ``fold`` and ``qlen`` for
+    the 16-head store layout. ``phase`` is 0 (push and poll), 1 (push), or 2
+    (poll).
     """
     esz = query.element_size()
     key = GatherBuild(
@@ -328,6 +358,12 @@ def dcp_quant_query_gather(
     The output is fp8 [tokens, ranks * heads, L + P], scaled by the per-tensor
     ``scale``. ``plan`` and ``phase`` match ``dcp_query_gather``.
     """
+    arch = get_gfx_runtime().split(":", 1)[0]
+    if arch != "gfx950":
+        raise RuntimeError(
+            "dcp_quant_query_gather requires OCP-FN FP8 conversion on gfx950, "
+            f"got {arch}"
+        )
     key = GatherBuild(
         tokens=nope.shape[0],
         ranks=ws.ranks,
