@@ -259,10 +259,10 @@ def s_scratch(cfg):
                 if _bad(e):
                     fails.append(f"rep {rep} M={M} (descending): {_fmt(e)}")
 
-        # Then force a grow: a wider M than anything seen reallocates the
-        # scratch, so the next narrow launch reads a *fresh* uninitialised
-        # buffer rather than a warm one.
-        for M in (192, 1):
+        # Then force a grow: M=256 is the first size past the 64 KB workspace
+        # bucket, so it runs on a fresh buffer, and the narrow launch after it
+        # goes back to the warm one.
+        for M in (256, 1):
             g, b, h, ref = _case(M)
             got = _alloc_poisoned(ref, M, TOPK0, 9)
             T._call_fused(g, b, h, got, E0, TOPK0, U0, True, 1.0, None, None)
@@ -485,7 +485,9 @@ def s_graph_interleave(cfg):
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # The workspace is keyed per stream: capture on `s` so the replay and
+        # the eager launches below share one semaphore, as in vLLM.
+        with torch.cuda.graph(graph, stream=s):
             T._call_fused(gg, bg, hg, gotg, E0, TOPK0, U0, True, 1.0, None, None)
 
         eager_ms = [1, 17, 33, 96]
@@ -493,11 +495,12 @@ def s_graph_interleave(cfg):
         torch.cuda.synchronize()
 
         for i in range(cfg.replays):
-            graph.replay()
             M = eager_ms[i % len(eager_ms)]
             g, b, h, ref = pre[M]
-            got = _alloc_poisoned(ref, M, TOPK0, i)
-            T._call_fused(g, b, h, got, E0, TOPK0, U0, True, 1.0, None, None)
+            with torch.cuda.stream(s):
+                graph.replay()
+                got = _alloc_poisoned(ref, M, TOPK0, i)
+                T._call_fused(g, b, h, got, E0, TOPK0, U0, True, 1.0, None, None)
             torch.cuda.synchronize()
             e = _errs(ref, got, M, TOPK0, U0)
             if _bad(e):

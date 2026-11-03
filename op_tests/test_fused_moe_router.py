@@ -491,6 +491,8 @@ def bench_fused_moe_router(
     errs, (g, b, h, _ref, got, mask) = _run_case(
         M, E, topk, unit_size, bias_dtype, need_renorm, rsf, ep, use_moe_buf
     )
+    # Stock moe_sorting zero-fills moe_buf, so the fused side has to as well.
+    moe_buf = torch.empty_like(_ref["moe_buf"])
 
     _, fused_us = run_perftest(
         _call_fused,
@@ -504,7 +506,7 @@ def bench_fused_moe_router(
         need_renorm,
         rsf,
         mask,
-        None,
+        moe_buf,
         num_iters=10,
         num_warmup=2,
     )
@@ -1493,7 +1495,7 @@ def test_shared_supported_gate():
     h = torch.randn(M, COLS, dtype=dtypes.bf16)
     w1 = torch.empty(E, 512, COLS // 2, dtype=dtypes.fp4x2)
     w2 = torch.empty(E, COLS, 128, dtype=dtypes.fp4x2)
-    ask = lambda tk, ns: fused_moe_router_supported(
+    ask = lambda tk, ns, **kw: fused_moe_router_supported(
         h,
         w1,
         w2,
@@ -1501,11 +1503,14 @@ def test_shared_supported_gate():
         quant_type=QuantType.per_1x32.value,
         activation=ActivationType.Silu.value,
         num_fused_shared_experts=ns,
+        **kw,
     )
     assert ask(topk, 0)
     assert ask(topk, 1)
     assert not ask(topk, 2)
     assert not ask(64, 1)
+    assert not ask(0, 0)
+    assert not ask(topk, 0, doweight_stage1=True)
 
 
 @pytest.mark.parametrize("n_shared", [0, 1])
@@ -1524,7 +1529,6 @@ def test_cfg_topk_matches_stock(ep, n_shared):
     mask = torch.empty(1, dtype=dtypes.i32) if ep else None
     # What vLLM allocates for the stock path (init_aiter_topK_meta_data).
     stock_width = topk + n_shared + (1 if (ep and n_shared) else 0)
-    # Both sides lose int(is_ep) inside get_2stage_cfgs, so compare pre-strip.
     assert _cfg_topk(topk, n_shared, mask) == stock_width
 
 
