@@ -748,6 +748,11 @@ jobs:
           echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
           echo "CK submodule SHA: ${ck_sha}"
 
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
+
       - name: Restore CK submodule cache
         id: restore_ck_submodule
         if: ${{ github.event_name != 'schedule' }}
@@ -1151,6 +1156,11 @@ jobs:
           echo "path=${ck_path}" >> "$GITHUB_OUTPUT"
           echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
           echo "CK submodule SHA: ${ck_sha}"
+
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
 
       - name: Restore CK submodule cache
         id: restore_ck_submodule
