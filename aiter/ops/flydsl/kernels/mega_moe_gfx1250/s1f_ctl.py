@@ -43,7 +43,9 @@ _QUANT_FUSE_BLOCKS = int(os.environ.get("AITER_MEGA_QUANT_FUSE", "128"))
 # Smallest m-tile the flag region is sized for (one flag per tile/source).
 _S1F_MIN_TILE_M = 16
 #: The GEMM1 tile n / k every stage-1 variant embeds (M256 uses 2x2 waves;
-#: smaller M tiles use 1x4).
+#: smaller M tiles use 1x4). The CSV row's tile_n / tile_k / num_buffers only
+#: tune the unfused GEMM1, so the stage-1 kernel keeps its own; only the row's
+#: tile_m has to match.
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m: (pipeline buffers, CTAs per CU).
 #:
@@ -634,7 +636,7 @@ class _Stage1Fusion:
         align_m = int(self.d._step.align_m)
         wire_row = int(self.d.compact.wire_row)
         got = {
-            "tile": (tile_m, tile_n, tile_k),
+            "tile_m": int(tile_m),
             "out_is_f16": int(out_is_f16),
             "a_is_fp4": int(a_is_fp4),
             "bias": bias is not None,
@@ -644,7 +646,7 @@ class _Stage1Fusion:
             "variant": align_m,
         }
         want = {
-            "tile": (align_m, _S1F_TILE_N, _S1F_TILE_K),
+            "tile_m": align_m,
             "out_is_f16": 0,
             "a_is_fp4": 1,
             "bias": False,
@@ -653,8 +655,6 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        # The stage-1 kernel runs its own 256x256 n/k tiles.
-        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
