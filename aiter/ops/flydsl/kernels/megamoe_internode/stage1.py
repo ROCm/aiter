@@ -39,9 +39,7 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
 from ..mxfp4_gemm_common import k_tiles_total_for
 from . import communication as comm
 from .communication import ccqe_enabled as _rail_ccqe
-
-# The checked rail shim keeps MORI device assertions on dispatch.
-from .communication import checked as _rail
+from .communication import rail as _rail
 
 # GEMM helper changes must also invalidate this module's kernel cache.
 from .gemm import (
@@ -1821,12 +1819,16 @@ def _compile_stage1(
                     generation,
                     aggregate=True,
                 )
+                # Ring per chunk so the peer sees each credit as soon as it is
+                # earned; nothing here needs our own completion, so reap only
+                # the last request (one QP completes in order).
                 credit_req = _rail.flush_async(
                     dev_comm,
                     qp,
                     fx.Int32(remote_node),
                 )
-                _rail.wait(dev_comm, qp, credit_req)
+                if chunk == fx.Int32(dispatch_chunks - 1):
+                    _rail.wait(dev_comm, qp, credit_req)
 
         # The role targeting this rank observes exactly eight EOS values; each
         # one covers a local source rank and its aligned remote source rank.

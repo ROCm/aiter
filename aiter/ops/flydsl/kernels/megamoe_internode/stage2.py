@@ -43,7 +43,7 @@ from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _run_compiled, buf_copy_store, ptr_buf_tensor
 from . import communication as comm
 from .communication import ccqe_enabled as _rail_ccqe
-from .communication import release as _rail
+from .communication import rail as _rail
 from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
@@ -1162,7 +1162,11 @@ def compile_stage2_node_combine(
               _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(remote_node),
                               arena_win, _consumed_off, generation,
                               aggregate=True)
-              _rail.flush_peer(dev_comm, fx.Int32(0), fx.Int32(remote_node))
+              # Ring now, reap our own completion after the peer's credit:
+              # the two are independent, so waiting for our ACK first only
+              # serializes one extra round trip in front of the credit wait.
+              _consumed_req = _rail.flush_async(
+                  dev_comm, fx.Int32(0), fx.Int32(remote_node))
               if lane == fx.Int32(0):
                   # 反过来等对端的信用:确认我们写进它 rx 的那块已被读完,
                   # 下一代才可以再往同一个 parity 槽写。system-acquire 是
@@ -1173,6 +1177,7 @@ def compile_stage2_node_combine(
                   while _credit < generation:
                       _credit = fx.Int64(
                           comm.load_i64_global_system(_credit_ptr))
+              _rail.wait(dev_comm, fx.Int32(0), _consumed_req)
 
     @flyc.jit
     def launch(
