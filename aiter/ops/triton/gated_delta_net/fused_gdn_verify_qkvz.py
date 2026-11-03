@@ -9,6 +9,8 @@ window in chunk form (the state's products on WMMA, never the state itself),
 and ``_fused_gdn_verify`` runs it token by token on the rebuilt state, for the
 shapes that the first does not take."""
 
+import os
+
 import torch
 import triton
 
@@ -139,6 +141,7 @@ def fused_gdn_verify_qkvz(
     from aiter.ops.triton._gluon_kernels.gfx1250.gated_delta_net.fused_gdn_verify_qkvz import (
         _fused_gdn_verify,
         _fused_gdn_verify_chunk,
+        _fused_gdn_verify_chunk_compact,
     )
 
     _, v_heads, head_k_dim, head_v_dim = checkpoint.shape
@@ -184,11 +187,18 @@ def fused_gdn_verify_qkvz(
     num_warps, kl, ks = config["num_warps"], config["KL"], config["KS"]
     # The chunk-form kernel where it fits, else the token-loop kernel.
     kernel, tile_args = _fused_gdn_verify, {"KL": kl, "KS": ks}
-    chunk_warps = config.get("chunk_num_warps", 0)
+    # AITER_GDN_VERIFY_CHUNK_WARPS overrides the chunk kernel's waves and
+    # AITER_GDN_VERIFY_COMPACT=1 selects its compact form (experiments, off by default).
+    chunk_warps = int(os.environ.get("AITER_GDN_VERIFY_CHUNK_WARPS", "0")) or config.get(
+        "chunk_num_warps", 0
+    )
     if chunk_warps and _chunk_kernel_fits(
         head_k_dim, head_v_dim, ratio, max_query_len, cap, chunk_warps
     ):
-        kernel, num_warps, tile_args = _fused_gdn_verify_chunk, chunk_warps, {}
+        chunk_kernel = _fused_gdn_verify_chunk
+        if os.environ.get("AITER_GDN_VERIFY_COMPACT", "0") == "1":
+            chunk_kernel = _fused_gdn_verify_chunk_compact
+        kernel, num_warps, tile_args = chunk_kernel, chunk_warps, {}
     kernel[(seqs * k_heads,)](
         query_start_loc,
         slot_idx,
