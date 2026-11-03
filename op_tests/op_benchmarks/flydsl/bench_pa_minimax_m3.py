@@ -90,6 +90,23 @@ def git_info(source):
     }
 
 
+def logical_traffic(case, lengths, dtype):
+    """Count logical tensor IO once per sequence, including reuse across rows."""
+    tokens = sum(lengths)
+    kv_bytes = 2 * tokens * KV_HEADS * DIM * (1 if dtype == "fp8" else 2)
+    scale_bytes = 2 * tokens * KV_HEADS * 4 if dtype == "fp8" else 0
+    # BF16 Q read and BF16 output write. Dense MTP queries share their KV;
+    # count that KV once per request rather than once per query token.
+    query_output_bytes = 2 * case["batch"] * case["query_length"] * HEADS * DIM * 2
+    return {
+        "logical_kv_tokens": tokens,
+        "kv_payload_bytes": kv_bytes,
+        "kv_scale_bytes": scale_bytes,
+        "query_output_bytes": query_output_bytes,
+        "logical_io_bytes": kv_bytes + scale_bytes + query_output_bytes,
+    }
+
+
 def build_inputs(case, dtype, seed, torch):
     torch.manual_seed(seed)
     batch, qlen, page = case["batch"], case["query_length"], case["page"]
@@ -318,6 +335,8 @@ def measure(case, dtype, profile, args, pa, torch):
     cluster = bool(policy.get("cluster_merge", False))
     direct = bool(policy.get("direct_output", False))
     mode = "cluster" if cluster else "direct" if direct else "reducer"
+    latency_us = statistics.median(rounds)
+    traffic = logical_traffic(case, inputs["lengths"], dtype)
     return dict(
         case=case["id"],
         suite=case["suite"],
@@ -342,7 +361,9 @@ def measure(case, dtype, profile, args, pa, torch):
         workgroup_budget=args.workgroup_budget,
         output_mode=mode,
         scratch_bytes=sum(t.numel() * t.element_size() for t in workspace.values()),
-        median_us=statistics.median(rounds),
+        median_us=latency_us,
+        effective_bandwidth_tb_s=traffic["logical_io_bytes"] / latency_us / 1e6,
+        **traffic,
         round_min_us=rounds,
         samples_us=all_samples,
         checked=args.check,
@@ -532,6 +553,11 @@ def main():
         },
         checked=args.check,
         expected_results=len(cases) * len(profiles) * len(dtypes),
+        bandwidth_definition=(
+            "logical K/V payload + FP32 per-token K/V scales for FP8 + BF16 Q read "
+            "+ BF16 output write; KV once per sequence; excludes metadata/scratch; "
+            "decimal TB/s, not measured HBM traffic"
+        ),
         status="running",
     )
     rows = []
@@ -543,7 +569,9 @@ def main():
                     rows.append(row)
                     write_results(args.output, metadata, rows)
                     print(
-                        f"{profile:4} {dtype:4} {case['id']:42} {row['median_us']:9.3f} us  {row['output_mode']}",
+                        f"{profile:4} {dtype:4} {case['id']:42} "
+                        f"{row['median_us']:9.3f} us  "
+                        f"{row['effective_bandwidth_tb_s']:7.3f} TB/s  {row['output_mode']}",
                         flush=True,
                     )
     if args.compare_to:

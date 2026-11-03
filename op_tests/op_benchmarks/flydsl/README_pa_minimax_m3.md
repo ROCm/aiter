@@ -127,6 +127,28 @@ software versions, timing samples, actual plan cap/capacity, scratch size,
 table width, output mode and reference error. Keep result files outside the
 source checkout when comparing clean revisions.
 
+## Effective bandwidth
+
+The benchmark also reports logical IO bytes and effective bandwidth in decimal
+TB/s. Let `N = sum(context_lengths)`, `T = batch * query_length`, `Hkv = 1`,
+`Hq = 16`, and `D = 128`:
+
+```text
+KV payload bytes = 2 * N * Hkv * D * KV element size
+KV scale bytes   = 2 * N * Hkv * 4 for FP8; zero for BF16
+Q + output bytes = 2 * T * Hq * D * 2
+Logical IO bytes = KV payload bytes + KV scale bytes + Q/output bytes
+Effective TB/s   = logical IO bytes / latency_us / 1e6
+```
+
+Dense MTP4 queries share KV, counted once per request. Sparse rows count each
+row's visible logical KV, including repeated references to the shared physical
+pool. Prefill uses its actual increasing lengths. Metadata, block-table reads,
+scratch traffic and additional kernel reads are excluded. This is an effective
+tensor IO metric; CUDA graphs replay the same inputs and sparse rows share KV,
+so cache reuse can make it exceed physical HBM bandwidth. Hardware HBM traffic
+is not measured.
+
 ## Validation
 
 Validated on 2026-11-02 against PR 7079 head `15214dad7`, with a 256-CU gfx1250,
