@@ -71,6 +71,9 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_la
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.snapshot import (
+    snapshot_chunk_rows,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -430,6 +433,8 @@ def _seg_occupancy_class(num_segs: int) -> int:
         "PAGED_H_IN": lambda args: (
             args["state_cache"] is not None and args["h_in"] is None
         ),
+        # `.get`: only pass C passes it, and the heuristic sees passed args only.
+        "HAS_SNAP": lambda args: args.get("snap_out") is not None,
     }
 )
 @triton.jit
@@ -474,6 +479,9 @@ def _flash_kda_segment_kernel(
     cache_stride=0,
     PAGED_CACHE: tl.constexpr = False,
     PAGED_H_IN: tl.constexpr = False,
+    snap_out=None,
+    chunk_snap_row=None,
+    HAS_SNAP: tl.constexpr = False,
 ):
     """Delta-rule recurrence over one segment of chunks.
 
@@ -489,6 +497,12 @@ def _flash_kda_segment_kernel(
 
     With one segment per sequence this degenerates to a plain sequential scan
     and only the third form runs.
+
+    ``HAS_SNAP`` (third form only) also stores the state that enters each chunk
+    into row ``chunk_snap_row[chunk]`` of ``snap_out``, cast as the final state
+    is. A row of -1 stores nothing. The state that enters a chunk is the state
+    after every earlier token of the sequence, so it is the final state of a
+    forward that ends at that chunk boundary.
     """
     # Every V block of a (segment, head) re-reads its chunk workspace; remapped,
     # they land on one XCD and share its L2 instead of each pulling it through
@@ -547,6 +561,35 @@ def _flash_kda_segment_kernel(
         b_h2 = tl.zeros([64, BW], dtype=tl.float32)
 
     for j in range(n_chunks):
+        if HAS_SNAP:
+            snap_i = tl.load(chunk_snap_row + chunk_base + j).to(tl.int64)
+            if snap_i >= 0:
+                e_sn = snap_out.dtype.element_ty
+                if STATE_V_FIRST:
+                    n_off = (snap_i * H + i_h) * V * K + o_w[None, :] * K
+                    tl.store(
+                        snap_out + n_off + o_k1[:, None],
+                        b_h1.to(e_sn),
+                        mask=m_w[None, :],
+                    )
+                    tl.store(
+                        snap_out + n_off + o_k2[:, None],
+                        b_h2.to(e_sn),
+                        mask=m_w[None, :],
+                    )
+                else:
+                    n_off = (snap_i * H + i_h) * K * V + o_w[None, :]
+                    tl.store(
+                        snap_out + n_off + o_k1[:, None] * V,
+                        b_h1.to(e_sn),
+                        mask=m_w[None, :],
+                    )
+                    tl.store(
+                        snap_out + n_off + o_k2[:, None] * V,
+                        b_h2.to(e_sn),
+                        mask=m_w[None, :],
+                    )
+
         ws_idx = i_h * TOTAL_TILES + chunk_base + j
         ck = ws_idx * C * K
         t0 = tok_base + j * C
@@ -1139,6 +1182,23 @@ def _build_segments(
     return desc, off, len(chunk_base), max_per_seq
 
 
+@functools.lru_cache(maxsize=64)
+def _build_snapshots(
+    seqs: tuple[tuple[int, int], ...],
+    C: int,
+    targets: tuple[tuple[int, int], ...],
+    device: torch.device,
+) -> torch.Tensor:
+    """`snapshot_chunk_rows` as an int32 tensor on ``device``.
+
+    Cached like `_build_segments`: every KDA layer of a forward asks with the
+    same key.
+    """
+    return torch.tensor(
+        snapshot_chunk_rows(seqs, C, targets), dtype=torch.int32, device=device
+    )
+
+
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel)
 _segment_fast = fast_launch(_flash_kda_segment_kernel)
 _seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel)
@@ -1199,6 +1259,8 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1236,6 +1298,20 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        snapshot_targets:   ``((n, off), ...)``: also write sequence ``n``'s
+                            state after its first ``off`` tokens. ``off`` is an
+                            interior multiple of the 32-token chunk. A sequence
+                            can have any number of targets, in any order, but
+                            no position twice. Host ints, so the mapping needs
+                            no device read. A call with targets runs K2 on
+                            Triton, which is the only K2 that stores them.
+        snapshot_out:       ``[len(snapshot_targets), H, V, K]`` when
+                            ``state_v_first`` else ``[.., H, K, V]``, on the
+                            device of ``q``; row ``i`` receives target ``i``.
+                            Cast as the final state is, so in ``final_state``'s
+                            dtype it holds the bits that a forward ending at
+                            ``off`` returns as its final state, when that
+                            forward also runs unsegmented on the Triton K2.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1270,7 +1346,11 @@ def flash_kda_fwd(
             raise ValueError("out must be contiguous")
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # Only the Triton K2 stores snapshots. Deciding it here also keeps v packed
+    # for it on gfx1250.
+    use_gluon_k2 = (
+        AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and not snapshot_targets
+    )
     # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
     # stride. Every other kernel needs them packed.
     stride_q = stride_k = stride_g = H * K
@@ -1452,6 +1532,26 @@ def flash_kda_fwd(
         seqs, C, chunks_per_seg, dev
     )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
+
+    snap_args = {}
+    if snapshot_targets:
+        if snapshot_out is None:
+            raise ValueError("snapshot_targets needs snapshot_out")
+        targets = tuple((int(n), int(off)) for n, off in snapshot_targets)
+        want = (len(targets), H, V, K) if state_v_first else (len(targets), H, K, V)
+        if (
+            tuple(snapshot_out.shape) != want
+            or not snapshot_out.is_contiguous()
+            or snapshot_out.device != dev
+        ):
+            raise ValueError(
+                f"snapshot_out must be a contiguous {want} tensor on {dev}, got "
+                f"{tuple(snapshot_out.shape)} on {snapshot_out.device}"
+            )
+        snap_args = {
+            "snap_out": snapshot_out,
+            "chunk_snap_row": _build_snapshots(seqs, C, targets, dev),
+        }
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
     # once here instead of carrying the layout through three passes.
@@ -1685,6 +1785,7 @@ def flash_kda_fwd(
             STORE_H_OUT=False,
             STORE_FINAL=store_final,
             **(paged_args if paged else {}),
+            **snap_args,
         )
 
     return o, final_state

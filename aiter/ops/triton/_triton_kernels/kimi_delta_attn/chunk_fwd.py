@@ -72,6 +72,8 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -110,6 +112,9 @@ def chunk_delta_attn_fwd(
         out:                Optional contiguous output buffer, same shape as
                             ``v``. FlashKDA-only, like ``state_cache``.
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
+        snapshot_targets:   Optional interior states to write out, see
+                            ``flash_kda_fwd``. FlashKDA-only.
+        snapshot_out:       Their destination. FlashKDA-only.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -168,6 +173,11 @@ def chunk_delta_attn_fwd(
             "out is only implemented on the FlashKDA path; use the returned "
             "tensor, or pass a call that flash_kda_supported accepts"
         )
+    if snapshot_targets and not use_flash_kda:
+        raise ValueError(
+            "state snapshots are only implemented on the FlashKDA path; pass a "
+            "call that flash_kda_supported accepts, with AITER_FDA_ENABLE on"
+        )
 
     if use_flash_kda:
         o, final_state = flash_kda_fwd(
@@ -189,6 +199,8 @@ def chunk_delta_attn_fwd(
             state_cache=state_cache,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
+            snapshot_targets=snapshot_targets,
+            snapshot_out=snapshot_out,
         )
         return o, final_state, None, None, None, None, None, None, None
 

@@ -30,6 +30,9 @@ python bench_flash_kda.py --k3-tp8 --impl chunk_kda
 # Pin segment lengths instead of letting the heuristic choose
 python bench_flash_kda.py --seg-sweep
 
+# Each shape without and with 3 state snapshots per sequence
+python bench_flash_kda.py --k3-tp8 --snapshots 3
+
 # Save CSV
 python bench_flash_kda.py -o
 """
@@ -225,6 +228,24 @@ def _seg_label(chunks_per_seg):
     return "1seg" if chunks_per_seg <= 0 else str(chunks_per_seg)
 
 
+def _snapshot_kwargs(t, per_seq):
+    """``per_seq`` evenly spaced interior chunk boundaries of each sequence."""
+    if not per_seq:
+        return {}
+    B, T, H = t["q"].shape[:3]
+    cu_seqlens = t.get("cu_seqlens")
+    lens = [T] * B if cu_seqlens is None else torch.diff(cu_seqlens).tolist()
+    targets = []
+    for n, length in enumerate(lens):
+        bounds = (length - 1) // FLASH_KDA_CHUNK
+        count = min(per_seq, bounds)
+        targets += [
+            (n, k * bounds // count * FLASH_KDA_CHUNK) for k in range(1, count + 1)
+        ]
+    out = torch.empty(len(targets), H, K_DIM, K_DIM, device=DEVICE, dtype=torch.float32)
+    return {"snapshot_targets": tuple(targets), "snapshot_out": out}
+
+
 def run_benchmark(args):
     if args.k3_tp8:
         x_vals_list = [
@@ -243,6 +264,8 @@ def run_benchmark(args):
     header = f"{'B':>4} {'T':>6} {'H':>4} {'K':>4} {'V':>4}  {'Time(ms)':>10}  {'TFLOPS':>8}  {'BW(GB/s)':>10}"
     if args.seg_sweep:
         header += f"  {'seg':>6}"
+    if args.snapshots:
+        header += f"  {'snaps':>6}"
     if args.k3_tp8:
         header += "  seqlens"
     print(header)
@@ -262,12 +285,16 @@ def run_benchmark(args):
         else:
             segs = [None]
 
-        for m in segs:
+        for m, snaps in itertools.product(segs, sorted({0, args.snapshots})):
             if args.impl == "chunk_kda":
                 fn = _chunk_kda_fn(t)
             else:
                 fn = functools.partial(
-                    flash_kda_fwd, **t, lower_bound=LOWER_BOUND, chunks_per_seg=m
+                    flash_kda_fwd,
+                    **t,
+                    lower_bound=LOWER_BOUND,
+                    chunks_per_seg=m,
+                    **_snapshot_kwargs(t, snaps),
                 )
 
             # Time-based warmup: run until WARMUP_MS elapsed so JIT/autotune completes.
@@ -290,6 +317,9 @@ def run_benchmark(args):
             if args.seg_sweep:
                 line += f"  {_seg_label(m):>6}"
                 row.append(_seg_label(m))
+            if args.snapshots:
+                line += f"  {snaps:>6}"
+                row.append(snaps)
             if args.k3_tp8:
                 seqlens = "+".join(map(str, K3_TP8_STEPS[i][0]))
                 line += f"  {seqlens}"
@@ -304,6 +334,8 @@ def run_benchmark(args):
         cols = ["B", "T", "H", "K", "V", "Time_ms", "TFLOPS", "BW_GBs"]
         if args.seg_sweep:
             cols.append("seg")
+        if args.snapshots:
+            cols.append("snaps")
         if args.k3_tp8:
             cols.append("seqlens")
         with open(fname, "w", newline="") as f:
@@ -355,6 +387,14 @@ def parse_args(args=None):
         "count, or the hardware.",
     )
     parser.add_argument(
+        "--snapshots",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Also time each shape with N state snapshots per sequence "
+        "(snapshot_targets), at evenly spaced interior chunk boundaries.",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="Write results to a CSV file in the current directory.",
@@ -374,6 +414,10 @@ def parse_args(args=None):
     args = parser.parse_args(args=args)
     if args.seg_sweep and args.impl != "flash_kda":
         parser.error("--seg-sweep pins FlashKDA segment lengths; use --impl flash_kda")
+    if args.snapshots and args.impl != "flash_kda":
+        parser.error("--snapshots is a FlashKDA option; use --impl flash_kda")
+    if args.snapshots < 0:
+        parser.error("--snapshots must be >= 0")
     return args
 
 
