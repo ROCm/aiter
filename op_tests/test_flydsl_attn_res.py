@@ -357,16 +357,26 @@ def test_flydsl_attn_res_matches_triton_gate(
     from aiter.ops.triton.fusions.attn_res import attn_res_gate
 
     inputs = _make_inputs(tokens, hidden_size, num_blocks, max_plus_one_parent=True)
+    expected = _call(attn_res_reference, inputs, cfg)
     triton_out = _call(attn_res_gate, inputs, cfg)
     out = _call(flydsl_attn_res, inputs, cfg)
     torch.cuda.synchronize()
 
     msg = f"vs Triton {cfg} T={tokens} D={hidden_size} B={num_blocks}"
     assert len(out) == len(triton_out), msg
-    _assert_y_close(out[0], triton_out[0], cfg, msg)
+    _assert_y_close(out[0], expected[0], cfg, f"{msg}: FlyDSL y vs FP32 reference")
     assert torch.equal(out[1], triton_out[1]), f"{msg}: prefix_out differs"
     if cfg.close:
         assert torch.equal(out[2], triton_out[2]), f"{msg}: block_out differs"
+
+    # Triton's y is sometimes wrong when more than about 7 processes share the GPU.
+    try:
+        _assert_y_close(triton_out[0], expected[0], cfg, msg)
+    except AssertionError as triton_error:
+        pytest.xfail(
+            f"Triton attn_res_gate y is outside the FP32 reference bound: {triton_error}"
+        )
+    _assert_y_close(out[0], triton_out[0], cfg, msg)
 
 
 @_skip_unsupported_gfx
