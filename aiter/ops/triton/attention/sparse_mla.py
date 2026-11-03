@@ -476,12 +476,15 @@ def _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp
 _FP8_LAZY = 8
 
 
-def _fp8_heads_per_program(num_queries, num_heads):
+def _fp8_heads_per_program(num_queries, num_heads, two_loops=False):
     """64 once a row's 64-head programs alone fill the CUs (a key is then
     gathered once per 64 heads), else up to 32, which leaves room for split-K to
-    fill them."""
+    fill them. The two-loop kernel spills at 64 heads: at 64 heads in all, two
+    32-head programs per row are faster (DSv4.1-Flash, 4-11%); at 128 the
+    64-head program still wins."""
     if num_heads % 64 == 0 and num_queries * (num_heads // 64) >= get_num_sms():
-        return 64
+        if not (two_loops and num_heads == 64):
+            return 64
     return min(32, num_heads)
 
 
@@ -511,7 +514,7 @@ def _sparse_mla_fp8_launch(
     out [C, H, >= 512] bf16, or None with out_mxfp8 (e4m3 data [C, H * 512],
     E8M0 scales [C, H * 16]). Returns (out, lse or None)."""
     C, H, _ = q.shape
-    G = _fp8_heads_per_program(C, H)
+    G = _fp8_heads_per_program(C, H, segs is not None and segs.seg == 2)
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:

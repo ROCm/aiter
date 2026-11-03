@@ -22,9 +22,10 @@ share the work, so there is one loop body for every head count:
         (GM = max(G, 16) MFMA rows; G = 8 pads to 16)
     PV  waves split the 512 output dims
 With KG = 1 (64 heads on 4 waves) a wave owns whole rows: QK runs as two 32-key
-halves, since a whole tile's K operand would be 128 registers, and the row sum is
-reduced in-wave every tile. With KG > 1 the row sum is deferred (a [GM, 64]
-accumulator, reduced once).
+halves, since a whole tile's K operand would be 128 registers, its K read in
+128-dim chunks one chunk ahead of its MFMAs, and the row sum is reduced in-wave
+every tile. With KG > 1 the row sum is deferred (a [GM, 64] accumulator, reduced
+once).
 
 Per tile, from a 2-slot LDS ring of [64, 512] fp8 tiles that direct-to-LDS gathers
 fill one tile ahead:
@@ -108,6 +109,25 @@ def _add(a, b):
     return gl.inline_asm_elementwise(
         "v_add_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True,
         pack=1,
+    )  # fmt: skip
+
+
+# _add / _fma behind one wait state, for an operand a v_exp_f32 may have written in
+# the previous instruction: LLVM pads its own readers of a TRANS result (gfx950's
+# trans forwarding hazard), not inline asm, which then reads stale lanes.
+@gluon.jit
+def _add_t(a, b):
+    return gl.inline_asm_elementwise(
+        "s_nop 0\n\tv_add_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32,
+        is_pure=True, pack=1,
+    )  # fmt: skip
+
+
+@gluon.jit
+def _fma_t(a, b, c):
+    return gl.inline_asm_elementwise(
+        "s_nop 0\n\tv_fma_f32 $0, $1, $2, $3", "=v,v,v,v", [a, b, c],
+        dtype=gl.float32, is_pure=True, pack=1,
     )  # fmt: skip
 
 
@@ -384,14 +404,49 @@ def _mask(S, k0, end):
 
 
 @gluon.jit
-def _qk(cfg, kvt, q_dot, k0: gl.constexpr, NK: gl.constexpr):
-    """Scores of tile keys k0 .. k0 + NK: 16x16x128 scaled MFMAs, unit scales."""
+def _qk(cfg, kvt, q_dot):
+    """Scores of the whole tile: 16x16x128 scaled MFMAs, unit scales."""
     k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK, 16)
-    k = kvt.slice(k0, NK, dim=0).permute([1, 0]).load(k_op)
-    acc = gl.zeros([q_dot.shape[0], NK], gl.float32, cfg.QK)
+    k = kvt.permute([1, 0]).load(k_op)
+    acc = gl.zeros([q_dot.shape[0], BN], gl.float32, cfg.QK)
     return gl.amd.cdna4.mfma_scaled(
         q_dot, None, "e4m3", k.to(gl.float8e4nv, bitcast=True), None, "e4m3", acc
     )
+
+
+@gluon.jit
+def _kc(cfg, kvt, i: gl.constexpr, NK: gl.constexpr):
+    """K chunk i of the tile, as the QK MFMA's B operand: keys (i // 4) * NK ..
+    + NK, dims (i % 4) * 128 .. + 128."""
+    k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK, 16)
+    kc = kvt.slice((i // 4) * NK, NK, dim=0).slice((i % 4) * 128, 128, dim=1)
+    return kc.permute([1, 0]).load(k_op).to(gl.float8e4nv, bitcast=True)
+
+
+@gluon.jit
+def _qk_halves(cfg, kvt, qc):
+    """Scores of the tile's two 32-key halves, one accumulator each, q in 128-dim
+    chunks qc. Each K chunk is read before the previous chunk's MFMAs; the fences
+    hold that order, since left alone LLVM moves every read down to its MFMA and
+    waits lgkmcnt(0) there."""
+    HB: gl.constexpr = BN // 2
+    S0 = gl.zeros([qc[0].shape[0], HB], gl.float32, cfg.QK)
+    S1 = S0
+    k = _kc(cfg, kvt, 0, HB)
+    for i in gl.static_range(8):
+        kn = k
+        if i + 1 < 8:
+            kn = _kc(cfg, kvt, i + 1, HB)
+        _sched_barrier()
+        if i < 4:
+            S0 = gl.amd.cdna4.mfma_scaled(qc[i], None, "e4m3", k, None, "e4m3", S0)
+        else:
+            S1 = gl.amd.cdna4.mfma_scaled(
+                qc[i - 4], None, "e4m3", k, None, "e4m3", S1
+            )
+        _sched_barrier()
+        k = kn
+    return S0, S1
 
 
 @gluon.jit
@@ -405,12 +460,14 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
 
     # c > 0, so the max of the scaled scores is the scaled max
     if HALVES:
-        S0 = _mask(_qk(cfg, kvt, q[0], 0, HB), k0, end)
-        _sched_barrier()  # one half's K operand live at a time
-        S1 = _mask(_qk(cfg, kvt, q[0], HB, HB), k0 + HB, end)
+        # K read ahead pays here only: with KG > 1 the fences cost more (GLM-5.2)
+        # and the chunked q costs the small decodes 2-4%
+        S0, S1 = _qk_halves(cfg, kvt, q[0])
+        S0 = _mask(S0, k0, end)
+        S1 = _mask(S1, k0 + HB, end)
         mx = gl.maximum(gl.max(S0, axis=1), gl.max(S1, axis=1))
     else:
-        S0 = _qk(cfg, kvt, q[0], 0, BN)
+        S0 = _qk(cfg, kvt, q[0])
         if cfg.ROPE > 0:
             kr_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QR, 8)
             kr = krt.permute([1, 0]).load(kr_op).to(gl.float8e4nv, bitcast=True)
@@ -434,7 +491,7 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
     p0 = gl.exp2(_fma(S0, c2, nm))
     if HALVES:
         p1 = gl.exp2(_fma(S1, c2, nm))
-        l_i = _fma(l_i, alpha, gl.reduce(_add(p0, p1), 1, _add))
+        l_i = _fma(l_i, alpha, gl.reduce(_add_t(p0, p1), 1, _add))
         p_smem.slice(0, HB, dim=1).store(
             p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
         )
@@ -443,7 +500,7 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
         )
     else:
         # deferred row sum: no cross-wave reduction per tile
-        l_i = _fma(l_i, gl.broadcast(alpha[:, None], S0)[0], p0)
+        l_i = _fma_t(l_i, gl.broadcast(alpha[:, None], S0)[0], p0)
         p_smem.store(p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True))
     a_smem.store(alpha)
     gl.barrier()
@@ -520,13 +577,24 @@ class _Program:
 
     @gluon.jit
     def q_fp8(self):
-        """(latent, RoPE) operands of fp8 q, loaded straight into the operand layouts."""
+        """(latent, RoPE) operands of fp8 q, loaded straight into the operand layouts;
+        with KG = 1 the latent as four 128-dim chunks (_qk_halves)."""
         cfg = self.cfg
         q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK, 16)
-        q_dot = self.load_q(0, D, q_op).to(gl.float8e4nv, bitcast=True)
+        if cfg.KG == 1:
+            q_dot = (
+                self.load_q(0, 128, q_op).to(gl.float8e4nv, bitcast=True),
+                self.load_q(128, 128, q_op).to(gl.float8e4nv, bitcast=True),
+                self.load_q(256, 128, q_op).to(gl.float8e4nv, bitcast=True),
+                self.load_q(384, 128, q_op).to(gl.float8e4nv, bitcast=True),
+            )
+        else:
+            q_dot = self.load_q(0, D, q_op).to(gl.float8e4nv, bitcast=True)
         if cfg.ROPE > 0:
             qr_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QR, 8)
             qr_dot = self.load_q(D, cfg.ROPE, qr_op).to(gl.float8e4nv, bitcast=True)
+        elif cfg.KG == 1:
+            qr_dot = q_dot[0]  # unused without RoPE
         else:
             qr_dot = q_dot
         return q_dot, qr_dot
@@ -534,26 +602,44 @@ class _Program:
     @gluon.jit
     def q_bf16(self):
         """bf16 q as e4m3 with one scale per head (over latent and RoPE):
-        ((latent, RoPE) operands, the scale per row)."""
+        ((latent, RoPE) operands as q_fp8 returns them, the scale per row)."""
         cfg = self.cfg
-        q = self.load_q(0, D, cfg.WIDE_L).to(gl.float32)
-        amax = gl.max(gl.abs(q), axis=1)
+        if cfg.KG == 1:
+            ql: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [cfg.NW, 1], [1, 0])
+            q0 = self.load_q(0, 128, ql).to(gl.float32)
+            q1 = self.load_q(128, 128, ql).to(gl.float32)
+            q2 = self.load_q(256, 128, ql).to(gl.float32)
+            q3 = self.load_q(384, 128, ql).to(gl.float32)
+            amax = gl.maximum(
+                gl.maximum(gl.max(gl.abs(q0), axis=1), gl.max(gl.abs(q1), axis=1)),
+                gl.maximum(gl.max(gl.abs(q2), axis=1), gl.max(gl.abs(q3), axis=1)),
+            )
+        else:
+            q = self.load_q(0, D, cfg.WIDE_L).to(gl.float32)
+            amax = gl.max(gl.abs(q), axis=1)
         if cfg.ROPE > 0:
             rl: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [cfg.NW, 1], [1, 0])
             qr = self.load_q(D, cfg.ROPE, rl).to(gl.float32)
             amax_r = gl.convert_layout(gl.max(gl.abs(qr), axis=1), amax.type.layout)
             amax = gl.maximum(amax, amax_r)
         s = gl.maximum(amax, 1e-30) / 448.0
-        q_dot = gl.convert_layout(
-            (q / s[:, None]).to(gl.float8e4nv), gl.DotOperandLayout(0, cfg.QK, 16)
-        )
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK, 16)
+        if cfg.KG == 1:
+            q_dot = (
+                gl.convert_layout((q0 / s[:, None]).to(gl.float8e4nv), q_op),
+                gl.convert_layout((q1 / s[:, None]).to(gl.float8e4nv), q_op),
+                gl.convert_layout((q2 / s[:, None]).to(gl.float8e4nv), q_op),
+                gl.convert_layout((q3 / s[:, None]).to(gl.float8e4nv), q_op),
+            )
+            qr_dot = q_dot[0]
+        else:
+            q_dot = gl.convert_layout((q / s[:, None]).to(gl.float8e4nv), q_op)
+            qr_dot = q_dot
         if cfg.ROPE > 0:
             sr = gl.convert_layout(s, gl.SliceLayout(1, rl))
             qr_dot = gl.convert_layout(
                 (qr / sr[:, None]).to(gl.float8e4nv), gl.DotOperandLayout(0, cfg.QR, 8)
             )
-        else:
-            qr_dot = q_dot
         return (q_dot, qr_dot), gl.convert_layout(s, cfg.ROW_L)
 
     @gluon.jit
