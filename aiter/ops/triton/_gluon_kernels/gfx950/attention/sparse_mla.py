@@ -2210,7 +2210,7 @@ def _epilogue_store(
     if INV_ROPE:
         x = _inv_rope(x, cs_row, ROPE_DIM)
     if OUT_MXFP8:
-        x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
+        x = _mxfp8(x, scale_ptr + row.to(gl.int64) * scale_stride0, h0, num_heads)
     hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
     ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
     row_ptr = out_ptr + row.to(gl.int64) * out_stride0  # 32-bit offset would overflow
@@ -3038,12 +3038,13 @@ def _sparse_mla_reduce(
 
         if HAS_LSE:
             gl.store(
-                lse_ptr + query_idx * num_heads + h,
+                lse_ptr + query_idx64 * num_heads + h,
                 (m_final + gl.log2(l_final)) * LN2,
                 mask=h < num_heads,
             )
-        # One reciprocal per row instead of a per-element f32 divide.
-        out = acc * (1.0 / l_final)
+        # One reciprocal per row instead of a per-element f32 divide. A row with
+        # no key in any split (and no sink) has l = 0 and comes out 0, not NaN.
+        out = acc * gl.where(l_final > 0.0, 1.0 / l_final, 0.0)
         if INV_ROPE or OUT_MXFP8:
             _epilogue_store(
                 gl.expand_dims(out, 0),
