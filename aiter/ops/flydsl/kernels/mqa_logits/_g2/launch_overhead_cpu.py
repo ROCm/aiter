@@ -111,8 +111,8 @@ def main():
         captured.append(args)
 
     stubs = [patch.object(K, "_run", run),
-             patch.object(K, "_build_wmma_kernel", lambda *a: _Launch()),
-             patch.object(K, "_build_wmma_fp8_kernel", lambda *a: _Launch()),
+             patch.object(K, "_build_wmma_kernel", lambda *a, **k: _Launch()),
+             patch.object(K, "_build_wmma_fp8_kernel", lambda *a, **k: _Launch()),
              patch.object(torch.cuda, "current_stream", lambda dev=None: None)]
     for s in stubs:
         s.start()

@@ -8,6 +8,10 @@ Run: python -B aiter/ops/flydsl/kernels/mqa_logits/_g2/test_bf16_routing_cpu.py 
 """
 from __future__ import annotations
 
+import sys as _n64_sys, pathlib as _n64_path  # ROUND-NATIVE64 seam support
+_n64_sys.path.insert(0, str(_n64_path.Path(__file__).resolve().parent))
+from native64_seam import ensure_i32  # noqa: E402
+
 import ast
 import copy
 from functools import lru_cache
@@ -31,6 +35,7 @@ def _exec(nodes, namespace):
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     module = ast.Module(body=[future] + copy.deepcopy(nodes), type_ignores=[])
     ast.fix_missing_locations(module)
+    ensure_i32(namespace)
     exec(compile(module, str(SOURCE), "exec"), namespace)
 
 
@@ -87,14 +92,18 @@ class Bf16RoutingCPU(unittest.TestCase):
     def assert_selection(self, ns, geometry, mode, tdm, r16_tdm_cols=32):
         launch = ns["_build_wmma_kernel"](1.0, geometry, mode)
         kernel = _selected(launch)
+        # ROUND-MERGE1: QSA_R16_NOBAR defaults to 1 -> TDM r16 selects the barrier-free kernel.
+        nobar = bool(ns["TDM_R16_NOBAR"]) and tdm and geometry == 16
         expected = ("kernel_tdm_r16" if tdm else "kernel") if geometry == 16 else ("kernel_r64" if geometry == 64 else "kernel_r32")
+        if nobar:
+            expected = "kernel_tdm_r16_nobar"
         self.assertEqual(kernel._func.__name__, expected)
         self.assertEqual(kernel.block, [128, 1, 1])
         self.assertEqual(launch.dtype_tag, "bf16_wmma")
         cols = r16_tdm_cols if (tdm and geometry == 16) else 64
         self.assertEqual(launch.cols_per_block, cols)
         name = "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r%d_c%d_flydsl" % (geometry, cols)
-        self.assertEqual(launch.kernel_name, name + ("_tdm" if tdm else ""))
+        self.assertEqual(launch.kernel_name, name + ("_tdm" if tdm else "") + ("_nobar" if nobar else ""))
         self.assertEqual(kernel.name, launch.kernel_name)
 
     def test_unset_environment_defaults_auto(self):
@@ -106,6 +115,24 @@ class Bf16RoutingCPU(unittest.TestCase):
         for geometry, resolved in ((16, "tdm"), (32, "tdm"), (64, "tdm")):
             self.assertEqual(ns["_resolve_bf16_k_load"](geometry), resolved)
             self.assert_selection(ns, geometry, None, resolved == "tdm")
+
+    def test_r16_nobar_default_on_and_opt_out(self):
+        # ROUND-MERGE1: default 1 (barrier-free r16 TDM); "0" restores the champion kernel.
+        self.assertIs(_namespace()["TDM_R16_NOBAR"], True)
+        self.assertIs(_namespace({"QSA_R16_NOBAR": "1"})["TDM_R16_NOBAR"], True)
+        off = _namespace({"QSA_R16_NOBAR": "0"})
+        self.assertIs(off["TDM_R16_NOBAR"], False)
+        self.assertEqual(_selected(off["_build_wmma_kernel"](1.0, 16, "tdm"))._func.__name__, "kernel_tdm_r16")
+        on = _namespace()
+        self.assertEqual(_selected(on["_build_wmma_kernel"](1.0, 16, "tdm"))._func.__name__, "kernel_tdm_r16_nobar")
+        # never for raw r16, r32, r64 or persistent builds
+        self.assertEqual(_selected(on["_build_wmma_kernel"](1.0, 16, "raw"))._func.__name__, "kernel")
+        self.assertEqual(_selected(on["_build_wmma_kernel"](1.0, 32, "tdm"))._func.__name__, "kernel_r32")
+        for mode in ("auto", "raw", "tdm"):
+            ns = _namespace({"QSA_BF16_K_LOAD": mode, "QSA_R16_NOBAR": "0"})
+            for geometry in (16, 32, 64):
+                with self.subTest(mode=mode, geometry=geometry):
+                    self.assert_selection(ns, geometry, None, mode != "raw")
 
     def test_modes_and_explicit_overrides_select_actual_functions(self):
         for environment in ("auto", "raw", "tdm"):

@@ -562,9 +562,14 @@ def load_module():
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns):
+def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns, pos64=False):
+    """``pos64=True`` (ROUND-NATIVE64): build the int64-position kernel and pass
+    the int64 ``qpos`` exactly as the wrapper does (zero-copy int32 view)."""
     block_rows = int(os.environ.get("QSA_TRACE_ROWS_PER_BLOCK", "16"))
-    launch = K._build_wmma_kernel(math.sqrt(128), block_rows)
+    if pos64:
+        launch = K._build_wmma_kernel(math.sqrt(128), block_rows, pos64=True)
+    else:
+        launch = K._build_wmma_kernel(math.sqrt(128), block_rows)
     closure = dict(zip(launch.__code__.co_freevars,
                        (c.cell_contents for c in launch.__closure__)))
     # The r16/r32 shape selector renamed the launcher capture in round J.
@@ -582,7 +587,8 @@ def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns):
         "kv": cache.contiguous().view(torch.uint8).view(num_pages, -1),
         "pt": table.to(torch.int32).contiguous(),
         "t2r": t2r.to(torch.int32).contiguous(),
-        "qp": qpos.to(torch.int32).contiguous(),
+        "qp": (qpos.to(torch.int64).contiguous().view(torch.int32) if pos64
+               else qpos.to(torch.int32).contiguous()),
         "cl": ctx.to(torch.int32).contiguous(),
         "logits": torch.zeros(rows, columns, dtype=torch.float32),
         "visible_groups": torch.zeros(rows, dtype=torch.int32),
@@ -605,7 +611,7 @@ def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns):
               "row_starts": (rows * 4, "i")}
     ext = {k: Sim.planes[k].extent for k in Sim.planes}
     want_ext = {"q": rows * 1024, "kv": num_pages * 1024, "pt": num_requests * width * 4,
-                "t2r": rows * 4, "qp": rows * 4, "cl": num_requests * 4,
+                "t2r": rows * 4, "qp": rows * (8 if pos64 else 4), "cl": num_requests * 4,
                 "logits": rows * columns * 4, "visible_groups": rows * 4, "row_starts": rows * 4}
     for k, v in want_ext.items():
         if ext.get(k) != max(v, 4):

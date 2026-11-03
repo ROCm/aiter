@@ -70,9 +70,15 @@ def historical_args(args, kw):
 class LaunchPathCPU(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.build_kw = []
+
+        def build(*a, **kw):
+            self.build_kw.append(kw)
+            return _Launch()
+
         self.stack = [patch.object(K, "_run", lambda launch, *a: self.calls.append(a)),
-                      patch.object(K, "_build_wmma_kernel", lambda *a: _Launch()),
-                      patch.object(K, "_build_wmma_fp8_kernel", lambda *a: _Launch()),
+                      patch.object(K, "_build_wmma_kernel", build),
+                      patch.object(K, "_build_wmma_fp8_kernel", build),
                       patch.object(torch.cuda, "current_stream", lambda dev=None: "STREAM")]
         for s in self.stack:
             s.start()
@@ -97,7 +103,17 @@ class LaunchPathCPU(unittest.TestCase):
             self.assertEqual(got.tolist(), src.tolist())
         self.assertEqual(qp.dtype, torch.int32)
         self.assertEqual(tuple(qp.stride()), (1,))
-        self.assertEqual(qp.tolist(), args[4].tolist())
+        src = args[4]
+        if src.dtype == torch.int64:
+            # ROUND-NATIVE64: zero-copy int32 view [2*rows] + pos64 specialization.
+            self.assertEqual(self.build_kw[-1], {"pos64": True})
+            self.assertEqual(tuple(qp.shape), (2 * src.shape[0],))
+            self.assertEqual(qp.view(torch.int64).tolist(), src.tolist())
+            if src.stride(0) == 1:
+                self.assertEqual(qp.data_ptr(), src.data_ptr())
+        else:
+            self.assertEqual(self.build_kw[-1], {})   # unchanged int32 call
+            self.assertEqual(qp.tolist(), src.tolist())
         vg, rs = a[7 + off], a[8 + off]
         rows = args[0].shape[0]
         for t in (vg, rs):

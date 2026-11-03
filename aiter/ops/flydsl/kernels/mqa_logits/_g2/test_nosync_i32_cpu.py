@@ -18,6 +18,13 @@ Checks
   -> exactly one ``aten::clamp.Tensor_out`` (+ its output allocation); never
   ``_local_scalar_dense`` (host sync), min/max reductions or casts;
 * QSA_STRICT_I32=1 restores the historical raise; read once at import.
+
+ROUND-NATIVE64: int64 ``query_positions`` are no longer narrowed by the
+wrapper. The launch receives the zero-copy int32 view [2*rows] of the caller's
+tensor and a ``pos64=True`` specialization whose in-kernel saturation
+(``kernel_sat_pos64`` below, a line-by-line model of ``_sat_pos64``; the real
+source is executed in ``test_native64_cpu.py``) equals ``sat(v, INT32_MAX-1)``
+for all 36 boundary values. The census for int64 positions is 0 ops.
 """
 from __future__ import annotations
 
@@ -74,6 +81,28 @@ def sat(value, hi=I32_MAX):
     return max(I32_MIN, min(hi, value))
 
 
+def kernel_sat_pos64(lo, hi):
+    """Model of the kernel's ``_sat_pos64`` on the two i32 words of an int64."""
+    ext = -1 if lo < 0 else 0
+    fits = hi == ext
+    outside = I32_MAX - 1 if hi >= 0 else I32_MIN
+    return min(lo, I32_MAX - 1) if fits else outside
+
+
+def split_words(values):
+    words = torch.tensor(values, dtype=torch.int64).view(torch.int32).tolist()
+    return list(zip(words[0::2], words[1::2]))
+
+
+def launch_positions(launch, qp):
+    """Per-row i32 position as the launched specialization computes it."""
+    if getattr(launch, "pos64", False):
+        assert qp.dtype == torch.int32 and qp.numel() % 2 == 0
+        words = qp.tolist()
+        return [kernel_sat_pos64(lo, hi) for lo, hi in zip(words[0::2], words[1::2])]
+    return qp.tolist()
+
+
 class SaturationSemanticsCPU(unittest.TestCase):
     def test_converter_values_dtype_and_zero_copy(self):
         src = torch.tensor(BOUNDARY, dtype=torch.int64)
@@ -125,6 +154,22 @@ class SaturationSemanticsCPU(unittest.TestCase):
                             if 0 <= col <= max_column:
                                 self.assertEqual(col < got, col < gold, col)
 
+    def test_in_kernel_saturation_model_all_36_boundaries(self):
+        # ROUND-NATIVE64: lo/hi dwords exactly as the kernel loads them from the
+        # zero-copy view; equals the NOSYNC wrapper clamp and the golden formula.
+        self.assertEqual(len(BOUNDARY), 36)
+        for value, (lo, hi) in zip(BOUNDARY, split_words(BOUNDARY)):
+            with self.subTest(value=value):
+                self.assertEqual((lo & 0xFFFFFFFF) + hi * 2**32, value)  # signed lo, hi
+                self.assertEqual(kernel_sat_pos64(lo, hi), sat(value, I32_MAX - 1))
+                for ctx in BOUNDARY:
+                    ctx_list = [ctx]
+                    gold = golden_visible(0, value, ctx_list, 1)
+                    got = kernel_visible(0, kernel_sat_pos64(lo, hi), [sat(ctx)], 1)
+                    self.assertEqual(got, gold if gold < 2**29 else 2**29 - 1)
+        got = K._to_i32_saturated(torch.tensor(BOUNDARY, dtype=torch.int64), I32_MAX - 1)
+        self.assertEqual(got.tolist(), [kernel_sat_pos64(lo, hi) for lo, hi in split_words(BOUNDARY)])
+
     def test_historical_endpoint_is_fixed_for_int64_positions(self):
         # Old path: int64 INT32_MAX passed the probe, became int32 INT32_MAX and
         # the kernel's i32 pos+1 wrapped to INT32_MIN => visible 0 (golden: ctx//4).
@@ -146,6 +191,7 @@ def model_run(records, launch, *args):
     records.append((launch, args))
     for name, tensor in (("table", table), ("t2r", t2r), ("qp", qp), ("ctx", ctx)):
         assert tensor.dtype == torch.int32, name
+    positions = launch_positions(launch, qp)
     q = q.view(torch.bfloat16).view(rows, 4, 128).float()
     keys = cache.view(torch.float8_e4m3fn if fp8 else torch.bfloat16).view(pages, 4, 128).float()
     ctx_list = ctx.tolist()
@@ -153,7 +199,7 @@ def model_run(records, launch, *args):
     rst.zero_()
     for r in range(rows):
         req = int(t2r[r])
-        visible = kernel_visible(req, int(qp[r]), ctx_list, reqs)
+        visible = kernel_visible(req, positions[r], ctx_list, reqs)
         vis[r] = visible
         valid = 0 <= req < reqs
         for c in range(cols):
@@ -170,13 +216,14 @@ class WrapperCPU(unittest.TestCase):
     def setUp(self):
         self.records = []
 
-        def bf16(divisor, geometry, mode):
+        def bf16(divisor, geometry, mode, pos64=False):
             cols = (K.WMMA_COLS * K.TDM_PERSIST_CHUNKS if mode == "persist" else
                     K.R16_TDM_COLS if geometry == 16 and mode == "tdm" else 64)
-            return type("Launch", (), {"dtype_tag": "bf16_wmma", "cols_per_block": cols})()
+            return type("Launch", (), {"dtype_tag": "bf16_wmma", "cols_per_block": cols,
+                                       "pos64": pos64})()
 
-        def fp8(divisor, geometry, mode):
-            return type("Launch", (), {"dtype_tag": "fp8_wmma"})()
+        def fp8(divisor, geometry, mode, pos64=False):
+            return type("Launch", (), {"dtype_tag": "fp8_wmma", "pos64": pos64})()
 
         self.stack = [
             patch.object(K, "_run", lambda launch, *a: model_run(self.records, launch, *a)),
@@ -244,10 +291,15 @@ class WrapperCPU(unittest.TestCase):
             with self.subTest(fmt=fmt):
                 data = self.fixture(fmt, table, t2r, qp, ctx, rows)
                 out, vis = self.check_against_golden(data)
-                args = self.records[-1][1]
+                launch, args = self.records[-1]
                 idx = 3 if fmt == "fp8" else 2
                 pt, rt2r, rqp, rctx = args[idx:idx + 4]
-                self.assertEqual(rqp.tolist(), [sat(v, I32_MAX - 1) for v in qp])
+                # ROUND-NATIVE64: raw int64 words, zero-copy, pos64 specialization;
+                # the in-kernel saturation yields the former wrapper values.
+                self.assertTrue(launch.pos64)
+                self.assertEqual(rqp.data_ptr(), data["query_positions"].data_ptr())
+                self.assertEqual(rqp.view(torch.int64).tolist(), qp)
+                self.assertEqual(launch_positions(launch, rqp), [sat(v, I32_MAX - 1) for v in qp])
                 self.assertEqual(rt2r.tolist(), [sat(v) for v in t2r])
                 self.assertEqual(rctx.tolist(), [sat(v) for v in ctx])
                 self.assertEqual(pt.tolist(), [[sat(v) for v in row] for row in table])
@@ -266,7 +318,8 @@ class WrapperCPU(unittest.TestCase):
         for key in ("page_table", "token_to_request", "query_positions", "context_lens"):
             data[key] = data[key].to(torch.int32)
         self.check_against_golden(data)
-        args = self.records[-1][1]
+        launch, args = self.records[-1]
+        self.assertFalse(launch.pos64)   # int32 callers: the unchanged specialization
         for i, key in zip(range(2, 6), ("page_table", "token_to_request", "query_positions", "context_lens")):
             self.assertEqual(args[i].data_ptr(), data[key].data_ptr(), key)
 
@@ -304,8 +357,10 @@ class WrapperCPU(unittest.TestCase):
                 K.qsa_paged_mqa_logits_page4(**data, logits=out, visible_groups=vis, row_starts=rst)
             work = [op for op in census.ops if op.split(".")[0] not in views]
             with self.subTest(int64=int64_keys):
+                # ROUND-NATIVE64: int64 query_positions cost no op (view only).
+                narrowed = [k for k in int64_keys if k != "query_positions"]
                 self.assertEqual(sorted(work), sorted(
-                    ["aten::empty.memory_format", "aten::clamp.Tensor_out"] * len(int64_keys)), census.ops)
+                    ["aten::empty.memory_format", "aten::clamp.Tensor_out"] * len(narrowed)), census.ops)
                 self.assertFalse(any(("min" in op and "clamp" not in op) or "max" in op
                                      or "_to_copy" in op or "copy_" in op for op in work))
 

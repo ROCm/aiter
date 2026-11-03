@@ -28,8 +28,10 @@ def plan(rows, cols, requests, width, dtype="bf16", pages=8):
 
 
 def model_run(launch, *args):
-    fp8 = launch.dtype_tag == "fp8_wmma"
-    if fp8:
+    fp8 = launch.dtype_tag in ("fp8_wmma", "fp8_draft")
+    # ROUND-MERGE1: the default draft kernel (rows <= requests) takes the fp8
+    # argument layout for both dtypes (bf16 passes a dummy scale plane).
+    if fp8 or launch.dtype_tag == "bf16_draft":
         q, cache, scale, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
     else:
         q, cache, table, t2r, qp, ctx, logits, vis, rst, gx, gy, rows, cols, pages, reqs, width, stream = args
@@ -203,6 +205,10 @@ class PadDispatchCPU(unittest.TestCase):
                     data = self.fixture(rows, cols, reqs, width, dtype)
                     off = self.call(data, cols, "0")
                     off_record = self.records[-1]
+                    # ROUND-MERGE1: the exact (QSA_PAD_BUCKET=0) path of a draft
+                    # shape is the default draft kernel unless QSA_DRAFT_PATH=0.
+                    draft = K._DRAFT_PATH and rows <= reqs
+                    self.assertEqual(off_record[0].dtype_tag.endswith("_draft"), draft)
                     on = self.call(data, cols, "1")
                     self.assertTrue(torch.equal(off[0].view(torch.int32), on[0].view(torch.int32)))
                     self.assertTrue(torch.equal(off[1], on[1]))
@@ -222,7 +228,7 @@ class PadDispatchCPU(unittest.TestCase):
                         plogits = args[idx + 4]
                         self.assertTrue(bool(torch.isneginf(plogits[:, cols:]).all()))
                         self.assertTrue(bool(torch.isneginf(plogits[rows:]).all()))
-                    else:
+                    elif not draft:
                         self.assertEqual(off_record[0].geometry, self.records[-1][0].geometry)
 
     def test_exact_bucket_reuses_outputs_and_scalar_override_stays_exact(self):

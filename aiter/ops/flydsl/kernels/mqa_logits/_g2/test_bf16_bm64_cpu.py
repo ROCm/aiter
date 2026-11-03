@@ -19,6 +19,10 @@ Run: python -B aiter/ops/flydsl/kernels/mqa_logits/_g2/test_bf16_bm64_cpu.py -v
 """
 from __future__ import annotations
 
+import sys as _n64_sys, pathlib as _n64_path  # ROUND-NATIVE64 seam support
+_n64_sys.path.insert(0, str(_n64_path.Path(__file__).resolve().parent))
+from native64_seam import ensure_i32  # noqa: E402
+
 import ast
 from collections import Counter
 import copy
@@ -160,6 +164,7 @@ def _exec(nodes, namespace):
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     module = ast.Module(body=[future] + nodes, type_ignores=[])
     ast.fix_missing_locations(module)
+    ensure_i32(namespace)
     exec(compile(module, str(SOURCE), "exec"), namespace)
 
 

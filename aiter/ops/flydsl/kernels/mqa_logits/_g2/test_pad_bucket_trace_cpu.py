@@ -16,6 +16,10 @@ from unittest.mock import patch
 
 os.environ["QSA_BF16_K_LOAD"] = "raw"
 os.environ["QSA_BF16_PERSIST"] = "0"
+# ROUND-MERGE1: the trace executor instruments the WMMA kernel bodies only; the
+# default draft kernel (rows <= requests) is covered by the lane-level emulation
+# in test_draft_cpu.py and by GPU correctness. Pin the champion routing here.
+os.environ["QSA_DRAFT_PATH"] = "0"
 
 import torch
 import trace_check_cpu as T

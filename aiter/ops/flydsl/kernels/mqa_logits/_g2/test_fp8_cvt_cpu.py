@@ -13,6 +13,10 @@ Run: python aiter/ops/flydsl/kernels/mqa_logits/_g2/test_fp8_cvt_cpu.py
 """
 from __future__ import annotations
 
+import sys as _n64_sys, pathlib as _n64_path  # ROUND-NATIVE64 seam support
+_n64_sys.path.insert(0, str(_n64_path.Path(__file__).resolve().parent))
+from native64_seam import ensure_i32  # noqa: E402
+
 import ast
 from contextlib import contextmanager
 from pathlib import Path
@@ -334,6 +338,7 @@ def actual_cvt_route(value, rows, k_load, access="raw"):
     namespace = dict(helpers, _FP8_CVT=actual_cvt_environment(value), _FP8_K_LOAD="auto",
                      _ACCESS=access, rows_per_block=rows, k_load=k_load,
                      HEAD_DIM=128, NUM_HEADS=4, PAGE_SIZE=4, WMMA_COLS=64)
+    ensure_i32(namespace)
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(KERNEL_PATH), "exec"), namespace)
     return namespace
 

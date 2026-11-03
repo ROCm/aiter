@@ -25,6 +25,10 @@ Run: python -B aiter/ops/flydsl/kernels/mqa_logits/_g2/test_persist_cpu.py -v
 """
 from __future__ import annotations
 
+import sys as _n64_sys, pathlib as _n64_path  # ROUND-NATIVE64 seam support
+_n64_sys.path.insert(0, str(_n64_path.Path(__file__).resolve().parent))
+from native64_seam import ensure_i32, unseam  # noqa: E402
+
 import ast
 import hashlib
 from pathlib import Path
@@ -240,12 +244,16 @@ BASE_SOURCE = {
 
 
 def _segment_sha(node):
-    return hashlib.sha256(ast.get_source_segment(TEXT, node).encode()).hexdigest()
+    # ROUND-NATIVE64: hash after mapping the query_positions seam back to its
+    # pre-NATIVE64 text (native64_seam.unseam), i.e. the pinned functions may
+    # differ from adea96d5 by exactly that seam and nothing else.
+    return hashlib.sha256(unseam(ast.get_source_segment(TEXT, node)).encode()).hexdigest()
 
 
 def _exec(nodes, ns):
     module = ast.Module(body=list(nodes), type_ignores=[])
     ast.fix_missing_locations(module)
+    ensure_i32(ns)
     exec(compile(module, str(SOURCE), "exec"), ns)
     return ns
 

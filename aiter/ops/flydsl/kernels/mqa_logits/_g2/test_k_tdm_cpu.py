@@ -1088,7 +1088,11 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
         self.assertFalse(_calls(self.kernel, "_rows_meta"))
         uniform = self.helpers["_rows_meta_uniform"]
         raw = self.helpers["_rows_meta"]
-        self.assertEqual(len(_calls(uniform, "_ld_uniform_i32")), 3)
+        # ROUND-NATIVE64: the position load goes through the build-time seam
+        # (ld_uniform_pos / ld_pos), the other two loads are unchanged.
+        self.assertEqual(len(_calls(uniform, "_ld_uniform_i32")), 2)
+        self.assertEqual(len(_calls(uniform, "ld_uniform_pos")), 1)
+        self.assertEqual(len(_calls(raw, "ld_pos")), 1)
         self.assertFalse(_calls(uniform, "_ld_i32"))
         # Prove the scalar clone has exactly the raw metadata computation and
         # clamps, differing only in the three load helpers; no code execution.
@@ -1096,6 +1100,8 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
         for node in ast.walk(normalized):
             if isinstance(node, ast.Name) and node.id == "_ld_uniform_i32":
                 node.id = "_ld_i32"
+            elif isinstance(node, ast.Name) and node.id == "ld_uniform_pos":
+                node.id = "ld_pos"
         self.assertEqual([ast.dump(node) for node in normalized.body],
                          [ast.dump(node) for node in raw.body])
         for name in ("kernel", "kernel_r32"):
@@ -1399,7 +1405,8 @@ class KR16Cols32KernelSourceCPU(unittest.TestCase):
         wrapper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
                        and n.name == "qsa_paged_mqa_logits_page4")
         text = ast.unparse(wrapper)
-        self.assertIn("launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load)", text)
+        # ROUND-NATIVE64: int32 callers expand **qp_kw to no keyword at all.
+        self.assertIn("launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load, **qp_kw)", text)
         self.assertIn("wmma_grid(rows, columns, rows_per_block, launch.cols_per_block)", text)
 
 
