@@ -31,14 +31,6 @@ import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile
 
 from aiter import dtypes
-from aiter.dist.parallel_state import (
-    destroy_distributed_environment,
-    destroy_model_parallel,
-    ensure_model_parallel_initialized,
-    get_tp_group,
-    init_distributed_environment,
-    set_custom_all_reduce,
-)
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 
 
@@ -348,24 +340,22 @@ def _worker(
     eager_iters: int,
     graph_iters: int,
 ):
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     if not _is_gfx1250(device):
         raise RuntimeError(f"rank {rank}: F6 validation requires gfx1250")
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=TP, rank=rank, distributed_init_method=init_method
+    dist.init_process_group(
+        "gloo", world_size=TP, rank=rank, init_method=init_method
     )
-    ensure_model_parallel_initialized(TP, 1)
-    tp = get_tp_group()
-    group = tp.device_group
-    ca = tp.device_communicator.ca_comm
+    ca = CustomAllreduce(dist.group.WORLD, device)
     if ca is None or ca.disabled:
         raise RuntimeError(f"rank {rank}: gfx1250 custom all-reduce is disabled")
 
     retained = []
     try:
-        dist.all_reduce(torch.zeros(1, device=device), group=group)
+        dist.barrier()
         torch.cuda.synchronize()
         results = []
         for m in rows:
@@ -382,14 +372,14 @@ def _worker(
                 retained.append(result)
                 results.append(result)
         torch.cuda.synchronize()
-        tp.barrier()
+        dist.barrier()
         return results
     finally:
         torch.cuda.synchronize()
-        tp.barrier()
+        dist.barrier()
         retained.clear()
-        destroy_model_parallel()
-        destroy_distributed_environment()
+        ca.close()
+        dist.destroy_process_group()
 
 
 def main() -> None:
