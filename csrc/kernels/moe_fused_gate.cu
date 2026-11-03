@@ -20,11 +20,10 @@
 #include "opus/opus.hpp"
 #include "aiter_stream.h"
 #include "moe_op.h"
+#include "topk_pad_rows.h"
 #include <algorithm>
 #include <cfloat>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 #include <stdio.h>
 #include <type_traits>
 
@@ -98,7 +97,9 @@ __device__ void moe_fused_gate_impl(void* input,
                                     int64_t topk,
                                     int64_t num_fused_shared_experts,
                                     double routed_scaling_factor,
+                                    int64_t input_stride,
                                     int32_t out_stride,
+                                    const int* num_valid_rows,
                                     Params params)
 {
     int tidx           = threadIdx.x;
@@ -108,6 +109,7 @@ __device__ void moe_fused_gate_impl(void* input,
     {
         return;
     }
+    const bool pad = aiter::is_pad_row(num_valid_rows, thread_row);
     extern __shared__ char shared_mem[];
     char* ptr = (char*)(((size_t)shared_mem + 255) & ~255);
 
@@ -129,7 +131,7 @@ __device__ void moe_fused_gate_impl(void* input,
     // Cast pointers to type T:
     auto* input_ptr      = reinterpret_cast<T*>(input);
     auto* bias_ptr       = reinterpret_cast<T*>(bias);
-    auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
+    auto* thread_row_ptr = input_ptr + thread_row * input_stride;
 
     int thread_group_idx         = tidx % params.THREADS_PER_ROW;
     int first_elt_read_by_thread = thread_group_idx * params.VPT;
@@ -246,10 +248,10 @@ __device__ void moe_fused_gate_impl(void* input,
         //       }
         //     }
 
-        using kvp = hipcub::KeyValuePair<int, float>;
+        using kvp = aiter::KeyValuePair<int, float>;
 
-        hipcub::ArgMax arg_max;
-        hipcub::ArgMin arg_min;
+        aiter::ArgMax arg_max;
+        aiter::ArgMin arg_min;
 
         kvp thread_kvp;
         thread_kvp.key       = expert;
@@ -300,8 +302,8 @@ __device__ void moe_fused_gate_impl(void* input,
             max_val = -FLT_MAX;
         }
 
-        using kvp = hipcub::KeyValuePair<int, float>;
-        hipcub::ArgMax arg_max;
+        using kvp = aiter::KeyValuePair<int, float>;
+        aiter::ArgMax arg_max;
         kvp thread_kvp;
         thread_kvp.key       = expert;
         thread_kvp.value     = max_val;
@@ -352,7 +354,7 @@ __device__ void moe_fused_gate_impl(void* input,
             // bias_chunk[expert_to_clear_in_thread] = -FLT_MAX;
             //// store output
             // output_ptr[idx] = row_chunk[expert_to_clear_in_thread];
-            indices_ptr[idx] = static_cast<int32_t>(expert);
+            indices_ptr[idx] = pad ? -1 : static_cast<int32_t>(expert);
         }
         __syncthreads();
 
@@ -374,8 +376,8 @@ __device__ void moe_fused_gate_impl(void* input,
         int64_t expert_offset = thread_row % num_fused_shared_experts;
         indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
-        // Set the weight to the sum of all weights divided by routed_scaling_factor
-        output_ptr[last_idx] = output_sum / routed_scaling_factor;
+        // A fused shared expert weighs 1 / routed_scaling_factor, as in sglang.
+        output_ptr[last_idx] = 1.0 / routed_scaling_factor;
 
         if(num_fused_shared_experts > 1)
         {
@@ -384,8 +386,7 @@ __device__ void moe_fused_gate_impl(void* input,
                 ++last_idx;
                 ++expert_offset;
                 indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
-                // Set the weight to the sum of all weights divided by routed_scaling_factor
-                output_ptr[last_idx] = output_sum / routed_scaling_factor;
+                output_ptr[last_idx]  = 1.0 / routed_scaling_factor;
             }
         }
     }
@@ -394,11 +395,10 @@ __device__ void moe_fused_gate_impl(void* input,
     ////////////////////// Rescale Output //////////////////////
     if(thread_group_idx == 0)
     {
-#pragma unroll
-        for(int ii = 0; ii < topk; ++ii)
+        for(int ii = 0; ii < topk_excluding_share_expert_fusion; ++ii)
         {
             int64_t const idx = out_stride * thread_row + ii;
-            output_ptr[idx]   = scores[ii] / output_sum;
+            output_ptr[idx]   = pad ? 0.0f : scores[ii] / output_sum;
         }
     }
 }
@@ -436,7 +436,9 @@ __global__ void moe_fused_gate_kernel(void* input,
                                       int64_t topk,
                                       int64_t num_fused_shared_experts,
                                       double routed_scaling_factor,
-                                      int32_t out_stride)
+                                      int64_t input_stride,
+                                      int32_t out_stride,
+                                      const int* num_valid_rows)
 {
     constexpr int EXPERT_GROUP = THREADS_PER_ROW;
     constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;
@@ -452,7 +454,9 @@ __global__ void moe_fused_gate_kernel(void* input,
                            topk,
                            num_fused_shared_experts,
                            routed_scaling_factor,
+                           input_stride,
                            out_stride,
+                           num_valid_rows,
                            params);
 }
 
@@ -477,7 +481,9 @@ __global__ void moe_fused_gate_kernel(void* input,
                 topk,                                                                        \
                 num_fused_shared_experts,                                                    \
                 routed_scaling_factor,                                                       \
-                out_stride);                                                                 \
+                input_stride,                                                                \
+                out_stride,                                                                  \
+                aiter::num_valid_rows_ptr(num_valid_rows));                                  \
         dispatched = true;                                                                    \
     } while(0)
 
@@ -506,7 +512,9 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                                               int64_t topk,
                                               int64_t num_fused_shared_experts,
                                               double routed_scaling_factor,
-                                              int32_t out_stride)
+                                              int64_t input_stride,
+                                              int32_t out_stride,
+                                              const int* num_valid_rows)
 {
     KernelParamsDynamic params;
     params.NUM_EXPERTS = num_experts;            // e.g, for deepseek v3, this is 256
@@ -527,7 +535,9 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                            topk,
                            num_fused_shared_experts,
                            routed_scaling_factor,
+                           input_stride,
                            out_stride,
+                           num_valid_rows,
                            params);
 }
 
@@ -542,15 +552,27 @@ void moe_fused_gate(const aiter_tensor_t& input,
                     int64_t topk_group,
                     int64_t topk,
                     int64_t num_fused_shared_experts,
-                    double routed_scaling_factor)
+                    double routed_scaling_factor,
+                    std::optional<aiter_tensor_t> num_valid_rows)
 {
     int64_t num_rows                = input.size(0);
     int32_t num_experts             = input.size(1);
     const aiter_tensor_t& output    = topk_weights;
     const aiter_tensor_t& indices   = topk_ids;
+    const int64_t input_stride      = input.stride(0);
     const int out_stride            = topk_ids.stride(0);
+    AITER_CHECK(input.stride(1) == 1, "input rows must be contiguous");
     AITER_CHECK(topk_weights.stride(0) == out_stride,
                 "topk_weights and topk_ids must have the same stride in dim 0");
+    // The launcher reinterpret_casts these to float*/int32_t*, so a wider
+    // buffer is written 4 bytes per element and the rest keeps whatever the
+    // caller allocated -- a partially written tensor that still looks valid.
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32, got ",
+                AiterDtype_to_str(topk_weights.dtype()));
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32, got ",
+                AiterDtype_to_str(topk_ids.dtype()));
 
     // Compute grid dimensions based on runtime value for num_expert_group.
     int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
@@ -721,7 +743,9 @@ void moe_fused_gate(const aiter_tensor_t& input,
                                                                      topk,
                                                                      num_fused_shared_experts,
                                                                      routed_scaling_factor,
-                                                                     out_stride);
+                                                                     input_stride,
+                                                                     out_stride,
+                                                                     aiter::num_valid_rows_ptr(num_valid_rows));
         }
         else if(input.dtype() == AITER_DTYPE_fp16)
         {
@@ -737,7 +761,9 @@ void moe_fused_gate(const aiter_tensor_t& input,
                                                                      topk,
                                                                      num_fused_shared_experts,
                                                                      routed_scaling_factor,
-                                                                     out_stride);
+                                                                     input_stride,
+                                                                     out_stride,
+                                                                     aiter::num_valid_rows_ptr(num_valid_rows));
         }
         else if(input.dtype() == AITER_DTYPE_fp32)
         {
@@ -753,7 +779,9 @@ void moe_fused_gate(const aiter_tensor_t& input,
                                                                      topk,
                                                                      num_fused_shared_experts,
                                                                      routed_scaling_factor,
-                                                                     out_stride);
+                                                                     input_stride,
+                                                                     out_stride,
+                                                                     aiter::num_valid_rows_ptr(num_valid_rows));
         }
         else
         {

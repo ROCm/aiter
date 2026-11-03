@@ -23,8 +23,16 @@ void scaled_silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input,
 void silu_and_mul_quant(const aiter_tensor_t& out, const aiter_tensor_t& input,
                         const aiter_tensor_t& scale, int group_size,
                         float limit = 0.0f, bool shuffle_scale = false);
+void situv2_and_mul_quant(const aiter_tensor_t& out,
+                          const aiter_tensor_t& input,
+                          const aiter_tensor_t& scale,
+                          int group_size,
+                          float beta,
+                          float linear_beta,
+                          bool shuffle_scale = false);
 void gelu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_tanh_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_fast(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void relu2(const aiter_tensor_t& out, const aiter_tensor_t& input);
 
 } // namespace aiter

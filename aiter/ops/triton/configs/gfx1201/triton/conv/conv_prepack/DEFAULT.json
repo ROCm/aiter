@@ -1,0 +1,41 @@
+{
+    "shapes": {
+        "N=1,C=1,H=16,W=16,CB=64": {
+            "BLOCK_C": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=3,H=7,W=7,CB=64": {
+            "BLOCK_C": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=3,H=512,W=512,CB=64": {
+            "BLOCK_C": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1
+        }
+    },
+    "M_LEQ_256": {
+        "BLOCK_C": 64,
+        "BLOCK_M": 32,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "M_LEQ_4096": {
+        "BLOCK_C": 32,
+        "BLOCK_M": 64,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "any": {
+        "BLOCK_C": 32,
+        "BLOCK_M": 128,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 2
+    }
+}

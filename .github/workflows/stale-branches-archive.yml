@@ -1,0 +1,58 @@
+name: Archive stale branches
+
+# Archives a branch after 30 days without commits, gives notice 30 days later,
+# deletes the archive 14 days after that: 74 days end to end, restorable at any
+# stage with the command the bot comments print. Off until STALE_BRANCHES_ARCHIVE
+# is 'true'; every run reports and writes nothing until then. Exemptions live in
+# .github/stale-branch-exemptions.txt. Policy runs from the default branch only.
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Mondays, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would happen without changing anything'
+        type: boolean
+        default: true
+      max_actions:
+        description: 'Most branches to touch in this run'
+        type: string
+        default: '50'
+
+permissions:
+  contents: write       # create and delete refs, comment on commits
+  pull-requests: read   # head and base branches of open PRs are exempt
+
+concurrency:
+  group: stale-branches-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # The delete is a leased git push, made with these credentials.
+          persist-credentials: true
+          sparse-checkout: |
+            .github/scripts/archive_stale_branches.py
+            .github/stale-branch-exemptions.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Archive, give notice, delete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Via the environment: a ${{ }} input in the run block is shell-expanded.
+          MAX_ACTIONS: ${{ inputs.max_actions || 50 }}
+        run: |
+          python3 .github/scripts/archive_stale_branches.py \
+            --stale-days 30 \
+            --archive-days 30 \
+            --notice-days 14 \
+            --exemptions .github/stale-branch-exemptions.txt \
+            --max-actions "$MAX_ACTIONS" \
+            ${{ (inputs.dry_run != true && vars.STALE_BRANCHES_ARCHIVE == 'true' && github.ref_name == github.event.repository.default_branch) && '--apply' || '' }}

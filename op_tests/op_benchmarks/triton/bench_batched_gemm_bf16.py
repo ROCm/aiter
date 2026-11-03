@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -7,11 +8,15 @@ import triton
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -22,10 +27,20 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+):
     c_dtype = torch.bfloat16
 
-    x, w, bias, y = generate_batched_gemm_bf16_inputs(
+    _p_gen = functools.partial(
+        generate_batched_gemm_bf16_inputs,
         batch,
         M,
         N,
@@ -34,31 +49,32 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
         layout=layout,
         output=True,
     )
+    # batched_gemm_bf16 names its activation/weight/output kwargs XQ/WQ/YQ
+    _out_vals_keys = ["XQ", "WQ", "bias", "YQ"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
+    )
+
+    kernel_fn = functools.partial(batched_gemm_bf16, dtype=c_dtype)
 
     # FLOPs for batched GEMM:
     # C[B, M, N] = A[B, M, K] @ W[B, N, K]^T
     flops = 2.0 * batch * M * N * K
 
-    # Memory traffic.
-    mem_read = (
-        x.numel() * x.element_size()
-        + w.numel() * w.element_size()
-        + (bias.numel() * bias.element_size() if bias is not None else 0)
+    # Memory traffic. bias keeps its own numel ((N,)-shaped, which doesn't
+    # reduce to a clean M/N/K product).
+    bias_buf = rot_bufs[0]["bias"]
+    mem_read = (batch * M * K) * rot_bufs[0]["XQ"].element_size() + (
+        batch * N * K
+    ) * rot_bufs[0]["WQ"].element_size()
+    mem_read += (
+        bias_buf.numel() * bias_buf.element_size() if bias_buf is not None else 0
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = (batch * M * N) * rot_bufs[0]["YQ"].element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_bf16(
-            x,
-            w,
-            bias=bias,
-            dtype=c_dtype,
-            YQ=y,
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -80,6 +96,9 @@ def run_model_benchmark(args):
         x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
+
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_bf16(
@@ -107,7 +126,9 @@ def run_model_benchmark(args):
         else:
             raise ValueError(f"Unsupported layer: {layer}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
+        )
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,
@@ -122,9 +143,14 @@ def run_shape_benchmark(args):
         x_names=["batch", "M", "N", "K"],
     )
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_bf16(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
+        )
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,

@@ -35,7 +35,7 @@
 #define __launch_bounds__(...) \
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
 #ifndef __cluster_dims__
 #define __cluster_dims__(...) __attribute__((cluster_dims(__VA_ARGS__)))
 #endif
@@ -43,6 +43,9 @@
 
 #ifndef __shared__
 #define __shared__      __attribute__((shared))
+#endif
+#ifndef __align__
+#define __align__(x)    __attribute__((aligned(x)))
 #endif
 #ifndef __device__
 #define __device__      __attribute__((device))

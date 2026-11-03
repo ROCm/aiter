@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -8,11 +9,15 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import (
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -23,28 +28,52 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8 import (
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
+
+    _p_gen = functools.partial(
+        generate_batched_gemm_a8w8_inputs,
+        batch,
+        M,
+        N,
+        K,
+        dtype=c_dtype,
+        layout=layout,
+        output=True,
     )
-    # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
+    # batched_gemm_a8w8 names its activation/weight/output kwargs XQ/WQ/YQ
+    _out_vals_keys = ["XQ", "WQ", "x_scale", "w_scale", "bias", "YQ"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
+    )
+
+    kernel_fn = functools.partial(batched_gemm_a8w8, dtype=c_dtype)
+
     # flops
     flops = 2.0 * M * N * K * batch
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    # memory transfer. x_scale/w_scale keep their own numel (per-token/per-tensor
+    # scales, which don't reduce to a clean M/N/K product).
+    mem_read = (batch * M * K) * rot_bufs[0]["XQ"].element_size() + (
+        batch * N * K
+    ) * rot_bufs[0]["WQ"].element_size()
     mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
+        rot_bufs[0]["x_scale"].numel() * rot_bufs[0]["x_scale"].element_size()
+        + rot_bufs[0]["w_scale"].numel() * rot_bufs[0]["w_scale"].element_size()
     )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = (batch * M * N) * rot_bufs[0]["YQ"].element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_a8w8(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -67,6 +96,9 @@ def run_model_benchmark(args):
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(
         M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
@@ -84,7 +116,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -96,9 +130,14 @@ def run_shape_benchmark(args):
         x_names=["batch", "M", "N", "K"],
     )
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 

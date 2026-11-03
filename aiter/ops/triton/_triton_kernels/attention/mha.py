@@ -2,17 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
 
 import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
+    _compute_fp8_scaling_factors,
+)
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    remap_workgroup_spatial,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
 @triton.jit
@@ -91,7 +94,6 @@ def _attn_fwd_inner(
     seqlen_q,
     dropout_p,
     sd_mask_ptrs,
-    dropout_mask_ptrs,
     philox_seed,
     philox_ptrs,
     block_min,
@@ -224,14 +226,19 @@ def _attn_fwd_inner(
                 philox_seed, philox_ptrs
             )  # TODO: use tl.randint for better performance
             dropout_mask = rng_output > dropout_p
-            tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+            # Keep both uses of the dropout predicate close together. This works
+            # around an SGPR split/spill bug that corrupts a loop-carried buffer
+            # descriptor on gfx950.
+            p_kept = tl.where(dropout_mask, p, 0.0)
+
+            if RETURN_SCORES:
+                # return scores with negative values for dropped vals
+                sd_mask = tl.where(dropout_mask, p, -p)
+                tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
 
             # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
+            p = p_kept
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             tl.store(sd_mask_ptrs, p, mask=p_mask)
@@ -267,7 +274,6 @@ def _attn_fwd_inner(
             sd_mask_ptrs += BLOCK_N * stride_sn
 
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += BLOCK_N * stride_sn
             philox_ptrs += BLOCK_N * stride_sn
 
     return acc, l_i, m_i
@@ -305,7 +311,6 @@ def _attn_fwd(
     out_ptr: torch.Tensor,
     alibi_slopes_ptr: torch.Tensor,
     s_dmask_ptr: torch.Tensor,
-    dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
     sink_ptr: torch.Tensor,
     stride_qz_in,
@@ -360,6 +365,7 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
+    SWIZZLE: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
@@ -372,10 +378,22 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    tl.static_assert(
+        SWIZZLE == "default" or SWIZZLE == "spatial",
+        "SWIZZLE must be 'default' or 'spatial'; set via AITER_TRITON_MHA_SWIZZLE or mha_set_swizzle()",
+    )
+    if SWIZZLE == "default":
+        # Default: head-first round-robin with XCD-aware head remapping.
+        off_q_head = wid % NUM_Q_HEADS
+        off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    else:
+        # Spatial: XCD-aware KV-head mapping for MHA and GQA.
+        NUM_QUERIES_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
+        off_q_head, start_m, off_z = remap_workgroup_spatial(
+            wid, NUM_Q_HEADS, NUM_BLOCKS, BATCH, NUM_QUERIES_PER_KV, NUM_XCD
+        )
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -648,14 +666,7 @@ def _attn_fwd(
         s_dmask_ptrs = None
 
     # dropout
-    if dropout_mask_ptr is not None:
-        dropout_mask_offs = (
-            off_z * stride_sd_z
-            + off_q_head * stride_sd_h
-            + offs_m[:, None] * stride_sd_m
-            + offs_n[None, :] * stride_sd_n
-        )
-        dropout_mask_ptrs = dropout_mask_ptr + dropout_mask_offs
+    if ENABLE_DROPOUT:
         philox_ptrs = (
             philox_offset_base
             + off_z * stride_sd_z
@@ -664,7 +675,6 @@ def _attn_fwd(
             + offs_n[None, :] * stride_sd_n
         )
     else:
-        dropout_mask_ptrs = None
         philox_ptrs = None
 
     if ENABLE_SINK:
@@ -738,7 +748,6 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
             philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
@@ -761,7 +770,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -808,7 +816,7 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -826,7 +834,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -871,7 +878,7 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL and (causal_start_idx > start_m_idx and causal_start_idx < end_m_idx):
+    if IS_CAUSAL and causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
         out_mask_boundary = tl.full(
             (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
         )
@@ -935,22 +942,50 @@ def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
+    head_dim_v: int | None = None,
+    causal: bool = False,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    batch_heads: int | None = None,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned
+    # TODO: pe + dropout is not tuned on every arch.
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
         return fwd_cfg["pe_dropout_or_fp32"]
     elif has_pe and "pe" in fwd_cfg:
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
+    elif (
+        head_dim_v is not None
+        and 64 < head_dim_v <= 128
+        and dtype in (torch.float16, torch.bfloat16)
+        and "mid_head" in fwd_cfg
+    ):
+        # 128x128 tiles run out of LDS above d128, so larger heads keep "default".
+        # "mid_head_skip" rules send short-KV, large-grid shapes back to
+        # "default"; a rule matches when every key it sets is satisfied.
+        if None not in (max_seqlen_q, max_seqlen_k, batch_heads):
+            programs = batch_heads * triton.cdiv(
+                max_seqlen_q, fwd_cfg["mid_head"]["BLOCK_M"]
+            )
+            for rule in fwd_cfg.get("mid_head_skip", []):
+                if (
+                    rule.get("causal", causal) == causal
+                    and head_dim_v >= rule.get("min_head_dim_v", 0)
+                    and max_seqlen_k <= rule.get("max_seqlen_k", max_seqlen_k)
+                    and programs >= rule.get("min_programs", 0)
+                ):
+                    return fwd_cfg["default"]
+        return fwd_cfg["mid_head"]
     else:
         return fwd_cfg["default"]

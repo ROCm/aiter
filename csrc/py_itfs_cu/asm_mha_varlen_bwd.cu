@@ -3,7 +3,6 @@
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
-#include "py_itfs_common.h"
 #include "mha_common.h"
 
 #include "mha_bwd.h"

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 
 import torch
 import triton
@@ -343,6 +344,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     v_out: Tensor = None,  # Optional output buffer for v
     return_kv: bool = False,  # Whether to return k_out and v_out
     use_shuffle_layout: bool = False,  # Whether to use shuffle layout
+    use_strided_layout: bool = False,  # Whether to use vLLM's unified layout
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
@@ -350,7 +352,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     # qkv = qkv.clone()  # inplace op
     # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
     x = 0
-    block_size = page_size
+    block_size = page_size if use_shuffle_layout or use_strided_layout else 0
     if use_shuffle_layout:
         x = 16 // k_cache.element_size()
 
@@ -431,6 +433,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
     kv_cache_dtype=None,  # Optional: specify KV cache dtype (e.g., torch.float8_e4m3fn)
     test_return_kv=False,  # Whether to test k_out and v_out return
     use_shuffle_layout=False,  # Whether to test shuffle layout
+    use_strided_layout=False,  # Whether to test vLLM's unified layout
     page_size=0,  # Page size (block_size) for shuffle layout
     max_positions=10000,
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
@@ -490,6 +493,28 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_cache_ref_flat = v_cache_ref.view(
             num_blocks * page_size, num_heads_v, head_size
         )
+    elif use_strided_layout:
+        assert num_heads_k == num_heads_v
+        num_blocks = (max_positions + page_size - 1) // page_size
+        num_slots = num_blocks * page_size
+        k_cache_ref = torch.rand(num_slots, num_heads_k, head_size, device="cuda").to(
+            kv_cache_dtype
+        )
+        v_cache_ref = torch.rand(num_slots, num_heads_v, head_size, device="cuda").to(
+            kv_cache_dtype
+        )
+        kv_cache = torch.rand(
+            num_blocks,
+            num_heads_k,
+            page_size,
+            2 * head_size,
+            device="cuda",
+        ).to(kv_cache_dtype)
+        k_cache, v_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+        assert not k_cache.is_contiguous()
+        assert not v_cache.is_contiguous()
+        k_cache_ref_flat = k_cache_ref
+        v_cache_ref_flat = v_cache_ref
     else:
         k_cache_ref = torch.rand(
             max_positions, num_heads_k, head_size, device="cuda"
@@ -582,10 +607,59 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_out,
         test_return_kv,
         use_shuffle_layout,
+        use_strided_layout,
         page_size,
         rotary_dim,
         gemma_norm,
     )
+
+    if use_strided_layout:
+        q_out_contiguous = torch.empty_like(q_out)
+        k_cache_contiguous = torch.empty_like(k_cache_ref)
+        v_cache_contiguous = torch.empty_like(v_cache_ref)
+        run_fused_mrope_3d_rms_set_kv_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            mrope_section,
+            is_interleaved,
+            eps,
+            q_out_contiguous,
+            k_cache_contiguous,
+            v_cache_contiguous,
+            kv_loc,
+            k_scale,
+            v_scale,
+            is_mrope,
+            None,
+            None,
+            False,
+            False,
+            False,
+            0,
+            rotary_dim,
+            gemma_norm,
+        )
+        torch.testing.assert_close(
+            k_cache.reshape(-1, num_heads_k, head_size)[kv_loc].float(),
+            k_cache_contiguous[kv_loc].float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            v_cache.reshape(-1, num_heads_v, head_size)[kv_loc].float(),
+            v_cache_contiguous[kv_loc].float(),
+            rtol=0,
+            atol=0,
+        )
 
     info = f"dtype:{dtype}, kv_cache_dtype:{kv_cache_dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
     if is_mrope:
@@ -594,6 +668,8 @@ def test_mrope_3d_rms_set_kv_shuffle(
         info += f", return_kv:{test_return_kv}"
     if use_shuffle_layout:
         info += f", use_shuffle_layout:{use_shuffle_layout}, page_size:{page_size}"
+    if use_strided_layout:
+        info += f", use_strided_layout:{use_strided_layout}, page_size:{page_size}"
     if rotary_dim > 0:
         info += f", rotary_dim:{rotary_dim}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
@@ -605,6 +681,23 @@ def test_mrope_3d_rms_set_kv_shuffle(
         # Reshape shuffle cache back to flat format for comparison
         k_cache_flat = k_cache.view(-1, num_heads_k, head_size)
         v_cache_flat = v_cache.view(-1, num_heads_v, head_size)
+        checkAllclose(
+            k_cache_ref_flat[kv_loc].float(),
+            k_cache_flat[kv_loc].float(),
+            msg="k_cache",
+            rtol=1e-2,
+            atol=0.05,
+        )
+        checkAllclose(
+            v_cache_ref_flat[kv_loc].float(),
+            v_cache_flat[kv_loc].float(),
+            msg="v_cache",
+            rtol=1e-2,
+            atol=0.05,
+        )
+    elif use_strided_layout:
+        k_cache_flat = k_cache.reshape(-1, num_heads_k, head_size)
+        v_cache_flat = v_cache.reshape(-1, num_heads_v, head_size)
         checkAllclose(
             k_cache_ref_flat[kv_loc].float(),
             k_cache_flat[kv_loc].float(),
@@ -732,6 +825,14 @@ parser.add_argument(
           or --kv_cache_dtypes fp8""",
 )
 
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help="""Sweep the full matrix (~600 cases, ~19 min on MI355X) instead of the
+default covering set (46 cases). -n/-t/-hd/-hs/-i/-k only apply with
+--full; -d and -m apply to both.""",
+)
+
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
 # MRoPE sections for partial rotary: sum(section) == rotary_dim / 2
@@ -740,13 +841,137 @@ mrope_partial_sections_dict = {
     (128, 32): [4, 6, 6],  # head_size=128, rotary_dim=32, sum=16
 }
 
-if __name__ == "__main__":
-    args = parser.parse_args()
+
+def _case(kv, tokens, heads_q, heads_kv, head_size, mrope_section, **kw):
+    is_mrope = mrope_section is not None
+    return dict(
+        kv_cache_dtype=kv,
+        num_tokens=tokens,
+        num_heads_q=heads_q,
+        num_heads_k=heads_kv,
+        num_heads_v=heads_kv,
+        head_size=head_size,
+        mrope_section=mrope_section,
+        is_mrope=is_mrope,
+        is_neox_style=kw.pop("neox", True),
+        is_interleaved=kw.pop("interleaved", True) if is_mrope else None,
+        test_return_kv=kw.pop("return_kv", True),
+        use_shuffle_layout=not kw.get("use_strided_layout", False),
+        page_size=16,
+        **kw,
+    )
+
+
+def _default_cases():
+    """Covering set for the default run: every kernel instantiation the full
+    matrix reaches, run once, plus the feature and model cases below.
+
+    The kernels are templated on <head_size, neox, interleaved, KV dtype>
+    (MRoPE) and <head_size, neox, KV dtype> (RoPE); everything else is a
+    runtime argument. Token count (3 / 127 / 1257 = decode, small, non-power-
+    of-2 prefill), head count and return-kv rotate across the instantiations;
+    return-kv is XORed with the KV dtype bit so every instantiation family
+    runs fp8 and bf16 KV with return-kv both on and off.
+    """
+    bf16, fp8 = dtypes.bf16, dtypes.fp8
+    tokens, heads = [3, 127, 1257], [32, 64]
+    cases = []
+    for i, (head_size, neox, interleaved, kv) in enumerate(
+        itertools.product([64, 128, 256], [True, False], [True, False], [bf16, fp8])
+    ):
+        cases.append(
+            _case(
+                kv,
+                tokens[i % 3],
+                heads[(i ^ i >> 2) & 1],
+                1,
+                head_size,
+                mrope_sections_dict[head_size],
+                neox=neox,
+                interleaved=interleaved,
+                return_kv=(i ^ i >> 1) & 1 == 0,
+            )
+        )
+    for i, (head_size, neox, kv) in enumerate(
+        itertools.product([64, 128, 256], [True, False], [bf16, fp8])
+    ):
+        num_heads = heads[(i ^ i >> 2) & 1]
+        cases.append(
+            _case(
+                kv,
+                tokens[i % 3],
+                num_heads,
+                num_heads,
+                head_size,
+                None,
+                neox=neox,
+                return_kv=(i ^ i >> 1) & 1 == 0,
+            )
+        )
+    cases += [
+        # vLLM unified-attention strided KV view (non-contiguous token/head strides)
+        _case(
+            bf16,
+            127,
+            32,
+            1,
+            128,
+            [24, 20, 20],
+            return_kv=False,
+            use_strided_layout=True,
+        ),
+        _case(
+            fp8, 127, 32, 1, 128, [24, 20, 20], return_kv=False, use_strided_layout=True
+        ),
+        # Partial rotary RoPE / MRoPE (Qwen3.5: head_size=256, rotary_dim=64)
+        _case(fp8, 1257, 32, 4, 256, None, rotary_dim=64),
+        _case(bf16, 3, 8, 2, 128, None, rotary_dim=32, neox=False),
+        _case(fp8, 3, 32, 4, 256, [8, 12, 12], rotary_dim=64),
+        _case(bf16, 1257, 8, 2, 128, [4, 6, 6], rotary_dim=32, interleaved=False),
+        # GemmaRMSNorm (Qwen3.6 full-attention layer; Qwen3.8-27B TP1 = 24q / 4kv)
+        _case(bf16, 1257, 16, 2, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 3, 16, 2, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 127, 24, 4, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
+        _case(fp8, 127, 8, 2, 128, [4, 6, 6], rotary_dim=32, gemma_norm=True),
+    ]
+    return cases
+
+
+def run_default_cases(args):
+    print("\n=== Default covering set (use --full for the full matrix) ===", flush=True)
+    for case in _default_cases():
+        case["num_tokens"] = min(case["num_tokens"], args.max_positions)
+        test_mrope_3d_rms_set_kv_shuffle(
+            args.dtype, eps=1e-6, max_positions=args.max_positions, **case
+        )
+
+
+def run_full_matrix(args):
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
     partial_rotary_configs = [(256, 64), (128, 32)]
     partial_rotary_heads = [(32, 4), (8, 2)]
+
+    print("\n=== vLLM unified-attention strided KV layout ===", flush=True)
+    for kv_cache_dtype in args.kv_cache_dtypes:
+        test_mrope_3d_rms_set_kv_shuffle(
+            args.dtype,
+            min(127, args.max_positions),
+            32,
+            1,
+            1,
+            128,
+            True,
+            mrope_sections_dict[128],
+            True,
+            eps=1e-6,
+            is_mrope=True,
+            kv_cache_dtype=kv_cache_dtype,
+            use_strided_layout=True,
+            page_size=16,
+            max_positions=args.max_positions,
+        )
 
     for kv_cache_dtype in args.kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
@@ -914,3 +1139,20 @@ if __name__ == "__main__":
                                 rotary_dim=rotary_dim,
                                 gemma_norm=True,
                             )
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    # Compare parsed values: argparse runs `type` on string defaults.
+    defaults = parser.parse_args([])
+    sweep_axes = ["neox_style", "token", "head", "head_sizes"]
+    sweep_axes += ["is_interleaved", "kv_cache_dtypes"]
+    changed = [
+        a for a in sweep_axes if tuple(getattr(args, a)) != tuple(getattr(defaults, a))
+    ]
+    if changed and not args.full:
+        parser.error(f"--{', --'.join(changed)} only apply with --full")
+    if args.full:
+        run_full_matrix(args)
+    else:
+        run_default_cases(args)

@@ -1,6 +1,7 @@
 # Documentation Deployment Guide
 
-This guide explains how to build and deploy AITER documentation to `doc.aiter.amd.com`.
+This guide explains how to build and deploy AITER documentation to the default
+GitHub Pages URL: `https://rocm.github.io/aiter/`.
 
 ## Building Documentation Locally
 
@@ -61,7 +62,7 @@ The workflow:
 1. ✅ Builds documentation with Sphinx
 2. ✅ Checks for warnings and errors
 3. ✅ Runs link checker
-4. ✅ Deploys to GitHub Pages (or custom server)
+4. ✅ Deploys to GitHub Pages
 
 ### GitHub Pages Setup
 
@@ -73,17 +74,23 @@ The workflow:
    - Branch: `gh-pages` (created by workflow)
    - Folder: `/ (root)`
 
-2. **Configure custom domain:**
-   - Add `doc.aiter.amd.com` in "Custom domain" field
-   - Wait for DNS check to complete
+2. **Do not configure a custom domain for the default deployment:**
+   - Leave the "Custom domain" field empty
+   - The documentation is served at `https://rocm.github.io/aiter/`
 
-3. **DNS Configuration (AMD IT):**
+3. **Enforce HTTPS:**
+   - Check "Enforce HTTPS" in Pages settings
+
+### Optional Custom Domain
+
+Only configure a custom domain after DNS is ready. For example:
+
    ```
    doc.aiter.amd.com. CNAME rocm.github.io.
    ```
 
-4. **Enforce HTTPS:**
-   - Check "Enforce HTTPS" in Pages settings
+After DNS is configured, add `doc.aiter.amd.com` in the repository's Pages
+settings and restore the `cname` entry in `.github/workflows/docs.yml`.
 
 ## Alternative: Deploy to AMD Servers
 
@@ -256,13 +263,10 @@ smv_remote_whitelist = r'^origin$'
 
 ```bash
 # Test HTTPS
-curl -I https://doc.aiter.amd.com
+curl -I https://rocm.github.io/aiter/
 
-# Check DNS
-dig doc.aiter.amd.com
-
-# Validate SSL
-openssl s_client -connect doc.aiter.amd.com:443 -servername doc.aiter.amd.com
+# Check that the deployment branch exists
+git ls-remote --heads https://github.com/ROCm/aiter.git gh-pages
 ```
 
 ### Analytics (Optional)
@@ -292,8 +296,8 @@ html_theme_options = {
 
 3. **Verify deployment:**
    ```bash
-   # Check file timestamps on server
-   ssh user@doc.aiter.amd.com "ls -la /var/www/doc.aiter.amd.com/html/"
+   # Check the published page
+   curl -I https://rocm.github.io/aiter/
    ```
 
 ### Build warnings
@@ -304,11 +308,11 @@ Common issues:
 - **Broken references:** Check `:doc:` and `:ref:` targets
 - **Missing images:** Verify paths in `docs/_static/`
 
-### DNS issues
+### Custom domain DNS issues
 
 - DNS propagation can take up to 48 hours
 - Use `dig` to check current records
-- Contact AMD IT if CNAME is not configured
+- Contact AMD IT if the custom domain CNAME is not configured
 
 ## Maintenance
 

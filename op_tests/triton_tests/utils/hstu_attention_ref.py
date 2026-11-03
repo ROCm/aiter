@@ -78,7 +78,7 @@ def jagged_to_padded_dense(
 def pad_sequence(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_value):
     L, D = q.shape
     padded_q = jagged_to_padded_dense(
-        q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=0.0
+        q.reshape(L, D), offsets=seq_offsets, max_seq_len=N, padding_value=padding_value
     )
 
     return padded_q
@@ -91,20 +91,21 @@ def qkv_to_padded_dense(
     seq_offsets: torch.Tensor,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    L, H, D = q.shape
+    L, H, DQ = q.shape
+    DV = v.shape[2]
     padded_q = (
-        pad_sequence(q.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
+        pad_sequence(q.reshape(L, H * DQ), seq_offsets, N, 0.0)
+        .view(-1, N, H, DQ)
         .transpose(1, 2)
     )
     padded_k = (
-        pad_sequence(k.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
+        pad_sequence(k.reshape(L, H * DQ), seq_offsets, N, 0.0)
+        .view(-1, N, H, DQ)
         .transpose(1, 2)
     )
     padded_v = (
-        pad_sequence(v.reshape(L, H * D), seq_offsets, N, 0.0)
-        .view(-1, N, H, D)
+        pad_sequence(v.reshape(L, H * DV), seq_offsets, N, 0.0)
+        .view(-1, N, H, DV)
         .transpose(1, 2)
     )
 

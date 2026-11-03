@@ -2,9 +2,10 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "rocm_ops.hpp"
+#include "aiter_stream.h"
 #include "mhc.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     MHC_PYBIND;
 }
