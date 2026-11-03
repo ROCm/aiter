@@ -7,7 +7,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
 )
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):
