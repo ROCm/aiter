@@ -17,7 +17,6 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
-from aiter.ops.triton.moe.reduce import EpCombineScatter
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp

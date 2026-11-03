@@ -15,7 +15,6 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     ExptData,
     RoutingData,
 )
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view
 
 
