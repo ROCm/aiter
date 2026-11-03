@@ -38,6 +38,9 @@ from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
     default_varctx_parallel_unit_num,
     flydsl_pa_mqa_logits_fp4,
 )
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_common import (
+    _validate_packed_scale_config,
+)
 from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
     flydsl_pa_mqa_logits_fp4_prefill,
 )
@@ -68,6 +71,7 @@ HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
 PAGE_BYTES = KV_BLOCK_SIZE * 68
 BLOCK_K = 256
+CHUNK_CONFIGS = ((64, 1), (128, 2), (256, 4), (512, 8))
 HEADS = 64
 EXPECTED_LOGIT = 8192.0
 GUARD = 123456.0
@@ -134,12 +138,11 @@ def allocate_pool(page_base, page_stride, dense_cache):
     return cache, storage_bytes
 
 
-def make_inputs(rows, context, constant=False):
+def make_inputs(rows, context, constant=False, block_k=BLOCK_K):
     """Three requests, distinct per-block scales and signed random FP4 data."""
     generator = torch.Generator(device=dev).manual_seed(SEED)
     requests = 3
-    # Kernel loads page metadata in four-page chunks, including masked tails.
-    pages_per_request = (context + BLOCK_K - 1) // BLOCK_K * 4
+    pages_per_request = (context + block_k - 1) // block_k * (block_k // KV_BLOCK_SIZE)
     tokens = pages_per_request * KV_BLOCK_SIZE
     pages = requests * pages_per_request
     logical_pages = torch.randperm(pages, generator=generator, device=dev).reshape(
@@ -238,10 +241,13 @@ def run_case(
     constant=False,
     paths=("prefill", "decode"),
     layouts=("dense", "strided"),
+    block_k=BLOCK_K,
+    num_warps=4,
 ):
+    _validate_packed_scale_config(block_k, KV_BLOCK_SIZE, num_warps)
     page_base, page_stride = CASES[name]
     dense_cache, dense_table, q, qs, weights, q_dq, k_dq, mapping = make_inputs(
-        rows, context, constant
+        rows, context, constant, block_k
     )
     dense_values, dense_scales = vllm_fp4_cache_views(dense_cache)
     # Stock kernels expect separately contiguous K and scale arrays. Preserve
@@ -314,6 +320,8 @@ def run_case(
                         starts,
                         ends,
                         context,
+                        block_k=block_k,
+                        num_warps=num_warps,
                         parallel_unit_num=max(512, rows),
                         out=out,
                     )
@@ -327,7 +335,8 @@ def run_case(
                     ends,
                     context,
                     kv_block_size=KV_BLOCK_SIZE,
-                    block_k=BLOCK_K,
+                    block_k=block_k,
+                    num_warps=num_warps,
                     parallel_unit_num=max(512, rows),
                     out=out,
                 )
@@ -388,7 +397,8 @@ def run_case(
                     "heads": HEADS,
                     "head_dim": HEAD_DIM,
                     "kv_block_size": KV_BLOCK_SIZE,
-                    "block_k": BLOCK_K,
+                    "block_k": block_k,
+                    "num_warps": num_warps,
                     "q_shape": list(q.shape),
                     "kv_shape": list(kv.shape),
                     "page_stride_bytes": kv.stride(0),
@@ -520,8 +530,34 @@ def test_precomputed_decode_schedule_empty_windows(next_n: int) -> None:
             assert bool((out[~valid] == GUARD).all())
 
 
-def test_small_stride_prefill_decode(graph: bool = False) -> None:
-    run_case("small", graph=graph, sensitivity=True)
+def test_packed_scale_config() -> None:
+    for page_size in (64, 128):
+        for num_warps in range(1, 17):
+            block_k = 64 * num_warps
+            if block_k % page_size:
+                with pytest.raises(ValueError, match="multiple of kv_block_size"):
+                    _validate_packed_scale_config(block_k, page_size, num_warps)
+            else:
+                _validate_packed_scale_config(block_k, page_size, num_warps)
+    for block_k, page_size, num_warps in (
+        (64, 64, 4),
+        (256, 64, 1),
+        (256, 32, 4),
+        (256, 256, 4),
+        (0, 64, 0),
+        (1088, 64, 17),
+    ):
+        with pytest.raises(ValueError):
+            _validate_packed_scale_config(block_k, page_size, num_warps)
+
+
+@pytest.mark.parametrize("block_k,num_warps", CHUNK_CONFIGS)
+def test_small_stride_prefill_decode(
+    block_k: int, num_warps: int, graph: bool = False
+) -> None:
+    run_case(
+        "small", graph=graph, sensitivity=True, block_k=block_k, num_warps=num_warps
+    )
 
 
 def test_large_offset_prefill_decode(graph: bool = False) -> None:
@@ -573,6 +609,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.rows < 4 or args.context < 65 or args.iters < 1 or args.warmup < 1:
         parser.error("rows >= 4, context >= 65, iters >= 1, warmup >= 1 required")
+    test_packed_scale_config()
     arch = get_arch()
     if arch != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {arch}).")
@@ -613,22 +650,30 @@ def main() -> None:
         "results": [],
     }
     for name in CASES if args.case == "all" else (args.case,):
-        report["results"].extend(
-            run_case(
-                name,
-                graph=args.graph,
-                sensitivity=args.sensitivity,
-                benchmark=args.benchmark,
-                rows=args.rows,
-                context=args.context,
-                iters=args.iters,
-                warmup=args.warmup,
-                paths=("prefill", "decode") if args.path == "both" else (args.path,),
-                layouts=(
-                    ("dense", "strided") if args.layout == "both" else (args.layout,)
-                ),
+        configs = CHUNK_CONFIGS if name == "small" else ((BLOCK_K, 4),)
+        for block_k, num_warps in configs:
+            report["results"].extend(
+                run_case(
+                    name,
+                    graph=args.graph,
+                    sensitivity=args.sensitivity,
+                    benchmark=args.benchmark,
+                    rows=args.rows,
+                    context=args.context,
+                    iters=args.iters,
+                    warmup=args.warmup,
+                    paths=(
+                        ("prefill", "decode") if args.path == "both" else (args.path,)
+                    ),
+                    layouts=(
+                        ("dense", "strided")
+                        if args.layout == "both"
+                        else (args.layout,)
+                    ),
+                    block_k=block_k,
+                    num_warps=num_warps,
+                )
             )
-        )
         gc.collect()
         torch.cuda.empty_cache()
     if args.case == "all":

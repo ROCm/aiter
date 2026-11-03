@@ -18,9 +18,9 @@ from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
 from ..tensor_shim import _run_compiled
 from .pa_mqa_logits_fp4_common import (
-    _NON_WRITER_LANE_OFF,
     _i32_buffer,
     _load_vec4_i32,
+    _validate_packed_scale_config,
 )
 
 DEFAULT_HEADS = 64
@@ -384,6 +384,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
     block_table_stride: int | None = None,
 ):
     """Build the ragged-prefill FP4 MQA logits kernel."""
+    _validate_packed_scale_config(block_k, kv_block_size, num_warps)
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
@@ -519,16 +520,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
             chunk_start = cta_info_vec[2]
             chunk_count = cta_info_vec[3]
 
-            # A V# spanning exactly [local_start, local_end) of this row: num_records
-            # then IS the window test, in hardware. A token below the window
-            # underflows to a huge unsigned offset and is dropped by the same bound,
-            # so one check covers both ends. Lanes 16..63 hold redundant copies of
-            # the butterfly result and must not write; a large constant added to
-            # their offset puts them past num_records. It must be a CONSTANT, not a
-            # multiple of win_len: `token_base - local_start` is negative for a
-            # token below a non-zero window start, and adding win_len to that lands
-            # back INSIDE the window, racing the lane that owns the column. Both
-            # terms are chunk-invariant, so both live here.
             win_len = local_end - local_start
             _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row) + fx.Int64(
                 local_start
@@ -543,9 +534,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 ),
                 max_size=False,
                 num_records_bytes=win_len * fx.Int32(4),
-            )
-            out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
-                fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
             )
             out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
             out_reg_ty = fx.MemRefType.get(
@@ -759,16 +747,18 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 thread_sum = _bperm_xor_add(thread_sum, 32)
                 # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
-                # Window and writer-lane guards are both in the V#; nothing is
-                # tested here. Cells outside stay at the caller's -inf pre-fill.
                 r_out = fx.memref_alloca(out_reg_ty, out_reg_lay)
                 fx.memref_store_vec(
                     fx.Vector.from_elements([thread_sum], dtype=fx.Float32), r_out
                 )
+                out_offset = token_base - local_start + lane_mod_16
+                out_offset = (
+                    (out_offset >= fx.Int32(0)) & (lane_div_16 == fx.Int32(0))
+                ).select(out_offset, fx.Int32((1 << 30) - 1))
                 fx.copy(
                     out_atom,
                     r_out,
-                    fx.slice(out_win, (token_base - local_start + out_lane_off, None)),
+                    fx.slice(out_win, (out_offset, None)),
                 )
 
             def _compute_chunk(
@@ -954,11 +944,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
-    if kv_block_size not in (64, 128) or block_k != 256:
-        raise ValueError(
-            "FP4 packed-scale kernels require kv_block_size=64 or 128 and "
-            "block_k=256"
-        )
+    _validate_packed_scale_config(block_k, kv_block_size, num_warps)
 
     if (cta_info is None) != (n_ctas is None):
         raise ValueError("Pass both cta_info and n_ctas, or neither.")

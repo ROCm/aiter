@@ -18,6 +18,7 @@ from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
     _load_vec4_i32,
+    _validate_packed_scale_config,
     compute_varctx_schedule,
     default_varctx_parallel_unit_num,
 )
@@ -57,6 +58,7 @@ def build_pa_mqa_logits_fp4_module(
     kv_scale_page_stride: int | None = None,
     block_table_stride: int | None = None,
 ):
+    _validate_packed_scale_config(block_k, kv_block_size, num_warps)
     block_threads_k = num_warps * WARP_SIZE
     head_dim_packed = head_dim // 2
     m_tiles = heads // MFMA_M
@@ -694,11 +696,7 @@ def flydsl_pa_mqa_logits_fp4(
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
-    if kv_block_size not in (64, 128) or block_k != 256:
-        raise ValueError(
-            "FP4 packed-scale kernels require kv_block_size=64 or 128 and "
-            "block_k=256"
-        )
+    _validate_packed_scale_config(block_k, kv_block_size, num_warps)
     if q_next_n != next_n:
         raise ValueError(f"q_fp4 next_n dim ({q_next_n}) != next_n arg ({next_n}).")
 

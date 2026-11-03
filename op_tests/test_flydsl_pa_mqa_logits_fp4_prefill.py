@@ -35,7 +35,7 @@ import statistics
 import torch
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.test_common import run_perftest
+from aiter.test_common import assertAllclose, run_perftest
 
 dev = "cuda"
 SCALE_BLOCK = 32
@@ -186,6 +186,7 @@ def run_case(
     bench=False,
     iters=50,
     warmup=10,
+    num_warps=4,
 ):
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -294,6 +295,7 @@ def run_case(
             weight_scale=weight_scale,
             block_k=block_k,
             kv_block_size=kv_block_size,
+            num_warps=num_warps,
             parallel_unit_num=parallel_unit_num,
             out=out,
             cta_info=cta_info,
@@ -304,6 +306,15 @@ def run_case(
     torch.cuda.synchronize()
 
     m = ~torch.isneginf(ref_fp4)
+    assertAllclose(
+        ref_fp4[m].float(),
+        out[m].float(),
+        rtol=2e-4,
+        atol=2e-3,
+        tol_err_ratio=0.0,
+        msg="FP4-dequant reference",
+        printLog=False,
+    )
     cos_exact = _cos(out[m], ref_fp4[m]).item()
     cos_bf16 = _cos(out[m], ref_bf16[m]).item()
     oob_ok = bool(torch.isneginf(out[~m]).all().item()) if (~m).any() else True
@@ -808,6 +819,19 @@ def main():
         block_k=256,
         seed=5,
     )
+    for page_size, block_k, num_warps in (
+        (64, 64, 1),
+        (64, 128, 2),
+        (128, 128, 2),
+        (128, 512, 8),
+    ):
+        run_case(
+            2,
+            [[(17, 333), (1, 128), (65, 257)], [(31, 129), (127, 200)]],
+            kv_block_size=page_size,
+            block_k=block_k,
+            num_warps=num_warps,
+        )
 
     if args.bench:
         kvb = 64

@@ -18,6 +18,23 @@ from flydsl.expr.typing import T
 _NON_WRITER_LANE_OFF = 1 << 30
 
 
+def _validate_packed_scale_config(block_k: int, kv_block_size: int, num_warps: int):
+    """Each wave consumes four 16-row MFMA tiles within one physical page."""
+    if kv_block_size not in (64, 128):
+        raise ValueError("FP4 packed-scale kernels require kv_block_size=64 or 128")
+    if not 1 <= num_warps <= 16:
+        raise ValueError("FP4 packed-scale kernels require 1 <= num_warps <= 16")
+    if block_k != 64 * num_warps:
+        raise ValueError(
+            "FP4 packed-scale kernels require block_k=64 * num_warps; "
+            f"got block_k={block_k}, num_warps={num_warps}"
+        )
+    if block_k % kv_block_size != 0:
+        raise ValueError(
+            f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
+        )
+
+
 def _i32_buffer(ptr, width=1, byte_offset=None):
     """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).
 
