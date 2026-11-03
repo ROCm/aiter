@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Benchmark SonicMoE forward and training throughput."""
 
+import functools
+import itertools
+
 import torch
 import triton
 
@@ -11,9 +14,13 @@ from aiter.ops.triton.moe.sonicmoe import (
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 # tokens, hidden, intermediate, experts, top-k, label
 _SHAPES = [
@@ -22,8 +29,10 @@ _SHAPES = [
     (4096, 4096, 14336, 8, 2, "Mixtral-train"),
 ]
 
+_OUT_VAL_KEYS = ["x", "router", "w1", "w2", "grad"]
 
-def _setup(tokens, hidden, intermediate, experts, top_k):
+
+def _generate_pool_inputs(tokens, hidden, intermediate, experts):
     dtype = torch.bfloat16
     x = (torch.randn(tokens, hidden, device="cuda", dtype=dtype) * 0.1).requires_grad_()
     router = torch.randn(experts, hidden, device="cuda", dtype=dtype) * 0.02
@@ -52,34 +61,53 @@ def benchmark(args):
         args={},
     )
 
+    bencher = RotatingBufferBench.from_dict(get_rot_bufs_kwargs(args))
+
     @triton.testing.perf_report([config])
     def _run(tokens, hidden, intermediate, experts, top_k, label, provider):
-        x, router, w1, w2, grad = _setup(tokens, hidden, intermediate, experts, top_k)
+        _p_gen = functools.partial(
+            _generate_pool_inputs, tokens, hidden, intermediate, experts
+        )
+        rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+        pool_len = len(rot_bufs)
+        counter = itertools.count()
 
         def forward():
-            return moe_TC_softmax_topk_layer(
-                x,
-                router,
-                w1,
-                None,
-                w2,
-                None,
-                top_k,
-                torch.cuda.current_stream().cuda_stream,
-                SonicMoEActivationType.SWIGLU,
-            )[0]
+            entry = rot_bufs[next(counter) % pool_len]
+            return (
+                moe_TC_softmax_topk_layer(
+                    entry["x"],
+                    entry["router"],
+                    entry["w1"],
+                    None,
+                    entry["w2"],
+                    None,
+                    top_k,
+                    torch.cuda.current_stream().cuda_stream,
+                    SonicMoEActivationType.SWIGLU,
+                )[0],
+                entry,
+            )
 
         if provider == "forward":
-            fn = forward
+
+            def fn():
+                forward()
+
             flops = 6 * tokens * top_k * hidden * intermediate
         else:
 
             def fn():
-                out = forward()
-                torch.autograd.grad(out, (x, w1, w2), grad)
+                out, entry = forward()
+                torch.autograd.grad(
+                    out, (entry["x"], entry["w1"], entry["w2"]), entry["grad"]
+                )
 
             flops = 18 * tokens * top_k * hidden * intermediate
 
+        # moe_TC_softmax_topk_layer's autograd path is not CUDA-graph-safe, so
+        # this keeps the original plain do_bench timing; RotatingBufferBench
+        # is only used here to build the rotating pool.
         ms = triton.testing.do_bench(fn, warmup=10, rep=50)
         if args.metric == "time":
             return ms
