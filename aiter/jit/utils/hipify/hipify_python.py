@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
 """The Python Hipify script.
 ##
-# Copyright (C) 2015-2026 Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2015-2016 Advanced Micro Devices, Inc. All rights reserved.
 #               2017-2018 Advanced Micro Devices, Inc. and
 #                         Facebook Inc. All rights reserved.
 #

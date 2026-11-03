@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 
 """Vendored TDM gather-mode API for gfx1250 (self-contained, no FlyDSL patch).
 

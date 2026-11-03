@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: SIM102
 
 """FlyDSL intranode dispatch/combine kernels for EP MoE."""

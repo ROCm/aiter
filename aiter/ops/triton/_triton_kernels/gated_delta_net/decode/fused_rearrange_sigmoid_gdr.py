@@ -6,7 +6,7 @@
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
-# Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import triton
 import triton.language as tl

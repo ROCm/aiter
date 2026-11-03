@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 """Every environment variable MegaMoEV2 reads, in one place.
 
 Read through this module (``envs.AITER_MEGA_...``) rather than ``os.environ``.

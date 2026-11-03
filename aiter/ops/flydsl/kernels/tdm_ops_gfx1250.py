@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 
 """gfx1250 TDM compatibility helpers."""
 

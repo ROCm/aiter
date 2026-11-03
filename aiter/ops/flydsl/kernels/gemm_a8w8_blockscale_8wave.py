@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
 # Ported from pyhip a3a94c5a34fc525c118649418b76221cd6d91579, fixed to raw DMA.

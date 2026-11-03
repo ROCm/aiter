@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025-2026 FlyDSL Project Contributors
 # ruff: noqa: B023
 # Nested @flyc.jit functions execute immediately inside compile-time loops.
 """Aligned common-row fusion for MegaMoE Stage2.

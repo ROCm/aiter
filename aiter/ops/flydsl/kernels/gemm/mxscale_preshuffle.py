@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025-2026 FlyDSL Project Contributors
 
 """MXFP4/MXFP6/MXFP8 A x MXFP4/MXFP8 B preshuffle GEMM (gfx950): per-32 E8M0 scales folded
 into a scaled 16x16x128 fx.gemm; A streams global->LDS via double-buffered async DMA. Layout

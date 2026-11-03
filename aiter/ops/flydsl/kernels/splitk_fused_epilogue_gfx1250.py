@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 
 """Fused split-K reduction shared by the K-split workgroups in one cluster."""
 
