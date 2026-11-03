@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Check per-tensor scale/output compatibility and guarded vector tails.
+
+Finite scales use a Torch reduction and the existing static conversion.
+NaN/Inf cases require raw-bit parity with the same build's atomic path;
+they preserve existing behavior rather than define a new nonfinite policy.
+"""
 
 import argparse
 import itertools
@@ -9,7 +15,6 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import dynamic_per_tensor_quant, static_per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -83,7 +88,13 @@ def assert_dispatch(x, out, scale, partial):
         for event in profile.events()
         if event.device_type == torch.autograd.DeviceType.CUDA
     ]
-    assert any("data_to_scale_kernel" in name for name in names), names
+    tail = x.shape[-1] % 4 != 0
+    assert sum("data_to_scale_kernel" in name for name in names) == int(not tail), names
+    assert sum("data_to_scale_tail_kernel" in name for name in names) == int(
+        tail
+    ), names
+    assert sum("scaled_quant_kernel" in name for name in names) == int(not tail), names
+    assert sum("scaled_quant_tail_kernel" in name for name in names) == int(tail), names
     assert sum("reduce_per_tensor_scale" in name for name in names) == int(
         partial
     ), names
@@ -108,6 +119,28 @@ def update_reference(x, pattern, reference):
         # NaN/Inf checks establish parity with the forced atomic scale path.
         # They do not define an independent numerical policy for nonfinite input.
         dynamic_per_tensor_quant(ref_out, x, ref_scale)
+
+
+def assert_tail_storage(x, actual, reference):
+    # Reuse #6677's zero/poison suffix and output-guard checks for both modes.
+    count = x.numel()
+    input_storage = torch.empty(count + 16, dtype=x.dtype, device=x.device)
+    input_storage[:count].copy_(x.reshape(-1))
+    guarded_x = input_storage[:count].view_as(x)
+    storage, out, scale, _ = actual
+    for suffix in (0.0, 10000.0):
+        input_storage[count:].fill_(suffix)
+        input_before = input_storage.clone()
+        for static in (False, True):
+            storage.fill_(16)
+            scale.fill_(99.0)
+            if static:
+                scale.copy_(reference[2])
+                static_per_tensor_quant(out, guarded_x, scale)
+            else:
+                dynamic_per_tensor_quant(out, guarded_x, scale)
+            assert_exact(actual, reference, count)
+            assert torch.equal(input_storage, input_before)
 
 
 def assert_changed_input_graph(x, actual, reference):
@@ -144,7 +177,8 @@ def test_per_tensor_quant_exact(m, n, input_dtype, output_dtype, pattern, layout
     actual = make_output(x.shape, output_dtype, layout)
     storage, out, scale, _ = actual
     candidates = {"hip": lambda: dynamic_per_tensor_quant(out, x, scale)}
-    ret = {"gfx": get_gfx()}
+    gfx = torch.cuda.get_device_properties(x.device).gcnArchName.split(":", 1)[0]
+    ret = {"gfx": gfx}
     for name, fn in candidates.items():
         for _ in range(3):
             storage.fill_(16)
@@ -174,9 +208,15 @@ def test_per_tensor_quant_exact(m, n, input_dtype, output_dtype, pattern, layout
 
     if pattern == "finite":
         partial = (
-            m >= 1024 and n % 4 == 0 and out.is_contiguous() and out.data_ptr() % 4 == 0
+            gfx == "gfx942"
+            and m >= 1024
+            and n % 4 == 0
+            and out.is_contiguous()
+            and out.data_ptr() % 4 == 0
         )
         assert_dispatch(x, out, scale, partial)
+        if n % 4 != 0:
+            assert_tail_storage(x, actual, reference)
         if m == 1024 and n in (20, 520):
             assert_changed_input_graph(x, actual, reference)
     return ret
@@ -220,12 +260,24 @@ def main():
             (1024, 520),
             (512, 20),
             (512, 520),
+            # Tail widths below, at and above the partial-dispatch threshold.
+            (1, 2),
+            (1, 3),
+            (1023, 4097),
+            (1024, 2),
+            (1024, 3),
+            (1024, 4097),
+            (1024, 4099),
+            (1025, 4099),
         ],
     )
     args = parser.parse_args()
-    if get_gfx() not in ("gfx942", "gfx950"):
+    gfx = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.split(":", 1)[0]
+    if gfx not in ("gfx942", "gfx950"):
         aiter.logger.warning(
-            "Per-tensor exactness test unsupported on %s; skipping", get_gfx()
+            "Per-tensor exactness test unsupported on %s; skipping", gfx
         )
         return
     if any(dtype not in (torch.bfloat16, torch.float16) for dtype in args.dtype):

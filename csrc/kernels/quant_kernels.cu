@@ -795,7 +795,7 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
 __global__ void reduce_per_tensor_scale(float* scale, const float* partials, int count)
 {
     float maximum = 0.0f;
-    for(int i = threadIdx.x; i < count; i += BlockSize)
+    for(int64_t i = threadIdx.x; i < count; i += BlockSize)
         maximum = max(maximum, partials[i]);
     maximum = block_reduce<float, aiter::Max, BlockSize, true>(maximum, aiter::Max());
     if(threadIdx.x == 0)
@@ -1307,17 +1307,18 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
+    HipDeviceGuard device_guard(input.device_id);
     // Input, output and scale storage must be disjoint, as on the atomic path.
     // Four-byte row boundaries keep the existing vector loads/stores in bounds.
     // The output holds one float per row until conversion overwrites it.
-    // Keep small row counts on the atomic path: public-call timing on gfx942
-    // regresses at 512 rows, while the tested 1024-row cases improve.
+    // Only gfx942 was measured: 512-row public calls regress, while tested
+    // 1024-row calls improve. Other architectures retain the atomic path.
     const bool use_partials = out.is_contiguous() && rows >= 1024 && cols % 4 == 0 &&
                               out.numel() * out.element_size() >=
                                   static_cast<size_t>(rows) * sizeof(float) &&
-                              reinterpret_cast<uintptr_t>(out.data_ptr()) % alignof(float) == 0;
+                              reinterpret_cast<uintptr_t>(out.data_ptr()) % alignof(float) == 0 &&
+                              get_device_gfx() == "gfx942";
     dim3 block(BlockSize);
-    HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     if(out.dtype() == AITER_DTYPE_fp8)
     {
