@@ -823,17 +823,37 @@ def _grouped_a8w4_tdm_moe(
     # surplus tiles fall past ``psum`` and exit early. The TDM batched GEMMs
     # themselves are EP-agnostic: they operate on the routed contiguous layout.
     _is_ep = expert_mask is not None
-    # Small TP batches: one workgroup counts, scans and remaps every route, in
-    # place of the counter fill, route and psum-remap launches; it runs where the
-    # psum is built below. HERD routes carry K+1 candidates per row and are
-    # dropped to K by herd_route_psum_remap, which this kernel does not do.
-    _fused_tp_route = (
+    _g2l_lut = None
+    _g2l_counter = None
+    _gather_w_buf = None
+    _ep_nvr = None
+    _ep_nvt = None
+    _fuse_ep_route_quant = False
+    ep_rowmap = None
+    # TP-only route fusions share these exclusions. HERD routes carry K+1
+    # candidates per row and are dropped to K by herd_route_psum_remap, which
+    # neither kernel implements.
+    _tp_route_fusion_base = (
         not herd_topk
         and not _compact
         and not _is_ep
         and not enable_ep_scatter
-        and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
+    # Decode: one workgroup performs route + psum + remap in one launch.
+    _fused_tp_route = (
+        _tp_route_fusion_base and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+    )
+    # Prefill: retain route parallelism, but write complete per-workgroup
+    # histograms so no global counter fill is needed. A second kernel combines
+    # those histograms and remaps in deterministic route-block order.
+    _fused_tp_route_fill = (
+        _tp_route_fusion_base
+        and not _fused_tp_route
+        and int(E) == 129
+        and int(topk) == 5
+        and token_num * topk >= _FUSED_ROUTE_BLOCK_COUNTS_MIN_NUMEL
+        and token_num * topk <= _FUSED_ROUTE_BLOCK_COUNTS_MAX_NUMEL
     )
     try:
         _tp_reduce_max_tokens = int(
@@ -885,13 +905,6 @@ def _grouped_a8w4_tdm_moe(
         )
         and (_tp_reduce_max_tokens <= 0 or token_num <= _tp_reduce_max_tokens)
     )
-    _g2l_lut = None
-    _g2l_counter = None
-    _gather_w_buf = None
-    _ep_nvr = None
-    _ep_nvt = None
-    _fuse_ep_route_quant = False
-    ep_rowmap = None
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -976,7 +989,7 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
-    elif not _fused_tp_route:
+    elif not (_fused_tp_route or _fused_tp_route_fill):
         _fuse_ep_route_quant = False
         if herd_topk:
             _masked_m, topids_to_rows, herd_psum, herd_gather_w = herd_route_psum_remap(
@@ -1039,6 +1052,14 @@ def _grouped_a8w4_tdm_moe(
         psum = herd_psum
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids,
+            E,
+            max_m,
+            _align_m,
+            row_to_token=_tp_row_to_token,
+        )
+    elif _fused_tp_route_fill:
+        _masked_m, topids_to_rows, psum = fused_route_fill_psum_remap(
             topk_ids,
             E,
             max_m,
@@ -2094,6 +2115,26 @@ def _get_compiled_route_psum_fused():
     return build_moe_route_psum_fused_module()
 
 
+@functools.cache
+def _get_compiled_route_block_counts(experts: int):
+    """Compile the TP router that emits one complete histogram per workgroup."""
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_block_counts_module,
+    )
+
+    return build_moe_topids_to_rows_block_counts_module(int(experts))
+
+
+@functools.cache
+def _get_compiled_block_counts_psum_remap():
+    """Compile the per-workgroup histogram prefix/remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_block_counts_psum_remap_module,
+    )
+
+    return build_moe_block_counts_psum_remap_module()
+
+
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
 # grid-stride, so a larger count is correct but stops being worth fusing; on
 # gfx1250 the split launches catch up at about 2.5K routes.
@@ -2101,6 +2142,11 @@ def _get_compiled_route_psum_fused():
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+# Keep the parallel fallback on the two measured MiniMax-M3 TP4 prefills. It
+# materializes ``ceil(routes/256) * E`` int32 counts: 25,800 B at M=2517 and
+# 45,924 B at M=4536 (E=129, topk=5).
+_FUSED_ROUTE_BLOCK_COUNTS_MIN_NUMEL = 2517 * 5
+_FUSED_ROUTE_BLOCK_COUNTS_MAX_NUMEL = 4536 * 5
 
 
 def fused_route_psum_remap(
@@ -2149,6 +2195,79 @@ def fused_route_psum_remap(
         experts,
         int(max_m),
         int(tile_m),
+        int(topk),
+        current_stream_arg(),
+    )
+    return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+def fused_route_fill_psum_remap(
+    topk_ids: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+    row_to_token: torch.Tensor | None = None,
+):
+    """Two-launch prefill route path with no global counter fill.
+
+    The first launch routes in parallel and writes a complete histogram for
+    every 256-route workgroup. The second combines those histograms, builds the
+    tile-aligned prefix, and remaps local slots in route-block order.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    if experts > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
+        raise ValueError(
+            f"fused_route_fill_psum_remap supports at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}"
+        )
+    route_blocks = (numel + 255) // 256
+    if numel > _FUSED_ROUTE_BLOCK_COUNTS_MAX_NUMEL:
+        raise ValueError(
+            f"fused_route_fill_psum_remap supports at most "
+            f"{_FUSED_ROUTE_BLOCK_COUNTS_MAX_NUMEL} routes, got {numel}"
+        )
+
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    block_counts = torch.empty(
+        (route_blocks, experts),
+        dtype=torch.int32,
+        device=device,
+    )
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
+    topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
+
+    _run_compiled(
+        _get_compiled_route_block_counts(experts),
+        ptr_arg(topk_ids_i32),
+        ptr_arg(block_counts),
+        ptr_arg(topids_to_rows),
+        int(numel),
+        int(max_m),
+        int(route_blocks),
+        current_stream_arg(),
+    )
+    _run_compiled(
+        _get_compiled_block_counts_psum_remap(),
+        ptr_arg(block_counts),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(contiguous_m_t),
+        int(numel),
+        experts,
+        int(max_m),
+        int(tile_m),
+        int(route_blocks),
+        ptr_arg(
+            row_to_token.reshape(-1) if row_to_token is not None else None
+        ),
         int(topk),
         current_stream_arg(),
     )

@@ -115,6 +115,13 @@ def test_masked_offsets_use_unsigned_high_bit(launcher):
 
 
 def test_fused_scan_writes_contiguous_row_to_token():
+    if not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 fused TP scan optimization")
+
     tokens, topk, experts, tile = 64, 5, 129, 16
     ids = (
         torch.arange(tokens * topk, device="cuda", dtype=torch.int32) % experts
