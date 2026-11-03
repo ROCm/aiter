@@ -28,6 +28,8 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 
 __all__ = [
+    "CACHE_DEVICE",
+    "CACHE_SYSTEM",
     "GeometryTuningTable",
     "TaggedMailbox",
     "atomic_add_agent",
@@ -36,6 +38,8 @@ __all__ = [
     "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
+    "buffer_load_i32",
+    "buffer_resource",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -51,6 +55,7 @@ __all__ = [
     "load_i32_nt",
     "load_i32_system",
     "load_i64_acquire",
+    "load_i64_from_buffer",
     "load_i64_global",
     "load_v4i32_nt",
     "spin_until_eq_i32",
@@ -74,14 +79,16 @@ __all__ = [
     "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i32",
     "wave_uniform_i64",
 ]
 
-_SYSTEM_CACHE = 17
 _TAGGED_POLL_MAX = 12
+CACHE_DEVICE = 16
+CACHE_SYSTEM = 17
 
 
-def _buffer_resource(address):
+def buffer_resource(address):
     return bo.create_buffer_resource_from_addr(address)
 
 
@@ -117,9 +124,9 @@ class TaggedMailbox:
         )
         bo.buffer_store(
             fx.Vector.from_elements([bits, self.tag], fx.Int32),
-            _buffer_resource(address),
+            buffer_resource(address),
             index * 2,
-            cache_modifier=_SYSTEM_CACHE,
+            cache_modifier=CACHE_SYSTEM,
         )
 
     def put_words(self, address, index, words):
@@ -128,9 +135,9 @@ class TaggedMailbox:
             values += [fx.Int32(word), self.tag]
         bo.buffer_store(
             fx.Vector.from_elements(values, fx.Int32),
-            _buffer_resource(address),
+            buffer_resource(address),
             index * 2,
-            cache_modifier=_SYSTEM_CACHE,
+            cache_modifier=CACHE_SYSTEM,
         )
 
     def poll(self, specs, batch=_TAGGED_POLL_MAX):
@@ -146,11 +153,11 @@ class TaggedMailbox:
             for address, index, count in specs:
                 loaded = fx.Vector(
                     bo.buffer_load(
-                        _buffer_resource(address),
+                        buffer_resource(address),
                         fx.Int32(index) * 2,
                         vec_width=2 * count,
                         dtype=T.i32,
-                        cache_modifier=_SYSTEM_CACHE,
+                        cache_modifier=CACHE_SYSTEM,
                     )
                 )
                 words += [loaded[item] for item in range(2 * count)]
@@ -177,11 +184,42 @@ def wait_lds_wave():
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
+def wave_uniform_i32(value):
+    """Broadcast an i32 value from the first lane of the wave."""
+    return fx.Int32(readfirstlane(T.i32, fx.Int32(value).ir_value()))
+
+
 def wave_uniform_i64(addr):
     v = fx.Uint64(addr)
     lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
     hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+
+
+def buffer_load_i32(address, index, cache_modifier=0):
+    """Load one i32 from a raw device address through a buffer resource."""
+    return fx.Int32(
+        bo.buffer_load(
+            buffer_resource(address),
+            index,
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+
+
+def load_i64_from_buffer(address, index):
+    """Load a wave-uniform i64 from two adjacent i32 buffer words."""
+    words = fx.Vector(
+        bo.buffer_load(
+            buffer_resource(address),
+            index * 2,
+            vec_width=2,
+            dtype=T.i32,
+        )
+    )
+    return wave_uniform_i64((fx.Int64(words[1]) << 32) | fx.Int64(fx.Uint32(words[0])))
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
