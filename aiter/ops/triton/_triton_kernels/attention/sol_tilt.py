@@ -51,7 +51,11 @@ def _sol_q_tile_absmax_kernel(
     cols = tl.arange(0, HEAD_DIM)
     live = rows[:, None] < seqlen
     x = tl.load(
-        q_ptr + b * stride_qb + h * stride_qh + rows[:, None] * stride_qs + cols[None, :],
+        q_ptr
+        + b * stride_qb
+        + h * stride_qh
+        + rows[:, None] * stride_qs
+        + cols[None, :],
         mask=live,
     )
     if ROTATE:
@@ -61,12 +65,19 @@ def _sol_q_tile_absmax_kernel(
         x = x.to(tl.float32)
     if HAS_SCALE:
         byte = tl.load(
-            scale_ptr + b * stride_sb + h * stride_sh + rows[:, None] * stride_ss + (cols // 32)[None, :],
+            scale_ptr
+            + b * stride_sb
+            + h * stride_sh
+            + rows[:, None] * stride_ss
+            + (cols // 32)[None, :],
             mask=live,
         )
         x = x * tl.exp2(byte.to(tl.float32) - 127.0)
     m = tl.max(tl.where(live, tl.abs(x), 0.0), 0)
-    tl.store(out_ptr + b * stride_ob + t * stride_ot + h * stride_oh + cols, m.to(out_ptr.dtype.element_ty))
+    tl.store(
+        out_ptr + b * stride_ob + t * stride_ot + h * stride_oh + cols,
+        m.to(out_ptr.dtype.element_ty),
+    )
 
 
 @triton.jit
@@ -90,12 +101,18 @@ def _sol_q_head_absmax_kernel(
     for t0 in range(0, tiles, TILE_CHUNK):
         t = t0 + tl.arange(0, TILE_CHUNK)
         tile = tl.load(
-            tile_ptr + b * stride_tb + t[:, None] * stride_tt + h * stride_th + cols[None, :],
+            tile_ptr
+            + b * stride_tb
+            + t[:, None] * stride_tt
+            + h * stride_th
+            + cols[None, :],
             mask=(t < tiles)[:, None],
             other=0.0,
         )
         m = tl.maximum(m, tl.max(tile.to(tl.float32), 0))
-    tl.store(out_ptr + b * stride_ob + h * stride_oh + cols, m.to(out_ptr.dtype.element_ty))
+    tl.store(
+        out_ptr + b * stride_ob + h * stride_oh + cols, m.to(out_ptr.dtype.element_ty)
+    )
 
 
 @triton.jit
@@ -154,7 +171,10 @@ def _sol_jensen_cap_kernel(
     if HAS_VAR_SCALE or EXPONENT_GAIN:
         scale = tl.load(var_scale_ptr + scale_off).to(tl.int32)
     if HAS_VAR_SCALE:
-        var = tl.reshape(var, [HEAD_DIM // 32, 32]) * tl.exp2(scale.to(tl.float32) - 127.0)[:, None]
+        var = (
+            tl.reshape(var, [HEAD_DIM // 32, 32])
+            * tl.exp2(scale.to(tl.float32) - 127.0)[:, None]
+        )
         var = tl.reshape(var, [HEAD_DIM])
     if HAS_DESCALE:
         qd = tl.load(q_descale_ptr).to(tl.float32)
@@ -167,14 +187,22 @@ def _sol_jensen_cap_kernel(
         t = t0 + tl.arange(0, TILE_CHUNK)
         live = t < tiles
         qm = tl.load(
-            qmax_ptr + b * stride_qb + t[:, None] * stride_qt + h * stride_qh + cols[None, :],
+            qmax_ptr
+            + b * stride_qb
+            + t[:, None] * stride_qt
+            + h * stride_qh
+            + cols[None, :],
             mask=live[:, None],
             other=0.0,
         ).to(tl.float32)
         j = tl.sum(qm * qm * var[None, :], 1)
         if HAS_MASK:
             exact = tl.load(
-                mask_ptr + b * stride_mb + h * stride_mh + t * stride_mt + n * stride_mn,
+                mask_ptr
+                + b * stride_mb
+                + h * stride_mh
+                + t * stride_mt
+                + n * stride_mn,
                 mask=live,
                 other=1,
             )
@@ -185,7 +213,10 @@ def _sol_jensen_cap_kernel(
     if EXPONENT_GAIN:
         shift = tl.floor(tl.log2(gain))
         gain = tl.exp2(shift)
-        tl.store(out_scale_ptr + scale_off, tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(tl.uint8))
+        tl.store(
+            out_scale_ptr + scale_off,
+            tl.minimum(tl.maximum(scale + shift.to(tl.int32), 0), 254).to(tl.uint8),
+        )
     else:
         tl.store(out_var_ptr + var_off, (var * gain).to(out_var_ptr.dtype.element_ty))
     tl.store(gain_ptr + b * stride_gb + n * stride_gn + h * stride_gh, gain)
@@ -213,7 +244,9 @@ def _orthonormalize(x, RANK: tl.constexpr, WIDTH: tl.constexpr, PASSES: tl.const
                 col = col - tl.sum(t * proj[None, :], 1)
                 g_col = tl.sum(g * col[None, :], 1)
             norm2 = tl.sum(col * g_col, 0)
-            col = tl.where(norm2 > 1e-5 * g_ii, col / tl.sqrt(tl.maximum(norm2, 1e-30)), 0.0)
+            col = tl.where(
+                norm2 > 1e-5 * g_ii, col / tl.sqrt(tl.maximum(norm2, 1e-30)), 0.0
+            )
             t = tl.where(rows[None, :] == i, col[:, None], t)
         x = tl.dot(x, t, input_precision="ieee")
     return x
@@ -267,8 +300,20 @@ def _sol_tilt_factor_kernel(
     dims = tl.arange(0, HEAD_DIM)
     slots = tl.arange(0, WIDTH)
 
-    kt = tl.load(k_ptr + b * stride_kb + h * stride_kh + rows[:, None] * stride_ks + dims[None, :])
-    vt = tl.load(v_ptr + b * stride_vb + h * stride_vh + rows[:, None] * stride_vs + dims[None, :])
+    kt = tl.load(
+        k_ptr
+        + b * stride_kb
+        + h * stride_kh
+        + rows[:, None] * stride_ks
+        + dims[None, :]
+    )
+    vt = tl.load(
+        v_ptr
+        + b * stride_vb
+        + h * stride_vh
+        + rows[:, None] * stride_vs
+        + dims[None, :]
+    )
     if TO_BF16:
         kt = kt.to(tl.bfloat16)
         vt = vt.to(tl.bfloat16)
@@ -277,7 +322,9 @@ def _sol_tilt_factor_kernel(
     ones = tl.full([16, BLOCK_N], 1.0, dtype=tl.float32).to(kt.dtype)
     sk = tl.dot(ones, kt)
     sv = tl.dot(ones, vt)
-    c = tl.dot(tl.trans(vt), kt) - tl.dot(tl.trans(sv), sk, input_precision="ieee") / (16 * BLOCK_N)
+    c = tl.dot(tl.trans(vt), kt) - tl.dot(tl.trans(sv), sk, input_precision="ieee") / (
+        16 * BLOCK_N
+    )
     norms = tl.sum(c * c, 1)
     c = c.to(tl.bfloat16)
     c_t = tl.trans(c)
@@ -288,10 +335,14 @@ def _sol_tilt_factor_kernel(
         norms = tl.where(dims == top, -1.0, norms)
         pick = tl.where((dims[:, None] == top) & (slots[None, :] == i), 1.0, pick)
     # Conditioning the start only needs one round; the last basis gets two.
-    x = _orthonormalize(tl.dot(c_t, pick.to(tl.bfloat16)), RANK, WIDTH, 1 if ITERS > 0 else 2)
+    x = _orthonormalize(
+        tl.dot(c_t, pick.to(tl.bfloat16)), RANK, WIDTH, 1 if ITERS > 0 else 2
+    )
     for it in tl.static_range(ITERS):
         y = tl.dot(c, x.to(tl.bfloat16))
-        x = _orthonormalize(tl.dot(c_t, y.to(tl.bfloat16)), RANK, WIDTH, 2 if it == ITERS - 1 else 1)
+        x = _orthonormalize(
+            tl.dot(c_t, y.to(tl.bfloat16)), RANK, WIDTH, 2 if it == ITERS - 1 else 1
+        )
 
     left = tl.dot(c, x.to(tl.bfloat16))
     qm = tl.load(qmax_ptr + b * stride_qb + h * stride_qh + dims).to(tl.float32)
@@ -302,7 +353,13 @@ def _sol_tilt_factor_kernel(
         fb = fb * tl.load(gain_ptr + b * stride_gb + n * stride_gn + h * stride_gh)
 
     live = slots[None, :] < RANK
-    off = slots[None, :] * stride_fr + b * stride_fb + n * stride_fn + h * stride_fh + dims[:, None]
+    off = (
+        slots[None, :] * stride_fr
+        + b * stride_fb
+        + n * stride_fn
+        + h * stride_fh
+        + dims[:, None]
+    )
     tl.store(a_ptr + off, fa, mask=live)
     tl.store(b_ptr + off, fb, mask=live)
     peak = peak_ptr + 2 * ((b * tl.num_programs(1) + h) * tl.num_programs(0) + n)
@@ -344,8 +401,12 @@ def _sol_tilt_shift_kernel(
     b_max = tl.zeros([BLOCK], dtype=tl.float32)
     for p0 in range(0, peaks, BLOCK):
         live = p0 + pairs < peaks
-        a_max = tl.maximum(a_max, tl.load(peak_ptr + 2 * (p0 + pairs), mask=live, other=0.0))
-        b_max = tl.maximum(b_max, tl.load(peak_ptr + 2 * (p0 + pairs) + 1, mask=live, other=0.0))
+        a_max = tl.maximum(
+            a_max, tl.load(peak_ptr + 2 * (p0 + pairs), mask=live, other=0.0)
+        )
+        b_max = tl.maximum(
+            b_max, tl.load(peak_ptr + 2 * (p0 + pairs) + 1, mask=live, other=0.0)
+        )
     a_top = tl.maximum(tl.max(a_max, 0), 1e-30)
     b_top = tl.max(b_max, 0)
     qd = tl.load(q_descale_ptr).to(tl.float32)
@@ -359,7 +420,9 @@ def _sol_tilt_shift_kernel(
     vshift = tl.ceil(tl.log2(b_peak / (vd * w_max * fmax * b_headroom)))
     vshift = tl.minimum(tl.maximum(vshift, -128.0), 127.0)
     b_unit = vd * w_max * tl.exp2(vshift)
-    tl.store(shift_ptr, (shift.to(tl.int32) & 0xFF) | ((vshift.to(tl.int32) & 0xFF) << 8))
+    tl.store(
+        shift_ptr, (shift.to(tl.int32) & 0xFF) | ((vshift.to(tl.int32) & 0xFF) << 8)
+    )
     tl.store(unit_ptr, fmax / a_top)
     tl.store(unit_ptr + 1, b_scale / b_unit)
 
@@ -397,8 +460,12 @@ def _sol_tilt_unit_kernel(
     b_max = tl.zeros([BLOCK], dtype=tl.float32)
     for p0 in range(0, peaks, BLOCK):
         live = p0 + pairs < peaks
-        a_max = tl.maximum(a_max, tl.load(peak_ptr + 2 * (p0 + pairs), mask=live, other=0.0))
-        b_max = tl.maximum(b_max, tl.load(peak_ptr + 2 * (p0 + pairs) + 1, mask=live, other=0.0))
+        a_max = tl.maximum(
+            a_max, tl.load(peak_ptr + 2 * (p0 + pairs), mask=live, other=0.0)
+        )
+        b_max = tl.maximum(
+            b_max, tl.load(peak_ptr + 2 * (p0 + pairs) + 1, mask=live, other=0.0)
+        )
     qd = tl.load(q_descale_ptr).to(tl.float32)
     kd = tl.load(k_descale_ptr).to(tl.float32)
     vd = tl.load(v_descale_ptr).to(tl.float32)
@@ -419,7 +486,14 @@ def _sol_tilt_unit_kernel(
 
 @triton.jit
 def _sol_tilt_valu_kernel(
-    unit_ptr, q_descale_ptr, k_descale_ptr, out_ptr, w_max, stride0, stride1, stride2,
+    unit_ptr,
+    q_descale_ptr,
+    k_descale_ptr,
+    out_ptr,
+    w_max,
+    stride0,
+    stride1,
+    stride2,
     STRIDES: tl.constexpr,
 ):
     """A code-score kernel's tilt parameters, from _sol_tilt_unit_kernel's units.
@@ -521,12 +595,19 @@ def _sol_tilt_pack_kernel(
         fb = tl.load(b_ptr + r * stride_fr + src, mask=live, other=0.0)
         if ROUND_K:
             fa = libdevice.nearbyint(fa)
-        tl.store(ext_k_ptr + (r + 1) * stride_er + ext, fa.to(ext_k_ptr.dtype.element_ty))
-        tl.store(ext_v_ptr + (r + 1) * stride_vr + ext_v, (fb * b_unit).to(ext_v_ptr.dtype.element_ty))
+        tl.store(
+            ext_k_ptr + (r + 1) * stride_er + ext, fa.to(ext_k_ptr.dtype.element_ty)
+        )
+        tl.store(
+            ext_v_ptr + (r + 1) * stride_vr + ext_v,
+            (fb * b_unit).to(ext_v_ptr.dtype.element_ty),
+        )
 
 
 @triton.jit
-def _sol_tilt_stack_kernel(plane0_ptr, planes_ptr, out_ptr, size, width, BLOCK: tl.constexpr):
+def _sol_tilt_stack_kernel(
+    plane0_ptr, planes_ptr, out_ptr, size, width, BLOCK: tl.constexpr
+):
     """Row p of out_ptr's (1 + rank, width) gets plane0 for p = 0, else plane p - 1 of planes.
 
     Each plane holds `size` elements of out_ptr's dtype; the rest of the row is left as it is.

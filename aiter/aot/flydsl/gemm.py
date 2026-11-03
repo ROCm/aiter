@@ -15,6 +15,7 @@ Supported kernel families:
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
+    - ``flydsl_blockscale_8w_*``                gfx950 8-wave FP32-scale GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
@@ -86,6 +87,15 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    KERNEL_PREFIX as BLOCKSCALE_8W_PREFIX,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    kernel_fits_shape as blockscale_kernel_fits_shape,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    kernels_by_name as blockscale_kernels_by_name,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
@@ -394,6 +404,12 @@ def parse_csv(csv_path: str):
             if params is not None:
                 params = dict(params)
                 params["kind"] = "8wave"
+        elif kernel_name.startswith(BLOCKSCALE_8W_PREFIX):
+            params = (
+                {"kind": "blockscale_8wave"}
+                if kernel_name in blockscale_kernels_by_name
+                else None
+            )
         elif kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
             params = parse_mxfp8_8wave_kernel_name(kernel_name)
             if params is not None:
@@ -429,7 +445,9 @@ def parse_csv(csv_path: str):
             if params is not None:
                 params = dict(params)
                 params["kind"] = (
-                    "a16w16_gfx1250" if params["target_gfx"] == "gfx1250" else "hgemm"
+                    "a16w16_gfx1250"
+                    if params["target_gfx"] in ("gfx1250", "gfx1250-strict")
+                    else "hgemm"
                 )
         else:
             params = None
@@ -625,7 +643,7 @@ def _compile_a16w16_gfx1250_to_cache(
 
     import torch
 
-    if target_gfx != "gfx1250":
+    if target_gfx not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"The FlyDSL gfx1250 A16W16 kernel only supports gfx1250, got {target_gfx}"
         )
@@ -803,6 +821,8 @@ def _compile_mxscale_preshuffle_to_cache(
     a_scale_layout: str,
     b_scale_layout: str,
     fused_split_k: bool = False,
+    prefetch: bool = False,
+    b_nt: bool = False,
     **kwargs,
 ):
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
@@ -858,28 +878,35 @@ def _compile_mxscale_preshuffle_to_cache(
         scales.append(torch.empty(shape, device=dev, dtype=torch.uint8))
     a_scale, b_scale = scales
 
+    # The fused split-K reduce picks its grid (l2_reduce) from M per launch: a
+    # runtime M off the CSV row's can take the other one, so compile both.
+    fused = fused_split_k and split_k > 1
     with compile_only_env():
-        flydsl_mxscale_preshuffle_gemm(
-            a,
-            b,
-            a_scale,
-            b_scale,
-            out,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            waves_per_eu=waves_per_eu,
-            xcd_swizzle=xcd_swizzle,
-            split_k=split_k,
-            stream=fx.Stream(0),
-            a_scale_block=a_scale_block,
-            b_scale_block=b_scale_block,
-            a_scale_layout=a_scale_layout,
-            b_scale_layout=b_scale_layout,
-            fused_split_k=fused_split_k,
-        )
+        for l2_reduce in (False, True) if fused else (None,):
+            flydsl_mxscale_preshuffle_gemm(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                waves_per_eu=waves_per_eu,
+                xcd_swizzle=xcd_swizzle,
+                split_k=split_k,
+                stream=fx.Stream(0),
+                a_scale_block=a_scale_block,
+                b_scale_block=b_scale_block,
+                a_scale_layout=a_scale_layout,
+                b_scale_layout=b_scale_layout,
+                fused_split_k=fused_split_k,
+                prefetch=prefetch,
+                b_nt=b_nt,
+                l2_reduce=l2_reduce,
+            )
 
 
 def _compile_8wave_to_cache(
@@ -951,6 +978,44 @@ def _compile_mxfp8_8wave_to_cache(
     )
     # The 8-wave launcher takes (A, B, C, ...), as _compile_8wave_to_cache.
     _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
+
+
+def _compile_blockscale_8wave_to_cache(
+    *,
+    kernel_name: str,
+    m: int,
+    n: int,
+    k: int,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    from aiter.ops.flydsl.gemm_a8w8_blockscale import _compile_gemm
+
+    ki = blockscale_kernels_by_name.get(kernel_name)
+    if ki is None or not blockscale_kernel_fits_shape(ki, m, n, k, target_gfx):
+        raise ValueError(
+            f"Unsupported FlyDSL blockscale config: {kernel_name} "
+            f"M={m}, N={n}, K={k}, gfx={target_gfx}"
+        )
+
+    dev = torch.device("cpu")
+    a = torch.empty((m, k), device=dev, dtype=torch.int8)
+    b = torch.empty((n, k), device=dev, dtype=torch.int8)
+    scale_a = torch.empty((m * (k // 128),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty(
+        (((n + 127) // 128) * (k // 128),), device=dev, dtype=torch.float32
+    )
+    # Share the runtime factory, including opt_level=2 and the fixed pipeline
+    # flags. The -1 host-cache slot cannot collide with a live device index.
+    # A tuned row has no output-dtype key, so precompile both public outputs.
+    for out_dtype in (torch.bfloat16, torch.float16):
+        out = torch.empty((m, n), device=dev, dtype=out_dtype)
+        exe = _compile_gemm(n, k, kernel_name, -1, out_dtype)
+        _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, fx.Stream(0))
 
 
 def _compile_bmm_mfma_to_cache(
@@ -1245,6 +1310,15 @@ def compile_one_config(
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "blockscale_8wave":
+                _compile_blockscale_8wave_to_cache(
+                    kernel_name=kernel_name,
+                    m=m,
+                    n=n,
+                    k=k,
+                    target_gfx=aot_arch,
+                    **kwargs,
+                )
             elif kind == "mxfp8_8wave":
                 _compile_mxfp8_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_wmma":

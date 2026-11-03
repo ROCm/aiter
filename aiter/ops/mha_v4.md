@@ -5,7 +5,7 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 and MXFP6 on GFX950.
 - BF16 BSHD output.
 - Dense, sorted block-sparse, and Sol-Attn inference.
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
@@ -41,6 +41,9 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 GFX942 ships BF16/BF16, BF16/FP8, and per-tensor FP8/FP8 and INT8/FP8, each in all three modes.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
+
+Head dimension 256 exists only for all-MXFP4 and all-MXFP6 Q/K/V, dense, on GFX950. Every other
+recipe, sorted sparse, and GFX942 reject it.
 
 ## Ownership
 
@@ -133,6 +136,14 @@ calling `mha_v4_packed`.
 
 MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Each 128-token tile
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
+
+At head dimension 256 the MXFP4 producers run the hd128 kernels on a `[B, S, 2H, 128]` view, so
+each tile carries twice the data and scale bytes and the slack doubles to 128 bytes. The Hadamard
+acts on each 128-wide half independently, which keeps it orthogonal and Q.K^T unchanged.
+
+hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers each pair of 128-token
+hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
+tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
 
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
@@ -227,8 +238,9 @@ call. The order changes only scheduling, and the output is bitwise identical eit
 
 ## Validation
 
-Run `pytest op_tests/test_mha_v4.py op_tests/test_mha_v4_sparse.py` for entrypoint changes, and
-`op_tests/triton_tests/attention/test_sol_prepare.py` for Sol-Attn routing or pooling. Quantizer/layout changes additionally
+Run `python3 op_tests/test_mha_v4.py` and `python3 op_tests/test_mha_v4_sparse.py` for entrypoint
+changes; CI runs them as scripts, not under pytest. Sol-Attn routing or pooling changes also need
+`pytest op_tests/triton_tests/attention/test_sol_prepare.py`. Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
