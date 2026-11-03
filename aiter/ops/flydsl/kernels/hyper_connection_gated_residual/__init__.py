@@ -3,9 +3,9 @@
 """Two-stage Gated-Residual (Hyper-Connections) ``combine_and_mix``.
 
 The public fused two-stage kernel and its shared numerical reference.
-``K1`` fuses combine + grouped-RMSNorm + down; ``K2`` fuses silu + up + gated
-mean and re-forms ``xn`` from ``r2`` on the fly, so ``xn``/``gate`` never touch
-HBM. The operator runs as a K1+K2 pair, with an additional K1 reduction when
+``K1`` fuses combine + grouped-RMSNorm + down, applying SiLU in its K
+reduction; ``K2`` fuses up + gated mean and re-forms ``xn`` from ``r2`` on the
+fly, so ``xn``/``gate`` never touch HBM. The operator runs as a K1+K2 pair, with an additional K1 reduction when
 required by its split-K or decoupled schedule.
 """
 

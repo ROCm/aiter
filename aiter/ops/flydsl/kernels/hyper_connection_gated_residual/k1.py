@@ -40,12 +40,16 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
+    check_norm_weight,
+    check_tensor,
     mfma_bf16,
     norm_weight_f32,
+    stream_scope,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
@@ -339,26 +343,22 @@ def _build_down_norm_pipe(
             load_b(stage, stage)
             load_a(stage, stage)
             rocdl.asyncmark()
-        # These unstable FlyDSL primitives are required to order async
-        # global-to-LDS copies against MFMA operations.
-        rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles - (stages - 1)
         for k_tile in range(main_loop_end):
             current_stage = k_tile % stages
             write_stage = (current_stage + stages - 1) % stages
             rocdl.wait_asyncmark(stages - 2)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             load_b(k_tile + (stages - 1), write_stage)
             load_a(k_tile + (stages - 1), write_stage)
             rocdl.asyncmark()
             compute_stage(current_stage, k_tile)
-            rocdl.sched_barrier(0)
 
         current_stage = main_loop_end % stages
         for s in range_constexpr(stages - 1):
             rocdl.wait_asyncmark(stages - 2 - s)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             compute_stage(current_stage, main_loop_end + s)
             current_stage = (current_stage + 1) % stages
 
@@ -676,26 +676,22 @@ def _build_down_norm_partial_pipe(
             load_b(k_base + stage, stage)
             load_a(k_base + stage, stage)
             rocdl.asyncmark()
-        # These unstable FlyDSL primitives are required to order async
-        # global-to-LDS copies against MFMA operations.
-        rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles_local - (stages - 1)
         for kt in range(main_loop_end):
             current_stage = kt % stages
             write_stage = (current_stage + stages - 1) % stages
             rocdl.wait_asyncmark(stages - 2)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             load_b(k_base + kt + (stages - 1), write_stage)
             load_a(k_base + kt + (stages - 1), write_stage)
             rocdl.asyncmark()
             compute_stage(current_stage, k_base + kt)
-            rocdl.sched_barrier(0)
 
         current_stage = main_loop_end % stages
         for s in range_constexpr(stages - 1):
             rocdl.wait_asyncmark(stages - 2 - s)
-            rocdl.s_barrier()
+            fx.gpu.barrier()
             compute_stage(current_stage, k_base + main_loop_end + s)
             current_stage = (current_stage + 1) % stages
 
@@ -957,11 +953,41 @@ def _decode_reduce_params(total: int):
     return 1, 1
 
 
-# Select the two-kernel skinny implementation unless diagnostics disable it.
+# Temporary rollback switch for diagnosing the two-kernel skinny implementation.
+# It is not a supported tuning knob and may be removed once the path is proven.
 _SKINNY_TWO_KERNEL = os.environ.get("AITER_GR_SKINNY_TWO_KERNEL", "1") == "1"
 # Chunked partial stores keep the two-kernel path within its register budget
 # through M=8. The unchunked fallback is limited to M=4.
 DECODE_MAX_M = 8 if _SKINNY_TWO_KERNEL else 4
+
+
+@lru_cache(maxsize=64)
+def skinny_decode_supported(
+    hidden: int,
+    n_pad: int,
+    hc_count: int,
+    lowrank: int,
+    split_k_per_stream: int = 2,
+    waves_per_block: int = 4,
+) -> bool:
+    """Whether :func:`flydsl_k1k2_skinny_decode` can build kernels for this shape.
+
+    The op checks this before dispatch and otherwise uses the tiled path.
+    """
+    if _SKINNY_TWO_KERNEL:
+        from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.skinny import (
+            skinny_supported,
+        )
+
+        return skinny_supported(hidden, n_pad, hc_count, lowrank, waves_per_block)
+    stream_dim = hidden // hc_count
+    return (
+        n_pad % waves_per_block == 0
+        and stream_dim % split_k_per_stream == 0
+        and (stream_dim // split_k_per_stream) % WAVE == 0
+        and stream_dim % waves_per_block == 0
+        and lowrank % WAVE == 0
+    )
 
 
 def flydsl_k1k2_skinny_decode(
@@ -989,7 +1015,44 @@ def flydsl_k1k2_skinny_decode(
     ``xn = r2*rrms`` with **no** ``(1+w)`` multiply -- so passing an unfolded merged
     weight here produces silently wrong output (no shape/dtype tripwire catches it).
     The op only routes here when ``fold_w=True``; do not call it directly otherwise.
+
+    Inputs must satisfy :func:`validate_k1_inputs`; the op checks them before
+    dispatch. ``block_output=None`` normalizes ``residual`` without a combine.
     """
+    ctx, stream = stream_scope(stream, residual.device)
+    with ctx:
+        return _skinny_decode(
+            residual,
+            block_output,
+            injection,
+            norm_weight,
+            w_up,
+            w_down_merged,
+            lowrank,
+            hc_count,
+            eps,
+            need_inj,
+            split_k_per_stream,
+            waves_per_block,
+            stream,
+        )
+
+
+def _skinny_decode(
+    residual,
+    block_output,
+    injection,
+    norm_weight,
+    w_up,
+    w_down_merged,
+    lowrank,
+    hc_count,
+    eps,
+    need_inj,
+    split_k_per_stream,
+    waves_per_block,
+    stream,
+):
     from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
         _build_reduce_silu,
     )
@@ -997,29 +1060,15 @@ def flydsl_k1k2_skinny_decode(
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
-    # The combine+RMS prologue reads residual and block_output as contiguous
-    # row-major; the injection may be a column slice (unit inner stride).
-    assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
-    assert block_output.dtype == torch.bfloat16 and block_output.is_contiguous()
-    assert injection.dtype == torch.bfloat16 and injection.stride(-1) == 1
-    inj_stride = injection.stride(0) if tokens > 1 else hc_count
-    # Folding cannot be checked numerically here; enforce its dtype and layout
-    # requirements so incompatible weights fail early.
-    assert (
-        w_down_merged.dtype == torch.bfloat16 and w_down_merged.is_contiguous()
-    ), "skinny decode needs a bf16 contiguous merged down weight"
-    assert w_down_merged.shape == (
-        n_pad,
-        hidden,
-    ), f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
+    combine = block_output is not None
+    # The injection may be a column slice of the previous packed output.
+    inj_stride = injection.stride(0) if combine and tokens > 1 else hc_count
     skinny_reads_bf16 = (
         _SKINNY_TWO_KERNEL
         and norm_weight.dtype == torch.bfloat16
         and norm_weight.is_contiguous()
     )
     w = norm_weight.reshape(-1) if skinny_reads_bf16 else norm_weight_f32(norm_weight)
-    if stream is None:
-        stream = torch.cuda.current_stream()
     if _SKINNY_TWO_KERNEL:
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.skinny import (
             skinny_chunked_two_kernel,
@@ -1047,7 +1096,11 @@ def flydsl_k1k2_skinny_decode(
         inj_next = packed[:, lowrank : lowrank + hc_count] if need_inj else None
         return r2, x, inj_next
     dev = residual.device
-    r2 = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+    r2 = (
+        torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+        if combine
+        else residual
+    )
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
     nb = hc_count * split_k_per_stream
     partial = torch.empty(nb * tokens, n_pad, dtype=torch.float32, device=dev)
@@ -1055,8 +1108,15 @@ def flydsl_k1k2_skinny_decode(
     x = torch.empty(tokens, stream_dim, dtype=torch.bfloat16, device=dev)
 
     pro = _build_combine_rms(
-        hc_count, stream_dim, float(eps), 0 if inj_stride == hc_count else inj_stride
+        hc_count,
+        stream_dim,
+        float(eps),
+        0 if inj_stride == hc_count else inj_stride,
+        combine=combine,
+        write_r2=combine,
     )
+    if not combine:
+        block_output = injection = residual
     gd = _build_down_gemv_partial(
         hidden, n_pad, hc_count, stream_dim, tokens, split_k_per_stream, waves_per_block
     )
@@ -1086,12 +1146,23 @@ def flydsl_k1k2_skinny_decode(
 
 
 @lru_cache(maxsize=16)
-def _build_combine_rms(hc_count: int, stream_dim: int, eps: float, inj_stride: int = 0):
+def _build_combine_rms(
+    hc_count: int,
+    stream_dim: int,
+    eps: float,
+    inj_stride: int = 0,
+    combine: bool = True,
+    write_r2: bool = True,
+):
     """Prologue for the split-K K1 path: combine + per-stream RMS, emit r2 + rrms.
 
     Writes the combined residual ``r2`` and per-stream reciprocal RMS values.
-    The following GEMM reconstructs ``xn`` while loading A.
+    The following GEMM reconstructs ``xn`` while loading A. ``combine=False``
+    normalizes ``residual`` as-is (``block_output``/``injection`` are unread);
+    ``write_r2=False`` then skips the copy when the GEMM reads ``residual``.
     """
+    assert combine or inj_stride == 0
+    assert write_r2 or not combine
     hidden = hc_count * stream_dim
     assert stream_dim % (WAVE * CHUNK) == 0
     chunks = stream_dim // (WAVE * CHUNK)
@@ -1102,9 +1173,10 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float, inj_stride: i
     # the logits as a column slice of the previous down-GEMM output.
     istride = inj_stride or hc_count
     stride_tag = f"_is{istride}" if inj_stride else ""
+    mode_tag = "" if combine else ("_rms_copy" if write_r2 else "_rms")
 
     @flyc.kernel(
-        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}",
+        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}{mode_tag}",
         known_block_size=[WAVE, 1, 1],
     )
     def kernel(
@@ -1123,20 +1195,28 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float, inj_stride: i
         r2 = GTensor(r2_out, T.bf16, (1, hidden))
         rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
 
-        inj_val = fx.BFloat16(inj.load(tok * istride + stream, vec_size=1)).to(
-            fx.Float32
-        )
-        gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
+        if const_expr(combine):
+            inj_val = fx.BFloat16(inj.load(tok * istride + stream, vec_size=1)).to(
+                fx.Float32
+            )
+            gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
         row_r = tok * hidden + stream * stream_dim
         row_y = tok * stream_dim
         sq = fx.Float32(0.0)
         for c in range_constexpr(chunks):
             off = c * (WAVE * CHUNK) + tid * CHUNK
-            rv = fx.Vector(r.load(row_r + off, vec_size=CHUNK)).to(fx.Float32)
-            yv = fx.Vector(y.load(row_y + off, vec_size=CHUNK)).to(fx.Float32)
-            comb = [rv[i] + yv[i] * gate for i in range_constexpr(CHUNK)]
-            comb_bf16 = fx.Vector.from_elements(comb, dtype=fx.Float32).to(fx.BFloat16)
-            r2.store(row_r + off, comb_bf16)
+            r_raw = r.load(row_r + off, vec_size=CHUNK)
+            if const_expr(combine):
+                rv = fx.Vector(r_raw).to(fx.Float32)
+                yv = fx.Vector(y.load(row_y + off, vec_size=CHUNK)).to(fx.Float32)
+                comb = [rv[i] + yv[i] * gate for i in range_constexpr(CHUNK)]
+                comb_bf16 = fx.Vector.from_elements(comb, dtype=fx.Float32).to(
+                    fx.BFloat16
+                )
+            else:
+                comb_bf16 = fx.Vector(r_raw)
+            if const_expr(write_r2):
+                r2.store(row_r + off, comb_bf16)
             comb_r = comb_bf16.to(fx.Float32)
             for i in range_constexpr(CHUNK):
                 sq = sq + comb_r[i] * comb_r[i]
@@ -1430,20 +1510,156 @@ def flydsl_k1_combine_norm_down(
     the raw next-injection logits (slice with
     :func:`~...common.split_down_inject`).
     """
-    assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
-    assert block_output.dtype == torch.bfloat16 and block_output.is_contiguous()
-    assert injection.dtype == torch.bfloat16 and injection.is_contiguous()
-    assert w_dn_merged.dtype == torch.bfloat16 and w_dn_merged.is_contiguous()
+    validate_k1_inputs(
+        residual, block_output, injection, norm_weight, w_dn_merged, lowrank, hc_count
+    )
+    ctx, stream = stream_scope(stream, residual.device)
+    with ctx:
+        return _k1_combine_norm_down(
+            residual,
+            block_output,
+            injection,
+            norm_weight,
+            w_dn_merged,
+            lowrank,
+            hc_count,
+            eps,
+            stream,
+            r2_out=r2_out,
+            out=out,
+            rrms_out=rrms_out,
+            block_m=block_m,
+            block_k=block_k,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            stages=stages,
+            split_k=split_k,
+            dn_block_n=dn_block_n,
+            dn_block_m=dn_block_m,
+            dn_m_waves=dn_m_waves,
+            dn_n_waves=dn_n_waves,
+            sk_block_m=sk_block_m,
+            fold_w=fold_w,
+            gemm_pad=gemm_pad,
+            use_tuned=use_tuned,
+        )
+
+
+def validate_k1_inputs(
+    residual: torch.Tensor,
+    block_output: torch.Tensor | None,
+    injection: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    w_dn_merged: torch.Tensor,
+    lowrank: int,
+    hc_count: int,
+) -> None:
+    """Shape/dtype/layout contract shared by the skinny and tiled K1 paths.
+
+    ``block_output``/``injection`` are ``None`` for the no-combine (mix-only)
+    variant. ``injection`` may be a column slice with unit inner stride.
+    """
+    if residual.ndim != 2 or residual.dtype != torch.bfloat16:
+        raise ValueError("residual must be a 2-D bf16 tensor")
+    if not residual.is_contiguous():
+        raise ValueError("residual must be row-major contiguous")
+    tokens, hidden = residual.shape
+    if hc_count <= 0 or hidden % hc_count:
+        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
+    stream_dim = hidden // hc_count
+    dev = residual.device
+    if (block_output is None) != (injection is None):
+        raise ValueError("block_output and injection must both be given or omitted")
+    if block_output is not None:
+        check_tensor("block_output", block_output, (tokens, stream_dim), dev)
+        check_tensor("injection", injection, (tokens, hc_count), dev, contiguous=False)
+        if injection.stride(-1) != 1:
+            raise ValueError("injection must have a contiguous inner dimension")
+    check_norm_weight(norm_weight, stream_dim, hidden, dev)
+    if w_dn_merged.ndim != 2:
+        raise ValueError("w_dn_merged must be 2-D")
+    n_pad = w_dn_merged.shape[0]
+    check_tensor("w_dn_merged", w_dn_merged, (n_pad, hidden), dev)
+    if n_pad < lowrank:
+        raise ValueError(f"w_dn_merged has {n_pad} rows < lowrank={lowrank}")
+
+
+@lru_cache(maxsize=256)
+def _k1_tuned_plan(arch, gemm_tokens, n_pad, hidden, stream_dim):
+    """Tuned K1 plan, or ``None`` when the entry cannot tile this shape.
+
+    The table is keyed by token count and packed width only, so an entry
+    measured for one hidden size may not divide another.
+    """
+    plan = k1_plan(arch, gemm_tokens, n_pad)
+    if plan is None:
+        return None
+    block_k = int(plan.get("block_k", 64))
+    if hidden % block_k or stream_dim % block_k:
+        return None
+    k_tiles = hidden // block_k
+    stages = int(plan.get("stages", 2))
+    if plan.get("method") != "decouple":
+        split_k = int(plan.get("split_k", 1))
+        if k_tiles % split_k or k_tiles // split_k < stages - 1:
+            return None
+    return plan
+
+
+def _k1_combine_norm_down(
+    residual: torch.Tensor,
+    block_output: torch.Tensor | None,
+    injection: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    w_dn_merged: torch.Tensor,
+    lowrank: int,
+    hc_count: int,
+    eps: float,
+    stream: int,
+    r2_out: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    rrms_out: torch.Tensor | None = None,
+    block_m: int | None = None,
+    block_k: int | None = None,
+    m_waves: int = 1,
+    n_waves: int = 4,
+    stages: int | None = None,
+    split_k: int | str = "auto",
+    dn_block_n: int | None = None,
+    dn_block_m: int | None = None,
+    dn_m_waves: int | None = None,
+    dn_n_waves: int | None = None,
+    sk_block_m: int | None = None,
+    fold_w: bool = False,
+    gemm_pad: int | None = None,
+    use_tuned: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K1 body for validated inputs; ``stream`` is the raw handle of the current stream.
+
+    ``block_output=None`` skips the combine: ``residual`` is normalized as-is
+    and returned as ``r2`` when no row padding is needed.
+    """
+    combine = block_output is not None
     tokens, hidden = residual.shape
     n_pad = w_dn_merged.shape[0]
     # GEMM stages use padded rows, but the combine prologue reads only real
     # tokens. Padded outputs are independent per row and are discarded.
     assert gemm_pad is None or gemm_pad >= tokens, "gemm_pad must be >= tokens"
     gemm_tokens = tokens if gemm_pad is None else gemm_pad
+    if gemm_tokens == 0:
+        return (
+            residual.new_empty(0, hidden) if r2_out is None else r2_out,
+            residual.new_empty(0, n_pad) if out is None else out,
+        )
     # Configuration precedence is explicit argument, tuned plan, then heuristic.
     # Use the padded token count because it determines the GEMM launch shape.
     arch = arch_name(residual.device)
-    plan = k1_plan(arch, gemm_tokens, n_pad) if use_tuned else None
+    stream_dim = hidden // hc_count
+    plan = (
+        _k1_tuned_plan(arch, gemm_tokens, n_pad, hidden, stream_dim)
+        if use_tuned
+        else None
+    )
     if stages is None:
         stages = int(plan.get("stages", 2)) if plan is not None else 2
     # Async-LDS loads require at least 32 rows for whole-thread coverage.
@@ -1452,7 +1668,8 @@ def flydsl_k1_combine_norm_down(
         block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
     # gfx942 uses 32-bit async loads, so split-K uses register prefetch to avoid
     # multiplying load instructions. Other architectures use the async pipeline.
-    # GR_FORCE_PIPE enables the gfx942 pipeline for diagnostics.
+    # GR_FORCE_PIPE is a temporary diagnostic rollback switch, not a supported
+    # tuning knob.
     _gfx942_regp_partial = arch == "gfx942" and not os.environ.get("GR_FORCE_PIPE")
     _plan_sk_block_m = None
     if plan is not None:
@@ -1486,6 +1703,11 @@ def flydsl_k1_combine_norm_down(
             sk_block_m = 32
         else:
             sk_block_m = block_m
+    # Split-K stores are not row-masked. A nearest-neighbour tuned plan can
+    # select a tile height that does not divide a direct caller's token count.
+    if gemm_tokens % sk_block_m:
+        sk_block_m = 64 if gemm_tokens % 64 == 0 else block_m
+    assert gemm_tokens % sk_block_m == 0
     if split_k == "auto":
         split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles)
     use_splitk = isinstance(split_k, int) and split_k > 1
@@ -1497,15 +1719,7 @@ def flydsl_k1_combine_norm_down(
             f"async-LDS pipeline (stages={stages}) needs block_m*block_k >= "
             f"block_threads*async_vec; got block_m={block_m}, block_k={block_k}"
         )
-    stream_dim = hidden // hc_count
-    assert w_dn_merged.shape == (n_pad, hidden)
-    assert block_output.shape == (tokens, stream_dim)
-    assert injection.shape == (tokens, hc_count)
     w_len = norm_weight.numel()
-    assert w_len in (
-        stream_dim,
-        hidden,
-    ), f"norm_weight must be [{stream_dim}] (shared) or [{hidden}], got {w_len}"
     assert (
         gemm_tokens % block_m == 0
     ), f"gemm_tokens={gemm_tokens} must be a multiple of block_m={block_m}"
@@ -1515,7 +1729,12 @@ def flydsl_k1_combine_norm_down(
     # is never read by the down GEMM. Avoid launching a bf16->f32 conversion
     # whose result would only be passed through as an unused kernel argument.
     w = norm_weight if fold_w else norm_weight_f32(norm_weight)
-    if r2_out is None:
+    # Without a combine, the GEMM can read the residual itself unless it needs
+    # padded rows past the caller's allocation.
+    reuse_residual = not combine and r2_out is None and gemm_tokens == tokens
+    if reuse_residual:
+        r2_out = residual
+    elif r2_out is None:
         r2_out = torch.empty(
             gemm_tokens, hidden, dtype=residual.dtype, device=residual.device
         )
@@ -1523,8 +1742,23 @@ def flydsl_k1_combine_norm_down(
         out = torch.empty(
             gemm_tokens, n_pad, dtype=torch.bfloat16, device=residual.device
         )
-    if stream is None:
-        stream = torch.cuda.current_stream()
+    inj_stride = injection.stride(0) if combine and tokens > 1 else hc_count
+    prologue = _build_combine_rms(
+        hc_count,
+        stream_dim,
+        float(eps),
+        0 if inj_stride == hc_count else inj_stride,
+        combine=combine,
+        write_r2=not reuse_residual,
+    )
+    # The no-combine prologue never reads block_output/injection; any tensor
+    # satisfies the launch signature.
+    prologue_args = (
+        residual,
+        block_output if combine else residual,
+        injection if combine else residual,
+        r2_out,
+    )
 
     # K2 needs per-stream reciprocal RMS values to reconstruct xn from r2.
     def _rrms_buf():
@@ -1552,7 +1786,6 @@ def flydsl_k1_combine_norm_down(
         partial = torch.empty(
             split_k * gemm_tokens, n_pad, dtype=torch.float32, device=residual.device
         )
-        prologue = _build_combine_rms(hc_count, stream_dim, float(eps))
         # N-tiling increases parallelism on large grids. A tuned width may not
         # divide the final mixer's narrower output, so require exact divisibility.
         if dn_block_n is not None and n_pad % dn_block_n == 0:
@@ -1606,16 +1839,13 @@ def flydsl_k1_combine_norm_down(
         vec = 4 if total % (256 * 4) == 0 else 2
         reduce = _build_reduce_silu(total, split_k, lowrank, n_pad, hc_count, 256, vec)
         fx_stream = fx.Stream(stream)
-        _run_compiled(
-            prologue, residual, block_output, injection, r2_out, rrms, fx_stream
-        )
+        _run_compiled(prologue, *prologue_args, rrms, fx_stream)
         _run_compiled(part, r2_out, rrms, w, w_dn_merged, partial, fx_stream)
         _run_compiled(reduce, partial, out, fx_stream)
         return r2_out, out
 
     if use_decouple:
         rrms = _rrms_buf()
-        prologue = _build_combine_rms(hc_count, stream_dim, float(eps))
         # N-tiling trades smaller LDS panels and more workgroups for repeated r2
         # reads. Explicit or tuned dimensions override these fallback choices.
         _dn_bn = dn_block_n
@@ -1637,7 +1867,7 @@ def flydsl_k1_combine_norm_down(
             aux_lds += ((_dn_bm * hc_count * 4 + 15) // 16) * 16
             fixed_lds = stages * _dn_bm * block_k * 2 + aux_lds
             bytes_per_n = stages * block_k * 2
-            max_block_n = (64 * 1024 - fixed_lds) // bytes_per_n
+            max_block_n = (get_lds_capacity_bytes(arch) - fixed_lds) // bytes_per_n
             if _dn_bn > max_block_n:
                 _dn_bn = _decouple_block_n(n_pad, min(_dn_bn, max_block_n))
             assert _dn_bn <= max_block_n, "decoupled K1 exceeds gfx942 LDS capacity"
@@ -1664,9 +1894,7 @@ def flydsl_k1_combine_norm_down(
             fold_w=fold_w,
         )
         fx_stream = fx.Stream(stream)
-        _run_compiled(
-            prologue, residual, block_output, injection, r2_out, rrms, fx_stream
-        )
+        _run_compiled(prologue, *prologue_args, rrms, fx_stream)
         _run_compiled(downpipe, r2_out, rrms, w, w_dn_merged, out, fx_stream)
         return r2_out, out
 

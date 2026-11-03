@@ -409,6 +409,53 @@ def atomic_add_agent(addr_i64, val):
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
 
 
+def _av_scope(syncscope):
+    return _llvm_d.MetadataAsValueOp(
+        ir.Attribute.parse(f'#llvm.md_node<#llvm.md_string<"{syncscope}">>')
+    ).result
+
+
+def av_store_b128(addr_i64, val, syncscope="agent"):
+    """Store-available 128-bit global store at ``syncscope``.
+
+    ``llvm.amdgcn.av.store.b128`` makes the payload available at the given
+    scope by itself, which is what an ``amdgcn-av:none`` release relies on.
+    The scope operand must be an MD node wrapping the scope string.
+    """
+    v4i32 = ir.VectorType.get([4], T.i32)
+    data = _llvm_d.BitcastOp(v4i32, arith.unwrap(val)).res
+    _llvm_d.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_to_ptr_global(addr_i64), data, _av_scope(syncscope)],
+        [],
+        [],
+    )
+
+
+def atomic_add_agent_acq_rel_av_none(addr_i64, val):
+    """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
+
+    ``!mmra !{"amdgcn-av", "none"}`` removes the release's make-available and
+    the acquire's make-visible steps (no ``buffer_wbl2``/``buffer_inv``); the
+    RMW still synchronizes. Callers must provide payload availability and
+    visibility independently through AV accesses or a documented
+    target-specific cache-policy protocol.
+    """
+    op = _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_global(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.acq_rel,
+        syncscope=fx.rocdl.SyncScope.Agent,
+        alignment=4,
+    )
+    op.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
+    return op.res
+
+
 def atomic_add_agent_one_as(addr_i64, val):
     """Agent-one-as monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.AgentOneAs)
