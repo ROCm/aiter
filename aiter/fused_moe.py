@@ -2273,6 +2273,8 @@ def fused_moe_router_supported(
         # every expert", which is the same as no grouping at all.
         and num_expert_group == 1
         and topk_group == 1
+        and not doweight_stage1
+        and 1 <= topk
         and topk + n_shared <= FUSED_MOE_ROUTER_MAX_TOPK
         # Mirror the entry's expert-count checks. topk is global, so it goes
         # against global_E; only the shared rows live in this rank's w1.
