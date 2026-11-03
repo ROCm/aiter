@@ -171,6 +171,7 @@ def compute_tile(
     TRANSPOSE_B: gl.constexpr,
     ACC_DTYPE: gl.constexpr,
     C_ALIAS: gl.constexpr,
+    C_OFFSET_64: gl.constexpr,
     KTAIL: gl.constexpr,
     TOKENS: gl.constexpr,
 ):
@@ -274,8 +275,22 @@ def compute_tile(
         # The TDM engine must finish reading LDS before the next tile refills the ring.
         gl.amd.cdna5.tdm.async_wait(0)
     else:
-        offs_m = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA))
-        offs_n = off_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA))
-        offs_c = stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-        mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        gl.store(c_ptr + offs_c, acc.to(c_ptr.type.element_ty), mask=mask_c)
+        rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA))
+        cols = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA))
+        mask_c = ((off_m + rows)[:, None] < M) & ((off_n + cols)[None, :] < N)
+        if C_OFFSET_64:
+            # C holds more than 2**31 elements, so an absolute index overflows int32 and drops
+            # every store past it. Rebase to this tile in int64 and index inside it in int32.
+            # The host gates this: 64-bit address maths costs up to 18% on this store, so a C
+            # that cannot overflow must keep the int32 form.
+            c_base = (
+                c_ptr + off_m.to(gl.int64) * stride_cm + off_n.to(gl.int64) * stride_cn
+            )
+            offs_c = stride_cm * rows[:, None] + stride_cn * cols[None, :]
+            gl.store(c_base + offs_c, acc.to(c_ptr.type.element_ty), mask=mask_c)
+        else:
+            offs_c = (
+                stride_cm * (off_m + rows)[:, None]
+                + stride_cn * (off_n + cols)[None, :]
+            )
+            gl.store(c_ptr + offs_c, acc.to(c_ptr.type.element_ty), mask=mask_c)
