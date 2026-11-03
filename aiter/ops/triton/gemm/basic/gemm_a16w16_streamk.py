@@ -13,6 +13,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.layouts import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -20,10 +21,58 @@ _LOGGER = AiterTritonLogger()
 
 _SUPPORTED_ARCHS = ("gfx1250",)
 
+# wmma takes 16-bit operands and accumulates in fp32.
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+_OPERAND_BYTES = 2
 
-@functools.lru_cache(maxsize=8)
-def _num_cus(device_index):
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+# Floors for a remainder sub-tile. These are hardware widths, not tuned values, so they stay
+# here and not in the config, like TDM_PAD_INTERVAL_MAX in _gluon_kernels/gfx1250/layouts.py.
+# A TDM transfer and the aliased C store want a 128-byte row, which is 64 elements of a 16-bit
+# operand. Below that the row halves to 64 bytes: a per-CTA N of 32 measured -11.2% against 64
+# at an equal sub-tile area and an equal sub-tile count, while 128 against 64 measured -0.3%.
+_SPLIT_FLOOR_N = 128 // _OPERAND_BYTES
+# M only has to fill the warp grid, and a per-CTA M of 32 measures well.
+_SPLIT_FLOOR_M = 32
+
+
+def _plan_k_pipeline(K, BLOCK_K, num_buffers):
+    """Depth of the K pipeline, and whether its steady loop runs at all.
+
+    Returns `(num_k_tiles, num_buffers, steady_nonempty)`. The steady loop needs a full ring
+    before it runs, so the depth clamps to the K tile count, but it keeps a floor of 2. One K
+    tile therefore leaves the steady loop empty, and the kernel must not then state that its
+    trip count is above 0: that is UB, and it miscompiles the whole kernel. The unit test calls
+    this too, so a shape meant to cover the empty loop cannot quietly stop covering it.
+    """
+    num_k_tiles = triton.cdiv(K, BLOCK_K)
+    num_buffers = max(2, min(num_buffers, num_k_tiles))
+    steady_nonempty = 1 if num_k_tiles - (num_buffers - 1) > 0 else 0
+    return num_k_tiles, num_buffers, steady_nonempty
+
+
+def _plan_tiles(M, N, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
+    """Map a shape onto the workers: how many tiles, how many workers, what the remainder gets.
+
+    Returns `(num_tiles, num_sms, streamk_tiles, split_m, split_n)`. `streamk_tiles` is 0 when
+    phase 2 does not run. The unit test calls this too, so the test cannot drift from the
+    dispatch that the launch really uses.
+    """
+    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    # get_num_sms honors the CU_NUM override, which is also what the config dispatch keys on,
+    # so the worker count stays consistent with the selected config.
+    num_sms = min(get_num_sms() // (CTAS_M * CTAS_N), num_tiles)
+
+    # The tiles left over after the whole waves. There is nothing to balance until the machine
+    # holds at least one full wave, so a shape with too few tiles gets zero.
+    streamk_tiles = 0 if num_tiles <= num_sms else num_tiles % num_sms
+    split_m, split_n = _pick_split(
+        streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
+    )
+    if split_m * split_n == 1:
+        streamk_tiles = (
+            0  # one sub-tile for each tile is the phase-1 path, keep it there
+        )
+    return num_tiles, num_sms, streamk_tiles, split_m, split_n
 
 
 def _pick_split(streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
@@ -33,11 +82,8 @@ def _pick_split(streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
     and the aliased C store. A sub-tile must stay divisible by the cluster and keep enough
     elements for each CTA on the axis that it splits.
 
-    The two axes have different floors. M needs 32, which is what the warp grid needs. N needs
-    64, because a per-CTA N of 32 makes a bf16 row of only 64 bytes, and both the TDM transfer
-    and the C store want 128. At an equal sub-tile area and an equal sub-tile count, a per-CTA
-    N of 32 measured -11.2% against 64, while 128 against 64 measured -0.3%. The floor is
-    therefore a cliff at 32, not a preference for a wide N.
+    The two axes have different floors, `_SPLIT_FLOOR_M` and `_SPLIT_FLOOR_N`. Both come from a
+    hardware width; see the comment where they are set.
     """
     sm, sn = 1, 1
     if not streamk_tiles:
@@ -49,9 +95,13 @@ def _pick_split(streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
     # Split only while the sub-tiles still fit ONE wave. Going past num_sms turns one partly
     # idle wave into two full ones of half-size tiles, which is slower: at 12 left-over tiles on
     # 16 workers a 2x split gives 24 sub-tiles, so 1 wave becomes 2 and the shape loses 6%.
-    while streamk_tiles * sm * sn * 2 <= num_sms and ok(BLOCK_M, sm * 2, CTAS_M, 32):
+    while streamk_tiles * sm * sn * 2 <= num_sms and ok(
+        BLOCK_M, sm * 2, CTAS_M, _SPLIT_FLOOR_M
+    ):
         sm *= 2
-    while streamk_tiles * sm * sn * 2 <= num_sms and ok(BLOCK_N, sn * 2, CTAS_N, 64):
+    while streamk_tiles * sm * sn * 2 <= num_sms and ok(
+        BLOCK_N, sn * 2, CTAS_N, _SPLIT_FLOOR_N
+    ):
         sn *= 2
     return sm, sn
 
@@ -112,10 +162,21 @@ def gemm_a16w16_streamk_(
     assert x.shape[1] == w.shape[1], f"incompatible shapes {x.shape} and {w.shape}"
     assert x.stride(1) == 1, f"x must be row major (M, K), got strides {x.stride()}"
 
+    # wmma is built for 16-bit operands, so an unsupported dtype must stop here. Without this
+    # check it reaches the layout builders and fails with a compiler message about tt.dot.
+    assert x.dtype in _SUPPORTED_DTYPES, f"x must be fp16 or bf16, got {x.dtype}"
+    assert w.dtype in _SUPPORTED_DTYPES, f"w must be fp16 or bf16, got {w.dtype}"
+    assert (
+        x.dtype == w.dtype
+    ), f"x and w must share a dtype, got {x.dtype} and {w.dtype}"
+
     M, K = x.shape
     N = w.shape[0]
     if dtype is None:
         dtype = x.dtype
+    assert dtype in _SUPPORTED_DTYPES + (
+        torch.float32,
+    ), f"the output must be fp16, bf16 or fp32, got {dtype}"
 
     cfg = deserialize_str(config) if config else None
     if cfg is None:
@@ -150,30 +211,28 @@ def gemm_a16w16_streamk_(
         )
     stride_bk, stride_bn = w_t.stride(0), w_t.stride(1)
 
-    # The steady loop needs a full ring before it runs, so clamp the depth to the K tile count.
-    num_k_tiles = triton.cdiv(K, BLOCK_K)
-    NUM_BUFFERS = max(2, min(NUM_BUFFERS, num_k_tiles))
+    _, NUM_BUFFERS, STEADY_NONEMPTY = _plan_k_pipeline(K, BLOCK_K, NUM_BUFFERS)
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
+    else:
+        # The kernel writes a whole (M, N) tile grid, so a y that is too small is overrun. The
+        # TDM store also addresses C by row, which needs a unit stride on N.
+        assert tuple(y.shape) == (
+            M,
+            N,
+        ), f"y must be ({M}, {N}), got {tuple(y.shape)}"
+        assert y.dtype == dtype, f"y must be {dtype}, got {y.dtype}"
+        assert y.device == x.device, f"y must be on {x.device}, got {y.device}"
+        assert y.stride(1) == 1, f"y must be row major (M, N), got strides {y.stride()}"
 
     wmma, dot_a, dot_b, shared_a, shared_b = _build_layouts(
         BLOCK_M, BLOCK_N, BLOCK_K, (CTAS_M, CTAS_N), num_warps, TRANSPOSE_B
     )
 
-    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    NUM_SMS = min(_num_cus(x.device.index) // num_ctas, num_tiles)
-
-    # StreamK remainder: the tiles left over after the whole waves. There is nothing to balance
-    # until the machine holds at least one full wave, so a shape with too few tiles gets zero.
-    STREAMK_TILES = 0 if num_tiles <= NUM_SMS else num_tiles % NUM_SMS
-    SPLIT_M, SPLIT_N = _pick_split(
-        STREAMK_TILES, NUM_SMS, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
+    num_tiles, NUM_SMS, STREAMK_TILES, SPLIT_M, SPLIT_N = _plan_tiles(
+        M, N, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
     )
-    if SPLIT_M * SPLIT_N == 1:
-        STREAMK_TILES = (
-            0  # one sub-tile for each tile is the phase-1 path, so keep it there
-        )
     rem = (
         _build_layouts(
             BLOCK_M // SPLIT_M,
@@ -190,6 +249,11 @@ def gemm_a16w16_streamk_(
 
     # KTAIL is decided here, from the real K, so only one drain path is compiled.
     KTAIL = 1 if (K % BLOCK_K) == (BLOCK_K // 2) else 0
+
+    # The masked C store indexes C by an absolute element offset, which overflows int32 past
+    # 2**31 elements. Switch that store to a 64-bit base only when C can reach it: the 64-bit
+    # address maths costs up to 18% on this path.
+    C_OFFSET_64 = 1 if (M - 1) * y.stride(0) + (N - 1) * y.stride(1) >= 2**31 else 0
 
     _LOGGER.info("GEMM_A16W16_STREAMK [gluon/gfx1250]: x=%s w=%s", x.shape, w.shape)
 
@@ -225,6 +289,8 @@ def gemm_a16w16_streamk_(
         CTAS_N=CTAS_N,
         GROUP_SIZE_M=GROUP_SIZE_M,
         KTAIL=KTAIL,
+        STEADY_NONEMPTY=STEADY_NONEMPTY,
+        C_OFFSET_64=C_OFFSET_64,
         STREAMK_TILES=STREAMK_TILES,
         SPLIT_M=SPLIT_M,
         SPLIT_N=SPLIT_N,
