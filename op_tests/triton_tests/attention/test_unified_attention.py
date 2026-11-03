@@ -1416,6 +1416,8 @@ def test_unified_attn_non_causal(
         [(4, 8704)] * 3 + [(4, 40)],
         # prefill and mixed batches
         [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
+        # max_seqlen_k <= 512 selects the 2D kernel; the batches above take 3D
+        [(1, 15), (12, 133), (100, 345), (512, 512)],
     ],
 )
 @pytest.mark.parametrize(
