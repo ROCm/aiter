@@ -577,13 +577,13 @@ def main(argv=None):
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
     arch = get_gfx_runtime()
-    if arch not in ("gfx942", "gfx950", "gfx1250"):
+    if arch not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
         )
     if args.value_dim != args.head_dim and arch not in ("gfx942", "gfx950"):
         raise ValueError("asymmetric PA decode tuning requires gfx942/gfx950")
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         if args.head_dim != 64 and args.head_dim % 128:
             raise ValueError("gfx1250 head-dim must be 64 or a multiple of 128")
     elif args.kv_dtype == "bf16" and (args.query_dtype != "bf16" or not args.trans_v):
