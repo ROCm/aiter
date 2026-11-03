@@ -129,8 +129,16 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--rot-bufs-target-mb",
         type=positive_int,
-        default=256,
-        help="rotating buffers target size in MB",
+        default=None,
+        help="rotating buffers target size in MB (default: a fixed value per "
+        "device arch, see RotatingBufferBench._default_target_rot_pool_sz_mb)",
+    )
+    parser.add_argument(
+        "--rot-bufs-max-gpu-mem-mb",
+        type=positive_int,
+        default=None,
+        help="cap on the rotating pool's total real device-memory footprint, "
+        "in MB (default: 90%% of currently free device memory)",
     )
     parser.add_argument(
         "--rot-bufs-print-info",
@@ -143,7 +151,8 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
 
 
 def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
-    """do_bench_aiter_triton kwargs from the --graph-* flags added by get_parser()."""
+    """RotatingBufferBench.bench/bench_synced kwargs from the --graph-* flags
+    added by get_parser()."""
     return {
         "warmup_iters": args.graph_warmup_iters,
         "warmup_replays": args.graph_warmup_replays,
@@ -153,16 +162,25 @@ def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
 
 
 def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
-    """generate_rotating_buffers_pool kwargs from the --rot-bufs-* flags and added by get_parser().
-    Note: max_pool_len is set to --graph-kernels-per-graph
+    """RotatingBufferBench.from_dict kwargs from the --rot-bufs-* flags added
+    by get_parser().
+    Note: max_pool_len is set to --graph-kernels-per-graph; the MB-valued
+    --rot-bufs-max-gpu-mem-mb flag is converted to GB here for
+    total_pool_sz_gb.
     """
     return {
-        "target_mb": args.rot_bufs_target_mb,
+        "target_rot_pool_sz_mb": args.rot_bufs_target_mb,
+        "total_pool_sz_gb": (
+            args.rot_bufs_max_gpu_mem_mb / 1024
+            if args.rot_bufs_max_gpu_mem_mb is not None
+            else None
+        ),
         "min_pool_len": args.rot_bufs_min_pool_len,
         "print_info": args.rot_bufs_print_info,
         # By default keep the rotating buffer pool length <= graph_kernels_per_graph
-        # Otherwise, in case per-set bytes are too small, then covering target_mb might
-        # blow up the pool_len. This is not ideal for capturing graph
+        # Otherwise, in case per-set bytes are too small, then covering
+        # target_rot_pool_sz_mb might blow up the pool_len. This is not ideal
+        # for capturing graph
         "max_pool_len": args.graph_kernels_per_graph,
     }
 
