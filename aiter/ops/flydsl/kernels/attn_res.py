@@ -46,12 +46,14 @@ _ALLOWED_GFX = ("gfx942", "gfx950")
 # and never read back.
 _STORE_CACHE_MODIFIER = 2
 _SMALL_D_ROWS_PER_WG = 1
-# Extra block sources kept outstanding during consume_source. Value 3 means
-# sources i+1, i+2, i+3 are already issued when reducing source i. Prefix is
-# already resident and is not prefetched.
+# Block-source loads issued ahead of the source being consumed; the prefix is
+# already in registers.
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _clear_caches().
 _SOURCE_GROUP_SIZE = 2
+# One-wave rows reduce this many sources together; more sources hold more registers.
+# Changing this constant requires _clear_caches().
+_ONE_WAVE_GROUP_SIZE = 2
 # Multi-wave rows when T exceeds the CU count.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
@@ -339,7 +341,7 @@ def _build_attn_res(spec: _AttnResSpec):
     # slower that way at large T.
     mix_only = not (has_add or close_block or output_norm)
     if red_slots == 1:
-        group_size = 1
+        group_size = _ONE_WAVE_GROUP_SIZE
     elif wide_grid:
         group_size = _WIDE_SOURCE_GROUP_SIZE
     elif mix_only:
@@ -430,6 +432,13 @@ def _build_attn_res(spec: _AttnResSpec):
                         partial_index(buf, 4 * register) + row * wave_stride + wave,
                     )
 
+        def uniform_value(registers, value, values_per_register, lanes_per_value):
+            register, row = divmod(value, values_per_register)
+            bits = registers[register].bitcast(fx.Int32)
+            return fx.Int32(
+                fx.rocdl.readlane(T.i32, bits, row * lanes_per_value)
+            ).bitcast(fx.Float32)
+
         def finish_group_reduce(n_members, buf):
             is_wave = wave_slot < red_slots
             totals = []
@@ -440,22 +449,32 @@ def _build_attn_res(spec: _AttnResSpec):
                 totals.append(
                     _row_reduce_f32(is_wave.select(partial, zero), wave_stride, fm_fast)
                 )
+            return [
+                tuple(
+                    uniform_value(totals, 2 * slot + kind, values_per_reg, wave_stride)
+                    for kind in range(2)
+                )
+                for slot in range(n_members)
+            ]
 
-            def total(value):
-                register, row = divmod(value, values_per_reg)
-                bits = totals[register].bitcast(fx.Int32)
-                return fx.Int32(
-                    fx.rocdl.readlane(T.i32, bits, row * wave_stride)
-                ).bitcast(fx.Float32)
-
-            return [(total(2 * slot), total(2 * slot + 1)) for slot in range(n_members)]
-
-        def block_reduce_add2(sumsq_local, dot_local, buf):
+        def reduce_group(pairs, buf):
             if const_expr(red_slots == 1):
-                return store_reduce(sumsq_local), store_reduce(dot_local)
-            store_group_partials([(sumsq_local, dot_local)], buf)
+                totals = _wave_sum_batched(
+                    [value for pair in pairs for value in pair],
+                    lane,
+                    fm_fast,
+                    native_swap,
+                )
+                return [
+                    tuple(
+                        uniform_value(totals, 2 * slot + kind, 4, _ROW_LANES)
+                        for kind in range(2)
+                    )
+                    for slot in range(len(pairs))
+                ]
+            store_group_partials(pairs, buf)
             fx.gpu.barrier()
-            return finish_group_reduce(1, buf)[0]
+            return finish_group_reduce(len(pairs), buf)
 
         def block_reduce(value, value_index, buf, op):
             if const_expr(red_slots == 1):
@@ -671,65 +690,41 @@ def _build_attn_res(spec: _AttnResSpec):
                     new_mixed.append(old_mixed[tile] * old_scale + value * new_scale)
                 return new_max, new_denominator, new_mixed
 
-            def consume_source(values_local, old_max, old_denominator, old_mixed, buf):
-                """One-wave path: full reduce in registers, then softmax."""
-                thread_sumsq, thread_dot = local_sumsq_dot(values_local)
-                sumsq, dot = block_reduce_add2(thread_sumsq, thread_dot, buf)
-                return update_softmax(
-                    values_local, sumsq, dot, old_max, old_denominator, old_mixed
-                )
-
-            if const_expr(red_slots == 1 or num_sources == 1):
-                for source in range_constexpr(num_blocks):
-                    if const_expr(source + prefetch_in_flight < num_blocks):
-                        in_flight.append(
-                            issue_block_source(source + prefetch_in_flight)
-                        )
-                    source_local = take_block_source(source)
-                    max_logit, denominator, mixed_local = consume_source(
-                        source_local, max_logit, denominator, mixed_local, source % 2
+            # Group G independent reductions behind one barrier (none on one-wave
+            # rows). Softmax updates stay in source order. Block sources stay in
+            # bf16 across the barrier; the reconvert for the mix is lossless.
+            for group in range_constexpr(num_groups):
+                start = group * group_size
+                n_members = min(group_size, num_sources - start)
+                buf = group % 2
+                group_local = []
+                group_partials = []
+                for slot in range_constexpr(n_members):
+                    src = start + slot
+                    if const_expr(src == prefix_slot):
+                        source_local = prefix_local
+                    else:
+                        block = src - first_block_slot
+                        if const_expr(block + prefetch_in_flight < num_blocks):
+                            in_flight.append(
+                                issue_block_source(block + prefetch_in_flight)
+                            )
+                        source_local = take_block_source(block)
+                    group_partials.append(local_sumsq_dot(source_local))
+                    group_local.append(source_local)
+                group_sums = reduce_group(group_partials, buf)
+                for slot in range_constexpr(n_members):
+                    sumsq, dot = group_sums[slot]
+                    max_logit, denominator, mixed_local = update_softmax(
+                        group_local[slot],
+                        sumsq,
+                        dot,
+                        max_logit,
+                        denominator,
+                        mixed_local,
                     )
-                max_logit, denominator, mixed_local = consume_source(
-                    prefix_local, max_logit, denominator, mixed_local, num_blocks % 2
-                )
-            else:
-                # Group G independent reductions behind one barrier. Softmax
-                # updates stay in source order. Block sources stay in bf16
-                # across the barrier; the reconvert for the mix is lossless.
-                for group in range_constexpr(num_groups):
-                    start = group * group_size
-                    n_members = min(group_size, num_sources - start)
-                    buf = group % 2
-                    group_local = []
-                    group_partials = []
-                    for slot in range_constexpr(n_members):
-                        src = start + slot
-                        if const_expr(src == prefix_slot):
-                            source_local = prefix_local
-                        else:
-                            block = src - first_block_slot
-                            if const_expr(block + prefetch_in_flight < num_blocks):
-                                in_flight.append(
-                                    issue_block_source(block + prefetch_in_flight)
-                                )
-                            source_local = take_block_source(block)
-                        group_partials.append(local_sumsq_dot(source_local))
-                        group_local.append(source_local)
-                    store_group_partials(group_partials, buf)
-                    fx.gpu.barrier()
-                    group_sums = finish_group_reduce(n_members, buf)
-                    for slot in range_constexpr(n_members):
-                        sumsq, dot = group_sums[slot]
-                        max_logit, denominator, mixed_local = update_softmax(
-                            group_local[slot],
-                            sumsq,
-                            dot,
-                            max_logit,
-                            denominator,
-                            mixed_local,
-                        )
-                    if const_expr(wide_grid):
-                        pin_registers(mixed_local)
+                if const_expr(wide_grid):
+                    pin_registers(mixed_local)
 
             # Use the LDS half the last group did not touch, so epilogue writes
             # cannot race waves still reading it.
