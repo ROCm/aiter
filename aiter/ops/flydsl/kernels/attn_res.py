@@ -125,8 +125,15 @@ def _wave_reduce_to_one_lane_f32(value, fastmath, op: str = "add"):
     return fx.Int32(fx.rocdl.readlane(T.i32, bits, 63)).bitcast(fx.Float32)
 
 
-def _has_permlane_swap() -> bool:
+def _has_gfx950_ops() -> bool:
+    """Whether the target has the permlane swaps and the packed BF16 dot product."""
     return get_gfx_runtime() == "gfx950"
+
+
+def _bf16_dot2(a, b, accumulator):
+    return fx.Float32(
+        fx.rocdl.fdot2_f32_bf16_(T.f32, a, b, accumulator.ir_value(), clamp=False)
+    )
 
 
 def _exchange_halves(a, b, offset: int, lane, native: bool):
@@ -349,7 +356,7 @@ def _build_attn_res(spec: _AttnResSpec):
     if red_slots > _ROW_LANES:
         raise ValueError(f"at most {_ROW_LANES} waves per row, got {red_slots}")
 
-    native_swap = _has_permlane_swap()
+    native_ops = _has_gfx950_ops()
     # Alternate buffers per group so the next group's writes need no second
     # barrier. Waves pad to a power of two so a DPP row reduce over wave_stride
     # lanes sums one value.
@@ -418,7 +425,7 @@ def _build_attn_res(spec: _AttnResSpec):
 
         def store_group_partials(pairs, buf):
             totals = _wave_sum_batched(
-                [value for pair in pairs for value in pair], lane, fm_fast, native_swap
+                [value for pair in pairs for value in pair], lane, fm_fast, native_ops
             )
             if lane % _ROW_LANES == 0:
                 row = lane // _ROW_LANES
@@ -460,7 +467,7 @@ def _build_attn_res(spec: _AttnResSpec):
                     [value for pair in pairs for value in pair],
                     lane,
                     fm_fast,
-                    native_swap,
+                    native_ops,
                 )
                 return [
                     tuple(
@@ -619,7 +626,7 @@ def _build_attn_res(spec: _AttnResSpec):
                 if const_expr(has_add2):
                     add2_div = row_of(fx.rocdl.make_buffer_tensor(add_hidden2), token)
             for tile in range_constexpr(tiles_per_thread):
-                q_local.append(load_bf16_vec(score_weight_div, tile).to(fx.Float32))
+                q_local.append(load_bf16_vec(score_weight_div, tile))
                 prefix_value = load_bf16_vec(prefix_div, tile)
                 if const_expr(has_add):
                     prefix_value = prefix_value.to(fx.Float32) + load_bf16_vec(
@@ -650,17 +657,25 @@ def _build_attn_res(spec: _AttnResSpec):
             max_logit = neg_inf
             denominator = zero
 
-            def local_sumsq_dot(values_local):
+            def local_sumsq_dot(values_local, is_bf16):
                 thread_sumsq = zero
                 thread_dot = zero
                 for tile in range_constexpr(tiles_per_thread):
-                    value = values_local[tile].to(fx.Float32)
-                    thread_sumsq = thread_sumsq + (value * value).reduce(
-                        ReductionOp.ADD, fastmath=fm_fast
-                    )
-                    thread_dot = thread_dot + (value * q_local[tile]).reduce(
-                        ReductionOp.ADD, fastmath=fm_fast
-                    )
+                    if const_expr(native_ops and is_bf16):
+                        for pair in range_constexpr(tile_widths[tile] // 2):
+                            mask = [2 * pair, 2 * pair + 1]
+                            value = values_local[tile].shuffle(values_local[tile], mask)
+                            q = q_local[tile].shuffle(q_local[tile], mask)
+                            thread_sumsq = _bf16_dot2(value, value, thread_sumsq)
+                            thread_dot = _bf16_dot2(value, q, thread_dot)
+                    else:
+                        value = values_local[tile].to(fx.Float32)
+                        thread_sumsq = thread_sumsq + (value * value).reduce(
+                            ReductionOp.ADD, fastmath=fm_fast
+                        )
+                        thread_dot = thread_dot + (
+                            value * q_local[tile].to(fx.Float32)
+                        ).reduce(ReductionOp.ADD, fastmath=fm_fast)
                 return thread_sumsq, thread_dot
 
             def update_softmax(
@@ -718,7 +733,11 @@ def _build_attn_res(spec: _AttnResSpec):
                                 issue_block_source(block + prefetch_in_flight)
                             )
                         source_local = take_block_source(block)
-                    group_partials.append(local_sumsq_dot(source_local))
+                    group_partials.append(
+                        local_sumsq_dot(
+                            source_local, not (has_add and src == prefix_slot)
+                        )
+                    )
                     group_local.append(source_local)
                 max_logit, denominator, mixed_local = update_softmax(
                     group_local,

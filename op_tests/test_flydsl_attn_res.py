@@ -401,15 +401,14 @@ def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
 @pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8), ids=str)
-def test_flydsl_attn_res_without_permlane_swap(monkeypatch, hidden_size: int, cfg):
-    """The shuffle fallback for targets without ``v_permlane*_swap`` gives the same results."""
-    monkeypatch.setattr(attn_res_kernel, "_has_permlane_swap", lambda: False)
-    attn_res_kernel._build_attn_res.cache_clear()
+def test_flydsl_attn_res_without_gfx950_ops(monkeypatch, hidden_size: int, cfg):
+    monkeypatch.setattr(attn_res_kernel, "_has_gfx950_ops", lambda: False)
+    attn_res_kernel._clear_caches()
     try:
         for tokens in (1, 17, _num_cus() + 1):
             _run_and_check(tokens, _MAX_BLOCKS - 1, cfg, hidden_size=hidden_size)
     finally:
-        attn_res_kernel._build_attn_res.cache_clear()
+        attn_res_kernel._clear_caches()
 
 
 def _invalid_call(case: str):
