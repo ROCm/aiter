@@ -15,14 +15,19 @@ from aiter.utility.dtypes import fp8
 
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
-# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
-# 2048. RCCL is faster above that.
+# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes inputs up to 8 MiB.
+# RCCL is faster above that; hidden 6144 uses an internally padded 8192-wide tile.
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
+
+
+def _supports_gluon_fused_ar_hidden(hidden: int) -> bool:
+    """The Gluon row tile is native power-of-two, with one masked 6144 case."""
+    return hidden >= 256 and (hidden & (hidden - 1) == 0 or hidden == 6144)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -337,14 +342,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         total_bytes = input_.numel() * input_.element_size()
         if (
             self.gluon_ar is not None
+            and total_bytes > 0
             and total_bytes <= _GLUON_AR_MAX_BYTES
             and input_.dim() == 2
             and input_n == n
-            and n >= 256
-            and n & (n - 1) == 0
+            and _supports_gluon_fused_ar_hidden(n)
             and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
             and input_.is_contiguous()
             and res_inp_.is_contiguous()
+            and weight_.is_contiguous()
             and x_pad_to_multiple == 0
         ):
             from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
@@ -532,6 +538,45 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
+        gluon_ar = getattr(self, "gluon_ar", None)
+        # Decode-sized gfx1250 TP4 messages bypass the CA/QR split paths: Gluon
+        # owns the collective, Gemma RMSNorm, and per-token FP8 in one launch.
+        if (
+            quant_type == "per_token"
+            and gluon_ar is not None
+            and total_bytes > 0
+            and total_bytes <= _GLUON_AR_MAX_BYTES
+            and input_.dim() == 2
+            and _supports_gluon_fused_ar_hidden(hidden_dim)
+            and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+            and res_inp_.shape == input_.shape
+            and weight_.shape == (hidden_dim,)
+            and input_.is_contiguous()
+            and res_inp_.is_contiguous()
+            and weight_.is_contiguous()
+            and res_inp_.device == input_.device
+            and weight_.device == input_.device
+        ):
+            from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+                all_reduce_rmsnorm_quant,
+            )
+
+            result = all_reduce_rmsnorm_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                True,
+                self.cpu_group,
+                *gluon_ar,
+                per_token_quant=True,
+                return_norm=emit_bf16,
+            )
+            if emit_bf16:
+                bf16_out, res_out, out, scale_out = result
+                return out, res_out, scale_out, bf16_out
+            return result
         # gfx1250 fuses only above the 4 MiB LL range, so the old-arch default
         # would rule its fused kernel out; bound it like the unquantized path.
         default_quant_bytes = (
