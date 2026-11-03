@@ -114,7 +114,7 @@ def compile_pa_decode_ps_reduce(
     groups = parallel_groups
     if groups < 1 or groups & (groups - 1):
         raise ValueError(f"parallel_groups must be a power of two, got {groups}")
-    if groups > 1 and not dual and architecture != "gfx1250":
+    if groups > 1 and not dual and architecture not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(f"parallel_groups > 1 requires NP > {register_partitions}")
     if groups * group_waves > max_cta_waves:
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
@@ -154,7 +154,11 @@ def compile_pa_decode_ps_reduce(
     reverse_pair = not dual and partitions > 32
     # Groups tile whole wave-sized weight chunks, so their slots stay in range.
     weight_chunks = -(-partitions // wave)
-    split = min(groups, SPLIT_GROUPS) if architecture == "gfx1250" else 1
+    split = (
+        min(groups, SPLIT_GROUPS)
+        if architecture in ("gfx1250", "gfx1250-strict")
+        else 1
+    )
     split_rows = 1
     for rung in high_rungs + dual_rungs:
         per = -(-rung // split)
@@ -282,7 +286,9 @@ def compile_pa_decode_ps_reduce(
             unit = urem_const(worker, group_waves) * c_wave + lane
         else:
             unit = fx.thread_idx.x
-        if fx.const_expr(architecture == "gfx1250" and (dual or groups > 1)):
+        if fx.const_expr(
+            architecture in ("gfx1250", "gfx1250-strict") and (dual or groups > 1)
+        ):
             storage = fx.SharedAllocator().allocate(SharedStorage).peek()
 
         def _zero():
@@ -582,7 +588,7 @@ def compile_pa_decode_ps_reduce(
                         ladder_acc = _bottom_first(dual_rungs, _reduce_register, unit)
                         _store(ladder_acc, unit)
             else:
-                if fx.const_expr(architecture == "gfx1250"):
+                if fx.const_expr(architecture in ("gfx1250", "gfx1250-strict")):
                     lds_acc = _top_first(lds_rungs, _reduce_lds_rung, unit, groups)
                 else:
                     lds_acc = _reduce_lds()
@@ -646,7 +652,7 @@ def compile_pa_decode_ps_reduce(
             stream=stream,
         )
 
-    if architecture == "gfx1250":
+    if architecture in ("gfx1250", "gfx1250-strict"):
         # All 108 argument bytes preload into user SGPRs, so the first load
         # is reduce_info.
         launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {

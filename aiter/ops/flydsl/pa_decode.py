@@ -116,7 +116,11 @@ def launch_pa_decode_ps_reduce(
     )
     ctas = batch * kv_heads * rows
     groups, num_xcds = 1, 0
-    if not dual and arch == "gfx1250" and partitions > SPLIT_PARTITIONS:
+    if (
+        not dual
+        and arch in ("gfx1250", "gfx1250-strict")
+        and partitions > SPLIT_PARTITIONS
+    ):
         # Register rungs above 16 partitions split their loads over groups,
         # within the same wave budget as the dual-mode CTA.
         group_waves = head_size // wave // (2 if pairs else 1)
@@ -135,7 +139,7 @@ def launch_pa_decode_ps_reduce(
         budget = max_cta_waves * props.multi_processor_count
         max_groups = max_cta_waves // group_waves
         if head_size == 128 and exp_sums.shape[1] <= DUAL_REGISTER_PARTITIONS * batch:
-            max_groups = SPLIT_GROUPS if arch == "gfx1250" else 1
+            max_groups = SPLIT_GROUPS if arch in ("gfx1250", "gfx1250-strict") else 1
         while 2 * groups <= max_groups and 2 * groups * group_waves * ctas <= budget:
             groups *= 2
         per_seq = rows * kv_heads
@@ -693,7 +697,7 @@ def pa_decode(
     cluster_merge = (
         max_partitions
         if (
-            arch == "gfx1250"
+            arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
             and sinks is None
             and output.stride() == query.stride()
@@ -795,7 +799,7 @@ def pa_decode(
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     merge_args = ()
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
         merge_args = (
             ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
