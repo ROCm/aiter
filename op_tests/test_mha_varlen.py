@@ -777,7 +777,7 @@ def test_varlen_flash_attn_seq_padding(
         batch_size, -1
     ) < torch.tensor(k_actual_lens, device=device).unsqueeze(1)
 
-    dout = torch.randn_like(q, dtype=q.dtype, device=device)
+    dout = torch.randn(*q.shape[:-1], d_v, dtype=q.dtype, device=device)
     out_ck, dq_ck, dk_ck, dv_ck = run_ck_seq_padding(
         q,
         k,
