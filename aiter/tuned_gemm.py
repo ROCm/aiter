@@ -295,7 +295,7 @@ def get_GEMM_A16W16_config(
             # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
             # since they are matched before this fallback is reached.
             if (
-                gfx == "gfx1250"
+                gfx in ("gfx1250", "gfx1250-strict")
                 and not scaleAB
                 and eval(dtype) in (dtypes.bf16, dtypes.fp16)
             ):
@@ -419,9 +419,11 @@ def _gemm_a16w16(
     otype = otype if otype is not None else inp_view.dtype
     if out is not None and out.dtype != otype:
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
-    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
 
     gfx, cu_num = _device_arch_and_cu(inp_view.device)
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx, cu_num = get_gfx(), get_cu_num()
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
