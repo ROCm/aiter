@@ -49,8 +49,6 @@ _SMALL_D_ROWS_PER_WG = 1
 # Block-source loads issued ahead of the source being consumed; the prefix is
 # already in registers.
 _SOURCE_PREFETCH_IN_FLIGHT = 3
-# Changing this constant requires _clear_caches().
-_SOURCE_GROUP_SIZE = 3
 # Multi-wave rows when T exceeds the CU count.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
@@ -342,16 +340,7 @@ def _build_attn_res(spec: _AttnResSpec):
     prefetch_in_flight = min(prefetch, max(num_blocks - 1, 0))
     prefix_slot = 0 if wide_grid else num_blocks
     first_block_slot = 1 if wide_grid else 0
-    # One-wave rows have no cross-wave barrier. Mix-only rows put every source
-    # behind one barrier; rows with adds, block stores, or output norm are
-    # slower that way at large T.
-    mix_only = not (has_add or close_block or output_norm)
-    if wide_grid:
-        group_size = _WIDE_SOURCE_GROUP_SIZE
-    elif red_slots == 1 or mix_only:
-        group_size = num_sources
-    else:
-        group_size = _SOURCE_GROUP_SIZE
+    group_size = _WIDE_SOURCE_GROUP_SIZE if wide_grid else num_sources
     num_groups = (num_sources + group_size - 1) // group_size
     if red_slots > _ROW_LANES:
         raise ValueError(f"at most {_ROW_LANES} waves per row, got {red_slots}")
