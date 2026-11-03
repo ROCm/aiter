@@ -1,0 +1,13 @@
+"Correlation_Id","Dispatch_Id","Agent_Id","Queue_Id","Process_Id","Thread_Id","Grid_Size","Kernel_Id","Kernel_Name","Workgroup_Size","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"
+43,43,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",74549.593750,42281394419718,42281394581720
+44,44,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18575.062500,42281395989350,42281396150912
+45,45,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18560.062500,42281397540595,42281397698511
+46,46,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18546.156250,42281399077097,42281399234733
+47,47,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18550.437500,42281400623334,42281400781451
+48,48,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18543.906250,42281402173618,42281402332616
+51,51,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18580.750000,42281452576112,42281452739958
+52,52,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18533.718750,42281454124913,42281454283230
+53,53,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18576.500000,42281455665342,42281455823419
+54,54,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18538.343750,42281457211339,42281457369896
+55,55,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18558.593750,42281458750846,42281458909523
+56,56,"Agent 2",2,53174,53174,1048576,3972,"pa_decode_tile_kernel_kvfp8_qbf16_d128_bs16_gqa16_mtp1_pertoken_direct",128,38400,0,64,0,128,"FETCH_SIZE",18545.718750,42281460352085,42281460509882

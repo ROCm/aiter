@@ -1,0 +1,5 @@
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]

@@ -1,8 +1,10 @@
-# MiniMax-M3 TP4 FlyDSL PA 性能：gfx1250，2026-11-03
+# MiniMax-M3 TP4 FlyDSL PA 延迟与逻辑 IO 吞吐：gfx1250，2026-11-03
 
 本次实测覆盖 18 个 MiniMax-M3 TP4 attention 形状，分别运行 BF16/FP8 KV、ATOM/PR 两种配置，另加 239/240/241 行 cluster 边界，共 **84 个测量点**。所有测量点通过参考结果和 CUDA graph 更新输入检查。主结果采用 ATOM 调用配置。
 
 测量对象是一次 `aiter.ops.flydsl.pa_decode.pa_decode` 完整调用，包括需要的 partition reduction。输入为合成的 attention 张量；测试范围是 PA 算子，模型其他算子和多层执行时间不包含在下面的延迟中。
+
+**主表 TB/s 全部为逻辑 IO 吞吐。HBM 完整读写带宽未测量；额外的显存读取 counter 核对结果单列在下文。**
 
 ## 测试环境
 
@@ -26,29 +28,62 @@
 | 随机种子 | 37，同形状在两个 profile 使用相同输入 |
 | Harness SHA256 | `d0aa3073c901f5cbd481876519a59c96edef472c0c7b2139c6b22451563c45b9` |
 
-## 计时与带宽口径
+## 计时与逻辑 IO 吞吐口径
 
 每个 CUDA graph 含 10 次完整 PA 调用。每个样本用 GPU events 计时 5 次 graph replay，再除以 50 次调用。每轮取 5 个样本的最小值，表中时间为 **5 轮最小值的中位数**；eager 和 graph 各预热 5 次。编译、plan 构建、KV 量化、table 构建、分配和正确性检查均在计时外。
 
-表中带宽是 **逻辑张量 IO 的有效带宽**，使用十进制 TB/s。设 `N=sum(context_lengths)`，`T=batch×query_length`：
+表中 TB/s 是 **逻辑张量 IO 吞吐**，使用十进制 TB/s。设 `N=sum(context_lengths)`，`T=batch×query_length`：
 
 ```text
 KV payload bytes = 2 × N × Hkv × D × sizeof(KV)
 KV scale bytes   = 2 × N × Hkv × 4（FP8）；BF16 为 0
 Q + output bytes = 2 × T × Hq × D × 2
 Logical IO bytes = KV payload bytes + KV scale bytes + Q/output bytes
-Effective TB/s   = Logical IO bytes / latency_us / 10^6
+Logical IO TB/s  = Logical IO bytes / latency_us / 10^6
 ```
 
 Dense MTP4 的 KV 按每个请求计一次，4 个 query 共享 KV。Sparse 按每行有效 context 累加逻辑 KV，即使多行引用相同物理页；prefill 使用实际递增长度。统计不含 block table、plan metadata、scratch 或额外 kernel 读取。
 
-Graph 重复读取相同输入，sparse 行共享 KV pool，所以该指标包含缓存复用效果，不能解释为硬件 HBM 实测吞吐，也不用于计算 HBM 峰值利用率。尤其是 4096/8192 行 sparse prefill，逻辑带宽可明显高于物理显存吞吐。
+Graph 重复读取相同输入，sparse 行共享 KV pool，所以该指标包含缓存复用效果，不能解释为硬件 HBM 实测吞吐，也不用于计算 HBM 峰值利用率。尤其是 4096/8192 行 sparse prefill，逻辑 IO 吞吐可明显高于物理显存吞吐。
+
+## 24.193 TB/s 的含义
+
+FP8 sparse prefill、8192 行的 24.193 TB/s 来自 `3,942,916,096 bytes / 162.979431 µs / 10^6`。
+分子按各行 context 累加，共有 14,681,088 次逻辑 token 引用，包含约 3.758 GB KV payload、0.117 GB scale 和 0.067 GB Q/O。
+
+物理 KV pool 是 `4096 pages × 16 tokens × 128 dims × 2(K/V) × 1 byte = 16 MiB`，scale 为 0.5 MiB。
+多行共享这些物理页，graph 还重复读取同一批输入。逻辑引用的重复计数以及硬件缓存/数据复用允许逻辑 IO 吞吐高于物理 HBM 吞吐。
+该数值没有采集 HBM 流量计数器，不能用来判断 HBM 带宽或利用率；延迟仍是此前记录的 GPU-event 测量值。
+
+原始 JSON/CSV 保留原名 `effective_bandwidth_tb_s` 和全部测量样本，以保持记录的可核查性。
+该字段实际表示本节定义的逻辑 IO 吞吐；新版本 benchmark 已改名为 `logical_io_throughput_tb_s`。
+
+## 显存读取 counter 核对：FP8 sparse prefill 8192 行
+
+另外用 `rocprofv3 --pmc FETCH_SIZE` 采集同一 case 的 12 次 tile kernel dispatch。
+去掉 6 次 eager 调用，取 5 次 graph 预热及 1 次 sample 的 6 个 dispatch：
+
+| 指标 | 值 |
+| --- | ---: |
+| `FETCH_SIZE` 显存读取量中位数 | 18.117340 MiB / dispatch |
+| 读取量范围 | 18.099335–18.145264 MiB |
+| Counter trace 的 kernel 时间中位数 | 158.437 µs |
+| 每个 dispatch 读取字节/时间的中位数 | 0.119821 TB/s，仅读取 |
+
+`FETCH_SIZE` 由 GL2C 向外部显存发出的 32/64/128/256-byte read requests 累加，结果单位是 KiB。
+这说明该 case 的显存读取量远小于累计逻辑 IO；原主表的 24.193 TB/s 不能作为 HBM 吞吐。
+本次未统计 stores/writebacks，也没有测得完整读写 HBM 带宽。Counter run 的 graph size/repetition
+与主测量不同，profiler 还插入了 queue interception，因此保留主测量的 162.979 µs；counter run
+只用于核对读取流量，采用 profiler 的 per-kernel timestamps，不使用其带 profiler 开销的 graph-event 延迟。
+
+原始 [counter CSV](fp8_prefill_8192_fetch_counter.csv)、[统计和完整命令](fp8_prefill_8192_fetch_summary.json)、
+[FETCH_SIZE 定义](fetch_size_definition.txt) 已一并保存。
 
 ## ATOM 调用配置：主要结果
 
 Dense table 补齐到 256K tokens，`max_context_length=None`。Sparse decode/verify 的 bound 为 2048，cap 在 4/64 行为 8、128 行为 4、256 行为 2；prefill cap1。
 
-| 场景 | BF16 时间 (µs) | BF16 有效带宽 (TB/s) | FP8 时间 (µs) | FP8 有效带宽 (TB/s) | 输出路径 BF16/FP8 |
+| 场景 | BF16 时间 (µs) | BF16 逻辑 IO 吞吐 (TB/s) | FP8 时间 (µs) | FP8 逻辑 IO 吞吐 (TB/s) | 输出路径 BF16/FP8 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Dense decode，bs1，ctx8192 | 5.515 | 0.762 | 5.362 | 0.405 | reducer |
 | Dense decode，bs4，ctx8192 | 5.887 | 2.855 | 5.643 | 1.539 | reducer |
@@ -73,7 +108,7 @@ Dense table 补齐到 256K tokens，`max_context_length=None`。Sparse decode/ve
 
 Dense 使用 exact-sized table 和实际 context bound；其余使用默认 planner cap/budget，与 PR 7079 主性能表的设置一致。两种配置的字节统计相同，plan/dispatch 可不同。
 
-| 场景 | BF16 时间 (µs) | BF16 有效带宽 (TB/s) | FP8 时间 (µs) | FP8 有效带宽 (TB/s) | 输出路径 BF16/FP8 |
+| 场景 | BF16 时间 (µs) | BF16 逻辑 IO 吞吐 (TB/s) | FP8 时间 (µs) | FP8 逻辑 IO 吞吐 (TB/s) | 输出路径 BF16/FP8 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Dense decode，bs1，ctx8192 | 5.397 | 0.779 | 5.157 | 0.421 | reducer |
 | Dense decode，bs4，ctx8192 | 5.631 | 2.985 | 5.385 | 1.613 | reducer |
@@ -100,7 +135,7 @@ Dense 使用 exact-sized table 和实际 context bound；其余使用默认 plan
 
 ### ATOM profile，cap2
 
-| 场景 | BF16 时间 (µs) | BF16 有效带宽 (TB/s) | FP8 时间 (µs) | FP8 有效带宽 (TB/s) | 输出路径 BF16/FP8 |
+| 场景 | BF16 时间 (µs) | BF16 逻辑 IO 吞吐 (TB/s) | FP8 时间 (µs) | FP8 逻辑 IO 吞吐 (TB/s) | 输出路径 BF16/FP8 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 239 rows，cap2 | 13.242 | 19.073 | 13.132 | 9.989 | cluster |
 | 240 rows，cap2 | 13.370 | 18.970 | 13.118 | 10.042 | cluster |
@@ -108,7 +143,7 @@ Dense 使用 exact-sized table 和实际 context bound；其余使用默认 plan
 
 ### PR profile，cap2
 
-| 场景 | BF16 时间 (µs) | BF16 有效带宽 (TB/s) | FP8 时间 (µs) | FP8 有效带宽 (TB/s) | 输出路径 BF16/FP8 |
+| 场景 | BF16 时间 (µs) | BF16 逻辑 IO 吞吐 (TB/s) | FP8 时间 (µs) | FP8 逻辑 IO 吞吐 (TB/s) | 输出路径 BF16/FP8 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 239 rows，cap2 | 13.517 | 18.685 | 13.061 | 10.043 | cluster |
 | 240 rows，cap2 | 13.643 | 18.590 | 12.972 | 10.155 | cluster |
@@ -144,7 +179,7 @@ python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py \
 ```
 
 - [results.json](results.json)：版本、完整精度字段、字节组成、每轮/每样本时间、实际 plan 和输出路径。
-- [results.csv](results.csv)：84 个测量点的时间、有效带宽、字节数和正确性结果。
+- [results.csv](results.csv)：84 个测量点的时间、逻辑 IO 吞吐、字节数和正确性结果。
 - [gpu-start.txt](gpu-start.txt) / [gpu-end.txt](gpu-end.txt)：测量起止 GPU 使用率、显存和时钟快照。
 - [Benchmark 使用说明](../../README_pa_minimax_m3.md)。
 

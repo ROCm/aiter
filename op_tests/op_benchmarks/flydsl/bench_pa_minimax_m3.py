@@ -362,7 +362,7 @@ def measure(case, dtype, profile, args, pa, torch):
         output_mode=mode,
         scratch_bytes=sum(t.numel() * t.element_size() for t in workspace.values()),
         median_us=latency_us,
-        effective_bandwidth_tb_s=traffic["logical_io_bytes"] / latency_us / 1e6,
+        logical_io_throughput_tb_s=traffic["logical_io_bytes"] / latency_us / 1e6,
         **traffic,
         round_min_us=rounds,
         samples_us=all_samples,
@@ -553,7 +553,7 @@ def main():
         },
         checked=args.check,
         expected_results=len(cases) * len(profiles) * len(dtypes),
-        bandwidth_definition=(
+        logical_io_throughput_definition=(
             "logical K/V payload + FP32 per-token K/V scales for FP8 + BF16 Q read "
             "+ BF16 output write; KV once per sequence; excludes metadata/scratch; "
             "decimal TB/s, not measured HBM traffic"
@@ -571,7 +571,7 @@ def main():
                     print(
                         f"{profile:4} {dtype:4} {case['id']:42} "
                         f"{row['median_us']:9.3f} us  "
-                        f"{row['effective_bandwidth_tb_s']:7.3f} TB/s  {row['output_mode']}",
+                        f"{row['logical_io_throughput_tb_s']:7.3f} logical IO TB/s  {row['output_mode']}",
                         flush=True,
                     )
     if args.compare_to:

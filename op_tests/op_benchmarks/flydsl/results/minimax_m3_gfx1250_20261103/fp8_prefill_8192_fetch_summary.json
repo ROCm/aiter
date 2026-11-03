@@ -1,0 +1,49 @@
+{
+  "case": "sparse-prefill-b8192-q1-ctx2048",
+  "profile": "atom",
+  "kv_dtype": "fp8",
+  "gpu": 0,
+  "scope": "FETCH_SIZE video-memory reads only; stores/writebacks not collected; separate profiling run",
+  "counter_unit": "KiB (expression divides read-request bytes by 1024)",
+  "counter_expression": "(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024",
+  "dispatches_collected": 12,
+  "eager_dispatches_excluded": 6,
+  "warm_graph_dispatches": 6,
+  "warm_read_bytes": [
+    19026688.0,
+    18978528.0,
+    19022336.0,
+    18983264.0,
+    19004000.0,
+    18990816.0
+  ],
+  "warm_kernel_us": [
+    163.846,
+    158.317,
+    158.077,
+    158.557,
+    158.677,
+    157.797
+  ],
+  "median_read_bytes": 18997408.0,
+  "median_kernel_us": 158.437,
+  "median_read_throughput_tb_s": 0.11982103150203463,
+  "timing_source": "rocprofv3 per-kernel start/end timestamps; profiler event timing is not used as baseline PA latency",
+  "command": "rocprofv3 --pmc FETCH_SIZE --kernel-include-regex pa_decode_tile --output-format csv --output-directory /tmp/m3-pa-fetch-counter-check -- python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py --dtype fp8 --case sparse-prefill-b8192-q1-ctx2048 --graph-calls 1 --replays 1 --rounds 1 --samples 1 --no-check --output /tmp/m3-pa-fetch-counter-check/benchmark.json",
+  "profiling_source_commit": "3e518359f06e74a0d45df6fb9dfac5dd4f94174c",
+  "profiling_source_dirty": true,
+  "profiling_harness_sha256": "46aa561f489625fb455719ef57f2367ab891c85fc99588c29ce1fd73216a60ed",
+  "profiling_timestamp_utc": "2026-11-03T00:25:21.847525+00:00",
+  "gpu_metadata": {
+    "name": "AMD Radeon Graphics",
+    "arch": "gfx1250",
+    "cus": 256,
+    "uuid": "32636139-6565-3437-3732-643939363430",
+    "total_memory": 463856467968
+  },
+  "software": {
+    "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+    "flydsl": "0.4.1",
+    "hip": "7.16.26315"
+  }
+}
