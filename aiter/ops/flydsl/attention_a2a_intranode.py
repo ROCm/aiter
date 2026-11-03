@@ -11,10 +11,8 @@ import os
 from typing import NamedTuple
 
 import flydsl.expr as fx
-import mori.shmem as ms
 import torch
 from flydsl.expr.typing import Stream
-from mori.shmem import mori_shmem_create_tensor
 
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.ops.mha_v4_quant import (
@@ -23,7 +21,7 @@ from aiter.ops.mha_v4_quant import (
     mxfp6_v_tiles,
 )
 
-from .communication_ops_host_utils import build_p2p_table
+from .communication_ops_host_utils import make_symmetric_heap, resolve_inbox_memory
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,
     make_attention_a2a_dequant_jit,
@@ -191,10 +189,20 @@ class AttentionA2AIntraNodeOp:
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
 
+    inbox_memory selects the memory type of the buffers peers write into:
+    "uncached" allocates them in the MoRI symmetric heap, "finegrained" in HIP
+    IPC buffers exchanged over group. "auto" (default) is uncached on xGMI and
+    fine-grained on PCIe at TP4 and TP8: over PCIe, uncached peer writes
+    serialize per destination, while fine-grained writes combine in L2 and are
+    published by the release before each completion flag. The link comes from
+    the KFD topology, or from AITER_FLY_AR_LINK when that is unreadable.
+    Only "uncached" needs MoRI initialized.
+
     group is a required torch.distributed ProcessGroup containing exactly the
-    MoRI participants (size == world_size, group rank == rank). Construction
-    verifies that all ranks agree on the configuration and on the offsets of
-    every symmetric buffer, raising ValueError on every rank otherwise.
+    participants (size == world_size, group rank == rank; for "uncached", the
+    MoRI participants). Construction verifies that all ranks agree on the
+    configuration and, in the MoRI heap, on the offsets of every symmetric
+    buffer, raising ValueError on every rank otherwise.
     A role-0 submit on a different stream than the previous trio raises; use a
     new op or join the streams.
 
@@ -216,6 +224,7 @@ class AttentionA2AIntraNodeOp:
         softmax_scale=None,
         hadamard=None,
         valid_kv_len=None,
+        inbox_memory="auto",
         group,
     ):
         self._next_role = 0
@@ -224,7 +233,7 @@ class AttentionA2AIntraNodeOp:
         if group is None:
             raise ValueError(
                 "group is required: a torch.distributed ProcessGroup containing "
-                "exactly the MoRI participants"
+                "exactly the participants"
             )
         self.quant = quant is not None
         if self.quant:
@@ -407,11 +416,18 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
-        if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
-            raise ValueError(
-                f"rank/world_size ({rank}/{world_size}) != MoRI "
-                f"PE/npes ({ms.shmem_mype()}/{ms.shmem_npes()})"
-            )
+        self.inbox_memory = resolve_inbox_memory(inbox_memory, world_size)
+        # The MoRI heap checks rank against MoRI's PE here; the IPC heap is
+        # local until publish().
+        heap = make_symmetric_heap(
+            memory=self.inbox_memory,
+            rank=rank,
+            world_size=world_size,
+            device=self.device,
+            group=group,
+        )
+        # Owned from here, so a failed construction still frees it in __del__.
+        self._heap = heap
         # Must run before any symmetric allocation: mismatched configs
         # would otherwise hang in the shmem barrier instead of raising.
         if group.size() != world_size:
@@ -433,6 +449,7 @@ class AttentionA2AIntraNodeOp:
             q_multiplier,
             world_size,
             spin_timeout_iters,
+            self.inbox_memory,
         )
         configs = [None] * world_size
         torch.distributed.all_gather_object(configs, config, group=group)
@@ -541,7 +558,7 @@ class AttentionA2AIntraNodeOp:
             )
         self.v_partial_sets = (
             tuple(
-                mori_shmem_create_tensor(
+                heap.create_tensor(
                     (world_size // 2, 2, heads_local, 256), torch.float32
                 )
                 for _ in range(2)
@@ -551,7 +568,7 @@ class AttentionA2AIntraNodeOp:
         )
         self.v_partial_ready_sets = (
             tuple(
-                mori_shmem_create_tensor((world_size, heads_local), torch.int64)
+                heap.create_tensor((world_size, heads_local), torch.int64)
                 for _ in range(2)
             )
             if split_v_exchange
@@ -560,16 +577,13 @@ class AttentionA2AIntraNodeOp:
         for ready in self.v_partial_ready_sets:
             ready.zero_()
         self.outputs_sets = tuple(
-            tuple(
-                mori_shmem_create_tensor((size,), payload_dtype)
-                for size in payload_sizes
-            )
+            tuple(heap.create_tensor((size,), payload_dtype) for size in payload_sizes)
             for _ in range(2)
         )
         # FP32 descales precede the replicated partial-max exchange slots.
         self.scale_storage_sets = tuple(
             tuple(
-                mori_shmem_create_tensor(
+                heap.create_tensor(
                     (size,),
                     torch.float32 if per_tensor else torch.uint8,
                 )
@@ -605,10 +619,10 @@ class AttentionA2AIntraNodeOp:
             self._dequant_launch = make_attention_a2a_dequant_jit(
                 numel=numel, codec=self.codecs, fp8_fnuz=self.fp8_fnuz
             )
-        self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
+        self.xdb_mem = heap.create_tensor((world_size,), torch.int64)
         # Consumer-drain readiness is separate from producer-complete flags.
         self.reuse_mem_sets = tuple(
-            mori_shmem_create_tensor((world_size,), torch.int64) for _ in range(2)
+            heap.create_tensor((world_size,), torch.int64) for _ in range(2)
         )
         for ready_mem in self.reuse_mem_sets:
             ready_mem.zero_()
@@ -626,53 +640,51 @@ class AttentionA2AIntraNodeOp:
         self.xdb_mem.zero_()
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
 
-        # The MoRI barrier is host-only: peers must not publish into our flags
+        # The heap barrier is host-only: peers must not publish into our flags
         # before our zeroing has completed on the device. The zeroing is enqueued
         # on the current stream, so syncing it avoids waiting on unrelated work.
         torch.cuda.current_stream(self.device).synchronize()
-        ms.shmem_barrier_all()
+        heap.publish()
         self.p2p_outputs_sets = tuple(
-            tuple(
-                build_p2p_table(output, rank, world_size, device) for output in outputs
-            )
+            tuple(heap.p2p_table(output) for output in outputs)
             for outputs in self.outputs_sets
         )
         self.p2p_scales_sets = tuple(
-            tuple(build_p2p_table(scale, rank, world_size, device) for scale in scales)
+            tuple(heap.p2p_table(scale) for scale in scales)
             for scales in self.scale_storage_sets
         )
         self.p2p_v_partial_sets = tuple(
-            build_p2p_table(partial, rank, world_size, device)
-            for partial in self.v_partial_sets
+            heap.p2p_table(partial) for partial in self.v_partial_sets
         )
         self.p2p_v_partial_ready_sets = tuple(
-            build_p2p_table(ready, rank, world_size, device)
-            for ready in self.v_partial_ready_sets
+            heap.p2p_table(ready) for ready in self.v_partial_ready_sets
         )
-        self.p2p_xdb_mem = build_p2p_table(self.xdb_mem, rank, world_size, device)
+        self.p2p_xdb_mem = heap.p2p_table(self.xdb_mem)
         self.p2p_reuse_mem_sets = tuple(
-            build_p2p_table(ready_mem, rank, world_size, device)
-            for ready_mem in self.reuse_mem_sets
+            heap.p2p_table(ready_mem) for ready_mem in self.reuse_mem_sets
         )
-        ms.shmem_barrier_all()
+        heap.barrier()
         # shmem_ptr_p2p translates by the offset from the local heap base, so
         # divergent allocation order would silently address the wrong buffer.
-        sym = [("output", t) for outs in self.outputs_sets for t in outs]
-        sym += [("scale", t) for sc in self.scale_storage_sets for t in sc]
-        sym += [("v_partial", t) for t in self.v_partial_sets]
-        sym += [("v_partial_ready", t) for t in self.v_partial_ready_sets]
-        sym += [("xdb", self.xdb_mem)]
-        sym += [("reuse", t) for t in self.reuse_mem_sets]
-        base = sym[0][1].data_ptr()
-        offsets = [(n, t.data_ptr() - base) for n, t in sym]
-        all_offsets = [None] * world_size
-        torch.distributed.all_gather_object(all_offsets, offsets, group=group)
-        for i, mine in enumerate(offsets):
-            if any(o[i] != all_offsets[0][i] for o in all_offsets):
-                raise ValueError(
-                    f"symmetric buffer {i} ({mine[0]}) offset differs across ranks: "
-                    f"{[o[i][1] for o in all_offsets]}"
-                )
+        # IPC buffers are separate allocations, opened by handle; every rank
+        # agreed on inbox_memory, so all of them take the same branch.
+        if self.inbox_memory == "uncached":
+            sym = [("output", t) for outs in self.outputs_sets for t in outs]
+            sym += [("scale", t) for sc in self.scale_storage_sets for t in sc]
+            sym += [("v_partial", t) for t in self.v_partial_sets]
+            sym += [("v_partial_ready", t) for t in self.v_partial_ready_sets]
+            sym += [("xdb", self.xdb_mem)]
+            sym += [("reuse", t) for t in self.reuse_mem_sets]
+            base = sym[0][1].data_ptr()
+            offsets = [(n, t.data_ptr() - base) for n, t in sym]
+            all_offsets = [None] * world_size
+            torch.distributed.all_gather_object(all_offsets, offsets, group=group)
+            for i, mine in enumerate(offsets):
+                if any(o[i] != all_offsets[0][i] for o in all_offsets):
+                    raise ValueError(
+                        f"symmetric buffer {i} ({mine[0]}) offset differs across "
+                        f"ranks: {[o[i][1] for o in all_offsets]}"
+                    )
         self._epoch = 0
         self._reuse_launch = make_attention_a2a_reuse_jit(
             rank=rank, npes=world_size, spin_timeout_iters=spin_timeout_iters
@@ -812,6 +824,21 @@ class AttentionA2AIntraNodeOp:
             self._epoch += 1
             return self.outputs_sets[parity]
         return packed_result
+
+    def close(self):
+        """Free the IPC buffers of a fine-grained op; the op is unusable after.
+        The MoRI heap keeps its buffers until MoRI is finalized."""
+        heap = getattr(self, "_heap", None)
+        if heap is not None:
+            self._heap = None
+            heap.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            # Destructors must not raise, especially during interpreter shutdown.
+            return
 
     def _submit_role_launch(self, i, args):
         launch_args = (*(fx.Int64(arg) for arg in args[:-1]), args[-1])
