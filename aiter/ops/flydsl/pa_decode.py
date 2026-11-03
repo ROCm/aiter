@@ -71,7 +71,7 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = 32 if arch == "gfx1250" else 64
+    wave = props.warp_size
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
@@ -122,7 +122,7 @@ def launch_pa_decode_ps_reduce(
                 groups *= 2
         per_seq = rows * kv_heads
         if (
-            arch != "gfx1250"
+            arch not in ("gfx1250", "gfx1250-strict")
             and ctas * group_waves >= budget
             and batch * per_seq * per_seq <= 2**30
         ):
@@ -197,6 +197,7 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
     causal: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
@@ -259,6 +260,13 @@ def pa_decode(
     graph replay: every context length that will run must be at most
     ``max_context_length``. A smaller value still covers the real context:
     page ids outside the staged window are read from the block table.
+
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -369,13 +377,17 @@ def pa_decode(
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and ((is_bf16_kv and arch != "gfx1250") or q_chunk <= 8 or q_chunk % 8 == 0)
+        and (
+            (is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict"))
+            or q_chunk <= 8
+            or q_chunk % 8 == 0
+        )
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             + (
                 "are multiples of 64 in [64, 1024] for BF16 KV"
-                if is_bf16_kv and arch != "gfx1250"
+                if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict")
                 else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
@@ -391,7 +403,7 @@ def pa_decode(
             f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
         )
 
-    if is_bf16_kv and arch != "gfx1250" and not trans_v:
+    if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict") and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
@@ -442,7 +454,11 @@ def pa_decode(
         query_dtype = "f16"
     else:
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
-    if is_bf16_kv and arch != "gfx1250" and query.dtype != torch.bfloat16:
+    if (
+        is_bf16_kv
+        and arch not in ("gfx1250", "gfx1250-strict")
+        and query.dtype != torch.bfloat16
+    ):
         raise NotImplementedError("BF16 KV requires bfloat16 queries")
     if output.dtype != query.dtype:
         raise TypeError(
@@ -609,7 +625,7 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
     direct_output = (
-        arch == "gfx1250"
+        arch in ("gfx1250", "gfx1250-strict")
         and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()
@@ -648,6 +664,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            mask_unowned_kv=mask_unowned_kv,
             causal=causal,
         )
 

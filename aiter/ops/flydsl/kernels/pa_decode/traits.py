@@ -134,6 +134,7 @@ class PaDecodeSchedule:
         max_context_length: int | None = None,
         sliding_window: int = 0,
         trans_k: bool = True,
+        mask_unowned_kv: bool = True,
         causal: bool = True,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
@@ -355,6 +356,7 @@ class PaDecodeSchedule:
             sliding_window,
             causal,
             kv_dtype,
+            bool(mask_unowned_kv),
             D256_PIPE,
             stage_pages,
         )
@@ -385,6 +387,7 @@ class PaDecodeTraits:
     causal: bool
     trans_v: bool
     wide_kv_addressing: bool
+    mask_unowned_kv: bool
     query_splits: int
     sliding_window: int
     single_tile_plan: bool
@@ -494,6 +497,7 @@ class PaDecodeTraits:
             sliding_window,
             causal,
             kv_dtype,
+            mask_unowned_kv,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
@@ -694,6 +698,7 @@ class PaDecodeTraits:
             causal=causal,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
+            mask_unowned_kv=mask_unowned_kv,
             query_splits=query_splits,
             sliding_window=sliding_window,
             single_tile_plan=single_tile_plan,
