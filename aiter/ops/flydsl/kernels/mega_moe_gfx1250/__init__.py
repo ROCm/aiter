@@ -5,7 +5,15 @@
 
 import importlib
 
-__all__ = ["MegaMoEGfx1250", "read_dispatch_wire_env"]
+__all__ = [
+    "CombineKind",
+    "DispatchKind",
+    "ExpertComputeConfig",
+    "MegaMoEGeometry",
+    "MegaMoEGfx1250",
+    "MegaMoERecipe",
+    "read_dispatch_wire_env",
+]
 
 
 def __getattr__(name):
