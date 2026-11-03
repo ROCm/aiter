@@ -26,13 +26,10 @@ def _get_config(M: int) -> dict:
     """Config for M rows: the smallest ``M_LEQ_<x> >= M``, else ``any``.
 
     Reads ``configs/<arch>/triton/fusions/fused_mixed_sample/DEFAULT.json``.
-    An arch without that file uses the gfx950 copy.
+    Raises ``FileNotFoundError`` when the running arch has no such file.
     """
     cfg_dir = resolve_config_dir("fusions", _CONFIG_NAME)
-    raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    if raw is None:
-        cfg_dir = resolve_config_dir("fusions", _CONFIG_NAME, arch="gfx950")
-        raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=True)
+    raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=True)
     return select_leq_config(raw, M, prefix="M_LEQ_")
 
 
@@ -69,7 +66,7 @@ def fused_mixed_sample(
         temperatures: shape [M], fp32.
         eps: added to the noise before the division.
         greedy_eps: rows with a temperature at or below this value are greedy.
-        out: optional output, shape [M], int32.
+        out: optional output, shape [M], int32, contiguous.
         config: optional config with ``BLOCK_V``, ``num_warps`` and
             ``num_warps_pick``. If it is None, the tuned config is loaded.
 
@@ -77,7 +74,9 @@ def fused_mixed_sample(
         The token ids, shape [M], int32.
 
     Limits:
-        V must be smaller than 2**31.
+        V must be at least 1 and smaller than 2**31. The tuned configs are for
+        gfx942 and gfx950. Without ``config``, other archs raise
+        ``FileNotFoundError``.
     """
     if input.dim() != 2 or exponentials.shape != input.shape:
         raise ValueError(
@@ -89,12 +88,14 @@ def fused_mixed_sample(
     if input.stride(1) != 1 or exponentials.stride(1) != 1:
         raise ValueError("the last dim of input and exponentials must be contiguous")
     M, V = input.shape
+    if not 1 <= V < 2**31:
+        raise ValueError(f"V must be at least 1 and smaller than 2**31, got {V}")
     if temperatures.shape != (M,):
         raise ValueError(f"temperatures must have shape ({M},)")
     if out is None:
         out = torch.empty(M, dtype=torch.int32, device=input.device)
-    elif out.shape != (M,) or out.dtype != torch.int32:
-        raise ValueError(f"out must be int32 with shape ({M},)")
+    elif out.shape != (M,) or out.dtype != torch.int32 or out.stride(0) != 1:
+        raise ValueError(f"out must be a contiguous int32 tensor with shape ({M},)")
     if M == 0:
         return out
 

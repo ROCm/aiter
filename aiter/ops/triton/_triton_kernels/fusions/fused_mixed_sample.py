@@ -38,26 +38,26 @@ def _fused_mixed_sample_tile_kernel(
     ).to(tl.float32)
     temp = tl.load(temps_ptr + r).to(tl.float32)
     o = t * rows + r
+    # The raw-logit max of the tile. Both row kinds store it.
+    m = tl.max(x, axis=0)
+    tl.store(part_m_ptr + o, m)
     if temp <= greedy_eps:
-        # Greedy row: the raw-logit max of the tile and its lowest id.
-        m = tl.max(x, axis=0)
+        # Greedy row: the lowest id at the max.
         idx = tl.min(tl.where((x == m) & mask, offs, vocab), axis=0)
-        tl.store(part_m_ptr + o, m)
         tl.store(part_idx_ptr + o, idx)
     else:
-        xs = x * (1.0 / tl.maximum(temp, 1e-5))
-        m = tl.max(xs, axis=0)
-        # A tile that is -inf throughout has m = -inf. Shift it by 0, so that
-        # exp(-inf - -inf) does not give NaN.
+        # Subtract the max before the division by T. Then a small T does not
+        # lose the low bits of the logits. A tile that is -inf throughout has
+        # m = -inf: shift it by 0, so that -inf - -inf does not give NaN.
         m_safe = tl.where(m == -float("inf"), 0.0, m)
+        inv_t = 1.0 / tl.maximum(temp, 1e-5)
         e = (
             tl.load(exp_ptr + r.to(tl.int64) * stride_exp + offs, mask=mask, other=1.0)
             + eps
         )
-        key = tl.where(mask, tl.exp(xs - m_safe) / e, -1.0)
+        key = tl.where(mask, tl.exp((x - m_safe) * inv_t) / e, -1.0)
         best = tl.max(key, axis=0)
         idx = tl.min(tl.where((key == best) & mask, offs, vocab), axis=0)
-        tl.store(part_m_ptr + o, m)
         tl.store(part_key_ptr + o, best)
         tl.store(part_idx_ptr + o, idx)
 
@@ -89,8 +89,9 @@ def _fused_mixed_sample_pick_kernel(
         k = tl.load(part_key_ptr + o, mask=tm, other=-1.0)
         mm = tl.max(m, axis=0)
         mm = tl.where(mm == -float("inf"), 0.0, mm)
+        inv_t = 1.0 / tl.maximum(temp, 1e-5)
         # Rescale each tile key to the global max of the row.
-        ks = tl.where(tm, k * tl.exp(m - mm), -1.0)
+        ks = tl.where(tm, k * tl.exp((m - mm) * inv_t), -1.0)
         best = tl.max(ks, axis=0)
         tok = tl.min(tl.where((ks == best) & tm, idx, vocab), axis=0)
     tl.store(out_ptr + r, tok.to(tl.int32))

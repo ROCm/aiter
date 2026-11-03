@@ -76,6 +76,25 @@ def test_fused_mixed_sample_agrees_with_hip_kernel(vocab):
         assert gap < NEAR_TIE, f"row {r}: {int(out[r])} vs HIP {int(hip[r])}"
 
 
+@pytest.mark.parametrize("temp", [1e-7, 1e-5, 1e-3])
+def test_fused_mixed_sample_small_temperature(temp):
+    # Two close logits and a small T. The kernel must subtract the max before
+    # the division by T, else fp32 rounding of x / T can change the winner.
+    logits = torch.tensor(
+        [[4.0, 4.0 + 2.0**-21]] * 3, dtype=torch.float32, device="cuda"
+    )
+    noise = torch.tensor(
+        [[1.0, 1.0 / 0.96], [1.0, 1.0 / 0.97], [1.0, 1.0 / 0.95]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    temps = torch.full((3,), temp, dtype=torch.float32, device="cuda")
+    out = fused_mixed_sample(logits, noise, temps, eps=EPS)
+    for r in range(3):
+        keys = _keys64(logits[r], temps[r], noise[r])
+        assert int(out[r]) == int(keys.argmax()), f"row {r}: {int(out[r])}"
+
+
 @pytest.mark.parametrize("forced", [0, 5, 4095, 4096, 100000, 163839])
 def test_fused_mixed_sample_forced_row(forced):
     # All ids but one are -inf, as a required-tool-call mask makes them.
@@ -134,3 +153,8 @@ def test_fused_mixed_sample_rejects_bad_inputs():
         fused_mixed_sample(logits, noise[:, :100], temps)
     with pytest.raises(ValueError):
         fused_mixed_sample(logits.t(), noise.t(), temps)
+    with pytest.raises(ValueError):
+        fused_mixed_sample(logits[:, :0], noise[:, :0], temps)
+    strided = torch.empty(8, dtype=torch.int32, device="cuda")[::2]
+    with pytest.raises(ValueError):
+        fused_mixed_sample(logits, noise, temps, out=strided)
