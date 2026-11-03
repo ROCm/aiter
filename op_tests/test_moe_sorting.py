@@ -38,15 +38,11 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
         385: tokens,
     }
     for E, token in itertools.product(multi_tokens, tokens):
-        auto_workspace = moe_sorting_opus_get_workspace_size(
-            token, E, 8, 0, device_id
-        )
+        auto_workspace = moe_sorting_opus_get_workspace_size(token, E, 8, 0, device_id)
         oneshot_workspace = moe_sorting_opus_get_workspace_size(
             token, E, 8, 1, device_id
         )
-        multi_workspace = moe_sorting_opus_get_workspace_size(
-            token, E, 8, 2, device_id
-        )
+        multi_workspace = moe_sorting_opus_get_workspace_size(token, E, 8, 2, device_id)
         expect_auto_multi = token in multi_tokens[E]
         assert (
             auto_workspace > 0
