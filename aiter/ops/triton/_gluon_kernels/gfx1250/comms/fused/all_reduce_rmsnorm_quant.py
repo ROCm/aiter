@@ -185,12 +185,9 @@ def _all_reduce_rmsnorm_kernel(
                         token_max = gl.max(
                             gl.max(gl.abs(y_quant), axis=1), axis=0
                         )
-                        token_scale = token_max / 448.0
-                        safe_scale = gl.where(
-                            token_scale > 0.0, token_scale, 1.0
-                        )
+                        token_scale = token_max * (1.0 / 448.0)
                         yq = gl.clamp(
-                            y_quant / safe_scale, -448.0, 448.0
+                            y_quant / token_scale, -448.0, 448.0
                         ).to(gl.float8e4nv)
                         gl.amd.cdna5.buffer_store(yq, q, at, mask=valid_col)
                         gl.store(scale + row + r, token_scale)
