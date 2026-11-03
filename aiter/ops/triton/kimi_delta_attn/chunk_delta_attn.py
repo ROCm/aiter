@@ -66,6 +66,8 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -162,6 +164,18 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        snapshot_targets (tuple, optional):
+            `((n, off), ...)` host ints: also return sequence `n`'s recurrent
+            state after its first `off` tokens, for `off` a multiple of 32
+            strictly inside the sequence. Any number per sequence, in any
+            order, but no position twice. FlashKDA-only. It is the state a
+            forward ending at `off` would return as its final state (bit for
+            bit when that forward also runs unsegmented on the Triton K2), so
+            prefix checkpoints can be taken without ending the forward there.
+        snapshot_out (torch.Tensor, optional):
+            Destination, `[len(snapshot_targets), HV, V, K]` when
+            `state_v_first` else `[.., HV, K, V]`, contiguous; its dtype is
+            the cast applied. Required with `snapshot_targets`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -300,5 +314,7 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        snapshot_targets=snapshot_targets,
+        snapshot_out=snapshot_out,
     )
     return o.to(q.dtype), final_state
