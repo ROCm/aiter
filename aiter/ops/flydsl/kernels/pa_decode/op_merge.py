@@ -26,7 +26,9 @@ writeback; each CTA then writes its share of the sequence's rows.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import SyncScope, cluster
+from flydsl.expr.typing import T
 
 from ..pa_decode_plan import ARRIVAL_COUNTER_STRIDE
 from ..utils import rcp_f32
@@ -360,3 +362,156 @@ class Gfx1250ClusterMerge:
                         fx.ptr_store(acc.to(t.q_dtype), target)
                 else:
                     fx.ptr_store(acc.to(t.q_dtype), target)
+
+
+class Gfx1250OutputQuant:
+    """Quantize one contiguous GQA-16 output row after an in-kernel merge.
+
+    The optional PA interface deliberately targets MiniMax-M3's sparse path:
+    one KV head, one query token per sequence, GQA 16 and D128. A direct CTA
+    owns the whole token; a cluster8 launch splits its 2048 values over eight
+    CTAs. The first 32 float-sized slots of that token's still-unwritten FP8
+    destination temporarily hold the eight CTAs' four wave maxima; every byte
+    is overwritten by FP8 output after the cluster consumes them.
+    """
+
+    def __init__(
+        self,
+        t,
+        output,
+        quantized_output,
+        output_scale,
+        stride_q_row,
+        stride_q_head,
+    ):
+        self.t = t
+        self.output = output
+        self.quantized_output = quantized_output
+        self.output_scale = output_scale
+        self.stride_q_row = stride_q_row
+        self.stride_q_head = stride_q_head
+
+    def _output_offset(self, seq, linear):
+        t = self.t
+        row, d = linear // t.head_dim, linear % t.head_dim
+        return (
+            (fx.Int64(seq) * t.query_length + row // t.query_group_size)
+            * self.stride_q_row
+            + (row % t.query_group_size) * self.stride_q_head
+            + d
+        )
+
+    def _sync(self):
+        if const_expr(self.t.cluster_merge):
+            fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
+            cluster.cluster_barrier()
+            fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
+        else:
+            fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+            gpu.barrier()
+            fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+
+    @flyc.jit
+    def run(self, seq, part):
+        t = self.t
+        parts = t.cluster_merge if t.cluster_merge else 1
+        total = t.rows * t.head_dim
+        chunk = -(-total // parts)
+        iterations = -(-chunk // t.BLOCK_THREADS)
+        source = fx.recast_iter(t.q_dtype, self.output)
+        quantized = _global_pointer(self.quantized_output, fx.Int32)
+        quant_stats = _global_pointer(self.quantized_output, fx.Float32)
+        scales = fx.recast_iter(fx.Float32, self.output_scale)
+
+        # Every producer finishes its BF16/FP16 output before any CTA reads it.
+        self._sync()
+
+        tid = fx.Int32(gpu.thread_id("x"))
+        warp, lane = tid // t.WAVE, tid % t.WAVE
+        begin = part * chunk
+        local_max = fx.Float32(0.0)
+        for i in range_constexpr(iterations):
+            linear = begin + tid + i * t.BLOCK_THREADS
+            if linear < fx.Int32(total):
+                value = fx.Float32(source[self._output_offset(seq, linear)])
+                local_max = fx.maxnumf(local_max, fmath.absf(value))
+        for shift in (16, 8, 4, 2, 1):
+            local_max = fx.maxnumf(
+                local_max,
+                local_max.shuffle_xor(fx.Int32(shift), fx.Int32(t.WAVE)),
+            )
+
+        # Four wave maxima per CTA, staged in this sequence's own FP8 output.
+        stat = part * t.NWARP + warp
+        stats_base = fx.Int64(seq) * (total // 4)
+        if lane == 0:
+            quant_stats[stats_base + stat] = local_max
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+        gpu.barrier()
+        fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+
+        if warp == 0:
+            wave_max = fx.Float32(0.0)
+            if lane < t.NWARP:
+                stat = part * t.NWARP + lane
+                wave_max = fx.Float32(quant_stats[stats_base + stat])
+            for shift in (16, 8, 4, 2, 1):
+                wave_max = fx.maxnumf(
+                    wave_max,
+                    wave_max.shuffle_xor(fx.Int32(shift), fx.Int32(t.WAVE)),
+                )
+            if lane == 0:
+                stat = part * t.NWARP
+                quant_stats[stats_base + stat] = wave_max
+
+        # Publish one maximum per CTA, then form the token-wide scale.
+        self._sync()
+        token_max = fx.Float32(0.0)
+        for p in range_constexpr(parts):
+            stat = p * t.NWARP
+            value = fx.Float32(quant_stats[stats_base + stat])
+            token_max = fx.maxnumf(token_max, value)
+        scale = token_max * fx.Float32(1.0 / t.FP8_MAX)
+        if (part == 0) & (tid == 0):
+            scales[seq] = scale
+
+        # Every CTA has consumed the temporary maxima before any FP8 store
+        # overwrites the same destination bytes.
+        self._sync()
+        inv_scale = fx.Float32(rcp_f32(scale))
+        total_packs = total // 8
+        pack_chunk = total_packs // parts
+        pack_iterations = -(-pack_chunk // t.BLOCK_THREADS)
+        pack_begin = part * pack_chunk
+        for i in range_constexpr(pack_iterations):
+            pack = pack_begin + tid + i * t.BLOCK_THREADS
+            if pack < fx.Int32(total_packs):
+                linear = pack * 8
+                offset = self._output_offset(seq, linear)
+                values = []
+                for j in range_constexpr(8):
+                    value = fx.Float32(source[offset + j]) * inv_scale
+                    value = fx.maxnumf(value, fx.Float32(-t.FP8_MAX))
+                    value = fx.minnumf(value, fx.Float32(t.FP8_MAX))
+                    values.append(value.ir_value())
+                words = []
+                for word in range_constexpr(2):
+                    base = word * 4
+                    packed_word = fx.Int32(0).ir_value()
+                    packed_word = fx.rocdl.cvt_pk_fp8_f32(
+                        T.i32,
+                        values[base],
+                        values[base + 1],
+                        packed_word,
+                        0,
+                    )
+                    packed_word = fx.rocdl.cvt_pk_fp8_f32(
+                        T.i32,
+                        values[base + 2],
+                        values[base + 3],
+                        packed_word,
+                        1,
+                    )
+                    words.append(packed_word)
+                packed = fx.Vector.from_elements(words, dtype=fx.Int32)
+                fx.ptr_store(packed, fx.add_offset(quantized, offset // 4))

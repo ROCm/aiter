@@ -65,6 +65,7 @@ from .pa_decode.op_merge import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     Gfx1250ClusterMerge,
+    Gfx1250OutputQuant,
 )
 from .pa_decode.pipeline import (
     Gfx1250Bf16Pipeline,
@@ -122,6 +123,7 @@ def _pa_decode_tile_kernel_name(
     direct_output=False,
     merge_partitions=False,
     cluster_merge=0,
+    quant_output=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -142,6 +144,8 @@ def _pa_decode_tile_kernel_name(
         name += "_merge"
     if cluster_merge:
         name += f"_cluster{cluster_merge}"
+    if quant_output:
+        name += "_quant"
     return name
 
 
@@ -171,6 +175,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    quant_output: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -253,10 +258,11 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            quant_output=quant_output,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
-    if direct_output or cluster_merge:
+    if direct_output or cluster_merge or quant_output:
         raise NotImplementedError("direct_output and cluster_merge require gfx1250")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -500,6 +506,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    quant_output=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -530,6 +537,7 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        quant_output,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -548,6 +556,25 @@ def compile_gfx1250_pa_decode(
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if quant_output and not (
+        (
+            direct_output
+            and not merge_partitions
+            and query_length == 1
+            and query_splits == 1
+        )
+        or cluster_merge == 8
+    ):
+        raise ValueError("quant_output requires the gfx1250 direct or cluster8 path")
+    if quant_output and (
+        query_group_size != 16
+        or head_dim != 128
+        or query_length != 1
+        or block_size != 16
+    ):
+        raise ValueError(
+            "quant_output requires query_length=1, GQA=16, head_dim=128 and page16"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -575,6 +602,7 @@ def compile_gfx1250_pa_decode(
         direct_output=direct_output,
         merge_partitions=merge_partitions,
         cluster_merge=cluster_merge,
+        quant_output=quant_output,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
@@ -603,6 +631,8 @@ def compile_gfx1250_pa_decode(
         reduce_info: fx.Pointer,
         output: fx.Pointer,
         counters: fx.Pointer,
+        quantized_output: fx.Pointer,
+        output_scale: fx.Pointer,
     ):
         _ = tag
 
@@ -640,7 +670,7 @@ def compile_gfx1250_pa_decode(
             task_slot = (part < count).select(first + part, fx.Int32(0))
         if const_expr(t.direct_output):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
-            info = fx.recast_iter(fx.Int32, pmax)
+            info = fx.recast_iter(fx.Int32, reduce_info if t.quant_output else pmax)
             count = fx.Int32(info[task_slot * 2 + 1])
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
@@ -722,6 +752,17 @@ def compile_gfx1250_pa_decode(
                 merge.run(seq, part, first, count, capacity)
             elif (count == 0) & (part == 0):
                 zero_output(seq, output)
+        if const_expr(t.quant_output):
+            quant_seq = seq if t.cluster_merge else fx.Int32(gpu.block_id("x"))
+            quant_part = part if t.cluster_merge else fx.Int32(0)
+            Gfx1250OutputQuant(
+                t,
+                output,
+                quantized_output,
+                output_scale,
+                sq_row,
+                sq_head,
+            ).run(quant_seq, quant_part)
 
     @flyc.jit
     def launch(
@@ -746,6 +787,8 @@ def compile_gfx1250_pa_decode(
         output: fx.Pointer,
         reduce_info: fx.Pointer,
         counters: fx.Pointer,
+        quantized_output: fx.Pointer,
+        output_scale: fx.Pointer,
         stream: fx.Stream,
     ):
         _ = tag
@@ -776,6 +819,8 @@ def compile_gfx1250_pa_decode(
             reduce_info,
             output,
             counters,
+            quantized_output,
+            output_scale,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
                 if t.cluster_merge
