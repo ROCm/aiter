@@ -333,12 +333,17 @@ def _cat_and_cache_mla(
     apply_rope = cos is not None
     if seg_page_size > 0:
         assert (
-            DEVICE_ARCH == "gfx1250" and apply_rope
+            DEVICE_ARCH in ("gfx1250", "gfx1250-strict") and apply_rope
         ), "seg-packed KV pages are only written by the gfx1250 gluon rope kernel"
         assert not shuffled_kv_cache, "seg-packed and shuffled KV layouts are exclusive"
         assert (
             kv_cache.dim() == 3 and kv_cache.shape[1] == 1
         ), "seg-packed KV pages need a (tokens, 1, D) single-head kv_cache"
+        # The writer packs nope then rope with element offsets from the page
+        # base, so a token stride larger than D stores past the view.
+        assert (
+            kv_cache.is_contiguous()
+        ), "seg-packed pages need a contiguous (tokens, 1, D) kv_cache"
         assert (
             kv_cache.shape[0] % seg_page_size == 0
         ), "seg-packed kv_cache must hold whole pages"
