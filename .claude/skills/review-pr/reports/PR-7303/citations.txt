@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/mnt/raid0/zufa/aiter/.claude/skills/review-pr/check_citations.py", line 205, in <module>
+    sys.exit(main(sys.argv))
+             ^^^^^^^^^^^^^^
+  File "/mnt/raid0/zufa/aiter/.claude/skills/review-pr/check_citations.py", line 169, in main
+    tree = tree_for(work, argv[2] if len(argv) > 2 else None)
+           ^^^^^^^^
+NameError: name 'tree_for' is not defined. Did you mean: 'trees_for'?

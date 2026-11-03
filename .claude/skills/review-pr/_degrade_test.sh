@@ -5,7 +5,7 @@ set -uo pipefail
 S="$1"; T=$(mktemp -d); WORK="$T/work"; mkdir -p "$WORK"
 START=$(grep -n '^if \[ -n "\$VALIDATION_REPORT" \]; then$' "$S/fetch.sh" | cut -d: -f1)
 END=$(awk -v s="$START" 'NR>s && /^fi$/{print NR}' "$S/fetch.sh" | sed -n 2p)
-{ echo 'set -e'; sed -n "${START},${END}p" "$S/fetch.sh"; } > "$T/region.sh"
+{ echo 'set -euo pipefail'; sed -n "${START},${END}p" "$S/fetch.sh"; } > "$T/region.sh"
 
 printf '{"headRefOid":"HEADSHA","author":{"login":"x"}}' > "$WORK/pr_meta.json"
 echo BASESHA > "$WORK/base_head.txt"

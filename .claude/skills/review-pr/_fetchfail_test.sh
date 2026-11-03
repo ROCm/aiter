@@ -6,7 +6,11 @@ S="$1"; T=$(mktemp -d)
 A=$(grep -n '^# errexit must not win here' "$S/run_one.sh" | cut -d: -f1)
 B=$(awk -v a="$A" 'NR>a && /^rm -f "\$FL"$/{print NR; exit}' "$S/run_one.sh")
 {
-  echo 'set -e'
+  # The real script runs `set -euo pipefail`. Testing the region under bare `set -e`
+  # is what let an unreachable classification pass as a working one: pipefail turns a
+  # no-match grep inside a command substitution into a fatal assignment, and none of
+  # the code under test ran in production. Use the flags the script actually uses.
+  echo 'set -euo pipefail'
   echo 'say() { echo "$*"; }'
   echo 'fail() { local c=$1 x=$2; shift 2; say "$*"; printf "%s\t%s\n" "$c" "$*" > "$STATUS"; exit "$x"; }'
   echo 'FL=$(mktemp)'

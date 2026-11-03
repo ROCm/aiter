@@ -166,8 +166,8 @@ def main(argv):
     if not card.is_file():
         print("CITATIONS: no card.md to check")
         return 1
-    tree = tree_for(work, argv[2] if len(argv) > 2 else None)
-    if tree is None:
+    trees = trees_for(work, argv[2] if len(argv) > 2 else None)
+    if not trees:
         print("CITATIONS: no tree to resolve citations against")
         return 1
     diff = work / "pr.diff"

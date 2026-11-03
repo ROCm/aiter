@@ -720,7 +720,9 @@ PY
   _CONSUME_RC=$?
   set -e
   if [ "$_CONSUME_RC" -ne 0 ]; then
-    _why=$(grep -v "^$" "$WORK/validation_rejected.txt" 2>/dev/null | tail -1)
+    # `|| true`: this file runs `set -euo pipefail`, so a rejection that wrote nothing
+    # makes grep exit 1 and kills the handler that exists to keep the review alive.
+    _why=$(grep -v "^$" "$WORK/validation_rejected.txt" 2>/dev/null | tail -1 || true)
     cat "$WORK/validation_rejected.txt" >&2 2>/dev/null || true
     rm -f "$WORK/validation_report.json"
     printf "validation evidence was produced but rejected before use: %s\n" \

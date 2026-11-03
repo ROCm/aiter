@@ -109,7 +109,11 @@ else
   (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 fi
 set -e
-W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
+# `|| true` is load-bearing under `set -euo pipefail`: on a dead fetch this grep matches
+# nothing, exits 1, and pipefail makes the whole substitution fail -- a fatal assignment that
+# killed run_one here, BEFORE any of the classification below could run. Every improvement to
+# that classification was unreachable in production while this line stayed unguarded.
+W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2 || true)"
 if [ -z "$W" ] || [ ! -d "$W" ]; then
   # Name the cause the runner can act on. "check gh auth/token, network, git and disk" sends
   # someone hunting a broken credential when the credential is fine and a quota is empty --
