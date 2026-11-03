@@ -186,7 +186,7 @@ def fmoe(
 ) -> None: ...
 
 
-@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+@compile_ops("module_moe_g1u1_bf16_small_m", ffi_type="ctypes")
 def fmoe_g1u1_bf16_small_m(
     out: Tensor,
     input: Tensor,

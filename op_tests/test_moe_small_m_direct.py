@@ -6,7 +6,11 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.fused_moe import fused_moe, torch_moe
+from aiter.fused_moe import (
+    _can_use_bf16_g1u1_small_m_direct,
+    fused_moe,
+    torch_moe,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_weight
@@ -27,13 +31,7 @@ def _make_balanced_topk(token: int, topk: int, expert: int):
     return topk_ids.contiguous(), topk_weights.contiguous()
 
 
-@pytest.mark.parametrize("token", [1, 2, 3, 4, 8, 16])
-@pytest.mark.parametrize("inter_dim", [128, 256])
-@pytest.mark.parametrize(
-    "preshuffle_w1,preshuffle_w2",
-    [(False, False), (True, False), (True, True)],
-)
-def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2):
+def _make_case(token: int = 4, inter_dim: int = 128):
     torch.manual_seed(2026 + token + inter_dim)
     model_dim = 2048
     expert = 256
@@ -45,6 +43,17 @@ def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2
     )
     w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
     topk_ids, topk_weights = _make_balanced_topk(token, topk, expert)
+    return hidden_states, w1, w2, topk_weights, topk_ids
+
+
+@pytest.mark.parametrize("token", [1, 2, 3, 4, 8, 16])
+@pytest.mark.parametrize("inter_dim", [128, 256])
+@pytest.mark.parametrize(
+    "preshuffle_w1,preshuffle_w2",
+    [(False, False), (True, False), (True, True)],
+)
+def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2):
+    hidden_states, w1, w2, topk_weights, topk_ids = _make_case(token, inter_dim)
     w1_input = shuffle_weight(w1, layout=(16, 16)) if preshuffle_w1 else w1
     w2_input = shuffle_weight(w2, layout=(16, 16)) if preshuffle_w2 else w2
 
@@ -68,4 +77,78 @@ def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2
         activation=aiter.ActivationType.Silu,
     )
 
-    checkAllclose(actual, expected, rtol=1e-2, atol=1e-2)
+    assert checkAllclose(actual, expected, rtol=1e-2, atol=1e-2) == 0
+
+
+def test_bf16_g1u1_small_m_direct_output_buffer():
+    hidden_states, w1, w2, topk_weights, topk_ids = _make_case()
+    expected = torch_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+    )
+    output = torch.empty_like(expected)
+    output.fill_(float("nan"))
+
+    actual = fused_moe(
+        hidden_states,
+        shuffle_weight(w1, layout=(16, 16)),
+        shuffle_weight(w2, layout=(16, 16)),
+        topk_weights,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.No,
+        dtype=dtypes.bf16,
+        gate_mode=GateMode.SEPARATED.value,
+        output=output,
+    )
+
+    assert actual is output
+    assert checkAllclose(output, expected, rtol=1e-2, atol=1e-2) == 0
+
+
+def test_bf16_g1u1_small_m_direct_gate_rejects_unsupported_integration():
+    hidden_states, w1, w2, topk_weights, topk_ids = _make_case()
+    gate_kwargs = dict(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weights,
+        topk_ids=topk_ids,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.No,
+        dtype=dtypes.bf16,
+        doweight_stage1=False,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+        num_local_tokens=None,
+        moe_sorting_dispatch_policy=0,
+        expert_mask=None,
+        hidden_pad=0,
+        intermediate_pad=0,
+        bias1=None,
+        bias2=None,
+        gate_mode=GateMode.SEPARATED.value,
+    )
+
+    assert _can_use_bf16_g1u1_small_m_direct(**gate_kwargs)
+    assert not _can_use_bf16_g1u1_small_m_direct(
+        **gate_kwargs, stage2_scatter=object()
+    )
+
+    w1_bad_layout = shuffle_weight(w1, layout=(32, 16))
+    assert not _can_use_bf16_g1u1_small_m_direct(
+        **{**gate_kwargs, "w1": w1_bad_layout}
+    )
+
+    w1_guinterleave = shuffle_weight(
+        w1, layout=(16, 16), is_guinterleave=True, gate_up=True
+    )
+    assert not _can_use_bf16_g1u1_small_m_direct(
+        **{**gate_kwargs, "w1": w1_guinterleave}
+    )

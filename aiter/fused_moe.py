@@ -1278,42 +1278,6 @@ def fused_moe(
             clamp_shared=clamp_shared,
             output=output,
         )
-    out_dtype = hidden_states.dtype if dtype is None else dtype
-    if _can_use_bf16_g1u1_small_m_direct(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        activation=activation,
-        quant_type=quant_type,
-        dtype=out_dtype,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        expert_mask=expert_mask,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        splitk=splitk,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gate_mode,
-    ):
-        return fused_moe_g1u1_bf16_small_m_direct(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            dtype=out_dtype,
-        )
     if not block_size_M:
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
@@ -1438,12 +1402,14 @@ def fused_moe_g1u1_bf16_small_m_direct(
     topk_ids: torch.Tensor,
     *,
     dtype: torch.dtype,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M = hidden_states.shape[0]
     topk = topk_ids.shape[1]
     model_dim = w2.shape[1]
     inter_dim = w2.shape[2]
-    output = torch.empty((M, model_dim), dtype=dtype, device=hidden_states.device)
+    if output is None:
+        output = torch.empty((M, model_dim), dtype=dtype, device=hidden_states.device)
     act_workspace = torch.empty(
         (M * topk, inter_dim), dtype=dtype, device=hidden_states.device
     )
@@ -1460,6 +1426,20 @@ def fused_moe_g1u1_bf16_small_m_direct(
         bool(getattr(w2, "is_shuffled", False)),
     )
     return output
+
+
+_BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT = (16, 16)
+
+
+def _supports_bf16_g1u1_small_m_direct_shuffle(weight: torch.Tensor) -> bool:
+    if not getattr(weight, "is_shuffled", False):
+        return True
+    return (
+        getattr(weight, "aiter_shuffle_layout", None)
+        == _BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT
+        and not getattr(weight, "gate_up_interleave", False)
+        and not getattr(weight, "aiter_shuffle_is_guinterleave", False)
+    )
 
 
 def _can_use_bf16_g1u1_small_m_direct(
@@ -1489,6 +1469,7 @@ def _can_use_bf16_g1u1_small_m_direct(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str | GateMode | None = GateMode.SEPARATED.value,
+    stage2_scatter: Stage2ScatterContext | None = None,
 ) -> bool:
     M = topk_ids.shape[0]
     return (
@@ -1513,6 +1494,7 @@ def _can_use_bf16_g1u1_small_m_direct(
         and topk_weight.dtype == dtypes.fp32
         and w1.shape[1] == 2 * w2.shape[2]
         and expert_mask is None
+        and stage2_scatter is None
         and not doweight_stage1
         and w1_scale is None
         and w2_scale is None
@@ -1529,6 +1511,8 @@ def _can_use_bf16_g1u1_small_m_direct(
         and beta is None
         and linear_beta is None
         and gate_mode in (None, GateMode.SEPARATED, GateMode.SEPARATED.value)
+        and _supports_bf16_g1u1_small_m_direct_shuffle(w1)
+        and _supports_bf16_g1u1_small_m_direct_shuffle(w2)
     )
 
 
@@ -1850,6 +1834,7 @@ def _fused_moe_impl(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
     ):
         return fused_moe_g1u1_bf16_small_m_direct(
             hidden_states,
@@ -1858,6 +1843,7 @@ def _fused_moe_impl(
             topk_weight,
             topk_ids,
             dtype=dtype,
+            output=output,
         )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
