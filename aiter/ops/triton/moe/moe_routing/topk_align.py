@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk_align import (
     _topk_scatter_kernel,
 )
 from aiter.ops.triton.moe.moe_routing.routing import ExptData, RoutingData
+from aiter.utility.graph_alloc import persistent_alloc
 
 _TOPK_ALIGN_SCRATCH = {}
 
@@ -25,23 +26,31 @@ def _max_tiles(route_count: int, num_experts: int, block_m: int) -> int:
 
 
 def _scratch(device, route_count: int, num_experts: int, block_m: int):
-    key = (device, route_count, num_experts, block_m)
+    stream = torch.cuda.current_stream(device)
+    key = (device, stream.cuda_stream, route_count, num_experts, block_m)
     scratch = _TOPK_ALIGN_SCRATCH.get(key)
     if scratch is not None:
         return scratch
 
     max_blocks = _max_tiles(route_count, num_experts, block_m)
-    scratch = {
-        "hist": torch.empty(num_experts, dtype=torch.int32, device=device),
-        "raw_offsets": torch.empty(num_experts + 1, dtype=torch.int32, device=device),
-        "tile_offsets": torch.empty(num_experts + 1, dtype=torch.int32, device=device),
-        "cursor": torch.empty(num_experts, dtype=torch.int32, device=device),
-        "total_blocks": torch.empty(1, dtype=torch.int32, device=device),
-        "block_pid_map": torch.empty(max_blocks, dtype=torch.int32, device=device),
-        "sorted_routes": torch.empty(route_count, dtype=torch.int32, device=device),
-        "sorted_weights": torch.empty(route_count, dtype=torch.float32, device=device),
-        "inverse": torch.empty(route_count, dtype=torch.int32, device=device),
-    }
+    with persistent_alloc(device):
+        scratch = {
+            "hist": torch.empty(num_experts, dtype=torch.int32, device=device),
+            "raw_offsets": torch.empty(
+                num_experts + 1, dtype=torch.int32, device=device
+            ),
+            "tile_offsets": torch.empty(
+                num_experts + 1, dtype=torch.int32, device=device
+            ),
+            "cursor": torch.empty(num_experts, dtype=torch.int32, device=device),
+            "total_blocks": torch.empty(1, dtype=torch.int32, device=device),
+            "block_pid_map": torch.empty(max_blocks, dtype=torch.int32, device=device),
+            "sorted_routes": torch.empty(route_count, dtype=torch.int32, device=device),
+            "sorted_weights": torch.empty(
+                route_count, dtype=torch.float32, device=device
+            ),
+            "inverse": torch.empty(route_count, dtype=torch.int32, device=device),
+        }
     _TOPK_ALIGN_SCRATCH[key] = scratch
     return scratch
 

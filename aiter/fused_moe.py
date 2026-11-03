@@ -1382,6 +1382,7 @@ _BF16_G1U1_GFX1201_TRITON_LARGE_M = {
     1945,
     2048,
 }
+_BF16_G1U1_GFX1201_TRITON_CU_NUM = 64
 
 
 def _can_use_bf16_g1u1_gfx1201_triton_large_m(
@@ -1418,6 +1419,7 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
     tokens = topk_ids.shape[0]
     return (
         get_gfx_runtime() == "gfx1201"
+        and get_cu_num() == _BF16_G1U1_GFX1201_TRITON_CU_NUM
         and tokens in _BF16_G1U1_GFX1201_TRITON_LARGE_M
         and hidden_states.is_cuda
         and w1.is_cuda

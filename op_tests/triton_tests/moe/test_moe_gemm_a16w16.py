@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
+
 import pytest
 import torch
 
@@ -17,6 +19,8 @@ pytestmark = pytest.mark.skipif(
 
 _RTOL = 1e-2
 _ATOL = 128
+_SELECTED_TOKENS = [1152, 1543, 1728, 1799, 1803, 1815, 1837, 1945, 2048]
+_NEIGHBOR_TOKENS = [1151, 1153, 1542, 1544, 1944, 2047, 2049]
 
 
 def _make_case(tokens: int):
@@ -34,6 +38,53 @@ def _make_case(tokens: int):
     weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return hidden, w1.contiguous(), w2.contiguous(), weights.contiguous(), ids.contiguous()
+
+
+def _large_m_gate_inputs(tokens: int):
+    fused_moe_mod = importlib.import_module("aiter.fused_moe")
+    hidden, w1, w2, weights, ids = _make_case(tokens)
+    return {
+        "hidden_states": hidden,
+        "w1": w1,
+        "w2": w2,
+        "topk_weight": weights,
+        "topk_ids": ids,
+        "activation": aiter.ActivationType.Silu,
+        "quant_type": aiter.QuantType.No,
+        "dtype": dtypes.bf16,
+        "q_dtype_a": dtypes.bf16,
+        "q_dtype_w": dtypes.bf16,
+        "is_g1u1": True,
+        "doweight_stage1": False,
+        "w1_scale": None,
+        "w2_scale": None,
+        "a1_scale": None,
+        "a2_scale": None,
+        "num_local_tokens": None,
+        "moe_sorting_dispatch_policy": 0,
+        "expert_mask": None,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "bias1": None,
+        "bias2": None,
+        "swiglu_limit": None,
+        "beta": None,
+        "linear_beta": None,
+        "gate_mode": fused_moe_mod.GateMode.SEPARATED.value,
+        "stage2_scatter": None,
+    }
+
+
+def _large_m_gate(**kwargs):
+    fused_moe_mod = importlib.import_module("aiter.fused_moe")
+    return fused_moe_mod._can_use_bf16_g1u1_gfx1201_triton_large_m(**kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _force_validated_gfx1201_target(monkeypatch):
+    fused_moe_mod = importlib.import_module("aiter.fused_moe")
+    monkeypatch.setattr(fused_moe_mod, "get_gfx_runtime", lambda: "gfx1201")
+    monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
 
 @pytest.mark.parametrize("tokens", [1152, 1543, 1728, 2048])
@@ -85,3 +136,38 @@ def test_public_fused_moe_bf16_g1u1_selected_large_m_output_buffer():
     )
     assert actual is output
     assert checkAllclose(output, expected, rtol=_RTOL, atol=_ATOL) == 0
+
+
+@pytest.mark.parametrize("tokens", _SELECTED_TOKENS)
+def test_large_m_gate_accepts_selected_rows(tokens):
+    assert _large_m_gate(**_large_m_gate_inputs(tokens))
+
+
+@pytest.mark.parametrize("tokens", _NEIGHBOR_TOKENS)
+def test_large_m_gate_rejects_neighbor_rows(tokens):
+    assert not _large_m_gate(**_large_m_gate_inputs(tokens))
+
+
+def test_large_m_gate_rejects_unsupported_modes(monkeypatch):
+    fused_moe_mod = importlib.import_module("aiter.fused_moe")
+    case = _large_m_gate_inputs(1152)
+
+    monkeypatch.setattr(fused_moe_mod, "get_gfx_runtime", lambda: "gfx950")
+    assert not _large_m_gate(**case)
+    monkeypatch.setattr(fused_moe_mod, "get_gfx_runtime", lambda: "gfx1201")
+
+    monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 60)
+    assert not _large_m_gate(**case)
+    monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
+
+    assert not _large_m_gate(**{**case, "quant_type": aiter.QuantType.per_Token})
+    assert not _large_m_gate(**{**case, "is_g1u1": False})
+    assert not _large_m_gate(**{**case, "expert_mask": torch.ones(256, device="cuda")})
+    assert not _large_m_gate(**{**case, "stage2_scatter": object()})
+
+    shuffled_w1 = case["w1"].clone()
+    shuffled_w1.is_shuffled = True
+    assert not _large_m_gate(**{**case, "w1": shuffled_w1})
+
+    noncontig_w1 = case["w1"].transpose(1, 2)
+    assert not _large_m_gate(**{**case, "w1": noncontig_w1})
