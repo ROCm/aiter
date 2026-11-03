@@ -468,8 +468,8 @@ def verify_production_variants(num_heads, head_dims, clean_logits):
     Auto-routing is shape-dependent, so the reduced/full sweeps reach a given
     production variant only by chance; this pins each one down across the
     num_heads, head-dim, clean_logits and window axes. Heads and head dims the
-    variant's MFMA atom cannot tile are skipped. Returns (rows, failures) in the shape main()
-    reports them.
+    variant's MFMA atom cannot tile are skipped. Returns (rows, failures) in
+    the shape main() reports them.
     """
     rows, failures = [], []
     for tag, nh, hd, cl, window in itertools.product(
@@ -679,8 +679,9 @@ Case = namedtuple(
 )
 
 
-def _log_speedup(ratios, output_file=None):
-    """Headline FlyDSL-over-reference figure for a bench sweep.
+def _log_speedup(ratios):
+    """Log, and return, the headline FlyDSL-over-reference figure for a bench
+    sweep (None if no case has a finite ratio).
 
     Geometric mean, because these are ratios: an arithmetic mean over a sweep
     spanning 0.13x to 70x would just report the widest win.
@@ -688,25 +689,15 @@ def _log_speedup(ratios, output_file=None):
     r = pd.to_numeric(ratios, errors="coerce")
     r = r[r.gt(0) & r.lt(float("inf"))].dropna()
     if r.empty:
-        return
-    aiter.logger.info(
-        f"fp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on %d of %d cases: "
-        "geomean=%.2fx min=%.2fx max=%.2fx, FlyDSL faster on %d (>1 is faster)",
-        len(r),
-        len(ratios),
-        float(np.exp(np.log(r).mean())),
-        r.min(),
-        r.max(),
-        int(r.gt(1).sum()),
+        return None
+    line = (
+        f"fp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on {len(r)} of "
+        f"{len(ratios)} cases: geomean={float(np.exp(np.log(r).mean())):.2f}x "
+        f"min={r.min():.2f}x max={r.max():.2f}x, FlyDSL faster on "
+        f"{int(r.gt(1).sum())} (>1 is faster)"
     )
-    if output_file is None:
-        return
-    with open(output_file, "a") as file:
-        line = (
-            f"\n\nfp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on {len(r)} of {len(ratios)} cases: "
-            f"geomean={float(np.exp(np.log(r).mean())):.2f} min={r.min():.2f} max={r.max():.2f}, FlyDSL faster on {int(r.gt(1).sum())} (>1 is faster)"
-        )
-        file.write(line)
+    aiter.logger.info(line)
+    return line
 
 
 def _cp_eligible(s_q, s_k):
@@ -748,21 +739,15 @@ def _model_set(args):
 
 
 def _csv_set(args):
-    """Cases from a CSV of (M, N) shapes -- one measurement row per CSV row.
+    """Cases from a CSV of (M, N) shapes, e.g. a production shape dump.
 
     The CSV must have a header. Required columns are ``M`` (seq_q) and ``N``
-    (seq_kv). Optional per-row columns, each falling back to a global default
-    when absent or blank:
-
-      ``num_heads``  (default --csv-num-heads, itself default 32, GLM-5.2)
-      ``head_dim``   (default 128)
-      ``window``     (default --csv-window, itself default "causal")
-      ``batch``      (default 1)
-
-    Any other columns (e.g. a per-shape call ``count``/``weight`` from a
-    production shape dump) are ignored here; they are provenance, not axes.
-    The dtype pair and clean_logits come from the usual CLI axes, so a CSV
-    sweep still honours --q-dtype/--kv-dtype/--clean-logits.
+    (seq_kv). Optional per-row ``num_heads``, ``head_dim``, ``window`` and
+    ``batch`` columns pin that axis for the row; where a column is absent or
+    blank the row sweeps the matching CLI axis (--num-heads, --head-dim,
+    --window; batch 1). Any other columns (e.g. a per-shape call count) are
+    provenance, not axes, and are ignored. The dtype pair and clean_logits come
+    from the usual CLI axes.
     """
     df = pd.read_csv(args.shapes_csv)
     cols = {c.lower().strip(): c for c in df.columns}
@@ -771,34 +756,37 @@ def _csv_set(args):
             f"{args.shapes_csv}: need 'M' and 'N' columns; got {list(df.columns)}"
         )
 
-    def _col(row, key, default):
+    def _axis(row, key, values):
         src = cols.get(key)
-        if src is None:
-            return default
-        val = row[src]
-        if pd.isna(val) or (isinstance(val, str) and not val.strip()):
-            return default
-        return val
+        if src is None or pd.isna(row[src]) or not str(row[src]).strip():
+            return values
+        return [row[src]]
 
     cases = []
     for cl in args.clean_logits:
         for _, row in df.iterrows():
-            s_q = int(_col(row, "m", None))
-            s_k = int(_col(row, "n", None))
-            batch = int(_col(row, "batch", 1))
-            cases.append(
-                Case(
-                    s_q=s_q,
-                    s_k=s_k,
-                    num_heads=int(_col(row, "num_heads", args.csv_num_heads)),
-                    head_dim=int(_col(row, "head_dim", 128)),
-                    q_dtype=args.q_dtype[0],
-                    kv_dtype=args.kv_dtype[0],
-                    clean_logits=bool(cl),
-                    window=str(_col(row, "window", args.csv_window)),
-                    batch=batch,
+            s_q, s_k = int(row[cols["m"]]), int(row[cols["n"]])
+            for nh, hd, win, batch in itertools.product(
+                _axis(row, "num_heads", args.num_heads),
+                _axis(row, "head_dim", args.head_dim),
+                _axis(row, "window", args.window),
+                _axis(row, "batch", [1]),
+            ):
+                if win == "cp" and not _cp_eligible(s_q, s_k):
+                    continue
+                cases.append(
+                    Case(
+                        s_q=s_q,
+                        s_k=s_k,
+                        num_heads=int(nh),
+                        head_dim=int(hd),
+                        q_dtype=args.q_dtype[0],
+                        kv_dtype=args.kv_dtype[0],
+                        clean_logits=bool(cl),
+                        window=str(win),
+                        batch=int(batch),
+                    )
                 )
-            )
     return cases
 
 
@@ -907,24 +895,10 @@ def main():
         "--shapes-csv",
         type=str,
         default=None,
-        help="Path to a CSV of (M, N) shapes, one bench row per CSV row.\n"
+        help="Path to a CSV of (M, N) shapes to sweep instead of --shapes.\n"
         "Required columns M (seq_q) and N (seq_kv); optional per-row\n"
-        "num_heads/head_dim/window/batch columns (else the --csv-* defaults).\n"
-        "Overrides --shapes/--num-heads/--head-dim/--window; the dtype and\n"
-        "clean_logits axes still apply. Pairs with --scenario bench.",
-    )
-    parser.add_argument(
-        "--csv-num-heads",
-        type=int,
-        default=32,
-        help="num_heads for CSV rows lacking a num_heads column (default 32).",
-    )
-    parser.add_argument(
-        "--csv-window",
-        type=str,
-        default="causal",
-        choices=["causal", "cp", "misaligned", "empty", "past_end", "batch_causal"],
-        help="window mode for CSV rows lacking a window column (default causal).",
+        "num_heads/head_dim/window/batch columns pin that axis for the row,\n"
+        "otherwise the row sweeps --num-heads/--head-dim/--window.",
     )
     parser.add_argument(
         "-s",
@@ -998,8 +972,13 @@ def main():
         "--output",
         type=str,
         default=None,
+        help="Also write each scenario's summary table (and the bench speedup\n"
+        "line) to this markdown file, e.g. -o results/fp8_mqa_logits.md",
     )
     args = parser.parse_args()
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        open(args.output, "w").close()
 
     if args.shapes_csv:
         cases = _csv_set(args)
@@ -1087,28 +1066,16 @@ def main():
                 failures.append((scenario, _case_tag(*case), exc))
                 rows.append({**case._asdict(), "gfx": get_gfx(), "status": "FAIL"})
         df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "fp8_mqa_logits %s summary (markdown):\n%s",
-            scenario,
-            df.to_markdown(index=False),
-        )
-
-        # Write optionally the data frame to a file.
-        if args.output is not None:
-            from pathlib import Path
-
-            path = Path(args.output)
-            base_dir = path.parent
-            if not Path.exists(base_dir):
-                Path.mkdir(base_dir, parents=True)
-            with open(args.output, "w") as file:
-                table = (
-                    f"fp8_mqa_logits {scenario} summary:\n{df.to_markdown(index=False)}"
-                )
-                file.write(table)
-
+        table = df.to_markdown(index=False)
+        aiter.logger.info("fp8_mqa_logits %s summary (markdown):\n%s", scenario, table)
+        report = [f"fp8_mqa_logits {scenario} summary:\n\n{table}\n"]
         if "speedup" in df:
-            _log_speedup(df["speedup"], args.output)
+            line = _log_speedup(df["speedup"])
+            if line:
+                report.append(f"\n{line}\n")
+        if args.output:
+            with open(args.output, "a") as f:
+                f.write("".join(report) + "\n")
 
     if failures:
         aiter.logger.error(

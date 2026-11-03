@@ -323,8 +323,8 @@ def _mk_builder(
             sw_pipe=sw_pipe,
             rs_head=rs_head,
             lds_scales=lds_scales,
-            **({"tile_skip": True} if tile_skip else {}),
-            **({"dma_guard": True} if dma_guard else {}),
+            tile_skip=tile_skip,
+            dma_guard=dma_guard,
         )
     return builder, mfma
 

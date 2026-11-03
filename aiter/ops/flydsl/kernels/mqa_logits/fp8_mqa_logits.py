@@ -125,12 +125,12 @@ def _accumulate_heads(mfma, c_frag, w_mi, col_sum, f32_0, head_acc="add"):
             col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_mi[ii]
     elif head_acc == "fma":
         for ii in range_constexpr(mfma.ACC_ELEMS):
-            col_sum = fx.math.fma(Vec(acc)[ii].maximumf(f32_0), w_mi[ii], col_sum)
+            col_sum = fx.fma(Vec(acc)[ii].maximumf(f32_0), w_mi[ii], col_sum)
     else:
         relu = Vec(acc).maximumf(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
         for ii in range_constexpr(0, mfma.ACC_ELEMS, 2):
             pair = [ii, ii + 1]
-            col_sum = fx.math.fma(
+            col_sum = fx.fma(
                 relu.shuffle(relu, pair), w_mi.shuffle(w_mi, pair), col_sum
             )
     return col_sum
@@ -1191,7 +1191,7 @@ def _build_kernel_mfma_lds_pipe(
         kv_copy = fx.make_copy_atom(fx.UniversalCopy(mfma.frag_bytes * 8), 8)
         tc_kv = fx.make_tiled_copy_B(kv_copy, tiled_mma).get_slice(lane)
 
-        wave_s = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, wave.ir_value()))
+        wave_s = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, wave))
 
         # First row owned by this wave.
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
@@ -1327,14 +1327,10 @@ def _build_kernel_mfma_lds_pipe(
             ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
             starts[j] = fx.Int32(
-                rocdl.readfirstlane(
-                    fx.Int32.ir_type, in_rows.select(ss, seq_len_kv).ir_value()
-                )
+                rocdl.readfirstlane(fx.Int32.ir_type, in_rows.select(ss, seq_len_kv))
             )
             ends[j] = fx.Int32(
-                rocdl.readfirstlane(
-                    fx.Int32.ir_type, in_rows.select(ee, fx.Int32(0)).ir_value()
-                )
+                rocdl.readfirstlane(fx.Int32.ir_type, in_rows.select(ee, fx.Int32(0)))
             )
 
             # A-fragments: the row's [H, D] Q tile, partitioned by the tiled MMA

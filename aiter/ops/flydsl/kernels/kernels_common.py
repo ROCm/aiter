@@ -112,19 +112,21 @@ def atomic_max_i32(memref, val, offset, syncscope):
 
 # Cross-lane-group reductions, spelled like ``fx.coop``'s warp collectives.
 #
-# ``fx.coop.warp_reduce`` / ``warp_reduce_batched`` fold *contiguous* groups of
-# ``width`` lanes (XOR distances 1 .. width/2). An MFMA accumulator needs the
-# opposite: fold the lanes that differ only in the bits at and above ``stride``
-# (the lane groups holding different M rows) while keeping the low bits (the N
-# column) apart. Same signatures as ``fx.coop`` plus ``stride``, so these can be
-# replaced by ``fx.coop`` once it grows a lane-stride option.
+# Every ``fx.coop`` warp collective in FlyDSL 0.4.1 (``warp_reduce``,
+# ``warp_reduce_batched[_to_blocked|_to_striped]``, and the ROCm DPP override
+# of ``warp_reduce``) folds *contiguous* groups of ``width`` lanes, i.e. XOR
+# distances 1 .. width/2. An MFMA accumulator needs the opposite: fold the
+# lanes that differ only in the bits at and above ``stride`` (the lane groups
+# holding different M rows) while keeping the low bits (the N column) apart.
+# These keep the ``fx.coop`` signatures plus ``stride``, so they can be
+# replaced once ``fx.coop`` grows a lane-stride option.
 
 
 def _combine(op, lhs, rhs):
     if op is fx.ReductionOp.ADD:
         return lhs + rhs
     if op is fx.ReductionOp.MAX:
-        return lhs.maximumf(rhs)
+        return fx.max(lhs, rhs)
     raise TypeError(f"unsupported ReductionOp, got {op!r}")
 
 
@@ -134,6 +136,9 @@ def _permlane_swap(swap, x, y):
     permlane32: ``x' = [x lanes 0-31, y lanes 0-31]``,
     ``y' = [x lanes 32-63, y lanes 32-63]``. permlane16 does the same within
     each 32-lane half, on 16-lane rows. gfx950 only.
+
+    Raw ROCDL boundary: FlyDSL 0.4.1 exposes only the generated op, which
+    takes i32 ``ir.Value`` operands and returns an ``!llvm.struct<(i32, i32)>``.
     """
     pair = swap(
         _llvm.StructType.get_literal([T.i32, T.i32]),
