@@ -84,6 +84,33 @@ def _sched_barrier():
         gl.amd.hint.sched_barrier()
 
 
+# The loop's f32 math as unpacked VOP3 ops. Left to itself LLVM pairs them into
+# v_pk_*, which cannot issue while an MFMA is in flight; these can, and two waves
+# can dual-issue them.
+@gluon.jit
+def _fma(a, b, c):
+    return gl.inline_asm_elementwise(
+        "v_fma_f32 $0, $1, $2, $3", "=v,v,v,v", [a, b, c], dtype=gl.float32,
+        is_pure=True, pack=1,
+    )  # fmt: skip
+
+
+@gluon.jit
+def _mul(a, b):
+    return gl.inline_asm_elementwise(
+        "v_mul_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True,
+        pack=1,
+    )  # fmt: skip
+
+
+@gluon.jit
+def _add(a, b):
+    return gl.inline_asm_elementwise(
+        "v_add_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True,
+        pack=1,
+    )  # fmt: skip
+
+
 @gluon.jit
 def _relayout(smem, layout: gl.constexpr):
     """The same LDS bytes under another shared layout."""
@@ -387,9 +414,11 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
         if cfg.ROPE > 0:
             kr_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QR, 8)
             kr = krt.permute([1, 0]).load(kr_op).to(gl.float8e4nv, bitcast=True)
-            S0 = gl.convert_layout(
-                gl.amd.cdna4.mfma(q[1], kr, gl.convert_layout(S0, cfg.QR)), cfg.QK
-            )
+            # Its own accumulator, added after: chaining onto S0 makes this MFMA
+            # read another shape's MFMA result, a hazard Triton 3.8's LLVM pads
+            # with no wait states (nondeterministic scores).
+            sr = gl.amd.cdna4.mfma(q[1], kr, gl.zeros(S0.shape, gl.float32, cfg.QR))
+            S0 = S0 + gl.convert_layout(sr, cfg.QK)
         S0 = _mask(S0, k0, end)
         S1 = S0
         mx = gl.max(S0, axis=1)
@@ -402,10 +431,10 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
     m_sub = gl.where(live, m_new - cfg.LOG2_PS, 0.0)
     c2 = gl.broadcast(c[:, None], S0)[0]
     nm = gl.broadcast(-m_sub[:, None], S0)[0]
-    p0 = gl.exp2(gl.fma(S0, c2, nm))
+    p0 = gl.exp2(_fma(S0, c2, nm))
     if HALVES:
-        p1 = gl.exp2(gl.fma(S1, c2, nm))
-        l_i = gl.fma(l_i, alpha, gl.sum(p0, axis=1) + gl.sum(p1, axis=1))
+        p1 = gl.exp2(_fma(S1, c2, nm))
+        l_i = _fma(l_i, alpha, gl.reduce(_add(p0, p1), 1, _add))
         p_smem.slice(0, HB, dim=1).store(
             p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
         )
@@ -413,10 +442,8 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
             p1.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
         )
     else:
-        # Deferred row sum: no cross-wave reduction per tile. Rounded twice on
-        # purpose (the launch turns contraction off): as v_pk_fma_f32 it is
-        # slower than v_pk_mul + v_pk_add.
-        l_i = l_i * gl.broadcast(alpha[:, None], S0)[0] + p0
+        # deferred row sum: no cross-wave reduction per tile
+        l_i = _fma(l_i, gl.broadcast(alpha[:, None], S0)[0], p0)
         p_smem.store(p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True))
     a_smem.store(alpha)
     gl.barrier()
@@ -424,7 +451,7 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
     # a uniform branch: on most tiles no row max moved
     alpha_pv = a_smem.load(gl.SliceLayout(1, cfg.PV))
     if gl.min(alpha_pv, axis=0) < 1.0:
-        acc = acc * alpha_pv[:, None]
+        acc = _mul(acc, gl.broadcast(alpha_pv[:, None], acc)[0])
     p_op: gl.constexpr = gl.DotOperandLayout(0, cfg.PV, cfg.KW_PV)
     v_op: gl.constexpr = gl.DotOperandLayout(1, cfg.PV, cfg.KW_PV)
     v = _relayout(kvt, cfg.V_SH).load(v_op).to(gl.float8e4nv, bitcast=True)
@@ -533,7 +560,7 @@ class _Program:
     def loop(self, q, kv_ptr, ix, start, n, t0, t1, c, init):
         """Tiles t0 .. t1 of the n-key list ix (start: its position in the
         concatenated list, for the masks). q: the (latent, RoPE) operands, or None
-        to load fp8 q behind the first gather. init: None or the (acc, m, l) to
+        to load fp8 q ahead of the first gather. init: None or the (acc, m, l) to
         continue from. Returns (acc, m, l), l as _tile keeps it."""
         cfg = self.cfg
         GM: gl.constexpr = cfg.GM
@@ -573,11 +600,12 @@ class _Program:
         # r: the row ids of the next tile to gather
         n_s = gl.minimum(n, t1 * BN)
         kb = t0 * BN
+        if q is None:
+            # its latency hides behind the list bounds -> row ids -> gather chain
+            q = self.q_fp8()
         r = _rows(ix, kb, n_s, cfg.KEY_L)
         _gather(cfg, kv0, kr0, kv_ptr, ix, r, cols)
         r = _rows(ix, kb + BN, n_s, cfg.KEY_L)
-        if q is None:
-            q = self.q_fp8()
 
         # Unrolled over the two slots. An odd tile count runs one fully masked
         # tile, which reads nothing of the next split: its keys end at n_s.
@@ -756,7 +784,7 @@ def _sparse_mla_fp8(
         q, q_s = pgm.q_bf16()
         c = q_s * (k_scale * sm_scale_log2)
     else:
-        q = None  # loaded by the loop, behind its first gather
+        q = None  # loaded by the loop, ahead of its first gather
         c = gl.zeros([cfg.GM], gl.float32, cfg.ROW_L) + (
             gl.load(q_scale_ptr) * k_scale * sm_scale_log2
         )
