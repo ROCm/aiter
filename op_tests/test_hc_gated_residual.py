@@ -929,6 +929,38 @@ def _run_counter_cache_bound():
         skinny._MAX_COUNTER_SETS, skinny._MAX_PINNED_SETS = limits
 
 
+def _run_skinny_n_pad_8():
+    """Skinny decode keeps 8-row ``n_pad`` granularity; tiled K1 rejects it."""
+    for tokens in (1, 8, 64):
+        inp = _make_inputs(tokens, seed=36)
+        merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+        folded = fold_norm_weight(merged, inp["norm_weight"], HC)
+        narrow = folded[: LOWRANK + 8].contiguous()
+
+        def call(w, inp=inp):
+            return flydsl_gr_two_stage_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                HC,
+                EPS,
+                w_down_merged=w,
+                fold_w=True,
+            )
+
+        if tokens > 8:
+            _expect_value_error(f"n_pad_8[M={tokens}]", lambda w=narrow: call(w))
+            continue
+        got, want = call(narrow), call(folded)
+        if not all(torch.equal(g, w) for g, w in zip(got, want)):
+            print(f"[FAIL] n_pad_8[M={tokens}]: differs from the 16-row-padded weight")
+            _FAILURES.append(f"n_pad_8[M={tokens}]")
+
+
 def _run_heuristic_marker():
     """A tuner ``heuristic`` entry must route to the heuristic, not a neighbour."""
     from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import tuned
@@ -1261,6 +1293,7 @@ def main():
     _run_arch_gating()
     _run_stream_device_mismatch()
     _run_heuristic_marker()
+    _run_skinny_n_pad_8()
     _run_direct_k2()
     _run_direct_k1_buffers()
     for m in args.decode_tokens:

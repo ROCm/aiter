@@ -1662,8 +1662,8 @@ def validate_k1_inputs(
     ``block_output``/``injection`` are ``None`` for the no-combine (mix-only)
     variant. ``injection`` may be a column slice with unit inner stride.
     ``hidden / hc_count`` must be a multiple of
-    :data:`~.common.STREAM_DIM_ALIGN` and ``w_dn_merged`` must have a multiple
-    of 16 rows (one MFMA N tile).
+    :data:`~.common.STREAM_DIM_ALIGN`. The tiled path additionally needs a
+    multiple of 16 ``w_dn_merged`` rows; the skinny path checks its own widths.
     """
     if residual.ndim != 2 or residual.dtype != torch.bfloat16:
         raise ValueError("residual must be a 2-D bf16 tensor")
@@ -1686,8 +1686,6 @@ def validate_k1_inputs(
     check_tensor("w_dn_merged", w_dn_merged, (n_pad, hidden), dev)
     if n_pad < lowrank:
         raise ValueError(f"w_dn_merged has {n_pad} rows < lowrank={lowrank}")
-    if n_pad % 16:
-        raise ValueError(f"w_dn_merged rows={n_pad} must be a multiple of 16")
 
 
 @lru_cache(maxsize=256)
@@ -1755,6 +1753,11 @@ def _k1_combine_norm_down(
         return (
             residual.new_empty(0, hidden) if r2_out is None else r2_out,
             residual.new_empty(0, n_pad) if out is None else out,
+        )
+    if n_pad % 16:
+        raise ValueError(
+            f"w_dn_merged rows={n_pad} must be a multiple of 16 for the tiled K1 "
+            "(one MFMA N tile)"
         )
     # Configuration precedence is explicit argument, tuned plan, then heuristic.
     # Use the padded token count because it determines the GEMM launch shape.
