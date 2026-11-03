@@ -554,10 +554,8 @@ def unshuffle_weights_gfx1250(
 
 @gluon.jit
 def _swiglu(input, alpha, limit, ADD_RESIDUAL: gl.constexpr):
-    # Gluon-native SwiGLU. The shared Triton version in _triton_kernels/moe/
-    # activations.py uses v_min_f32 inline asm whose register constraints hide a
-    # clobber from the allocator, causing scratch spills and non-deterministic
-    # corruption of rows 0-31 at block_m 128 on gfx1250.
+    # Gluon-native SwiGLU, avoids the v_min_f32 inline asm in the shared Triton
+    # version whose register clobber causes non-deterministic corruption on gfx1250.
     gate, up = gl.split(gl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
     gate = gate.to(gl.float32)
     if limit is not None:
