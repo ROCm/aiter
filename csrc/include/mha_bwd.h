@@ -263,11 +263,26 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p42;
     int mask_y; // 0x2b0
     p3 _p43;
-    // Everything from here on is gfx1250 only; the other archs' kernels end at 0x2c0.
+    // 0x2c0 - 0x2d0 are gfx1250 only; the other archs' kernels end at 0x2c0, except the gfx942
+    // 7-GEMM kernels, which skip to 0x2e0.
     unsigned int nsplit; // 0x2c0: deterministic only, number of private dq_acc planes
     p3 _p44;
     unsigned int split_stride; // 0x2d0: deterministic only, bytes between dq_acc planes
     p3 _p45;
+    // Read only by the gfx942 hd192 7-GEMM kernels (*_g7_group), which write bf16 dq directly
+    // and run dK/dV and dQ workgroups (n_kb + n_qb ranks per (head, batch)) in one dispatch.
+    unsigned int Hs_dq; // 0x2e0: dq head stride in bytes
+    p3 _p46;
+    unsigned int Seqs_dq; // 0x2f0: dq row stride in bytes
+    p3 _p47;
+    unsigned int n_kb; // 0x300: dK/dV workgroups per (head, batch): ceil(max_seqlen_k / 128)
+    p3 _p48;
+    unsigned int n_qb; // 0x310: dQ workgroups per (head, batch): ceil(max_seqlen_q / 128)
+    p3 _p49;
+    // 0x320: grid layout, 0: (nhead_q, batch, rank), 1: (rank, nhead_q, batch),
+    // 2: (nhead_q, rank, batch)
+    unsigned int g7_order;
+    p3 _p50;
 };
 
 struct __attribute__((packed)) fmha_bwd_odo_args

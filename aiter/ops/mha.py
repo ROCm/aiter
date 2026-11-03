@@ -3348,6 +3348,16 @@ def _flash_attn_varlen_backward(
 
         return ret
 
+    def g7():
+        # bwd_hd192_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
+        # bwd_hd192_hd128_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
+        # a16 7-GEMM kernels: dq / dk / dv are written once in bf16 (no dq_acc), so they are
+        # also deterministic
+        ret = hdim_q == 192 and hdim_v in (192, 128)
+        ret &= q.dtype == dtypes.bf16
+
+        return ret
+
     def can_impl_fmha_v3_bwd():
         # basic
         ret = get_gfx() == "gfx942"
@@ -3355,12 +3365,12 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= deterministic == False
-        ret &= hdim_q == hdim_v
+        ret &= deterministic == False or g7()
+        ret &= hdim_q == hdim_v or g7()
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= not swa
-        ret &= pssk() or psskddv()
+        ret &= pssk() or psskddv() or g7()
 
         return ret
 
@@ -3383,8 +3393,8 @@ def _flash_attn_varlen_backward(
         return ret
 
     def can_impl_fmha_bwd_flydsl():
-        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
-        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
+        # d_qk=192 / d_v=128 causal varlen self-attention, taken only when no ASM v3 kernel
+        # covers it (gfx942 has the bf16 7-GEMM kernels, see `g7`).
         # `deterministic` is absent on purpose: the kernel uses no atomics and
         # writes each of dq/dk/dv exactly once, so it is deterministic either way.
         ret = get_gfx() == "gfx942"
@@ -3413,10 +3423,15 @@ def _flash_attn_varlen_backward(
     # gfx950 hd256 backward uses a16 (atomic32=0)
     if get_gfx() == "gfx950" and hdim_q == 256:
         is_v3_atomic_fp32 = False
+    # and so does gfx942 hd192 bf16 (the 7-GEMM kernels)
+    if get_gfx() == "gfx942" and g7():
+        is_v3_atomic_fp32 = False
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
-    can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
+    can_impl_fmha_bwd_flydsl_ = (
+        not can_impl_fmha_v3_bwd_ and _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
+    )
 
     if can_impl_fmha_bwd_flydsl_:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
