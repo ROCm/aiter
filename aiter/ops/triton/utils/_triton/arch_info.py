@@ -28,15 +28,22 @@ def get_arch():
 
 
 def is_gluon_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def is_fp4_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def is_fp8_avail():
-    return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
+    return get_arch() in (
+        "gfx942",
+        "gfx950",
+        "gfx1250",
+        "gfx1250-strict",
+        "gfx1200",
+        "gfx1201",
+    )
 
 
 def is_sw_emulated_fp8_avail():
@@ -53,11 +60,11 @@ def is_any_fp8_avail():
 
 
 def is_mx_scale_preshuffling_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def is_tdm_avail():
-    return get_arch() in ("gfx1250",)
+    return get_arch() in ("gfx1250", "gfx1250-strict")
 
 
 _LDS_CAP_BYTES = {"gfx1250": 327680, "gfx950": 163840, "gfx942": 65536}
