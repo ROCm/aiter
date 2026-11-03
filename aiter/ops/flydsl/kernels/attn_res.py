@@ -50,7 +50,7 @@ _SMALL_D_ROWS_PER_WG = 1
 # already in registers.
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _clear_caches().
-_SOURCE_GROUP_SIZE = 2
+_SOURCE_GROUP_SIZE = 3
 # One-wave rows reduce this many sources together; more sources hold more registers.
 # Changing this constant requires _clear_caches().
 _ONE_WAVE_GROUP_SIZE = 2
