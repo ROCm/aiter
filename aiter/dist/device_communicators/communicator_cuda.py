@@ -555,6 +555,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else 64 * 1024 * 1024
         )
         ca_comm = self.ca_comm
+        qr_comm = self.qr_comm
         if (
             ca_comm is not None
             and not ca_comm.disabled
@@ -600,7 +601,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm is not None
             and not ca_comm.disabled
             and not ca_comm.has_old_arch_fused_kernels
-            and (self.qr_comm is None or self.qr_comm.disabled)
             and input_.dim() == 2
             # Match the vectorized FP8 store alignment; tail rows keep
             # the existing standalone quantizer.
@@ -618,6 +618,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and weight_.device == input_.device
             and ca_comm.can_fuse_ar_rms(input_, hidden_dim, hidden_dim)
             and not ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and (
+                qr_comm is None
+                or qr_comm.disabled
+                or (
+                    # This branch is already confined to the gfx1250 LL range
+                    # by should_fuse_ar_rms above. Keep QR's production routing
+                    # predicate authoritative for its minimum-size crossover.
+                    self.world_size == 4
+                    and get_gfx() == "gfx1250"
+                    and input_.dtype == torch.bfloat16
+                    and not qr_comm.should_quick_allreduce(input_)
+                )
+            )
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             # Keep the LL all-reduce, but fuse its residual/norm and quant
