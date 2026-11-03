@@ -111,6 +111,13 @@ class _EpDispatcher:
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
         self._dispatch.prefetch(topk_ids, recv_token_bound)
 
+    def drop_pending_plan(self) -> None:
+        """Retire a compact plan started for a step another path runs: the
+        stream waits for it (its slot may be reused) and nothing reads it."""
+        wait = getattr(self._dispatch, "_wait_plan", None)
+        if wait is not None:
+            wait()
+
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         self._dispatch.warmup(recv_token_bound, token_count)
 

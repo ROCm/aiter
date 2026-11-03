@@ -1262,8 +1262,10 @@ if os.environ.get("AITER_DMK_CTAS_PER_CU"):
 
 
 def read_decode_mega_tokens() -> int:
-    """``AITER_MEGA_DECODE``: the largest ``max_tokens_per_rank`` the decode
-    megakernel serves (0 or unset: off)."""
+    """``AITER_MEGA_DECODE``: tokens per rank up to which a step runs the decode
+    megakernel (0 or unset: off). A step qualifies when its receive bound
+    (``recv_token_bound``, else ``world * max_tokens_per_rank``) is at most
+    ``world`` times this, so every rank picks the same path."""
     v = os.environ.get("AITER_MEGA_DECODE", "")
     return int(v) if v.strip() else 0
 
@@ -1278,8 +1280,6 @@ def decode_mega_reason(config) -> str | None:
     recipe, geo = config.recipe, config.geometry
     if bound <= 0:
         return "AITER_MEGA_DECODE is off"
-    if geo.max_tokens_per_rank > bound:
-        return f"max_tokens_per_rank={geo.max_tokens_per_rank} > {bound}"
     if recipe.dispatch is not DispatchKind.COMPACT or config.dispatch_wire != "fp4":
         return "needs the compact dispatch on the fp4 wire"
     if recipe.combine is not CombineKind.FUSED_SCATTER:
@@ -1294,7 +1294,7 @@ def decode_mega_reason(config) -> str | None:
     ):
         return "needs per_1x32 quant and no padding"
     H, I = config.hidden_dim, geo.inter_dim
-    t = dmk_tile(geo.max_tokens_per_rank)
+    t = dmk_tile(dmk_small_tokens(config))
     if H % (32 * WAVE) or (2 * I) % t["tile_n"] or H % t["tile_n2"]:
         return f"hidden {H} / inter {I} do not tile"
     if config.world_size > WAVE or geo.experts % config.world_size:
@@ -1302,10 +1302,23 @@ def decode_mega_reason(config) -> str | None:
     return None
 
 
+def dmk_small_tokens(config) -> int:
+    """Tokens per rank the megakernel serves: ``AITER_MEGA_DECODE``, at most the
+    instance's ``max_tokens_per_rank``."""
+    return min(read_decode_mega_tokens(), int(config.geometry.max_tokens_per_rank))
+
+
+def dmk_recv_cap(config) -> int:
+    """The largest receive bound (tokens) a step may have to run the megakernel."""
+    return config.world_size * dmk_small_tokens(config)
+
+
 def dmk_cap(config) -> int:
-    """Rows each local expert reserves: every token of every rank."""
-    tm = dmk_tile(config.geometry.max_tokens_per_rank)["tile_m"]
-    rows = config.world_size * config.geometry.max_tokens_per_rank
+    """Rows each local expert reserves. A token's top-k experts are distinct, so
+    an expert gets at most one row per token its rank receives, and a served
+    step receives at most ``dmk_recv_cap`` tokens."""
+    tm = dmk_tile(dmk_small_tokens(config))["tile_m"]
+    rows = dmk_recv_cap(config)
     return (rows + tm - 1) // tm * tm
 
 
@@ -1343,7 +1356,8 @@ class DecodeMega:
         epr, cap = config.experts_per_rank, dmk_cap(config)
         self.cap = cap
         self.row = dmk_wire_row(config)
-        t = self.tile = dmk_tile(geo.max_tokens_per_rank)
+        t = self.tile = dmk_tile(dmk_small_tokens(config))
+        self.recv_cap = dmk_recv_cap(config)
         from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
         rep2 = get_wmma_m_rep(t["tile_m"], t["tile_n2"], 1, 4, "gemm2")
@@ -1373,6 +1387,16 @@ class DecodeMega:
         self._traced = 0
         self._launch = None
         self._act_key = None
+
+    def serves(self, recv_token_bound) -> bool:
+        """Whether a step with this receive bound runs the megakernel: the
+        same answer on every rank, since every rank passes the same bound."""
+        if not self.enabled:
+            return False
+        bound = (
+            self.config.max_recv if recv_token_bound is None else int(recv_token_bound)
+        )
+        return bound <= self.recv_cap
 
     def _launcher(self, stage1_act):
         if self._launch is None or self._act_key != stage1_act:

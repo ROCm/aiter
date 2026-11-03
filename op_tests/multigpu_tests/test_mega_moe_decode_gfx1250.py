@@ -14,6 +14,9 @@ combine, with and without a fused shared expert:
   * the megakernel against the staged path of the same instance (its per-call
     switch), bit for bit and both ways round, at several token counts per
     rank, uneven across ranks;
+  * the path follows the step's receive bound: an instance sized for more
+    tokens than AITER_MEGA_DECODE runs the megakernel only for steps bounded
+    to it, and a compact plan started for a step it serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
 """
 
@@ -34,8 +37,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HIDDEN, INTER, TOPK = 7168, 1024, 6
 EXPERTS_PER_RANK = 8
-# The instance's tokens per rank; the megakernel serves it (AITER_MEGA_DECODE).
-MAX_TOKENS = 32
+# The instance's tokens per rank, and the steps the megakernel serves
+# (AITER_MEGA_DECODE): those whose receive bound is at most world * SMALL_TOKENS.
+MAX_TOKENS = 64
+SMALL_TOKENS = 32
 # Tokens per rank of each step: rank r runs max(1, t - r), so the ranks differ.
 STEPS = (1, 7, 16, 32)
 
@@ -143,11 +148,24 @@ class _Case:
         )
         return x, d_ids, d_wts, l_ids, l_wts
 
-    def layer(self, x, ids, wts, *, mega):
+    @property
+    def small_bound(self):
+        return self.world * SMALL_TOKENS
+
+    def layer(self, x, ids, wts, *, mega=True, bound="small"):
+        """One layer; ``bound`` is the step's recv_token_bound ("small": the
+        largest the megakernel serves)."""
         self.dmk.enabled = mega
         w1, w2, w1s, w2s = self.weights
         y = self.mega(
-            self.B._rmsnorm(x), wts, ids, w1=w1, w2=w2, w1_scale=w1s, w2_scale=w2s
+            self.B._rmsnorm(x),
+            wts,
+            ids,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1s,
+            w2_scale=w2s,
+            recv_token_bound=self.small_bound if bound == "small" else bound,
         )
         return x + y
 
@@ -176,8 +194,31 @@ def _check_case(case, comm):
         check(case.dmk.errors() == 0, f"{what}: expert slot overflow")
         check.settle()
 
+    # The path follows the bound: the megakernel serves only steps bounded to
+    # world * SMALL_TOKENS, whatever the instance holds.
+    dmk = case.dmk
+    check(dmk.serves(case.small_bound), "small bound not served")
+    check(not dmk.serves(case.small_bound + 1), "bound past the slots served")
+    check(not dmk.serves(None), "unbounded step served (instance > small)")
+    check.settle()
+    x, ids, wts, _, _ = case.step(SMALL_TOKENS - case.rank, seed=71)
+    small = case.layer(x, ids, wts).clone()
+    unbounded = case.layer(x, ids, wts, bound=None).clone()  # staged
+    # A plan started for a step the megakernel then serves is dropped, and the
+    # next staged step plans its own routing.
+    x2, ids2, wts2, _, _ = case.step(MAX_TOKENS - case.rank, seed=73)
+    staged_only = case.layer(x2, ids2, wts2, bound=None).clone()
+    case.mega.prefetch_compact_plan(ids, recv_token_bound=None)
+    small_again = case.layer(x, ids, wts).clone()
+    after = case.layer(x2, ids2, wts2, bound=None).clone()
+    torch.cuda.synchronize()
+    check(torch.equal(small, unbounded), "bounded megakernel != unbounded staged")
+    check(torch.equal(small, small_again), "megakernel after a pending plan differs")
+    check(torch.equal(after, staged_only), "staged step after a dropped plan differs")
+    check.settle()
+
     # A captured step replays the eager bits.
-    x, ids, wts, _, _ = case.step(MAX_TOKENS - case.rank, seed=99)
+    x, ids, wts, _, _ = case.step(SMALL_TOKENS - case.rank, seed=99)
     eager = case.layer(x, ids, wts, mega=True).clone()
     torch.cuda.synchronize()
     comm.barrier()
@@ -206,7 +247,7 @@ def _worker(local_rank, world, port, failures):
         WORLD_SIZE=str(world),
         LOCAL_RANK=str(local_rank),
         AITER_FORCE_A8W4="0",
-        AITER_MEGA_DECODE=str(MAX_TOKENS),
+        AITER_MEGA_DECODE=str(SMALL_TOKENS),
     )
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)

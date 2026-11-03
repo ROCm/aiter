@@ -357,13 +357,14 @@ class MegaMoEGfx1250:
         dmk = ep.decode_mega
         if (
             dmk is not None
-            and dmk.enabled
+            and dmk.serves(recv_token_bound)
             and not quant_bits
             and bias1 is None
             and bias2 is None
         ):
-            # Every rank of this MegaMoE runs it (the choice is per instance),
-            # so the ranks always agree on the path.
+            # Every rank passes the same bound, so the ranks agree on the path.
+            # A plan an earlier staged layer started for this step is dropped.
+            ep.drop_pending_plan()
             return dmk.forward(
                 hidden_states,
                 topk_weights,
@@ -606,7 +607,8 @@ class MegaMoEGfx1250:
         caller that captures a ladder of batch sizes warms every rung through
         here first. A no-op off the compact path.
         """
-        if self._ep.decode_mega is not None:
+        dmk = self._ep.decode_mega
+        if dmk is not None and dmk.serves(recv_token_bound):
             return
         self._ep.warmup(recv_token_bound, token_count)
 
@@ -622,7 +624,8 @@ class MegaMoEGfx1250:
         to ``forward`` so the plan overlaps the previous expert GEMM instead.
         A no-op off the compact path.
         """
-        if self._ep.decode_mega is not None:
+        dmk = self._ep.decode_mega
+        if dmk is not None and dmk.serves(recv_token_bound):
             return
         self._ep.prefetch(topk_ids, recv_token_bound)
 
