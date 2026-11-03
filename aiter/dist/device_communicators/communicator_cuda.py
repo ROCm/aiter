@@ -1007,6 +1007,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
+    def all_to_all(self, output: torch.Tensor, input_: torch.Tensor) -> None:
+        """Equal split along dim 0 into a same-shape ``output``: input block i goes
+        to group rank i, output block i comes from it. On the current stream through
+        pynccl (graph-capturable), else torch.distributed."""
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all(output, input_)
+        else:
+            torch.distributed.all_to_all_single(output, input_, group=self.device_group)
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""

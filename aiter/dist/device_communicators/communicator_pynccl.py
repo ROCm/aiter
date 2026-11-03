@@ -299,6 +299,58 @@ class PyNcclCommunicator:
             split_offset += split_size
         self.nccl.ncclGroupEnd()
 
+    def all_to_all(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
+    ):
+        """Equal split along dim 0: input block i goes to rank i, output block i
+        comes from rank i."""
+        if self.disabled:
+            return
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert (
+            input_tensor.is_contiguous()
+            and output_tensor.is_contiguous()
+            and output_tensor.shape == input_tensor.shape
+            and output_tensor.dtype == input_tensor.dtype
+            and output_tensor.device == input_tensor.device
+            and input_tensor.shape[0] % self.world_size == 0
+        ), "all_to_all: same-shape contiguous tensors, dim 0 divisible by world size"
+        if stream is None:
+            stream = current_stream()
+        count = input_tensor.numel() // self.world_size
+        step = count * input_tensor.element_size()
+        src, dst = input_tensor.data_ptr(), output_tensor.data_ptr()
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+        cuda_stream = cudaStream_t(stream.cuda_stream)
+        self.nccl.ncclGroupStart()
+        for peer in range(self.world_size):
+            self.nccl.ncclSend(
+                buffer_type(src + peer * step),
+                count,
+                dtype,
+                peer,
+                self.comm,
+                cuda_stream,
+            )
+            self.nccl.ncclRecv(
+                buffer_type(dst + peer * step),
+                count,
+                dtype,
+                peer,
+                self.comm,
+                cuda_stream,
+            )
+        self.nccl.ncclGroupEnd()
+
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return

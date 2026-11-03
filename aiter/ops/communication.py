@@ -125,11 +125,25 @@ def _mori_env():
             os.environ.pop("MORI_ENABLE_SDMA", None)
 
 
+class MegaMoeSetupError(RuntimeError):
+    """A MegaMoeTP setup failure raised alike on every rank of the group; the caller may
+    fall back collectively."""
+
+
 def _mori():
     with _mori_env():
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
+
+
+def sdma_available() -> bool:
+    """Whether MORI CCO imports on this rank (SdmaComm agrees on it across the group)."""
+    try:
+        _mori()
+    except ImportError:
+        return False
+    return True
 
 
 def sdma_bitcode() -> str:
@@ -150,10 +164,19 @@ class SdmaComm:
     def __init__(self, *, group=None, num_queues: int = 8, device=None):
         from .flydsl.kernels.mega_moe_tp.mega_moe_tp import SymmetricArena
 
-        Communicator, Reqs, gda_none = _mori()
         self.group = group
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
+        err = ""
+        try:
+            Communicator, Reqs, gda_none = _mori()
+        except ImportError as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        errs: list = [None] * self.world
+        dist.all_gather_object(errs, err, group=group)
+        bad = {r: e for r, e in enumerate(errs) if e}
+        if bad:
+            raise MegaMoeSetupError(f"SdmaComm: MORI unavailable on ranks {bad}")
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.nq = num_queues
         self._comm_cls, self._reqs_cls, self._gda_none = Communicator, Reqs, gda_none
@@ -195,7 +218,7 @@ class SdmaComm:
         dist.all_gather_object(errs, err, group=self.group)
         bad = {r: e for r, e in enumerate(errs) if e}
         if bad:
-            raise RuntimeError(f"SdmaComm: MORI SDMA setup failed on ranks {bad}")
+            raise MegaMoeSetupError(f"SdmaComm: MORI SDMA setup failed on ranks {bad}")
         try:
             self.arena.commit()  # (raises on every rank if any rank fails)
         except BaseException:
