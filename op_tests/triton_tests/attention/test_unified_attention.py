@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -383,11 +385,13 @@ def ref_paged_attn(
         [(1, 8192)] * 32,
         [(1, 523), (1, 37), (1, 2011)],
         [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        [(2, 8704), (7, 8704)],
+        [(8, 8704)] * 32,
     ],
 )
 @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
@@ -424,7 +428,7 @@ def test_triton_unified_attn_3d(
         "gfx1250",
     ):
         # gfx1250 -> Gluon
-        # gfx950 -> Triton
+        # gfx950 -> Gluon
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:
@@ -738,6 +742,140 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size, sliding_window",
+    [
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048),
+        ([(8, 8704)], (16, 2), 128, 2048),
+        ([(8, 582), (1, 582)], (16, 2), 64, 512),
+        ([(1, 8704)] * 4, (16, 2), 16, 2048),
+        ([(128, 1100)], (32, 32), 64, 1024),
+        ([(17, 1100)], (32, 32), 64, 1024),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_verify_split(
+    seq_lens, num_heads, block_size, sliding_window
+):
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    max_q = max(query_lens)
+    q, k, v, _, _, sinks, out, cu_q, kv_lens_t, _, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    sinks = sinks + 8.0
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        sliding_window,
+        sinks=sinks,
+    ).float()
+
+    first = [max(0, kv - ql - sliding_window + 1) // block_size for ql, kv in seq_lens]
+    width = (sliding_window + max_q + block_size - 2) // block_size + 1
+    index = torch.tensor(first, device="cuda")[:, None] + torch.arange(
+        width, device="cuda"
+    )
+    trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
+    assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
+
+    for block_table, lens, max_seqlen_k in [
+        (table, kv_lens_t, max_k),
+        (
+            table.gather(1, index.clamp(max=table.shape[1] - 1)),
+            torch.tensor(trimmed_lens, dtype=torch.int32, device="cuda"),
+            max(trimmed_lens),
+        ),
+    ]:
+        out = torch.empty_like(out)
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=lens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size",
+    [
+        ([(8, 10246)], (16, 2), 8192),
+        ([(8, 6150), (1, 6150)], (8, 1), 4096),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
+    # a page much longer than a tile leaves 32+ empty leading segments, a whole
+    # reduce chunk at head 256, which without sinks has no finite max
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+
+    sliding_window = 2048
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=256,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    ).float()
+
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],
@@ -1010,4 +1148,109 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         scale=scale,
         out_dtype=dtype,
     )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
+    """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
+    rng = random.Random(seed)
+    return [
+        (rng.randint(1, max_query_len), rng.randint(max_query_len + 1, 3000))
+        for _ in range(batch)
+    ]
+
+
+@pytest.mark.parametrize(
+    "path, sliding_window", [("3d", None), ("2d", None), ("2d", 256), ("auto", None)]
+)
+@pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
+@pytest.mark.parametrize("max_query_len", [4, 8])
+@pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_unified_attn_spec_verify_gfx1250(
+    path: str,
+    sliding_window: int | None,
+    batch: int,
+    seed: int,
+    max_query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    monkeypatch,
+) -> None:
+    """Short multi-token queries (speculative-decode verify) on gfx1250: the 3D
+    split-KV kernel, where query rows of one block have different causal horizons
+    so a split segment can be partly or wholly past a row's horizon, and the 2D
+    kernel with a BLOCK_M sized to the query rows."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    torch.manual_seed(seed)
+    seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
+    block_size = 16
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        soft_cap=None,
+        sinks=None,
+    )
+    assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

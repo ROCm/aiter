@@ -878,10 +878,19 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
+        # include them so the test harness exercises the emsort path. Only
+        # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
+        # per_1x128 blockscale fp8, ...) quantize weights differently and
+        # test_fmoe's host-side quant paths do not cover them.
         if (
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
+            and not (
+                kernel_name1.startswith("_ZN5aiter")
+                and str(row.get("q_type", "")) == "QuantType.per_1x32"
+            )
         ):
             continue
         if args.csv_filter:

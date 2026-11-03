@@ -28,6 +28,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Windows ROCm ships `hipinfo` instead of `rocminfo`; the output formats differ,
 # so each has its own compute-unit parser below.
 _GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
+_GFX_ARCH_PATTERN = r"gfx[0-9a-z]+(?:-[0-9a-z]+)*"
 
 
 @functools.lru_cache(maxsize=1)
@@ -47,7 +48,15 @@ def _detect_native() -> list[str]:
     try:
         # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
         for line in _gpu_info_output().splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            # Preserve the exact ROCr-reported identity, including the
+            # gfx1250-strict (MI450 A0) variant. strict is mapped to the gfx1250
+            # kernel family only at explicitly validated dispatch sites, via
+            # base_gfx_arch()/is_gfx1250_family(); build artifacts, caches, tuned
+            # configs and prebuilt binaries stay keyed by the exact target.
+            # Folding here would make _needs_arch_rebuild() treat a strict .so as
+            # not covering a strict device and rebuild in a loop once ROCr
+            # reports gfx1250-strict.
+            match = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
@@ -98,6 +107,7 @@ _LDS_CAPACITY_BYTES = {
     "gfx1200": 64 * 1024,
     "gfx1201": 64 * 1024,
     "gfx1250": 320 * 1024,
+    "gfx1250-strict": 320 * 1024,
 }
 
 
@@ -118,19 +128,32 @@ def get_gfx_runtime() -> str:
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
-    """
-    try:
-        gfx_arch = _detect_native()[0]
-    except RuntimeError:
-        if not IS_WINDOWS:
-            raise
-        import torch
 
-        if torch.version.hip is None or not torch.cuda.is_available():
-            raise
-        gfx_arch = (
-            torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-        )
+    The exception is an AOT replay process (AITER_AOT_REPLAY=1, started by
+    aiter.aot.flydsl.common.replay_env): it runs the runtime without a GPU for
+    the one arch GPU_ARCHS names, which stands in for the live GPU there.
+    """
+    if os.getenv("AITER_AOT_REPLAY") == "1":
+        targets = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", ""))
+        if len(targets) != 1:
+            raise RuntimeError(
+                "AITER_AOT_REPLAY=1 needs GPU_ARCHS to name the one arch the "
+                f"process compiles for, got {os.getenv('GPU_ARCHS')!r}"
+            )
+        gfx_arch = targets[0]
+    else:
+        try:
+            gfx_arch = _detect_native()[0]
+        except RuntimeError:
+            if not IS_WINDOWS:
+                raise
+            import torch
+
+            if torch.version.hip is None or not torch.cuda.is_available():
+                raise
+            gfx_arch = (
+                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
+            )
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -138,6 +161,14 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+def _parse_asic_revision(value: str) -> int:
+    """Parse rocminfo/hipinfo decimal or hex ASIC Revision, not chip revision."""
+    token = value.split("(", 1)[0].strip()
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", token):
+        raise ValueError(f"invalid ASIC Revision {value!r}")
+    return int(token, 16 if token.lower().startswith("0x") else 10)
 
 
 @functools.lru_cache(maxsize=1)
@@ -161,12 +192,12 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         key, value = m.group(1), m.group(2)
         if key == "Name" and name is None:
             # Agent names can carry target-id features ("gfx942:sramecc+").
-            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            m2 = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", value, re.IGNORECASE)
             name = m2.group(1) if m2 else value
         elif key == "Device Type":
             kind = value
         elif key == "ASIC Revision":
-            rev = int(value.split("(")[0])
+            rev = _parse_asic_revision(value)
         if kind == "GPU" and name is not None and rev is not None:
             agents.append((name.lower(), rev))
             name = kind = rev = None
@@ -180,11 +211,15 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     for block in re.split(r"^device#", _gpu_info_output(), flags=re.MULTILINE)[1:]:
         # gcnArchName can carry target-id features ("gfx942:sramecc+").
         name = re.search(
-            r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
+            rf"^gcnArchName:\s*({_GFX_ARCH_PATTERN})",
+            block,
+            re.MULTILINE | re.IGNORECASE,
         )
-        rev = re.search(r"^asicRevision:\s*(\d+)", block, re.MULTILINE)
+        rev = re.search(
+            r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE
+        )
         if name and rev:
-            agents.append((name.group(1).lower(), int(rev.group(1))))
+            agents.append((name.group(1).lower(), _parse_asic_revision(rev.group(1))))
     return agents
 
 
@@ -643,7 +678,7 @@ def _get_device_name(device_id: int) -> str:
         if num_xcds == 4:
             return "MI350P"
         return "MI350"
-    elif gfx == "gfx1250":
+    elif gfx in ("gfx1250", "gfx1250-strict"):
         return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")

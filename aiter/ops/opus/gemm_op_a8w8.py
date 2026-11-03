@@ -12,11 +12,11 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
-    a8w8_mxscale_bmm_kernels_list,
+    get_registry,
 )
 
 from ...jit.core import compile_ops
-from ._arch import _device_arch
+from ._arch import _device_arch_and_cu
 from .launch_plan import (
     _A8W8_BLOCKSCALE_FAMILY,
     _A8W8_BPRESHUFFLE_FAMILY,
@@ -123,7 +123,7 @@ def opus_gemm_a8w8_blockscale_bpreshuffle_tune(
     x_scale: Tensor,
     w_scale: Tensor,
     Y: Tensor | None = None,
-    kernelId: int = 11000,
+    kernelId: int = 0,
 ) -> Tensor:
     """Compatibility entry for the existing A8W8 blockscale tuner."""
     if Y is None:
@@ -259,12 +259,14 @@ def _launch_a8w8_gemm(
             raise ValueError(
                 "opus_gemm A8W8 expects logical 2D XQ/WQ/Y; " "this family is GEMM-only"
             )
-        arch = route_arch or _device_arch(XQ.device)
+        device_arch, cu_num = _device_arch_and_cu(XQ.device)
+        arch = route_arch or device_arch
         resolved_kid = _require_registered_kid(
             arch=arch,
             family=_A8W8_FAMILY,
             kid=kid,
             output_dtype=Y.dtype,
+            cu_num=cu_num,
         )
     _launch_a8w8_backend(
         XQ.unsqueeze(0),
@@ -299,12 +301,14 @@ def _launch_a8w8_blockscale_gemm(
                 "opus_gemm A8W8 blockscale expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
             )
-        arch = route_arch or _device_arch(XQ.device)
+        device_arch, cu_num = _device_arch_and_cu(XQ.device)
+        arch = route_arch or device_arch
         resolved_kid = _require_registered_kid(
             arch=arch,
             family=_A8W8_BLOCKSCALE_FAMILY,
             kid=kid,
             output_dtype=Y.dtype,
+            cu_num=cu_num,
         )
     _launch_a8w8_backend(
         XQ.unsqueeze(0),
@@ -345,12 +349,14 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
                 "opus_gemm A8W8 blockscale bpreshuffle expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
             )
-        arch = route_arch or _device_arch(XQ.device)
+        device_arch, cu_num = _device_arch_and_cu(XQ.device)
+        arch = route_arch or device_arch
         resolved_kid = _require_registered_kid(
             arch=arch,
             family=_A8W8_BPRESHUFFLE_FAMILY,
             kid=kid,
             output_dtype=Y.dtype,
+            cu_num=cu_num,
         )
     _launch_a8w8_backend(
         XQ.unsqueeze(0),
@@ -405,7 +411,8 @@ def _validate_a8w8_mxscale_bmm_tensors(
     # 128 here and in opus_bmm_a8w8_common_checks, and fixing only the C++ copy
     # left this one rejecting every correct GROUP_K=32 launch that reached it --
     # the same rule living in two places and drifting.
-    inst = a8w8_mxscale_bmm_kernels_list[int(kid)]
+    arch, cu_num = _device_arch_and_cu(XQ.device)
+    inst = get_registry(_A8W8_MXSCALE_BMM_FAMILY, arch, cu_num)[int(kid)]
     group_n, group = inst.GROUP_N, inst.GROUP_K
     if N % group_n or K % group:
         raise ValueError(
@@ -483,7 +490,8 @@ def _launch_a8w8_mxscale_bmm(
 
     M, batch, K = map(int, launch_x.shape)
     N = int(WQ.shape[1])
-    arch = route_arch or _device_arch(XQ.device)
+    device_arch, cu_num = _device_arch_and_cu(XQ.device)
+    arch = route_arch or device_arch
     plan = _get_cached_a8w8_mxscale_bmm_plan(
         arch,
         int(kid),
@@ -493,6 +501,7 @@ def _launch_a8w8_mxscale_bmm(
         N,
         K,
         int(split_k),
+        cu_num=cu_num,
     )
 
     launch_workspace = workspace
@@ -596,6 +605,8 @@ def bmm_a8w8_mxscale_opus(
 
     _validate_mxscale_bmm_group_size(group_size)
     block = f"{group_size}x{group_size}"
+    gfx, cu_num = _device_arch_and_cu(x.device)
+    scope = {"gfx": gfx, "cu_num": cu_num}
     m, g, k = map(int, x.shape)
     n = int(wo_a.shape[1])
     Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
@@ -603,14 +614,16 @@ def bmm_a8w8_mxscale_opus(
     # A stale tuned row may name a different layout, scale block or M alignment.
     # Discard its splitK along with the id before choosing a row-major fallback.
     if kernelId is not None and not (
-        mxscale_bmm_kid_takes_b_layout(int(kernelId), False)
-        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
-        and mxscale_bmm_kid_block(int(kernelId)) == block
-        and mxscale_bmm_kid_runs_m(int(kernelId), m)
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), False, **scope)
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId), **scope)
+        and mxscale_bmm_kid_block(int(kernelId), **scope) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m, **scope)
     ):
         kernelId = splitK = None
     if kernelId is None:
-        kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
+        kernelId = _heuristic_mxscale_bmm_kid(
+            g, m, n, k, group_size=group_size, **scope
+        )
 
     return _launch_bmm_a8w8_mxscale_opus(
         x, wo_a, x_scale, w_scale, Y, kid=int(kernelId), split_k=splitK
@@ -656,6 +669,8 @@ def bmm_a8w8_mxscale_opus_bpreshuffle(
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
     mxscale_bmm_groups_of_block(block)
+    gfx, cu_num = _device_arch_and_cu(x.device)
+    scope = {"gfx": gfx, "cu_num": cu_num}
     m, g, k = map(int, x.shape)
     n = int(wo_a.shape[1])
     Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
@@ -663,15 +678,22 @@ def bmm_a8w8_mxscale_opus_bpreshuffle(
     # The preshuffled entry accepts only matching B and ordinary scale layouts.
     # A padded-M tuned row can also require an alignment the real M lacks.
     if kernelId is not None and not (
-        mxscale_bmm_kid_takes_b_layout(int(kernelId), True)
-        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
-        and mxscale_bmm_kid_block(int(kernelId)) == block
-        and mxscale_bmm_kid_runs_m(int(kernelId), m)
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), True, **scope)
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId), **scope)
+        and mxscale_bmm_kid_block(int(kernelId), **scope) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m, **scope)
     ):
         kernelId = splitK = None
     if kernelId is None:
         kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
-            g, m, n, k, group_size=group_size, group_n=group_n, output_dtype=Y.dtype
+            g,
+            m,
+            n,
+            k,
+            group_size=group_size,
+            group_n=group_n,
+            output_dtype=Y.dtype,
+            **scope,
         )
         if kernelId is None:
             raise ValueError(
@@ -720,8 +742,9 @@ def _mxscale_bmm_workspace(
     if split_k <= 1:
         return None
     m, g, k = map(int, x.shape)
+    arch, cu_num = _device_arch_and_cu(x.device)
     spec = _get_cached_a8w8_mxscale_bmm_plan(
-        _device_arch(x.device), kid, Y.dtype, m, g, int(wo_a.shape[1]), k, split_k
+        arch, kid, Y.dtype, m, g, int(wo_a.shape[1]), k, split_k, cu_num
     ).workspace_spec
     if spec is None:
         return None
