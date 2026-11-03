@@ -60,29 +60,17 @@ def _flops(tokens: int) -> int:
 
 def benchmark(args):
     device = torch.device("cuda")
-    unit = "ms" if args.metric == "time" else "TFLOPS"
-    config = triton.testing.Benchmark(
-        x_names=["tokens"],
-        x_vals=args.tokens,
-        line_arg="provider",
-        line_vals=["moe_gemm_a16w16"],
-        line_names=[f"moe_gemm_a16w16 ({unit})"],
-        styles=[("blue", "-")],
-        ylabel=unit,
-        plot_name="bench_moe_gemm_a16w16",
-        args={},
-    )
-
-    @triton.testing.perf_report([config])
-    def _run(tokens, provider):
+    metric_name = "time_ms" if args.metric == "time" else "tflops"
+    print(f"tokens,{metric_name}", flush=True)
+    for tokens in args.tokens:
         hidden, w1, w2, topk_weight, topk_ids = _make_case(tokens, device)
         fn = lambda: fused_moe_bf16_g1u1(hidden, w1, w2, topk_weight, topk_ids)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         if args.metric == "time":
-            return ms
-        return _flops(tokens) / ms * 1e-9
-
-    _run.run(save_path="." if args.o else None, print_data=True, show_plots=False)
+            value = ms
+        else:
+            value = _flops(tokens) / ms * 1e-9
+        print(f"{tokens},{value:.6f}", flush=True)
 
 
 def parse_args():
@@ -104,7 +92,6 @@ def parse_args():
     )
     parser.add_argument("--warmup", type=positive_int, default=25)
     parser.add_argument("--rep", type=positive_int, default=100)
-    parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()
 
 
