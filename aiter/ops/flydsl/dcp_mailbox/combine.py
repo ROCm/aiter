@@ -16,42 +16,34 @@ import flydsl.expr as fx
 import torch
 import torch.distributed as dist
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.dcp_mailbox.common import (
-    CM_DEV,
     KernelAbi,
     bf2_f32,
     bf16_pair,
-    hw_exp2,
-    hw_f32,
     key_tuple,
-    ld_dev,
-    ld_i32,
-    load_ptr64,
     pair_layout,
-    peer_bases,
-    rsrc,
-    traced,
-    uniform,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    CACHE_DEVICE,
     TaggedMailbox,
     atomic_add_agent,
+    buffer_load_i32,
+    buffer_resource,
+    load_i64_from_buffer,
     tagged_peer_address,
     tagged_shift,
+    wave_uniform_i32,
 )
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
 MAX_THREADS = 1024
 TAG_SLOTS = 256
-LOG2E = 1.4426950408889634
 NEG_INF = float("-inf")
 POS_INF = float("inf")
-LN2 = 0.6931471805599453
-
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
 
@@ -100,27 +92,17 @@ ABI = KernelAbi(
 )
 
 
-def _log(x):
-    f = getattr(fmath, "log", None)
-    return f(x) if f is not None else hw_f32("llvm.amdgcn.log.f32", x) * LN2
-
-
-def _log2(x):
-    f = getattr(fmath, "log2", None)
-    return f(x) if f is not None else hw_f32("llvm.amdgcn.log.f32", x)
-
-
 def _row_empty(b, seqs, seq_lens, qsl):
     """Row ``b`` is graph padding, or its request has no KV on this rank."""
-    rows = ld_i32(qsl, seqs)
+    rows = buffer_load_i32(qsl, seqs)
     si = fx.Int32(0)
     for i in range_constexpr(seqs):
-        si = si + (ld_i32(qsl, i + 1) <= b).select(1, 0)
+        si = si + (buffer_load_i32(qsl, i + 1) <= b).select(1, 0)
     si = fx.min(si, seqs - 1)
-    return (b >= rows) | (ld_i32(seq_lens, si) == 0)
+    return (b >= rows) | (buffer_load_i32(seq_lens, si) == 0)
 
 
-@traced
+@flyc.jit
 def _poll_combine(
     poll,
     own_lse,
@@ -157,7 +139,7 @@ def _poll_combine(
         m = fx.max(m, ls[src])
     m = (m == fx.Float32(NEG_INF)).select(fx.Float32(0.0), m)
     scale = LOG2E if base_e else 1.0
-    ex = [hw_exp2((ls[src] - m) * fx.Float32(scale)) for src in range(n)]
+    ex = [fx.exp2((ls[src] - m) * fx.Float32(scale)) for src in range(n)]
     tot = ex[0]
     for src in range_constexpr(1, n):
         tot = tot + ex[src]
@@ -180,27 +162,37 @@ def _poll_combine(
             ],
             fx.Int32,
         ),
-        rsrc(res),
+        buffer_resource(res),
         (b * res_sb + lh * res_sh) // 2 + j,
     )
     if const_expr(ret_lse):  # noqa: SIM102
         if tid == 0:
             if const_expr(base_e):
-                g = _log(tot) + m
+                g = fx.log(tot) + m
             else:
-                g = _log2(tot) + m
-            bo.buffer_store(fx.Float32(g), rsrc(res_lse), b * hl + lh)
+                g = fx.log2(tot) + m
+            bo.buffer_store(fx.Float32(g), buffer_resource(res_lse), b * hl + lh)
 
 
-@traced
+@flyc.jit
 def _finish(tid, state, e, nblk):
     """The last CTA advances the epoch for the next launch."""
     gpu.barrier()
     if tid == 0:
         old = atomic_add_agent(state + fx.Int64(4), 1)
         if old == nblk - 1:
-            bo.buffer_store(fx.Int32(0), rsrc(state), 1, cache_modifier=CM_DEV)
-            bo.buffer_store(e + 1, rsrc(state), 0, cache_modifier=CM_DEV)
+            bo.buffer_store(
+                fx.Int32(0),
+                buffer_resource(state),
+                1,
+                cache_modifier=CACHE_DEVICE,
+            )
+            bo.buffer_store(
+                e + 1,
+                buffer_resource(state),
+                0,
+                cache_modifier=CACHE_DEVICE,
+            )
 
 
 def build(key: CombineBuild):
@@ -237,16 +229,16 @@ def build(key: CombineBuild):
         state: Int64,
     ):
         _ = keyed
-        tid = fx.Int32(fx.thread_idx.x)
-        bid = fx.Int32(fx.block_idx.x)
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
         b = bid // hl
         lh = bid % hl
-        e = uniform(fx.Int32(ld_dev(state, 0)))
+        e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
         mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
         put, put_words, poll = mb.put, mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
-        bases = peer_bases(peers, n)
-        own = load_ptr64(peers, rank)
+        bases = [load_i64_from_buffer(peers, source) for source in range(n)]
+        own = load_i64_from_buffer(peers, rank)
         data = [
             tagged_shift(tagged_peer_address(p, lay["data"][0]), flip) for p in bases
         ]
@@ -260,7 +252,7 @@ def build(key: CombineBuild):
         ws = [
             fx.Vector(
                 bo.buffer_load(
-                    rsrc(out),
+                    buffer_resource(out),
                     (b * out_sb + (dest * hl + lh) * out_sh) // 2 + j,
                     vec_width=2,
                     dtype=T.i32,
@@ -271,7 +263,7 @@ def build(key: CombineBuild):
         lv = [
             fx.Float32(
                 bo.buffer_load(
-                    rsrc(lse),
+                    buffer_resource(lse),
                     b * lse_sb + (dest * hl + lh) * lse_sh,
                     vec_width=1,
                     dtype=T.f32,

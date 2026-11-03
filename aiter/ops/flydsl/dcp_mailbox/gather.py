@@ -23,22 +23,22 @@ from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     bf2_f32,
-    fp8_pack4,
     key_tuple,
-    ld_dev,
-    load_ptr64,
     pair_layout,
-    peer_bases,
-    rsrc,
-    uniform,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    CACHE_DEVICE,
     TaggedMailbox,
+    buffer_load_i32,
+    buffer_resource,
+    load_i64_from_buffer,
     tagged_peer_address,
     tagged_shift,
+    wave_uniform_i32,
 )
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_fp8
 
 THREADS = 128
 FP8_MAX = 448.0
@@ -118,16 +118,16 @@ def build(key: GatherBuild):
         state: Int64,
     ):
         _ = keyed
-        tid = fx.Int32(fx.thread_idx.x)
-        bid = fx.Int32(fx.block_idx.x)
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
         b = bid // hl
         lh = bid % hl
-        e = uniform(fx.Int32(ld_dev(state, 0)))
+        e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
         mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
         put_words, poll = mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
-        bases = peer_bases(peers, n)
-        own = load_ptr64(peers, rank)
+        bases = [load_i64_from_buffer(peers, source) for source in range(n)]
+        own = load_i64_from_buffer(peers, rank)
         to = [
             tagged_shift(tagged_peer_address(peer, lay["q"][0]), flip) for peer in bases
         ]
@@ -140,7 +140,7 @@ def build(key: GatherBuild):
             in_nope = e0 < key.nope
             vn = fx.Vector(
                 bo.buffer_load(
-                    rsrc(q),
+                    buffer_resource(q),
                     (b * q_sb + lh * q_sh + fx.min(e0, key.nope - 8)) // 2,
                     vec_width=4,
                     dtype=T.i32,
@@ -148,14 +148,14 @@ def build(key: GatherBuild):
             )
             vp = fx.Vector(
                 bo.buffer_load(
-                    rsrc(pe),
+                    buffer_resource(pe),
                     (b * pe_sb + lh * pe_sh + fx.max(e0 - key.nope, 0)) // 2,
                     vec_width=4,
                     dtype=T.i32,
                 )
             )
             inv = fx.Float32(1.0) / fx.Float32(
-                bo.buffer_load(rsrc(scale), 0, vec_width=1, dtype=T.f32)
+                bo.buffer_load(buffer_resource(scale), 0, vec_width=1, dtype=T.f32)
             )
             xs = []
             for k in range_constexpr(4):
@@ -165,11 +165,17 @@ def build(key: GatherBuild):
                 fx.max(fx.min(x * inv, fx.Float32(FP8_MAX)), fx.Float32(-FP8_MAX))
                 for x in xs
             ]
-            v = [fp8_pack4(*ys[0:4]), fp8_pack4(*ys[4:8])]
+            v = [
+                emit_f32_to_fp8(ys[0], ys[1]) | (emit_f32_to_fp8(ys[2], ys[3]) << 16),
+                emit_f32_to_fp8(ys[4], ys[5]) | (emit_f32_to_fp8(ys[6], ys[7]) << 16),
+            ]
         if const_expr(push and key.nope == 0):
             vw = fx.Vector(
                 bo.buffer_load(
-                    rsrc(q), b * q_sb + lh * q_sh + j, vec_width=2, dtype=T.i32
+                    buffer_resource(q),
+                    b * q_sb + lh * q_sh + j,
+                    vec_width=2,
+                    dtype=T.i32,
                 )
             )
             v = [vw[0], vw[1]]
@@ -191,7 +197,7 @@ def build(key: GatherBuild):
                 at = (b * key.pad_heads + src * hl + lh) * w + j
             bo.buffer_store(
                 fx.Vector.from_elements([got[src][0], got[src][1]], fx.Int32),
-                rsrc(gq),
+                buffer_resource(gq),
                 at,
             )
         _finish(tid, state, e, nblk)
