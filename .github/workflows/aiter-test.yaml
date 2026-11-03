@@ -906,7 +906,7 @@ jobs:
 
       - name: Run full MoE 2-stage matrix (scheduled/dispatch only)
         if: >-
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
           matrix.shard_idx == 0 &&
           matrix.runner == 'linux-aiter-mi35x-1'
         continue-on-error: true
@@ -940,7 +940,7 @@ jobs:
       - name: Upload full matrix log
         if: >-
           always() &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
           matrix.shard_idx == 0 &&
           matrix.runner == 'linux-aiter-mi35x-1'
         uses: actions/upload-artifact@v4
