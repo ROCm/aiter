@@ -66,7 +66,7 @@ count times ``DMK_CTAS_PER_CU`` for small_m, ``LM_CTAS_PER_CU`` for large_m, and
 no other kernel may hold CUs). A wait
 traps after ``TIMEOUT_S``: a peer's launch may start seconds late.
 
-No launch handshake: rank s writes d's ``dmk_disp`` / ``dmk_rowmap`` /
+Cross-launch reuse: rank s writes d's ``dmk_disp`` / ``dmk_rowmap`` /
 ``running`` in launch L+1 only after s's launch L ended, which needed d's close
 of L, which comes after every read d made of them in L (and after CTA 0 reset
 the counters launch L+1 uses). Rows of ``comb_inp`` on s are written in L+1
@@ -75,6 +75,14 @@ d only once d's X1 row of the same launch arrived, i.e. once d's previous
 launch ended; that holds whichever path (large_m or staged, which share
 ``disp_out``, ``ep_rowmap`` and ``comb_inp``) ran it, as the staged dispatch
 likewise waits for d's counts.
+
+Start handshake: that ordering is not enough on its own. Writes that reached a
+rank still between two launches (its previous kernel done, the next one not
+started) came out corrupted now and then: about 1 in 400 small_m calls had one
+token wrong, and an idle delay before any send removed it. So small_m sends
+only once every peer's ``started`` flag carries this launch's generation, which
+CTA 0 polls and passes on through each CTA's send gate. large_m needs no extra
+step: its rows go out after every peer's X1, which proves the same.
 
 Generation and parity come from u64 entry tickets (``G`` per launch over
 ``N_TICKET`` counters): every rank launches once per layer, so they agree.
@@ -214,8 +222,8 @@ RED_ELEMS = WAVE * 16
 
 def dmk_ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
     """Bytes of the arena's ``dmk_ctl`` region: slot counters, then src_done,
-    then comb_flag (``FLAG_SPAN`` apart)."""
-    return dmk_src_off(experts_per_rank) + FLAG_SPAN + npes * FLAG_STRIDE
+    comb_flag and started (``FLAG_SPAN`` apart)."""
+    return dmk_src_off(experts_per_rank) + 2 * FLAG_SPAN + npes * FLAG_STRIDE
 
 
 def dmk_epr_pad(experts_per_rank: int) -> int:
@@ -244,9 +252,9 @@ def dmk_ctl_layout(
     *, experts_per_rank: int, mt_cap: int, workers: int, npes: int = 0, compact=False
 ):
     """Word offsets of the local control block: the per-m-tile GEMM1 lines,
-    the plan replicas (per expert ``rows``, 16 bits each), one plan gate and one
-    combine gate line per CTA, and on the compact layout the segment counters,
-    the send-table replicas and one send gate line per CTA. No line is read or
+    the plan replicas (per expert ``rows``, 16 bits each), one plan, one
+    combine and one send gate line per CTA, and on the compact layout the
+    segment counters and the send-table replicas. No line is read or
     polled by more than a few CTAs: hundreds of CTAs on one uncached line
     serialize at its DRAM bank."""
     epr_pad = dmk_epr_pad(experts_per_rank)
@@ -254,14 +262,20 @@ def dmk_ctl_layout(
     plan_slot = (epr_pad // 2 + 31) // 32 * 32
     gate_p = plan + PLAN_REPS * plan_slot
     gate_c = gate_p + int(workers) * GATE_STRIDE
-    end = gate_c + int(workers) * GATE_STRIDE
-    lay = {"plan": plan, "plan_slot": plan_slot, "gate_p": gate_p, "gate_c": gate_c}
+    gate_s = gate_c + int(workers) * GATE_STRIDE
+    end = gate_s + int(workers) * GATE_STRIDE
+    lay = {
+        "plan": plan,
+        "plan_slot": plan_slot,
+        "gate_p": gate_p,
+        "gate_c": gate_c,
+        "gate_s": gate_s,
+    }
     if compact:
         segs = dmk_segs_pad(npes=npes, experts_per_rank=experts_per_rank)
         lay["seg_cnt"] = end
         lay["srep"] = end + segs * SEG_STRIDE
-        lay["gate_s"] = lay["srep"] + N_SREP * segs
-        end = lay["gate_s"] + int(workers) * GATE_STRIDE
+        end = lay["srep"] + N_SREP * segs
     lay["words"] = end
     return lay
 
@@ -371,6 +385,7 @@ def make_decode_mega(
     EPR_CH = EPR_PAD // WAVE
     SRC_OFF = dmk_src_off(EPR)
     CF_OFF = SRC_OFF + FLAG_SPAN
+    ST_OFF = SRC_OFF + 2 * FLAG_SPAN
     MT_PER_E = CAP // TM
     MT_CAP = int(mt_cap) if COMPACT else EPR * MT_PER_E
     N1 = 2 * I
@@ -385,12 +400,12 @@ def make_decode_mega(
     )
     CTL_WORDS = _lay["words"]
     PLAN_W, PLAN_SLOT = _lay["plan"], _lay["plan_slot"]
-    GATE_P, GATE_C = _lay["gate_p"], _lay["gate_c"]
+    GATE_P, GATE_C, GATE_S = _lay["gate_p"], _lay["gate_c"], _lay["gate_s"]
     if MT_CAP > 0xFFFF or (not COMPACT and CAP > 0xFFFF):
         raise ValueError("the packed plan holds m-tile ends and rows in 16 bits")
     SEGS_PAD = dmk_segs_pad(npes=npes, experts_per_rank=EPR)
     if COMPACT:
-        SEG_CNT_W, SREP_W, GATE_S = _lay["seg_cnt"], _lay["srep"], _lay["gate_s"]
+        SEG_CNT_W, SREP_W = _lay["seg_cnt"], _lay["srep"]
         if npes * SEGS_PAD * 4 > dmk_src_off(EPR) or SEGS_PAD > (1 << SEG_BITS):
             raise ValueError("the X1 rows do not fit the control region")
         MAXR = int(max_tok_per_rank) * K
@@ -414,12 +429,22 @@ def make_decode_mega(
     # A at the default policy: only the m-tile's own GEMM2 units read its a2
     # rows, after g1_ready, and the launch started with no line of them cached.
     POL_A = int(os.environ.get("AITER_DMK_POL_A", "0"))
+    # Debug only: GEMM1's A / A-scale loads (the dispatched rows).
+    POL_A1 = int(os.environ.get("AITER_DMK_POL_A1", "0"))
     POL_C = int(os.environ.get("AITER_DMK_POL_C", str(SCOPE_DEV)))
     POL_S = int(os.environ.get("AITER_DMK_POL_S", str(SCOPE_SYS)))
     # Debug only: AITER_DMK_NOTRAP=1 has a timed-out wait count itself in
     # ctl[CTL_FAIL + site] and go on instead of trapping (with a short
     # AITER_DMK_TIMEOUT_S, a hung protocol then shows where it stops).
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
+    # Debug only: AITER_DMK_INV=1 has wave 0 of every CTA invalidate the caches
+    # at system scope at launch (a stale cross-launch L2 line test).
+    INV = int(os.environ.get("AITER_DMK_INV", "0"))
+    # Debug only: every wave idles this many us after its ticket (lets every
+    # rank's launch start before anyone sends).
+    DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
+    # Debug only: AITER_DMK_NO_HS=1 drops small_m's start handshake.
+    HS = not int(os.environ.get("AITER_DMK_NO_HS", "0"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
     )
@@ -498,6 +523,7 @@ def make_decode_mega(
             a_scale_row_stride_bytes=ROW,
             tile_meta=meta1_holder,
             a_ready=ready1_holder if COMPACT else None,
+            a_cache_modifier=POL_A1,
             c_cache_modifier=POL_C,
             **common,
         )
@@ -638,6 +664,9 @@ def make_decode_mega(
                     _trap()
 
             stamp(0)
+            if const_expr(INV):  # noqa: SIM102 - preserve DSL staging
+                if wave == fx.Int32(0):
+                    comm_ops.fence_acquire(fx.rocdl.SyncScope.OneAs)
 
             # ---- entry ticket (u64) -> generation, parity ----
             # CTA b takes its ticket on counter b % N_TICKET, which G / N_TICKET
@@ -673,6 +702,12 @@ def make_decode_mega(
             par = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(4))))
             tag16 = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(16))))
             other = fx.Int32(1) - par
+            if const_expr(DELAY_US):
+                d_end = _now() + fx.Int64(DELAY_US * (NOW_HZ // 1_000_000))
+                d_live = fx.Int32(1)
+                while d_live != fx.Int32(0):
+                    fx.rocdl.s_sleep(32)
+                    d_live = alive(d_end)
 
             stamp(1)
             # ---- CTA 0: reset the next launch's counters ----
@@ -852,6 +887,23 @@ def make_decode_mega(
                     carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
                 if lane == fx.Int32(0):
                     comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
+
+            if const_expr(not COMPACT and HS):  # noqa: SIM102 - preserve DSL staging
+                # ---- start handshake (small_m) ----
+                # A peer writes this rank's counters, rows and rowmap only once
+                # this launch has started: writes that reached a rank still
+                # between launches came out corrupted now and then (measured;
+                # a 300 us delay before any send removed it). large_m sends
+                # only after every peer's X1, which proves the same.
+                if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
+                    if lane < fx.Int32(npes):
+                        comm_ops.store_i32_global_system_monotonic(
+                            peer_va(lane, off_ctl)
+                            + fx.Int64(ST_OFF + rank * FLAG_STRIDE),
+                            gen,
+                        )
+                    poll_peer_flags(ST_OFF, 8)
+                    open_gates(GATE_S, GATE_STRIDE)
 
             # ======================== 1. PRODUCE ========================
             rsrc_x = create_buffer_resource_from_addr(addr_x)
@@ -1367,6 +1419,10 @@ def make_decode_mega(
                     # resource and touch no memory (an add of 0 by each idle lane
                     # on one scratch word serialized ~1700 atomics per launch), and
                     # the return is waited on only at its first use.
+                    # Every peer has started this launch (the row loads above
+                    # are local and go out first).
+                    if const_expr(HS):
+                        wait_gate(GATE_S, GATE_STRIDE, 1)
                     rsrc_run = create_buffer_resource_from_addr(
                         peer_va(dst, off_ctl), num_records_bytes=SRC_OFF
                     )
@@ -2433,8 +2489,9 @@ class DecodeMega:
 
     def fails(self) -> list:
         """AITER_DMK_NOTRAP: timed-out waits per site (X1, send gate, source
-        flags, plan gate, g1_ready, combine flags, reduce gate, rows gate)."""
-        return self.ctl[CTL_FAIL : CTL_FAIL + 8].tolist()
+        flags, plan gate, g1_ready, combine flags, reduce gate, rows gate,
+        started flags)."""
+        return self.ctl[CTL_FAIL : CTL_FAIL + 9].tolist()
 
 
 __all__ = [
