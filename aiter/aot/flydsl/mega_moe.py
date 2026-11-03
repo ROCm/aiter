@@ -30,6 +30,9 @@ Usage:
 
     # One custom profile
     python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192
+
+    # Check that a cache holds every kernel of the same jobs (compiles nothing)
+    python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192 --check
 """
 
 from __future__ import annotations
@@ -306,7 +309,15 @@ def main():
         choices=DEFAULT_QUANTS,
         default=list(DEFAULT_QUANTS),
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compile nothing; fail on any kernel the replay needs but the cache lacks",
+    )
     args = parser.parse_args()
+    if args.check:
+        # Every launch the replay reaches must load from the cache instead of compiling.
+        os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
     if os.environ.get("AITER_AOT_REPLAY") != "1":
         raise SystemExit(run(sys.argv[1:]))
     check_replay_process(ARCH)
@@ -341,7 +352,8 @@ def main():
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(
-        f"[aiter] FlyDSL MegaMoE replay: {len(results) - failed} ok, {failed} failed",
+        f"[aiter] FlyDSL MegaMoE {'cache check' if args.check else 'replay'}: "
+        f"{len(results) - failed} ok, {failed} failed",
         flush=True,
     )
     raise SystemExit(1 if failed else 0)

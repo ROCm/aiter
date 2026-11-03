@@ -30,7 +30,6 @@ __all__ = [
     "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
-    "atomic_umax_agent",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -53,6 +52,7 @@ __all__ = [
     "spin_until_ge_i32_system",
     "spin_until_ge_i64",
     "spin_until_gt_i32",
+    "spin_until_shifted_eq_i64",
     "store_i32_global_agent_release",
     "store_i32_global_system_monotonic",
     "store_i32_global_system_release",
@@ -225,6 +225,18 @@ def spin_until_ge_i64(addr_i64, val, *, max_iters=0):
 
 
 @flyc.jit
+def spin_until_shifted_eq_i64(addr_i64, val, *, shift):
+    """Spin until an i64 flag shifted right by ``shift`` equals ``val``; returns the flag.
+
+    Unlike a ``>=`` wait it stays correct when the generation in the high bits wraps.
+    """
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while (cur >> fx.Int64(shift)) != fx.Int64(val):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
+
+
+@flyc.jit
 def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
     """Spin on a system-visible i32 flag until it reaches ``val``."""
     cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
@@ -308,15 +320,6 @@ def store_i64_global_system(addr_i64, val):
 def store_i64_global(addr_i64, val):
     """Plain (non-atomic) global i64 store to ``addr_i64``."""
     fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))
-
-
-def atomic_umax_agent(addr_i64, val):
-    """Agent-scope monotonic global unsigned fetch-and-max on an i32 word."""
-    return fx.atomic_max(
-        _to_ptr_global(addr_i64, fx.Uint32, 4),
-        fx.Uint32(val),
-        syncscope=fx.rocdl.SyncScope.Agent,
-    )
 
 
 # FlyDSL has no wrapper for the two instructions below.

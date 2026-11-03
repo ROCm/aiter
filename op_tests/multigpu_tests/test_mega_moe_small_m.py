@@ -71,6 +71,51 @@ def _rank_case(tokens_per_rank, rank, x, w, ids, experts, pad_rows=0):
     return xi, wi, ii, n - pad_rows
 
 
+def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
+    """All ranks with zero rows, then launches across the 32-bit epoch wrap.
+
+    The small-input generation is preset just below 2**31 and 2**32 and the large-input
+    combine generation and launch epoch just below 2**31; each following launch must give
+    the result it gave before. Returns the number of mismatched rows over all ranks.
+    """
+    bind(0, 0)
+    mism = 0
+    empty_x = torch.empty((0, case[0].shape[1]), dtype=case[0].dtype, device=device)
+    empty_w = torch.empty((0, case[1].shape[1]), dtype=case[1].dtype, device=device)
+    empty_i = torch.empty((0, case[2].shape[1]), dtype=case[2].dtype, device=device)
+    if moe.forward_small_m(empty_x, empty_w, empty_i, max_tokens=0).shape[0] != 0:
+        mism += 1
+    if moe._large_m is not None and moe(empty_x, empty_w, empty_i).shape[0] != 0:
+        mism += 1
+
+    xi, wi, ii, expect, real, mt = case
+    large_expect = None
+    if large_case is not None:
+        large_expect = moe(*large_case[:3])[: large_case[4]].clone()
+    for base in (2**31 - 2, 2**32 - 2):
+        _barrier()
+        for runtime in moe._small_m_runtimes:
+            # generation = entry_count // (2 * CUs); the next launches cross the wrap.
+            runtime._s1_dispatch_workspace["entry_count"].fill_(
+                base * 2 * runtime._s1_num_cu
+            )
+        if moe._large_m is not None:
+            large = moe._large_m
+            large._fused_comb_ctr_arena[:, 1].fill_(2**31 - 3)
+            large._s1_epoch_expected_arena.fill_(2**31 - 2 * moe.world_size)
+        torch.cuda.synchronize()
+        _barrier()
+        for _ in range(4):
+            out = moe.forward_small_m(xi, wi, ii, max_tokens=mt)[:real]
+            mism += int((out != expect[:real]).any(dim=-1).sum().item())
+            if large_expect is not None:
+                out = moe(*large_case[:3])[: large_case[4]]
+                mism += int((out != large_expect).any(dim=-1).sum().item())
+    total = torch.tensor(mism, device=device)
+    dist.all_reduce(total)
+    return int(total.item())
+
+
 def run(args):
     rank, world, device = _setup_dist()
     net = NETWORKS["v4_pro"]
@@ -329,6 +374,22 @@ def run(args):
         if not ok:
             failures.append("alternation")
         _barrier()
+
+        # ---- 2b. zero rows on every rank; 32-bit epochs wrapping ----------
+        if not args.time_only:
+            case = small_m_out_cache[(keys[0][0], 0)]
+            large_case = case if large_m else None
+            wrap_mism = _check_epoch_wrap_and_zero_rows(
+                moe, bind, case, large_case, device
+            )
+            if rank == 0:
+                print(
+                    f"[WRAP] zero_rows+epoch_wrap mismatched_rows={wrap_mism} "
+                    f"large_m={large_m} {'PASS' if wrap_mism == 0 else 'FAIL'}",
+                    flush=True,
+                )
+            if wrap_mism:
+                failures.append("epoch wrap")
 
         # ---- 3. CUDA graph capture/replay --------------------------------
         n = args.graph_bs

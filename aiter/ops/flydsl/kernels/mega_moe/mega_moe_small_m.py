@@ -53,6 +53,7 @@ from .mega_moe_fused_gemm import (
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity
 from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
+from .weights import check_bindable, contiguous_weights, weight_spec
 
 __all__ = ["SmallMRuntime"]
 
@@ -698,9 +699,9 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
         if fx.Int32(ticket) >= first:
             if tx_i32 < fx.Int32(npes):
                 if const_expr(row_format):
-                    # Any format bit of this launch's flag; earlier launches published smaller values.
-                    seen = fx.Int64(comm_ops.spin_until_ge_i64(
-                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag << fx.Int64(1)))
+                    # This launch's flag with either format bit (flag << 1 | fp8).
+                    seen = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
+                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1))
                     fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
                 else:
                     comm_ops.wait_i64_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
@@ -1194,16 +1195,16 @@ def compile_mega_moe_stage1(
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
             first_local = fx.Int32(
                 comm_ops.atomic_add_agent(a_work_head + fx.Int64(xcd) * fx.Int64(64), fx.Int32(1)))
-            plan_floor = (fx.Int64(gate_epoch) << fx.Int64(32)) - fx.Int64(1)
             a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
             plan_word = fx.Int64(0)
+            # Match this launch's epoch in the high word exactly: a >= wait breaks when the 32-bit epoch wraps.
             if first_local == fx.Int32(0):
-                plan_word = fx.Int64(comm_ops.spin_until_ge_i64(
-                    _disp_ptr(DispatchSlot.PLAN_NV), plan_floor + fx.Int64(1)))
+                plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
+                    _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
                 comm_ops.fence_agent_acquire()
                 comm_ops.store_i64_global_system(a_xcd_acq, plan_word)
             else:
-                plan_word = fx.Int64(comm_ops.spin_until_ge_i64(a_xcd_acq, plan_floor + fx.Int64(1)))
+                plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(a_xcd_acq, gate_epoch, shift=32))
                 comm_ops.invalidate_l1()
             fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
         fx.barrier()
@@ -1258,7 +1259,9 @@ def compile_mega_moe_stage1(
                 cnt_addr = a_g2_cnt + fx.Int64(m) * fx.Int64(4)
                 old_cnt = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, inc))
                 if old_cnt + inc == fx.Int32(N_TILES):
-                    comm_ops.atomic_umax_agent(a_g2_ready + fx.Int64(m) * fx.Int64(4), gate_epoch)
+                    # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
+                    # (a max would stick at 0xffffffff).
+                    comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), gate_epoch)
                     # All counts of this launch are in: rewind to 0, since the next launch's config may use another
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
                     comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
@@ -1479,10 +1482,17 @@ class SmallMRuntime:
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
-        num_cu = torch.cuda.get_device_properties(self.dev).multi_processor_count
-        if num_cu != 256:
-            # The kernel splits its work over 8 XCDs by XCC id; a 4-XCD part leaves half unclaimed.
-            raise ValueError(f"SmallMRuntime needs an 8-XCD (256-CU) gfx950 device, got {num_cu} CUs")
+        from .mega_moe_v2 import small_m_eligible
+
+        # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
+        # work over 8 XCDs and bakes in the EP8 DeepSeek-V4 shape), instead of failing at compile.
+        if not small_m_eligible(
+            enabled=True, arch=get_gfx_runtime(),
+            num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
+            world_size=self.world_size, model_dim=self.model_dim, inter_dim=self.inter_dim,
+            experts=self.experts, topk=self.topk, quant=quant, swiglu_limit=self.swiglu_limit,
+        ):
+            raise ValueError("SmallMRuntime supports the EP8 DeepSeek-V4 a8w4 layout on 8-XCD gfx950 only")
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.
         self._reducers = _COMBINE_REDUCERS
@@ -1508,10 +1518,9 @@ class SmallMRuntime:
         ms.shmem_barrier_all()
         # Contiguous copies of strided weights live as long as the runtime: a graph captured with
         # them keeps their pointers even after another bind_weights() call.
-        w1, w1_scale, w2, w2_scale = (
-            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
-        )
-        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
+        w1, w1_scale, w2, w2_scale = self._construction_weights
+        self._weight_spec = weight_spec(self._construction_weights)
         self.w2 = w2
         self.w2_scale = w2_scale
         self._build(w1, w1_scale)
@@ -1631,12 +1640,11 @@ class SmallMRuntime:
         reused afterwards, including inside captured graphs. A refused binding
         leaves the previous one in place.
         """
-        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
-            # A contiguous copy would die after this call while a captured graph keeps its pointer.
-            raise ValueError("bind_weights needs contiguous weights")
+        check_bindable((w1, w1_scale, w2, w2_scale), self._weight_spec)
+        w1_bytes, w1_scale_bytes = w1.view(torch.uint8), w1_scale.view(torch.uint8)
         disp = self.w2_dispatch_table(w2, w2_scale)
-        self._s1_w1 = w1.view(torch.uint8)
-        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self._s1_w1 = w1_bytes
+        self._s1_w1_scale = w1_scale_bytes
         self.w2 = w2
         self.w2_scale = w2_scale
         self._s1_disp = disp
@@ -1701,6 +1709,9 @@ class SmallMRuntime:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (run_tokens, self.topk):
             raise ValueError(f"topk_ids must have shape ({run_tokens}, {self.topk})")
+        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
         if run_tokens == 0:
             x_bf16, wts, topk_ids = self._idle_inputs
         if stream is None:

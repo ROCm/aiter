@@ -61,6 +61,7 @@ from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
 __all__ = ["LargeMRuntime"]
 from .quant import _get_launcher as _get_quant_launcher
 from .quant import per_1x32_mx_quant
+from .weights import check_bindable, contiguous_weights, weight_spec
 
 
 class DispatchSlot(IntEnum):
@@ -1478,8 +1479,10 @@ def compile_mega_moe_stage1(
                 launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
                 remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
                 comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
-                comm_ops.wait_i32_until_greater_than(
-                    a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
+                # Equality, not >=, so the 32-bit epoch may wrap: no peer can be a launch of this slot
+                # ahead, since finishing this one needs this rank's dispatch.
+                comm_ops.wait_i32_until_equals(
+                    a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch
                 )
                 comm_ops.fence_system_acquire()
             if tid == fx.Int32(0):
@@ -1845,10 +1848,12 @@ def compile_mega_moe_stage1(
         fx.barrier()
         if tid == fx.Int32(0):
             for source in range_constexpr(fz_npes):
-                comm_ops.wait_i32_until_greater_than(
+                # Equality so the 32-bit generation may wrap; a peer cannot publish the next one
+                # before this rank's next dispatch.
+                comm_ops.wait_i32_until_equals(
                     c_tok_ready
                     + fx.Int64(C_MTPR + source) * fx.Int64(4),
-                    c_gen - fx.Int32(1),
+                    c_gen,
                 )
             comm_ops.fence_system_acquire()
         fx.barrier()
@@ -2015,10 +2020,9 @@ class LargeMRuntime:
         ms.shmem_barrier_all()
         # Contiguous copies of strided weights live as long as the runtime: a graph captured with
         # them keeps their pointers even after another bind_weights() call.
-        w1, w1_scale, w2, w2_scale = (
-            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
-        )
-        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
+        w1, w1_scale, w2, w2_scale = self._construction_weights
+        self._weight_spec = weight_spec(self._construction_weights)
         self.w2 = w2
         self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
@@ -2204,11 +2208,10 @@ class LargeMRuntime:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         """Bind layer weights; launch arguments capture these exact pointers."""
-        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
-            # A contiguous copy would die after this call while a captured graph keeps its pointer.
-            raise ValueError("bind_weights needs contiguous weights")
-        self._s1_w1 = w1.view(torch.uint8)
-        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        check_bindable((w1, w1_scale, w2, w2_scale), self._weight_spec)
+        w1_bytes, w1_scale_bytes = w1.view(torch.uint8), w1_scale.view(torch.uint8)
+        self._s1_w1 = w1_bytes
+        self._s1_w1_scale = w1_scale_bytes
         self.w2 = w2
         self.w2_scale = w2_scale
 
@@ -2256,6 +2259,9 @@ class LargeMRuntime:
             raise ValueError(f"scales must be E8M0 (uint8 or {dtypes.fp8_e8m0}), got {scales.dtype}")
         if not scales.is_contiguous() or scales.device != self.dev:
             raise ValueError(f"scales must be contiguous on {self.dev}")
+        if any(t.device != self.dev for t in (x, wts, topk_ids)):
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x, wts and topk_ids must be on {self.dev}")
         if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
             # The kernel reads a full row of scales per token.
             raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
@@ -2406,6 +2412,9 @@ class LargeMRuntime:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
         # The quant kernel runs on the launch stream, ahead of the persistent kernel.
         with torch.cuda.stream(_torch_stream(stream)):
             x_q, scales = self.quantize(x_bf16)

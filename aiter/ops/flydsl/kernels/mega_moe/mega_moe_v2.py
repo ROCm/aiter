@@ -27,6 +27,7 @@ from .mega_moe_config import (
 )
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
+from .weights import check_bindable, contiguous_weights, weight_spec
 
 __all__ = ["MegaMoEV2"]
 
@@ -199,10 +200,9 @@ class MegaMoEV2:
         ms.shmem_barrier_all()
         # Contiguous copies of strided weights live as long as the instance: a graph captured with
         # them keeps their pointers even after another bind_weights() call.
-        w1, w1_scale, w2, w2_scale = (
-            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
-        )
-        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
+        w1, w1_scale, w2, w2_scale = self._construction_weights
+        self._weight_spec = weight_spec(self._construction_weights)
         self.w2 = w2
         self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
@@ -346,31 +346,22 @@ class MegaMoEV2:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         """Bind weights for the main path and the optional small- and large-input runtimes."""
-        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
-            # A contiguous copy would die after this call while a captured graph keeps its pointer.
-            raise ValueError("bind_weights needs contiguous weights")
+        weights = (w1, w1_scale, w2, w2_scale)
         # Everything that can refuse runs before any binding changes, so a refusal leaves the main,
         # small- and large-input paths on the previous weights together.
+        check_bindable(weights, self._weight_spec)
+        w1_bytes, w1_scale_bytes = w1.view(torch.uint8), w1_scale.view(torch.uint8)
         for runtime in self._small_m_runtimes:
             runtime.w2_dispatch_table(w2, w2_scale)
-        self._s1_w1 = w1.view(torch.uint8)
-        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self._s1_w1 = w1_bytes
+        self._s1_w1_scale = w1_scale_bytes
         self.w2 = w2
         self.w2_scale = w2_scale
+        # The runtimes were built from the same weights, so they take the same tensors.
         if self._large_m is not None:
-            self._large_m.bind_weights(
-                self._s1_w1,
-                self._s1_w1_scale,
-                self.w2,
-                self.w2_scale,
-            )
+            self._large_m.bind_weights(*weights)
         for runtime in self._small_m_runtimes:
-            runtime.bind_weights(
-                self._s1_w1,
-                self._s1_w1_scale,
-                self.w2,
-                self.w2_scale,
-            )
+            runtime.bind_weights(*weights)
 
     def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
         """Bind a stable layer slot and its weights without resetting state; a refused
@@ -875,6 +866,8 @@ class MegaMoEV2:
             raise ValueError(f"scales must be E8M0 (uint8 or {dtypes.fp8_e8m0}), got {scales.dtype}")
         if not scales.is_contiguous() or scales.device != self.dev:
             raise ValueError(f"scales must be contiguous on {self.dev}")
+        if any(t.device != self.dev for t in (x, wts, topk_ids)):
+            raise ValueError(f"x, wts and topk_ids must be on {self.dev}")
         if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
             # The kernel reads a full row of scales per token.
             raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
@@ -1059,6 +1052,9 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
         large_m = self._get_large_m()
         if large_m is not None:
             return large_m.forward(

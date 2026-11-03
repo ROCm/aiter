@@ -539,6 +539,26 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device)
 
 
+def _binding_state(moe):
+    """Every bound weight view, dispatch table and layer slot of the operator and its runtimes."""
+    state = [moe._s1_w1, moe._s1_w1_scale, moe.w2, moe.w2_scale]
+    if moe._large_m is not None:
+        large = moe._large_m
+        state += [large._s1_w1, large._s1_w1_scale, large.w2, large.w2_scale]
+        state.append(large._active_layer_slot)
+    for runtime in moe._small_m_runtimes:
+        state += [runtime._s1_w1, runtime._s1_w1_scale, runtime.w2, runtime.w2_scale]
+        state.append(runtime._s1_disp)
+    return state
+
+
+def _same_binding(state, expected):
+    return len(state) == len(expected) and all(
+        a is b if isinstance(b, torch.Tensor) else a == b
+        for a, b in zip(state, expected)
+    )
+
+
 def _check_large_m_edges(
     moe,
     x,
@@ -553,6 +573,9 @@ def _check_large_m_edges(
     check_mask,
 ):
     """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import (
         large_m_eligible,
         small_m_eligible,
@@ -603,45 +626,55 @@ def _check_large_m_edges(
             raise AssertionError(f"bs={tokens} rank-local mask relL2={rel_l2:.6f}")
 
     # Launches keep the bound pointers (a captured graph replays them): a copy made for a
-    # strided weight would be freed after the call, so bind_weights refuses one.
-    try:
-        moe.bind_weights(
-            moe._s1_w1, moe._s1_w1_scale, moe.w2.transpose(-1, -2), moe.w2_scale
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("bind_weights accepted a non-contiguous weight")
-    # A refused slot leaves the weights bound before the call.
-    bound_w2 = moe.w2
-    try:
-        moe.bind_layer(
-            1 << 20, moe._s1_w1, moe._s1_w1_scale, moe.w2.clone(), moe.w2_scale
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("bind_layer accepted an out-of-range slot")
-    if moe.w2 is not bound_w2:
-        raise AssertionError("a refused bind_layer changed the bound weights")
-    # The same for the large-input runtime itself: a refused binding keeps its slot and weights.
-    # Strided weights for another slot need two slots (--large-m-state-slots); one slot checks the range only.
+    # strided weight would be freed after the call, so bind_weights refuses one, as it refuses
+    # weights of another layout or an out-of-range slot. A refusal changes no binding anywhere.
+    bound = _binding_state(moe)
+    w1, w1_scale, w2, w2_scale = moe._s1_w1, moe._s1_w1_scale, moe.w2, moe.w2_scale
     large = moe._large_m
-    bound = (large._active_layer_slot, large.w2)
-    refusals = [(1 << 20, large.w2.clone())]
-    other_slot = (bound[0] + 1) % large.state_slots
-    if other_slot != bound[0]:
-        refusals.append((other_slot, large.w2.transpose(-1, -2)))
-    for slot, w2 in refusals:
+    refusals = [
+        (
+            "strided",
+            lambda: moe.bind_weights(w1, w1_scale, w2.transpose(-1, -2), w2_scale),
+        ),
+        ("layout", lambda: moe.bind_weights(w1, w1_scale, w2.flatten(), w2_scale)),
+        ("slot", lambda: moe.bind_layer(1 << 20, w1, w1_scale, w2.clone(), w2_scale)),
+        (
+            "runtime_slot",
+            lambda: large.bind_layer(1 << 20, w1, w1_scale, w2.clone(), w2_scale),
+        ),
+    ]
+    # Strided weights for another slot need two slots (--large-m-state-slots); one slot checks the range only.
+    other_slot = (large._active_layer_slot + 1) % large.state_slots
+    if other_slot != large._active_layer_slot:
+        refusals.append(
+            (
+                "runtime_strided",
+                lambda: large.bind_layer(
+                    other_slot, w1, w1_scale, w2.transpose(-1, -2), w2_scale
+                ),
+            )
+        )
+    for label, refused in refusals:
         try:
-            large.bind_layer(slot, large._s1_w1, large._s1_w1_scale, w2, large.w2_scale)
+            refused()
         except ValueError:
             pass
         else:
-            raise AssertionError("the large-input runtime accepted a refused binding")
-        if large._active_layer_slot != bound[0] or large.w2 is not bound[1]:
-            raise AssertionError("a refused large-input bind_layer changed its state")
-    slot_refusal = "PASS" if len(refusals) == 2 else "RANGE-ONLY"
+            raise AssertionError(f"a {label} binding was accepted")
+        if not _same_binding(_binding_state(moe), bound):
+            raise AssertionError(f"a refused {label} binding changed the bound state")
+    slot_refusal = "PASS" if len(refusals) == 5 else "RANGE-ONLY"
+    # A null stream handle is the default stream, not a new one the persistent kernel never waits on.
+    if any(
+        _torch_stream(s) != torch.cuda.default_stream() for s in (0, fx.Stream(None))
+    ):
+        raise AssertionError("a null stream handle did not map to the default stream")
+    null_output = moe(x, weights, ids, stream=fx.Stream(None))[:tokens]
+    torch.cuda.synchronize()
+    if not _reduce_float(
+        torch.equal(null_output, eager_output), device, dist.ReduceOp.MIN
+    ):
+        raise AssertionError(f"bs={tokens} the null stream changed the output")
     # Stage1 reads scales as E8M0 bytes: another 1-byte dtype is refused before any launch.
     x_q, x_scale = moe.quantize(x)
     for label, stage1 in (
@@ -680,7 +713,7 @@ def _check_large_m_edges(
             f"[LARGE-M] bs={tokens} explicit_stream=PASS "
             f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS "
             f"strided_weights=PASS xcd_gate=PASS slot_refusal={slot_refusal} "
-            "scale_dtype=PASS",
+            "scale_dtype=PASS null_stream=PASS",
             flush=True,
         )
 
