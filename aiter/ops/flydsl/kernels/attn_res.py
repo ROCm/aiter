@@ -55,6 +55,10 @@ _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
 # Two sources fill one batched wave-sum register; one source per barrier lost
 # 3 to 7% at T=1024.
 _WIDE_SOURCE_GROUP_SIZE = 2
+# On the 256-thread grid the BF16 dot wins at T=320 to 2048 but loses 2.5 to 3%
+# at T=8192, where the grid is bandwidth-bound. Above this limit it uses FP32
+# math.
+_WIDE_BF16_DOT_MAX_TOKENS = 4096
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
 _DPP_QUAD_XOR2 = 0x4E
@@ -265,8 +269,10 @@ class _AttnResSpec:
     scale: float
     rows_per_wg: int
     wide_grid: bool
+    native_swap: bool
     fp8_dtype: torch.dtype | None = None
     block_alias: bool = False
+    bf16_dot: bool = False
 
     @property
     def kernel_name(self) -> str:
@@ -277,6 +283,7 @@ class _AttnResSpec:
             f"_onorm{int(self.output_norm)}"
             f"{'_fp8' if self.fp8_dtype is not None else ''}"
             f"{'_wide' if self.wide_grid else ''}"
+            f"{'_bf16dot' if self.bf16_dot else ''}"
         )
 
 
@@ -345,7 +352,8 @@ def _build_attn_res(spec: _AttnResSpec):
     if red_slots > _ROW_LANES:
         raise ValueError(f"at most {_ROW_LANES} waves per row, got {red_slots}")
 
-    native_ops = _has_gfx950_ops()
+    native_swap = spec.native_swap
+    bf16_dot = spec.bf16_dot
     # Alternate buffers per group so the next group's writes need no second
     # barrier. Waves pad to a power of two so a DPP row reduce over wave_stride
     # lanes sums one value.
@@ -414,7 +422,7 @@ def _build_attn_res(spec: _AttnResSpec):
 
         def store_group_partials(pairs, buf):
             totals = _wave_sum_batched(
-                [value for pair in pairs for value in pair], lane, fm_fast, native_ops
+                [value for pair in pairs for value in pair], lane, fm_fast, native_swap
             )
             if lane % _ROW_LANES == 0:
                 row = lane // _ROW_LANES
@@ -456,7 +464,7 @@ def _build_attn_res(spec: _AttnResSpec):
                     [value for pair in pairs for value in pair],
                     lane,
                     fm_fast,
-                    native_ops,
+                    native_swap,
                 )
                 return [
                     tuple(
@@ -650,7 +658,7 @@ def _build_attn_res(spec: _AttnResSpec):
                 thread_sumsq = zero
                 thread_dot = zero
                 for tile in range_constexpr(tiles_per_thread):
-                    if const_expr(native_ops and is_bf16):
+                    if const_expr(bf16_dot and is_bf16):
                         for pair in range_constexpr(tile_widths[tile] // 2):
                             mask = [2 * pair, 2 * pair + 1]
                             value = values_local[tile].shuffle(values_local[tile], mask)
@@ -1183,6 +1191,7 @@ def _plan_launch(
             and num_tokens > _num_cus(prefix.device)
             and _wide_row_supported(hidden_size)
         )
+        gfx950_ops = _has_gfx950_ops()
         launcher = _build_attn_res(
             _AttnResSpec(
                 hidden_size=hidden_size,
@@ -1200,6 +1209,9 @@ def _plan_launch(
                 wide_grid=wide_grid,
                 fp8_dtype=out_quant_dtype,
                 block_alias=block_alias,
+                native_swap=gfx950_ops,
+                bf16_dot=gfx950_ops
+                and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),
             )
         )
 

@@ -390,6 +390,45 @@ def test_flydsl_attn_res_float64_oracle(hidden_size: int, num_blocks: int, cfg):
 
 
 @_skip_unsupported_gfx
+@pytest.mark.parametrize("cfg", (MIX, ALL_ON), ids=str)
+def test_flydsl_attn_res_wide_grid_above_bf16_dot_limit(cfg: _Config):
+    limit = attn_res_kernel._WIDE_BF16_DOT_MAX_TOKENS
+    for tokens in (limit, limit + 1):
+        _run_and_check(tokens, 3, cfg)
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_dot_choice_reaches_the_build(monkeypatch):
+    real = attn_res_kernel._build_attn_res
+    specs = []
+
+    def spy(spec):
+        specs.append(spec)
+        return real(spec)
+
+    spy.cache_clear = real.cache_clear
+    monkeypatch.setattr(attn_res_kernel, "_build_attn_res", spy)
+    attn_res_kernel._clear_caches()
+    native = attn_res_kernel._has_gfx950_ops()
+    limit = attn_res_kernel._WIDE_BF16_DOT_MAX_TOKENS
+    try:
+        for tokens in (limit, limit + 1, 1):
+            _run_and_check(tokens, 3, MIX)
+        assert [spec.bf16_dot for spec in specs] == [native, False, native]
+        assert {spec.native_swap for spec in specs} == {native}
+        assert len({spec.kernel_name for spec in specs}) == (3 if native else 2)
+
+        monkeypatch.setattr(attn_res_kernel, "_has_gfx950_ops", lambda: False)
+        attn_res_kernel._clear_caches()
+        specs.clear()
+        _run_and_check(1, 3, MIX)
+        assert [spec.bf16_dot for spec in specs] == [False]
+        assert [spec.native_swap for spec in specs] == [False]
+    finally:
+        attn_res_kernel._clear_caches()
+
+
+@_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (2048, 3072, 5120, 9216, 16384))
 @pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
 def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
