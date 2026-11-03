@@ -20,7 +20,7 @@ import torch
 from torch import Tensor
 
 from aiter.jit.core import AITER_ROOT_DIR, compile_ops
-from aiter.jit.utils.chip_info import GFX_MAP, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_LOG2E,
@@ -45,6 +45,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_mxfp6_quant,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut, lse_merge
+from aiter.ops.triton.utils._triton import arch_info
 
 __all__ = (
     "MHA_V4_LOG2E",
@@ -870,21 +871,13 @@ _VARLEN_CAPABLE_QV = frozenset(
 )
 
 
-_GFX_IDS = {gfx: gfx_id for gfx_id, gfx in GFX_MAP.items()}
-
-
-# get_gfx_runtime() probes rocminfo, which Dynamo cannot trace, so it sits behind a custom op the
-# way get_gfx() does. Unlike get_gfx() it ignores GPU_ARCHS and names the GPU the launcher runs on.
-@torch_compile_guard()
-def _mha_v4_gfx_runtime_id() -> int:
-    return _GFX_IDS[get_gfx_runtime()]
-
-
 def _varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> bool:
-    """Whether the dense row for these operands takes per-batch key lengths."""
+    """Whether the dense row for these operands takes per-batch key lengths.
+
+    Asks the live GPU, as the launcher dispatches on it, not get_gfx(), which follows GPU_ARCHS.
+    """
     return (
-        GFX_MAP[_mha_v4_gfx_runtime_id()] == "gfx950"
-        and (q_format, v_format) in _VARLEN_CAPABLE_QV
+        arch_info.get_arch() == "gfx950" and (q_format, v_format) in _VARLEN_CAPABLE_QV
     )
 
 
