@@ -352,7 +352,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.work_info_set =
         static_cast<const opus_mla_decode_work_info*>(work_info_set->data_ptr());
     kargs.H              = H;
-    kargs.total_tokens   = static_cast<int>(kv->size(0));
+    kargs.total_tokens   = static_cast<int>(kv->numel() / kHeadDimQk);
     kargs.softmax_scale  = softmax_scale;
     kargs.stride_q_b     = H * kHeadDimQk;
     kargs.stride_q_h     = kHeadDimQk;
