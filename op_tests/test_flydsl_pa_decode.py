@@ -14,6 +14,7 @@ import torch
 
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import checkAllclose
 
 
 @pytest.fixture
@@ -157,8 +158,16 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         )
         # Plans keep every count within the partition bound.
         bounded = [seq for seq, c in enumerate(counts) if c <= partitions]
-        torch.testing.assert_close(
-            grouped[bounded, 0].float(), reference[bounded], atol=2e-2, rtol=2e-2
+        err = checkAllclose(
+            grouped[bounded, 0].float(),
+            reference[bounded],
+            atol=2e-2,
+            rtol=2e-2,
+            msg=f"split_groups partitions={partitions} split={split}",
+        )
+        assert err == 0, (
+            f"split_groups partitions={partitions} split={split}: "
+            f"mismatch ratio={err}"
         )
 
 
