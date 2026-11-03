@@ -144,6 +144,7 @@ class AttentionConfig:
     SCALE_K_WIDTH: gl.constexpr
     q_scales_layout: gl.constexpr
     k_scales_layout: gl.constexpr
+    k_scales_sub_layout: gl.constexpr
     v_packed_layout: gl.constexpr
     v_scales_layout: gl.constexpr
     FP8_DOT: gl.constexpr
@@ -350,6 +351,12 @@ class AttentionConfig:
                     self.k_layout, [TILE_SIZE, HEAD_SIZE // 16], scale_factor=16
                 )
             )
+            # loop variant 2: the scales of one key half of the tile
+            self.k_scales_sub_layout = gl.constexpr(
+                gl.amd.gfx1250.get_wmma_scale_layout(
+                    self.k_layout, [TILE_SIZE // 2, HEAD_SIZE // 16], scale_factor=16
+                )
+            )
             # 8 packed bytes (16 e2m1) per lane: unpacks to the k_width-16 bf16 V operand
             self.v_packed_layout = gl.constexpr(
                 gl.DotOperandLayout(
@@ -378,6 +385,7 @@ class AttentionConfig:
         else:
             self.q_scales_layout = gl.constexpr(None)
             self.k_scales_layout = gl.constexpr(None)
+            self.k_scales_sub_layout = gl.constexpr(None)
             self.v_packed_layout = gl.constexpr(None)
             self.v_scales_layout = gl.constexpr(None)
             self.SCALE_K_WIDTH = gl.constexpr(0)
@@ -1605,13 +1613,35 @@ class AttentionProgram:
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
 
     @gluon.jit
-    def compute_qk_subtile(self, k):
+    def compute_qk_subtile(self, k, k_scales=None):
         S = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2],
             dtype=gl.float32,
             layout=self.cfg.qk_layout,
         )
-        return gl.amd.gfx1250.wmma(self.q, k, S)
+        if self.cfg.KV_NVFP4:
+            # NVFP4 K: the scaled WMMA of compute_qk on one key half
+            return gl.amd.gfx1250.wmma_scaled(
+                self.q,
+                self.q_scales,
+                "e2m1" if self.cfg.Q_NVFP4 else "e4m3",
+                k,
+                k_scales,
+                "e2m1",
+                S,
+            )
+        else:
+            return gl.amd.gfx1250.wmma(self.q, k, S)
+
+    @gluon.jit
+    def split_k_scales(self, k_scales):
+        """NVFP4 K scales [TILE_SIZE, HEAD_SIZE // 16] -> the scales of key rows [0, TILE_SIZE // 2) and
+        [TILE_SIZE // 2, TILE_SIZE), the two halves split_subtile gives K."""
+        x = k_scales.reshape(2, self.cfg.TILE_SIZE // 2, self.cfg.HEAD_SIZE // 16).permute(1, 2, 0)
+        s0, s1 = gl.split(x)
+        s0 = gl.convert_layout(s0, self.cfg.k_scales_sub_layout)
+        s1 = gl.convert_layout(s1, self.cfg.k_scales_sub_layout)
+        return s0, s1
 
     @gluon.jit
     def apply_mask_qk_subtile(self, S, j, sub_idx):
@@ -2012,14 +2042,21 @@ def attention_loop_tensor_subtile_split(
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur)
 
     k = kv_loader.load_k_from_shared(
-        wait_count=2, buffer_id=buf_tile_cur, target_dtype=q.dtype
+        later="KV", wait_count=2, buffer_id=buf_tile_cur, target_dtype=q.dtype
     )
+    # NVFP4 K: its scales come with K (the wait covered both TDM ops) and travel with it
+    k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_cur)
     kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
     kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)
 
     k0_s, k1_s = pgm.split_subtile(k)
-    qk0 = pgm.compute_qk_subtile(k0_s)
-    qk1 = pgm.compute_qk_subtile(k1_s)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
+        qk1 = pgm.compute_qk_subtile(k1_s)
     if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
         qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
@@ -2037,8 +2074,10 @@ def attention_loop_tensor_subtile_split(
     alpha = gl.exp2(m_diff_scaled)
 
     k = kv_loader.load_k_from_shared(
-        wait_count=3, buffer_id=buf_tile_next, target_dtype=q.dtype
+        later="VKV", wait_count=3, buffer_id=buf_tile_next, target_dtype=q.dtype
     )
+    if cfg.KV_NVFP4:
+        k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next)
 
     qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
     qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
@@ -2055,9 +2094,14 @@ def attention_loop_tensor_subtile_split(
         if MERGE_LOOP_TDM_WAITS:
             gl.amd.gfx1250.tdm.async_wait(1)
         k0_s, k1_s = pgm.split_subtile(k)
+        if cfg.KV_NVFP4:
+            ks0, ks1 = pgm.split_k_scales(k_scales)
 
         # --- S1: QK sub 0 + SM1-A ---
-        qk0 = pgm.compute_qk_subtile(k0_s)
+        if cfg.KV_NVFP4:
+            qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+        else:
+            qk0 = pgm.compute_qk_subtile(k0_s)
         if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
             kv_loader.load_k_to_shared(
                 next3_physical_block_idx,
@@ -2067,6 +2111,7 @@ def attention_loop_tensor_subtile_split(
                 next2_physical_block_idx, buffer_id=buf_tile_next2
             )
         v = kv_loader.load_v_from_shared(
+            later="KV",
             wait_count=2,
             buffer_id=buf_tile_cur,
             target_dtype=q.dtype,
@@ -2085,17 +2130,23 @@ def attention_loop_tensor_subtile_split(
             )
 
         # --- S2: QK sub 1 + SM1-B ---
-        qk1 = pgm.compute_qk_subtile(k1_s)
+        if cfg.KV_NVFP4:
+            qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+        else:
+            qk1 = pgm.compute_qk_subtile(k1_s)
         p = pgm.concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
         L = L * alpha + l_ij
         p = p.to(q.dtype)
         k = kv_loader.load_k_from_shared(
+            later="VK",
             wait_count=2,
             buffer_id=buf_tile_next2,
             target_dtype=q.dtype,
             skip_wait=MERGE_LOOP_TDM_WAITS,
         )
+        if cfg.KV_NVFP4:
+            k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next2)
 
         # --- S3: PV sub 0 + SM0-A ---
         acc0 = pgm.compute_pv(p, v0_s, acc0)
@@ -2145,9 +2196,14 @@ def attention_loop_tensor_subtile_split(
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
 
     k0_s, k1_s = pgm.split_subtile(k)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
 
     # --- S1: QK sub 0 for L+1 + SM1-A for L ---
-    qk0 = pgm.compute_qk_subtile(k0_s)
+    if cfg.KV_NVFP4:
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
     p1 = gl.exp2(qk1_shifted)
     acc0 = acc0 * alpha[:, None]
     acc1 = acc1 * alpha[:, None]
@@ -2156,6 +2212,7 @@ def attention_loop_tensor_subtile_split(
         qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
     v_wait: gl.constexpr = 2
     v = kv_loader.load_v_from_shared(
+        later="KV",
         wait_count=v_wait,
         buffer_id=buf_tile_cur,
         target_dtype=q.dtype,
@@ -2163,7 +2220,10 @@ def attention_loop_tensor_subtile_split(
     )
 
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
-    qk1 = pgm.compute_qk_subtile(k1_s)
+    if cfg.KV_NVFP4:
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk1 = pgm.compute_qk_subtile(k1_s)
     if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
         qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
     p = pgm.concat_subtile(p0, p1)
@@ -2175,11 +2235,14 @@ def attention_loop_tensor_subtile_split(
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
     v0_s, v1_s = pgm.split_subtile(v)
     k = kv_loader.load_k_from_shared(
+        later="VV",
         wait_count=2,
         buffer_id=buf_tile_next2,
         target_dtype=q.dtype,
         skip_wait=MERGE_EPI_TDM_WAITS,
     )
+    if cfg.KV_NVFP4:
+        k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next2)
 
     # --- S3: PV sub 0 for L + SM0 for L+1 ---
     acc0 = pgm.compute_pv(p, v0_s, acc0)
@@ -2203,6 +2266,7 @@ def attention_loop_tensor_subtile_split(
         gl.amd.gfx1250.tdm.async_wait(0)
 
     v = kv_loader.load_v_from_shared(
+        later="V",
         wait_count=1,
         buffer_id=buf_tile_next,
         target_dtype=q.dtype,
@@ -2210,9 +2274,14 @@ def attention_loop_tensor_subtile_split(
     )
 
     k0_s, k1_s = pgm.split_subtile(k)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
 
     # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
-    qk0 = pgm.compute_qk_subtile(k0_s)
+    if cfg.KV_NVFP4:
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
     acc0 = acc0 * alpha[:, None]
     acc1 = acc1 * alpha[:, None]
     p1_next = gl.exp2(qk1_shifted)
@@ -2221,7 +2290,10 @@ def attention_loop_tensor_subtile_split(
     qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
-    qk1 = pgm.compute_qk_subtile(k1_s)
+    if cfg.KV_NVFP4:
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk1 = pgm.compute_qk_subtile(k1_s)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
     p = p.to(q.dtype)
@@ -2242,6 +2314,7 @@ def attention_loop_tensor_subtile_split(
     alpha = gl.exp2(m_diff_scaled)
 
     v = kv_loader.load_v_from_shared(
+        later="",
         wait_count=0,
         buffer_id=buf_tile_next2,
         target_dtype=q.dtype,
@@ -2485,10 +2558,10 @@ def _unified_attention_gluon_kernel_2d(
         V_NVFP4,
     )
     if KV_NVFP4:
-        # the wait sites of loop variants 0 and 1 (two buffers) name their later loads; 2 does not yet
+        # the wait sites of loop variants 0, 1 and 2 (two buffers) name their later loads
         gl.static_assert(
-            LOOP_VARIANT == 0 or LOOP_VARIANT == 1,
-            "NVFP4 K runs loop variants 0 and 1",
+            LOOP_VARIANT == 0 or LOOP_VARIANT == 1 or LOOP_VARIANT == 2,
+            "NVFP4 K runs loop variants 0, 1 and 2",
         )
         gl.static_assert(NUM_BUFFERS == 2, "NVFP4 K runs two buffers")
         gl.static_assert(

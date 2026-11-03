@@ -919,6 +919,95 @@ def fused_qk_rope_reshape_and_cache(
     return q_out, k_out, key_cache, value_cache
 
 
+def reshape_and_cache_k4v8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Write K and V into an A8K4V8 KV cache (NVFP4 K, FP8 V), in place: the cache write of
+    ``fused_qk_rope_reshape_and_cache`` for that format, without the RoPE, for callers whose
+    K is already normed and roped (e.g. Qwen3.5's fused Q/K norm + MRoPE).
+
+    - k, v: (T, KH, D), any strides (e.g. views into a packed qkv).
+    - key_cache: uint8 (T_cache, KH, block_size, D // 2 + D // 16): e2m1 pairs shuffled in
+      (16, 16) tiles, then the e4m3 per-16 scales preshuffled in min(128, block_size)-row groups.
+    - value_cache: FP8 e4m3 (T_cache, KH, block_size // 16, D, 16), the shuffled layout.
+    - slot_mapping: (T_slot >= T,) int, page * block_size + row; negative slots are skipped.
+    - k_scale / v_scale: optional 1-element fp32. K is quantized from K / k_scale and V stored as
+      V / v_scale; the attention side then reads k_descale = k_scale (pass None: 1) and
+      v_descale = v_scale.
+    block_size 64, 128 or a multiple of 128; D a power of 2, >= 64.
+    """
+    from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+        _reshape_and_cache_k4v8_kernel,
+    )
+
+    t, kh, d = k.shape
+    assert v.shape == (t, kh, d), f"v {tuple(v.shape)} must match k {tuple(k.shape)}"
+    assert key_cache.dtype == torch.uint8 and key_cache.ndim == 4, (
+        f"A8K4V8 key_cache must be uint8 (T_cache, KH, block_size, D // 2 + D // 16), "
+        f"got {key_cache.dtype} {tuple(key_cache.shape)}"
+    )
+    assert value_cache.dtype == e4m3_dtype and value_cache.ndim == 5, (
+        f"A8K4V8 value_cache must be FP8 (T_cache, KH, block_size // 16, D, 16), "
+        f"got {value_cache.dtype} {tuple(value_cache.shape)}"
+    )
+    t_cache, kh_cache, block_size, d_cache = key_cache.shape
+    t_cache_v, kh_cache_v, slot_chunk_v, d_v, x_size = value_cache.shape
+    assert x_size == 16 // value_cache.element_size() and slot_chunk_v * x_size == block_size
+    assert t_cache == t_cache_v and kh == kh_cache == kh_cache_v and d_v == d
+    assert d >= 64 and d == triton.next_power_of_2(d), f"head size {d} must be a power of 2 >= 64"
+    assert d_cache == d // 2 + d // 16, f"key_cache last dim {d_cache} != {d // 2 + d // 16}"
+    assert block_size >= 64 and (block_size <= 128 or block_size % 128 == 0), (
+        f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
+    )
+    assert key_cache.stride(3) == 1, "key_cache's last dim must be contiguous"
+    (t_slot,) = slot_mapping.shape
+    assert t <= t_slot, f"{t=} tokens but {t_slot=} slots"
+    _LOGGER.info(
+        "RESHAPE_AND_CACHE_K4V8: k=%s v=%s key_cache=%s value_cache=%s",
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
+    )
+    if t == 0:
+        return
+    scale_k = d // 16
+    _reshape_and_cache_k4v8_kernel[(t * kh,)](
+        k,
+        v,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        *k.stride(),
+        *v.stride(),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(3),
+        value_cache.stride(4),
+        value_cache.stride(2),
+        KH=kh,
+        BLOCK_D=d,
+        BLOCK_SIZE=block_size,
+        X_SIZE=x_size,
+        SCALE_K_WIDTH=min(16, triton.next_power_of_2(scale_k)) if scale_k >= 4 else scale_k,
+        SCALE_PRESHUFFLE=min(128, block_size),
+        HAVE_K_SCALE=k_scale is not None,
+        HAVE_V_SCALE=v_scale is not None,
+        num_warps=1,
+    )
+
+
 def fused_qk_rope_cosine_cache_llama(
     q: torch.Tensor,
     k: torch.Tensor,
