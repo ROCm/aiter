@@ -702,7 +702,7 @@ class _CompactDispatch(_Dispatch):
         count, so eager steps (prefill, or any width the warmup never ran)
         reached the JIT inside the serving loop (the first ~100 s of a c512
         run had 250-470 ms prefill steps). This walks every recv bound a
-        fused step can have (<= the S1F max recv, 4096), takes the
+        fused step can have (<= the S1F max recv), takes the
         alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
         """
@@ -710,10 +710,9 @@ class _CompactDispatch(_Dispatch):
             return
         from ..compact_plan import compact_plan_blocks
         from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb
-        from ..s1f_ctl import _S1F_MAX_RECV as _lim
 
         config = self.config
-        limit = min(int(config.max_recv), int(_lim))
+        limit = min(int(config.max_recv), self.fusion.max_recv())
         saved = self._step
         bounds = sorted(set(range(16, limit + 1, 16)) | {1, limit})
         steps = {}
@@ -843,9 +842,9 @@ class _CompactDispatch(_Dispatch):
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
             if plan_s1f:
-                from ..s1f_stage1 import FLAG_M
+                from ..s1f_stage1 import s1f_flag_m
 
-                tile_m = FLAG_M
+                tile_m = s1f_flag_m(align_m)
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,

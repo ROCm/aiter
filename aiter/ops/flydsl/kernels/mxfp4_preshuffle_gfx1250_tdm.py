@@ -1733,11 +1733,13 @@ def build_gemm_a8w4_tdm_task(
                                         cluster_sync()
 
                     dispatch_wave_job(steady_post)
+                    if const_expr(item_hooks is not None):
+                        item_hooks[0]["drain_start"]()
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
                         buf = kt % num_buffers
                         has_next = next_stage_on and j + 1 < num_buffers
-                        pipeline_fence(
+                        stage_fence(
                             outstanding=TDM_PER
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )

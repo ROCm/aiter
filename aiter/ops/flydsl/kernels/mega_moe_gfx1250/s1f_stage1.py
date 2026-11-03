@@ -141,8 +141,16 @@ MB_REC_B = 128
 MB_SM_B = 128
 #: Rows of a flag tile, the plan's tile: the unit of the producer's pieces,
 #: of tile_info and of the per-source flags, whatever the GEMM1 tile_m (a
-#: multiple of it). A piece then has at most FLAG_M / run_rows = 8 runs.
+#: multiple of it; a smaller tile_m is its own flag tile, see s1f_flag_m).
+#: A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+
+
+def s1f_flag_m(tile_m: int) -> int:
+    """Flag tile rows for a GEMM1 tile: FLAG_M, or the whole tile below it."""
+    return min(int(tile_m), FLAG_M)
+
+
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
 #: has at most FLAG_M / run_rows = 8 runs, so a block of >= 8 runs always holds
 #: a piece start; the claimer owns the pieces that START in its block and
@@ -610,10 +618,11 @@ def make_s1f_stage1(
     run_hdr = compact_run_header_dwords(npes=npes, experts_per_rank=epr)
     run_cap = compact_run_capacity(max_routes=max_routes)
     # tile_info words and flags are per flag tile, GEMM1 items per m-tile.
-    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FLAG_M)
+    FM = s1f_flag_m(tile_m)
+    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FM)
     m_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
-    SUB = int(tile_m) // FLAG_M
-    FSH = FLAG_M.bit_length() - 1
+    SUB = int(tile_m) // FM
+    FSH = FM.bit_length() - 1
     SPAN = int(workers if ticket_span is None else ticket_span)
     if SPAN % int(workers):
         raise ValueError(f"ticket_span={SPAN} is not a multiple of workers={workers}")
@@ -633,10 +642,10 @@ def make_s1f_stage1(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
         )
     B1 = GM * NT
-    # Runs per W1 claim. A piece has at most FLAG_M / R = 8 runs, and W1 reads
+    # Runs per W1 claim. A piece has at most FM / R runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
     RBK = int(block_runs)
-    assert 1 <= RBK and RBK + FLAG_M // R <= WAVE - 1, RBK
+    assert 1 <= RBK and RBK + FM // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
     # Storer w owns the ring slots s % 2 == w and blocks on its oldest
     # store only with all of them in flight (at most 3 TDM ops per wave):
@@ -651,9 +660,9 @@ def make_s1f_stage1(
         raise ValueError("the producer gathers with 16-bit token indices")
     if R != 8 or npes > 16:
         raise ValueError("the producer is laid out for 8-row runs")
-    if int(tile_m) % FLAG_M or not 1 <= SUB <= 4:
+    if FM % R or FM & (FM - 1) or int(tile_m) % FM or not 1 <= SUB <= 4:
         raise ValueError(
-            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FLAG_M} rows"
+            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
     if SUB > 1 and not POLL:
         raise ValueError(
@@ -728,6 +737,7 @@ def make_s1f_stage1(
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
+        g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
         lds_holder = [None]
         ready_holder = [None]
         meta_holder = [None]
@@ -740,7 +750,7 @@ def make_s1f_stage1(
             m_warp=1,
             n_warp=4,
             out_is_f16=0,
-            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+            num_buffers=g1_buffers,
             a_is_fp4=1,
             n_experts=epr,
             stage1_act=stage1_act,
@@ -774,7 +784,8 @@ def make_s1f_stage1(
             tile_meta=meta_holder,
             item_hooks=hooks_holder,
             raw_drain=True,
-            defer_c_wait=True,
+            # Needs the mid-loop fence the GEMM body only has above 32 rows.
+            defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
         )
         if block != 4 * WAVE:
