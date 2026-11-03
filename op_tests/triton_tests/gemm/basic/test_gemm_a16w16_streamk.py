@@ -6,10 +6,15 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16_streamk import (
+    _SPLIT_FLOOR_M,
+    _SPLIT_FLOOR_N,
     _SUPPORTED_ARCHS,
+    _plan_k_pipeline,
+    _plan_tiles,
     gemm_a16w16_streamk,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 
 def is_supported():
@@ -32,6 +37,26 @@ def generate_inputs(M, N, K, dtype, layout="TN"):
     return x, w
 
 
+def assert_matches_torch(out, x, w):
+    """One tolerance for every correctness test, so they cannot drift apart."""
+    expect = F.linear(x.float(), w.float(), bias=None).to(out.dtype)
+    torch.testing.assert_close(out, expect, atol=1e-1, rtol=1e-2)
+
+
+def plan_for(M, N, K):
+    """The tile plan the wrapper will really use for this shape."""
+    config, _ = get_gemm_config("GEMM-A16W16-STREAMK", M, N, K, backend="gluon")
+    plan = _plan_tiles(
+        M,
+        N,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["CTAS_M"],
+        config["CTAS_N"],
+    )
+    return config, plan
+
+
 def get_x_vals():
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 8)]
     x_vals += [(64, 4096, 4096), (128, 4096, 4096), (512, 4096, 4096)]
@@ -39,8 +64,25 @@ def get_x_vals():
     x_vals += [(4096, 2880, 4096)]  # N not a multiple of the cluster tile
     x_vals += [(3000, 2048, 2048)]  # M not a multiple of the cluster tile
     x_vals += [(3000, 2880, 2048)]  # M and N both ragged
+    x_vals += get_small_k_x_vals()
     x_vals += get_remainder_x_vals()
     return x_vals
+
+
+def get_small_k_x_vals():
+    """Shapes with one K tile only, where the steady loop of the pipeline is empty.
+
+    NUM_BUFFERS has a floor of 2, so `cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)` is 0 here. The
+    kernel must not then state that the trip count is above 0. It did, and the UB miscompiled
+    the kernel: 64x64x256 returned NaN and 64x64x32 returned garbage.
+    """
+    return [
+        (64, 64, 32),  # a part K tile, below one wmma K step
+        (64, 64, 128),  # a half K tile, which also takes the KTAIL drain
+        (64, 64, 256),  # exactly one K tile
+        (256, 256, 64),
+        (1024, 1024, 128),
+    ]
 
 
 def get_remainder_x_vals():
@@ -68,10 +110,7 @@ def get_remainder_x_vals():
 def test_gemm_a16w16_streamk(M: int, N: int, K: int, layout):
     x, w = generate_inputs(M, N, K, torch.bfloat16, layout=layout)
 
-    out = gemm_a16w16_streamk(x, w)
-    torch_out = F.linear(x, w, bias=None)
-
-    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+    assert_matches_torch(gemm_a16w16_streamk(x, w), x, w)
 
 
 @pytest.mark.parametrize("M, N, K", [(2048, 2048, 2048), (3000, 2880, 2048)])
@@ -89,8 +128,7 @@ def test_gemm_a16w16_streamk_dtypes(M, N, K, in_dtype, out_dtype, layout):
     out = gemm_a16w16_streamk(x, w, dtype=out_dtype)
 
     assert out.dtype == (out_dtype or in_dtype)
-    torch_out = F.linear(x.float(), w.float(), bias=None).to(out.dtype)
-    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+    assert_matches_torch(out, x, w)
 
 
 @pytest.mark.parametrize("M, N, K", [(2048, 2048, 2048)])
@@ -102,7 +140,51 @@ def test_gemm_a16w16_streamk_out_tensor(M: int, N: int, K: int):
     out = gemm_a16w16_streamk(x, w, y=y)
 
     assert out.data_ptr() == y.data_ptr()
-    torch.testing.assert_close(y, F.linear(x, w, bias=None), atol=1e-1, rtol=1e-2)
+    assert_matches_torch(y, x, w)
+
+
+def test_gemm_a16w16_streamk_rejects_bad_inputs():
+    """The wrapper must refuse what the kernel cannot do, and refuse it before the launch.
+
+    A y that is too small is the important one: the kernel writes a whole (M, N) tile grid, so
+    it goes past the end of the allocation instead of failing.
+    """
+    M = N = K = 512
+    x, w = generate_inputs(M, N, K, torch.bfloat16)
+
+    for bad_y in (
+        torch.empty((1, N), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((M, 1), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((M, N), dtype=torch.float32, device="cuda"),
+        torch.empty((N, M), dtype=torch.bfloat16, device="cuda").T,
+    ):
+        with pytest.raises(AssertionError):
+            gemm_a16w16_streamk(x, w, y=bad_y)
+
+    with pytest.raises(AssertionError):
+        gemm_a16w16_streamk(x.float(), w.float())
+    with pytest.raises(AssertionError):
+        gemm_a16w16_streamk(x, w, dtype=torch.float64)
+    with pytest.raises(AssertionError):
+        gemm_a16w16_streamk(x, w.half())
+
+
+@pytest.mark.parametrize("M, N, K", get_small_k_x_vals())
+def test_gemm_a16w16_streamk_small_k_empties_the_steady_loop(M: int, N: int, K: int):
+    """Each small-K shape must really leave the steady loop empty.
+
+    These shapes exist to cover the empty steady loop, where the kernel must not state that the
+    trip count is above 0. Their result is correct on any path, so without this assert a config
+    change can take them off that path and the coverage goes away unnoticed.
+    """
+    config, _ = plan_for(M, N, K)
+    _, _, steady_nonempty = _plan_k_pipeline(
+        K, config["BLOCK_K"], config["NUM_BUFFERS"]
+    )
+
+    assert (
+        not steady_nonempty
+    ), f"K={K} still fills the steady loop, so it covers nothing"
 
 
 @pytest.mark.parametrize("M, N, K", get_remainder_x_vals())
@@ -113,22 +195,7 @@ def test_gemm_a16w16_streamk_remainder_runs(M: int, N: int, K: int):
     computes every whole tile. A config change can therefore take the remainder out of the test
     coverage and no other test fails. This test holds the coverage.
     """
-    import triton
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w16_streamk import _pick_split
-    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-    config, _ = get_gemm_config("GEMM-A16W16-STREAMK", M, N, K, backend="gluon")
-    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
-    CTAS_M, CTAS_N = config["CTAS_M"], config["CTAS_N"]
-
-    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    num_cus = torch.cuda.get_device_properties(0).multi_processor_count
-    num_sms = min(num_cus // (CTAS_M * CTAS_N), num_tiles)
-    streamk_tiles = 0 if num_tiles <= num_sms else num_tiles % num_sms
-    split_m, split_n = _pick_split(
-        streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N
-    )
+    config, (num_tiles, num_sms, streamk_tiles, split_m, split_n) = plan_for(M, N, K)
 
     assert (
         streamk_tiles > 0
@@ -138,8 +205,10 @@ def test_gemm_a16w16_streamk_remainder_runs(M: int, N: int, K: int):
     assert streamk_tiles * split_m * split_n <= num_sms
     # The N floor is a measured cliff, not a layout limit: a per-CTA N of 32 makes a bf16 row
     # of 64 bytes, and that measured -11.2% against 64 at an equal area and sub-tile count.
-    assert BLOCK_N // split_n // CTAS_N >= 64, "the sub-tile is too narrow on N"
-    assert BLOCK_M // split_m // CTAS_M >= 32, "the sub-tile is too short on M"
+    per_cta_m = config["BLOCK_M"] // split_m // config["CTAS_M"]
+    per_cta_n = config["BLOCK_N"] // split_n // config["CTAS_N"]
+    assert per_cta_n >= _SPLIT_FLOOR_N, f"sub-tile too narrow on N: {per_cta_n}"
+    assert per_cta_m >= _SPLIT_FLOOR_M, f"sub-tile too short on M: {per_cta_m}"
 
 
 @pytest.mark.parametrize(

@@ -78,7 +78,7 @@ def main():
         "--layout",
         default="TN",
         choices=["TN", "TT"],
-        help="TN gives an N-major weight, TT a K-major one",
+        help="TN gives a K-major weight, TT an N-major one",
     )
     parser.add_argument(
         "--shape",

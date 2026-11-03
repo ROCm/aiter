@@ -30,6 +30,8 @@ _GLUON_REPR_KEYS = [
     "CTAS_N",
     "TRANSPOSE_B",
     "KTAIL",
+    "STEADY_NONEMPTY",
+    "C_OFFSET_64",
     "STREAMK_TILES",
     "SPLIT_M",
     "SPLIT_N",
@@ -73,6 +75,8 @@ def gemm_a16w16_streamk_kernel_(
     CTAS_N: gl.constexpr = 1,
     GROUP_SIZE_M: gl.constexpr = 2,
     KTAIL: gl.constexpr = 0,
+    STEADY_NONEMPTY: gl.constexpr = 1,
+    C_OFFSET_64: gl.constexpr = 0,
     STREAMK_TILES: gl.constexpr = 0,
     SPLIT_M: gl.constexpr = 1,
     SPLIT_N: gl.constexpr = 1,
@@ -125,9 +129,12 @@ def gemm_a16w16_streamk_kernel_(
         b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout
     )
 
-    # Trip-count hint: the host guarantees cdiv(K, BLOCK_K) >= NUM_BUFFERS, so the steady loop runs
-    # at least once and the backend can drop the loop guard.
-    gl.assume(gl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1) > 0)
+    # Trip-count hint, so the backend can drop the guard of the steady loop. The host sets the
+    # gate: K can give only one K tile, and NUM_BUFFERS has a floor of 2, so the steady loop is
+    # then empty. Without the gate this states 0 > 0, and that UB miscompiles the whole kernel:
+    # 64x64x256 returned NaN and 64x64x32 returned garbage.
+    if STEADY_NONEMPTY:
+        gl.assume(gl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1) > 0)
 
     # wmma gives an fp32 result, so ANY 2-byte C accumulates in fp32 and narrows at store time.
     # Testing only bfloat16 here leaves fp16 with an fp16 accumulator, which fails to compile.
@@ -195,6 +202,7 @@ def gemm_a16w16_streamk_kernel_(
             TRANSPOSE_B,
             ACC_DTYPE,
             C_ALIAS_B,
+            C_OFFSET_64,
             KTAIL,
             TOKENS,
         )
@@ -287,6 +295,7 @@ def gemm_a16w16_streamk_kernel_(
                 TRANSPOSE_B,
                 ACC_DTYPE,
                 C_ALIAS_R,
+                C_OFFSET_64,
                 KTAIL,
                 TOKENS,
             )
