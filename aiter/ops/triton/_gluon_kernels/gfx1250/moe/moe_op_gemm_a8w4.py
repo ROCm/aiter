@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
 )
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
