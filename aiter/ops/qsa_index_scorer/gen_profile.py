@@ -45,7 +45,10 @@ TOOL_VERSION = 1
 GOLDEN_REVISION = "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8"
 GOLDEN_RTOL = 1e-4
 GOLDEN_ATOL = 1e-4
-KERNEL_GIT_REV = "a78c285c"
+KERNEL_GIT_REV = "82c4dec5"
+#: Profiled kernel (champion 82c4dec5). `emit` refuses any other source so a
+#: kernel change can never silently inherit evidence.
+KERNEL_SHA256 = "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93"
 E2E_WIDTH = 16384
 E2E_PAGES = 738964
 ARCH, CU = "gfx1250", 256
@@ -85,9 +88,23 @@ def cell_name(e: dict) -> str:
             f"_c{e['columns']}_w{e['table_width']}")
 
 
-#: Phase-1 GPU golden evidence for the champion kernel (a78c285c commit body:
+#: Phase-1 GPU golden evidence, recorded on kernel a78c285c (a78c285c commit body:
 #: "GPU (a08-1 GPU3, gpu-lock + idle gate): correctness 22/22 default").
 #: cell -> run_gpu.py correctness case names that exercised exactly that row.
+#: It carries over to 82c4dec5 only for bf16 rows: every bf16 kernel is ISA
+#: byte-identical a78c285c -> 82c4dec5 (BF16_ISA_IDENTITY). Every fp8 kernel
+#: changed (intrinsic pk8 converter, decode-group w64, draft qpre) -> fp8 rows are
+#: `pending` until the root's GPU `gen_profile check` restamps them.
+PHASE1_KERNEL_SHA256 = "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
+PHASE1_GIT_REV = "a78c285c"
+BF16_ISA_IDENTITY = (
+    "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md "
+    "isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs "
+    "a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled "
+    "bf16 rows")
+STALE_FP8_NOTE = ("82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; "
+                  "decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c "
+                  "does not apply -> run `gen_profile check` on GPU")
 PHASE1_EVIDENCE = {
     "decode_bf16_r64q16_c65536_w16384": ["I1_e2e_decode_bf16"],
     "decode_fp8_r64q16_c65536_w16384": ["I2_e2e_decode_fp8"],
@@ -110,6 +127,8 @@ PHASE1_EVIDENCE = {
 }
 PHASE1_SOURCE = ("phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c "
                  "(a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)")
+EVIDENCE_NOTE = ("bf16 rows: Phase-1 GPU evidence on a78c285c carried by ISA identity; "
+                 "fp8 rows: pending fresh GPU evidence on 82c4dec5")
 
 
 def make_row(e: dict, evidence: dict | None = None) -> dict:
@@ -132,10 +151,18 @@ def make_row(e: dict, evidence: dict | None = None) -> dict:
         "generated_by": f"{TOOL}@{TOOL_VERSION}",
         "notes": e.get("notes", ""),
     }
-    if evidence and cell in evidence:
+    if evidence and cell in evidence and e["cache_dtype"] == "bf16":
         row["golden"] = {"status": "pass", "source": PHASE1_SOURCE, "cases": evidence[cell],
+                         "kernel_sha256": PHASE1_KERNEL_SHA256, "kernel_git_rev": PHASE1_GIT_REV,
+                         "isa_identity": BF16_ISA_IDENTITY,
                          "comparator": "qsa_golden.compare_logits",
                          "rtol": GOLDEN_RTOL, "atol": GOLDEN_ATOL}
+    elif evidence and cell in evidence:
+        row["golden"] = {"status": "pending", "stale_cases": evidence[cell],
+                         "stale_kernel_sha256": PHASE1_KERNEL_SHA256,
+                         "stale_kernel_git_rev": PHASE1_GIT_REV}
+        if not row["notes"]:
+            row["notes"] = STALE_FP8_NOTE
     elif not row["notes"]:
         row["notes"] = "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
     row["sig"] = P.row_signature(row)
@@ -149,6 +176,10 @@ def _kernel_sha() -> str:
 
 def build_profile(plan: list[dict], name: str = P.DEFAULT_PROFILE,
                   evidence: dict | None = PHASE1_EVIDENCE) -> dict:
+    sha = _kernel_sha()
+    if sha != KERNEL_SHA256:
+        raise ValueError(f"kernel source sha256 {sha} != profiled {KERNEL_SHA256} "
+                         f"({KERNEL_GIT_REV}): update KERNEL_SHA256/evidence for the new kernel")
     rows, seen = [], set()
     for e in plan:
         r = make_row(e, evidence)
@@ -162,7 +193,7 @@ def build_profile(plan: list[dict], name: str = P.DEFAULT_PROFILE,
         "profile": name,
         "api_version": P.API_VERSION,
         "backend": P.BACKEND,
-        "kernel": {"module": P.KERNEL_MODULE, "path": P.KERNEL_REL, "sha256": _kernel_sha(),
+        "kernel": {"module": P.KERNEL_MODULE, "path": P.KERNEL_REL, "sha256": sha,
                    "git_rev": KERNEL_GIT_REV, "toolchain": "flydsl 0.3.3 (gfx1250-atom-20261015)"},
         "kernel_env": dict(P.KERNEL_ENV_DEFAULTS),
         "contract": {"index_heads": P.INDEX_HEADS, "head_dim": P.HEAD_DIM,
@@ -176,7 +207,7 @@ def build_profile(plan: list[dict], name: str = P.DEFAULT_PROFILE,
                                     "outside-mask bit-identical (-inf)"]},
         "generated_by": {"tool": TOOL, "version": TOOL_VERSION, "mode": "emit",
                          "plan": "builtin (target buckets + Phase-1 GPU suite shapes)",
-                         "evidence": PHASE1_SOURCE,
+                         "evidence": PHASE1_SOURCE, "evidence_policy": EVIDENCE_NOTE,
                          "note": "exact rows only; pending rows are never selected at runtime"},
         "rows": rows,
     }
@@ -217,10 +248,18 @@ def verify(path: str, plan: list[dict] | None = None) -> list[str]:
     for sig in sorted(set(ra) & set(rb)):
         if ra[sig] != rb[sig]:
             errs.append(f"row {ra[sig]['cell']} differs")
+    ksha = have.get("kernel", {}).get("sha256")
     for r in have.get("rows", []):
-        st = r["golden"]["status"]
-        if st == "pass" and not (r["golden"].get("cases") or r["golden"].get("checked")):
+        g = r["golden"]
+        if g["status"] != "pass":
+            continue
+        if not (g.get("cases") or g.get("checked")):
             errs.append(f"row {r['cell']} is 'pass' without evidence")
+        if not g.get("kernel_sha256"):
+            errs.append(f"row {r['cell']} is 'pass' without the verified kernel_sha256")
+        elif g["kernel_sha256"] != ksha and not g.get("isa_identity"):
+            errs.append(f"row {r['cell']} 'pass' on kernel {g['kernel_sha256'][:12]} != {str(ksha)[:12]} "
+                        "without isa_identity")
     return errs
 
 
@@ -316,8 +355,12 @@ def check(path: str, out: str | None, cells: set | None) -> int:
                          "kernel_sha256": data["kernel"]["sha256"], "golden_revision": GOLDEN_REVISION,
                          "comparator": "qsa_golden.compare_logits",
                          "rtol": GOLDEN_RTOL, "atol": GOLDEN_ATOL}
-        if prev.get("cases"):
-            row["golden"]["phase1_cases"] = prev["cases"]
+        if prev.get("cases") or prev.get("stale_cases"):
+            row["golden"]["phase1_cases"] = prev.get("cases") or prev.get("stale_cases")
+            row["golden"]["phase1_kernel_sha256"] = (prev.get("kernel_sha256")
+                                                     or prev.get("stale_kernel_sha256"))
+        if ok and row.get("notes") == STALE_FP8_NOTE:
+            row["notes"] = ""
         print(f"[{'PASS' if ok else 'FAIL'}] {row['cell']} {json.dumps(rec)[:400]}", flush=True)
         torch.cuda.empty_cache()
     data["generated_by"] = dict(data["generated_by"], mode="check", checked_at=stamp)

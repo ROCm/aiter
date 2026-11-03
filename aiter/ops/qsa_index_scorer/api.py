@@ -172,15 +172,21 @@ def predict_route(K, cache_dtype: str, rows: int, requests: int, columns: int,
                   kv_ptr: int) -> tuple[str, dict]:
     """(vid, params) the kernel wrapper launches for this call (default-path routing)."""
     is_fp8 = cache_dtype == "fp8"
+    pk8 = "asm" if getattr(K, "_FP8_CVT_ASM", False) else "intrin"
     if K._DRAFT_PATH:
         d = K.draft_route(rows, requests, is_fp8, kv_ptr)
         if d is not None:
-            return "qsa.page4.draft.v1", {"k_load": d[0], "wave_cols": int(d[1])}
+            params = {"k_load": d[0], "wave_cols": int(d[1])}
+            if is_fp8:
+                params.update(sched=K.draft_fp8_sched(), pk8=pk8)
+            return "qsa.page4.draft.v1", params
     if K._DECODE_GROUP != "0":
         w = K.decode_group_route(rows, requests, is_fp8, kv_ptr)
         if w is not None:
-            return "qsa.page4.decg.v1", {"k_load": "tdm", "wave_cols": int(w),
-                                         "barrier": False}
+            params = {"k_load": "tdm", "wave_cols": int(w), "barrier": False}
+            if is_fp8:
+                params.update(sched=K.decg_fp8_sched(), pk8=pk8)
+            return "qsa.page4.decg.v1", params
     if not is_fp8 and K._BF16_PATH == "wmma":
         rpb = K.wmma_bf16_rows_per_block(rows, requests)
         k_load = K._resolve_bf16_k_load(rpb)
@@ -201,8 +207,8 @@ def predict_route(K, cache_dtype: str, rows: int, requests: int, columns: int,
             rpb, k_load = 16, "raw"
         if rpb == 32:
             return "qsa.page4.r32_fp8.v1", {"k_load": k_load, "rows_per_block": 32,
-                                            "cvt": K._FP8_CVT}
-        return "qsa.page4.r16_fp8.v1", {"k_load": k_load, "rows_per_block": 16}
+                                            "cvt": K._FP8_CVT, "pk8": pk8}
+        return "qsa.page4.r16_fp8.v1", {"k_load": k_load, "rows_per_block": 16, "pk8": pk8}
     return "qsa.page4.scalar.v0", {}
 
 

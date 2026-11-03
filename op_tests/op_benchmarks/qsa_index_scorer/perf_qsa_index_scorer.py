@@ -76,6 +76,8 @@ def load_api():
 
 
 PKG = load_api()
+#: profile name or JSON path (e.g. the GPU-restamped `gen_profile check --out` file)
+PROFILE = os.environ.get("QSA_TEST_PROFILE") or PKG.DEFAULT_PROFILE
 ITERS = int(os.environ.get("PT_ITERS", "51"))
 ROT = int(os.environ.get("PT_ROT", "4"))
 CASES = [  # name, regime, rows, requests, max_ctx, fmt  (integration brief section 5)
@@ -96,7 +98,7 @@ CASES = [  # name, regime, rows, requests, max_ctx, fmt  (integration brief sect
 
 def fused(q, kc, pt, t2r, qp, cl, sc, cols):
     return PKG.qsa_paged_mqa_logits(q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc,
-                                    profile=PKG.DEFAULT_PROFILE)
+                                    profile=PROFILE)
 
 
 def make_native(atom):
@@ -137,11 +139,11 @@ def decide_host_us(args, n=2000):
     q, kc, pt, t2r, qp, cl, sc, cols = args
     for _ in range(50):
         PKG.decide(q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc,
-                   profile=PKG.DEFAULT_PROFILE)
+                   profile=PROFILE)
     t0 = time.perf_counter()
     for _ in range(n):
         PKG.decide(q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc,
-                   profile=PKG.DEFAULT_PROFILE)
+                   profile=PROFILE)
     return (time.perf_counter() - t0) * 1e6 / n
 
 
@@ -150,13 +152,16 @@ def main(argv=None) -> int:
     ap.add_argument("--cases", default="")
     ap.add_argument("--legs", type=int, default=3)
     ap.add_argument("--json")
+    ap.add_argument("--profile", help="profile name or JSON path (default $QSA_TEST_PROFILE or the default)")
     a = ap.parse_args(argv)
+    global PROFILE
+    PROFILE = a.profile or PROFILE
     atom = QB.load_atom(os.path.join(GD, "atom_impl"))
     native = make_native(atom)
     props = torch.cuda.get_device_properties(0)
     meta = {"iters": ITERS, "rotate": ROT, "legs": a.legs, "test_common": TC_SRC,
             "device": f"{props.gcnArchName} cu={props.multi_processor_count}",
-            "atom_sha256": atom["sha256"], "profile": PKG.DEFAULT_PROFILE,
+            "atom_sha256": atom["sha256"], "profile": PROFILE, "kernel_sha256": PKG.api._kernel_sha256(),
             "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(("QSA_", "ATOM_"))}}
     print(json.dumps(meta), flush=True)
     sel = [s for s in a.cases.split(",") if s]
@@ -171,7 +176,7 @@ def main(argv=None) -> int:
         args = (d["q"], d["compressed_k_cache"], d["page_table"], d["token_to_request"],
                 d["query_positions"], d["context_lens"], d["compressed_k_scale"], cols)
         dec = PKG.decide(*args[:6], 4, None, cols, None, False, args[6],
-                         profile=PKG.DEFAULT_PROFILE)
+                         profile=PROFILE)
         rec = {"case": name, "decision": dec.reason.value, "cell": dec.cell, "vid": dec.vid,
                "fused_replay_us": [], "native_replay_us": [], "fused_perftest_us": [],
                "native_perftest_us": []}

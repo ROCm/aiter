@@ -185,21 +185,69 @@ class ProfileFormat(unittest.TestCase):
             sha = hashlib.sha256(fh.read()).hexdigest()
         self.assertEqual(self.data["kernel"]["sha256"], sha,
                          "kernel changed: re-run gen_profile emit + GPU check")
-        self.assertEqual(sha, "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-                         "kernel source differs from champion a78c285c (ISA identity)")
+        self.assertEqual(sha, "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+                         "kernel source differs from champion 82c4dec5 (ISA identity)")
+        self.assertEqual(self.data["kernel"]["git_rev"], "82c4dec5")
 
     def test_rows(self):
+        ksha = self.data["kernel"]["sha256"]
         for r in self.data["rows"]:
             self.assertEqual(r["sig"], PR.row_signature(r))
             self.assertEqual((r["vid"], r["params"]),
                              PR.expected_variant(r["cache_dtype"], r["regime"], r["columns"]))
             self.assertEqual(PR.regime_of(r["rows"]["min"], r["requests"]["min"]), r["regime"])
             self.assertIn(r["golden"]["status"], ("pass", "pending"))
-            if r["golden"]["status"] == "pass":
-                self.assertTrue(r["golden"].get("cases") or r["golden"].get("checked"))
+            g = r["golden"]
+            if g["status"] == "pass":
+                self.assertTrue(g.get("cases") or g.get("checked"))
+                # evidence names the kernel it was verified on; older kernel => ISA identity
+                self.assertTrue(g.get("kernel_sha256"), r["cell"])
+                if g["kernel_sha256"] != ksha:
+                    self.assertTrue(g.get("isa_identity"), r["cell"])
+                    self.assertEqual(r["cache_dtype"], "bf16", r["cell"])
             for key in ("arch", "cu", "cache_dtype", "columns", "table_width", "vid", "params",
                         "cell", "generated_by", "notes"):
                 self.assertIn(key, r)
+
+    def test_kernel_change_evidence_policy(self):
+        """82c4dec5: bf16 Phase-1 rows carried by ISA identity; every fp8 row pending until
+        a GPU `gen_profile check` on this kernel restamps it (then: pass on this sha)."""
+        old = "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
+        ksha = self.data["kernel"]["sha256"]
+        n_bf16 = 0
+        for r in self.data["rows"]:
+            g = r["golden"]
+            if g["status"] == "pass" and g["kernel_sha256"] == ksha:
+                self.assertTrue(g.get("checked"), r["cell"])         # restamped on GPU
+                n_bf16 += r["cache_dtype"] == "bf16"
+            elif r["cache_dtype"] == "fp8":
+                self.assertEqual(g["status"], "pending", r["cell"])  # never inherits old evidence
+                if g.get("stale_cases"):
+                    self.assertEqual(g["stale_kernel_sha256"], old)
+            elif g["status"] == "pass":
+                self.assertEqual((g["kernel_sha256"], g["kernel_git_rev"]), (old, "a78c285c"))
+                self.assertIn("byte-identical", g["isa_identity"])
+                n_bf16 += 1
+        self.assertGreaterEqual(n_bf16, 9)
+        fp8 = {r["cell"]: r for r in self.data["rows"] if r["cache_dtype"] == "fp8"}
+        self.assertEqual(fp8["decode_fp8_r64q16_c65536_w16384"]["params"],
+                         {"k_load": "tdm", "wave_cols": 64, "barrier": False, "sched": "base",
+                          "pk8": "intrin"})
+        self.assertEqual(fp8["draft_fp8_r16q16_c65536_w16384"]["params"],
+                         {"k_load": "tdm", "wave_cols": 32, "sched": "qpre", "pk8": "intrin"})
+        # a pass on an older kernel without an ISA-identity record is rejected
+        with _tmpdir() as td:
+            d = json.loads(json.dumps(self.data)); d["profile"] = "qsa_bad_v1"
+            r0 = next(r for r in d["rows"] if r["golden"]["status"] == "pass")
+            del r0["golden"]["isa_identity"]
+            with self.assertRaises(PR.ProfileError) as cm:
+                PR.load_profile(self._write(td, d), use_cache=False)
+            self.assertIn("isa_identity", str(cm.exception))
+            d = json.loads(json.dumps(self.data)); d["profile"] = "qsa_bad_v1"
+            r0 = next(r for r in d["rows"] if r["cache_dtype"] == "fp8")
+            r0["golden"] = {"status": "pass", "cases": ["x"]}            # no kernel sha
+            with self.assertRaises(PR.ProfileError):
+                PR.load_profile(self._write(td, d), use_cache=False)
 
     def test_target_buckets_present(self):
         cells = {r["cell"] for r in self.data["rows"]}
@@ -228,7 +276,11 @@ class ProfileFormat(unittest.TestCase):
             out = os.path.join(td, "qsa_page4_gfx1250_v1.json")
             self.assertEqual(gen.main(["emit", "--out", out]), 0)
             with open(out, encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh), self.data)
+                emitted = json.load(fh)
+            # identical modulo the fields a GPU `check` restamps (golden / notes / generated_by)
+            self.assertEqual(gen._strip_dynamic(emitted), gen._strip_dynamic(self.data))
+            if self.data["generated_by"].get("mode") == "emit":
+                self.assertEqual(emitted, self.data)
             cap = os.path.join(td, "cap.json")
             with open(cap, "w") as fh:
                 json.dump([{"cache_dtype": "bf16", "rows": 128, "requests": 32, "columns": 16384,
@@ -291,18 +343,31 @@ class ProfileFormat(unittest.TestCase):
         ignore = {"QSA_TRACE_ROWS_PER_BLOCK"}
         self.assertEqual(set(found) - ignore, set(PR.KERNEL_ENV_DEFAULTS))
         for key, val in PR.KERNEL_ENV_DEFAULTS.items():
-            want = "_BF16_K_LOAD" if key == "QSA_FP8_K_LOAD" else repr(val)
+            sym = PR.KERNEL_ENV_SYMBOLIC_DEFAULTS.get(key)
+            want = sym if sym else repr(val)
             self.assertEqual(found[key], {want}, key)
+            if sym and key != "QSA_FP8_K_LOAD":
+                self.assertEqual(getattr(K, sym), val, key)   # the constant's value is pinned
         # the env snapshot of the injected (clean-env) kernel matches its resolved switches
         self.assertEqual((K._DECODE_GROUP, K._DECODE_GROUP_COLS, K._DRAFT_PATH, K._ACCESS,
                           K._BF16_K_LOAD, K._FP8_K_LOAD, K.TDM_PERSIST, K.TDM_PERSIST_CHUNKS,
-                          K.TDM_R16_NOBAR, K._BF16_R64, K._FP8_CVT, K.R16_TDM_COLS),
-                         ("all", 32, True, "raw", "auto", "auto", True, 8, True, False,
-                          "fast", 32))
+                          K.TDM_R16_NOBAR, K._BF16_R64, K._FP8_CVT, K.R16_TDM_COLS,
+                          K._FP8_CVT_ASM, K.draft_fp8_sched(), K.decg_fp8_sched(),
+                          K._DECODE_GROUP_AUTO_COLS),
+                         ("all", None, True, "raw", "auto", "auto", True, 8, True, False,
+                          "fast", 32, False, "qpre", "base", {False: 32, True: 64}))
+        self.assertEqual(PR.DECG_WAVE_COLS, {"bf16": K._DECODE_GROUP_AUTO_COLS[False],
+                                             "fp8": K._DECODE_GROUP_AUTO_COLS[True]})
 
     def test_effective_env_inheritance(self):
         e = PR.effective_kernel_env({"QSA_BF16_K_LOAD": "RAW"})
         self.assertEqual((e["QSA_BF16_K_LOAD"], e["QSA_FP8_K_LOAD"]), ("raw", "raw"))
+        e = PR.effective_kernel_env({"QSA_DECODE_GROUP_COLS": " AUTO ", "QSA_DRAFT_FP8_SCHED": "QPRE",
+                                     "QSA_DECG_FP8_SCHED": "Base"})
+        self.assertEqual(e, PR.KERNEL_ENV_DEFAULTS)   # kernel lower()s these: same build
+        for key, val in (("QSA_FP8_CVT_ASM", "1"), ("QSA_DECODE_GROUP_COLS", "32"),
+                         ("QSA_DRAFT_FP8_SCHED", "kpipe"), ("QSA_DECG_FP8_SCHED", "kpipe")):
+            self.assertNotEqual(PR.effective_kernel_env({key: val})[key], PR.KERNEL_ENV_DEFAULTS[key])
         self.assertEqual(PR.effective_kernel_env({}), PR.KERNEL_ENV_DEFAULTS)
 
 
@@ -532,8 +597,26 @@ class Reasons(Env):
         with mock.patch.object(API, "_KERNEL", None), \
                 mock.patch.object(API, "_load_kernel", side_effect=ImportError("no flydsl")):
             self.assertReason(call_args(), "kernel_unavailable")
+        for key, val in (("QSA_FP8_CVT_ASM", "1"), ("QSA_DRAFT_FP8_SCHED", "kpipe"),
+                         ("QSA_DECG_FP8_SCHED", "kpipe"), ("QSA_DECODE_GROUP_COLS", "32")):
+            env = dict(PR.effective_kernel_env(_CLEAN), **{key: val})
+            with mock.patch.object(API, "_KERNEL_ENV", env):
+                d = self.assertReason(call_args(fmt="fp8"), "kernel_env_mismatch")
+                self.assertIn(key, d.detail)
         with mock.patch.object(K, "decode_group_route", lambda *a: 64):
-            self.assertReason(call_args(), "route_mismatch")
+            self.assertReason(call_args(), "route_mismatch")          # bf16 profiled w32
+        # fp8 rows: w64 + sched base + intrinsic pk8 are part of the row identity
+        fp8 = call_args(fmt="fp8")
+        self.assertTrue(self.decide(fp8, allow_unverified=True).ok)
+        for patch in (mock.patch.object(K, "decode_group_route", lambda *a: 32),
+                      mock.patch.object(K, "decg_fp8_sched", lambda: "kpipe"),
+                      mock.patch.object(K, "_FP8_CVT_ASM", True)):
+            with patch:
+                self.assertReason(fp8, "route_mismatch", allow_unverified=True)
+        draft8 = call_args(rows=16, requests=16, fmt="fp8")
+        self.assertTrue(self.decide(draft8, allow_unverified=True).ok)
+        with mock.patch.object(K, "draft_fp8_sched", lambda: "base"):
+            self.assertReason(draft8, "route_mismatch", allow_unverified=True)
 
     def test_coverage_reasons(self):
         self.assertReason(call_args(rows=6, requests=1), "rows_rule_uncovered")       # r16 tail
@@ -542,8 +625,29 @@ class Reasons(Env):
                           "table_width_uncovered")
         self.assertReason(call_args(columns=4096), "columns_uncovered")
         self.assertTrue(self.decide(call_args(columns=None)).ok)   # full width = 65536 bucket
-        d = self.assertReason(call_args(rows=16, requests=16, columns=32768), "row_unverified")
-        self.assertEqual(d.cell, "draft_bf16_r16q16_c32768_w16384")
+        # pending rows -> row_unverified, pass rows -> ok (holds before and after the
+        # root's GPU `gen_profile check` restamps the profile)
+        status = {r.cell: r.raw["golden"]["status"] for r in PR.load_profile(self.profile).rows}
+        n_pending = 0
+        for kw, cell in ((dict(rows=16, requests=16, columns=32768),
+                          "draft_bf16_r16q16_c32768_w16384"),
+                         (dict(fmt="fp8"), "decode_fp8_r64q16_c65536_w16384"),
+                         (dict(fmt="fp8", rows=16, requests=16), "draft_fp8_r16q16_c65536_w16384"),
+                         (dict(fmt="fp8", rows=512, requests=2), "prefill_fp8_r512q2_c65536_w16384")):
+            if status[cell] == "pending":
+                d = self.assertReason(call_args(**kw), "row_unverified")
+                n_pending += 1
+            else:
+                d = self.decide(call_args(**kw))
+                self.assertTrue(d.ok, d)
+            self.assertEqual(d.cell, cell)
+            self.assertTrue(self.decide(call_args(**kw), allow_unverified=True).ok)
+        if n_pending == 0 and any(s == "pending" for s in status.values()):
+            # still exercise the reason on whatever row is pending
+            row = next(r for r in PR.load_profile(self.profile).rows if not r.verified).raw
+            self.assertReason(call_args(rows=row["rows"]["min"], requests=row["requests"]["min"],
+                                        width=row["table_width"], columns=row["columns"],
+                                        fmt=row["cache_dtype"]), "row_unverified")
 
     def test_static_reason_set(self):
         self.assertIn(PR.Reason.CACHE_ALIGNMENT, PR.STATIC_REASONS)
@@ -616,10 +720,17 @@ class Dispatch(Env):
 
     @staticmethod
     def _vid(kind, a, kw):
+        pk8 = "asm" if K._FP8_CVT_ASM else "intrin"
         if kind == "draft":
-            return "qsa.page4.draft.v1", {"k_load": a[2], "wave_cols": a[3]}
+            p = {"k_load": a[2], "wave_cols": a[3]}
+            if a[0]:
+                p.update(sched=K.draft_fp8_sched(), pk8=pk8)
+            return "qsa.page4.draft.v1", p
         if kind == "decg":
-            return "qsa.page4.decg.v1", {"k_load": "tdm", "wave_cols": a[2], "barrier": False}
+            p = {"k_load": "tdm", "wave_cols": a[2], "barrier": False}
+            if a[0]:
+                p.update(sched=K.decg_fp8_sched(), pk8=pk8)
+            return "qsa.page4.decg.v1", p
         if kind == "wmma":
             rpb, k_load = a[1], a[2]
             if k_load == "persist":
@@ -631,23 +742,32 @@ class Dispatch(Env):
             rpb, k_load = a[1], a[2]
             if rpb == 32:
                 return "qsa.page4.r32_fp8.v1", {"k_load": k_load, "rows_per_block": 32,
-                                                "cvt": K._FP8_CVT}
-            return "qsa.page4.r16_fp8.v1", {"k_load": k_load, "rows_per_block": 16}
+                                                "cvt": K._FP8_CVT, "pk8": pk8}
+            return "qsa.page4.r16_fp8.v1", {"k_load": k_load, "rows_per_block": 16, "pk8": pk8}
         return "qsa.page4.scalar.v0", {}
 
-    def test_every_verified_row_dispatches_its_variant(self):
+    def test_every_row_dispatches_its_variant(self):
+        """Every row (verified via the public raise-API, pending via gen_profile's
+        allow_unverified path) launches exactly its profiled variant."""
         prof = PR.load_profile(PR.DEFAULT_PROFILE)
-        n = 0
+        n = n_ver = 0
         for row in prof.rows:
-            if not row.verified:
-                continue
             r = row.raw
             args = call_args(rows=r["rows"]["min"], requests=r["requests"]["min"],
                              width=r["table_width"], columns=r["columns"], fmt=r["cache_dtype"])
             rs = torch.full((r["rows"]["min"],), 7, dtype=torch.int32)
             args[9] = rs
             self.kinds.clear(); self.runs.clear()
-            logits, vis = API.qsa_paged_mqa_logits(*args, profile=self.profile)
+            if row.verified:
+                logits, vis = API.qsa_paged_mqa_logits(*args, profile=self.profile)
+                n_ver += 1
+            else:
+                with self.assertRaises(API.QSAIndexScorerUnsupported):
+                    API.qsa_paged_mqa_logits(*args, profile=self.profile)
+                self.assertEqual(self.runs, [], row.cell)
+                (logits, vis), d = API.try_qsa_paged_mqa_logits(*args, profile=self.profile,
+                                                                allow_unverified=True)
+                self.assertTrue(d.ok, row.cell)
             self.assertEqual(len(self.kinds), 1, row.cell)
             self.assertEqual(len(self.runs), 1, row.cell)
             kind, a, kw = self.kinds[0]
@@ -661,7 +781,9 @@ class Dispatch(Env):
             launch_tensors = [t for t in self.runs[0][1] if isinstance(t, torch.Tensor)]
             self.assertTrue(any(t.data_ptr() == rs.data_ptr() for t in launch_tensors), row.cell)
             n += 1
-        self.assertGreaterEqual(n, 15)
+        self.assertEqual(n, len(prof.rows))
+        self.assertGreaterEqual(n, 20)
+        self.assertGreaterEqual(n_ver, 9)   # bf16 Phase-1 rows (ISA identity) + GPU-restamped
 
     def test_try_and_raise(self):
         args = call_args(columns=4096)
@@ -678,12 +800,18 @@ class Dispatch(Env):
         self.assertEqual(self.kinds[-1][0], "decg")
 
     def test_caller_outputs_are_used(self):
-        args = call_args(rows=16, requests=16, fmt="fp8")
+        args = call_args(rows=16, requests=16, fmt="bf16")
         lg = torch.empty(16, 65536)
         vg = torch.empty(16, dtype=torch.int32)
         out = API.qsa_paged_mqa_logits(*args, logits=lg, visible_groups=vg, profile=self.profile)
         self.assertEqual(out[0].data_ptr(), lg.data_ptr())
         self.assertEqual(out[1].data_ptr(), vg.data_ptr())
+        args = call_args(rows=16, requests=16, fmt="fp8")          # pending row: sweep path
+        lg8 = torch.empty(16, 65536)
+        (o8, _), d = API.try_qsa_paged_mqa_logits(*args, logits=lg8, profile=self.profile,
+                                                  allow_unverified=True)
+        self.assertTrue(d.ok)
+        self.assertEqual(o8.data_ptr(), lg8.data_ptr())
 
 
 class Scripts(unittest.TestCase):

@@ -53,9 +53,31 @@ exactly what the generator writes. `--plan-file captured.json` adds captured cal
 (`{cache_dtype, rows, requests, columns, table_width}`) as `pending` rows.
 
 Regimes (identical to the kernel router): `draft` rows ≤ requests (draft kernel, TDM, 32-column wave
-slabs); `decode` requests < rows < 32·requests and rows % 4 == 0 (decode row-group kernel, w32,
-barrier-free); `prefill` rows ≥ 32·requests (bf16: persistent r32 TDM for columns ≥ 512, else r32
-TDM; fp8: r32 TDM, native fp8→bf16 conversion). Anything else is `rows_rule_uncovered`.
+slabs; fp8 tile schedule `qpre`); `decode` requests < rows < 32·requests and rows % 4 == 0 (decode
+row-group kernel, barrier-free, `QSA_DECODE_GROUP_COLS=auto`: bf16 32-column / fp8 64-column slabs,
+fp8 schedule `base`); `prefill` rows ≥ 32·requests (bf16: persistent r32 TDM for columns ≥ 512, else
+r32 TDM; fp8: r32 TDM, native fp8→bf16 conversion). Anything else is `rows_rule_uncovered`. Every fp8
+variant's `params` also record the converter build (`pk8: intrin`) and, for draft / decode-group,
+the fp8 schedule (`sched`), so a converter or schedule switch is a `route_mismatch` /
+`kernel_env_mismatch`, never a silent reuse of evidence.
+
+### Profiled kernel and evidence (kernel `82c4dec5`)
+
+The profile pins kernel source sha256
+`bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93` (champion `82c4dec5`) and the
+champion-default switch set in `kernel_env`, including the `82c4dec5` knobs `QSA_FP8_CVT_ASM=0`,
+`QSA_DRAFT_FP8_SCHED=qpre`, `QSA_DECG_FP8_SCHED=base` and `QSA_DECODE_GROUP_COLS=auto`. Every `pass`
+row names the kernel it was GPU-verified on (`golden.kernel_sha256`). A pass that was verified on an
+older kernel is accepted only with a recorded `golden.isa_identity` justification (the loader and
+`gen_profile verify` reject it otherwise):
+
+- **bf16 rows** keep their Phase-1 evidence. That evidence is `run_gpu.py` correctness 22/22 on
+  `a78c285c` (kernel sha `30c6213d…`). It carries over because every bf16 kernel is ISA
+  byte-identical from `a78c285c` to `82c4dec5`.
+- **fp8 rows** are `pending`. `82c4dec5` changed every fp8 kernel: the intrinsic pk8 converter,
+  decode-group w64 and draft `qpre`. Their old evidence is kept only as `stale_cases` /
+  `stale_kernel_sha256`. The rows serve nothing until the GPU `gen_profile check` restamps them with
+  `kernel_sha256 = bf49…`.
 
 ## Reasons (stable values)
 
@@ -74,8 +96,8 @@ reasons (`STATIC_REASONS`); the rest depend on the call's shape.
 
 | file | runs on | what |
 |---|---|---|
-| `op_tests/test_qsa_index_scorer_cpu.py` | CPU, no device | profile format/loader/matcher, every reason, off-by-default (no import side effects), ATOM signature drift (AST of `$QSA_GOLDEN_DIR/atom_impl/.../qsa.py` + its sha), kernel API kept, generator drift, regime/variant vs kernel router, dispatch of every verified row through the real wrapper |
-| `op_tests/test_qsa_index_scorer.py` | gfx1250 GPU | Phase-1 golden cases through the API (frozen comparator), side outputs, inputs untouched, int32≡int64, CUDA-graph≡eager, profile rows, fused vs frozen ATOM |
+| `op_tests/test_qsa_index_scorer_cpu.py` | CPU, no device | profile format/loader/matcher, every reason, off-by-default (no import side effects), ATOM signature drift (AST of `$QSA_GOLDEN_DIR/atom_impl/.../qsa.py` + its sha), kernel API kept, generator drift, regime/variant vs kernel router, dispatch of every row (pending rows via the sweep path) through the real wrapper, evidence policy |
+| `op_tests/test_qsa_index_scorer.py` | gfx1250 GPU | Phase-1 golden cases through the API (frozen comparator), side outputs, inputs untouched, int32≡int64, CUDA-graph≡eager, profile rows, fused vs frozen ATOM. `--allow-unverified` also serves/checks `pending` rows; `QSA_TEST_PROFILE=<path>` points the test at a restamped profile |
 | `op_tests/op_benchmarks/qsa_index_scorer/isa_audit_qsa_index_scorer.py` | CPU, no device | per row × {int64, int32 positions}: API-dispatched ISA == champion kernel ISA, zero scratch, resources |
 | `op_tests/op_benchmarks/qsa_index_scorer/perf_qsa_index_scorer.py` | GPU | formal protocol: `run_perftest(testGraph=True)` + graph replay, fused vs ATOM native, same process, interleaved legs; `decide()` host cost |
 
@@ -86,15 +108,25 @@ reasons (`STATIC_REASONS`); the rest depend on the call's shape.
   `score_divisor = sqrt(128)` only.
 - **Index-cache formats**: bf16 and fp8 E4M3 with one fp32 scale per compressed row only. **mxfp8 and
   fp4 (MXFP4) are not covered** (the golden supports them; the kernel does not) → `cache_format_unsupported`.
-- **fp8 decode-group 64-column variant is disabled** (`QSA_DECODE_GROUP_COLS=64` was GPU-incorrect for
-  fp8; the kernel always uses 32 columns for fp8, and any non-default value of that switch makes the
-  profile refuse every call with `kernel_env_mismatch`).
+- **fp8 WMMA hazards (fixed in `82c4dec5`)**: the fp8 kernels used an inline-asm fp8→bf16 converter.
+  LLVM's hazard recognizer does not pad inline asm, so its VALUs could overwrite WMMA A/B/D registers
+  inside the WMMA hazard window. This made the fp8 decode-group w64 kernel GPU-incorrect. The shipped
+  w32 / draft kernels had the same latent violations and were correct only because of how registers
+  happened to be allocated. Every fp8 kernel now uses a compiler-visible (intrinsic) pk8 converter,
+  and the WMMA-hazard scanner gate reports 0 violations on all default kernels. The fp8 decode-group
+  kernel therefore defaults to 64-column slabs; the earlier "fp8 w64 disabled" limitation is gone.
+  `QSA_FP8_CVT_ASM=1` restores the asm converter for debug and A/B runs only. With it, fp8 decode-group
+  falls back to w32. The profile refuses it with `kernel_env_mismatch`, as it does any non-default
+  `QSA_DECODE_GROUP_COLS`, `QSA_DRAFT_FP8_SCHED` or `QSA_DECG_FP8_SCHED`.
+- **fp8 rows await GPU re-verification on `82c4dec5`**: until the root's `gen_profile check` restamps
+  them, fp8 calls return `row_unverified` and run native.
 - **Alignment fallback**: TDM routes need a 128-B aligned cache base. The kernel itself falls back to
   raw-load kernels for 16-B (bf16) / 8-B (fp8) aligned subviews and stays correct, but those routes are
   not profiled: by policy such calls run native (`cache_alignment_unsupported`).
 - **Coverage = exact profiled rows with golden PASS** (decode 64/16, draft 16/16, prefill 512/2 at the
-  e2e table width 16384 and the Phase-1 small shapes). Rows marked `pending` (e.g. decode fp8
-  c32768, draft c32768, prefill 320/2) are inert until `gen_profile check` passes on GPU. Other batch
+  e2e table width 16384 and the Phase-1 small shapes). Rows marked `pending` (every fp8 row on
+  `82c4dec5`; bf16 decode c32768 is pass, bf16 draft c32768 / prefill 320/2 are pending) are inert
+  until `gen_profile check` passes on GPU. Other batch
   sizes, column buckets and table widths run native until captured, added and checked.
 - **r16 tail class** (requests < rows < 32·requests with rows % 4 != 0) is correct in-kernel but not
   profiled (`rows_rule_uncovered`). The opt-in kernel padding (`QSA_PAD_BUCKET=1`) is not used by the

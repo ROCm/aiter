@@ -57,7 +57,20 @@ def load_api():
 
 
 PKG, API, GEN = load_api()
-PROFILE = PKG.DEFAULT_PROFILE
+PROFILE = os.environ.get("QSA_TEST_PROFILE") or PKG.DEFAULT_PROFILE
+#: --allow-unverified: also serve `pending` rows (gen_profile sweep path). Needed to
+#: run the suite on a kernel whose rows are not restamped yet (82c4dec5: fp8 rows).
+ALLOW_UNVERIFIED = False
+
+
+def scorer(*args, **kw):
+    """Public raise-API; with --allow-unverified the try-API sweep path (pending rows)."""
+    if not ALLOW_UNVERIFIED:
+        return API.qsa_paged_mqa_logits(*args, **kw)
+    out, d = API.try_qsa_paged_mqa_logits(*args, allow_unverified=True, **kw)
+    if out is None:
+        raise API.QSAIndexScorerUnsupported(d)
+    return out
 
 # Phase-1 GPU golden suite (_g2/run_gpu.py --stage correctness), same specs.
 CASES = [
@@ -154,12 +167,13 @@ def run_case(name, spec):
     lg = torch.full((rows, cols), 12345.0, dtype=torch.float32, device="cuda")
     vg = torch.full((rows,), -7, dtype=torch.int32, device="cuda")
     dec = API.decide(*args_of(d), 4, None, cols, rs, False, d["compressed_k_scale"],
-                     logits=lg, visible_groups=vg, profile=PROFILE)
+                     logits=lg, visible_groups=vg, profile=PROFILE,
+                     allow_unverified=ALLOW_UNVERIFIED)
     rec = {"name": name, "decision": dec.reason.value, "cell": dec.cell, "vid": dec.vid}
     if not dec.ok:
         rec.update(passed=False, error=f"not eligible: {dec.reason.value}: {dec.detail}")
         return rec
-    out, vis = API.qsa_paged_mqa_logits(*args_of(d), 4, None, cols, rs, False,
+    out, vis = scorer(*args_of(d), 4, None, cols, rs, False,
                                         d["compressed_k_scale"], logits=lg, visible_groups=vg,
                                         profile=PROFILE)
     torch.cuda.synchronize()
@@ -178,7 +192,7 @@ def run_case(name, spec):
     d32 = dict(d)
     for k in ("token_to_request", "query_positions", "context_lens", "page_table"):
         d32[k] = d[k].to(torch.int32)
-    o32, v32 = API.qsa_paged_mqa_logits(*args_of(d32), 4, None, cols, None, False,
+    o32, v32 = scorer(*args_of(d32), 4, None, cols, None, False,
                                         d["compressed_k_scale"], profile=PROFILE)
     checks["int32_bitwise"] = bool(torch.equal(o32.view(torch.int32), out.view(torch.int32))
                                    and torch.equal(v32, vis))
@@ -188,13 +202,13 @@ def run_case(name, spec):
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        API.qsa_paged_mqa_logits(*args_of(d), 4, None, cols, None, False, d["compressed_k_scale"],
+        scorer(*args_of(d), 4, None, cols, None, False, d["compressed_k_scale"],
                                  logits=gl, visible_groups=gv, profile=PROFILE)
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
     gl.fill_(0)
     with torch.cuda.graph(g):
-        API.qsa_paged_mqa_logits(*args_of(d), 4, None, cols, None, False, d["compressed_k_scale"],
+        scorer(*args_of(d), 4, None, cols, None, False, d["compressed_k_scale"],
                                  logits=gl, visible_groups=gv, profile=PROFILE)
     gl.fill_(0)
     g.replay()
@@ -209,10 +223,12 @@ def run_case(name, spec):
 def run_profile_rows():
     out = []
     for row in API.P.load_profile(PROFILE).data["rows"]:
-        if row["golden"]["status"] != "pass":
+        status = row["golden"]["status"]
+        if status != "pass" and not ALLOW_UNVERIFIED:
             continue
-        rec = GEN.check_row(row, API, G, S)
-        out.append({"name": "profile:" + row["cell"], "passed": bool(rec.pop("pass_")), **rec})
+        rec = GEN.check_row(row, API, G, S, profile=PROFILE)
+        out.append({"name": "profile:" + row["cell"], "passed": bool(rec.pop("pass_")),
+                    "profile_status": status, **rec})
         torch.cuda.empty_cache()
     return out
 
@@ -230,7 +246,7 @@ def run_vs_atom():
         d = fixture(dict(regime=regime, rows=rows, requests=reqs, fmt=fmt, table_width=W,
                          cache_pages=PAGES, max_ctx=CTX))
         cols = int(d["max_columns"])
-        ours, ov = API.qsa_paged_mqa_logits(*args_of(d), 4, None, cols, None, False,
+        ours, ov = scorer(*args_of(d), 4, None, cols, None, False,
                                             d["compressed_k_scale"], profile=PROFILE)
         ref, rv = QB.call_scorer(atom["fn"], d, cols, False, None)
         gold, gvis, valid = G.reference_logits(*args_of(d), compress_ratio=4, max_columns=cols,
@@ -246,7 +262,11 @@ def main(argv=None) -> int:
     ap.add_argument("-k", default="")
     ap.add_argument("--json")
     ap.add_argument("--skip-atom", action="store_true")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="serve + check pending profile rows too (before `gen_profile check` restamps)")
     a = ap.parse_args(argv)
+    global ALLOW_UNVERIFIED
+    ALLOW_UNVERIFIED = bool(a.allow_unverified)
     props = torch.cuda.get_device_properties(0)
     if not str(props.gcnArchName).startswith("gfx1250"):
         print(f"SKIP: gfx1250 only (device {props.gcnArchName})")
@@ -268,7 +288,8 @@ def main(argv=None) -> int:
         if not a.skip_atom:
             recs += run_vs_atom()
     bad = [r["name"] for r in recs if not r["passed"]]
-    summary = {"pass": not bad, "n": len(recs), "failed": bad, "profile": PROFILE,
+    summary = {"pass": not bad, "n": len(recs), "failed": bad, "profile": PROFILE, "allow_unverified": ALLOW_UNVERIFIED,
+               "kernel_sha256": API._kernel_sha256(),
                "device": f"{props.gcnArchName} cu={props.multi_processor_count}", "records": recs}
     if a.json:
         with open(a.json, "w") as fh:

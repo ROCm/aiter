@@ -9,7 +9,9 @@ int32 query_positions) this compiles, in fresh no-device processes,
               dispatches for the row's shape (real wrapper, real router, real
               builder + compiler; only ``_run`` and the stream lookup intercepted);
 * ``base`` -- the same shape through the champion kernel module directly
-              (``--base-source``, e.g. ``git show a78c285c:<kernel path>``),
+              (``--base-source``: the profiled champion ``82c4dec5``; with
+              ``--cache-dtype bf16 --base-source <a78c285c kernel>`` it proves the
+              bf16 ISA identity that carries the a78c285c Phase-1 evidence),
 
 and checks: identical normalized final ISA (``21_final_isa.s`` minus .loc/.file/
 comments) api vs base, exactly one launch per call, zero scratch
@@ -149,7 +151,8 @@ def worker(a) -> int:
 def driver(a) -> int:
     assert not Path("/dev/kfd").exists() and not Path("/dev/dri").exists(), "devices visible"
     prof = json.loads(Path(a.profile).read_text())
-    rows = [r for r in prof["rows"] if a.all_rows or r["golden"]["status"] == "pass"]
+    rows = [r for r in prof["rows"] if (a.all_rows or r["golden"]["status"] == "pass")
+            and (not a.cache_dtype or r["cache_dtype"] == a.cache_dtype)]
     out = Path(a.results)
     out.mkdir(parents=True, exist_ok=True)
     jobs = []
@@ -173,7 +176,8 @@ def driver(a) -> int:
         for (r, meta, side, _), rc in ex.map(run, jobs):
             if rc:
                 fails.append(f"{r['cell']}-{meta}-{side} rc={rc}")
-    summary = {"rows": len(rows), "compiles": len(jobs), "compile_failures": fails, "pairs": []}
+    summary = {"rows": len(rows), "cache_dtype": a.cache_dtype or "all", "all_rows": bool(a.all_rows),
+               "compiles": len(jobs), "compile_failures": fails, "pairs": []}
     for r in rows:
         for meta in ("qp64", "i32"):
             pair = {}
@@ -214,6 +218,7 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", default=str(PROFILE))
     ap.add_argument("--base-source")
     ap.add_argument("--all-rows", action="store_true")
+    ap.add_argument("--cache-dtype", choices=("bf16", "fp8"), help="audit only rows of this dtype")
     ap.add_argument("--jobs", type=int, default=int(os.environ.get("ISA_JOBS", "8")))
     a = ap.parse_args(argv)
     if a.worker:

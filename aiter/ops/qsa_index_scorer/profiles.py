@@ -22,7 +22,10 @@ Row keys (all must match):
 * ``table_width``             -- ``page_table.shape[1]``;
 * ``vid`` / ``params``        -- kernel variant the kernel router selects for the
                                  row (checked against the router at call time);
-* ``golden``                  -- ``{"status": "pass"|"pending"|"fail", ...}``.
+* ``golden``                  -- ``{"status": "pass"|"pending"|"fail", ...}``; a
+                                 ``pass`` names the kernel sha it was GPU-verified on
+                                 (``kernel_sha256``) and, if that is not the profiled
+                                 kernel, the ISA-identity evidence (``isa_identity``).
 """
 
 from __future__ import annotations
@@ -79,14 +82,32 @@ KERNEL_ENV_DEFAULTS: dict[str, str] = {
     "QSA_DRAFT_K_LOAD": "tdm",
     "QSA_DRAFT_COLS": "auto",
     "QSA_DECODE_GROUP": "all",
-    "QSA_DECODE_GROUP_COLS": "32",
+    # 82c4dec5: per-dtype slab ('auto' = bf16 32 / fp8 64); '32'/'64' force both dtypes
+    "QSA_DECODE_GROUP_COLS": "auto",
+    # 82c4dec5 fp8 WMMA-hazard fix: compiler-visible (intrinsic) pk8 converter by
+    # default; '1' restores the inline-asm converter (fp8 decode-group back to w32)
+    "QSA_FP8_CVT_ASM": "0",
+    "QSA_DRAFT_FP8_SCHED": "qpre",
+    "QSA_DECG_FP8_SCHED": "base",
     "QSA_PAD_BUCKET": "0",
     "QSA_PAD_INT32_GUARD": "0",
     "QSA_STRICT_I32": "0",
 }
 _LOWERED = {"QSA_G2_ACCESS", "QSA_BF16_PATH", "QSA_FP8_PATH", "QSA_BF16_K_LOAD",
             "QSA_FP8_K_LOAD", "QSA_FP8_CVT", "QSA_DRAFT_K_LOAD", "QSA_DRAFT_COLS",
-            "QSA_DECODE_GROUP"}
+            "QSA_DECODE_GROUP", "QSA_DECODE_GROUP_COLS", "QSA_DRAFT_FP8_SCHED",
+            "QSA_DECG_FP8_SCHED"}
+#: Kernel switches whose default in the kernel source is a module constant, not
+#: a literal (CPU drift test resolves them on the imported kernel).
+KERNEL_ENV_SYMBOLIC_DEFAULTS = {"QSA_FP8_K_LOAD": "_BF16_K_LOAD",
+                                "QSA_DRAFT_FP8_SCHED": "_DRAFT_FP8_SCHED_DEFAULT",
+                                "QSA_DECG_FP8_SCHED": "_DECG_FP8_SCHED_DEFAULT"}
+
+#: Default-env per-dtype variant facts of the profiled kernel (82c4dec5).
+DECG_WAVE_COLS = {"bf16": 32, "fp8": 64}       # QSA_DECODE_GROUP_COLS=auto
+FP8_PK8 = "intrin"                              # QSA_FP8_CVT_ASM=0
+DRAFT_FP8_SCHED = KERNEL_ENV_DEFAULTS["QSA_DRAFT_FP8_SCHED"]
+DECG_FP8_SCHED = KERNEL_ENV_DEFAULTS["QSA_DECG_FP8_SCHED"]
 
 REGIMES = ("draft", "decode", "prefill")
 CACHE_DTYPES = ("bf16", "fp8")
@@ -180,14 +201,27 @@ PERSIST_MIN_COLUMNS = 64 * 8   # WMMA_COLS * QSA_PERSIST_COLS (default)
 
 
 def expected_variant(cache_dtype: str, regime: str, columns: int) -> tuple[str, dict]:
-    """(vid, params) the default-env kernel router selects for an aligned cache."""
+    """(vid, params) the default-env kernel router selects for an aligned cache.
+
+    fp8 variants carry the converter build (``pk8``) and, for the draft /
+    decode-group kernels, the fp8 tile schedule (``sched``); bf16 kernels have
+    neither (their ISA is unchanged by the 82c4dec5 fp8 work).
+    """
+    fp8 = cache_dtype == "fp8"
     if regime == "draft":
-        return "qsa.page4.draft.v1", {"k_load": "tdm", "wave_cols": 32}
+        params = {"k_load": "tdm", "wave_cols": 32}
+        if fp8:
+            params.update(sched=DRAFT_FP8_SCHED, pk8=FP8_PK8)
+        return "qsa.page4.draft.v1", params
     if regime == "decode":
-        return "qsa.page4.decg.v1", {"k_load": "tdm", "wave_cols": 32, "barrier": False}
+        params = {"k_load": "tdm", "wave_cols": DECG_WAVE_COLS[cache_dtype], "barrier": False}
+        if fp8:
+            params.update(sched=DECG_FP8_SCHED, pk8=FP8_PK8)
+        return "qsa.page4.decg.v1", params
     if regime == "prefill":
-        if cache_dtype == "fp8":
-            return "qsa.page4.r32_fp8.v1", {"k_load": "tdm", "rows_per_block": 32, "cvt": "fast"}
+        if fp8:
+            return "qsa.page4.r32_fp8.v1", {"k_load": "tdm", "rows_per_block": 32, "cvt": "fast",
+                                            "pk8": FP8_PK8}
         if int(columns) >= PERSIST_MIN_COLUMNS:
             return "qsa.page4.r32_persist.v1", {"k_load": "tdm", "rows_per_block": 32,
                                                 "persist_cols": 8, "buffers": 2}
@@ -328,8 +362,19 @@ def validate_profile(data: Mapping[str, Any], name: str | None = None) -> None:
             INDEX_HEADS, HEAD_DIM, PAGE_SIZE, COMPRESS_RATIO):
         bad(f"contract geometry {c}")
     sigs = set()
+    ksha = data["kernel"].get("sha256")
     for row in data["rows"]:
         validate_row(row)
+        g = row["golden"]
+        if g["status"] == "pass":
+            # every pass names the kernel it was GPU-verified on; evidence from an
+            # older kernel is only valid with a recorded ISA-identity justification
+            vsha = g.get("kernel_sha256")
+            if not vsha:
+                bad(f"row {row['cell']}: pass without golden.kernel_sha256")
+            if vsha != ksha and not g.get("isa_identity"):
+                bad(f"row {row['cell']}: pass verified on kernel {str(vsha)[:12]} != profiled "
+                    f"{str(ksha)[:12]} without golden.isa_identity")
         if row["sig"] in sigs:
             bad(f"duplicate row sig {row['sig']} ({row['cell']})")
         sigs.add(row["sig"])
