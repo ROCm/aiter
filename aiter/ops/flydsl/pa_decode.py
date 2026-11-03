@@ -212,8 +212,10 @@ def _pa_decode_mxfp4(
             "MXFP4 pa_decode needs head_dim 128 and 1..16 query heads per KV head, "
             f"got query {tuple(query.shape)} over {num_kv_heads} KV heads"
         )
-    if query.dtype != torch.bfloat16:
-        raise TypeError(f"MXFP4 pa_decode needs a bf16 query, got {query.dtype}")
+    if query.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise TypeError(
+            f"MXFP4 pa_decode needs an e4m3 or bf16 query, got {query.dtype}"
+        )
     if output.dtype != torch.bfloat16 or output.shape != query.shape:
         raise TypeError("MXFP4 pa_decode needs a bf16 output shaped like the query")
     if output.device != dev:
@@ -303,7 +305,7 @@ def _pa_decode_mxfp4(
             ).multi_processor_count,
             num_partitions=1 if direct else work_plan.max_partitions,
             softmax_scale=softmax_scale,
-            query_dtype="bf16",
+            query_dtype="fp8" if query.dtype == torch.float8_e4m3fn else "bf16",
             kv_dtype="mxfp4",
             work_capacity=capacity,
             max_context_length=schedule_context_length,
@@ -452,8 +454,8 @@ def pa_decode(
     [pages, kv_heads, 128, 64] (``dtypes.fp4x2`` or uint8) and
     ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, 128, 4]
     (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
-    byte strides, multiples of 16). ``query`` is bf16, quantized to e4m3 per head
-    row in the kernel; ``output`` is bf16.
+    byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
+    bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
     Supported: head_dim 128, block size 128, ``query_length`` 1, at most 16 query
     heads per KV head. Refused: other block sizes, head dims and output dtypes,
     sliding windows and sinks (``mask_unowned_kv`` has no effect: tokens past the

@@ -149,8 +149,8 @@ class PaDecodeSchedule:
         if kv_dtype == "mxfp4":
             if arch != "gfx950":
                 raise ValueError(f"MXFP4 PA decode requires gfx950; got {arch}")
-            if query_dtype != "bf16":
-                raise ValueError("MXFP4 KV requires a BF16 query")
+            if query_dtype not in ("bf16", "fp8"):
+                raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
             if per_token_kv:
                 raise ValueError("MXFP4 KV scales are in the cache, not per token")
         elif is_bf16_kv:
@@ -164,6 +164,8 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV does not use quantization scales")
             if not trans_v:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
+        elif query_dtype == "fp8":
+            raise ValueError("An FP8 query needs MXFP4 KV")
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
             kv_dtype == "fp8"
@@ -416,6 +418,7 @@ class PaDecodeTraits:
     FP8: type
     FP8_MAX: float
     Q_DTYPE: type
+    Q_IN_DTYPE: type
     DIRECT: bool
     is_bf16_kv: bool
     PV_BF16: bool
@@ -524,7 +527,7 @@ class PaDecodeTraits:
         MXFP4 = kv_dtype == "mxfp4"
         is_bf16_kv = kv_dtype == "bf16"
         PV_BF16 = is_bf16_kv or MXFP4
-        IS_BF16 = query_dtype == "bf16"
+        IS_BF16 = query_dtype in ("bf16", "fp8")
         TUNED_SHAPE = (
             kv_dtype == "fp8"
             and is_gfx950
@@ -560,8 +563,10 @@ class PaDecodeTraits:
         assert query_dtype in (
             "f16",
             "bf16",
-        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
+            "fp8",
+        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
         Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
+        Q_IN_DTYPE = FP8 if query_dtype == "fp8" else Q_DTYPE
         KV_DTYPE = fx.BFloat16 if PV_BF16 else FP8
         KV_VECTOR_WIDTH = 8 if PV_BF16 else 16
         # Q in LDS: bf16 for BF16 KV, e4m3 bytes otherwise (MXFP4 included).
@@ -745,6 +750,7 @@ class PaDecodeTraits:
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
+            Q_IN_DTYPE=Q_IN_DTYPE,
             DIRECT=DIRECT,
             is_bf16_kv=is_bf16_kv,
             PV_BF16=PV_BF16,
