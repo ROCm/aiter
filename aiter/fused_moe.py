@@ -1655,7 +1655,27 @@ def _fused_moe_impl(
             intermediate_pad=intermediate_pad,
             has_bias1=bias1 is not None,
             has_bias2=bias2 is not None,
+            weight_bytes=max(
+                w1.numel() * w1.element_size(), w2.numel() * w2.element_size()
+            ),
         )
+        # The sort leaves out dropped routes (topk_ids -1), so the reduction
+        # would add their uninitialized stage-2 partials. Give them zero weight
+        # and an expert the token does not use, which adds exactly zero; a token
+        # routed twice to one expert is not deterministic. The k-th dropped
+        # route takes the k-th expert in 0..topk-1 the token does not use, of
+        # which there are always enough.
+        dropped = topk_ids < 0
+        candidates = torch.arange(
+            topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
+        )
+        used = (topk_ids.unsqueeze(-1) == candidates).any(1)
+        unused = torch.sort(used.to(torch.uint8), dim=1, stable=True).indices
+        rank = (dropped.cumsum(1) - 1).clamp_(min=0)
+        topk_ids = torch.where(
+            dropped, unused.gather(1, rank).to(topk_ids.dtype), topk_ids
+        )
+        topk_weight = topk_weight.masked_fill(dropped, 0)
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -3583,6 +3603,7 @@ def _check_deterministic_supported(
     intermediate_pad,
     has_bias1,
     has_bias2,
+    weight_bytes,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
     layout = {True: "gate/up-interleaved", False: "separated"}.get(
@@ -3662,6 +3683,12 @@ def _check_deterministic_supported(
                 # columns, while stage 2 with a bias reads them.
                 intermediate_pad > 0 and has_bias2 and not has_bias1,
                 "intermediate padding with a stage-2 bias but no stage-1 bias",
+            ),
+            (
+                # The kernels address each weight with one 32-bit buffer
+                # descriptor, so experts past 4 GiB would read other experts.
+                weight_bytes > FHMOE_BUFFER_MAX_BYTES,
+                f"weights of {weight_bytes} bytes (at most 4 GiB per projection)",
             ),
             (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
         )

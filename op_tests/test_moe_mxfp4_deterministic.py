@@ -140,21 +140,22 @@ def _check_batch_invariant(p, out, activation, **kwargs):
 
 @_SKIP
 @pytest.mark.parametrize(
-    "model_dim,inter_dim,E,topk",
+    "model_dim,inter_dim,E,topk,bias",
     [
-        (1024, 512, 32, 4),
-        (3072, 3072, 32, 4),
-        (3072, 3072, 128, 4),
-        (6144, 768, 129, 6),
-        (6144, 1536, 129, 5),
+        (1024, 512, 32, 4, True),
+        (3072, 3072, 32, 4, True),
+        (3072, 3072, 128, 4, True),
+        (6144, 768, 129, 6, True),
+        (6144, 1536, 129, 5, True),
+        (6144, 768, 129, 6, False),
     ],
 )
-def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
-    """SwiGLU with clamp and per-expert biases; gpt-oss shapes, and MiniMax-M3's per
-    GPU at TP4 and TP2 (128 routed experts plus a fused shared expert). The
-    stage-1 bias stays in [gate.., up..] order."""
+def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk, bias):
+    """SwiGLU with clamp, with per-expert biases (gpt-oss shapes, and MiniMax-M3's
+    per GPU at TP4 and TP2: 128 routed experts plus a fused shared expert) and
+    without them. The stage-1 bias stays in [gate.., up..] order."""
     limit = 7.0
-    p = _problem(_M, model_dim, inter_dim, E, topk)
+    p = _problem(_M, model_dim, inter_dim, E, topk, bias=bias)
     out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)
     assert not out.isnan().any().item(), "deterministic output contains NaN"
     ref = _reference(
@@ -176,9 +177,14 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
 def test_deterministic_zero_routing_weights(M):
     """Routes with zero weight must not change a token's result: half the tokens
     keep only their first route. Accuracy as with nonzero weights, and a token
-    alone matches the same token in the batch."""
+    alone matches the same token in the batch. Dropped routes (topk_ids -1)
+    give the same result as zero-weight ones, also when the token's kept route
+    is expert 0."""
     shape = (3072, 3072, 128, 4)
     p = _problem(M, *shape)
+    # Every token's first route goes to expert 0; the shift keeps a token's
+    # experts distinct.
+    p["topk_ids"] = (p["topk_ids"] - p["topk_ids"][:, :1]) % shape[2]
     p["topk_weights"][::2, 1:] = 0
     kw = {"swiglu_limit": 7.0}
     out = _run(p, slice(None), ActivationType.Swiglu, True, **kw)
@@ -188,6 +194,12 @@ def test_deterministic_zero_routing_weights(M):
     for i in range(min(M, 4)):
         alone = _run(p, slice(i, i + 1), ActivationType.Swiglu, True, **kw)
         assert torch.equal(alone, out[i : i + 1]), f"token {i} alone differs"
+    p["topk_ids"][::2, 1:] = -1
+    for _ in range(2):
+        dropped = _run(p, slice(None), ActivationType.Swiglu, True, **kw)
+        assert torch.equal(
+            dropped, out
+        ), "dropped routes differ from zero-weight routes"
 
 
 @_SKIP
