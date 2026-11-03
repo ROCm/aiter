@@ -722,14 +722,6 @@
             "'-ffp-contract=off'"
         ],
         "flags_extra_hip_per_source": {
-            "*fused_norm_rope_attn_rope_cast/attention_64rows_h16.cu": [
-                "-ffast-math",
-                "-fno-gpu-flush-denormals-to-zero",
-                "-mllvm --amdgpu-kernarg-preload-count=0",
-                "-mllvm -amdgpu-early-inline-all=false",
-                "-mllvm -amdgpu-function-calls=true",
-                "-mllvm -enable-post-misched=1"
-            ],
             "*fused_norm_rope_attn_rope_cast/attention_32rows.cu": [
                 "-fno-gpu-flush-denormals-to-zero"
             ],
