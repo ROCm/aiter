@@ -1266,5 +1266,3 @@ def test_gfx1250_gluon_ua2d_ignores_poisoned_v_tail(
         sinks=None,
     )
     torch.testing.assert_close(clean, ref_output, atol=1.5e-2, rtol=1e-2)
-
-
