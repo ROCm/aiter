@@ -15,6 +15,9 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qpe_rope_and_cache_mla_kernel as triton_fused_qpe_rope_and_cache_mla_kernel,
+)
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
@@ -41,6 +44,14 @@ _LOGGER = AiterTritonLogger()
 DEVICE_ARCH = arch_info.get_arch()
 
 _BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
+# q_nope-prestored MLA rope kernel: "gluon" (gfx1250 pure-decode head-tiled
+# kernel, falls back to Triton when ineligible) or "triton" (always Triton).
+_QPE_ROPE_IMPL = os.environ.get("AITER_QPE_ROPE_IMPL", "gluon")
+# Head tile / warps of the Triton q_nope-prestored MLA rope kernel; 0 = pick by
+# token count (gfx1250 sweep: 64 heads / 4 warps up to 256 tokens, else 128
+# heads / 1 warp, 2 warps for NeoX).
+_QPE_ROPE_BLOCK_H = int(os.environ.get("AITER_QPE_ROPE_BLOCK_H", "0"))
+_QPE_ROPE_NUM_WARPS = int(os.environ.get("AITER_QPE_ROPE_NUM_WARPS", "0"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -146,9 +157,9 @@ def fused_qk_rope_cat_and_cache_mla(
       (e.g. a bf16-absorb k-up GEMM wrote q_nope straight into q_out), so this
       op only ropes q_pe into ``q_out[..., D1:]`` and writes the KV cache,
       skipping the q_nope read/copy. Restrictions (asserted below): requires
-      ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
-      gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
-      full path.
+      ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), RoPE
+      inputs, and ``num_decode_toks_for_zeros == 0``. gfx1250 pure decode uses a gluon head-tiled kernel; other archs
+      and mixed prefill + decode use a Triton head-tiled kernel.
 
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
 
@@ -448,16 +459,76 @@ def _cat_and_cache_mla(
     if q_nope_prestored:
         # q_nope already lives in q_out[..., :d_nope] (written there in the q_out
         # dtype by its producer, e.g. a bf16-absorb GEMM with an fp8 epilogue).
-        # gfx1250 pure-decode MLA ropes only q_pe (head-tiled) and writes the KV
-        # cache, reusing the full-rope kernel's gluon rope + _store_mla_kv_cache so
-        # q_pe and the KV cache are bit-identical to the full-rope path.
+        # Only q_pe is roped (head-tiled) and the KV cache written, skipping the
+        # q_nope read/rewrite. gfx1250 pure-decode MLA uses the gluon kernel,
+        # which reuses the full-rope kernel's gluon rope + _store_mla_kv_cache;
+        # everything else (other archs, mixed prefill + decode) uses the Triton
+        # kernel.
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
+        assert apply_rope, "q_nope_prestored requires RoPE inputs"
+        # The prestored kernels write neither decode_q_pe_out nor
+        # q_nope_zeros_out, so reject a request for them.
         assert (
-            DEVICE_ARCH == "gfx1250"
+            num_decode_toks_for_zeros == 0
+        ), "q_nope_prestored does not produce decode_q_pe_out / q_nope_zeros_out"
+        use_gluon_htile = (
+            _QPE_ROPE_IMPL != "triton"
+            and DEVICE_ARCH == "gfx1250"
             and gluon_qpe_htile_kernel is not None
             and b_slot == b
-            and num_decode_toks_for_zeros == 0
-        ), "q_nope_prestored is currently supported on gfx1250 pure-decode MLA only"
+        )
+        if not use_gluon_htile:
+            block_h = _QPE_ROPE_BLOCK_H or (64 if b <= 256 else 128)
+            block_h = min(triton.next_power_of_2(qh), block_h)
+            num_warps = _QPE_ROPE_NUM_WARPS or (
+                4 if b <= 256 else (2 if is_neox else 1)
+            )
+            h_tiles = triton.cdiv(qh, block_h)
+            # grid column h_tiles is the KV-cache writer for each token
+            triton_fused_qpe_rope_and_cache_mla_kernel[(b_slot, h_tiles + 1)](
+                q_pe,
+                k_nope,
+                k_pe,
+                pos,
+                cos,
+                sin,
+                q_out,
+                k_pe_out,
+                kv_cache,
+                slot_mapping,
+                b,
+                *q_pe.stride(),
+                k_nope.stride(0),
+                k_nope.stride(2),
+                k_pe.stride(0),
+                k_pe.stride(2),
+                pos.stride(0),
+                cos.stride(0),
+                cos.stride(-1),
+                *q_out.stride(),
+                k_pe_out.stride(0),
+                k_pe_out.stride(2),
+                kv_cache_stride_b,
+                kv_cache_stride_h,
+                kv_cache_stride_d,
+                k_scale_ptr=k_scale,
+                QH=qh,
+                BLOCK_H=block_h,
+                H_TILES=h_tiles,
+                REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+                IS_NEOX=is_neox,
+                BLOCK_D_nope=d_nope,
+                BLOCK_D_pe=d_pe,
+                BLOCK_D_HALF_pe=d_pe // 2,
+                BLOCK_SIZE=block_size,
+                SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
+                SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
+                HAVE_K_SCALE=(k_scale is not None and apply_scale),
+                UPCAST_OPERAND=upcast_operand,
+                num_warps=num_warps,
+            )
+            return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
         BLOCK_H_HT = 16
         H_TILES_HT = triton.cdiv(qh, BLOCK_H_HT)
         gluon_qpe_htile_kernel[(b * H_TILES_HT,)](
