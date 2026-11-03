@@ -1737,8 +1737,13 @@ def _moe_gemm_a8w4_decode(
             0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
         )
         mask_y = (offs_y_m < M)[:, None] & (offs_y_n < yN)[None, :]
+        # Widen before the stride multiply. offs * stride is an int32 product
+        # otherwise, so a tile past 2**31 elements wraps and stores before Y
+        # even though start_m was already cast to index_type.
         gl.store(
-            Y + offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n,
+            Y
+            + offs_y_m.to(index_type)[:, None] * stride_y_m
+            + offs_y_n.to(index_type)[None, :] * stride_y_n,
             out,
             mask=mask_y,
         )
