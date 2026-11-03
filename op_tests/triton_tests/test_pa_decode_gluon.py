@@ -138,8 +138,15 @@ CASE_SETS = {
             "ps": [True],
         },
         # One context partition: ps=False also selects the PS kernel, and the
-        # kernel stores the output directly.
-        {"num_heads": [(8, 1), (16, 1)], "context_length": [256], "ps": [False]},
+        # kernel stores the output directly. Ragged lengths of at most 256
+        # tokens keep one partition. Short sequences need the kv_varlen
+        # tolerance, because the kernel rounds the probabilities to bf16.
+        {
+            "num_heads": [(8, 1), (16, 1)],
+            "kv_varlen": [True],
+            "context_length": [256],
+            "ps": [False],
+        },
     ],
     "sliding_window_accuracy": [
         {
