@@ -636,8 +636,6 @@ parser.add_argument(
     nargs="*",
     default=[
         1,
-        3,
-        5,
         16,
         32,
         64,
@@ -645,8 +643,6 @@ parser.add_argument(
         256,
         1024,
         4096,
-        8192,
-        163840,
     ],
     help="""Number of tokens.
     e.g.: -t 1024""",
