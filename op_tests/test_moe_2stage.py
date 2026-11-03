@@ -1587,9 +1587,11 @@ _FMOE_64XN = {
 
 
 def _run_blockscale_case(symbol, **case):
-    """Run one SiLU case on the named kernel."""
+    """Run one SiLU case on the named kernel without a routing override."""
+    global AITER_MOE_NUM_EXPERT_ACTIVATED
     launched = []
     orig = aiter.fmoe_fp8_blockscale_g1u1
+    orig_num_expert_activated = AITER_MOE_NUM_EXPERT_ACTIVATED
 
     def wrap(*args, **kwargs):
         if len(args) >= 13:
@@ -1601,8 +1603,9 @@ def _run_blockscale_case(symbol, **case):
         return orig(*args, **kwargs)
 
     aiter.fmoe_fp8_blockscale_g1u1 = wrap
-    torch.manual_seed(0)
     try:
+        AITER_MOE_NUM_EXPERT_ACTIVATED = 0
+        torch.manual_seed(0)
         test_fmoe(
             dtype=dtypes.bf16,
             actType=aiter.ActivationType.Silu,
@@ -1618,6 +1621,7 @@ def _run_blockscale_case(symbol, **case):
             **case,
         )
     finally:
+        AITER_MOE_NUM_EXPERT_ACTIVATED = orig_num_expert_activated
         aiter.fmoe_fp8_blockscale_g1u1 = orig
     assert launched, f"fp8 block-scale kernel was not launched for {case}"
     assert set(launched) == {
