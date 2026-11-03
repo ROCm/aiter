@@ -18,6 +18,7 @@ from ..config import (
     _COMPACT_ROUTE_UPTO,
     _DISPATCH_COMPACT,
     _WAVE_SIZE,
+    _compact_dispatch_schedule,
 )
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
@@ -211,18 +212,30 @@ class _CompactDispatch(_Dispatch):
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
         if blocks_env is not None or warps_env is not None:
-            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
-        else:
-            # Up to _COMPACT_ROUTE_UPTO tokens/rank the steps past 256 walk
-            # routes with _COMPACT_ROUTE_SPEC blocks/warps (see config.py).
-            upto = _COMPACT_ROUTE_UPTO
-            rb, rw = _COMPACT_ROUTE_SPEC
-            head = tuple(
-                e
-                for e in _DISPATCH_COMPACT
-                if e[0] is not None and e[0] < min(upto, 512)
+            route_parallel = os.environ.get(
+                "AITER_TDM_COMPACT_ROUTE_PARALLEL", "0"
+            ) in ("1", "true", "True")
+            schedule = (
+                (
+                    None,
+                    int(blocks_env or "64"),
+                    int(warps_env or "8"),
+                    route_parallel,
+                ),
             )
-            schedule = head + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
+        else:
+            # EP2 top-6 and EP4 top-9 have their own tables. The generic table
+            # still gets the mid-size route overlay from config.py.
+            table = _compact_dispatch_schedule(config.world_size, config.topk)
+            if table is _DISPATCH_COMPACT:
+                upto = _COMPACT_ROUTE_UPTO
+                rb, rw = _COMPACT_ROUTE_SPEC
+                head = tuple(
+                    e for e in table if e[0] is not None and e[0] < min(upto, 512)
+                )
+                schedule = head + ((upto, rb, rw, True), table[-1])
+            else:
+                schedule = table
         super().__init__(config, schedule)
         self.compact = _CompactGeometry.of(config)
         self.scale_stride = _align_up(config.dispatch_scale_nbytes, 128)
@@ -460,6 +473,10 @@ class _CompactDispatch(_Dispatch):
                     clear_route_counter=False,
                     compact_plan=True,
                     off_ep_rowmap=arena.offset("ep_rowmap"),
+                    # One payload per token per peer. The grouped GEMM scatters
+                    # those rows into expert order. The stage-1 kernel does not
+                    # launch this dispatch, so the flag stays off on that path.
+                    row_gather=True,
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
                     route_parallel=route_parallel,
                 )
@@ -581,6 +598,9 @@ class _CompactDispatch(_Dispatch):
                 recv_bound=step.recv_bound,
                 align_m=step.align_m,
                 rows=step.rows,
+                # The stage-1 kernel ships rows itself. Scattering the wire
+                # first would drop the stride that kernel requires.
+                row_gather=not s1f,
             ),
         )
         if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
