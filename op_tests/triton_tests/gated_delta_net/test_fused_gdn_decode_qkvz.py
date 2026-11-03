@@ -12,6 +12,10 @@ per-channel lower-bounded sigmoid gate, a sigmoid output gate, uniform head
 counts and no conv bias. Qwen3-Next GDN uses a per-head
 ``exp(-exp(A_log) * softplus(a + dt_bias))`` decay, a SiLU output gate,
 ``num_v_heads == 2 * num_k_heads`` and a biased conv.
+
+The op runs on gfx950 and gfx1250. The gfx1250 kernel also accepts a bf16
+recurrent state, token-strided projections, fp32 or bf16 gating parameters and
+norm weight, and no conv bias. The ``*_gfx1250_*`` tests cover these inputs.
 """
 
 import pytest
@@ -260,11 +264,18 @@ def _import_op():
     return fused_gdn_decode_qkvz
 
 
-def _requires_gfx950():
+def _requires_gluon_arch():
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-    if get_arch() != "gfx950":
-        pytest.skip(f"Gluon GDN decode kernel is gfx950-only, got {get_arch()}")
+    if get_arch() not in ("gfx950", "gfx1250"):
+        pytest.skip(f"Gluon GDN decode kernel is gfx950/gfx1250-only, got {get_arch()}")
+
+
+def _requires_gfx1250():
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx1250":
+        pytest.skip(f"gfx1250-only capability, got {get_arch()}")
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +359,7 @@ def test_reference_bf16_and_fp8_are_consistent():
 @pytest.mark.parametrize("batch", _BATCHES)
 def test_fused_gdn_decode_correctness(batch):
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(batch)
     ref_inp = {
@@ -403,7 +414,7 @@ _RATIO_TOPOLOGIES = [(16, 3), (8, 1), (4, 4)]
 @pytest.mark.parametrize("num_k_heads,ratio", _RATIO_TOPOLOGIES)
 def test_fused_gdn_decode_correctness_ratio(batch, num_k_heads, ratio):
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
     ref_inp = {
@@ -451,7 +462,7 @@ def test_fused_gdn_decode_correctness_flat_layout(batch, num_k_heads, ratio):
     must match the reference run on the equivalent interleaved packing; ratio 2
     takes the ratio-generic kernel here instead of the generated pair kernels."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
     ref_inp = {
@@ -502,7 +513,7 @@ def test_fused_gdn_decode_slot_strided_state_pools(
     width-major ([N, 3, channels] handed over as a transpose, vLLM "SD"). The
     ratio-generic kernel must read and write them in place through those views."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
     slots = inp["conv_state"].shape[0]
@@ -578,7 +589,7 @@ def test_fused_gdn_decode_query_start_loc_padding(
     empty query segment but their slot index is the null block or a stale live
     slot. With ``query_start_loc`` those rows must not touch any state."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
     live = batch - 3
@@ -629,7 +640,7 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
     """``out`` and ``query_start_loc`` are kernel operands like the rest, so CPU
     tensors with valid shapes and dtypes must not pass the support check."""
     _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
     from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
         fused_gdn_decode_qkvz_supported,
     )
@@ -669,7 +680,7 @@ def test_fused_gdn_decode_preallocated_out():
     """``out=`` writes the normalised output into the caller's buffer in place
     (a slice of a larger activation buffer) and returns that same tensor."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     batch = 16
     inp = make_inputs(batch, num_k_heads=16, ratio=3)
@@ -711,7 +722,7 @@ def test_fused_gdn_decode_ratio3_bf16_only_and_pad_slot():
     """Ratio 3: ``quant_dtype=None`` returns bf16 only, and PAD_SLOT_ID rows leave
     both state pools untouched."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(8, num_k_heads=16, ratio=3)
     inp["ssm_state_indices"][3] = -1  # PAD_SLOT_ID
@@ -756,7 +767,7 @@ def test_fused_gdn_decode_bf16_only():
     epilogue has to be optional for the op to be generally useful.
     """
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(32)
     ref_inp = {
@@ -796,7 +807,7 @@ def test_fused_gdn_decode_bf16_only():
 def test_fused_gdn_decode_pad_slot():
     """PAD_SLOT_ID (-1) rows are skipped without modifying state."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(4)
     inp["ssm_state_indices"] = torch.tensor(
@@ -830,7 +841,7 @@ def test_fused_gdn_decode_pad_slot():
 def test_fused_gdn_decode_determinism():
     """Same inputs, same state, twice: bit-identical outputs."""
     fused_gdn_decode_qkvz = _import_op()
-    _requires_gfx950()
+    _requires_gluon_arch()
 
     inp = make_inputs(32)
     args = (
@@ -859,3 +870,155 @@ def test_fused_gdn_decode_determinism():
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1].float(), second[1].float())
     assert torch.equal(first[2], second[2])
+
+
+# --------------------------------------------------------------------------
+# gfx1250 kernel: bf16 state, token-strided projections, optional conv bias and
+# fp32/bf16 gating parameters, all against the same reference.
+# --------------------------------------------------------------------------
+
+_OPERANDS = (
+    "projected_qkvz",
+    "projected_ba",
+    "conv_state",
+    "ssm_state",
+    "ssm_state_indices",
+    "conv_weight",
+    "conv_bias",
+    "A_log",
+    "dt_bias",
+    "norm_weight",
+)
+
+
+def _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, qkvz_layout, **kwargs):
+    """Reference on ``inp`` (interleaved), kernel on ``run_inp``; compares the
+    output and both state pools."""
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    out, quant, scales = fused_gdn_decode_qkvz(
+        *[run_inp[k] for k in _OPERANDS],
+        scale=run_inp["scale"],
+        norm_eps=run_inp["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+        **kwargs,
+    )
+    assert quant is None and scales is None
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        run_inp["ssm_state"].float(), ref_inp["ssm_state"].float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        run_inp["conv_state"].float(),
+        ref_inp["conv_state"].float(),
+        atol=ATOL,
+        rtol=ATOL,
+    )
+    return out
+
+
+@pytest.mark.parametrize("batch", [1, 64])
+@pytest.mark.parametrize("num_k_heads,ratio", [(4, 2), (16, 3)])
+def test_fused_gdn_decode_gfx1250_bf16_state(batch, num_k_heads, ratio):
+    """bf16 recurrent state pool: the update runs in fp32 and is stored as bf16,
+    as the reference does when given a bf16 pool."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx1250()
+
+    inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
+    inp["ssm_state"] = inp["ssm_state"].to(torch.bfloat16)
+    run_inp = to_flat_layout(inp)
+    run_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in run_inp.items()
+    }
+    _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, "flat")
+    assert run_inp["ssm_state"].dtype is torch.bfloat16
+
+
+@pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_gdn_decode_gfx1250_token_strided_projections(has_bias, state_dtype):
+    """Qwen3.5 projects q|k|v|z|b|a with one GEMM; ``projected_qkvz`` and
+    ``projected_ba`` are then column slices of that output, with a row stride
+    wider than either. The kernel reads them in place."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx1250()
+
+    batch = 64
+    inp = make_inputs(batch, num_k_heads=4, ratio=2)
+    inp["ssm_state"] = inp["ssm_state"].to(state_dtype)
+    if not has_bias:
+        inp["conv_bias"] = None
+    flat = to_flat_layout(inp)
+    qkvz, ba = flat["projected_qkvz"], flat["projected_ba"]
+    # [q|k|v|z|b|a] plus trailing padding, as a fused projection may produce.
+    packed = torch.full(
+        (batch, qkvz.shape[1] + ba.shape[1] + 64),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    packed[:, : qkvz.shape[1]] = qkvz
+    packed[:, qkvz.shape[1] : qkvz.shape[1] + ba.shape[1]] = ba
+    run_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in flat.items()
+    }
+    run_inp["projected_qkvz"] = packed[:, : qkvz.shape[1]]
+    run_inp["projected_ba"] = packed[:, qkvz.shape[1] : qkvz.shape[1] + ba.shape[1]]
+    # (a [1, N] slice still reports contiguous, so check the stride itself)
+    assert run_inp["projected_qkvz"].stride(0) == packed.shape[1] > qkvz.shape[1]
+    _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, "flat")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_gdn_decode_gfx1250_param_dtypes(dtype):
+    """A_log, dt_bias and norm_weight are widened in the kernel, so fp32 and
+    bf16 parameters (as models load them) give the reference's result for the
+    same values."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx1250()
+
+    inp = make_inputs(32, num_k_heads=4, ratio=2)
+    for name in ("A_log", "dt_bias", "norm_weight"):
+        inp[name] = inp[name].to(dtype)
+    run_inp = to_flat_layout(inp)
+    run_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in run_inp.items()
+    }
+    _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, "flat")
+
+
+def test_fused_gdn_decode_supported_arch_contract():
+    """The gfx1250-only capabilities are reported per arch, not assumed: gfx950
+    rejects them with a reason and gfx1250 accepts them."""
+    _import_op()
+    _requires_gluon_arch()
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz_supported,
+    )
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    inp = to_flat_layout(make_inputs(4, num_k_heads=4, ratio=2))
+    args = {k: inp[k] for k in _OPERANDS}
+    wide = torch.zeros(
+        4, inp["projected_qkvz"].shape[1] + 64, dtype=torch.bfloat16, device=device
+    )
+    variants = {
+        "bf16 state": {"ssm_state": inp["ssm_state"].to(torch.bfloat16)},
+        "no conv bias": {"conv_bias": None},
+        "strided projections": {
+            "projected_qkvz": wide[:, : inp["projected_qkvz"].shape[1]]
+        },
+        "bf16 A_log": {"A_log": inp["A_log"].to(torch.bfloat16)},
+    }
+    for name, change in variants.items():
+        ok, reason = fused_gdn_decode_qkvz_supported(
+            *{**args, **change}.values(), qkvz_layout="flat"
+        )
+        if get_arch() == "gfx1250":
+            assert ok, (name, reason)
+        else:
+            assert not ok and reason, name
