@@ -270,7 +270,9 @@ kernel_bench_callable = None
 # (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
-def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+def _moe_prepare_unsorted_input(
+    topk_ids, topk_weights, model_dim, moebuf_dtype, num_local_tokens=None
+):
     device = topk_ids.device
     M = topk_ids.shape[0]
     # FLAT kernels zero their own output rows on-device and need an
@@ -294,9 +296,15 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
-    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+    # sorted_expert_ids is unread; alias topk_ids so the pointer is valid.
+    # XC is one dword. A CUDA num_local_tokens is that storage. Otherwise the
+    # pointer is null (no allocation, no store) and the kernel keeps kernarg
+    # token_cnt, which is M.
+    if isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda:
+        num_valid_ids = num_local_tokens
+    else:
+        num_valid_ids = torch.empty(0, dtype=dtypes.i32, device=device)
+    return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
 
 
 def _adaptive_moe_sort(
@@ -820,7 +828,11 @@ def moe_sorting(
     if flat:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
-            topk_ids, topk_weights, model_dim, moebuf_dtype
+            topk_ids,
+            topk_weights,
+            model_dim,
+            moebuf_dtype,
+            num_local_tokens,
         )
     try:
         return _moe_sorting_impl(
@@ -1092,7 +1104,7 @@ def resolve_activation_dtype(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -1528,7 +1540,11 @@ def _fused_moe_impl(
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # gfx1250: GUGU row-interleave, not 16-row block shuffle.
-    if get_gfx() == "gfx1250" and isG1U1 and gate_mode != GateMode.INTERLEAVE:
+    if (
+        get_gfx() in ("gfx1250", "gfx1250-strict")
+        and isG1U1
+        and gate_mode != GateMode.INTERLEAVE
+    ):
         raise ValueError(
             "gfx1250 fused_moe requires gu_interleave weight layout "
             f"(gate_mode={GateMode.INTERLEAVE.value!r}), got {gate_mode.value!r}"
@@ -1629,6 +1645,7 @@ def _fused_moe_impl(
             stage2_scatter=stage2_scatter,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
+            output=output,
         )
 
     if grouped_a8w4_out is not None:

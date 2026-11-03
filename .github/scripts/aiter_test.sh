@@ -93,6 +93,12 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/test_gemm_a8w8.py)
+            # This suite checks correctness across thousands of tuned shapes.
+            # Check every shape once; the suite also times one shape per CSV
+            # kernel configuration. Dedicated runs can retain 100 iterations.
+            test_cmd=(timeout 60m env "AITER_GEMM_TEST_ITERS=${AITER_GEMM_TEST_ITERS:-1}" python3 "$file")
+            ;;
         tests/test_*.py)
             # The focused regression suite is pytest-style with no runnable
             # __main__, so `python3 "$file"` would exit 0 without executing a
@@ -122,8 +128,8 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine fused --dispatch_backend flydsl \
-                        --stage1_fused 1 --layers 2 --acc_verify 1
+                        --stage1_fused false --stage2_fused true \
+                        --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
@@ -158,6 +164,31 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec torchrun --standalone --nproc_per_node=4 "$test_file" \
                         --models m3 glm5 --tokens 256 512 1024 2048
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
+            {
+                echo "Running $file at its default group size, then at 6 ranks when available"
+            } | tee -a latest_test.log
+            # 6 ranks has no gather / scatter kernels (NCCL fallback) and a
+            # one-stage all-reduce whose 512 threads do not split evenly.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file"
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$ngpu" -lt 6 ]]; then
+                        echo "Skipping the 6-rank pass of $test_file: $ngpu GPUs"
+                        exit 0
+                    fi
+                    case "$test_file" in
+                        *test_custom_allreduce.py) exec python3 "$test_file" -t 6 --regression ;;
+                        *) exec python3 "$test_file" -t 6 ;;
+                    esac
                 '
                 _ "$file"
             )
