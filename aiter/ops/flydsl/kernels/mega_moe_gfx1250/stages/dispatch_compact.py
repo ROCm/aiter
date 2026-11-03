@@ -376,6 +376,7 @@ class _CompactDispatch(_Dispatch):
                         quant_blocks=_QUANT_FUSE_BLOCKS,
                     )
         self._precompile_s1f_plans()
+        self._precompile_per_rank_plans()
         self._kernels = self._build_kernels()
         # Width in whatever recv_dtype counts: bytes on both quantizing wires.
         width = (
@@ -694,6 +695,50 @@ class _CompactDispatch(_Dispatch):
             waves = max(waves, 16)
         return waves
 
+    def _plan_blocks_for(self, token_count: int | None) -> int:
+        """Block count for this step's route count (the arena's when None)."""
+        from ..compact_plan import compact_plan_blocks
+
+        routes = self.compact.max_routes
+        if token_count is not None:
+            routes = int(token_count) * int(self.config.topk)
+        return compact_plan_blocks(routes)
+
+    def _precompile_per_rank_plans(self) -> None:
+        """Compile the per-rank scatter's S1F=0 plan for every block count.
+
+        Off the stage-1 path that plan is keyed by its block count, which
+        follows the step's token count, so a prefill width the warmup never
+        ran would otherwise reach the JIT inside the serving loop. This walks
+        the recv bounds that run the S1F=0 plan, takes the alignments they
+        map to, and compiles one plan per distinct block count.
+        """
+        config = self.config
+        if not config.per_rank_scatter:
+            return
+        from ..s1f_ctl import _S1F_MAX_RECV
+
+        max_recv = int(config.max_recv)
+        lo = int(_S1F_MAX_RECV) + 1 if self.fusion.enabled else 1
+        if lo > max_recv:
+            return
+        steps = {}
+        for b in sorted(set(range(lo, max_recv + 1, 16)) | {max_recv}):
+            st = self._step_for(b)
+            steps.setdefault(int(st.align_m), st)
+        widths = {}
+        for tok in range(1, int(config.max_tokens_per_rank) + 1):
+            widths.setdefault(self._plan_blocks_for(tok), tok)
+        saved = self._step
+        try:
+            for align_m, st in sorted(steps.items()):
+                self._step = st
+                for tok in sorted(widths.values()):
+                    for slot in range(self._PLAN_SLOTS):
+                        self._plan_for(align_m, slot, tok)
+        finally:
+            self._step = saved
+
     def _slot_bufs(self, slot: int) -> dict:
         bufs = {
             "tok_map": self._tok_maps[slot],
@@ -721,11 +766,7 @@ class _CompactDispatch(_Dispatch):
         launch. The plan and the expert GEMM must agree on the tile, and
         double-buffered plans must not share a done counter.
         """
-        from ..compact_plan import (
-            compact_plan_blocks,
-            compact_plan_waves,
-            compile_tdm_compact_plan,
-        )
+        from ..compact_plan import compact_plan_waves, compile_tdm_compact_plan
 
         align_m = int(align_m)
         slot = int(slot)
@@ -739,16 +780,19 @@ class _CompactDispatch(_Dispatch):
         # the step, and tok_map / the fused quant are their own kernels.
         if fused:
             waves = self._plan_waves_for(token_count)
-            routes = (
-                self.compact.max_routes
-                if token_count is None
-                else int(token_count) * int(self.config.topk)
-            )
-            blocks = compact_plan_blocks(routes)
+            blocks = self._plan_blocks_for(token_count)
             key = (align_m, slot, waves, blocks, write_tok_map, plan_s1f, qb)
         else:
-            waves, blocks = None, None
-            key = (align_m, slot)
+            # The per-rank plan writes comb_slot for every route, so past one
+            # block's LDS route table it splits the routes across blocks like
+            # the fused plan does.
+            waves = None
+            blocks = (
+                self._plan_blocks_for(token_count)
+                if self.config.per_rank_scatter
+                else None
+            )
+            key = (align_m, slot, blocks)
         launch = self._plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
@@ -773,6 +817,8 @@ class _CompactDispatch(_Dispatch):
                 }
                 if plan_s1f:
                     extra.update(s1f=True, write_tok_map=write_tok_map, align_m=align_m)
+            elif blocks is not None:
+                extra = {"plan_blocks": blocks}
             # Stage-1: runs and tile_info per producer flag tile; experts are
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
