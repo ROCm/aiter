@@ -50,7 +50,9 @@ sys.path.insert(0, str(HERE))
 import check_citations  # noqa: E402  -- the one authority on whether a citation resolves
 
 REPORTS = HERE / "reports"
-REPO = os.environ.get("AITER_BOT_REPO") or os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
+REPO = os.environ.get("AITER_BOT_REPO") or os.environ.get(
+    "GITHUB_REPOSITORY", "ROCm/aiter"
+)
 BOT = os.environ.get("AITER_BOT_NAME", "aiter-bot")
 # The dedup marker is deliberately NOT built from BOT. It is a literal that has already been
 # written into comments on live PRs; deriving it from an overridable env var would let a box
@@ -223,8 +225,22 @@ def flagged_citations(pr):
     if not text.strip():
         return None
     out = set()
+    # Hard failures only. A `CITATIONS BAD:` entry means the citation resolves to
+    # nothing -- absent file, or a line past the end of it -- so anchoring there would
+    # fail at the API or point at empty space. A `CITATIONS NOTE:` says a quoted symbol
+    # is not within five lines of the cited one: a quality hint the checker's own
+    # docstring puts at roughly 50% precision, not evidence the line is wrong. Counting
+    # notes was measured switching the feature off entirely on aiter#7303 -- five cited
+    # findings, zero anchors, four of them vetoed by notes.
+    in_bad = False
     for ln in text.split("\n"):
-        if not (ln.startswith("CITATIONS NOTE:") or ln.startswith("  ")):
+        if ln.startswith("CITATIONS BAD:"):
+            in_bad = True
+            continue
+        if ln.startswith("CITATIONS"):
+            in_bad = False
+            continue
+        if not (in_bad and ln.startswith("  ")):
             continue
         m = check_citations.CITATION.search(ln)
         if m:
@@ -389,7 +405,7 @@ def first_clause(finding, cite=""):
         # first time this ran over one.
         s = re.sub(r"^`?" + re.escape(cite) + r"(?:-\d+)?`?[,:]?\s*", "", s)
     for sep in (" — ", " -- ", "; "):
-        if sep in s[:CLAUSE + 40]:
+        if sep in s[: CLAUSE + 40]:
             s = s.split(sep, 1)[0]
             break
     if len(s) > CLAUSE:
@@ -480,7 +496,10 @@ def already_posted(pr, sha):
     only read the reviews endpoint would repost on top of every one of those.
     """
     marker = f"{MARKER_BOT} review pr={pr} head={sha}"
-    for ep in (f"issues/{pr}/comments?per_page=100", f"pulls/{pr}/reviews?per_page=100"):
+    for ep in (
+        f"issues/{pr}/comments?per_page=100",
+        f"pulls/{pr}/reviews?per_page=100",
+    ):
         cs = _api(ep)
         if isinstance(cs, list) and any(marker in (c.get("body") or "") for c in cs):
             return True
@@ -532,19 +551,20 @@ def do_post(pr):
             # silently sheds half its findings reads exactly like a review that only had
             # the other half -- the failure this project keeps finding in its own parts.
             payload = dict(payload)
-            payload["body"] = (
-                payload["body"]
-                + "\n\n_The findings below could not be attached to their lines — GitHub "
-                "refused the anchored review, so they are inlined here instead._\n\n"
-                + "\n\n".join(
-                    f"`{anchor_label(c)}` — {c['body']}" for c in payload["comments"]
-                )
+            payload["body"] = payload[
+                "body"
+            ] + "\n\n_The findings below could not be attached to their lines — GitHub " "refused the anchored review, so they are inlined here instead._\n\n" + "\n\n".join(
+                f"`{anchor_label(c)}` — {c['body']}" for c in payload["comments"]
             )
             payload["comments"] = []
         r = _api(f"pulls/{pr}/reviews", method="POST", body=payload)
         if isinstance(r, dict) and r.get("html_url"):
             n = len(payload["comments"])
-            how = "" if attempt == "anchored" else "  [ANCHORS REFUSED -- folded into summary]"
+            how = (
+                ""
+                if attempt == "anchored"
+                else "  [ANCHORS REFUSED -- folded into summary]"
+            )
             return True, (
                 f'{r["html_url"]}  ({n} inline, '
                 f'{len(payload["body"])} chars in summary){how}'
@@ -587,9 +607,17 @@ def main(argv):
             ok, info = do_post(pr)
             print(f'  #{pr}: POST -> {"✅ "+info if ok else "❌ "+info}')
             (posted if ok else failed).append(pr)
-            if ok and severity((REPORTS / f"PR-{pr}" / "card.md").read_text(encoding="utf-8")) == "high":
+            if (
+                ok
+                and severity(
+                    (REPORTS / f"PR-{pr}" / "card.md").read_text(encoding="utf-8")
+                )
+                == "high"
+            ):
                 # extra signal in the checks UI; the card itself is already posted as a comment
-                print(f"::warning title=aiter-bot HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)")
+                print(
+                    f"::warning title=aiter-bot HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)"
+                )
         else:
             print(f"  #{pr}: {action} — {reason}")
         if a.payload and (REPORTS / f"PR-{pr}" / "card.md").is_file():

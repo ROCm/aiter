@@ -41,18 +41,27 @@ QUOTED = re.compile(r"`([A-Za-z_][\w.]{2,})`")
 EXCERPT = re.compile(r"[\"\u201c]([^\"\u201c\u201d]{12,})[\"\u201d]")
 
 
-def tree_for(work: pathlib.Path, explicit: str | None) -> pathlib.Path | None:
+def trees_for(work: pathlib.Path, explicit: str | None):
+    """The trees a citation may resolve against, in the order to try them.
+
+    `head/` holds the PR's versions of the files it changed; `merge-target/` is the full
+    tree at BASE_SHA, the code before this PR. A finding citing a line the PR added
+    exists only in the first; a finding citing untouched context exists only in the
+    second. One tree for everything gets one of those two wrong.
+
+    It used to take merge-target for everything, and the reviewer found that on
+    aiter#7303 itself: citations into files that PR grew reported `_publish.py:221 --
+    file has 171 lines`, 171 being the length on base. Every citation was flagged, every
+    anchor vetoed, and the review published with zero inline comments while all seven
+    gates read green.
+    """
     if explicit:
         p = pathlib.Path(explicit)
-        return p if p.is_dir() else None
-    for name in ("merge-target", "head"):
-        p = work / name
-        if p.is_dir():
-            return p
-    return None
+        return [p] if p.is_dir() else []
+    return [work / n for n in ("head", "merge-target") if (work / n).is_dir()]
 
 
-def check(card_text: str, tree: pathlib.Path, changed=()):
+def check(card_text: str, trees, changed=()):
     """Yield one complaint string per bad citation.
 
     `changed` is the PR's changed paths; a bare basename resolves against those first.
@@ -63,8 +72,12 @@ def check(card_text: str, tree: pathlib.Path, changed=()):
         quoted = set(QUOTED.findall(raw))
         excerpts = [e.strip() for e in EXCERPT.findall(raw)]
         for path, lineno in CITATION.findall(raw):
-            f = tree / path
-            if not f.is_file():
+            # Try each tree in order: head/ for a file this PR changed, merge-target/
+            # for context code it did not touch.
+            f = next((t / path for t in trees if (t / path).is_file()), None)
+            tree = next((t for t in trees if (t / path).is_file()), trees[0])
+            if f is None:
+                f = trees[0] / path
                 # Cards usually cite a bare basename. Resolve it the way a reader does:
                 # against the files this PR actually touched, not the whole tree -- a
                 # repo this size has several `scheduler.py`, and only one is in the diff.
@@ -165,7 +178,7 @@ def main(argv):
             diff.read_text(encoding="utf-8", errors="replace"),
             re.MULTILINE,
         )
-    out = list(check(card.read_text(encoding="utf-8"), tree, changed))
+    out = list(check(card.read_text(encoding="utf-8"), trees, changed))
     bad = [m for sev, m in out if sev == "bad"]
     notes = [m for sev, m in out if sev == "note"]
     # Only the deterministic failures gate. Proximity is a heuristic -- matching prose

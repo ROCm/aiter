@@ -74,8 +74,8 @@ def report(tmp_path, monkeypatch):
     (d / "card.md").write_text(CARD, encoding="utf-8")
     (d / "pr.diff").write_text(DIFF, encoding="utf-8")
     (d / "citations.txt").write_text(
-        "CITATIONS NOTE: helper.py:7 -- none of ['helper'] appears anywhere in this file\n"
-        "CITATIONS: every cited file:line resolves (1 proximity note(s))\n",
+        "CITATIONS BAD: 1 citation(s) do not resolve\n"
+        "  helper.py:7 -- no such file in the tree\n",
         encoding="utf-8",
     )
     (d / "pr_meta.json").write_text('{"headRefOid": "deadbeef"}', encoding="utf-8")
@@ -157,13 +157,33 @@ def test_anchors_only_what_the_diff_contains(report, monkeypatch):
     assert "elsewhere.py:900" in pl["body"]
 
 
-def test_a_flagged_citation_forfeits_the_inline_slot(report, monkeypatch):
+def test_a_hard_citation_failure_forfeits_the_inline_slot(report, monkeypatch):
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     pl = _publish.review_payload("9999")
     # shuffle.py:22 IS in the diff, but the same finding also cites helper.py:7, which
     # check_citations flagged -- so the finding is not anchored at all.
     assert not any(c["line"] == 22 for c in pl["comments"])
     assert "helper.py:7" in pl["body"]
+
+
+def test_a_proximity_note_does_not_forfeit_the_inline_slot(report, monkeypatch):
+    """A note is a quality hint, not evidence the cited line is wrong.
+
+    Counting notes as disqualifying was measured switching the feature off: on
+    aiter#7303 the reviewer produced five cited findings and anchored none, four of them
+    vetoed by notes. check_citations' own docstring puts that half at roughly 50%
+    precision, and a heuristic that silently disables what it guards is the worse
+    failure -- a wrong anchor is visible and correctable, an absent one looks like a
+    review with nothing to say.
+    """
+    (report / "citations.txt").write_text(
+        "CITATIONS NOTE: helper.py:7 -- none of ['x'] appears anywhere in this file\n"
+        "CITATIONS: every cited file:line resolves (1 proximity note(s))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    pl = _publish.review_payload("9999")
+    assert pl["comments"], "a proximity note must not veto every anchor"
 
 
 def test_no_citation_check_means_nothing_is_anchored(report, monkeypatch):
@@ -215,9 +235,12 @@ def test_dedup_marker_is_looked_for_in_reviews_too(report, monkeypatch):
     assert any(p.startswith("pulls/9999/reviews") for p in seen)
 
 
-def test_dedup_still_sees_the_issue_comments_the_bot_already_posted(report, monkeypatch):
+def test_dedup_still_sees_the_issue_comments_the_bot_already_posted(
+    report, monkeypatch
+):
     """aiter's bot is live and its markers are sitting in issue comments on real PRs. A
-    dedup that only read the reviews endpoint would repost on top of every one of them."""
+    dedup that only read the reviews endpoint would repost on top of every one of them.
+    """
     seen = []
 
     def fake_api(path, method="GET", body=None):
@@ -252,13 +275,17 @@ def _refusing_api(reject_anchored=True):
             return []
         sent.append(body)
         if reject_anchored and body.get("comments"):
-            return {"message": "pull_request_review_thread.line must be part of the diff"}
+            return {
+                "message": "pull_request_review_thread.line must be part of the diff"
+            }
         return {"html_url": "http://x/review"}
 
     return fake_api, sent
 
 
-def test_a_refused_anchor_retries_the_same_review_without_anchors(report, monkeypatch, capsys):
+def test_a_refused_anchor_retries_the_same_review_without_anchors(
+    report, monkeypatch, capsys
+):
     fake_api, sent = _refusing_api()
     monkeypatch.setattr(_publish, "_api", fake_api)
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
@@ -270,7 +297,9 @@ def test_a_refused_anchor_retries_the_same_review_without_anchors(report, monkey
     assert "✅" in out
 
 
-def test_the_degraded_review_still_carries_the_findings_it_could_not_anchor(report, monkeypatch):
+def test_the_degraded_review_still_carries_the_findings_it_could_not_anchor(
+    report, monkeypatch
+):
     """The whole point: a review that silently sheds half its findings reads exactly like a
     review that only had the other half."""
     fake_api, sent = _refusing_api()
@@ -278,7 +307,9 @@ def test_the_degraded_review_still_carries_the_findings_it_could_not_anchor(repo
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     _publish.main(["9999", "--post"])
     folded = sent[1]["body"]
-    assert "_FLYDSL_USE_HERD" in folded, "the anchored finding vanished from the summary"
+    assert (
+        "_FLYDSL_USE_HERD" in folded
+    ), "the anchored finding vanished from the summary"
     assert "aiter/ops/shuffle.py:23" in folded
     # and the findings that were never anchored are still there too
     assert "elsewhere.py:900" in folded
@@ -363,7 +394,11 @@ def range_report(tmp_path, monkeypatch):
 def test_a_cited_span_anchors_the_span_not_its_first_line(range_report):
     pl = _publish.review_payload("8888")
     c = [x for x in pl["comments"] if x.get("start_line") == 101][0]
-    assert (c["path"], c["start_line"], c["line"]) == ("aiter/ops/layernorm.py", 101, 104)
+    assert (c["path"], c["start_line"], c["line"]) == (
+        "aiter/ops/layernorm.py",
+        101,
+        104,
+    )
     assert c["start_side"] == "RIGHT" and c["side"] == "RIGHT"
 
 
@@ -378,7 +413,9 @@ def test_every_span_anchor_is_shaped_the_way_github_takes_one(range_report):
             assert "start_side" not in c, c
 
 
-def test_a_span_straddling_two_hunks_degrades_to_the_line_that_is_in_the_diff(range_report):
+def test_a_span_straddling_two_hunks_degrades_to_the_line_that_is_in_the_diff(
+    range_report,
+):
     """106 is in the first hunk, 201 in the second, and the lines between are in neither.
     GitHub takes a span only inside one hunk -- so this anchors 106 alone rather than
     sending a range that would fail the entire review."""
@@ -420,7 +457,8 @@ def test_a_span_is_not_also_counted_as_its_own_first_line(range_report):
 def test_a_line_outside_the_diff_gets_a_permalink_pinned_to_the_head_sha(range_report):
     body = _publish.review_payload("8888")["body"]
     assert (
-        "https://github.com/ROCm/aiter/blob/c0ffee1/aiter/ops/layernorm.py#L5220" in body
+        "https://github.com/ROCm/aiter/blob/c0ffee1/aiter/ops/layernorm.py#L5220"
+        in body
     )
 
 
@@ -471,7 +509,9 @@ def test_no_citation_check_means_no_permalinks_either(report, monkeypatch):
 # ------------------------------------------------------------ a refused RANGE degrades
 
 
-def test_a_refused_range_review_degrades_and_keeps_the_findings_text(range_report, monkeypatch, capsys):
+def test_a_refused_range_review_degrades_and_keeps_the_findings_text(
+    range_report, monkeypatch, capsys
+):
     """A malformed span is a new way to fail an all-or-nothing call. The fallback must catch
     it like any other refusal, and the span's finding must survive into the summary -- a
     review that sheds it reads exactly like a review that never made it."""
