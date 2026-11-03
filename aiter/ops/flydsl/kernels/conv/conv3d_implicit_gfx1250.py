@@ -31,7 +31,6 @@ from .conv3d_gfx1250_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
-    LDS_PAD,
     OOB_SENTINEL_ELEM,
     TILE_K,
     WAVE_SIZE,
@@ -518,48 +517,38 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
         big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
 
+        lds_k = cfg.lds_k_stride
+
         a_base = (
             ((n_idx * Dp + ot * param.st) * Hp + oh0 * param.sh) * Wp + ow0 * param.sw
         ) * Cp + fx.Int64(gi) * cgp
         row_stride = param.sh * Wp * Cp
         col_stride = param.sw * Cp
-        gA = fx.Tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(x), a_base),
-                fx.make_layout((R, C, TILE_K), (row_stride, col_stride, 1)),
-            )
-        )
         ho_left = fx.Int32(fx.Int64(ho_v) - oh0)
         wo_left = fx.Int32(fx.Int64(wo_v) - ow0)
-        atom_a = fx.rocdl.make_tdm_atom(
-            gA,
-            [ho_left, wo_left, None],
-            strides=[row_stride, col_stride, None],
-            num_warps=num_warps,
-            pad_interval=TILE_K,
-            pad_amount=LDS_PAD,
-            early_timeout=True,
-        )
 
-        b_base = fx.Int64(n_offset) * CRS
+        # Weights are K-tile aligned: one descriptor covers the whole channel
+        # range, the tail is clamped by the view extent, and each round indexes
+        # the K tile it needs. The LDS tile stride carries pad_interval/pad_amount.
+        n_left = fx.Int32(fx.Int64(kernel_grid.kg) - fx.Int64(n_local))
         gB = fx.Tensor(
             fx.make_view(
-                fx.add_offset(fx.get_iter(weight), b_base),
-                fx.make_layout((cfg.tile_n, TILE_K), (CRS, 1)),
+                fx.add_offset(fx.get_iter(weight), fx.Int64(n_offset) * CRS),
+                fx.make_layout((n_left, CRS), (CRS, 1)),
             )
         )
-        n_left = fx.Int32(fx.Int64(kernel_grid.kg) - fx.Int64(n_local))
-        atom_b = fx.rocdl.make_tdm_atom(
+        atom_b, coord_b = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
             gB,
-            [n_left, None],
-            strides=[CRS, None],
+            fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1)),
+            (cfg.tile_n, TILE_K),
             num_warps=num_warps,
-            pad_interval=TILE_K,
-            pad_amount=LDS_PAD,
-            early_timeout=True,
         )
+        blk_b = fx.zipped_divide(coord_b, (cfg.tile_n, TILE_K))[None, (0, None)]
 
-        lds_k = cfg.lds_k_stride
+        wave = fx.rocdl.wave_id()
+        warp_layout = fx.make_layout(num_warps, 1)
+
         a_bases = lane_bases_rowmajor(warp_m_base, wmma_m_rep, lds_k, lane16, lane_kgrp)
         b_bases = lane_bases_rowmajor(warp_n_base, wmma_n_rep, lds_k, lane16, lane_kgrp)
 
@@ -580,18 +569,35 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             kt_i = t2 // param.kh
             return kt_i, kh_i, kw_i, cc
 
-        def imm_a(kt_i, kh_i, kw_i, cc):
-            elems = (
-                (kt_i * param.dt * Hp + kh_i * param.dh) * Wp + kw_i * param.dw
-            ) * Cp + cc * TILE_K
-            return elems * BF16_BYTES
-
-        def imm_b(kt_i, kh_i, kw_i, cc):
-            k_base = ((kt_i * param.kh + kh_i) * param.kw + kw_i) * cgp + cc * TILE_K
-            return k_base * BF16_BYTES
-
         def issue_tdm(buf_idx, abs_k):
             kt_i, kh_i, kw_i, cc = _decode_k(abs_k)
+            # A tap shifts the base by whole rows/cols, which is not a multiple of
+            # the tile, so the tiled descriptor is built per issue from a shifted
+            # base instead of reusing one atom with an immediate offset.
+            a_off = (
+                a_base
+                + (kt_i * fx.Int64(param.dt) * Hp + kh_i * fx.Int64(param.dh))
+                * Wp
+                * Cp
+                + kw_i * fx.Int64(param.dw) * Cp
+                + fx.Int64(cc) * TILE_K
+            )
+            gA = fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(fx.get_iter(x), a_off),
+                    fx.make_layout(
+                        (ho_left, wo_left, TILE_K), (row_stride, col_stride, 1)
+                    ),
+                )
+            )
+            atom_a, coord_a = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
+                gA,
+                fx.make_layout((R, C, TILE_K), (C * lds_k, lds_k, 1)),
+                (R, C, TILE_K),
+                num_warps=num_warps,
+            )
+            blk_a = fx.zipped_divide(coord_a, (R, C, TILE_K))[None, (0, 0, None)]
             lds_a = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(big_a_mem, slot_a(buf_idx)),
@@ -604,8 +610,14 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                     fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1)),
                 )
             )
-            fx.copy(atom_a, gA, lds_a, imm_offset=imm_a(kt_i, kh_i, kw_i, cc))
-            fx.copy(atom_b, gB, lds_b, imm_offset=imm_b(kt_i, kh_i, kw_i, cc))
+            ts_a, tg_a = fx.rocdl.cdna5.tdm_partition(
+                atom_a, wave, warp_layout, lds_a, blk_a
+            )
+            fx.copy(atom_a, tg_a[None, 0], ts_a[None, 0])
+            ts_b, tg_b = fx.rocdl.cdna5.tdm_partition(
+                atom_b, wave, warp_layout, lds_b, blk_b
+            )
+            fx.copy(atom_b, tg_b[None, fx.Int32(abs_k)], ts_b[None, 0])
 
         def load_a_frags(buf_idx):
             off = slot_a(buf_idx)
