@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from argparse import ArgumentParser, ArgumentTypeError
+
 import torch
 import triton
 
 from aiter import dtypes
 from aiter.ops.triton.moe.moe_op_gemm_a16w16 import fused_moe_bf16_g1u1
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    override_parser_action,
-    positive_int,
-)
 
 _SELECTED_TOKENS = [1152, 1543, 1728, 1799, 1803, 1815, 1837, 1945, 2048]
 _MODEL_DIM = 2048
 _INTER_DIM = 128
 _EXPERTS = 256
 _TOPK = 8
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ArgumentTypeError(f"{value!r} is not an integer") from error
+    if parsed <= 0:
+        raise ArgumentTypeError(f"{value!r} is not positive")
+    return parsed
 
 
 def _make_case(tokens: int, device: torch.device):
@@ -79,10 +86,12 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = get_parser(kernel_name="moe_gemm_a16w16")
-    override_parser_action(
-        parser,
-        action="--metric",
+    parser = ArgumentParser(
+        prog="Benchmark moe_gemm_a16w16",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--metric",
         choices=["time", "throughput"],
         default="time",
     )
