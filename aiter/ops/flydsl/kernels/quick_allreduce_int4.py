@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce, plus its reduce-scatter
+and all-gather phases on their own (``mode``, below).
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
@@ -14,6 +15,27 @@ stays ``atoms * 1152``.
 before the first pack; the gathered sum is multiplied by it once, through
 the all-gather dequant scale, before the bf16 store. The second pack is
 left unchanged.
+
+``mode`` ``"rs"`` / ``"ag"`` run one phase on its own, for sequence
+parallelism (``super_tile=1`` only). Rank ``d`` then owns a contiguous block
+of ``N / world_size`` bytes (rows ``[d*T/W, (d+1)*T/W)`` of a ``[T, H]``
+tensor), not a slice of every tile: the tile machinery is unchanged and only
+the HBM address of atom ``a = d*rank_atoms + k`` of tile ``v`` moves from
+``v*ATOMS + a`` to ``d*A_s + v*rank_atoms + k`` with
+``A_s = num_tiles * rank_atoms``. Every partial, the rank's own included,
+goes through the codec. Both modes need the payload ``N`` to be a whole
+number of tiles and ``divisor == 1``.
+
+The all-reduce's second phase is the only guard against inbox reuse (a sender
+writes only after the receiver's previous release flag). A single phase has
+none, so both modes send their payload through the all-gather phase's slots
+and start every round with ``ready``: the reduce-scatter phase's release flag
+with no payload, published once this rank has finished reading the previous
+round (or launch), awaited by every sender before its first payload store. The
+exchange overlaps the round's load and quantize, and nothing is awaited after
+the reads, so a following all-reduce is safe too: it writes the reduce-scatter
+slots at once and waits for this rank's flag before it writes the all-gather
+ones. No other inbox word is used.
 """
 
 import flydsl.compiler as flyc
@@ -36,6 +58,11 @@ from .quant_utils import emit_mx_e8m0_scale
 
 WORLD = 8
 SUPPORTED_WORLDS = (2, 4, 8)
+# All-reduce, and its reduce-scatter / all-gather phase on its own.
+MODE_AR = "ar"
+MODE_RS = "rs"
+MODE_AG = "ag"
+MODES = (MODE_AR, MODE_RS, MODE_AG)
 SUPER_TILES = (1, 8)
 DEFAULT_GRID_CAP = 304 * 4
 # 1 keeps the previous INT4 result; larger divisors are opt-in.
@@ -370,6 +397,7 @@ def make_quick_allreduce_int4_kernel(
     norm_latency: bool = False,
     norm_mxfp4: bool = False,
     tile_atoms: int | None = None,
+    mode: str = MODE_AR,
 ):
     """Build the INT4 all-reduce kernel.
 
@@ -390,8 +418,21 @@ def make_quick_allreduce_int4_kernel(
     ``norm_latency`` (``super_tile=1`` only) trades occupancy for latency:
     two workgroups per CU instead of the persistent-grid residency, so the
     host may only launch it with ``num_tiles <= latency_max_tiles(cu)``.
+
+    ``mode`` is ``"ar"`` (default, the two-phase all-reduce), ``"rs"`` (the
+    reduce-scatter phase alone: ``[T, H]`` partials in, this rank's contiguous
+    ``[T/W, H]`` reduced block out) or ``"ag"`` (the all-gather phase alone:
+    ``[T/W, H]`` in, ``[T, H]`` out). ``nbytes`` is the size of the full
+    ``[T, H]`` tensor in both. They share the engine's inbox and colors with
+    the all-reduce, take ``super_tile=1``, the 8-atom tile and no fused norm,
+    and need ``nbytes`` to be a whole number of tiles.
     """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    SP_MODE = mode != MODE_AR
     fuse_norm = norm_hidden is not None
+    if SP_MODE and (fuse_norm or norm_latency or norm_mxfp4):
+        raise ValueError(f"mode={mode!r} has no fused-norm epilogue")
     if norm_latency and (not fuse_norm or super_tile != 1):
         raise ValueError("norm_latency needs norm_hidden and super_tile=1")
     if norm_mxfp4 and not fuse_norm:
@@ -416,6 +457,10 @@ def make_quick_allreduce_int4_kernel(
         raise ValueError(
             f"hidden={norm_hidden} needs a {norm_atoms}-atom tile, got {tile_atoms}"
         )
+    if SP_MODE and tile_atoms != DEFAULT_ATOMS:
+        raise ValueError(f"mode={mode!r} needs the {DEFAULT_ATOMS}-atom tile")
+    if SP_MODE and super_tile != 1:
+        raise ValueError(f"mode={mode!r} needs super_tile=1, got {super_tile!r}")
     # Per-build tile width; the 8-atom build is the original kernel.
     ATOMS = int(tile_atoms)
     TILE_BYTES = BLOCK * ATOMS * 16
@@ -515,6 +560,25 @@ def make_quick_allreduce_int4_kernel(
             (num_tiles, ATOMS, BLOCK * 4),
             (TILE_I32, BLOCK * 4, 1),
         )
+        if const_expr(SP_MODE):
+            # Shard-owned HBM views (module docstring). The full [T, H] tensor
+            # as (dest rank, tile, k, atom): rank d's block is bytes
+            # [d*N/W, (d+1)*N/W), and virtual tile v holds its atoms
+            # [v*rank_atoms, (v+1)*rank_atoms). The shard side is one rank's
+            # block as (tile, k, atom).
+            full_layout = fx.make_layout(
+                (world_size, num_tiles, rank_atoms, BLOCK * 4),
+                (
+                    num_tiles * fx.Int32(rank_atoms * BLOCK * 4),
+                    rank_atoms * BLOCK * 4,
+                    BLOCK * 4,
+                    1,
+                ),
+            )
+            shard_layout = fx.make_layout(
+                (num_tiles, rank_atoms, BLOCK * 4),
+                (rank_atoms * BLOCK * 4, BLOCK * 4, 1),
+            )
         hbm_row_layout = fx.make_layout((1, BLOCK * 4), (BLOCK * 4, 1))
         hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
         hbm_copy = fx.make_tiled_copy_tv(
@@ -571,14 +635,30 @@ def make_quick_allreduce_int4_kernel(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        def _payload_tensor(ptr):
-            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
+        def _payload_tensor(ptr, layout, live_bytes):
+            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), layout)
             return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
+                view, max_size=False, num_records_bytes=live_bytes
             )
 
-        in_buf = _payload_tensor(inp_ptr)
-        out_buf = _payload_tensor(out_ptr)
+        if const_expr(SP_MODE):
+            # ``nbytes`` is the full tensor in both modes; the shard side is
+            # one rank's block.
+            shard_bytes = nbytes // fx.Int64(world_size)
+            full_in = mode == MODE_RS
+            in_buf = _payload_tensor(
+                inp_ptr,
+                full_layout if full_in else shard_layout,
+                nbytes if full_in else shard_bytes,
+            )
+            out_buf = _payload_tensor(
+                out_ptr,
+                shard_layout if full_in else full_layout,
+                shard_bytes if full_in else nbytes,
+            )
+        else:
+            in_buf = _payload_tensor(inp_ptr, hbm_layout, nbytes)
+            out_buf = _payload_tensor(out_ptr, hbm_layout, nbytes)
         if const_expr(fuse_norm):
             res_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 residual_ptr, num_records_bytes=nbytes
@@ -619,9 +699,10 @@ def make_quick_allreduce_int4_kernel(
             )
             return fx.Int32(flags_i32) + slot
 
-        def _hbm_atom_row(buf, tile, atom):
+        def _hbm_row(buf, *coord):
+            """One 4 KiB atom of *buf*: *coord* indexes all but its last mode."""
             return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))),
+                fx.get_iter(fx.slice(buf, (*coord, None))),
                 hbm_row_layout,
             )
 
@@ -635,13 +716,36 @@ def make_quick_allreduce_int4_kernel(
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
             buffer_ops.buffer_store(color, color_rsrc, off)
 
+        def _load_atom(buf, *coord):
+            src = hbm_copy.partition_S(_hbm_row(buf, *coord))
+            frag = fx.make_fragment_like(src)
+            fx.copy(hbm_copy_atom, src, frag)
+            return _atom_bf16_to_f16(fx.Vector(frag.load()))
+
+        def _store_atom(buf, atom, *coord):
+            dst = hbm_copy.partition_D(_hbm_row(buf, *coord))
+            frag = fx.make_fragment_like(dst)
+            frag.store(_atom_f16_to_bf16(atom))
+            fx.copy(hbm_copy_atom, frag, dst)
+
         def _load_tile_atoms(tile):
             atoms = []
             for atom in range_constexpr(ATOMS):
-                src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                atoms.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
+                if const_expr(mode == MODE_RS):
+                    # Virtual atom ``d * rank_atoms + k`` is atom ``k`` of tile
+                    # ``tile`` of destination ``d``'s block.
+                    atoms.append(
+                        _load_atom(in_buf, atom // rank_atoms, tile, atom % rank_atoms)
+                    )
+                else:
+                    atoms.append(_load_atom(in_buf, tile, atom))
+            return atoms
+
+        def _load_shard_atoms(tile):
+            """The ``rank_atoms`` atoms of this rank's block in virtual tile *tile*."""
+            atoms = []
+            for k in range_constexpr(rank_atoms):
+                atoms.append(_load_atom(in_buf, tile, k))
             return atoms
 
         # One shared divisor. Scale before the first pack so the group max and
@@ -663,11 +767,21 @@ def make_quick_allreduce_int4_kernel(
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
-                packed = _atom_f16_to_bf16(atoms[atom])
-                dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
-                frag = fx.make_fragment_like(dst)
-                frag.store(packed)
-                fx.copy(hbm_copy_atom, frag, dst)
+                if const_expr(mode == MODE_AG):
+                    _store_atom(
+                        out_buf,
+                        atoms[atom],
+                        atom // rank_atoms,
+                        tile,
+                        atom % rank_atoms,
+                    )
+                else:
+                    _store_atom(out_buf, atoms[atom], tile, atom)
+
+        def _store_shard_atoms(tile, accs):
+            """Store the ``rank_atoms`` reduced atoms into this rank's block."""
+            for k in range_constexpr(rank_atoms):
+                _store_atom(out_buf, accs[k], tile, k)
 
         def _atom_soff(tile, atom):
             return tile * fx.Int32(TILE_BYTES) + fx.Int32(atom * BLOCK * 16)
@@ -902,11 +1016,12 @@ def make_quick_allreduce_int4_kernel(
                     )
 
         def _pack_all_gather(accs):
-            """Quantize the reduced slice and replicate it for every peer.
+            """Quantize this rank's ``rank_atoms`` atoms, replicated for every peer.
 
-            After reduce-scatter this rank holds ``rank_atoms`` reduced
-            atoms. Copy the same packets into every destination slot so the
-            NT fanout can push them into every peer's all-gather inbox.
+            The atoms are the reduced slice after the all-reduce's first phase,
+            and this rank's own shard in ``mode="ag"``. Copy the same packets
+            into every destination slot so the NT fanout can push them into
+            every peer's all-gather inbox.
             """
             for k in range_constexpr(rank_atoms):
                 packed, scale, is_leader = _codec_quant(accs[k], lane, tid)
@@ -959,9 +1074,11 @@ def make_quick_allreduce_int4_kernel(
             Last 64 B of this rank's slot (after the ST rank-tiles) is the
             handshake: 16 i32s all equal to *color*. Peers spin on that
             sector in their copy of our slot; seeing *color* means our
-            payload is visible.
+            payload is visible. ``mode="rs"`` / ``"ag"`` also publish ``ready``
+            this way, a flag with no payload.
 
-            ``vmcnt(0)``: this 64-lane wave's NT payload stores are done.
+            ``vmcnt(0)``: this 64-lane wave's NT payload stores are done (for
+            ``ready``: the tile's loads have landed).
             The workgroup barrier: the other three 64-lane waves issued
             payload too; ``vmcnt`` is per-wave, so without the join a
             wave-0 handshake could race stores still in flight. Neither
@@ -1011,14 +1128,12 @@ def make_quick_allreduce_int4_kernel(
             e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
             return packed, _e4m3_decoding_scale(e)
 
-        def _reduce_scattered(sub):
-            """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
+        def _reduce_scattered(sub, phase=PHASE_REDUCE_SCATTER):
+            """Dequant-accumulate every peer's packet of *phase* for *sub*."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale = _recv_quantized(
-                        PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
-                    )
+                    packed, scale = _recv_quantized(phase, fx.Int32(src), sub, k)
                     if accs[k] is None:
                         accs[k] = _codec_dequant(packed, scale)
                     else:
@@ -1042,7 +1157,39 @@ def make_quick_allreduce_int4_kernel(
 
         n_block_tiles = (num_tiles - bid + fx.Int32(grid - 1)) // fx.Int32(grid)
         color = _load_color()
-        if super_tile == 1:
+        if const_expr(SP_MODE):
+            # One tile per round, ``ready`` first (module docstring). It is
+            # published after the tile's loads have landed, so the previous
+            # round's HBM stores do not delay it, and awaited only before the
+            # first payload store, so its flight overlaps the quantize.
+            for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+                tile = bid + i * fx.Int32(grid)
+                if const_expr(mode == MODE_RS):
+                    atoms = _load_tile_atoms(tile)
+                else:
+                    atoms = _load_shard_atoms(tile)
+                _publish(PHASE_REDUCE_SCATTER, rank, color)
+                if const_expr(mode == MODE_RS):
+                    _pack_reduce_scatter(atoms)
+                else:
+                    _pack_all_gather(atoms)
+                gpu.barrier()
+                _wait_release(PHASE_REDUCE_SCATTER, color)
+                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
+                _publish(PHASE_ALL_GATHER, rank, color)
+
+                _wait_release(PHASE_ALL_GATHER, color)
+                if const_expr(mode == MODE_RS):
+                    _store_shard_atoms(
+                        tile, _reduce_scattered(fx.Int32(0), PHASE_ALL_GATHER)
+                    )
+                else:
+                    _epilogue(tile, fx.Int32(0))
+
+                color = color + fx.Int32(1)
+                if color == fx.Int32(0):  # 0 is unset sentinel
+                    color = fx.Int32(1)
+        elif super_tile == 1:
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * fx.Int32(grid)
                 res_pref = None
@@ -1119,10 +1266,11 @@ def make_quick_allreduce_int4_kernel(
     value_attrs = {"rocdl.flat_work_group_size": flat_wg}
     if NORM_LATENCY:
         value_attrs["rocdl.waves_per_eu"] = NORM_LATENCY_WGS_PER_CU
-    elif fuse_norm:
+    elif fuse_norm or SP_MODE:
         # The host sizes the persistent grid from _RESIDENT_WGS_PER_CU, which
         # was measured on the plain kernel. One wave per SIMD per workgroup,
-        # so pin the fused epilogue to the same VGPR budget.
+        # so pin the fused epilogue and the single-phase modes to the same
+        # VGPR budget.
         value_attrs["rocdl.waves_per_eu"] = _RESIDENT_WGS_PER_CU[
             (world_size, super_tile)
         ]
@@ -1173,9 +1321,10 @@ def make_quick_allreduce_int4_kernel(
             f"{'_mxfp4' if NORM_MXFP4 else ''}"
         )
     atoms_tag = "" if ATOMS == DEFAULT_ATOMS else f"_a{ATOMS}"
+    mode_tag = f"_{mode}" if SP_MODE else ""
     launch_quick_allreduce_int4.func.__name__ = (
         f"launch_quick_allreduce_int4_ws{world_size}_st{super_tile}"
-        f"{atoms_tag}{norm_tag}"
+        f"{atoms_tag}{norm_tag}{mode_tag}"
     )
     return {
         "launch": launch_quick_allreduce_int4,

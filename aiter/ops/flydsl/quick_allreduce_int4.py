@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce."""
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce, reduce-scatter
+and all-gather."""
 
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from .kernels.quick_allreduce_int4 import (
     DEFAULT_ATOMS,
     DEFAULT_DIVISOR,
     DEFAULT_GRID_CAP,
+    MODE_AG,
+    MODE_RS,
     RANK_TILE_BYTES,
     SUPER_TILES,
     SUPPORTED_WORLDS,
@@ -101,6 +104,7 @@ class _StEngine:
         self.spec = spec
         self.launch = spec["launch"]
         self._norm_launch = {}
+        self._sp_launch = {}
         self.super_tile = spec["super_tile"]
         self.grid = spec["grid"]
         self.buf_bytes = spec["flags_bytes"] + spec["data_bytes"]
@@ -156,20 +160,31 @@ class _StEngine:
     ):
         """Fused add+RMSNorm variant; shares this engine's inbox and colors."""
         key = (int(hidden), float(eps), bool(gemma_norm), bool(latency), bool(mxfp4))
-        launch = self._norm_launch.get(key)
+        return self._variant(
+            self._norm_launch,
+            key,
+            norm_hidden=key[0],
+            norm_eps=key[1],
+            gemma_norm=key[2],
+            norm_latency=key[3],
+            norm_mxfp4=key[4],
+        )
+
+    def sp_launch(self, mode: str):
+        """Reduce-scatter (``"rs"``) or all-gather (``"ag"``) alone; shares this engine's inbox and colors."""
+        return self._variant(self._sp_launch, mode, mode=mode)
+
+    def _variant(self, cache, key, **kwargs):
+        launch = cache.get(key)
         if launch is None:
             launch = make_quick_allreduce_int4_kernel(
                 world_size=self.spec["world_size"],
                 super_tile=self.super_tile,
                 grid=self.grid,
-                norm_hidden=key[0],
-                norm_eps=key[1],
-                gemma_norm=key[2],
-                norm_latency=key[3],
-                norm_mxfp4=key[4],
                 tile_atoms=self.spec["tile_atoms"],
+                **kwargs,
             )["launch"]
-            self._norm_launch[key] = launch
+            cache[key] = launch
         return launch
 
     def close(self):
@@ -349,7 +364,8 @@ class QuickAllReduceInt4:
             return 1
         return self.super_tile
 
-    def _check_payload(self, inp, out) -> int:
+    def _check_tensors(self, inp, out) -> tuple[int, int]:
+        """Type, dtype, device, layout and alignment of an input/output pair."""
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
             raise TypeError("QuickAllReduceInt4 requires torch.Tensor input/output")
         if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
@@ -370,6 +386,10 @@ class QuickAllReduceInt4:
         out_ptr = int(out.data_ptr())
         if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
             raise ValueError("QuickAllReduceInt4 requires 16-byte-aligned input/output")
+        return inp_ptr, out_ptr
+
+    def _check_payload(self, inp, out) -> int:
+        inp_ptr, out_ptr = self._check_tensors(inp, out)
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes > 0xFFFFFFFF:
             raise ValueError(
@@ -558,6 +578,80 @@ class QuickAllReduceInt4:
         st = self._pick_st(num_tiles, self._by_st)
         eng = self._by_st[st]
         self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes, divisor=divisor)
+
+    def _check_sp_payload(self, mode, inp, out) -> int:
+        """Validate a reduce-scatter / all-gather pair; return the full tensor's bytes."""
+        inp_ptr, out_ptr = self._check_tensors(inp, out)
+        inp_bytes = int(inp.numel()) * int(inp.element_size())
+        out_bytes = int(out.numel()) * int(out.element_size())
+        full_bytes, shard_bytes = (
+            (inp_bytes, out_bytes) if mode == MODE_RS else (out_bytes, inp_bytes)
+        )
+        if full_bytes != self.world_size * shard_bytes:
+            raise ValueError(
+                f"{mode}: the full tensor must be world_size={self.world_size} "
+                f"times the shard, got {full_bytes} and {shard_bytes} bytes"
+            )
+        if full_bytes == 0 or full_bytes % TILE_BYTES != 0:
+            raise ValueError(
+                f"{mode}: the full tensor must be a non-empty whole number of "
+                f"{TILE_BYTES}-byte tiles, got {full_bytes} bytes"
+            )
+        if full_bytes > 0xFFFFFFFF:
+            raise ValueError(
+                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
+            )
+        if max(inp_ptr, out_ptr) < min(inp_ptr + inp_bytes, out_ptr + out_bytes):
+            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
+        return full_bytes
+
+    def _launch_sp(self, mode, inp, out, stream, *, full_bytes: int) -> None:
+        # The single-phase kernels exist for super_tile=1 only (slower or equal
+        # at every size measured with 8). No divisor is passed: they need the
+        # default of 1, and the all-gather's dequant would scale by any other.
+        eng = self._by_st[1]
+        self._launch_eng(
+            eng, inp, out, stream, live_bytes=full_bytes, launch=eng.sp_launch(mode)
+        )
+
+    def reduce_scatter(self, inp, out, stream=None):
+        """INT4 reduce-scatter: this rank's contiguous block of the sum.
+
+        ``inp`` is this rank's bf16 ``[T, H]`` partial and ``out`` the
+        ``[T / world_size, H]`` block ``[rank * T/W, (rank + 1) * T/W)`` of the
+        element-wise sum over ranks. Only byte sizes are checked: ``inp`` must
+        be ``world_size`` times ``out`` and a whole number of 32 KiB tiles, so
+        pass ``T`` divisible by ``world_size``. Every partial, this rank's own
+        included, goes through the INT4 codec, so a row's value does not depend
+        on which rank owns it. Shares the inbox and colors of ``allreduce``;
+        every rank must issue the same sequence of launches and sizes.
+        """
+        full_bytes = self._check_sp_payload(MODE_RS, inp, out)
+        self._launch_sp(MODE_RS, inp, out, stream, full_bytes=full_bytes)
+
+    def all_gather(self, inp, out, stream=None):
+        """INT4 all-gather of contiguous row blocks.
+
+        ``inp`` is this rank's bf16 ``[T / world_size, H]`` block and ``out``
+        the ``[T, H]`` concatenation of every rank's block, in rank order. This
+        rank's own block is round-tripped through the codec too, so every rank
+        holds bitwise-equal output. Same size and sequence rules as
+        ``reduce_scatter``.
+        """
+        full_bytes = self._check_sp_payload(MODE_AG, inp, out)
+        self._launch_sp(MODE_AG, inp, out, stream, full_bytes=full_bytes)
+
+    def compile_sp(self, full, shard, stream=None) -> None:
+        """Eager-JIT ``reduce_scatter`` and ``all_gather``: run each once, so call
+        it before CUDA graph capture.
+
+        ``full`` is a ``[T, H]`` tensor and ``shard`` a ``[T / world_size, H]``
+        one; every rank must call this with the same shapes. ``shard`` is
+        overwritten by the reduce-scatter and ``full`` by the all-gather.
+        """
+        full_bytes = self._check_sp_payload(MODE_RS, full, shard)
+        for mode, src, dst in ((MODE_RS, full, shard), (MODE_AG, shard, full)):
+            self._launch_sp(mode, src, dst, stream, full_bytes=full_bytes)
 
     def supports_rmsnorm(self, hidden: int, nbytes: int) -> bool:
         """Whether ``allreduce_rmsnorm`` takes this row width and payload.
