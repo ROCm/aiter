@@ -667,32 +667,43 @@ def _build_attn_res(spec: _AttnResSpec):
                 return thread_sumsq, thread_dot
 
             def update_softmax(
-                values_local, sumsq, dot, old_max, old_denominator, old_mixed
+                group_values, group_sums, old_max, old_denominator, old_mixed
             ):
-                reciprocal_rms = fmath.rsqrt(
-                    sumsq * inv_hidden_size + eps, fastmath=fm_fast
-                )
-                logit = dot * reciprocal_rms
-                if const_expr(scale != 1.0):
-                    logit = logit * scale
+                logits = []
+                for sumsq, dot in group_sums:
+                    reciprocal_rms = fmath.rsqrt(
+                        sumsq * inv_hidden_size + eps, fastmath=fm_fast
+                    )
+                    logit = dot * reciprocal_rms
+                    if const_expr(scale != 1.0):
+                        logit = logit * scale
+                    logits.append(logit)
 
-                new_max = old_max.maximumf(logit)
+                new_max = old_max
+                for logit in logits:
+                    new_max = new_max.maximumf(logit)
                 old_scale_active = fmath.exp2(
                     (old_max - new_max) * log2e, fastmath=fm_fast
                 )
                 old_scale = (old_max == neg_inf).select(zero, old_scale_active)
-                new_scale = fmath.exp2((logit - new_max) * log2e, fastmath=fm_fast)
-                new_denominator = old_denominator * old_scale + new_scale
+                new_scales = [
+                    fmath.exp2((logit - new_max) * log2e, fastmath=fm_fast)
+                    for logit in logits
+                ]
+                new_denominator = old_denominator * old_scale
+                for new_scale in new_scales:
+                    new_denominator = new_denominator + new_scale
 
                 new_mixed = []
                 for tile in range_constexpr(tiles_per_thread):
-                    value = values_local[tile].to(fx.Float32)
-                    new_mixed.append(old_mixed[tile] * old_scale + value * new_scale)
+                    mixed = old_mixed[tile] * old_scale
+                    for values_local, new_scale in zip(group_values, new_scales):
+                        mixed = mixed + values_local[tile].to(fx.Float32) * new_scale
+                    new_mixed.append(mixed)
                 return new_max, new_denominator, new_mixed
 
-            # Group G independent reductions behind one barrier (none on one-wave
-            # rows). Softmax updates stay in source order. Block sources stay in
-            # bf16 across the barrier; the reconvert for the mix is lossless.
+            # Block sources stay BF16 across the barrier; widening them for the mix
+            # is exact.
             for group in range_constexpr(num_groups):
                 start = group * group_size
                 n_members = min(group_size, num_sources - start)
@@ -712,17 +723,13 @@ def _build_attn_res(spec: _AttnResSpec):
                         source_local = take_block_source(block)
                     group_partials.append(local_sumsq_dot(source_local))
                     group_local.append(source_local)
-                group_sums = reduce_group(group_partials, buf)
-                for slot in range_constexpr(n_members):
-                    sumsq, dot = group_sums[slot]
-                    max_logit, denominator, mixed_local = update_softmax(
-                        group_local[slot],
-                        sumsq,
-                        dot,
-                        max_logit,
-                        denominator,
-                        mixed_local,
-                    )
+                max_logit, denominator, mixed_local = update_softmax(
+                    group_local,
+                    reduce_group(group_partials, buf),
+                    max_logit,
+                    denominator,
+                    mixed_local,
+                )
                 if const_expr(wide_grid):
                     pin_registers(mixed_local)
 
