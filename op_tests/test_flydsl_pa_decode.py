@@ -14,6 +14,7 @@ import torch
 
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import checkAllclose
 
 
 @pytest.fixture
@@ -29,69 +30,297 @@ def device(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch,max_parts,budget,window,query_length",
+    "head_size,dtype,with_sinks",
     [
-        (1, 1, 1, 0, 1),
-        (6, 7, 160, 257, 4),
-        (63, 7, 160, 0, 1),
-        (65, 7, 512, 1, 4),
-        (257, None, 4096, 8193, 4),
-        (4096, None, 8192, 0, 1),
+        (128, torch.bfloat16, False),
+        (128, torch.bfloat16, True),
+        (64, torch.float16, False),
+        (192, torch.bfloat16, True),
+        (256, torch.float16, False),
+        (512, torch.bfloat16, False),
     ],
 )
-def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
-    """Packed tasks cover every visible tile and remain valid after graph refresh."""
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
+    """Rungs split across partition groups match the single-group ladder bit for bit.
 
-    def check(plan, lengths):
-        info = plan.reduce_info.cpu().tolist()
-        work = plan.work_info.cpu().tolist()
-        cursor = 0
-        for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
-            assert start == cursor
-            first = (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
-            )
-            last = (max(ctx, 0) + 255) // 256
-            assert 0 <= count <= min(last - first, plan.max_partitions)
-            assert (count > 0) == (last > first)
-            tile = first
-            for record in work[start : start + count]:
-                row, begin, end, original_length = record
-                assert row == seq and original_length == ctx
-                assert begin == tile and begin < end <= last
-                tile = end
-            assert tile == last
-            cursor += count
-        assert cursor <= plan.capacity
-        assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+    Register-only CTAs (24 and 32 partition bounds) and the register branch of
+    dual-mode CTAs reduce the same packed partials with one group and with
+    split groups; sequences above 32 partitions take the LDS branch and match
+    a float64 reference. Slots past the live tasks hold NaN.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 splits register rungs across partition groups")
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
 
-    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
-    lengths = [pattern[i % len(pattern)] for i in range(batch)]
-    context = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = plan_pa_decode(
-        context,
-        2,
-        max_partitions=max_parts,
-        workgroup_budget=budget,
-        sliding_window=window,
-        query_length=query_length,
+    from aiter.ops.flydsl.kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+    from aiter.ops.flydsl.kernels.tensor_shim import (
+        _run_compiled,
+        get_dtype_str,
+        ptr_arg,
     )
-    check(plan, lengths)
-    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        refreshed = plan_pa_decode(
-            context, 2, sliding_window=window, query_length=query_length, plan=plan
+
+    kv_heads, rows = 2, 16
+    counts = (17, 0, 32, 1, 24, 16, 31, 20, 40, 256, 100)
+    first = [sum(counts[:i]) for i in range(len(counts))]
+    capacity = sum(counts) + 8
+    torch.manual_seed(0)
+    exp_sums = torch.full((kv_heads, capacity, rows), float("nan"), device=device)
+    max_logits = torch.full_like(exp_sums, float("nan"))
+    logits = torch.full(
+        (kv_heads, capacity, rows, head_size), float("nan"), dtype=dtype, device=device
+    )
+    live = sum(counts)
+    exp_sums[:, :live] = torch.rand(kv_heads, live, rows, device=device) * 50 + 0.5
+    max_logits[:, :live] = torch.randn(kv_heads, live, rows, device=device) * 4
+    logits[:, :live] = torch.randn(kv_heads, live, rows, head_size, device=device).to(
+        dtype
+    )
+    reduce_info = torch.tensor(
+        [[f, c] for f, c in zip(first, counts)], dtype=torch.int32, device=device
+    )
+    sinks = None
+    if with_sinks:
+        sinks = torch.linspace(-3, 3, kv_heads * rows, device=device).to(dtype)
+        sinks[0] = float("-inf")
+
+    def pairs_for(partitions):
+        return head_size % 128 == 0 if partitions > 32 else head_size in (128, 256)
+
+    def run(partitions, groups):
+        pairs = pairs_for(partitions)
+        compiled = compile_pa_decode_ps_reduce(
+            architecture="gfx1250",
+            max_context_partition_num=partitions,
+            head_size=head_size,
+            output_dtype_str=get_dtype_str(dtype),
+            logits_dtype_str=get_dtype_str(dtype),
+            sink_dtype_str=get_dtype_str(dtype),
+            use_sinks=with_sinks,
+            query_group_size=rows,
+            pairs=pairs,
+            parallel_groups=groups,
         )
-    assert refreshed is plan
-    # All-empty replay must erase old active records, then mixed lengths must
-    # rebuild them using the same buffers without stale padding or readback.
-    for values in ([0] * batch, list(reversed(lengths))):
-        context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
-        graph.replay()
-        check(plan, values)
-        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+        out = torch.full(
+            (len(counts), 1, kv_heads, rows, head_size),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+        pointer = fx.BFloat16 if dtype == torch.bfloat16 else fx.Float16
+        _run_compiled(
+            compiled["launch"],
+            ptr_arg(out, pointer),
+            ptr_arg(exp_sums, fx.Float32),
+            ptr_arg(max_logits, fx.Float32),
+            ptr_arg(logits, pointer),
+            (
+                flyc.from_c_void_p(pointer, 0)
+                if sinks is None
+                else ptr_arg(sinks, pointer)
+            ),
+            *out.stride()[:4],
+            *exp_sums.stride()[:2],
+            *logits.stride()[:3],
+            1,
+            len(counts),
+            kv_heads,
+            ptr_arg(reduce_info, fx.Int32),
+            -(-(1 << 30) // rows),
+            -(-(1 << 30) // (rows * kv_heads)),
+            torch.cuda.current_stream(),
+        )
+        return out
+
+    reference = torch.zeros(len(counts), kv_heads, rows, head_size, device=device)
+    for seq, (f, c) in enumerate(zip(first, counts)):
+        if c == 0:
+            continue
+        maxima = max_logits[:, f : f + c].double()
+        top = maxima.max(dim=1).values
+        if sinks is not None:
+            top = torch.maximum(top, sinks.double().view(kv_heads, rows))
+        mass = exp_sums[:, f : f + c].double() * torch.exp(maxima - top[:, None])
+        total = mass.sum(dim=1)
+        if sinks is not None:
+            total = total + torch.exp(sinks.double().view(kv_heads, rows) - top)
+        weights = mass / total[:, None]
+        reference[seq] = (
+            (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
+        )
+    for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
+        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+            continue
+        single, grouped = run(partitions, 1), run(partitions, split)
+        register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
+        assert torch.equal(
+            single[register].view(torch.int16), grouped[register].view(torch.int16)
+        )
+        # Plans keep every count within the partition bound.
+        bounded = [seq for seq, c in enumerate(counts) if c <= partitions]
+        err = checkAllclose(
+            grouped[bounded, 0].float(),
+            reference[bounded],
+            atol=2e-2,
+            rtol=2e-2,
+            msg=f"split_groups partitions={partitions} split={split}",
+        )
+        assert err == 0, (
+            f"split_groups partitions={partitions} split={split}: "
+            f"mismatch ratio={err}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "mode,dim,scratch_offset",
+    [
+        ("last", 128, 0),
+        ("last", 128, 1),
+        ("last", 128, 2),
+        ("last", 128, 3),
+        ("cluster", 128, 1),
+        ("cluster", 384, 1),
+        ("reducer", 128, 1),
+    ],
+)
+def test_pa_decode_merge_alignment(
+    device, monkeypatch, mode, dim, scratch_offset, dtype
+):
+    """Offset scratch and odd query/output strides retain element alignment.
+
+    Last-arriver atomics require eight-byte scratch alignment; unaligned
+    scratch falls back to the cluster merge. Cluster loads and final stores
+    support the otherwise valid offset views directly, as does the reducer,
+    which a -inf sink selects without adding attention mass.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 tile-kernel partition merges")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    lengths = (1024,) if mode == "cluster" else (1024, 0, 0, 0)
+    page, group = 16, 16
+    query, key, value, table, context = _make_inputs(
+        1, 1, group, dim, page, dtype, "random", device, lengths
+    )
+    # Both the base address and each head's stride may be only two-byte aligned.
+    query_storage = torch.empty(
+        query.numel() + query.shape[0] * group + 1, dtype=dtype, device=device
+    )
+    query_view = query_storage[1:].as_strided(
+        query.shape, (group * (dim + 1), dim + 1, 1)
+    )
+    query_view.copy_(query)
+    query = query_view
+    output_storage = torch.full_like(query_storage, float("nan"))
+    output = output_storage[1:].as_strided(query.shape, query.stride())
+    key_cache = (
+        key.to(torch.bfloat16)
+        .reshape(-1, 1, page, dim // 8, 8)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.to(torch.bfloat16)
+        .reshape(-1, 1, page // 8, 8, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    plan = pa.plan_pa_decode(
+        context, 1, max_partitions=4, workgroup_budget=None if mode == "cluster" else 1
+    )
+    sinks = (
+        torch.full((group,), float("-inf"), dtype=dtype, device=device)
+        if mode == "reducer"
+        else None
+    )
+    scalar_shape = (1, plan.capacity, group)
+    partial_shape = (*scalar_shape, dim)
+    partials = torch.empty(
+        plan.capacity * group * dim + scratch_offset, dtype=dtype, device=device
+    )[scratch_offset:].reshape(partial_shape)
+    workspace = {
+        "exp_sums": torch.empty(scalar_shape, device=device),
+        "max_logits": torch.empty(scalar_shape, device=device),
+        "temporary_output": partials,
+    }
+    compile_kwargs = []
+    compile_tile = pa.compile_pa_decode_tile
+
+    def spy_tile(**kwargs):
+        compile_kwargs.append(kwargs)
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
+    reference = _reference(
+        query,
+        key.to(torch.bfloat16).float(),
+        value.to(torch.bfloat16).float(),
+        table,
+        context,
+        1,
+        0,
+        sinks,
+    )
+    for _ in range(3):
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        pa.pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            dim**-0.5,
+            1,
+            sinks=sinks,
+            work_plan=plan,
+            **workspace,
+        )
+        _check_output(output, reference)
+        assert torch.count_nonzero(plan.arrival_counters) == 0
+    last_arriver = mode == "last" and scratch_offset == 0
+    assert compile_kwargs[-1]["direct_output"] == last_arriver
+    assert compile_kwargs[-1]["cluster_merge"] == (
+        0 if last_arriver or mode == "reducer" else 4
+    )
+
+
+@pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("invalid_input", [False, True])
+def test_pa_decode_fp16_bf16_case_policy(
+    device, monkeypatch, architecture, invalid_input
+):
+    """Skip positive FP16-query cases while retaining input rejection checks."""
+    monkeypatch.setattr(
+        importlib.import_module(__name__), "get_gfx_runtime", lambda: architecture
+    )
+    monkeypatch.setattr(
+        importlib.import_module("aiter.ops.flydsl.pa_decode"),
+        "get_gfx_runtime",
+        lambda: architecture,
+    )
+    case = {
+        "kv_dtype": "bf16",
+        "query_dtype": torch.float16,
+        "query_length": 4,
+        "group_size": 16,
+        "block_size": 128,
+        "max_partitions": 3,
+    }
+    if invalid_input:
+        case.update(
+            invalid_input="fp16-query",
+            error=NotImplementedError,
+            match="BF16 KV requires bfloat16 queries",
+        )
+        test_pa_decode(case, device, monkeypatch)
+    else:
+        with pytest.raises(
+            pytest.skip.Exception, match="BF16 KV requires bfloat16 queries"
+        ):
+            test_pa_decode(case, device, monkeypatch)
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
@@ -230,6 +459,29 @@ _COMMON_CASES = [
         for page, group in ((16, 8), (128, 16))
         for pattern in ("small_query", "probability_tail")
     ],
+    # Sparse decode rows of up to 2048 tokens take 8 partitions, which gfx1250
+    # merges within one workgroup cluster; replays must not see stale partials.
+    (
+        "cluster8",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 8,
+        },
+    ),
+    (
+        "mtp4-g16-page128",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -269,6 +521,53 @@ _FP8_CASES = _COMMON_CASES + [
         "default-cap",
         {"group_size": 16, "block_size": 128, "max_partitions": None},
     ),
+    # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
+    # Varied token magnitudes make a misplaced per-token scale fail; rows past
+    # one page run unmasked interior pages (two-token rows exceed FP8 P error).
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-varied",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": None,
+            "lengths": (65, 129, 257, 300, 1027, 4100),
+            "pattern": "varied",
+        },
+    ),
+    (
+        "mtp4-g16-page128-probability_tail",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "probability_tail",
+        },
+    ),
+    # One task slot per sequence: slots of the empty rows give the long row
+    # several tasks, which its last-arriving CTA merges across replays.
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
     (
@@ -285,6 +584,16 @@ _BF16_CASES = _COMMON_CASES + [
     (
         "head256",
         {"kv_heads": 2, "head_dim": 256, "block_size": 16, "max_partitions": 7},
+    ),
+    (
+        "cluster16",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (4096,) * 3 + (0, 255),
+            "max_partitions": 16,
+            "cluster": 16,
+        },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
     (
@@ -304,6 +613,65 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    # Four 16-row query tiles at D128 over page128 caches: on gfx1250, wave
+    # pairs share two tiles and split every page, in each output mode. One
+    # task per sequence runs window-masked, unmasked and causal pages in turn;
+    # one slot per sequence merges the long rows' tasks across replays.
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-cluster",
+        {
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+        },
+    ),
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    (
+        "mtp4-g16-page128-fp16-query",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "query_dtype": torch.float16,
+            "lengths": (65, 1027, 4100),
+            "max_partitions": 3,
+            "sink_dtype": torch.float16,
+        },
+    ),
+    (
+        "mtp4-g16-page128-window",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65, 300, 1027, 4100),
+            "window": 700,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # 60 rows pad the last tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
     (
         "loose-bound",
@@ -503,11 +871,15 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case["cluster"] is not None:
+        expected = case["cluster"] if arch == "gfx1250" else 0
+        assert compile_kwargs[-1]["cluster_merge"] == expected
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
+        schedule_kwargs.pop("cluster_merge", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -576,10 +948,18 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "cluster": None,
         },
         **case,
     )
     arch = get_gfx_runtime()
+    if (
+        arch != "gfx1250"
+        and case["kv_dtype"] == "bf16"
+        and case["query_dtype"] == torch.float16
+        and "invalid_input" not in case
+    ):
+        pytest.skip("BF16 KV requires bfloat16 queries on gfx942/gfx950")
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
@@ -641,6 +1021,9 @@ def test_pa_decode(case, device, monkeypatch):
             key, value = key.to(compute_type), value.to(compute_type)
             if mode == "python":
                 key_scale, value_scale = 0.25, 2.0
+    else:
+        # FP16 queries read BF16 caches.
+        key, value = key.to(compute_type), value.to(compute_type)
     logical_key = key.float() * (1.0 if key_scale is None else key_scale)
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]

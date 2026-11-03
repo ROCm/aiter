@@ -74,7 +74,9 @@ from aiter.aot.flydsl.common import (
     get_max_workers,
     replay_env,
     run_jobs_parallel,
+    worker_waves,
 )
+from aiter.aot.flydsl.replay import requested_kernels
 from aiter.jit.core import AITER_CONFIGS
 from aiter_worker_limits import adopt_legacy_max_jobs
 
@@ -527,25 +529,8 @@ def _load_host_helpers(arch: str, cu_num: int) -> None:
         _mxfp4_moe_sort_internal_is_supported(256, 8, 7168, 32, True)
 
 
-@contextmanager
-def _requested_kernels():
-    """Collect the cache identity of every FlyDSL launch a replay reaches."""
-    from flydsl.compiler.jit_function import JitFunction
-
-    kernels = set()
-    build_key = JitFunction._build_full_cache_key
-
-    def record(self, *args, **kwargs):
-        key = build_key(self, *args, **kwargs)
-        kernels.add((self.manager_key, key))
-        return key
-
-    with mock.patch.object(JitFunction, "_build_full_cache_key", record):
-        yield kernels
-
-
 def _replay_recorded(job: dict) -> tuple[dict, frozenset | None]:
-    with _requested_kernels() as kernels:
+    with requested_kernels() as kernels:
         result = compile_one_config(**job)
     return result, (None if result["compile_time"] is None else frozenset(kernels))
 
@@ -694,7 +679,8 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     )
     for arch, count in sorted(skipped.items()):
         print(f"  [SKIP] {count} jobs for {arch}, which GPU_ARCHS omits", flush=True)
-    # The archs replay side by side and split one worker budget by job count.
+    # The archs replay side by side as far as one worker budget gives each a
+    # worker, and split it by job count (worker_waves).
     workers = get_max_workers(len(jobs))
     jobs_per_arch = Counter(job_arch(job) for job in jobs)
     if jobs_per_arch:
@@ -715,18 +701,20 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
             )
         command = [sys.executable, "-c", prepare]
         subprocess.run(command, env=replay_env(arch), check=True)
-    replays = []
-    for arch in archs:
-        command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
-        command += ["--csv"]
-        command += csv_paths
-        if not edges:
-            command.append("--row-tokens-only")
-        if check:
-            command.append("--check")
-        share = max(1, round(workers * jobs_per_arch[arch] / len(jobs)))
-        replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
-    return sum(replay.wait() != 0 for replay in replays)
+    failed = 0
+    for wave in worker_waves(workers, jobs_per_arch):
+        replays = []
+        for arch, share in wave.items():
+            command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
+            command += ["--csv"]
+            command += csv_paths
+            if not edges:
+                command.append("--row-tokens-only")
+            if check:
+                command.append("--check")
+            replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
+        failed += sum(replay.wait() != 0 for replay in replays)
+    return failed
 
 
 def main():
