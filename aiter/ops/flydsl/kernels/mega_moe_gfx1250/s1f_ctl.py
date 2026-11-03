@@ -47,6 +47,8 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #:
 #: * 16 rows (decode): its own flag tile. Even 3 buffers take 112,384 B, so
 #:   three CTAs do not fit a CU; 4 buffers edge out 3 at tpr 8 / 64.
+#: * 32 rows (EP2 tpr 256 / 512): its own flag tile too, with the 16-row
+#:   layout; the tuned GEMM1 picks tile 32 there.
 #: * 64 rows: ~230 VGPRs, 133,632 B of arena, two CTAs per CU.
 #: * 128 rows: twice the accumulators (398 VGPRs, no spills) in 162,816 B.
 #:   Two still fit: 2 x 163,840 B is exactly the 320 KB of LDS and two waves
@@ -57,7 +59,7 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
-_S1F_VARIANTS = {16: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
+_S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
