@@ -51,9 +51,6 @@ _SMALL_D_ROWS_PER_WG = 1
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _clear_caches().
 _SOURCE_GROUP_SIZE = 3
-# One-wave rows reduce this many sources together; more sources hold more registers.
-# Changing this constant requires _clear_caches().
-_ONE_WAVE_GROUP_SIZE = 2
 # Multi-wave rows when T exceeds the CU count.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
@@ -342,11 +339,9 @@ def _build_attn_res(spec: _AttnResSpec):
     # behind one barrier; rows with adds, block stores, or output norm are
     # slower that way at large T.
     mix_only = not (has_add or close_block or output_norm)
-    if red_slots == 1:
-        group_size = _ONE_WAVE_GROUP_SIZE
-    elif wide_grid:
+    if wide_grid:
         group_size = _WIDE_SOURCE_GROUP_SIZE
-    elif mix_only:
+    elif red_slots == 1 or mix_only:
         group_size = num_sources
     else:
         group_size = _SOURCE_GROUP_SIZE
