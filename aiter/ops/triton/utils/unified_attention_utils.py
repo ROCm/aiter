@@ -25,7 +25,9 @@ Lookup walks the axes in the order "schema" lists them and takes the first key
 that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
-Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
+Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any". The second dtype is the K
+cache's; a V cache of another dtype (A8K4V8: NVFP4 K, fp8 V) first tries DT_<q>_<k>_<v>, e.g.
+DT_fp8_nvfp4_fp8, then that same chain.
 
 A section with no axes, like reduce above, is just a config.
 
@@ -68,7 +70,7 @@ _AXIS_KIND = {
     "SW": "bool",  # sliding_window > 0
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
-    "DT": "enum",  # (q dtype tag, kv dtype tag)
+    "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
     # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
     "P": "num",
 }
@@ -122,8 +124,10 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "bool":
         return ([axis] if value else []) + ["any"]
     if kind == "enum":
-        q, kv = value
-        return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+        q, kv = value[:2]
+        # a V cache dtype unlike K's (A8K4V8) tries its own DT_q_k_v first
+        own = [f"{axis}_{q}_{kv}_{value[2]}"] if len(value) > 2 and value[2] != kv else []
+        return own + [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
 
     eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
@@ -225,6 +229,7 @@ def _axis_values(
     kv_dtype,
     programs_per_cu,
     num_queries_per_kv=1,
+    v_dtype=None,
 ) -> dict:
     return {
         "D": head_size,
@@ -234,7 +239,8 @@ def _axis_values(
         "SW": sliding_window > 0,
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
-        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
+        + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
         "P": programs_per_cu,
     }
 
@@ -282,6 +288,7 @@ def _get_unified_attention_config_cached(
     backend: str,
     arch: str | None,
     num_queries_per_kv: int = 1,
+    v_cache_dtype: torch.dtype | None = None,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -299,6 +306,7 @@ def _get_unified_attention_config_cached(
         kv_dtype,
         programs_per_cu,
         num_queries_per_kv,
+        v_dtype=v_cache_dtype,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -338,6 +346,7 @@ def get_unified_attention_config(
         backend,
         arch,
         params.num_queries_per_kv,
+        v_cache_dtype=getattr(params, "v_cache_dtype", None),
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -358,6 +367,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.kv_cache_dtype,
         _programs_per_cu(params),
         params.num_queries_per_kv,
+        v_dtype=getattr(params, "v_cache_dtype", None),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
