@@ -458,3 +458,36 @@ def test_gluon_in_kernel_gather_multiblock_experts(device="cuda"):
     E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
     M, block_m_cap = 2048, 64
     _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
+
+
+# ---------------
+# SwiGLU activation correctness at block_m 128: the shared Triton _swiglu used
+# v_min_f32 inline asm whose register constraints hid a clobber from the
+# allocator, causing scratch spills and non-deterministic corruption of rows
+# 0-31 on gfx1250.  The gluon-native _swiglu uses gl.minimum instead.
+# These tests run GEMM1 with SwiGLU twice (in-kernel gather vs pre-gathered)
+# and require the outputs to match, covering the shapes from the bug report.
+# ---------------
+
+
+@_SKIP_GATHER
+@pytest.mark.parametrize(
+    "M, E, E_LOCAL, D, I, block_m_cap",
+    [
+        # 9b shape (EP2, 128 local experts) at block_m 128
+        (4096, 256, 128, 2304, 2304, 128),
+        # t5 / 42B shape (EP8, 32 local experts) at block_m 128
+        (4096, 256, 32, 4096, 4096, 128),
+    ],
+    ids=["9b_bm128", "t5_bm128"],
+)
+def test_gluon_swiglu_no_bad_rows(M, E, E_LOCAL, D, I, block_m_cap, device="cuda"):
+    """GEMM1+GEMM2 with SwiGLU must match between in-kernel gather and pre-gathered at block_m 128.
+
+    The shared Triton _swiglu used v_min_f32 inline asm that clobbered a
+    register the allocator believed was live. This caused scratch spills and
+    non-deterministic corruption of rows 0-31 on gfx1250. The gluon-native
+    _swiglu uses gl.minimum and has zero spills.
+    """
+    TOPK = 8
+    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
