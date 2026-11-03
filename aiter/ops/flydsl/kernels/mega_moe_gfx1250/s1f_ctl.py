@@ -64,10 +64,6 @@ _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 _S1F_GROUP_M = 8
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
-# Decode steps have too little expert GEMM to hide the compact plan if the plan
-# waits out dispatch first. At or below this token count the next layer's plan
-# starts before dispatch returns and overlaps both.
-_DECODE_PLAN_OVERLAP_TOKENS = 128
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
