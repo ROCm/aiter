@@ -27,7 +27,15 @@ def load_chip_parsers(output):
     tree.body = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted
+        if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+        # keep module-level constants the parsers reference (e.g. _GFX_ARCH_PATTERN)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_GFX_ARCH_PATTERN"
+                for t in node.targets
+            )
+        )
     ]
     namespace = {
         "functools": functools,

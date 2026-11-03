@@ -6,7 +6,7 @@
 //   gfx950  -- v4: kernels compiled from opus/mla_v4_prefill_*.hpp;
 //              v4.1: 16mx1_16nx4 compiled from opus/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
 //              16mx4_64nx1 prebuilt code objects in hsa/gfx950/mla_opus/.
-//   gfx1250 -- v4: prebuilt code objects in hsa/gfx1250/mla_opus/.
+//   gfx1250 -- v4 and v4.1 (a8w8): prebuilt code objects in hsa/gfx1250/mla_opus/.
 
 #include "aiter_tensor.h"
 
@@ -933,8 +933,8 @@ using V41A8W4Traits16mx1 =
 using V41Traits16mx4 =
     opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>;
 
-// A workgroup covers one token and Q_TILE_SIZE * T_M heads: 16mx1_16nx4 for H <= 16, else
-// 16mx4_64nx1, whose code objects are built by csrc/kernels/mla/opus/build_co.sh.
+// A workgroup covers one token and Q_TILE_SIZE * T_M heads. On gfx950 16mx1_16nx4 serves H <= 16,
+// else 16mx4_64nx1, whose code objects are built by csrc/kernels/mla/opus/build_co.sh.
 constexpr int kV41Heads16mx1          = V41Traits16mx1<>::Q_TILE_SIZE * V41Traits16mx1<>::T_M;
 constexpr int kV41Heads16mx4          = V41Traits16mx4::Q_TILE_SIZE * V41Traits16mx4::T_M;
 constexpr const char* kV41A8W8Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
@@ -942,6 +942,14 @@ constexpr const char* kV41A8W4Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w4_16mx
 constexpr int kV41DHead               = 512;
 constexpr int kV41DScale              = kV41DHead / 32;
 constexpr int kV41DScaleFp4           = kV41DHead / 16;
+
+// gfx1250 code objects (ARCH=gfx1250 build_co.sh): 128 threads, 16 or 64 heads per workgroup; two
+// 16-head workgroups beat one 64-head one up to H = 32.
+constexpr const char* kV41Gfx1250Co16mx1 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx1_16nx4.co";
+constexpr const char* kV41Gfx1250Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
+constexpr int kV41Gfx1250Heads16mx1      = 16;
+constexpr int kV41Gfx1250Heads16mx4      = 64;
+constexpr int kV41Gfx1250NarrowH         = 32;
 
 bool v41_is_e8m0(const aiter_tensor_t* t)
 {
@@ -960,31 +968,23 @@ int v41_row_bytes(const aiter_tensor_t* t)
     return static_cast<int>(t->stride(0) * static_cast<int64_t>(t->element_size()));
 }
 
-// A8W4 takes an NVFP4 prefix source: [total_pages, 256] e2m1 pairs, [total_pages, 32] e4m3 scales.
+// The v4.1 validation and kernel arguments (`kargs.N` 0: nothing to run). A8W4 takes an NVFP4
+// prefix source: [total_pages, 256] e2m1 pairs, [total_pages, 32] e4m3 scales.
 template <bool A8W4>
-void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
-                                     aiter_tensor_t* q_scale,
-                                     aiter_tensor_t* unified_kv,
-                                     aiter_tensor_t* unified_kv_scale,
-                                     aiter_tensor_t* kv_indices_prefix,
-                                     aiter_tensor_t* kv_indptr_prefix,
-                                     aiter_tensor_t* kv,
-                                     aiter_tensor_t* kv_scale,
-                                     aiter_tensor_t* kv_indices_extend,
-                                     aiter_tensor_t* kv_indptr_extend,
-                                     aiter_tensor_t* attn_sink,
-                                     aiter_tensor_t* out,
-                                     float softmax_scale,
-                                     int num_splits,
-                                     aiter_tensor_t* partial_o,
-                                     aiter_tensor_t* partial_max,
-                                     aiter_tensor_t* partial_sum,
-                                     hipStream_t stream)
+opus_mla_v41_prefill_kargs v41_prefill_kargs(aiter_tensor_t* q,
+                                             aiter_tensor_t* q_scale,
+                                             aiter_tensor_t* unified_kv,
+                                             aiter_tensor_t* unified_kv_scale,
+                                             aiter_tensor_t* kv_indices_prefix,
+                                             aiter_tensor_t* kv_indptr_prefix,
+                                             aiter_tensor_t* kv,
+                                             aiter_tensor_t* kv_scale,
+                                             aiter_tensor_t* kv_indices_extend,
+                                             aiter_tensor_t* kv_indptr_extend,
+                                             aiter_tensor_t* attn_sink,
+                                             aiter_tensor_t* out,
+                                             float softmax_scale)
 {
-    const std::string gfx = get_gpu_arch();
-    AITER_CHECK(
-        gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
-
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q->dim() == 3 && q_scale->dim() == 3 && out->dim() == 3,
                 "q, q_scale and out must be 3-D [N, H, *]");
@@ -1052,11 +1052,11 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
                     kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
                 "kv_indices/kv_indptr (prefix+extend) must be contiguous");
-    const opus_mla_prefill_split_args split =
-        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
-
+    opus_mla_v41_prefill_kargs kargs{};
+    kargs.N = N;
+    kargs.H = H;
     if(N == 0)
-        return;
+        return kargs;
 
     AITER_CHECK(v41_aligned(q, q->stride(0), 16) && v41_aligned(q, q->stride(1), 16) &&
                     v41_aligned(unified_kv, unified_kv->stride(0), 16) &&
@@ -1071,7 +1071,6 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
                 "out base and row strides must be 16-byte aligned");
 
     // ---- Build kernel args -----------------------------------------------
-    opus_mla_v41_prefill_kargs kargs{};
     kargs.q_ptr                  = q->data_ptr();
     kargs.q_scale_ptr            = q_scale->data_ptr();
     kargs.unified_kv_ptr         = unified_kv->data_ptr();
@@ -1084,8 +1083,6 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
     kargs.kv_indices_prefix      = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
     kargs.kv_indptr_extend       = reinterpret_cast<const int*>(kv_indptr_extend->data_ptr());
     kargs.kv_indices_extend      = reinterpret_cast<const int*>(kv_indices_extend->data_ptr());
-    kargs.N                      = N;
-    kargs.H                      = H;
     kargs.total_pages            = static_cast<int>(unified_kv->size(0));
     kargs.total_tokens           = static_cast<int>(kv->size(0));
     kargs.stride_q_n             = static_cast<int>(q->stride(0));
@@ -1099,6 +1096,51 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
     kargs.stride_kv_page               = v41_row_bytes(kv);
     kargs.stride_kv_scale_page         = v41_row_bytes(kv_scale);
     kargs.softmax_scale                = softmax_scale;
+    return kargs;
+}
+
+template <bool A8W4>
+void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
+                                     aiter_tensor_t* q_scale,
+                                     aiter_tensor_t* unified_kv,
+                                     aiter_tensor_t* unified_kv_scale,
+                                     aiter_tensor_t* kv_indices_prefix,
+                                     aiter_tensor_t* kv_indptr_prefix,
+                                     aiter_tensor_t* kv,
+                                     aiter_tensor_t* kv_scale,
+                                     aiter_tensor_t* kv_indices_extend,
+                                     aiter_tensor_t* kv_indptr_extend,
+                                     aiter_tensor_t* attn_sink,
+                                     aiter_tensor_t* out,
+                                     float softmax_scale,
+                                     int num_splits,
+                                     aiter_tensor_t* partial_o,
+                                     aiter_tensor_t* partial_max,
+                                     aiter_tensor_t* partial_sum,
+                                     hipStream_t stream)
+{
+    const std::string gfx = get_gpu_arch();
+    AITER_CHECK(
+        gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
+    const opus_mla_v41_prefill_kargs kargs = v41_prefill_kargs<A8W4>(q,
+                                                                     q_scale,
+                                                                     unified_kv,
+                                                                     unified_kv_scale,
+                                                                     kv_indices_prefix,
+                                                                     kv_indptr_prefix,
+                                                                     kv,
+                                                                     kv_scale,
+                                                                     kv_indices_extend,
+                                                                     kv_indptr_extend,
+                                                                     attn_sink,
+                                                                     out,
+                                                                     softmax_scale);
+    const int N = kargs.N;
+    const int H = kargs.H;
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
+    if(N == 0)
+        return;
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
@@ -1248,4 +1290,64 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                           partial_max,
                                           partial_sum,
                                           stream);
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    opus_mla_v41_prefill_a8w8_gfx1250_fwd,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* unified_kv,
+     aiter_tensor_t* unified_kv_scale,
+     aiter_tensor_t* kv_indices_prefix,
+     aiter_tensor_t* kv_indptr_prefix,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* kv_scale,
+     aiter_tensor_t* kv_indices_extend,
+     aiter_tensor_t* kv_indptr_extend,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
+     aiter_tensor_t* out,
+     float softmax_scale,
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     hipStream_t stream),
+    (q, q_scale, unified_kv, unified_kv_scale, kv_indices_prefix, kv_indptr_prefix, kv,
+     kv_scale, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale, num_splits,
+     partial_o, partial_max, partial_sum, stream))
+{
+    const std::string gfx = get_gpu_arch();
+    AITER_CHECK(
+        gfx == "gfx1250", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx1250).");
+    const opus_mla_v41_prefill_kargs kargs = v41_prefill_kargs<false>(q,
+                                                                      q_scale,
+                                                                      unified_kv,
+                                                                      unified_kv_scale,
+                                                                      kv_indices_prefix,
+                                                                      kv_indptr_prefix,
+                                                                      kv,
+                                                                      kv_scale,
+                                                                      kv_indices_extend,
+                                                                      kv_indptr_extend,
+                                                                      attn_sink,
+                                                                      out,
+                                                                      softmax_scale);
+    const int N = kargs.N;
+    const int H = kargs.H;
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
+    if(N == 0)
+        return;
+
+    // ---- Launch ----------------------------------------------------------
+    HipDeviceGuard guard(q->device_id);
+    if(H <= kV41Gfx1250NarrowH)
+        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx1_16nx4", kV41Gfx1250Co16mx1, kargs, split,
+                       ceil_div(H, kV41Gfx1250Heads16mx1), 1, stream);
+    else
+        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx4_64nx1", kV41Gfx1250Co16mx4, kargs, split,
+                       ceil_div(H, kV41Gfx1250Heads16mx4), 1, stream);
+    if(num_splits > 1)
+        opus_mla_prefill_split_reduce<__hip_bfloat16>(
+            split, kargs.attn_sink_ptr, out, N, H, stream);
 }
