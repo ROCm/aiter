@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tune gemm_a8w8_mxfp8_bpreshuffle (FP8 GEMM, e8m0 microscales) on gfx950.
+"""Tune gemm_a8w8_mxfp8_bpreshuffle (FP8 GEMM, e8m0 microscales) on gfx950 / gfx1250.
 
 gfx950 runs two FlyDSL pipelines on unshuffled row-major scales (x_scale
 [M, K/32], w_scale [N, K/32]): the mxpsh kernel and the 8-wave 256x256 one
@@ -25,9 +25,15 @@ kernelId names the backend that runs it, "mxfp8" or "bmm":
         -i <shapes with a w_scale_block column> \\
         -o aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv
 
-On gfx1250 --mxscale_table times the mxfp8_128 kernels the 2-D dispatch runs
-(flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common, row-major A) on 128x128
-shapes, and a row's kernelId is the kernel's id in that list.
+On gfx1250 the same table's 32x32 and 128x128 blocks are tuned alike
+(--mxscale_table; its 1x32 block has a 32x4-shuffled w_scale, not tuned here): the
+candidates are the FlyDSL WMMA kernels that fit the shape, named for the block's
+runner (``flydsl_mxfp8_128_...``; ``flydsl_mxfp8_32_...`` on the raw [N/32, K/32]
+w_scale; the row's w_scale_block names the block, as for gfx950 and the batched
+table). 32x32 searches wmma_common.tuning_kernels, a per-shape space wider than
+kernels_list (tile_n follows N, more tile_m / warp / cluster choices, split-K of
+the compute kernel always fused), and its kernelId is "mxfp8"; 128x128 times the
+row-major-A kernels of kernels_list, and a row's kernelId is the kernel's id there.
 """
 
 from typing import Any, ClassVar
@@ -49,6 +55,9 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_mxfp8_bpreshuffle_tuned_gemm.csv"
+MXSCALE_CONFIG_ENV_NAME = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE"
+# The w_scale blocks gfx1250 tunes.
+GFX1250_W_SCALE_BLOCKS = ("32x32", "128x128")
 # The block of a shape list without a w_scale_block column, and of a tuned
 # table from before the column.
 W_SCALE_BLOCK = "1x32"
@@ -167,26 +176,49 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
     )
 
 
-def gfx1250_candidates(m, n, k):
-    """(kernelId, kernel) of the gfx1250 mxfp8_128 kernels the 2-D dispatch can
-    run for the shape (row-major A)."""
+def gfx1250_candidates(m, n, k, w_scale_block):
+    """(kernelId, split_k, kernelName) of every gfx1250 WMMA kernel that fits the
+    shape on this w_scale block. 32x32 searches the per-shape tuning space; 128x128
+    keeps kernels_list (its kernelId) until its own space is reviewed."""
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         kernel_fits_shape,
         kernels_list,
+        serves_padded_m,
+        tuning_kernels,
     )
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import mxfp8_32_kernel_name
 
+    w32 = w_scale_block == "32x32"
+    if w32:
+        kernels = enumerate(tuning_kernels(m, n, k, scale_block=32, w_scale_32x32=True))
+    else:
+        kernels = (
+            (kid, ki)
+            for kid, ki in kernels_list.items()
+            if kernel_fits_shape(ki, m, n, k, allow_n_tail=True)
+            and serves_padded_m(ki, m)
+        )
     return [
-        (kernel_id, ki)
-        for kernel_id, ki in kernels_list.items()
-        if not ki.a_preshuffle and kernel_fits_shape(ki, m, n, k)
+        (kid, ki.split_k, mxfp8_32_kernel_name(ki.name) if w32 else ki.name)
+        for kid, ki in kernels
     ]
 
 
 def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
-    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_128_bpreshuffle_flydsl
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        parse_mxfp8_32_wmma_kernel_name,
+        run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+        run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
+    )
 
-    return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-        x, weight_shuffle, x_scale, w_scale, out, {"kernelName": kernel_name}
+    # gfx1250 tunes 32x32 and 128x128 only: mxfp8_32 names run the raw 32x32
+    # w_scale, the rest are mxfp8_128's.
+    if parse_mxfp8_32_wmma_kernel_name(kernel_name) is None:
+        return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+            x, weight_shuffle, x_scale, w_scale, out, kernel_name
+        )
+    return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+        x, weight_shuffle, x_scale, w_scale, out, kernel_name, w_scale_32x32=True
     )
 
 
@@ -208,9 +240,24 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 return pipe.kernels_list[kernelId].name
         return None
 
+    def get_arg_defaults(self):
+        defaults = super().get_arg_defaults()
+        if getattr(self, "_mxscale_table", False):
+            # --run_config / --compare read the e8m0 block-scale table in this mode.
+            defaults["config_env_name"] = MXSCALE_CONFIG_ENV_NAME
+        return defaults
+
+    def pre_process(self, args):
+        # Before run(), so a standalone --run_config (which never calls tune) is set up too.
+        self._mxscale_table = bool(getattr(args, "mxscale_table", False))
+        super().pre_process(args)
+
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
 
+        _op._load_mxscale_bpreshuffle_tuned.cache_clear()
+        _op._mxscale_bpreshuffle_tuned_nk.cache_clear()
+        _op.get_mxscale_bpreshuffle_config.cache_clear()
         _op._get_mxfp8_bpreshuffle_config.cache_clear()
         _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
         _op._CKGEMM_CONFIG_CACHE.clear()
@@ -273,8 +320,19 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         return super().calculate(results, bpes=(1, 1, 2))
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_bpreshuffle
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle,
+            gemm_a8w8_mxfp8_bpreshuffle,
+        )
         from aiter.test_common import checkAllclose, run_perftest
+
+        # --mxscale_table rows (32x32 / 128x128) run through the blockscale operator,
+        # which reads the block from the w_scale shape; the 1x32 one takes shuffled scales.
+        op = (
+            gemm_a8w8_blockscale_bpreshuffle
+            if self._mxscale_table
+            else gemm_a8w8_mxfp8_bpreshuffle
+        )
 
         results = []
         for i in range(len(self.untunedf)):
@@ -286,7 +344,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             try:
                 d = generate_data(M, N, K, 0, block)
                 out, us = run_perftest(
-                    gemm_a8w8_mxfp8_bpreshuffle,
+                    op,
                     d["x"],
                     d["weight_shuffle"],
                     d["x_scale"],
@@ -337,34 +395,40 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
             )
-        if gfx == "gfx1250" and (
-            not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}
+        if gfx == "gfx1250" and not set(untunedf["w_scale_block"]) <= set(
+            GFX1250_W_SCALE_BLOCKS
         ):
             raise ValueError(
-                "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
-                "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
+                f"gfx1250 tunes the w_scale blocks {GFX1250_W_SCALE_BLOCKS} only, "
+                f"got {sorted(set(untunedf['w_scale_block']))}"
             )
-        seeds = self._bmm_seeds() if self._mxscale_table else {}
+        # bmm joins gfx950's candidates in the mxscale table.
+        use_bmm = self._mxscale_table and gfx == "gfx950"
+        seeds = self._bmm_seeds() if use_bmm else {}
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
             block = str(untunedf.loc[i, "w_scale_block"])
             info_keys = (gfx, cu_num, M, N, K, block)
-            # One pass per pipeline of the block, in their order.
-            cands = (
-                gfx1250_candidates(M, N, K)
-                if gfx == "gfx1250"
-                else [
+            if gfx == "gfx1250":
+                runs = [
+                    (kernel_id, split_k, name, run_gemm_flydsl_gfx1250)
+                    for kernel_id, split_k, name in gfx1250_candidates(M, N, K, block)
+                ]
+            else:
+                # One pass per pipeline of the block, in their order.
+                cands = [
                     (kernel_id, ki)
                     for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
                     for kernel_id, ki in pipe.kernels_list.items()
                     if pipe.fits(ki, M, N, K)
                 ]
-            )
-            run_fn = run_gemm_flydsl_gfx1250 if gfx == "gfx1250" else run_gemm_flydsl
-            runs = [(kernel_id, ki.split_k, ki.name, run_fn) for kernel_id, ki in cands]
-            if self._mxscale_table and gfx == "gfx950":
+                runs = [
+                    (kernel_id, ki.split_k, ki.name, run_gemm_flydsl)
+                    for kernel_id, ki in cands
+                ]
+            if use_bmm:
                 near = [
                     name
                     for mm, name in seeds.get((N, K, block), ())
@@ -427,8 +491,10 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif getattr(self, "_mxscale_table", False) and keys[0] == "gfx950":
-                # gfx1250 rows keep their kernels_list id, as the table's do.
+            elif getattr(self, "_mxscale_table", False) and (
+                keys[0] == "gfx950" or keys[-1] == "32x32"
+            ):
+                # gfx1250 128x128 rows keep their kernels_list id, as the table's do.
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
                     # bmm's ids sit between fsk's and the _pf ones
@@ -478,7 +544,8 @@ if __name__ == "__main__":
         "a8w8_mxfp8_bpreshuffle_tuned_gemm",
         key=key,
         resultList=resultList,
-        description="Tune gemm_a8w8_mxfp8_bpreshuffle (gfx950 FlyDSL mxpsh, 1x32 e8m0)",
+        description="Tune gemm_a8w8_mxfp8_bpreshuffle (gfx950 FlyDSL mxpsh, 1x32 e8m0; "
+        "gfx1250 WMMA with --mxscale_table)",
     )
     args = tuner.parse_args()
     tuner.run(args, False)

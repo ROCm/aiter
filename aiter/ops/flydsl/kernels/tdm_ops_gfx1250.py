@@ -26,6 +26,7 @@ compute_warp_distribution = _tdm_ops.compute_warp_distribution
 __all__ = [
     "TDMDescriptor2D",
     "clamp_tensor_descriptor_2d_inner_extent",
+    "clamp_tensor_descriptor_2d_outer_extent",
     "make_tensor_descriptor_2d",
     "tensor_load_2d",
     "tensor_wait",
@@ -70,6 +71,8 @@ def _fly_aware_lds_extraction():
 
 _DIM0_LO_SGPR = 1  # GROUP1 sgpr1[31:16] holds tensor_dim0[15:0]
 _DIM0_HI_SGPR = 2  # GROUP1 sgpr2[15:0]  holds tensor_dim0[31:16]
+_DIM1_LO_SGPR = 2  # GROUP1 sgpr2[31:16] holds tensor_dim1[15:0]
+_DIM1_HI_SGPR = 3  # GROUP1 sgpr3[15:0]  holds tensor_dim1[31:16]
 
 
 def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
@@ -98,6 +101,28 @@ def clamp_tensor_descriptor_2d_inner_extent(
         )
         bound = predicate.select(fx.Int32(bound), fx.Int32(old))
     return _clamp_inner_extent(desc, bound)
+
+
+def clamp_tensor_descriptor_2d_outer_extent(
+    desc: TDMDescriptor2D, bound, predicate=None
+) -> TDMDescriptor2D:
+    """Limit the outer dimension after advancing its global address."""
+    g1 = Vec(desc.dgroup1)
+    b = fx.Int32(bound)
+    if predicate is not None:
+        old = (fx.Uint32(g1[_DIM1_LO_SGPR]) >> 16) | (
+            (fx.Uint32(g1[_DIM1_HI_SGPR]) & 0xFFFF) << 16
+        )
+        b = predicate.select(b, fx.Int32(old))
+    dim1 = (b > 0).select(b, fx.Int32(0))
+    dim1 = fx.Uint32(dim1)
+    lanes = [fx.Uint32(g1[i]) for i in range(8)]
+    lanes[_DIM1_LO_SGPR] = (lanes[_DIM1_LO_SGPR] & 0xFFFF) | ((dim1 & 0xFFFF) << 16)
+    lanes[_DIM1_HI_SGPR] = (lanes[_DIM1_HI_SGPR] & fx.Uint32(0xFFFF0000)) | (dim1 >> 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=Vec.from_elements(lanes, fx.Uint32).ir_value(),
+    )
 
 
 def make_tensor_descriptor_2d(*args, oob_inner_bound=None, **kwargs) -> TDMDescriptor2D:
