@@ -45,7 +45,6 @@ _ALLOWED_GFX = ("gfx942", "gfx950")
 # 2 is the non-temporal cache policy; the BF16 and FP8 outputs are write-once
 # and never read back.
 _STORE_CACHE_MODIFIER = 2
-_SMALL_D_ROWS_PER_WG = 1
 # Block-source loads issued ahead of the source being consumed; the prefix is
 # already in registers.
 _SOURCE_PREFETCH_IN_FLIGHT = 3
@@ -237,7 +236,7 @@ def _block_threads_for(num_vec: int) -> int:
 def _resolve_rows_per_wg(row_threads: int, rows_per_wg: int | None) -> int:
     """Return a validated rows-per-workgroup; packing is one-wave rows only."""
     if rows_per_wg is None:
-        return _SMALL_D_ROWS_PER_WG if row_threads == _WARP_SIZE else 1
+        return 1
     if rows_per_wg < 1:
         raise ValueError(f"rows_per_wg must be >= 1, got {rows_per_wg}")
     if rows_per_wg != 1 and row_threads != _WARP_SIZE:
