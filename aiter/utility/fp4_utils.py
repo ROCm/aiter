@@ -517,7 +517,10 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
 
     bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    bs_offs_n = pid_n
+    # Keep this a rank-1 (size-1) tensor rather than the scalar pid_n: Triton 3.9
+    # rejects `scalar[None, :]` ("too many indices for tensor of rank 0"), which
+    # the block-scale stores below rely on. A size-1 range is broadcast-identical.
+    bs_offs_n = pid_n + tl.arange(0, 1)
 
     if SHUFFLE:
         bs_offs_0 = bs_offs_m[:, None] // 32
