@@ -68,9 +68,15 @@ REF_IMPL = (
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-    from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
+    from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
+        _auto_variant,
+        _auto_variants,
+        _resolve_variant,
+        _variant_supports,
+    )
 except ImportError:
-    flydsl_fp8_mqa_logits = _auto_variant = None
+    flydsl_fp8_mqa_logits = _auto_variant = _auto_variants = None
+    _resolve_variant = _variant_supports = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -435,6 +441,77 @@ def verify_auto_variant(s_q, s_k, num_heads):
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
 
 
+# Small odd shape: a clamped tail tile and a partial row block, so each
+# variant's epilogue and window handling is reached.
+_PRODUCTION_CASE = {"s_q": 67, "s_k": 1500}
+_PRODUCTION_WINDOWS = ("causal", "past_end")
+
+
+@contextlib.contextmanager
+def _forced_variant(tag):
+    """Route every flydsl_fp8_mqa_logits call to `tag`."""
+    key = "FLYDSL_FP8_MQA_LOGITS_VARIANT"
+    prev = os.environ.get(key)
+    os.environ[key] = tag
+    try:
+        yield
+    finally:
+        if prev is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = prev
+
+
+def verify_production_variants(num_heads, head_dims, clean_logits):
+    """Force each variant in `_auto_variants()` on a small odd shape.
+
+    Auto-routing is shape-dependent, so the reduced/full sweeps reach a given
+    production variant only by chance; this pins each one down across the
+    num_heads, head-dim, clean_logits and window axes. Heads and head dims the
+    variant's MFMA atom cannot tile are skipped. Returns (rows, failures) in the shape main()
+    reports them.
+    """
+    rows, failures = [], []
+    for tag, nh, hd, cl, window in itertools.product(
+        _auto_variants(),
+        num_heads,
+        head_dims,
+        clean_logits,
+        _PRODUCTION_WINDOWS,
+    ):
+        if not _variant_supports(tag, nh, hd):
+            continue
+        case = {
+            **_PRODUCTION_CASE,
+            "num_heads": nh,
+            "head_dim": hd,
+            "q_dtype": _DEFAULT_Q_DTYPES[0],
+            "kv_dtype": _DEFAULT_KV_DTYPES[0],
+            "clean_logits": bool(cl),
+            "window": window,
+        }
+        label = f"{tag} nh={nh} hd={hd} clean_logits={bool(cl)} window={window}"
+        try:
+            with _forced_variant(tag):
+                verify_fp8_mqa_logits(**case)
+            status = "ok"
+        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+            aiter.logger.error("FAILED production_variant case: %s", label)
+            failures.append(("production_variant", label, exc))
+            status = "FAIL"
+        rows.append(
+            {
+                "variant": tag,
+                "num_heads": nh,
+                "head_dim": hd,
+                "clean_logits": bool(cl),
+                "window": window,
+                "status": status,
+            }
+        )
+    return rows, failures
+
+
 _FLUSH_CACHE = None
 
 
@@ -565,7 +642,12 @@ def bench_fp8_mqa_logits(
     graded = _grade_all(outs, inp, s_q, s_k, num_heads, clean_logits, tag)
     del outs  # the graded buffers are dead; the timed replays allocate their own
 
-    ret = {"shape": _shape_label(s_q, s_k, batch), "gfx": get_gfx(), "status": "ok"}
+    ret = {
+        "shape": _shape_label(s_q, s_k, batch),
+        "gfx": get_gfx(),
+        "variant": _resolve_variant(None, s_q, s_k, num_heads, head_dim),
+        "status": "ok",
+    }
     times = {}
     for name, fn in candidates.items():
         err, rel = graded[name]
@@ -597,7 +679,7 @@ Case = namedtuple(
 )
 
 
-def _log_speedup(ratios):
+def _log_speedup(ratios, output_file=None):
     """Headline FlyDSL-over-reference figure for a bench sweep.
 
     Geometric mean, because these are ratios: an arithmetic mean over a sweep
@@ -617,6 +699,14 @@ def _log_speedup(ratios):
         r.max(),
         int(r.gt(1).sum()),
     )
+    if output_file is None:
+        return
+    with open(output_file, "a") as file:
+        line = (
+            f"\n\nfp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on {len(r)} of {len(ratios)} cases: "
+            f"geomean={float(np.exp(np.log(r).mean())):.2f} min={r.min():.2f} max={r.max():.2f}, FlyDSL faster on {int(r.gt(1).sum())} (>1 is faster)"
+        )
+        file.write(line)
 
 
 def _cp_eligible(s_q, s_k):
@@ -657,8 +747,63 @@ def _model_set(args):
     return cases
 
 
+def _csv_set(args):
+    """Cases from a CSV of (M, N) shapes -- one measurement row per CSV row.
+
+    The CSV must have a header. Required columns are ``M`` (seq_q) and ``N``
+    (seq_kv). Optional per-row columns, each falling back to a global default
+    when absent or blank:
+
+      ``num_heads``  (default --csv-num-heads, itself default 32, GLM-5.2)
+      ``head_dim``   (default 128)
+      ``window``     (default --csv-window, itself default "causal")
+      ``batch``      (default 1)
+
+    Any other columns (e.g. a per-shape call ``count``/``weight`` from a
+    production shape dump) are ignored here; they are provenance, not axes.
+    The dtype pair and clean_logits come from the usual CLI axes, so a CSV
+    sweep still honours --q-dtype/--kv-dtype/--clean-logits.
+    """
+    df = pd.read_csv(args.shapes_csv)
+    cols = {c.lower().strip(): c for c in df.columns}
+    if "m" not in cols or "n" not in cols:
+        raise ValueError(
+            f"{args.shapes_csv}: need 'M' and 'N' columns; got {list(df.columns)}"
+        )
+
+    def _col(row, key, default):
+        src = cols.get(key)
+        if src is None:
+            return default
+        val = row[src]
+        if pd.isna(val) or (isinstance(val, str) and not val.strip()):
+            return default
+        return val
+
+    cases = []
+    for cl in args.clean_logits:
+        for _, row in df.iterrows():
+            s_q = int(_col(row, "m", None))
+            s_k = int(_col(row, "n", None))
+            batch = int(_col(row, "batch", 1))
+            cases.append(
+                Case(
+                    s_q=s_q,
+                    s_k=s_k,
+                    num_heads=int(_col(row, "num_heads", args.csv_num_heads)),
+                    head_dim=int(_col(row, "head_dim", 128)),
+                    q_dtype=args.q_dtype[0],
+                    kv_dtype=args.kv_dtype[0],
+                    clean_logits=bool(cl),
+                    window=str(_col(row, "window", args.csv_window)),
+                    batch=batch,
+                )
+            )
+    return cases
+
+
 def _full_set(args):
-    """The cartesian product of every axis -- ~500 cases on the defaults."""
+    """The cartesian product of every axis -- 960 cases on the gfx950 defaults."""
     cases = []
     for (s_q, s_k), nh, hd, qd, kvd, cl, win in itertools.product(
         args.shapes,
@@ -678,7 +823,7 @@ def _full_set(args):
 def _reduced_set(args):
     """One case per (shape, window) pair, with the remaining axes rotated.
 
-    65 cases on the defaults, which is what the CI lane runs. Shape and window
+    80 cases on the defaults, which is what the CI lane runs. Shape and window
     are the axes that reach genuinely distinct kernel paths -- the grid.y split,
     the negative/empty window collapse, the cu_starts clamp -- so they are
     covered exhaustively. num_heads, head_dim, clean_logits and the operand
@@ -747,7 +892,7 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
-        help="sweep the full cartesian product of every axis (~500 cases)\n"
+        help="sweep the full cartesian product of every axis (960 cases on gfx950)\n"
         "instead of the default covering set (one case per shape x window)",
     )
     parser.add_argument(
@@ -757,6 +902,29 @@ def main():
         "6 (batch, seq_q, seq_kv) shapes x {dsv4: 64, glm5.2: 32} q-heads,\n"
         "head_dim 128, block-diagonal causal windows. Overrides --shapes,\n"
         "--num-heads, --head-dim and --window; pairs with --scenario bench.",
+    )
+    parser.add_argument(
+        "--shapes-csv",
+        type=str,
+        default=None,
+        help="Path to a CSV of (M, N) shapes, one bench row per CSV row.\n"
+        "Required columns M (seq_q) and N (seq_kv); optional per-row\n"
+        "num_heads/head_dim/window/batch columns (else the --csv-* defaults).\n"
+        "Overrides --shapes/--num-heads/--head-dim/--window; the dtype and\n"
+        "clean_logits axes still apply. Pairs with --scenario bench.",
+    )
+    parser.add_argument(
+        "--csv-num-heads",
+        type=int,
+        default=32,
+        help="num_heads for CSV rows lacking a num_heads column (default 32).",
+    )
+    parser.add_argument(
+        "--csv-window",
+        type=str,
+        default="causal",
+        choices=["causal", "cp", "misaligned", "empty", "past_end", "batch_causal"],
+        help="window mode for CSV rows lacking a window column (default causal).",
     )
     parser.add_argument(
         "-s",
@@ -788,6 +956,10 @@ def main():
             # leading rows, so these cover the negative-window path end to end.
             (128, 64),
             (1024, 1000),
+            # Long-context indexer prefill (vLLM: s_q 512-2048, s_kv 16k-128k).
+            (512, 32768),
+            (1024, 65536),
+            (2048, 131072),
         ],
     )
     parser.add_argument("--num-heads", type=int, nargs="*", default=[32, 64, 128])
@@ -821,9 +993,17 @@ def main():
         default=["causal", "cp", "misaligned", "empty", "past_end"],
         choices=["causal", "cp", "misaligned", "empty", "past_end", "batch_causal"],
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+    )
     args = parser.parse_args()
 
-    if args.model_shapes:
+    if args.shapes_csv:
+        cases = _csv_set(args)
+    elif args.model_shapes:
         cases = _model_set(args)
     elif args.full:
         cases = _full_set(args)
@@ -836,6 +1016,11 @@ def main():
     aiter.logger.info("fp8_mqa_logits: %d cases x %s", len(cases), "+".join(scenarios))
 
     if "bench" in scenarios:
+        if os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT"):
+            aiter.logger.warning(
+                "FLYDSL_FP8_MQA_LOGITS_VARIANT is set: bench measures that variant, "
+                "not the auto-selected one"
+            )
         global BENCH_WARMUP, BENCH_SAMPLES, BENCH_REPLAYS
         BENCH_WARMUP = args.warmup
         BENCH_SAMPLES = args.bench_samples
@@ -870,6 +1055,16 @@ def main():
         aiter.logger.warning(
             "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
         )
+    if "verify" in scenarios:
+        rows, variant_failures = verify_production_variants(
+            args.num_heads, args.head_dim, args.clean_logits
+        )
+        failures.extend(variant_failures)
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits production_variant summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
 
     for scenario in scenarios:
         run = verify_fp8_mqa_logits if scenario == "verify" else bench_fp8_mqa_logits
@@ -897,8 +1092,23 @@ def main():
             scenario,
             df.to_markdown(index=False),
         )
+
+        # Write optionally the data frame to a file.
+        if args.output is not None:
+            from pathlib import Path
+
+            path = Path(args.output)
+            base_dir = path.parent
+            if not Path.exists(base_dir):
+                Path.mkdir(base_dir, parents=True)
+            with open(args.output, "w") as file:
+                table = (
+                    f"fp8_mqa_logits {scenario} summary:\n{df.to_markdown(index=False)}"
+                )
+                file.write(table)
+
         if "speedup" in df:
-            _log_speedup(df["speedup"])
+            _log_speedup(df["speedup"], args.output)
 
     if failures:
         aiter.logger.error(

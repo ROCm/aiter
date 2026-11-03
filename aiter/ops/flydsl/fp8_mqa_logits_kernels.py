@@ -9,12 +9,14 @@ Wraps the gfx942/gfx950 kernel builders in
     (``_auto_variant`` / ``KERNEL_VARIANTS`` / ``DEFAULT_VARIANT``).
   - A build cache keyed by shape/variant/dtype-conversion flags
     (``compile_fp8_mqa_logits``).
-  - Output-column alignment, and the KV-column split (``grid.y``) heuristic
-    that fills the device for small-M shapes. Query rows are not padded.
+  - Output-column alignment, and the occupancy-aware KV-column split
+    (``grid.y``) heuristic that fills the device for small-M shapes
+    (``_auto_num_splits``). Query rows are not padded.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import re
@@ -83,12 +85,27 @@ class _SplitPolicy:
         stops being amortized. Note this is denominated in *tiles*, so its
         column-equivalent scales with the variant's ``block_kv``.
     cu_oversub : int
-        Target total blocks as a multiple of the device CU count.
+        Target total blocks as a multiple of the device CU count. Used only by
+        the fixed-oversubscription path (``block_overhead_tiles=None``).
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
     block_overhead_tiles : int | None
         Per-block fixed cost, in BKV tiles, of the occupancy-aware cost model
         (``_splits_by_wave_cost``). None keeps the ``cu_oversub`` target.
+    streaming_lowh_cu_oversub : int
+        Oversub target for the streaming, ``num_heads<=32`` regime specifically,
+        used only on the fixed-oversubscription path
+        (``block_overhead_tiles=None``). That regime is MFMA-latency / occupancy-
+        bound, not bandwidth-bound, so it wants an *aggressive* oversub to keep
+        every CU pinned through ramp/tail and hide the dependent ReLU/head-
+        reduce behind resident waves.
+    streaming_lowh_residency : int
+        Occupancy-derived replacement for ``streaming_lowh_cu_oversub`` on the
+        streaming ``num_heads<=32`` regime: the streaming block target is
+        ``streaming_lowh_residency * blocks_per_cu * cu_count`` instead of a
+        fixed blocks/CU constant. It expresses "how many full
+        waves-per-SIMD residencies of grid depth to queue". Falls back to
+        ``streaming_lowh_cu_oversub`` when ``blocks_per_cu`` is unknown.
     """
 
     min_seq_len_kv: int
@@ -96,6 +113,8 @@ class _SplitPolicy:
     cu_oversub: int
     fallback_cu: int
     block_overhead_tiles: int | None = None
+    streaming_lowh_cu_oversub: int = 0
+    streaming_lowh_residency: int = 0
 
 
 _SPLIT_POLICIES = {
@@ -108,9 +127,18 @@ _SPLIT_POLICIES = {
         fallback_cu=304,
         block_overhead_tiles=8,  # fitted on MI325X
     ),
-    # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
+    # MI355X (256 CU). gfx942's occupancy-aware wave-cost model and overhead;
+    # the gfx950 routes (_GFX950_ROUTES) were selected under it. The streaming
+    # fields serve only a launch that cannot query occupancy (the first one
+    # during graph capture).
     "gfx950": _SplitPolicy(
-        min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
+        min_seq_len_kv=0,
+        min_tiles_per_split=2,
+        cu_oversub=4,
+        fallback_cu=256,
+        block_overhead_tiles=8,
+        streaming_lowh_cu_oversub=12,
+        streaming_lowh_residency=4,
     ),
 }
 
@@ -159,6 +187,10 @@ def _max_blocks_per_cu(launcher, args):
     return launcher._max_blocks_per_cu
 
 
+def _is_streaming_lowh(seq_len: int, seq_len_kv: int, num_heads: int) -> bool:
+    return num_heads <= 32 and seq_len_kv > 2 * seq_len
+
+
 def _auto_num_splits(
     seq_len: int,
     seq_len_kv: int,
@@ -166,34 +198,51 @@ def _auto_num_splits(
     block_kv: int,
     device_index: int,
     blocks_per_cu: int | None = None,
+    aggressive: bool = False,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
-    Returns 1 once the row grid alone oversubscribes the device. The tuning
-    constants are per-arch -- see ``_SPLIT_POLICIES``.
 
-    With ``blocks_per_cu`` known, minimizes ``_splits_by_wave_cost`` over
-    ``cu_count * blocks_per_cu`` instead, since resident blocks per CU depend on
-    the compiled kernel (its register and LDS use), not only on the device.
+    Two paths, chosen per-arch by ``_SplitPolicy.block_overhead_tiles``:
+
+    - Occupancy-aware (gfx942, gfx950): how full the device is depends on the
+      kernel instance, not just the shape -- resident blocks per CU depend on
+      the compiled kernel's register and LDS use. With ``blocks_per_cu`` known,
+      this path forms ``cu_count * blocks_per_cu`` effective CUs and minimizes
+      ``_splits_by_wave_cost`` over them.
+    - Fixed oversubscription (``blocks_per_cu`` unknown): target
+      ``cu_oversub * cu_count`` blocks and return 1 once the row grid alone
+      reaches that. ``aggressive`` raises the target for the streaming H<=32
+      regime (``_is_streaming_lowh``), which is latency/occupancy-bound and
+      benefits from a much deeper block queue.
     """
     pol = _split_policy()
     grid_x = (seq_len + rows_per_block - 1) // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
+    cu_count = _device_cu_count(device_index)
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
-    if blocks_per_cu is not None:
+    if pol.block_overhead_tiles is not None and blocks_per_cu is not None:
         # The window bounds live on the device; the full KV extent stands in.
         return _splits_by_wave_cost(
             grid_x,
-            _device_cu_count(device_index) * blocks_per_cu,
+            cu_count * blocks_per_cu,
             seq_len_kv // block_kv,
             max_splits,
             pol.block_overhead_tiles,
         )
-    target_blocks = pol.cu_oversub * _device_cu_count(device_index)
+    target_blocks = pol.cu_oversub * cu_count
+    if aggressive:
+        streaming_target = 0
+        if pol.streaming_lowh_residency and blocks_per_cu is not None:
+            streaming_target = pol.streaming_lowh_residency * blocks_per_cu * cu_count
+        elif pol.streaming_lowh_cu_oversub:
+            streaming_target = pol.streaming_lowh_cu_oversub * cu_count
+        # never below the conservative non-streaming target
+        target_blocks = max(target_blocks, streaming_target)
     if grid_x >= target_blocks:
         return 1
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
@@ -205,17 +254,40 @@ def _auto_num_splits(
 # rows per block, WPB waves per block, block_kv fixed at _BLOCK_KV.
 #
 # gfx950 variants carry the MFMA shape and block_kv in the tag, because there
-# the atom and tile width both vary:
-#     "mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>[_lds<NUM_BUFFERS>]"
+# the atom and tile width both vary, and every other knob of the two builders
+# has a segment too, so a gfx950 tag *is* a config:
+#     "mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>"         direct load
+#     "[_lds<NB>[_pd<PD>][_swp][_rs][_ls][_ts][_dg]]"
+#                                                LDS pipeline (PD default 2)
+#     "[_h<fma|fma2>]"                           head_acc (default add)
+#     "[_wpe<N>]"                                waves_per_eu hint (default 2)
+#     "[_ns<N>]"                                 fixed grid.y KV split
+#                                                (default _auto_num_splits)
 # The ``_lds`` suffix selects the LDS-pipelined builder, in which all WPB waves
 # share one staged KV tile and partition rows, so a block owns RPB*WPB rows.
+# gfx950 has no hand-picked registry: any tag in this grammar builds on demand
+# (``_variant_builder``), and the tuned dispatch table ``_GFX950_ROUTES`` is a
+# list of tags. Only gfx942's fixed ``mfma_r<RPB>_w<WPB>`` family is registered
+# up front.
 #
 # Each entry hardcodes its own block_kv, overriding whatever the caller passed
 # to ``compile_fp8_mqa_logits``.
 
 
 def _mk_builder(
-    rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True, prefetch_depth=2
+    rpb,
+    wpb,
+    *,
+    mfma=_MFMA16,
+    bkv=None,
+    lds=None,
+    prefetch_depth=2,
+    sw_pipe=False,
+    rs_head=False,
+    lds_scales=False,
+    head_acc="add",
+    tile_skip=False,
+    dma_guard=False,
 ):
     """Registry entry factory.
 
@@ -227,12 +299,15 @@ def _mk_builder(
     to their tag so the cache and registry can hold both simultaneously.
     Constraint: ``(PD-1) * NUM_ASYNC_LOADS ≤ 63`` (gfx9 vmcnt encoding limit).
 
-    Also records ``mfma.MFMA_M`` in ``_VARIANT_MFMA_M`` so ``_resolve_variant``
-    can reject a ``num_heads`` the chosen variant's atom cannot tile (the
-    kernel builders only assert this deep inside, e.g. H=16 against an
-    MFMA_M=32 atom) with a clear, host-side error instead.
+    Also records ``mfma.MFMA_M`` / ``mfma.MFMA_K`` in ``_VARIANT_MFMA_M`` /
+    ``_VARIANT_MFMA_K`` so ``_resolve_variant`` can reject a ``num_heads`` or
+    ``head_size`` the chosen variant's atom cannot tile (the kernel builders
+    only assert this deep inside, e.g. H=16 against an MFMA_M=32 atom) with a
+    clear, host-side error instead.
     """
     extra = {} if bkv is None else {"block_kv": bkv}
+    if head_acc != "add":
+        extra["head_acc"] = head_acc
     if lds is None:
         builder = lambda **kw: _build_kernel_mfma_r_w(
             **{**kw, **extra}, rows_per_block=rpb, waves_per_block=wpb, mfma=mfma
@@ -243,21 +318,36 @@ def _mk_builder(
             rows_per_block=rpb,
             waves_per_block=wpb,
             mfma=mfma,
-            swizzle=swizzle,
             num_buffers=lds,
             prefetch_depth=prefetch_depth,
+            sw_pipe=sw_pipe,
+            rs_head=rs_head,
+            lds_scales=lds_scales,
+            **({"tile_skip": True} if tile_skip else {}),
+            **({"dma_guard": True} if dma_guard else {}),
         )
-    return builder, mfma.MFMA_M
+    return builder, mfma
 
 
 _VARIANT_BUILDERS = {}
 _VARIANT_MFMA_M = {}
+_VARIANT_MFMA_K = {}
 
 
 def _register_variants(entries):
-    for tag, (builder, mfma_m) in entries.items():
+    for tag, (builder, mfma) in entries.items():
         _VARIANT_BUILDERS[tag] = builder
-        _VARIANT_MFMA_M[tag] = mfma_m
+        _VARIANT_MFMA_M[tag] = mfma.MFMA_M
+        _VARIANT_MFMA_K[tag] = mfma.MFMA_K
+
+
+def _variant_supports(tag, num_heads, head_size):
+    """Whether ``tag``'s MFMA atom tiles ``num_heads`` x ``head_size``."""
+    if _variant_builder(tag) is None:
+        return False
+    return num_heads % _VARIANT_MFMA_M[tag] == 0 and (
+        head_size % _VARIANT_MFMA_K[tag] == 0
+    )
 
 
 if _ARCH == "gfx942":
@@ -265,120 +355,23 @@ if _ARCH == "gfx942":
         {f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)}
     )
 
-if _ARCH == "gfx950":
-    # CDNA4 scaled MFMA atoms (K=128/64): gfx950-only, since those instructions
-    # require native FN operands and do not exist on gfx942.
-    _K64 = _MFMA32_K64
-    _K128 = _MFMA16_K128
-    _register_variants(
-        {
-            # -- direct load: every wave fetches its own KV tile, no LDS --
-            "mfma16x16x128_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K128, bkv=128),
-            "mfma32x32x64_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K64, bkv=128),
-            # -- LDS double-buffered: WPB waves share one staged KV tile --
-            "mfma32x32x64_bkv64_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv64_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv128_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv128_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv128_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv256_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=256, lds=2
-            ),
-            "mfma32x32x64_bkv256_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=256, lds=2
-            ),
-            "mfma16x16x128_bkv64_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=64, lds=2
-            ),
-            "mfma16x16x128_bkv128_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv128_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv128_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv256_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=256, lds=2
-            ),
-            # -- LDS triple-buffered: same in-flight depth as _lds2 but the
-            #    reader/writer barrier is elided (num_buffers > prefetch_depth) --
-            "mfma32x32x64_bkv64_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv64_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv128_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K64, bkv=128, lds=3
-            ),
-            "mfma32x32x64_bkv128_r2_w4_lds3": _mk_builder(
-                2, 4, mfma=_K64, bkv=128, lds=3
-            ),
-            # -- K128/bkv64 triple-buffered (complement the _lds2 entry above).
-            #
-            # At H=32, mfma16x16x128 gives M_TILES=2 and N_TILES=4 per BKV-64
-            # tile (8 MFMAs/wave), vs mfma32x32x64's M_TILES=1 N_TILES=2
-            # (4 MFMAs/wave).  Despite the 2x MFMA advantage, K128 measured
-            # slower for H=32 square shapes: MFMA_N=16 (vs 32) doubles the
-            # scatter-write count per BKV tile and adds an extra shuffle in the
-            # head-reduce butterfly, erasing the MFMA gain.  K64 + WPB=4 is
-            # the preferred auto-selection for H<=32; these variants are kept
-            # as exploration coverage and may perform better for higher H. --
-            "mfma16x16x128_bkv64_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K128, bkv=64, lds=3
-            ),
-            "mfma16x16x128_bkv64_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K128, bkv=64, lds=3
-            ),
-            "mfma16x16x128_bkv128_r4_w4_lds3": _mk_builder(
-                4, 4, mfma=_K128, bkv=128, lds=3
-            ),
-            "mfma16x16x128_bkv128_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K128, bkv=128, lds=3
-            ),
-        }
-    )
-
-KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-# None on an unsupported/undetected arch: there is no variant to name when
-# _VARIANT_BUILDERS is empty, and compile_fp8_mqa_logits' membership check then
-# rejects it with the available-variants list rather than a confusing KeyError.
 DEFAULT_VARIANT = (
     "mfma_r2_w4"
     if _ARCH == "gfx942"
-    else ("mfma32x32x64_bkv64_r1_w2_lds3" if _ARCH == "gfx950" else None)
+    else ("mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma" if _ARCH == "gfx950" else None)
 )
 
-# Parses both tag schemes; group 1 is the shape (None for the gfx942 tags),
-# then block_kv (None -> _BLOCK_KV), RPB, WPB, and the LDS buffer count.
+# Parses both tag schemes (see the grammar above); ``shape`` is None for the
+# gfx942 tags, ``bkv`` None means _BLOCK_KV.
 _TAG_RE = re.compile(
     r"^mfma(?P<shape>\d+x\d+x\d+)?(?:_bkv(?P<bkv>\d+))?"
-    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?$"
+    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)"
+    r"(?:_lds(?P<lds>\d+)(?:_pd(?P<pd>\d+))?(?P<swp>_swp)?(?P<rs>_rs)?(?P<ls>_ls)?"
+    r"(?P<ts>_ts)?(?P<dg>_dg)?)?"
+    r"(?:_h(?P<ha>fma2?))?(?:_wpe(?P<wpe>\d+))?(?:_ns(?P<ns>\d+))?$"
 )
+
+_GFX950_ATOMS = {"32x32x64": _MFMA32_K64, "16x16x128": _MFMA16_K128}
 
 
 def _parse_variant(tag):
@@ -395,7 +388,135 @@ def _parse_variant(tag):
     return bkv, (rpb * wpb if m.group("lds") else rpb)
 
 
-def _auto_variant(seq_len, seq_len_kv, num_heads):
+def _variant_launch_knobs(tag):
+    """(compile-hint overrides, fixed num_splits or None) of a tag."""
+    m = _TAG_RE.match(tag)
+    if m is None:
+        return {}, None
+    hints = {"waves_per_eu": int(m.group("wpe"))} if m.group("wpe") else {}
+    return hints, (int(m.group("ns")) if m.group("ns") else None)
+
+
+def _variant_builder(tag):
+    """The builder of ``tag``: a registered one, or on gfx950 any tag in the
+    grammar above, built and registered on first use. None if neither."""
+    if tag in _VARIANT_BUILDERS:
+        return _VARIANT_BUILDERS[tag]
+    m = _TAG_RE.match(tag) if _ARCH == "gfx950" else None
+    if m is None or m.group("shape") not in _GFX950_ATOMS or not m.group("bkv"):
+        return None
+    lds = m.group("lds")
+    _register_variants(
+        {
+            tag: _mk_builder(
+                int(m.group("rpb")),
+                int(m.group("wpb")),
+                mfma=_GFX950_ATOMS[m.group("shape")],
+                bkv=int(m.group("bkv")),
+                lds=int(lds) if lds else None,
+                prefetch_depth=int(m.group("pd") or 2),
+                sw_pipe=bool(m.group("swp")),
+                rs_head=bool(m.group("rs")),
+                lds_scales=bool(m.group("ls")),
+                head_acc=m.group("ha") or "add",
+                tile_skip=bool(m.group("ts")),
+                dma_guard=bool(m.group("dg")),
+            )
+        }
+    )
+    return _VARIANT_BUILDERS[tag]
+
+
+@dataclass(frozen=True)
+class _Route:
+    """One tuned dispatch entry: ``tag`` serves ``seq_len <= max_seq_len`` and
+    ``seq_len_kv <= max_seq_len_kv`` (``None``: unbounded) not taken by an
+    earlier entry."""
+
+    max_seq_len: int | None
+    tag: str
+    max_seq_len_kv: int | None = None
+
+
+# Tuned gfx950 routes, (num_heads, head_size) class -> routes by seq_len,
+# shortest first, then by seq_len_kv within one seq_len bound, the last of each
+# unbounded. Each tag is the best geomean time, under the split policy
+# (_auto_num_splits), over the tuned problems of its (seq_len, seq_len_kv)
+# window, out of the winners of searches over the whole builder knob space.
+# The problems: every (num_heads, head_size) at 128x1024,
+# 256x8192, 1024x1024, 1024x1560 and 4096x4096 under causal, misaligned and
+# past-the-end windows, plus causal 256x32768, 1024x{2k,4k,8k,16k,32k,64k},
+# 4096x{8k,16k,32k} and (D128) 8192x8192, clean-logits causal at the first
+# five shapes and 1024x32768 and 4096x16384, and (D128, H32 and H64) the
+# DSv4/GLM block-diagonal batch_causal model shapes. Causal and batch_causal
+# are weighted 2x as the production windows. See
+# op_tests/tune_flydsl_fp8_mqa_logits.py (--auto-split).
+# A route is tuned at the class's own (num_heads, head_size): other sizes that
+# map to the class run untuned and may spill. Re-tune after a kernel or split
+# policy change. The tags carry no _ns: the split policy sizes grid.y per shape.
+_GFX950_ROUTES = {
+    (32, 64): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
+    ),
+    (32, 128): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"),
+        _Route(None, "mfma16x16x128_bkv64_r1_w4_lds2_pd1_swp_rs_ls_hfma2_wpe3", 4096),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma"),
+    ),
+    (64, 64): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds3_pd1_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds3_swp_rs_hfma_wpe4", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_ts_dg_hfma_wpe1", 4096),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
+    ),
+    (64, 128): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma_wpe3", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w4_lds3_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r2_w1_lds2_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv128_r1_w4_lds3_swp_rs_hfma", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_ts_hfma_wpe1"),
+    ),
+    (128, 64): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds2_pd1_swp_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_swp_rs_hfma_wpe4"),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_hfma_wpe1", 4096),
+        _Route(2048, "mfma32x32x64_bkv128_r1_w4_lds4_swp_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
+    ),
+    (128, 128): (
+        _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma", 4096),
+        _Route(256, "mfma32x32x64_bkv128_r1_w1_lds2_pd1_swp_rs_hfma_wpe1"),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_wpe4", 4096),
+        _Route(2048, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
+        _Route(None, "mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma_wpe4", 4096),
+        _Route(None, "mfma32x32x64_bkv64_r1_w4_lds4_rs_hfma_wpe1"),
+    ),
+}
+for _routes in _GFX950_ROUTES.values():
+    _bounds = [r.max_seq_len for r in _routes]
+    _uniq = list(dict.fromkeys(_bounds))
+    assert _uniq[-1] is None and _uniq[:-1] == sorted(
+        set(_uniq[:-1])
+    ), f"routes must have increasing bounds and end unbounded: {_bounds}"
+    for _b in _uniq:
+        _kv = [r.max_seq_len_kv for r in _routes if r.max_seq_len == _b]
+        assert _kv[-1] is None and _kv[:-1] == sorted(
+            set(_kv[:-1])
+        ), f"seq_len_kv bounds must increase and end unbounded: {_kv}"
+
+
+def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
     """Pick a variant from the problem shape.
 
     gfx942: RPB from ``seq_len * seq_len_kv`` thresholds; in the middle band an
@@ -403,17 +524,14 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         tiles per wave when M and N are both large, else WPB=4 for more
         wavefronts on small-M / short-window shapes.
 
-    gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
-
-    gfx950 H<=32: mfma32x32x64 r=2 with WPB=4 everywhere except streaming
-        shapes, which keep WPB=2.
-        K64 gives M_TILES=1 at H=32 -- half the compute of H=64 -- so the
-        smaller tile grid benefits from extra wavefronts per block (WPB=4)
-        rather than more blocks (WPB=2), which keeps the SIMD units busier
-        when the row grid alone under-saturates the device.
-
-    gfx950 H in (32, 128): mfma32x32x64 with r=2 for streaming / large-square
-        shapes (KV pressure high), r=1 otherwise.
+    gfx950: the tuned ``_GFX950_ROUTES`` table. ``num_heads`` maps to the
+        nearest tuned class (<= 32, 64, >= 128) and ``head_size`` to 64 or
+        128 (>= 128); within the class, the first ``_Route`` whose
+        ``max_seq_len`` admits ``seq_len`` and whose ``max_seq_len_kv`` admits
+        ``seq_len_kv`` wins. Routed tags use the
+        32x32x64 atom (K=64), except in the 128 head_size class, where a
+        16x16x128 atom (K=128) is also allowed: head sizes are powers of two,
+        so every head_size >= 128 is a multiple of 128.
     """
     if _ARCH == "gfx942":
         rpb2_min_elems = 2**19
@@ -428,30 +546,52 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
         return f"mfma_r{rpb}_w{wpb}"
     if _ARCH == "gfx950":
-        if num_heads >= 128:
-            return "mfma32x32x64_bkv64_r1_w2_lds3"
-        streaming = seq_len_kv > 2 * seq_len
-        large_square = seq_len >= 8192 and seq_len_kv >= seq_len
-        if num_heads <= 32:
-            if streaming:
-                return "mfma32x32x64_bkv64_r2_w2_lds3"
-            return "mfma32x32x64_bkv64_r2_w4_lds3"
-        r = 2 if streaming or large_square else 1
-        return f"mfma32x32x64_bkv64_r{r}_w2_lds3"
+        h = 32 if num_heads <= 32 else (128 if num_heads >= 128 else 64)
+        routes = _GFX950_ROUTES[(h, 128 if head_size >= 128 else 64)]
+        return next(
+            r.tag
+            for r in routes
+            if (r.max_seq_len is None or seq_len <= r.max_seq_len)
+            and (r.max_seq_len_kv is None or seq_len_kv <= r.max_seq_len_kv)
+        )
     raise NotImplementedError(
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
         "supported: gfx942, gfx950"
     )
 
 
-def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
+def _auto_variants():
+    """Every tag ``_auto_variant`` can return (registered, so their atoms are
+    known to ``_variant_supports``)."""
+    if _ARCH == "gfx942":
+        return [
+            f"mfma_r{rpb}_w{wpb}" for rpb, wpb in itertools.product((1, 2, 4), (2, 4))
+        ]
+    elif _ARCH == "gfx950":
+        tags = {r.tag for routes in _GFX950_ROUTES.values() for r in routes}
+        for t in tags:
+            _variant_builder(t)
+        return sorted(tags)
+    else:
+        raise NotImplementedError(
+            f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
+            "supported: gfx942, gfx950"
+        )
+
+
+# The variants worth naming: gfx942's registry, gfx950's routed tags (any other
+# tag in the gfx950 grammar also builds, on demand).
+KERNEL_VARIANTS = tuple(_auto_variants() if _ARCH == "gfx950" else _VARIANT_BUILDERS)
+
+
+def _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size=128):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
     tag = (
         variant
         or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        or _auto_variant(seq_len, seq_len_kv, num_heads)
+        or _auto_variant(seq_len, seq_len_kv, num_heads, head_size)
     )
-    if tag not in _VARIANT_BUILDERS:
+    if _variant_builder(tag) is None:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r} for arch {_ARCH}; "
             f"available: {list(KERNEL_VARIANTS)}"
@@ -468,7 +608,37 @@ def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
             f"MFMA_M={mfma_m} required by variant {tag!r} on arch {_ARCH}; "
             f"no compatible variant is registered for this num_heads on {_ARCH}"
         )
+    mfma_k = _VARIANT_MFMA_K[tag]
+    if head_size % mfma_k != 0:
+        raise NotImplementedError(
+            f"fp8_mqa_logits: head_size={head_size} is not a multiple of "
+            f"MFMA_K={mfma_k} required by variant {tag!r} on arch {_ARCH}"
+        )
     return tag
+
+
+def _policy_num_splits(
+    launcher, args, variant, seq_len, seq_len_kv, num_heads, device_index
+):
+    """The split policy's ``num_splits`` for ``launcher``, built from
+    ``variant``; ``args`` are its launch arguments (for occupancy)."""
+    bkv, rows_per_block = _parse_variant(variant)
+    pol = _split_policy()
+    aggressive = _is_streaming_lowh(seq_len, seq_len_kv, num_heads)
+    blocks_per_cu = None
+    if pol.block_overhead_tiles is not None or (
+        aggressive and pol.streaming_lowh_residency
+    ):
+        blocks_per_cu = _max_blocks_per_cu(launcher, args)
+    return _auto_num_splits(
+        seq_len,
+        seq_len_kv,
+        rows_per_block,
+        bkv,
+        device_index,
+        blocks_per_cu,
+        aggressive=aggressive,
+    )
 
 
 @lru_cache(maxsize=32)
@@ -500,12 +670,13 @@ def compile_fp8_mqa_logits(
         raise NotImplementedError(
             "Paged FlyDSL fp8_mqa_logits is Phase 2 and not implemented yet."
         )
-    if variant not in _VARIANT_BUILDERS:
+    builder = None if variant is None else _variant_builder(variant)
+    if builder is None:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {variant!r}; "
             f"available: {list(KERNEL_VARIANTS)}"
         )
-    launcher = _VARIANT_BUILDERS[variant](
+    launcher = builder(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=block_kv,
@@ -513,7 +684,8 @@ def compile_fp8_mqa_logits(
         convert_kv_fn=convert_kv_fn,
         clean_logits=clean_logits,
     )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
+    hints, _ = _variant_launch_knobs(variant)
+    launcher.compile_hints = {**_DEFAULT_COMPILE_HINTS, **hints}
     return launcher
 
 
@@ -598,7 +770,7 @@ def flydsl_fp8_mqa_logits(
     if scale_mul != 1.0:
         kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads)
+    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size)
 
     _BKV, _ROWS_PER_BLOCK = _parse_variant(variant)
 
@@ -629,19 +801,18 @@ def flydsl_fp8_mqa_logits(
     scalars = (int(seq_len), int(seq_len_kv), int(logits.stride(0)))
 
     with torch.cuda.device(Q.device.index):
-        blocks_per_cu = None
-        if _split_policy().block_overhead_tiles is not None:
-            blocks_per_cu = _max_blocks_per_cu(
-                launcher, (*tensors, *scalars, 1, stream)
+        # A tag's _ns<N> fixes the split; otherwise the arch's split policy.
+        _, num_splits = _variant_launch_knobs(variant)
+        if num_splits is None:
+            num_splits = _policy_num_splits(
+                launcher,
+                (*tensors, *scalars, 1, stream),
+                variant,
+                seq_len,
+                seq_len_kv,
+                num_heads,
+                Q.device.index,
             )
-        num_splits = _auto_num_splits(
-            seq_len,
-            seq_len_kv,
-            _ROWS_PER_BLOCK,
-            _BKV,
-            Q.device.index,
-            blocks_per_cu,
-        )
         _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
 
     return logits[:seq_len, :]
