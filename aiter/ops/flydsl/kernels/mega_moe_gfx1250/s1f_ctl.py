@@ -57,7 +57,7 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: VGPRs and LDS allow would hang, not just run slow.
 _S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
-_S1F_GROUP_M = 8
+_S1F_GROUP_M = int(os.environ.get("AITER_S1F_GROUP_M", "8"))  # hyi t12b env hook
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
 # Decode steps have too little expert GEMM to hide the compact plan if the plan
@@ -69,7 +69,26 @@ _DECODE_PLAN_OVERLAP_TOKENS = 128
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
 #: A step whose receive bound exceeds this runs the whole S1F=0 path (see
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
-_S1F_MAX_RECV = 4096
+_S1F_MAX_RECV = int(os.environ.get("AITER_S1F_MAX_RECV", "4096").strip() or "4096")
+#: hyi 1101: AITER_S1F_JIT_LOG=1 prints every compile / first launch the
+#: stage-1 path does (plan variants, stage-1 launchers, probes) with wall time.
+_S1F_JIT_LOG = os.environ.get("AITER_S1F_JIT_LOG", "0") == "1"
+
+
+def jit_log(what: str, t0: float, **kw) -> None:
+    if not _S1F_JIT_LOG:
+        return
+    import time
+
+    extra = " ".join(f"{k}={v}" for k, v in kw.items())
+    print(
+        f"[hyi-s1f-jit] t={time.time():.3f} pid={os.getpid()} {what} {extra} "
+        f"ms={(time.perf_counter() - t0) * 1e3:.1f} "
+        f"capturing={int(torch.cuda.is_current_stream_capturing())}",
+        flush=True,
+    )
+
+
 
 
 def read_s1f_mode() -> bool:
@@ -191,6 +210,7 @@ class _Stage1Fusion:
         self.ticket_span = 0
         self.launches: dict = {}
         self.precompiled: set = set()
+        self._launched: set = set()
 
     def arm(self) -> None:
         """Allocate the stage-1 buffers, or record why this instance cannot.
@@ -206,6 +226,8 @@ class _Stage1Fusion:
         if not config.stage1_fused:
             reasons.append("needs stage1_fused (the compact plan)")
         reasons += blocking_reasons(config)
+        if os.environ.get("HYI_S1F_DEBUG"):
+            print(f"[hyi-s1f] arm r{config.rank} mode={read_s1f_mode()} reasons={reasons}", flush=True)
         if reasons:
             _fallback_warn(self, reasons)
             return
@@ -297,12 +319,16 @@ class _Stage1Fusion:
         return (int(step.align_m), int(step.recv_bound))
 
     def _recv_too_big(self) -> bool:
-        # The receive bound is identical on every rank.
+        # AITER_S1F_MAX_RECV=N keeps steps whose receive bound
+        # (identical on every rank) exceeds N on dispatch + GEMM1, e.g. to
+        # fuse decode only. Unset retains main's 4096 limit; explicit 0 disables it.
         step = getattr(self.d, "_step", None)
-        return step is not None and int(step.recv_bound) > _S1F_MAX_RECV
+        return bool(_S1F_MAX_RECV) and step is not None and (
+            int(step.recv_bound) > _S1F_MAX_RECV
+        )
 
     def step_off(self) -> bool:
-        """A step over _S1F_MAX_RECV runs exactly the S1F=0 path.
+        """hyi 1101: a step over AITER_S1F_MAX_RECV runs exactly the S1F=0 path.
 
         Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
         kernel per alignment and slot, instead of one per launch width, block
@@ -344,6 +370,8 @@ class _Stage1Fusion:
             reasons.append("needs the fused GEMM1 requant epilogue")
         self.other_ok = not reasons
         reasons += self._gemm1_reasons()
+        if os.environ.get("HYI_S1F_DEBUG"):
+            print(f"[hyi-s1f] r{self.d.config.rank} key={self._g1_key()} cap={torch.cuda.is_current_stream_capturing()} reasons={reasons}", flush=True)
         if reasons:
             _fallback_warn(self, reasons)
             return False
@@ -446,6 +474,10 @@ class _Stage1Fusion:
         # then runs its own 256x256 n/k tiles instead of the tuned GEMM1's
         # (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
         want = {"tile_m": int(align_m)}
+        # Preserve the image's optional strict tile check; main's broad
+        # tile-m-only matching remains the default.
+        if os.environ.get("AITER_S1F_ANY_TILE", "1") == "0":
+            want.update(tile_n=_S1F_TILE_N, tile_k=_S1F_TILE_K)
         return tuple(
             f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
         )
@@ -463,6 +495,10 @@ class _Stage1Fusion:
         }
         mismatches = self._mismatches(got, self.d._step.align_m)
         self.g1_seen[self._g1_key()] = mismatches
+        if _S1F_JIT_LOG:
+            import time
+
+            jit_log("probe", time.perf_counter(), key=self._g1_key(), bad=mismatches)
         if mismatches:
             _fallback_warn(self, list(mismatches))
         return flydsl_grouped_gemm_a8w4_masked(
@@ -482,6 +518,9 @@ class _Stage1Fusion:
         key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
         launch = self.launches.get(key)
         if launch is None:
+            import time
+
+            _t0 = time.perf_counter()
             d, config = self.d, self.d.config
             num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
             launch = make_s1f_stage1(
@@ -512,6 +551,7 @@ class _Stage1Fusion:
                 ctas_per_cu=ctas_per_cu,
             )
             self.launches[key] = launch
+            jit_log("s1f_launcher_build", _t0, key=key)
         return launch
 
     def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
@@ -534,6 +574,9 @@ class _Stage1Fusion:
         psum = torch.zeros(
             max(1, config.experts_per_rank), dtype=torch.int32, device=dev
         )
+        import time
+
+        _t0 = time.perf_counter()
         seen = set()
         for tok in (1, 129, 1025, 2049):
             producers, block_runs = self._variant(tok)
@@ -550,6 +593,7 @@ class _Stage1Fusion:
                 launch(*launch_args(psum, send, runs, tsrc, 0))
         torch.cuda.synchronize()
         d.res.arena._communicator.barrier()
+        jit_log("s1f_precompile", _t0, tile_m=tile_m, act=stage1_act, wrep=quant_wmma_rep)
 
     def gemm1(
         self,
@@ -624,8 +668,9 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        # The stage-1 kernel runs its own 256x256 n/k tiles.
-        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        if os.environ.get("AITER_S1F_ANY_TILE", "1") != "0":
+            # Main's stage-1 kernel runs its own 256x256 n/k tiles.
+            got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
@@ -683,8 +728,16 @@ class _Stage1Fusion:
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
         )
+        first = _S1F_JIT_LOG and id(launch) not in self._launched
+        if first:
+            import time
+
+            self._launched.add(id(launch))
+            _t0 = time.perf_counter()
         launch(
             *launch_args(
                 m_tile_map, bufs["send_list"], bufs["runs"], bufs["tile_src"], tokens
             )
         )
+        if first:
+            jit_log("s1f_first_launch", _t0, tile_m=align_m, tok=tokens, rb=block_runs)

@@ -99,6 +99,19 @@ if FORCE_1X4_CLUSTER not in (0, 1):
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 
+# Track 11: decode-time M-row-block skipping. Comma list of 16-row WMMA block
+# counts, e.g. "1,2,4": a workgroup whose expert has <=16*L valid rows left in
+# its M tile runs a mainloop variant that only loads/computes the first L
+# 16-row blocks (per wave). Rows past mn_oob are TDM zero-filled padding whose
+# output the epilogue already discards, so the result is unchanged. Empty/0
+# keeps the single full-tile mainloop (original code).
+_MREP_SPLIT_ENV = os.environ.get("AITER_TDM_MREP_SPLIT", "").strip()
+MREP_SPLIT = tuple(
+    sorted({int(v) for v in _MREP_SPLIT_ENV.split(",") if v.strip() and int(v) > 0})
+)
+# hyi 1101 (Track 11 x S1F): also split inside the S1F stage-1 kernel's GEMM1.
+MREP_SPLIT_S1F = int(os.environ.get("AITER_TDM_MREP_SPLIT_S1F", "0"))
+
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
 )
@@ -365,6 +378,8 @@ def build_gemm_a8w4_tdm_task(
         rolled_drain,
         k_waves,
         m_align,
+        MREP_SPLIT,
+        MREP_SPLIT_S1F,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -559,6 +574,21 @@ def build_gemm_a8w4_tdm_task(
     _drain = "_rolleddrain" if rolled_drain else ""
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
     _malign = f"_ma{m_align}" if m_align else ""
+    # Only levels below the full per-wave M repetition need a variant.
+    # hyi 1101: inside the S1F stage-1 kernel (tile_meta / item_hooks set) the
+    # mainloop carries S1F's per-item hooks (a_ready gate, drain_start claim
+    # whose result epi_start reads after the mainloop); a per-variant scf.if
+    # around the mainloop would scope those values inside the branch. So the
+    # split stays off there unless AITER_TDM_MREP_SPLIT_S1F=1 (experimental).
+    _mrep_here = bool(MREP_SPLIT_S1F) or (tile_meta is None and item_hooks is None)
+    mrep_levels = tuple(
+        v
+        for v in MREP_SPLIT
+        if _mrep_here and v < wmma_m_rep and m_warp == 1 and cluster_m == 1
+    )
+    _mrep_split = (
+        "_mrep" + "x".join(str(v) for v in mrep_levels) if mrep_levels else ""
+    )
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -569,6 +599,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_kwaves}"
+        f"{_mrep_split}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1365,15 +1396,27 @@ def build_gemm_a8w4_tdm_task(
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
-        front_wm = (wmma_m_rep + 1) // 2
-        FRONT = list(range(front_wm))
-        BACK = list(range(front_wm, wmma_m_rep))
+        # Trace-time M repetition of the mainloop variant being emitted; the
+        # full value unless a Track 11 MREP_SPLIT variant is being traced.
+        MEFF = [wmma_m_rep]
+
+        def set_meff(value):
+            # A call, not ``MEFF[0] = ...``: the AST rewriter would treat a
+            # subscript store inside a dynamic if as an scf.if result.
+            MEFF.__setitem__(0, value)
+
+        def front_wm_of():
+            return (MEFF[0] + 1) // 2
+
+        def n_acc_eff():
+            return MEFF[0] * wmma_n_rep
 
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
         # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
         # tiles can have n_acc as low as the tail itself, so clamp it to keep at
         # least one group for the interleaved part.
-        FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
+        def fence_cover_mma():
+            return min(8, max(0, n_acc_eff() - sched_mma_group))
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -1413,8 +1456,15 @@ def build_gemm_a8w4_tdm_task(
         DS_B = 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
-        STATE_DS = wmma_m_rep * DS_A + BS_DS
+
+        def sa_pairs_eff():
+            return (MEFF[0] + 1) // 2
+
+        def state_ds():
+            return MEFF[0] * DS_A + wmma_n_rep * DS_B + sb_pairs + sa_pairs_eff()
+
+        def pad_to(vals, width):
+            return (vals * width)[:width]
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
         RmemSlot = namedtuple("RmemSlot", "a b sa sb")
@@ -1466,11 +1516,11 @@ def build_gemm_a8w4_tdm_task(
                 ]
                 sa_v = [
                     load_sa(lds_addr.sa, sm, ksl, kt)
-                    for sm in range_constexpr(sa_pairs)
+                    for sm in range_constexpr(sa_pairs_eff())
                 ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-                for wm in range_constexpr(wmma_m_rep):
+                slot.sa.store(Vec.from_elements(pad_to(sa_v, SA_WIDTH)))
+                for wm in range_constexpr(MEFF[0]):
                     slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
                 for wn in range_constexpr(wmma_n_rep):
                     slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
@@ -1482,15 +1532,15 @@ def build_gemm_a8w4_tdm_task(
                 # runtime branch even when the A/B repetition counts differ.
                 sa_v = []
                 sb_v = []
-                for i in range_constexpr(max(sa_pairs, sb_pairs)):
-                    if const_expr(i < sa_pairs):
+                for i in range_constexpr(max(sa_pairs_eff(), sb_pairs)):
+                    if const_expr(i < sa_pairs_eff()):
                         sa_v.append(load_sa(lds_addr.sa, i, ksl, kt))
                     if const_expr(i < sb_pairs):
                         sb_v.append(load_sb(lds_addr.sb, i, ksl))
-                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+                slot.sa.store(Vec.from_elements(pad_to(sa_v, SA_WIDTH)))
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-                for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
-                    if const_expr(i < wmma_m_rep):
+                for i in range_constexpr(max(MEFF[0], wmma_n_rep)):
+                    if const_expr(i < MEFF[0]):
                         slot.a[i].store(load_a(lds_addr.a, i, ksl))
                     if const_expr(i < wmma_n_rep):
                         slot.b[i].store(load_b(lds_addr.b, i, ksl))
@@ -1519,9 +1569,12 @@ def build_gemm_a8w4_tdm_task(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+            front_wm = front_wm_of()
+            FRONT = list(range(front_wm))
+            BACK = list(range(front_wm, MEFF[0]))
             mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+                mma_rows(BACK, cur_rmem.a[front_wm : MEFF[0]], cur_rmem.b, sa_k, sb_k)
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -1580,11 +1633,11 @@ def build_gemm_a8w4_tdm_task(
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
                 if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                    rocdl.sched_dsrd(state_ds() if not rmem_preloaded else 0)
                 # Keep one normal group for the LDS/TDM scheduling slots. Small
                 # tiles can have no more MFMAs than the requested fence tail.
-                tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
-                mma_total = n_acc - tail_mfma
+                tail_mfma = min(tail_mfma, max(0, n_acc_eff() - sched_mma_group))
+                mma_total = n_acc_eff() - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(sched_mma_group, mma_total) if KWS > 1 else 1
@@ -1600,7 +1653,7 @@ def build_gemm_a8w4_tdm_task(
                     for i in range_constexpr(remaining_slots)
                 ]
                 schedule_slots = len(mma_groups)
-                future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
+                future_schedule = spread(state_ds() if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
@@ -1660,7 +1713,7 @@ def build_gemm_a8w4_tdm_task(
                 emit_hints(
                     ksl,
                     (
-                        FENCE_COVER_MMA
+                        fence_cover_mma()
                         if (
                             tile_m > 32
                             and not is_last
@@ -1958,7 +2011,26 @@ def build_gemm_a8w4_tdm_task(
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
-            run_mainloop(bool(interleaved_lds_load_on))
+            def run_mrep_level(level):
+                """Emit the variant chain: level < len(mrep_levels) handles
+                tiles with <= 16*mrep_levels[level] valid rows, else falls
+                through to the next level; the last level is the full tile."""
+                if const_expr(level == len(mrep_levels)):
+                    set_meff(wmma_m_rep)
+                    run_mainloop(bool(interleaved_lds_load_on))
+                else:
+                    small = mn_oob <= fx.Int32(mrep_levels[level] * 16)
+                    if small:
+                        set_meff(mrep_levels[level])
+                        run_mainloop(bool(interleaved_lds_load_on))
+                        set_meff(wmma_m_rep)
+                    else:
+                        run_mrep_level(level + 1)
+
+            # Each variant is a CTA-uniform branch on the valid rows left in
+            # this M tile (mn_oob counts from blk_m; m_warp == 1, so a wave
+            # covers every row of the tile).
+            run_mrep_level(0)
 
             if const_expr(k_waves > 1):
                 # Every group is past its last LDS input read once this fence

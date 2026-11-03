@@ -67,6 +67,7 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
+import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -171,7 +172,7 @@ SPIN_LIMIT = 1 << 22
 #: s_sleep units (64 clk) between flag polls. Polling faster costs everyone:
 #: tpr 768 stage 1 measured 118.5 / 115.1 / 114.1 us at 8 / 32 / 64. s_sleep
 #: takes a 7-bit immediate.
-POLL_SLEEP = 64
+POLL_SLEEP = int(os.environ.get("AITER_S1F_POLL_SLEEP", "64"))  # hyi t12b env hook
 #: Cache scope of the flag poll: the flags are written by peer ranks.
 POLL_SCOPE = SCOPE_SYS
 #: Code bytes a launch prefetches into the instruction cache on its own:
@@ -203,6 +204,20 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
 S1F_PRODUCERS = (64, 64, 64, 64)
 S1F_BLOCK_RUNS = (4, 2, 8, 8)
+
+# hyi t12b tuning hooks (unset = upstream defaults): "N" sets all four tpr
+# buckets (<=128/<=1024/<=2048/above), "a,b,c,d" sets them one by one.
+def _env_buckets(name, default):
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    vals = tuple(int(x) for x in v.split(","))
+    return vals * 4 if len(vals) == 1 else vals
+
+
+S1F_PRODUCERS = _env_buckets("AITER_S1F_PRODUCERS", S1F_PRODUCERS)
+S1F_BLOCK_RUNS = _env_buckets("AITER_S1F_BLOCK_RUNS", S1F_BLOCK_RUNS)
+assert len(S1F_PRODUCERS) == 4 and len(S1F_BLOCK_RUNS) == 4
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:

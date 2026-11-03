@@ -71,6 +71,11 @@ def _alias(owner: str, name: str) -> property:
     return property(lambda self: getattr(getattr(self, owner), name))
 
 
+def _alias(owner: str, name: str) -> property:
+    """A read-only attribute that is ``self.<owner>.<name>``."""
+    return property(lambda self: getattr(getattr(self, owner), name))
+
+
 class MegaMoEGfx1250:
     """A8W4 EP MoE: dispatch, the grouped expert GEMM, combine.
 

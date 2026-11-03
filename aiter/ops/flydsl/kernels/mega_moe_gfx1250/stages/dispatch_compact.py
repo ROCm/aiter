@@ -210,16 +210,23 @@ class _CompactDispatch(_Dispatch):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
+        route_env = os.environ.get("AITER_TDM_COMPACT_ROUTE_PARALLEL")
         if blocks_env is not None or warps_env is not None:
-            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
+            spec = (None, int(blocks_env or "64"), int(warps_env or "8"))
+            if route_env is not None:
+                spec += (route_env == "1",)
+            schedule = (spec,)
         else:
-            # Up to _COMPACT_ROUTE_UPTO tokens/rank the steps past 256 walk
-            # routes with _COMPACT_ROUTE_SPEC blocks/warps (see config.py).
-            upto = _COMPACT_ROUTE_UPTO
-            rb, rw = _COMPACT_ROUTE_SPEC
+            # Keep main's tuned schedule by default, with the image's opt-in
+            # receive threshold / route geometry controls.
+            upto = int(os.environ.get("AITER_TDM_COMPACT_ROUTE_UPTO", str(_COMPACT_ROUTE_UPTO)))
+            rb, rw = (
+                int(v) for v in os.environ.get(
+                    "AITER_TDM_COMPACT_ROUTE_SPEC", ",".join(map(str, _COMPACT_ROUTE_SPEC))
+                ).split(",")
+            )
             head = tuple(
-                e
-                for e in _DISPATCH_COMPACT
+                e for e in _DISPATCH_COMPACT
                 if e[0] is not None and e[0] < min(upto, 512)
             )
             schedule = head + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
@@ -677,24 +684,33 @@ class _CompactDispatch(_Dispatch):
     def _precompile_s1f_plans(self) -> None:
         """Compile every stage-1 plan variant before serving.
 
-        With S1F on (the default) the plan is keyed by (align_m, slot, waves,
+        With ``AITER_MEGA_S1F=1`` the plan is keyed by (align_m, slot, waves,
         blocks, tok_map, fused quant), and waves/blocks follow the step's token
         count, so eager steps (prefill, or any width the warmup never ran)
-        reached the JIT inside the serving loop (the first ~100 s of a c512
-        run had 250-470 ms prefill steps). This walks every recv bound a
-        fused step can have (<= the S1F max recv, 4096), takes the
-        alignments they map to, and one token count per distinct
+        reached the JIT inside the serving loop. This walks every recv bound a
+        fused step can have (<= AITER_S1F_MAX_RECV, else the arena's), takes
+        the alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
+        ``AITER_S1F_PRECOMPILE=0`` skips it.
         """
         if not self.fusion.enabled:
             return
+        if os.environ.get("AITER_S1F_PRECOMPILE", "1") == "0":
+            return
+        import time
+
         from ..compact_plan import compact_plan_blocks
         from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb
         from ..s1f_ctl import _S1F_MAX_RECV as _lim
+        from ..s1f_ctl import jit_log
 
+        t0 = time.perf_counter()
         config = self.config
-        limit = min(int(config.max_recv), int(_lim))
+        limit = int(config.max_recv)
+        if _lim:
+            limit = min(limit, int(_lim))
         saved = self._step
+        n_before = len(self._plan_launches)
         bounds = sorted(set(range(16, limit + 1, 16)) | {1, limit})
         steps = {}
         for b in bounds:
@@ -721,6 +737,13 @@ class _CompactDispatch(_Dispatch):
                             )
         finally:
             self._step = saved
+        jit_log(
+            "plan_precompile_all",
+            t0,
+            aligns=sorted(steps),
+            widths=sorted(widths),
+            new=len(self._plan_launches) - n_before,
+        )
 
     def _plan_waves_for(self, token_count: int | None) -> int:
         """Wave count for this step's route count.
@@ -803,6 +826,9 @@ class _CompactDispatch(_Dispatch):
                     f"waves={waves} blocks={blocks} was not compiled before "
                     "graph capture; warm this token bucket eagerly first"
                 )
+            import time as _time
+
+            _t0 = _time.perf_counter()
             config, geo, arena = self.config, self.compact, self.res.arena
             extra = {}
             if fused:
@@ -850,6 +876,9 @@ class _CompactDispatch(_Dispatch):
                 ),
             )
             self._plan_launches[key] = launch
+            from ..s1f_ctl import jit_log
+
+            jit_log("plan_compile", _t0, key=key, tok=token_count)
         return launch
 
     def _plan_args(
