@@ -1,0 +1,18 @@
+{
+    "any": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "CTAS_M": 1,
+        "CTAS_N": 1,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "NUM_BUFFERS": 3,
+        "cache_modifier": null,
+        "B_SCALE_TDM": true,
+        "kernel_type": "bandwidth_bound",
+        "LOOP_UNROLL_FACTOR": 1
+    }
+}

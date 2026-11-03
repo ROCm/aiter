@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
+
 import itertools
 import math
 import shutil
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import triton
 from triton.testing import runtime
+
 from aiter.ops.triton.topk import topk as triton_topk
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
-    get_available_models,
 )
 
 DEVICE = "cuda"
@@ -71,7 +75,7 @@ class RoofDot:
     P: float  # FLOPs / s
 
 
-def _measure_topk(batch: int, M: int, K: int) -> Tuple[float, _FlopMem]:
+def _measure_topk(batch: int, M: int, K: int) -> tuple[float, _FlopMem]:
     x = torch.rand(batch, M, device=DEVICE, dtype=torch.float32)
     tiny_row_thresh = 1024
     if M <= tiny_row_thresh and K <= 8:
@@ -89,15 +93,15 @@ def _measure_topk(batch: int, M: int, K: int) -> Tuple[float, _FlopMem]:
     return ms / 1e3, fm
 
 
-def _collect_roof_points(M: int, K: int) -> List[RoofDot]:
-    pts: List[RoofDot] = []
+def _collect_roof_points(M: int, K: int) -> list[RoofDot]:
+    pts: list[RoofDot] = []
     for B in BATCH_SIZES:
         t, fm = _measure_topk(B, M, K)
         pts.append(RoofDot(B, fm.flops / fm.bytes, fm.flops / t))
     return pts
 
 
-def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None:
+def _plot_roofline(points: list[RoofDot], M: int, K: int, out_dir: Path) -> None:
     I_vals = [p.AI for p in points]
     P_vals = [p.P for p in points]
     labels = [str(p.batch) for p in points]
@@ -297,24 +301,8 @@ def run_benchmark(args, x_vals_list):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Top-K",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
+    parser = get_parser(kernel_name="Top-K")
+
     parser.add_argument(
         "--shape",
         type=int,
@@ -325,13 +313,7 @@ def parse_args():
     parser.add_argument(
         "--topk", type=int, default=1, help="Number of elements to select by top-K"
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time"],
-        default="time",
-        help="metric to plot",
-    )
+    override_parser_action(parser, action="--metric", choices=["time"], default="time")
     parser.add_argument(
         "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
     )
@@ -362,7 +344,7 @@ def main():
         config_file = args.model_configs
         configs = get_model_configs(config_path=config_file, models=args.model)
         x_vals = []
-        for _, config in configs.items():
+        for config in configs.values():
             # layer takes (batch_size, vocab_size) as input and selects (batch_size, topk)
             N = config["vocab_size"]
             for M in [2**i for i in range(15)]:

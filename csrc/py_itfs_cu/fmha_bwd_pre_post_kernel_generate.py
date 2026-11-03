@@ -2,12 +2,11 @@
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
-from dataclasses import dataclass
 import argparse
 import fnmatch
 import itertools
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -71,7 +70,7 @@ class FmhaBwdDQDKDVTileSize:
 # TODO: design a more practical way to do it
 # this is current supported tile size & pipeline.
 # fmt: off
-def get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype: str) -> Optional[dict]:
+def get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype: str) -> dict | None:
     if dtype == "fp16" or dtype == "bf16":
         return {
             "32":  [FmhaBwdDQDKDVTileSize(32, 128, 32,  32, 32,  32, 64, 32,  32,  1, 4, 1, 4, 1, 1, 2, 2, 1, 16, 16, 32, 16, 16, 16, 1), "kr_ktr_vr_iglp", "kr_ktr_vr"],
@@ -150,7 +149,7 @@ class FmhaBwdOGradDotOKernel:
     F_hdim: int  # hdim
     F_dtype: str  # data type
     F_spad: str  # true/false
-    F_dvpad: str  #
+    F_dvpad: str
     F_mode: str  # value from MODE_MAP
     F_occupancy: int
 
@@ -192,16 +191,16 @@ class FmhaBwdOGradDotOKernel:
 
 
 def get_bwd_dot_do_o_blobs(
-    kernel_filter: Optional[str],
-) -> List[FmhaBwdOGradDotOKernel]:
+    kernel_filter: str | None,
+) -> list[FmhaBwdOGradDotOKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
         return 2
 
-    gen = list()
+    gen = []
 
-    for dtype in BWD_DTYPE_MAP.keys():
+    for dtype in BWD_DTYPE_MAP:
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
         if d is None:
             continue
@@ -220,9 +219,8 @@ def get_bwd_dot_do_o_blobs(
                 F_mode=mode,
                 F_occupancy=get_occupancy(dtype, hdim),
             )
-            if kernel_filter != "":
-                if not fnmatch.fnmatch(k.name, kernel_filter):
-                    continue
+            if kernel_filter != "" and not fnmatch.fnmatch(k.name, kernel_filter):
+                continue
             gen.append(k)
 
     return gen
@@ -304,10 +302,10 @@ class FmhaBwdConvertQGradKernel:
     F_bm0: int  # tile size along q seqlen (block size)
     F_bn0: int  # tile size along k seqlen
     F_spad: str  # true/false
-    F_dpad: str  #
+    F_dpad: str
     F_mode: str  # value from MODE_MAP
-    F_occupancy: int  #
-    F_deterministic: str  #
+    F_occupancy: int
+    F_deterministic: str
 
     @property
     def template(self) -> str:
@@ -354,16 +352,16 @@ class FmhaBwdConvertQGradKernel:
 
 
 def get_bwd_convert_dq_blobs(
-    kernel_filter: Optional[str],
-) -> List[FmhaBwdConvertQGradKernel]:
+    kernel_filter: str | None,
+) -> list[FmhaBwdConvertQGradKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
         return 2
 
-    gen = list()
+    gen = []
 
-    for dtype in BWD_DTYPE_MAP.keys():
+    for dtype in BWD_DTYPE_MAP:
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
         if d is None:
             continue
@@ -386,9 +384,8 @@ def get_bwd_convert_dq_blobs(
                 F_occupancy=get_occupancy(dtype, hdim),
                 F_deterministic=deterministic,
             )
-            if kernel_filter != "":
-                if not fnmatch.fnmatch(k.name, kernel_filter):
-                    continue
+            if kernel_filter != "" and not fnmatch.fnmatch(k.name, kernel_filter):
+                continue
             gen.append(k)
 
     return gen
@@ -406,7 +403,7 @@ def write_single_bwd_convert_dq_kernel(
     (autogen_dir / kernel.filename).write_text(kernel.template)
 
 
-def write_blobs(output_dir: Optional[str], filters_list: List[str]) -> None:
+def write_blobs(output_dir: str | None, filters_list: list[str]) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:

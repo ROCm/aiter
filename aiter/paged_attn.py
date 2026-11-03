@@ -16,7 +16,6 @@
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 import torch
 
@@ -54,7 +53,7 @@ def paged_attention_v1(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
@@ -101,7 +100,7 @@ def paged_attention_v2(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
@@ -143,7 +142,7 @@ class PagedAttentionMetadata:
 
     # (batch_size,). The length of sequences (entire tokens seen so far) per
     # sequence.
-    seq_lens_tensor: Optional[torch.Tensor]
+    seq_lens_tensor: torch.Tensor | None
     # Maximum sequence length in the batch. 0 if it is prefill-only batch.
     max_decode_seq_len: int
     # (batch_size, max_blocks_per_seq).
@@ -152,7 +151,7 @@ class PagedAttentionMetadata:
     # in the kv cache. Each block can contain up to block_size tokens.
     # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
     # captured.
-    block_tables: Optional[torch.Tensor]
+    block_tables: torch.Tensor | None
 
 
 def _use_rocm_custom_paged_attention(
@@ -170,7 +169,7 @@ def _use_rocm_custom_paged_attention(
 
 class PagedAttention:
     @staticmethod
-    def get_supported_head_sizes() -> List[int]:
+    def get_supported_head_sizes() -> list[int]:
         return [64, 80, 96, 112, 120, 128, 192, 256]
 
     @staticmethod
@@ -179,7 +178,7 @@ class PagedAttention:
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         return (2, num_blocks, block_size * num_kv_heads * head_size)
 
     @staticmethod
@@ -187,7 +186,7 @@ class PagedAttention:
         kv_cache: torch.Tensor,
         num_kv_heads: int,
         head_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = 16 // kv_cache.element_size()
         num_blocks = kv_cache.shape[1]
 
@@ -232,10 +231,10 @@ class PagedAttention:
         kv_cache_dtype: str,
         num_kv_heads: int,
         scale: float,
-        alibi_slopes: Optional[torch.Tensor],
+        alibi_slopes: torch.Tensor | None,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -353,7 +352,7 @@ class PagedAttention:
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
         key_caches = [kv_cache[0] for kv_cache in kv_caches]

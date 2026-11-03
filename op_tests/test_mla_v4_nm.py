@@ -1,0 +1,3132 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tests for the v4 MLA pipeline (mla_decode_fwd_v4_nm).
+Usage:
+  pytest -xvs op_tests/test_mla_v4_nm.py
+"""
+
+import os
+import subprocess
+import sys
+
+import numpy as np
+import pytest
+import torch
+
+import aiter
+import aiter.mla  # main no longer auto-imports submodules; need explicit
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.mla_decode_v4 import mla_decode_v4_asm
+from aiter.test_common import checkAllclose, run_perftest
+
+# ---------------------------------------------------------------------------
+# Variant under test (matches the entry in hsa/gfx950/mla_v4/mla_v4_asm.csv
+# served by aiter/ops/asm/mla_decode_v4.py).
+# ---------------------------------------------------------------------------
+GQA_RATIO = 64  # num_heads / num_kv_heads
+PAGE_SIZE = 1
+NUM_KV_HEADS = 1
+DIM_NOPE = 448  # FP8 NOPE bytes per token
+DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
+DIM_QK_PACKED = 512  # FP8 NOPE 448 + e8m0 scales + pad; the kernel row stride
+V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
+
+
+def _on_gfx950():
+    try:
+        return get_gfx() == "gfx950"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+needs_gfx950 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _on_gfx950(),
+    reason="v4 nm shader is shipped only for gfx950; requires GPU",
+)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
+# packing here (that lives in the host-side kernel init). For
+# smoke testing the dispatcher we just need byte-level buffers of the right
+# shape and dtype; numerical correctness is deferred (see file docstring).
+# ---------------------------------------------------------------------------
+def _build_inputs(
+    batch=2, kv_seq_lens=64, q_seq_logical=1, num_heads=GQA_RATIO, device="cuda", seed=0
+):
+    """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
+
+    Sizes mirror what the reference host harness computes for the same cmd
+    (only with kv_seq_lens shrunk small for fast pytest):
+      total_q = batch * num_heads * q_seq_logical
+      num_page = batch * (kv_seq_lens / page_size)
+    """
+
+    rng_np = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    total_q = batch * q_seq_logical
+    num_page = batch * (kv_seq_lens // PAGE_SIZE)
+    num_kv_splits = 1  # passes=1 for this variant
+
+    # FP8 dtype: use aiter's canonical alias which auto-resolves per arch
+    # (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The kernel reads raw bytes (NOPE
+    # bytes + e8m0 dup-scale bytes packed by host), so we just need a
+    # 1-byte-per-elem tensor of the right shape — any random byte pattern
+    # will do for smoke testing (numerical correctness lives in
+    # test_mla_v4_nm_golden.py).
+    fp8_dt = aiter.dtypes.fp8
+
+    def _rand_fp8(shape):
+        # numpy seeded RNG (NOT torch.randint — that is non-reproducible
+        # in this env for uint8 even on CPU; see comment at top of
+        # _build_inputs).
+        np_arr = rng_np.integers(0, 256, size=shape, dtype=np.uint8)
+        u = torch.from_numpy(np_arr).to(device)
+        return u.view(fp8_dt)
+
+    q = _rand_fp8((total_q, num_heads, DIM_QK_PACKED))
+    qrope = torch.randn(
+        (total_q, num_heads, DIM_ROPE),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    kv_buffer = _rand_fp8((num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_QK_PACKED))
+    kvrope = torch.randn(
+        (num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_ROPE),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    # Index tables.
+    #   q_indptr[b] = b * (q_seq_lens / gqa_ratio) = b * q_seq_logical
+    qo_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
+    )
+
+    pages_per_seq = kv_seq_lens // PAGE_SIZE
+    kv_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * pages_per_seq
+    )
+
+    # Random page mapping (each batch's pages picked from [0, num_page)).
+    kv_page_indices = torch.arange(
+        0, batch * pages_per_seq, dtype=torch.int32, device=device
+    )
+
+    kv_last_page_lens = torch.full(
+        (batch,),
+        kv_seq_lens % PAGE_SIZE,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    split_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * num_kv_splits
+    )
+
+    # `output` here is the *final reduce* buffer (3D), used only when
+    # out_16_nosplit=1. The split-out fp32 logits are allocated *inside*
+    # mla_decode_fwd_v4_nm (aiter/mla.py) and returned separately. The
+    # underlying mla_decode_v4_asm C-ABI dispatcher reads
+    #   total_query_len = output.size(0)
+    #   num_heads       = output.size(1)
+    #   v_head_dim      = output.size(2)
+    # so this MUST be 3D [total_q, num_heads, v_head_dim].
+    output = torch.empty(
+        (total_q, num_heads, V_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    ).fill_(-1)
+
+    # sink: required by mla_decode_fwd_v4_nm. -inf = "no sink" math
+    # (exp(-inf) = 0 → virtual K-col contributes 0 to softmax denom).
+    sink = torch.full(
+        (num_heads,),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    return {
+        "q": q,
+        "qrope": qrope,
+        "kv_buffer": kv_buffer,
+        "kvrope": kvrope,
+        "output": output,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "split_indptr": split_indptr,
+        "max_seqlen_q": q_seq_logical,
+        "sink": sink,
+        "num_kv_splits": num_kv_splits,
+        "out_16_nosplit": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+@needs_gfx950
+def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
+    """Regression guard for the 21-slot (336B) v4 nm legacy kernarg layout.
+
+    Locks in the *scalar* portion (slot 7 scalar_f, slot 8-12 ints, slot 15
+    int) of the kernarg buffer produced by aiter/ops/asm/mla_decode_v4.py for
+    the canonical qh64/(gqa,qseq)∈{(16,4),(64,1),(128,1)}/page=1/passes=1
+    config (single .co; the lookup in mla_decode_v4.py remaps gqa∈{64,128}
+    to the (gqa=16,qSeqLen=4) CSV row). Any future
+    change to the dispatcher that shifts a slot, mis-computes a stride /
+    scale, or changes the formula here will trip this test before the golden
+    numerical test does.
+
+    Pointer slots are NOT checked (their values are runtime allocation
+    addresses and don't have a stable reference). Bytes printed by the
+    AITER_V4_NM_DUMP_KERNARG=1 path in mla_decode_v4.py are captured via capfd.
+    """
+    monkeypatch.setenv("AITER_V4_NM_DUMP_KERNARG", "1")
+    args = _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+    aiter.mla.mla_decode_fwd_v4_nm(**args)
+    torch.cuda.synchronize()
+
+    captured = capfd.readouterr()
+    # The launcher prints "[aiter kernarg <N>B]" then N/16 rows of 16 hex
+    # bytes. On gfx950 the legacy (non-preload) ABI is 21 slots x 16B = 336B:
+    # slots 0-18 from the original layout + slots 19/20 (valid_split scratch)
+    # added by the kargs-preload change. Parse the rows out of stderr.
+    import re
+
+    lines = captured.err.splitlines()
+    marker = re.compile(r"^\[aiter kernarg (\d+)B\]$")
+    start = None
+    arg_size = None
+    for i, line in enumerate(lines):
+        m = marker.match(line.strip())
+        if m:
+            start = i
+            arg_size = int(m.group(1))
+            break
+    if start is None:
+        pytest.fail(
+            "kernarg hexdump not found in stderr — "
+            "AITER_V4_NM_DUMP_KERNARG env var may have been ignored, "
+            "or the dump code was removed.\n"
+            f"stderr was: {captured.err[:500]}"
+        )
+    assert arg_size == 336, (
+        f"expected 336B legacy kernarg (21 slots) on gfx950, got {arg_size}B — "
+        "the MlaV4KernelArgsLegacy layout changed; update this guard."
+    )
+    n_slots = arg_size // 16
+    hex_rows = []
+    for line in lines[start + 1 : start + 1 + n_slots]:
+        m = re.match(r"^((?:[0-9a-fA-F]{2}\s*){16})$", line.strip())
+        if not m:
+            break
+        hex_rows.append(bytes.fromhex(line.strip().replace(" ", "")))
+
+    assert (
+        len(hex_rows) == n_slots
+    ), f"expected {n_slots} hex rows of kernarg, got {len(hex_rows)}"
+    kargs = b"".join(hex_rows)
+
+    # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
+    def slot(i):
+        return kargs[i * 16 : i * 16 + 16]
+
+    def slot_u32(i):
+        return int.from_bytes(slot(i)[:4], "little")
+
+    import struct
+
+    def slot_f32(i):
+        return struct.unpack("<f", slot(i)[:4])[0]
+
+    # scalar_f is computed in jinja with C `float`s (1.0f/sqrtf(512.f)). Mirror
+    # that precision here so the byte-exact compare doesn't false-fail on the
+    # FP64→FP32 round-off difference.
+    expected_scalar_f_bytes = struct.pack(
+        "<f", float(np.float32(1.0) / np.float32(np.sqrt(np.float32(448 + 64))))
+    )
+    expected_gqa_ratio = GQA_RATIO  # 16
+    expected_kv_split = 1  # num_kv_splits=1
+    expected_log2_page = 0  # log2(page_size=1)
+    # V3-style: out_16_nosplit is DERIVED = (num_kv_splits==1) ? 1 : 0. This
+    # config is single-pass (kv_split=1) so the dispatcher writes 1 into slot 15
+    # regardless of the caller-facing arg (which _build_inputs leaves default).
+    expected_out16ns = 1
+    # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
+    # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
+    # via zero-init to skip the per-call D2H readback that used to compute
+    # s_total_kv (see MlaV4KernelArgsLegacy in aiter/ops/asm/mla_decode_v4.py).
+    expected_total_kv = 0
+    expected_stride_pg = 0
+
+    # slot 7 scalar_f: byte-exact compare (FP32)
+    actual_scalar_f_bytes = slot(7)[:4]
+    assert actual_scalar_f_bytes == expected_scalar_f_bytes, (
+        f"slot 7 scalar_f bytes: got {actual_scalar_f_bytes.hex()}, "
+        f"want {expected_scalar_f_bytes.hex()} (= 1/sqrt(512) in FP32)"
+    )
+    for slot_idx, want, name in [
+        (8, expected_gqa_ratio, "s_gqa_ratio"),
+        (9, expected_kv_split, "s_kv_split"),
+        (10, expected_total_kv, "s_total_kv (DEAD; must be 0)"),
+        (11, expected_stride_pg, "s_stride_page (DEAD; must be 0)"),
+        (12, expected_log2_page, "s_log2_page"),
+        (15, expected_out16ns, "out_16_nosplit"),
+    ]:
+        got = slot_u32(slot_idx)
+        assert got == want, (
+            f"slot {slot_idx} ({name}): got {got} (0x{got:08x}), "
+            f"want {want} (0x{want:08x})"
+        )
+
+    # Sanity: pointer slots (0..6, 13, 14, 16, 17, 18) must be non-NULL.
+    # Slot 18 (ptr_sink) is REQUIRED non-NULL — caller must allocate even
+    # when they want "no sink" math (-inf works, but the buffer must exist).
+    for slot_idx in (0, 1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18):
+        ptr = int.from_bytes(slot(slot_idx)[:8], "little")
+        assert ptr != 0, f"slot {slot_idx} pointer is NULL"
+
+    # Slots 19/20 are the valid_split-count export scratch. gfx950 now WIRES
+    # them (valid-split-exporting kernels): slot 19 = valid_split_count buffer
+    # ptr (non-NULL, wrapper always allocates it), slot 20 = the opt-in flag =
+    # int(num_kv_splits > 1). This config uses num_kv_splits=1, so the flag is 0
+    # (single-split has no empty tail to skip) while the ptr is still a live
+    # buffer.
+    assert (
+        int.from_bytes(slot(19)[:8], "little") != 0
+    ), "slot 19 (ptr_valid_split) must be a live buffer ptr on gfx950"
+    assert (
+        slot_u32(20) == 0
+    ), "slot 20 (s_use_valid_split) must be 0 for num_kv_splits=1 (single-split)"
+
+
+# ---------------------------------------------------------------------------
+# Torch golden + accuracy + perf tests (resolves the TODO #1 in the file
+# docstring). Mirrors op_tests/rui.py's torch reference and op_tests/test_mla.py's
+# checkAllclose/run_perftest pattern. The ATOM-style wrapper below mirrors
+# ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode
+# so the asm op can drop in as a replacement for the triton fallback there.
+# ---------------------------------------------------------------------------
+
+# MODEL1_FP8Sparse layout (mirrored locally; not exported by aiter.ops.quant
+# in this tree). Drives the per-token packing the v4 nm asm kernel expects.
+_QUANT_D = 512  # full head dim = nope + rope
+_QUANT_D_NOPE = 448  # FP8-quantized
+_QUANT_D_ROPE = 64  # BF16 (kept separate in `qrope`/`kvrope` buffer)
+_QUANT_TILE_SIZE = 64
+_QUANT_NUM_TILES = _QUANT_D_NOPE // _QUANT_TILE_SIZE  # 7
+# v4 nm kernel reads each tile's e8m0 scale TWICE in a row, so the scale
+# block on disk is 14 bytes laid out as (s0,s0,s1,s1,...,s6,s6). Empirically
+# verified: without the duplication V[256:448] of the asm output is all-zero
+# and V[0:256] is partially correct, because scale reads land mid-pad.
+_QUANT_NUM_SCALE_BYTES = _QUANT_NUM_TILES * 2  # 14
+
+
+def _cast_scale_inv_to_ue8m0(t_input, out_dtype=torch.float32):
+    """Round scale to 2^ceil(log2(scale)) — matches e8m0 storage."""
+    return torch.pow(2, torch.clamp_min(t_input, 1e-4).log2().ceil()).to(out_dtype)
+
+
+def _native_to_2buff_for_asm(input_bf16):
+    """BF16 [..., 512] -> (nope_scale_buff [..., 512] fp8, rope_buff [..., 64] bf16).
+
+    Per-token nope_scale_buff layout (matches the v4 nm asm kernel's reader):
+      [ nope (448 fp8) | scale (14 e8m0; each tile-scale duplicated x2) | pad (50) ]
+                                                                              = 512 B
+      rope_buff = [ rope (64 bf16) ]                                         = 128 B
+
+    NOTE: differs from op_tests/rui.py which writes 7 e8m0 bytes once. The
+    v4 nm shader reads each tile's scale TWICE consecutively (s0,s0,s1,s1,
+    ...,s6,s6); writing only 7 leaves the second-half scale reads landing in
+    zero pad bytes, which empirically produced V[256:448] all-zero output.
+    """
+    assert input_bf16.shape[-1] == _QUANT_D
+    leading = input_bf16.shape[:-1]
+    nope = input_bf16[..., :_QUANT_D_NOPE]
+    rope = input_bf16[..., _QUANT_D_NOPE:].contiguous()
+
+    nope_scale_buff = torch.zeros(
+        leading + (_QUANT_D,),
+        dtype=dtypes.fp8,
+        device=input_bf16.device,
+    )
+    nope_part = nope_scale_buff[..., :_QUANT_D_NOPE]
+    scale_part = nope_scale_buff[
+        ..., _QUANT_D_NOPE : _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES
+    ].view(dtypes.fp8_e8m0)
+
+    fp8_max = torch.finfo(dtypes.fp8).max
+    for t in range(_QUANT_NUM_TILES):
+        s, e = t * _QUANT_TILE_SIZE, (t + 1) * _QUANT_TILE_SIZE
+        tile = nope[..., s:e]
+        scale_inv = torch.abs(tile).max(dim=-1).values.float() / fp8_max
+        scale_inv = _cast_scale_inv_to_ue8m0(scale_inv)
+        # Duplicate-write the scale: bytes [2t] and [2t+1] both hold s_t.
+        scale_part[..., 2 * t] = scale_inv.to(dtypes.fp8_e8m0)
+        scale_part[..., 2 * t + 1] = scale_inv.to(dtypes.fp8_e8m0)
+        nope_part[..., s:e] = (tile.float() / scale_inv.unsqueeze(-1)).to(dtypes.fp8)
+
+    return nope_scale_buff, rope
+
+
+def _quant_2buff_to_native(nope_scale_buff, rope_buff):
+    """Inverse of `_native_to_2buff_for_asm`. Returns BF16 [..., 512].
+
+    Reads only the first byte of each duplicated scale pair (bytes [2t]); the
+    second byte [2t+1] is a redundant copy written for the kernel's benefit.
+    """
+    leading = nope_scale_buff.shape[:-1]
+    out = torch.empty(
+        leading + (_QUANT_D,), dtype=dtypes.bf16, device=nope_scale_buff.device
+    )
+    nope_part = nope_scale_buff[..., :_QUANT_D_NOPE]
+    scale_part = nope_scale_buff[
+        ..., _QUANT_D_NOPE : _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES
+    ].view(dtypes.fp8_e8m0)
+    for t in range(_QUANT_NUM_TILES):
+        s, e = t * _QUANT_TILE_SIZE, (t + 1) * _QUANT_TILE_SIZE
+        out[..., s:e] = nope_part[..., s:e].to(dtypes.bf16) * scale_part[..., 2 * t].to(
+            dtypes.bf16
+        ).unsqueeze(-1)
+    out[..., _QUANT_D_NOPE:] = rope_buff
+    return out
+
+
+def _torch_attn_decode_bf16_golden(
+    q_bf16,  # [total_q, num_heads, D=512]
+    kv_bf16,  # [num_page, page_size=1, num_kv_heads=1, D=512]
+    qo_indptr,  # [batch+1]   q rows per sequence (per-batch cumulative)
+    kv_indptr,  # [batch+1]   pages per sequence (cumulative; page_size=1)
+    kv_page_indices,  # [total_pages_used]
+    kv_last_page_lens,  # [batch]
+    sm_scale,
+    attn_sink=None,  # [num_heads] or None
+):
+    """Pure-torch BF16 reference. Per-batch loop, scaled-dot-product attention
+    with GQA broadcast (single KV head -> all Q heads). Returns
+        out  [total_q, num_heads, D=512] bf16   (V dim == head dim for MLA)
+        lse  [total_q, num_heads] bf16
+    """
+    num_heads = q_bf16.size(1)
+    d = q_bf16.size(2)
+    page_size = kv_bf16.size(1)
+    assert page_size == 1, "this golden only supports page_size=1"
+
+    total_q = q_bf16.size(0)
+    out = torch.empty((total_q, num_heads, d), dtype=dtypes.bf16, device=q_bf16.device)
+    lse_full = torch.empty(
+        (total_q, num_heads), dtype=dtypes.bf16, device=q_bf16.device
+    )
+    batch = qo_indptr.size(0) - 1
+
+    qo_indptr_cpu = qo_indptr.cpu().tolist()
+    kv_indptr_cpu = kv_indptr.cpu().tolist()
+    kv_last_cpu = kv_last_page_lens.cpu().tolist()
+
+    for b in range(batch):
+        qs, qe = qo_indptr_cpu[b], qo_indptr_cpu[b + 1]
+        ps, pe = kv_indptr_cpu[b], kv_indptr_cpu[b + 1]
+        num_pages_b = pe - ps
+        if num_pages_b == 0:
+            out[qs:qe] = 0
+            lse_full[qs:qe] = float("+inf")
+            continue
+        page_ids = kv_page_indices[ps:pe]
+        kv_pages = kv_bf16[page_ids]  # [num_pages_b, 1, 1, D]
+        kv_flat = kv_pages.reshape(-1, 1, d)  # [num_pages_b*1, 1, D]
+        total_tokens = (num_pages_b - 1) * page_size + kv_last_cpu[b]
+        kv_b = kv_flat[:total_tokens].float()  # [seq_k, 1, D]
+        kv_b = kv_b.expand(-1, num_heads, -1)  # GQA broadcast
+
+        q_b = q_bf16[qs:qe].float()  # [s_q, H, D]
+        scores = torch.einsum("shd,khd->shk", q_b, kv_b) * sm_scale  # [s_q, H, seq_k]
+
+        if attn_sink is not None:
+            # Sink as virtual K: per-head logit, broadcast across all q_token.
+            # attn_sink is [num_heads] (one scalar bias per head, shared by
+            # every query token in that head).
+            sink_b = attn_sink.view(1, num_heads).float()  # [1, H] -> [s_q, H]
+            lse = scores.logsumexp(dim=-1)  # [s_q, H]
+            m = torch.maximum(lse, sink_b)
+            denom = torch.exp(lse - m) + torch.exp(sink_b - m)
+            lse_final = m + torch.log(denom)
+            probs = torch.exp(scores - lse_final.unsqueeze(-1))
+        else:
+            lse_final = scores.logsumexp(dim=-1)
+            probs = torch.exp(scores - lse_final.unsqueeze(-1))
+
+        v_b = kv_b  # MLA: V == K (first D dims)
+        out_b = torch.einsum("shk,khv->shv", probs, v_b)  # [s_q, H, D]
+        out[qs:qe] = out_b.to(dtypes.bf16)
+        lse_full[qs:qe] = lse_final.to(dtypes.bf16)
+
+    return out, lse_full
+
+
+def _torch_attn_decode_fp8_dequant_ref(
+    q_nope_scale,
+    q_rope,
+    kv_nope_scale,
+    kv_rope,
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    sm_scale,
+    attn_sink=None,
+):
+    """Dequantize the same FP8 tensors the asm kernel sees, then call the
+    BF16 golden. Isolates "kernel math bug" from "FP8 quant noise".
+    """
+    q_bf16 = _quant_2buff_to_native(q_nope_scale, q_rope)
+    # kv: nope_scale_buff is [num_page, page_size, num_kv_heads, 512] -> dequant
+    kv_bf16 = _quant_2buff_to_native(kv_nope_scale, kv_rope)
+    return _torch_attn_decode_bf16_golden(
+        q_bf16,
+        kv_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        attn_sink=attn_sink,
+    )
+
+
+def _asm_attn_decode_bf16(
+    q_bf16,  # [total_q, num_heads=16, D=512] bf16
+    kv_bf16,  # [num_page, page_size=1, num_kv_heads=1, D=512] bf16
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    sm_scale,
+):
+    """Quantize bf16 q/kv into the 2-buffer asm layout, call
+    `aiter.mla.mla_decode_fwd_v4_nm`, and reduce/reshape the FP32 split
+    logits back into a [total_q, num_heads, V_HEAD_DIM] BF16 tensor.
+
+    Returns (out_bf16, logits, attn_lse, packed_buffers).
+
+    Stride note: KV.size(3) is the per-token kernel stride in bytes. The
+    kernel reads exactly 448 (nope) + 8 (scale) + slack = our 512-byte
+    layout. Padding to 576 (the kernel's stride_Page) made the kernel read
+    garbage bytes as scale and produced all-NaN — DON'T pad.
+    """
+    total_q = q_bf16.size(0)
+    num_heads = q_bf16.size(1)
+    num_seqs = qo_indptr.size(0) - 1
+    assert num_heads == GQA_RATIO
+
+    q_packed, q_rope = _native_to_2buff_for_asm(
+        q_bf16
+    )  # [total_q, H, 512] / [.., 64] bf16
+    kv_packed, kv_rope = _native_to_2buff_for_asm(kv_bf16)  # [P, 1, 1, 512] / [.., 64]
+
+    # `output` is required by the C ABI even when reading from logits. The
+    # kernel currently does not fully populate it (out_16_nosplit=1 path is
+    # unverified at correctness), so we read from `logits` instead.
+    output = torch.empty(
+        (total_q, num_heads, V_HEAD_DIM), dtype=dtypes.bf16, device=q_bf16.device
+    )
+    num_kv_splits = 1
+    split_indptr = torch.tensor(
+        [i * num_kv_splits for i in range(num_seqs + 1)],
+        dtype=torch.int32,
+        device=q_bf16.device,
+    )
+    # sink: -inf = "no sink" math. Size = num_heads (post-2026-06-01
+    # shrink — kernel reads sink head-only). See aiter/mla.py docstring.
+    sink = torch.full(
+        (num_heads,),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_bf16.device,
+    )
+
+    logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(
+        q=q_packed,
+        qrope=q_rope.contiguous(),
+        kv_buffer=kv_packed,
+        kvrope=kv_rope.contiguous(),
+        output=output,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        split_indptr=split_indptr,
+        max_seqlen_q=max_seqlen_q,
+        sink=sink,
+        sm_scale=sm_scale,  # ignored by kernel (hardcodes 1/sqrt(512))
+        out_16_nosplit=0,
+        num_kv_splits=num_kv_splits,
+    )
+    # logits: [num_seqs, num_kv_splits=1, num_kv_heads=1, gqa*max_seqlen_q=64, D=512]
+    # Internal row layout: row = q_token * gqa_ratio + head (empirically verified
+    # by per-row compare against the torch golden — see the comparison test).
+    # Reshape: [num_seqs, q_seq_logical, gqa, D] then flatten to [total_q, H, D].
+    out_bf16 = (
+        logits[:, 0, 0]
+        .reshape(num_seqs, max_seqlen_q, num_heads, V_HEAD_DIM)
+        .reshape(total_q, num_heads, V_HEAD_DIM)
+        .to(dtypes.bf16)
+    )
+    return out_bf16, logits, attn_lse, (q_packed, q_rope, kv_packed, kv_rope)
+
+
+def _print_per_v_tile_diff(x_ref, y_asm, label):
+    """Per-64-elem-tile summary of |asm|/|ref| over the V dim.
+
+    Surfaces the "kernel only writes a subset of V tiles" failure mode
+    (empirically: dims [256:448] currently come back zero, suggesting the
+    kernel writes V_HEAD_DIM=256 of nope output + 64 of rope, leaving
+    [256:448] unwritten). Run this whenever the cos_diff threshold
+    trips so the gap is obvious without dropping into a debugger.
+    """
+    xd = x_ref.detach().float()
+    yd = y_asm.detach().float()
+    # collapse leading dims; we only care about the V axis (last dim).
+    xf = xd.reshape(-1, xd.shape[-1])
+    yf = yd.reshape(-1, yd.shape[-1])
+    print(f"  {label} per-V-tile |asm| / |ref|:")
+    for i in range(0, xf.shape[-1], 64):
+        mref = xf[:, i : i + 64].abs().mean().item()
+        masm = yf[:, i : i + 64].abs().mean().item()
+        ratio = masm / mref if mref > 1e-12 else float("nan")
+        max_diff = (xf[:, i : i + 64] - yf[:, i : i + 64]).abs().max().item()
+        print(
+            f"    V[{i:3d}:{i + 64:3d}]  |ref|={mref:.3e}  |asm|={masm:.3e}  "
+            f"asm/ref={ratio:.3f}  max|diff|={max_diff:.3e}"
+        )
+
+
+def _build_bf16_inputs(
+    batch=2,
+    kv_seq_lens=64,
+    q_seq_logical=1,
+    seed=0,
+    device="cuda",
+    gqa_ratio=GQA_RATIO,
+    attn_sink=True,
+):
+    """Build BF16 ground-truth q/kv and the aiter index tables. Output:
+    q_bf16:           [total_q = batch*q_seq_logical, num_heads=gqa_ratio, D=512]
+    kv_bf16:          [num_page = batch*kv_seq_lens, 1, 1, D=512]
+    qo_indptr/kv_indptr/kv_page_indices/kv_last_page_lens — aiter convention.
+
+    `attn_sink`:
+      Returns `sink` as a per-head [num_heads] FP32 tensor (one scalar per
+      head, shared across all query tokens). The caller is responsible for
+      tiling it across q_token into the kernel's flat buffer before the asm
+      call (see _run_one_point); the torch reference consumes the per-head
+      form directly.
+      True  -> NON-ZERO random (randn) per-head sink. randn (not a constant)
+               makes every head distinct so a head-dim layout mismatch shows
+               up as a cos_diff blowup, not a silent pass.
+      False -> per-head -inf ("no sink" no-op: exp(-inf - max) = 0).
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    total_q = batch * q_seq_logical
+    num_page = batch * (kv_seq_lens // PAGE_SIZE)
+
+    # Bare randn (~N(0,1)), matching op_tests/test_mla.py's input convention.
+    # No /10 scaling or clamp: under the strict 1% checkAllclose tolerance this
+    # leaves some elements over the bound (FP8 quant noise on the full dynamic
+    # range), reported as `failed!` — that is expected and double-checked by eye,
+    # not a hard gate (checkAllclose does not raise).
+    q_bf16 = torch.randn(
+        (total_q, gqa_ratio, _QUANT_D), dtype=dtypes.bf16, device=device
+    )
+    kv_bf16 = torch.randn(
+        (num_page, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+
+    qo_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
+    )
+    pages_per_seq = kv_seq_lens // PAGE_SIZE
+    kv_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * pages_per_seq
+    )
+    kv_page_indices = torch.arange(
+        0, batch * pages_per_seq, dtype=torch.int32, device=device
+    )
+    kv_last_page_lens = torch.full(
+        (batch,), kv_seq_lens % PAGE_SIZE, dtype=torch.int32, device=device
+    )
+    # page_size=1: kv_last_page_lens must be in [1, page_size], so 1.
+    kv_last_page_lens.fill_(1)
+
+    # sink: per-head [num_heads] attention sink (one scalar per head), consumed
+    # head-only by both the kernel and the torch ref — no q_token tiling.
+    # Scaled up by 10 (randn * 10) so the sink contributes ~15% to the softmax
+    # output vs a no-sink baseline: well above the checkAllclose tolerance, so a
+    # dropped / mis-scaled sink in the kernel shows up as a hard mismatch instead
+    # of being masked by quant noise (bare randn ~N(0,1) only moves ~0.8%).
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    if attn_sink:
+        sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 10.0
+    else:
+        # per-head -inf = "no sink" no-op (exp(-inf - max) = 0).
+        sink = torch.full(
+            (num_heads,), float("-inf"), dtype=torch.float32, device=device
+        )
+
+    return {
+        "q_bf16": q_bf16,
+        "kv_bf16": kv_bf16,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "sink": sink,
+        "max_seqlen_q": q_seq_logical,
+        "kv_seq_lens": kv_seq_lens,
+        "batch": batch,
+        "q_seq_logical": q_seq_logical,
+    }
+
+
+def _gated_allclose(a, b, msg, rtol=3e-2, atol=3e-2, tol_err_ratio=0.02):
+    """checkAllclose that fails the test on a `failed!` result.
+
+    checkAllclose only raises on a catastrophic delta; otherwise it logs
+    `failed!` and returns the mismatch fraction, so an ungated call lets a bad
+    accuracy result pass silently in both pytest and the script-mode sweep.
+    """
+    err = checkAllclose(
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=msg
+    )
+    assert err <= tol_err_ratio, (
+        f"{msg}: {err:.1%} of elements outside rtol={rtol} atol={atol} "
+        f"(limit {tol_err_ratio:.0%})"
+    )
+    return err
+
+
+def _run_one_point(
+    batch=2,
+    kv_seq_lens=64,
+    q_seq_logical=1,
+    seed=0,
+    num_iters=50,
+    num_warmup=3,
+    num_kv_splits=1,  # int, or None to auto-pick via get_meta_param (like the wrapper)
+    gqa_ratio=GQA_RATIO,
+    attn_sink=True,
+    out_16_nosplit=0,  # 1 -> kernel writes packed-BF16 result; wrapper resolves into output_buf
+):
+    """One shape point: build inputs ONCE, time the asm kernel via
+    run_perftest, then compare the last iter's output against the two torch
+    references. Mirrors the merged accuracy+perf pattern in test_mla.py:382-413.
+
+    Why num_rotate_args=1: skips both device_memory_profiling and the
+    copy.deepcopy(args) fan-out in aiter/test_common.py:46-71, so the
+    pre-allocated logits/lse buffers are reused across all iters. Without
+    this, run_perftest's default rotation tries to deepcopy ~MB of tensors
+    per iter and trips a GPU OOM (the reason the hand-rolled timer used to
+    live here).
+    """
+    # The shipped qh64 .co has a 64 q-row tile; the dispatcher
+    # (aiter/ops/asm/mla_decode_v4.py) selects sub_Q based on (gqa_ratio,
+    # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
+    # single .co covers these (gqa, q_seq_logical) entry points:
+    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → sub_Q=64, gdx=1
+    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → sub_Q=64, gdx=1
+    #   (128,1) — 128 heads × 1 logical-Q row = 128 → sub_Q=64, gdx=2 (2 WGs)
+    #   (16, 1) — 16 heads × 1 logical-Q row  = 16 → sub_Q=16, gdx=1; the
+    #             kernel writes a compact 16-row partial (no 64-row tile
+    #             slack — verified: logits come back [num_seqs,1,16,512]).
+    #   (16, 2) — 16 heads × 2 logical-Q rows = 32 → sub_Q=32, gdx=1; the
+    #             kernel writes a compact 32-row partial (2 q_tokens × 16
+    #             heads; logits [num_seqs,1,2,16,512] -> [total_q,16,512]).
+    #   (32, 1) — 32 heads × 1 logical-Q row  = 32 → sub_Q=32, gdx=1; compact
+    #             32-row partial (row == head; logits [num_seqs,1,32,512]).
+    # The CSV alias in mla_decode_v4.py remaps all of these to the single
+    # (Gqa=64, qSeqLen=1) lookup row so they share one kernel symbol.
+    _SHIPPED_TILE_VARIANTS = {
+        (16, 4),
+        (64, 1),
+        (128, 1),
+        (16, 1),
+        (16, 2),
+        (32, 1),
+    }
+    assert (gqa_ratio, q_seq_logical) in _SHIPPED_TILE_VARIANTS, (
+        f"(gqa_ratio={gqa_ratio}, q_seq_logical={q_seq_logical}) not in shipped "
+        f"variants {_SHIPPED_TILE_VARIANTS} for the qh64 .co. The dispatcher "
+        f"picks sub_Q from (gqa, max_seqlen_q) and launches "
+        f"gdx=ceil(gqa*max_seqlen_q/sub_Q) WGs along the head dim; only these "
+        f"pairs are exercised by CSV+dispatcher."
+    )
+
+    # Auto-pick the split count when the caller passes None — mirrors the
+    # production wrapper (aiter/mla.py mla_decode_fwd_v4_nm), which forwards
+    # num_kv_splits=None to get_meta_param's CU-occupancy x HBM-efficiency
+    # heuristic. We resolve it to a concrete int HERE (before any buffer
+    # allocation) because this driver pre-allocates logits/lse/split_indptr
+    # sized to a fixed split count; page_size=1 so total_kv = batch*kv_seq_lens
+    # and nhead = NUM_KV_HEADS*gqa_ratio.
+    if num_kv_splits is None:
+        # tg_factor mirrors the wrapper: gqa=128 launches ceil(128/64)=2 WGs
+        # per (seq, split), so its effective CU occupancy is 2x — feed that in
+        # so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
+        num_heads = NUM_KV_HEADS * gqa_ratio
+        tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+        num_kv_splits, _ = aiter.mla.get_meta_param(
+            None,
+            batch,
+            batch * kv_seq_lens,
+            num_heads,
+            q_seq_logical,
+            dtypes.fp8,
+            tg_factor,
+        )
+        num_kv_splits = int(num_kv_splits)
+        print(
+            f"[v4 nm] auto-selected num_kv_splits={num_kv_splits} "
+            f"(tg_factor={tg_factor})"
+        )
+
+    # out_16_nosplit=1 is the kernel's single-pass packed-BF16 direct path; it
+    # has no stage2 merge, so it is only valid with num_kv_splits==1 (the same
+    # constraint the wrapper enforces).
+    if out_16_nosplit != 0:
+        assert num_kv_splits == 1, (
+            f"out_16_nosplit={out_16_nosplit} requires num_kv_splits==1 "
+            f"(bf16-direct-write is single-pass only); got {num_kv_splits}."
+        )
+
+    # Multi-split input guard (checked BEFORE any kernel launch): the v4 nm 32n
+    # .co inner KV loop processes SUB_KV=32 tokens/iteration; each split WG must
+    # get at least one full pass (>=32 tokens) or its tail is dropped. The
+    # operator handles a non-divisible kv_seq_lens // splits (remainder
+    # distributed internally), so the only requirement is that the SMALLEST
+    # split >= 32. floor(kv/splits) is the smallest split's size regardless of
+    # how the remainder lands. The dispatcher does NOT validate this (forwards
+    # num_kv_splits to kernarg slot 9 verbatim), so guard it here.
+    if num_kv_splits > 1:
+        min_split = kv_seq_lens // num_kv_splits  # page_size=1
+        assert min_split >= 32, (
+            f"smallest KV split = floor({kv_seq_lens}/{num_kv_splits}) = "
+            f"{min_split} < SUB_KV=32: that split drops its tail. Reduce "
+            f"num_kv_splits or raise kv_seq_lens so "
+            f"kv_seq_lens // num_kv_splits >= 32."
+        )
+
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=q_seq_logical,
+        seed=seed,
+        gqa_ratio=gqa_ratio,
+        attn_sink=attn_sink,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)  # kernel ignores; only used by torch ref
+
+    # Torch references (CPU-side reference math, not timed). inputs["sink"] is
+    # the per-head [num_heads] sink consumed directly by both the torch refs
+    # and the asm kernel (the kernel reads per-head sink natively as of the
+    # 2026-06-01 shrink — no q_token tiling needed).
+    out_golden, _ = _torch_attn_decode_bf16_golden(
+        inputs["q_bf16"],
+        inputs["kv_bf16"],
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        sm_scale,
+        attn_sink=inputs["sink"],
+    )
+
+    # Pre-quantize once (Python quant helper is slow; would distort perf
+    # if timed). Same FP8 bytes feed both the asm kernel and the fp8-dequant
+    # ref so any diff between them isolates the kernel math.
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+
+    # Pre-allocate everything the kernel writes into so the timed iters
+    # don't allocate. Layout matches aiter/mla.py:1048.
+    total_q = inputs["q_bf16"].size(0)
+    num_seqs = inputs["qo_indptr"].size(0) - 1
+    output_buf = torch.empty(
+        (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+    )
+    split_indptr = torch.tensor(
+        [i * num_kv_splits for i in range(num_seqs + 1)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Kernel-native layout: [total_q, num_kv_splits, num_heads, dv] (mirrors V3)
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    logits_buf = torch.empty(
+        (total_q, num_kv_splits, num_heads, V_HEAD_DIM),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+    lse_buf = torch.empty(
+        (total_q, num_kv_splits, num_heads, 1),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+
+    # ---- timed call (1): torch fp8-dequant reference ----
+    # Same fp8 bytes the kernel reads → isolates kernel math from quant noise,
+    # and gives the speedup baseline. The ref does the dequant inside, so the
+    # us number includes that cost — matches what the asm kernel does on-die.
+    (out_fp8_ref, _lse_ref), us_ref = run_perftest(
+        _torch_attn_decode_fp8_dequant_ref,
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        sm_scale,
+        attn_sink=inputs["sink"],
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,
+    )
+
+    # ---- timed call (2a): asm kernel ONLY (no stage2 merge) ----
+    # Times the v4 nm decoder kernel in isolation so the perf number isolates
+    # kernel work from the cross-split merge cost. For num_kv_splits=1 this
+    # is the only kernel invocation; for num_kv_splits>1 the wrapper would
+    # additionally invoke `_fwd_kernel_stage2_asm` triton on top — see (2b).
+    _ret, us_asm_kernel = run_perftest(
+        mla_decode_v4_asm,
+        q_packed,
+        q_rope.contiguous(),
+        kv_packed,
+        kv_rope.contiguous(),
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        split_indptr,
+        inputs["sink"],  # per-head [num_heads] sink; req'd positional
+        logits_buf,
+        lse_buf,
+        output_buf,
+        None,  # valid_split_count
+        inputs["max_seqlen_q"],
+        sm_scale,
+        int(out_16_nosplit),  # out_16_nosplit (timing path; raw kernel does not unpack)
+        num_kv_splits,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,
+    )
+
+    # ---- timed call (2b): full wrapper (kernel + stage2 merge) ----
+    # End-to-end perf as the production caller sees it.
+    _ret, us_asm_total = run_perftest(
+        aiter.mla.mla_decode_fwd_v4_nm,
+        q=q_packed,
+        qrope=q_rope.contiguous(),
+        kv_buffer=kv_packed,
+        kvrope=kv_rope.contiguous(),
+        output=output_buf,
+        qo_indptr=inputs["qo_indptr"],
+        kv_indptr=inputs["kv_indptr"],
+        kv_page_indices=inputs["kv_page_indices"],
+        kv_last_page_lens=inputs["kv_last_page_lens"],
+        split_indptr=split_indptr,
+        max_seqlen_q=inputs["max_seqlen_q"],
+        sink=inputs["sink"],
+        sm_scale=sm_scale,
+        out_16_nosplit=int(out_16_nosplit),
+        num_kv_splits=num_kv_splits,
+        logits=logits_buf,
+        attn_lse=lse_buf,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,
+    )
+
+    # output_buf is the authoritative result for every split count: single-pass
+    # writes packed BF16 straight into it, multi-pass gets it from the stage2
+    # merge. logits_buf must not be read here -- the dispatcher derives
+    # out_16_nosplit from num_kv_splits (ignoring the caller's value), so for a
+    # single split the raw kernel call above fills logits_buf with packed BF16,
+    # not FP32 partials.
+    out_asm = output_buf  # [total_q, num_heads, dv] BF16
+
+    # ---- accuracy ----
+    # Two comparisons, run for BOTH single- and multi-split (split-kv is a perf
+    # optimization; its stage2-merged output is mathematically the same full
+    # attention the torch refs compute, so it is directly comparable):
+    #   [golden vs fp8_ref] = FP8 quant noise floor (kernel-independent)
+    #   [fp8_ref vs asm]    = kernel math error (quant-independent)
+    print(
+        f"\n[v4 nm accuracy] batch={batch} kv_seq_lens={kv_seq_lens} "
+        f"q_seq_logical={q_seq_logical} num_kv_splits={num_kv_splits} seed={seed}"
+    )
+    # Both are gated: golden vs fp8_ref catches a broken quant pipeline (e.g.
+    # all-zero e8m0 scales) that fp8_ref vs asm alone would miss, since the
+    # kernel and fp8_ref consume the same quantized bytes.
+    _gated_allclose(
+        out_golden.float(),
+        out_fp8_ref.float(),
+        msg="mla_v4_nm [golden_bf16 vs fp8_ref]",
+    )
+    _gated_allclose(
+        out_fp8_ref.float(),
+        out_asm.float(),
+        msg="mla_v4_nm [fp8_dequant_ref vs asm]",
+    )
+
+    # ---- perf: fp8_ref vs asm ----
+    # We report two asm timings:
+    #   asm_k: v4 kernel only (no stage2 merge) — kernel-isolated metric
+    #   asm  : full wrapper end-to-end (kernel + stage2 merge if splits>1)
+    # `speedup` uses asm_k since it's the kernel-comparable number; the
+    # multi-split merge is a separate cost we want to call out explicitly.
+    total_kv = batch * kv_seq_lens
+    flops = q_seq_logical * total_kv * gqa_ratio * (_QUANT_D + V_HEAD_DIM) * 2
+    us_asm = us_asm_kernel  # used by the caller in the summary
+    merge_us = us_asm_total - us_asm_kernel
+    speedup = us_ref / us_asm if us_asm > 0 else float("inf")
+    print(
+        f"[v4 nm perf]     iters={num_iters}: "
+        f"asm_k={us_asm_kernel:.2f} us ({flops / us_asm_kernel / 1e6:.2f} TFLOPS) "
+        f"merge={merge_us:.2f} us  total={us_asm_total:.2f} us, "
+        f"fp8_ref={us_ref:.2f} us, speedup(kernel)={speedup:.1f}x"
+    )
+    return us_asm, us_ref
+
+
+@needs_gfx950
+def test_v4_nm_accuracy_and_perf():
+    """Run the asm kernel via aiter.test_common.run_perftest at a fixed
+    shape, then compare against both torch references and report timing
+    in a single pass.
+
+    Accuracy tolerances:
+      [golden vs asm]   cos_diff < 3e-2  (FP8 quant headroom; test_mla.py:37)
+      [fp8 vs asm]      cos_diff < 5e-3  (kernel-only; FP32-accum-order vs torch)
+    Perf is informational (CI variance too high to assert).
+    """
+    _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+
+
+def _run_varlen_point(
+    kv_lens, gqa_ratio=128, seed=0, attn_sink=True, split_kwargs=None
+):
+    """Accuracy at a RAGGED (per-seq variable kv_len) decode shape with
+    auto-split (num_kv_splits=None).
+
+    Mirrors the production OP5 path (ATOM sparse_attn_v4_paged_decode ->
+    mla_decode_fwd_v4_nm): N seqs, gqa heads, qlen=1, per-seq kv_len from
+    `kv_lens`. get_meta_param picks the split count from the AVERAGE kv_len,
+    so short seqs in a ragged batch get per-split < SUB_KV (32) — this is the
+    case the kernel's illegal-KV-length guard must handle. Compares the merged
+    asm output against the fp8-dequant torch reference (the kernel-math gate;
+    quant-independent). Reads the result from the correct buffer per the
+    single/multi-split contract (logits[:,0] when resolved==1, else output).
+    """
+    device = "cuda"
+    gqa = gqa_ratio
+    batch = len(kv_lens)
+    total_kv = sum(kv_lens)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    kv_bf16 = torch.randn(
+        total_kv,
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        _QUANT_D,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor(
+        [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+    if attn_sink:
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+    else:
+        sink = torch.full((gqa,), float("-inf"), dtype=torch.float32, device=device)
+
+    qp, qr = _native_to_2buff_for_asm(q_bf16)
+    kp, kr = _native_to_2buff_for_asm(kv_bf16)
+
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        qp,
+        qr,
+        kp,
+        kr,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        attn_sink=(sink if attn_sink else None),
+    )
+
+    output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=qp,
+        qrope=qr.contiguous(),
+        kv_buffer=kp,
+        kvrope=kr.contiguous(),
+        output=output,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        max_seqlen_q=1,
+        sink=sink,
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        **(split_kwargs or {"split_indptr": None, "num_kv_splits": None}),
+    )
+    # Single/multi-split output contract (see ATOM paged_decode.py:986): the
+    # merged result lands in `output` for resolved splits > 1; the single-pass
+    # fp32 path leaves it in logits[:, 0].
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    print(
+        f"\n[v4 nm varlen] gqa={gqa} kv_lens={kv_lens} total_kv={total_kv} "
+        f"resolved_splits={resolved}"
+    )
+    err = _gated_allclose(
+        out_ref.float(),
+        out_asm,
+        msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
+    )
+    return float(err or 0), out_asm
+
+
+@needs_gfx950
+def test_v4_nm_varlen_ragged_kv_tail_split_guard():
+    """Ragged (variable per-seq kv_len) decode at the production OP5 shape
+    (gqa=128, qlen=1, N=4, auto-split), where short seqs in the batch get
+    per-split < SUB_KV=32.
+
+    get_meta_param picks the split count from the AVERAGE kv_len, so in a
+    ragged batch the shortest seq's per-split token count drops well below
+    SUB_KV (e.g. kv_lens=[516,300,130,64] -> 8 splits -> the 64-token seq
+    gets 8 tokens/split). This is exactly the tail-split-< SUB_KV case the
+    kernel's illegal-KV-length guard must survive without over-reading the
+    page table; a pre-guard kernel faulted (illegal K address) here. Locks
+    in both no-crash and bit-accuracy across a spread of ragged shapes.
+    """
+    _run_varlen_point([516, 300, 130, 64])  # long..tiny ragged (prod OP5)
+    _run_varlen_point([516, 516, 516, 516])  # uniform max (split=16, ~32/split)
+    _run_varlen_point([500, 250, 100, 40])  # more extreme ragged
+    _run_varlen_point([66, 50, 40, 33])  # all-short
+
+
+@pytest.mark.parametrize(
+    "num_seqs,kv_len,expected",
+    [
+        # One wave of workgroups: split only when KV is long enough to pay
+        # for the partial write + stage-2 merge.
+        (7, 1152, 8),
+        (7, 384, 5),
+        (35, 1152, 3),
+        (56, 1152, 2),
+        # 49..119 seqs with short KV: the occupancy-only pick chose 13-16
+        # splits (5-14 waves) here and ran 3-7x slower than one split.
+        (49, 384, 1),
+        (119, 384, 1),
+        (126, 1152, 1),
+        # Past one wave, long KV still splits to even out the tail wave.
+        (140, 8320, 4),
+    ],
+)
+def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert (
+        aiter.mla._v4_nm_pick_num_kv_splits(cost, num_seqs, 2, kv_len, 256) == expected
+    )
+
+
+def _uniform_split(num_seqs, num_heads, kv_len, device="cuda"):
+    """mla_decode_fwd_v4_nm split kwargs: aiter's split count and its uniform
+    split_indptr [0, s, 2s, ...]."""
+    s = aiter.mla.get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len)
+    return {
+        "num_kv_splits": s,
+        "split_indptr": torch.arange(
+            0, (num_seqs + 1) * s, s, dtype=torch.int32, device=device
+        ),
+    }
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "num_seqs,kv_len", [(7, 128), (7, 1152), (56, 1152), (14, 8320)]
+)
+def test_v4_nm_num_kv_splits_uses_cost_model(num_seqs, kv_len):
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert aiter.mla.get_mla_v4_nm_num_kv_splits(
+        num_seqs, 128, kv_len
+    ) == aiter.mla._v4_nm_pick_num_kv_splits(cost, num_seqs, 2, kv_len, get_cu_num())
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens,kv_len",
+    [
+        ([1152, 900, 64, 1152], 1152),  # planned for the longest seq
+        ([8320, 200], 8320),
+        ([100, 60, 128], 128),  # short, window-sized KV
+    ],
+)
+def test_v4_nm_split_plan_accuracy(kv_lens, kv_len):
+    err, out = _run_varlen_point(
+        kv_lens, split_kwargs=_uniform_split(len(kv_lens), 128, kv_len)
+    )
+    assert torch.isfinite(out).all()
+    assert err < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_split_plan_cudagraph_replay():
+    """Plan built once into a persistent buffer, captured, then replayed with
+    different per-seq KV lengths written into the same kv_indptr."""
+    device, gqa, n, kv_cap = "cuda", 128, 14, 1152
+    torch.manual_seed(0)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    qp, qr = _native_to_2buff_for_asm(
+        torch.randn(n, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    )
+    kp, kr = _native_to_2buff_for_asm(
+        torch.randn(
+            n * kv_cap,
+            PAGE_SIZE,
+            NUM_KV_HEADS,
+            _QUANT_D,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+    )
+    qr, kr = qr.contiguous(), kr.contiguous()
+    sink = torch.randn(gqa, dtype=torch.float32, device=device)
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    kv_page_indices = torch.randperm(n * kv_cap, device=device).to(torch.int32)
+    kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
+    output = torch.empty((n, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+
+    def set_lens(lens):
+        kv_indptr.copy_(torch.tensor([0] + np.cumsum(lens).tolist(), dtype=torch.int32))
+
+    split = _uniform_split(n, gqa, kv_cap)
+    assert split["num_kv_splits"] > 1  # exercise the stage-2 path under the graph
+
+    def run():
+        aiter.mla.mla_decode_fwd_v4_nm(
+            qp,
+            qr,
+            kp,
+            kr,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            1,
+            sink=sink,
+            sm_scale=sm_scale,
+            **split,
+        )
+
+    set_lens([kv_cap] * n)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for lens in ([kv_cap] * n, [1 + 83 * i for i in range(n)], [64] * n):
+        set_lens(lens)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref, _ = _torch_attn_decode_fp8_dequant_ref(
+            qp,
+            qr,
+            kp,
+            kr,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            sm_scale,
+            attn_sink=sink,
+        )
+        assert torch.isfinite(output).all()
+        err = checkAllclose(
+            ref.float(),
+            output.float(),
+            rtol=3e-2,
+            atol=3e-2,
+            tol_err_ratio=0.02,
+            msg=f"mla_v4_nm split plan graph replay lens={lens[:3]}...",
+        )
+        assert float(err or 0) < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_one_split_per_seq_on_wide_grid():
+    """Every seq on one split while the grid has 4: the kernel still writes
+    FP32 partials, so the stage-2 merge must not take its in-place BF16 copy
+    (it used to, keyed on split_indptr[-1] == num_seqs, and returned NaN)."""
+    kv_lens = [384, 384, 384, 384]
+    split_indptr = torch.arange(len(kv_lens) + 1, dtype=torch.int32, device="cuda")
+    err, out = _run_varlen_point(
+        kv_lens, split_kwargs={"num_kv_splits": 4, "split_indptr": split_indptr}
+    )
+    assert torch.isfinite(out).all()
+    assert err < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_ragged_short_seq_no_corrupt():
+    """A short seq must not be corrupted by over-allocated splits (host ragged
+    split_indptr fix).
+
+    get_meta_param picks a SINGLE num_kv_splits from the batch-AVERAGE kv and
+    (before the fix) built a UNIFORM split_indptr — every seq got num_kv_splits.
+    A seq shorter than num_kv_splits*mgc tokens then gets empty trailing splits
+    whose cyclic-tail garbage the stage2 reduce merges in, silently corrupting
+    THAT seq's own output (~45% off). Only surfaces at bs>=4 where a long seq
+    raises the average enough to push num_kv_splits above the short seq's
+    coverage. The wrapper now builds a RAGGED split_indptr (each seq capped at
+    ceil(kv_i/mgc) splits) so short seqs get no empty splits.
+
+    Regression: per-seq accuracy for gqa=16 ragged batches that trigger the
+    over-allocation, with the short seq at various positions and batch sizes.
+    """
+    device = "cuda"
+    gqa = 16
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    cases = [
+        [384, 256, 127, 384],  # short(127)@2 -> auto 3 splits, seq2 valid=2
+        [127, 384, 256, 384],  # short@0
+        [384, 256, 384, 127],  # short@3
+        [384, 256, 64, 384],  # even shorter (valid=1)
+        [384, 256, 127, 384, 384, 256, 384, 127],  # bs8, two short seqs
+    ]
+    for kv_lens in cases:
+        batch = len(kv_lens)
+        total_kv = sum(kv_lens)
+        torch.manual_seed(0)
+        q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+        kv_bf16 = torch.randn(
+            total_kv,
+            PAGE_SIZE,
+            NUM_KV_HEADS,
+            _QUANT_D,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+        qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor(
+            [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+        kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+        qp, qr = _native_to_2buff_for_asm(q_bf16)
+        kp, kr = _native_to_2buff_for_asm(kv_bf16)
+        out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+            qp,
+            qr,
+            kp,
+            kr,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            sm_scale,
+            attn_sink=sink,
+        )
+        output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+        logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+            q=qp,
+            qrope=qr.contiguous(),
+            kv_buffer=kp,
+            kvrope=kr.contiguous(),
+            output=output,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_last_page_lens=kv_last_page_lens,
+            split_indptr=None,
+            max_seqlen_q=1,
+            sink=sink,
+            sm_scale=sm_scale,
+            out_16_nosplit=0,
+            num_kv_splits=None,
+        )
+        resolved = logits.shape[1]
+        out = (output if resolved > 1 else logits[:, 0]).float()
+        ref = out_ref.float()
+        bad = [
+            ((out[b] - ref[b]).abs() > 3e-2 + 3e-2 * ref[b].abs()).float().mean().item()
+            for b in range(batch)
+        ]
+        print(
+            f"\n[v4 nm ragged-short] gqa={gqa} kv_lens={kv_lens} resolved_splits="
+            f"{resolved} per-seq bad={['%.1f%%' % (100 * x) for x in bad]}"
+        )
+        worst = max(bad)
+        assert worst < 0.02, (
+            f"ragged short-seq corruption: kv_lens={kv_lens} resolved={resolved} "
+            f"per-seq mismatch={['%.1f%%' % (100 * x) for x in bad]} (>=2%); a "
+            f"short seq got over-allocated splits and its empty-split garbage "
+            f"corrupted its own output."
+        )
+
+
+def _run_cudagraph_bucket_point(
+    real_kv_lens, gqa_ratio, pad_kv_len=1, seed=0, attn_sink=True
+):
+    """CUDA-graph bucketing / replay accuracy.
+
+    Mirrors serving with a fixed CUDA-graph capture: the graph is captured at a
+    BUCKET batch = len(real_kv_lens) + 1, but a replay carries only
+    len(real_kv_lens) REAL sequences; the extra trailing slot is a DUMMY padding
+    seq filled with stale/garbage data (here amplified random Q) that the caller
+    does not care about. The kernel still processes all `bucket` grid slots.
+
+    Correctness contract: the REAL slots (0..real_batch-1) must match the torch
+    reference bit-for-bit regardless of the padding slot's contents -- i.e. the
+    padding neither corrupts the real batches nor gets its garbage pulled into
+    them. The padding slot's own output is don't-care and is NOT checked.
+    """
+    device = "cuda"
+    gqa = gqa_ratio
+    real_batch = len(real_kv_lens)
+    kv_lens = list(real_kv_lens) + [pad_kv_len]  # trailing slot = dummy padding
+    batch = len(kv_lens)  # == bucket size
+    total_kv = sum(kv_lens)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    # Make the padding slot obviously "garbage" so any cross-batch bleed into
+    # the real slots would show up as a large error.
+    q_bf16[real_batch:] = torch.randn_like(q_bf16[real_batch:]) * 8.0
+    kv_bf16 = torch.randn(
+        total_kv, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D, dtype=dtypes.bf16, device=device
+    )
+
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor(
+        [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+    if attn_sink:
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+    else:
+        sink = torch.full((gqa,), float("-inf"), dtype=torch.float32, device=device)
+
+    qp, qr = _native_to_2buff_for_asm(q_bf16)
+    kp, kr = _native_to_2buff_for_asm(kv_bf16)
+
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        qp,
+        qr,
+        kp,
+        kr,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        attn_sink=(sink if attn_sink else None),
+    )
+
+    output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=qp,
+        qrope=qr.contiguous(),
+        kv_buffer=kp,
+        kvrope=kr.contiguous(),
+        output=output,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        split_indptr=None,
+        max_seqlen_q=1,
+        sink=sink,
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    print(
+        f"\n[v4 nm cudagraph-bucket] gqa={gqa} real_kv_lens={real_kv_lens} "
+        f"pad_kv_len={pad_kv_len} bucket={batch} resolved_splits={resolved}"
+    )
+    # Only the REAL slots must be correct; the trailing padding slot is
+    # don't-care and deliberately excluded from the compare. checkAllclose does
+    # NOT raise (it returns the mismatch fraction, 0 on a clean pass), so assert
+    # here to actually gate the test on real-slot accuracy.
+    err = checkAllclose(
+        out_ref[:real_batch].float(),
+        out_asm[:real_batch],
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=(
+            f"mla_v4_nm cudagraph-bucket REAL slots gqa={gqa} "
+            f"real_kv_lens={real_kv_lens} pad={pad_kv_len}"
+        ),
+    )
+    assert (err or 0) < 0.02, (
+        f"cudagraph-bucket REAL-slot accuracy failed: gqa={gqa} "
+        f"real_kv_lens={real_kv_lens} pad_kv_len={pad_kv_len} "
+        f"mismatch={float(err):.3%} (>=2%); padding slot corrupted the real "
+        f"batches or the bucketed split config changed real-slot results."
+    )
+
+
+@needs_gfx950
+def test_v4_nm_cudagraph_bucket_padding():
+    """CUDA-graph bucketing: capture at bucket batch=4, replay real batch=3 with
+    a dummy padding seq in the 4th slot. The 3 real slots must stay accurate
+    regardless of the padding slot's garbage. Covers gqa 16/64/128 with a ragged
+    real KV set and both a minimal (kv=1) and a mid-size padding seq.
+    """
+    for gqa in (16, 64, 128):
+        _run_cudagraph_bucket_point([384, 256, 127], gqa_ratio=gqa, pad_kv_len=1)
+        _run_cudagraph_bucket_point([516, 300, 130], gqa_ratio=gqa, pad_kv_len=64)
+
+
+@needs_gfx950
+def test_v4_nm_gqa16_qseqlen1_accuracy_and_perf():
+    """Accuracy for the (gqa_ratio=16, q_seq_logical=1) entry point.
+
+    This pair is served by the same single qh64 .co via the
+    `gqa_ratio == 16 && config_max_seqlen_q == 1` normalization branch in
+    mla_decode_v4.py. Unlike the other three shipped variants it does NOT
+    satisfy gqa*q_seq=64 (here 16*1=16); the dispatcher picks sub_Q=16 and
+    the kernel writes a compact 16-row partial (logits [num_seqs,1,16,512],
+    no 64-row tile slack). _run_one_point's buffers are already sized to
+    num_heads=gqa_ratio so the existing reshape/compare path handles it
+    directly. Run with sink off and on so the sink path is covered too.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=False,
+    )
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=True,
+    )
+
+
+@needs_gfx950
+def test_v4_nm_out_16_nosplit_accuracy_and_perf():
+    """Exercise the single-pass packed-BF16 direct path (out_16_nosplit=1).
+
+    The kernel writes its result as densely-packed BF16 into the logits
+    region (NOT the output buffer); the wrapper unpacks it into `output`
+    (see mla_decode_fwd_v4_nm). This locks in both that the unpack lands the
+    right bytes (accuracy vs the fp8-dequant torch ref) and that the path
+    runs end-to-end at perf. num_kv_splits must be 1 (bf16-direct is
+    single-pass). Perf is informational; accuracy is the gate.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        num_kv_splits=1,
+        out_16_nosplit=1,
+    )
+
+
+def _run_pad_poison_point(fill, poison_q, poison_kv, gqa_ratio, kv_seq_lens, batch):
+    """Run one decode with the packed rows' PAD bytes overwritten by `fill`.
+
+    Packed row layout (`_native_to_2buff_for_asm`):
+        [ nope 448 fp8 | scale 14 e8m0 | pad 50 ]  = 512 B
+    so the padding starts at _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES = 462.
+
+    The packer allocates with `torch.zeros`, so in every other test the padding
+    is 0x00. A served model reuses these buffers and the padding carries junk,
+    which is a different input the kernel has never been shown here.
+    """
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=gqa_ratio,
+        attn_sink=True,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+
+    pad_off = _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES
+    if poison_q:
+        q_packed.view(torch.uint8)[..., pad_off:] = fill
+    if poison_kv:
+        kv_packed.view(torch.uint8)[..., pad_off:] = fill
+
+    # Reference consumes the same poisoned buffers; it reads only the 448+14
+    # defined bytes, so its result must not move.
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        sm_scale,
+        attn_sink=inputs["sink"],
+    )
+
+    total_q = inputs["q_bf16"].size(0)
+    output = torch.empty(
+        (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+    )
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=q_packed,
+        qrope=q_rope.contiguous(),
+        kv_buffer=kv_packed,
+        kvrope=kv_rope.contiguous(),
+        output=output,
+        qo_indptr=inputs["qo_indptr"],
+        kv_indptr=inputs["kv_indptr"],
+        kv_page_indices=inputs["kv_page_indices"],
+        kv_last_page_lens=inputs["kv_last_page_lens"],
+        split_indptr=None,
+        max_seqlen_q=inputs["max_seqlen_q"],
+        sink=inputs["sink"],
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    who = "+".join([n for n, on in (("Q", poison_q), ("KV", poison_kv)) if on])
+    # Check NaN explicitly and FIRST: `nan > tol` is False, so an all-NaN
+    # result sails through any abs-difference tolerance check with zero
+    # mismatching rows. 0xFF in a byte the kernel wrongly treats as an e8m0
+    # scale is exactly the NaN encoding, so that is the failure this guards.
+    assert torch.isfinite(out_asm).all(), (
+        f"v4 nm: {who} pad byte 0x{fill:02X} produced non-finite output — the "
+        f"kernel is reading past the {_QUANT_NUM_SCALE_BYTES}-byte scale field "
+        f"at offset {_QUANT_D_NOPE} into the padding at {pad_off}."
+    )
+    _gated_allclose(
+        out_ref.float(),
+        out_asm,
+        msg=f"mla_v4_nm {who} pad=0x{fill:02X} [fp8_dequant_ref vs asm]",
+    )
+
+
+@needs_gfx950
+def test_v4_nm_packed_pad_poison():
+    """Padding bytes of the packed Q/KV rows must not change the result.
+
+    Regression for a kernel that read 16 e8m0 scale bytes where only 14 are
+    defined, pulling in packed-row bytes 462/463. 0xFF there is the e8m0 NaN
+    encoding, so the whole row came out NaN. It reproduced only with a served
+    model, which reuses the Q buffer and leaves junk in the padding; every
+    synthetic test missed it because `_native_to_2buff_for_asm` builds the row
+    with `torch.zeros` and the padding is therefore always 0x00.
+
+    Poisons Q, KV and both, with 0xFF (the e8m0 NaN encoding) and with a random
+    fill, across the three shipped (gqa, q_seq_logical) entry points.
+    """
+    for gqa in (16, 64, 128):
+        for fill in (0xFF, 0xA5):
+            for poison_q, poison_kv in ((True, False), (False, True), (True, True)):
+                _run_pad_poison_point(
+                    fill=fill,
+                    poison_q=poison_q,
+                    poison_kv=poison_kv,
+                    gqa_ratio=gqa,
+                    kv_seq_lens=1024,
+                    batch=4,
+                )
+
+
+# ---------------------------------------------------------------------------
+# ATOM-API wrapper (future drop-in replacement for ATOM's
+# `sparse_attn_v4_paged_decode`). Lives in the test file as a *proof of API
+# fit*; the production wrapper belongs in aiter/mla.py once exercised here.
+# ---------------------------------------------------------------------------
+def asm_sparse_attn_v4_paged_decode(
+    q,  # [N, H=16, D=512] bf16
+    unified_kv,  # [total_pages, D=512] bf16 (page_size=1, single KV head)
+    kv_indices,  # [total_indices] int32 — per-token flat
+    kv_indptr,  # [N+1] int32 — per-token prefix sum
+    attn_sink,  # [H] or None
+    softmax_scale,
+):
+    """Mirror of ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode.
+
+    Constraints (current asm variant qh64/qseqlen4 — single .co aliased to
+    (gqa,q_seq_logical) ∈ {(16,4),(64,1),(128,1)}):
+      - N (== total tokens) must be a multiple of 4.
+      - Tokens are processed in groups of 4 as one "sequence" — tokens [b*4 ..
+        (b+1)*4) MUST share the same kv span (i.e., kv_indptr is constant
+        within each group of 4). Caller's responsibility.
+      - attn_sink is currently unused (kernel does not honor sink); reserved
+        for API parity. Pass `None` until kernel support lands.
+
+    Returns: `out [N, H, D=512]` bf16.
+    """
+    assert q.dim() == 3 and q.size(1) == GQA_RATIO and q.size(2) == _QUANT_D
+    assert unified_kv.dim() == 2 and unified_kv.size(1) == _QUANT_D
+    n = q.size(0)
+    assert n % 4 == 0, f"N={n} must be multiple of qseqlen=4 for this variant"
+    if attn_sink is not None:
+        raise NotImplementedError("asm v4 nm kernel does not honor attn_sink yet")
+
+    batch = n // 4
+    device = q.device
+
+    # Per-batch aiter indices: one sequence per group-of-4 tokens.
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=device) * 4
+    # kv_indptr at every 4th position (group's shared span); validate constancy.
+    kv_indptr_per_seq = kv_indptr[::4].to(torch.int32).contiguous()
+    assert (
+        kv_indptr_per_seq.size(0) == batch + 1
+    ), f"kv_indptr layout invalid for groups-of-4: got len {kv_indptr.size(0)}, expected {batch * 4 + 1}"
+    # Sanity: within each group, kv_indptr must be constant relative to its base.
+    for b in range(batch):
+        base = int(kv_indptr[b * 4].item())
+        for j in range(1, 4):
+            assert (
+                int(kv_indptr[b * 4 + j].item()) == base
+            ), f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
+
+    kv_page_indices = kv_indices.to(torch.int32).contiguous()
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+
+    # unified_kv [P, D] -> [P, page_size=1, num_kv_heads=1, D]
+    kv_bf16 = unified_kv.view(-1, 1, 1, _QUANT_D)
+
+    out, _, _, _ = _asm_attn_decode_bf16(
+        q_bf16=q,
+        kv_bf16=kv_bf16,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr_per_seq,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        max_seqlen_q=4,
+        sm_scale=softmax_scale,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass (num_kv_splits > 1) — opens the path that mirrors V3's
+# non-persistent stage1 + stage2 reduce. The .co binary already supports any
+# number of passes via slot 9; this test verifies (a) the dispatcher lookup
+# isn't gated on num_kv_splits, (b) the python wrapper auto-builds
+# split_indptr V3-style, and (c) the in-place logsumexp merge writes a finite
+# result into the [:, 0] slot.
+# ---------------------------------------------------------------------------
+@needs_gfx950
+def test_v4_nm_multi_split():
+    """Multi-pass (num_kv_splits>1) path, two checks in one:
+
+    (A) Full-KV coverage: num_kv_splits=4 with kv_seq_lens=256 → 64 tokens
+        per split = two full SUB_KV=32 inner-KV passes each. Every split slot
+        in `logits` must be written (no SENTINEL leak), proving the dispatcher
+        isn't gated on num_kv_splits, the wrapper auto-builds split_indptr
+        V3-style, and the kernel doesn't tail-drop any split. Coverage
+        invariant: floor(kv/splits) >= SUB_KV (=32); 256/4=64 ✓.
+
+    (B) out_16_nosplit is derived internally (V3-style) from num_kv_splits, so
+        the caller-facing arg is ignored: multi-pass + out_16_nosplit=1 must NOT
+        raise and must still run the fp32-split + stage2-merge path.
+    """
+    # ---- (A) full-KV coverage ----
+    NUM_SPLITS = 4
+    BATCH = 2
+    KV_LEN = 256  # 256/4 = 64 = 2*SUB_KV (two full passes per split)
+    Q_SEQ = 1
+
+    args = _build_inputs(batch=BATCH, kv_seq_lens=KV_LEN, q_seq_logical=Q_SEQ, seed=0)
+    args["num_kv_splits"] = NUM_SPLITS
+    args["out_16_nosplit"] = 0
+    args.pop("split_indptr")  # auto-built V3-style
+
+    SENTINEL = -7.7e30
+    num_seqs = args["qo_indptr"].size(0) - 1
+    num_heads = args["q"].size(1)
+    msq = args["max_seqlen_q"]
+    total_q = num_seqs * msq
+    args["logits"] = torch.full(
+        (total_q, NUM_SPLITS, num_heads, V_HEAD_DIM),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    args["attn_lse"] = torch.full(
+        (total_q, NUM_SPLITS, num_heads, 1),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(**args)
+    torch.cuda.synchronize()
+
+    for s in range(NUM_SPLITS):
+        ut = (logits[:, s] == SENTINEL).float().mean().item()
+        assert ut < 0.01, (
+            f"split {s} kernel skipped ({ut*100:.1f}% still SENTINEL). "
+            f"Coverage invariant: floor(kv/splits)={KV_LEN // NUM_SPLITS} must "
+            f">= SUB_KV=32. If it holds, the bug is upstream (dispatcher launch "
+            f"geometry / split_indptr stride / kernel early-exit)."
+        )
+
+    # ---- (B) out_16_nosplit is now DERIVED (V3-style), so the caller-facing
+    # arg is ignored: passing out_16_nosplit=1 with multi-pass must NOT raise
+    # and must still run the fp32-split + stage2-merge path (the wrapper/kernel
+    # derive out_16_nosplit=0 from num_kv_splits>1). ----
+    args_ign = _build_inputs(batch=1, kv_seq_lens=128, q_seq_logical=1, seed=0)
+    args_ign["num_kv_splits"] = 2
+    args_ign["out_16_nosplit"] = 1  # ignored; derived to 0 for multi-pass
+    args_ign.pop("split_indptr")
+    out_ign, _lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
+    torch.cuda.synchronize()
+    # Multi-pass returns fp32 split logits (NOT the bf16 single-pass alias).
+    assert out_ign.dtype == torch.float32, (
+        f"multi-pass logits should be fp32 split partials, got {out_ign.dtype} "
+        f"— out_16_nosplit=1 was NOT correctly overridden to 0."
+    )
+    assert out_ign.shape[1] == 2, (
+        f"multi-pass logits should keep the num_kv_splits=2 axis, got "
+        f"shape {tuple(out_ign.shape)}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end)
+# ---------------------------------------------------------------------------
+# These tests pin down the behavioural contract: We assert that
+#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes — proves the
+#       sink data actually reaches the kernel and modulates the softmax
+#       denominator,
+#   (b) sink=-inf does NOT produce extra NaNs vs a near-equivalent finite
+#       sentinel (-1e9), so callers can safely use -inf as the "no sink"
+#       convention without numerical surprises.
+#
+# Build helper note: we use _build_bf16_inputs + _native_to_2buff_for_asm
+# instead of _build_inputs because the latter generates random FP8 bytes
+# (incl. random e8m0 scale bytes), which dequant to 100% NaN/inf and make
+# bit comparisons impossible. The BF16-then-quant path produces finite
+# outputs that actually expose the sink merge math.
+# ---------------------------------------------------------------------------
+def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
+    """Properly-quantized wrapper-args for sink behaviour tests. Returns the
+    full kwargs dict that mla_decode_fwd_v4_nm needs, with sink defaulted
+    to -inf (caller can override). Output cells will be finite (modulo the
+    rare quant-noise NaN), which is what byte-level diffing requires.
+    """
+    bf = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=q_seq_logical,
+        seed=seed,
+    )
+    q_packed, q_rope = _native_to_2buff_for_asm(bf["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(bf["kv_bf16"])
+
+    total_q = bf["q_bf16"].size(0)
+    num_heads = bf["q_bf16"].size(1)
+    device = bf["q_bf16"].device
+    output = torch.empty(
+        (total_q, num_heads, V_HEAD_DIM), dtype=dtypes.bf16, device=device
+    )
+    sink = torch.full(
+        (num_heads,),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    return {
+        "q": q_packed,
+        "qrope": q_rope.contiguous(),
+        "kv_buffer": kv_packed,
+        "kvrope": kv_rope.contiguous(),
+        "output": output,
+        "qo_indptr": bf["qo_indptr"],
+        "kv_indptr": bf["kv_indptr"],
+        "kv_page_indices": bf["kv_page_indices"],
+        "kv_last_page_lens": bf["kv_last_page_lens"],
+        "max_seqlen_q": bf["max_seqlen_q"],
+        "sink": sink,
+    }
+
+
+@needs_gfx950
+def test_v4_nm_sink():
+    """Sink contract, three checks in one:
+
+    (A) sink=-inf vs sink=10.0 produce DIFFERENT output bytes — proves sink
+        reaches the kernel via slot 18 (offset 0x120) and modulates softmax.
+    (B) sink=-inf introduces NO extra NaN vs a finite -1e9 control — the
+        documented "no sink" convention is -inf-stable.
+    (C) malformed sink (wrong dtype/size/stride/device) is rejected by the
+        wrapper BEFORE the dispatcher can mis-stride into garbage memory.
+    """
+    # ---- (A) sink value affects output ----
+    args_a = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+    sink_size = args_a["sink"].numel()  # = num_heads (2026-06-01 shrink)
+    device = args_a["q"].device
+
+    args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+    args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
+
+    aiter.mla.mla_decode_fwd_v4_nm(**args_a)
+    torch.cuda.synchronize()
+    # `output` is the authoritative BF16 result for BOTH single-pass (kernel
+    # writes packed-BF16 into it) and multi-pass (stage2 merges into it). Read
+    # it directly instead of the returned `logits` so the byte-level sink diff
+    # is robust to whatever split count the heuristic picks — v4 nm forces
+    # occupancy-only splits (ignore_total_kv), which can be >1 even for short
+    # KV, making `logits` an FP32 partial buffer rather than packed BF16.
+    out_a = args_a["output"]  # [total_q, num_heads, dv] BF16
+    out_a_bits = out_a.view(torch.int16).clone()
+
+    aiter.mla.mla_decode_fwd_v4_nm(**args_b)
+    torch.cuda.synchronize()
+    out_b = args_b["output"]
+    out_b_bits = out_b.view(torch.int16)
+
+    finite_both = torch.isfinite(out_a) & torch.isfinite(out_b)
+    assert finite_both.any(), (
+        "All output cells were NaN/inf under both sink values — the quant "
+        "pipeline returned junk OR sink=10 pushed the running max into a "
+        "saturating regime. Re-check _native_to_2buff_for_asm or lower "
+        "sink_b's magnitude."
+    )
+
+    diff_finite = (out_a_bits != out_b_bits) & finite_both
+    assert diff_finite.any(), (
+        "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical "
+        "output among finite cells. Either the dispatcher stopped writing "
+        "ptr_sink into kernarg slot 18 (offset 0x120), or the .co was "
+        "rebuilt from a non-sink-aware .s. Check MlaV4KernelArgsLegacy in "
+        "aiter/ops/asm/mla_decode_v4.py and rebuild from 3_13.s."
+    )
+
+    # ---- (B) sink=-inf introduces no extra NaN vs -1e9 control ----
+    args_inf = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=7)
+    sink_size = args_inf["sink"].numel()  # = num_heads (2026-06-01 shrink)
+    device = args_inf["q"].device
+
+    args_big = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=7)
+    args_big["sink"] = torch.full(
+        (sink_size,), -1.0e9, dtype=torch.float32, device=device
+    )
+
+    aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_big)
+    torch.cuda.synchronize()
+
+    # Compare the authoritative BF16 `output` (single/multi-pass agnostic).
+    nan_inf = torch.isnan(args_inf["output"])
+    nan_big = torch.isnan(args_big["output"])
+
+    # -inf must not produce *more* NaNs than the -1e9 control. The inverse
+    # would mean sink=-inf hits a kernel-side division-by-zero or
+    # exp(-inf)*0=NaN somewhere it shouldn't, breaking the wrapper's
+    # documented "pass torch.full(..., -inf) for no-sink math" recipe.
+    extra_nans = (nan_inf & ~nan_big).sum().item()
+    assert extra_nans == 0, (
+        f"sink=-inf introduced {extra_nans} NaN cells over the -1e9 "
+        f"control. The sink merge in 3_13.s is not -inf-stable; the "
+        f"wrapper docstring's recommendation to use -inf for 'no sink' "
+        f"is no longer safe — switch the convention to a large finite "
+        f"negative (e.g. -1e9)."
+    )
+
+    # ---- (C) malformed sink rejected before dispatch (5 paths) ----
+    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=1, seed=0)
+    num_heads = args["q"].size(1)
+    max_seqlen_q = args["max_seqlen_q"]
+    expected = num_heads  # 2026-06-01 shrink: was num_heads * max_seqlen_q
+    device = args["q"].device
+
+    # Wrong dtype (BF16 instead of FP32).
+    args_bad_dtype = dict(args)
+    args_bad_dtype["sink"] = torch.full(
+        (expected,), float("-inf"), dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(ValueError, match="sink.*FP32|sink.*float32"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args_bad_dtype)
+
+    args_under = dict(args)
+    args_under["sink"] = torch.full(
+        (max_seqlen_q,), float("-inf"), dtype=torch.float32, device=device
+    )
+    with pytest.raises(ValueError, match="sink.*numel"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args_under)
+
+    args_over = dict(args)
+    args_over["sink"] = torch.full(
+        (expected * 2,),  # clearly over-sized regardless of (gqa, max_seqlen_q)
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    with pytest.raises(ValueError, match="sink.*numel"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args_over)
+
+    # Non-contiguous sink (slice/transpose) — kernel reads flat fp32, so
+    # any stride mismatch silently scrambles the per-head sink layout.
+    args_strided = dict(args)
+    args_strided["sink"] = torch.full(
+        (expected * 2,), float("-inf"), dtype=torch.float32, device=device
+    )[
+        ::2
+    ]  # numel == expected but stride=2 → non-contiguous
+    assert args_strided["sink"].numel() == expected
+    with pytest.raises(ValueError, match="sink.*contiguous"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args_strided)
+
+    # Wrong device (CPU vs CUDA q).
+    args_bad_device = dict(args)
+    args_bad_device["sink"] = torch.full(
+        (expected,), float("-inf"), dtype=torch.float32, device="cpu"
+    )
+    with pytest.raises(ValueError, match="sink.*device|same device"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args_bad_device)
+
+
+# ---------------------------------------------------------------------------
+# gqa=128 Q_rope out-of-bounds guard-page detector.
+#
+# The tg_idx=1 Q_rope over-read bug (fixed in the 32n rebuild) is invisible to
+# accuracy AND to a plain crash check: the over-read bytes are wave-redundant
+# scans past head 127 that never feed a valid head's MFMA (so cos stays
+# ~0.99999 whether they are garbage or clamped to 0), and a normal torch
+# tensor's ~1.5KB overrun lands in adjacent mapped device memory (so it does
+# not fault). Only a memory-boundary check catches it.
+#
+# ROCm 7.2 has no compute-sanitizer, so we synthesize a guard page: run a
+# LARGE-batch gqa=128 decode with (a) PYTORCH_NO_HIP_MEMORY_CACHING=1 so the
+# qrope tensor gets its own tight hipMalloc, and (b) a cloned/contiguous qrope
+# so its storage ends near the allocation tail. The tg_idx=1 over-read then
+# crosses into an unmapped page and raises a GPU memory-access fault, which
+# kills the worker process — deterministically flagging the regression.
+#
+# The worker MUST run in a subprocess: a GPU fault is unrecoverable and would
+# abort the whole pytest session. Verified: buggy build faults, fixed build
+# exits 0.
+# ---------------------------------------------------------------------------
+def _oob_worker_main(gqa=128, q_seq_logical=1):
+    """Subprocess body: large-batch decode that faults iff the kernel over-reads
+    qrope past its buffer. gqa=128/q_seq_logical=1 targets the tg_idx=1 OOB bug;
+    gqa=16/q_seq_logical=4 independently exercises the (16,4) full-tile path."""
+    sm = 1.0 / (_QUANT_D**0.5)
+    inp = _build_bf16_inputs(
+        batch=256,
+        kv_seq_lens=384,
+        q_seq_logical=q_seq_logical,
+        seed=0,
+        gqa_ratio=gqa,
+        attn_sink=True,
+    )
+    qp, qr = _native_to_2buff_for_asm(inp["q_bf16"])
+    kp, kr = _native_to_2buff_for_asm(inp["kv_bf16"])
+    # Tight, independent allocation for qrope so its tail abuts the guard page.
+    qr = qr.contiguous().clone()
+    total_q = inp["q_bf16"].size(0)
+    out = torch.empty((total_q, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda")
+    aiter.mla.mla_decode_fwd_v4_nm(
+        q=qp,
+        qrope=qr,
+        kv_buffer=kp,
+        kvrope=kr.contiguous(),
+        output=out,
+        qo_indptr=inp["qo_indptr"],
+        kv_indptr=inp["kv_indptr"],
+        kv_page_indices=inp["kv_page_indices"],
+        kv_last_page_lens=inp["kv_last_page_lens"],
+        split_indptr=None,
+        max_seqlen_q=q_seq_logical,
+        sink=inp["sink"],
+        sm_scale=sm,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    torch.cuda.synchronize()
+
+
+def _run_oob_guardpage_worker(worker_args, fault_label):
+    """Launch the guard-page OOB worker in a subprocess and assert it finished
+    without a GPU memory-access fault.
+
+    The worker MUST be a subprocess: a GPU fault is unrecoverable and would
+    abort the whole pytest session. `worker_args` are extra argv passed after
+    `--oob-worker` (e.g. ["16", "4"] for gqa=16, q_seq_logical=4).
+    """
+    env = dict(os.environ)
+    env["PYTORCH_NO_HIP_MEMORY_CACHING"] = "1"
+    env["HSA_XNACK"] = "0"
+    # Suppress GPU/CPU core dumps: a buggy build faults here on purpose, and a
+    # leftover `core` / `core.gpu` in the cwd would pollute the workspace and
+    # can disturb a subsequent worker's own dump attempt.
+    env["AMD_LOG_LEVEL"] = "0"
+    # Ensure the worker subprocess can `import aiter` regardless of how pytest
+    # was invoked (pytest injects rootdir into its own sys.path, not into the
+    # child's PYTHONPATH). Prepend the repo root (parent of op_tests/) and the
+    # op_tests dir so `python <this_file> --oob-worker ...` resolves imports.
+    _op_dir = os.path.dirname(os.path.abspath(__file__))
+    _repo_root = os.path.dirname(_op_dir)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_repo_root, _op_dir, env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    def _no_core_dump():
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    proc = subprocess.run(
+        [sys.executable, __file__, "--oob-worker", *worker_args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        preexec_fn=_no_core_dump,
+        check=False,
+    )
+    combined = proc.stdout + proc.stderr
+    faulted = (
+        "Memory access fault" in combined
+        or "HSA_STATUS_ERROR" in combined
+        or proc.returncode != 0
+    )
+    assert not faulted, (
+        f"{fault_label} Worker exit={proc.returncode}.\n"
+        f"--- worker output ---\n{combined[-2000:]}"
+    )
+    assert "COMPLETED no fault" in combined, (
+        "OOB guard-page worker did not report completion; output:\n"
+        f"{combined[-2000:]}"
+    )
+
+
+@needs_gfx950
+def test_v4_nm_gqa128_qrope_oob_guardpage():
+    """Regression for the gqa=128 tg_idx=1 Q_rope out-of-bounds read.
+
+    Runs _oob_worker_main in a subprocess under a synthesized guard page
+    (non-caching allocator + tight qrope alloc + large batch) so any Q_rope
+    over-read faults the GPU. A buggy kernel -> the subprocess dies with a
+    GPU memory-access fault (nonzero exit); the fixed kernel -> clean exit 0.
+    This catches the class of "OOB but numerically silent + non-faulting on
+    small tensors" bugs that accuracy/perf/plain-crash checks all miss.
+    """
+    _run_oob_guardpage_worker(
+        ["128", "1"],
+        "gqa=128 Q_rope OOB detected: the decode kernel over-reads the qrope "
+        "buffer on the tg_idx=1 (head 64-127) path.",
+    )
+
+
+@needs_gfx950
+def test_v4_nm_gqa16_qrope_oob_guardpage():
+    """Guard-page OOB check for the gqa=16 (16,4) entry point.
+
+    Mirrors test_v4_nm_gqa128_qrope_oob_guardpage but for gqa=16,
+    q_seq_logical=4 (16 heads x 4 logical-Q rows = the full 64 q-row tile).
+    gqa=16 launches a SINGLE head-group thread-group (16 < 64, so there is no
+    tg_idx=1), so this does NOT exercise the gqa=128 tg_idx=1 over-read; it
+    independently verifies the gqa=16 path performs no qrope over-read of its
+    own. Same synthesized guard page (non-caching allocator + tight qrope
+    alloc + large batch) so any over-read faults the GPU and kills the worker.
+    """
+    _run_oob_guardpage_worker(
+        ["16", "4"],
+        "gqa=16 Q_rope OOB detected: the decode kernel over-reads the qrope "
+        "buffer on the (16,4) full-tile path.",
+    )
+
+
+def _assert_bitwise_repeatable(
+    gqa_ratio,
+    kv_seq_lens,
+    batch,
+    num_kv_splits,
+    reps=6,
+    seed=0,
+):
+    """Launch the same decode `reps` times and require bit-identical output.
+
+    The kernel is deterministic by construction: fixed inputs, a fixed split
+    count and a fixed reduction order, so every launch must return the same
+    bits. A divergence means a workgroup consumed state it did not produce —
+    stale LDS, a missing wait, or a racing write — never rounding.
+
+    Tolerance checks cannot stand in for this. A faulting workgroup corrupts
+    one (seq, split) tile, which is ~1% of the elements at these shapes, so
+    cos_diff stays around 4e-05 against the torch reference and every
+    tolerance gate in this file still passes while individual outputs move by
+    more than 0.1 in absolute terms.
+
+    `num_kv_splits` is explicit rather than auto-picked: get_meta_param's
+    choice depends on an occupancy heuristic that may change, and a shape that
+    silently collapses to a single split stops exercising the cross-split path
+    where the corruption was first seen.
+    """
+    assert kv_seq_lens // num_kv_splits >= 32, (
+        f"kv_seq_lens // num_kv_splits = {kv_seq_lens // num_kv_splits} < SUB_KV=32; "
+        "pick a shape whose smallest split holds a full pass."
+    )
+
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=seed,
+        gqa_ratio=gqa_ratio,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+    q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
+
+    total_q = inputs["q_bf16"].size(0)
+    num_seqs = inputs["qo_indptr"].size(0) - 1
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    split_indptr = torch.tensor(
+        [i * num_kv_splits for i in range(num_seqs + 1)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    outs = []
+    for _ in range(reps):
+        # Fresh zeroed buffers per rep: reusing them would let a workgroup that
+        # skips its write inherit the previous launch's correct result.
+        output_buf = torch.zeros(
+            (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+        )
+        logits_buf = torch.zeros(
+            (total_q, num_kv_splits, num_heads, V_HEAD_DIM),
+            dtype=dtypes.fp32,
+            device="cuda",
+        )
+        lse_buf = torch.zeros(
+            (total_q, num_kv_splits, num_heads, 1), dtype=dtypes.fp32, device="cuda"
+        )
+        aiter.mla.mla_decode_fwd_v4_nm(
+            q=q_packed,
+            qrope=q_rope,
+            kv_buffer=kv_packed,
+            kvrope=kv_rope,
+            output=output_buf,
+            qo_indptr=inputs["qo_indptr"],
+            kv_indptr=inputs["kv_indptr"],
+            kv_page_indices=inputs["kv_page_indices"],
+            kv_last_page_lens=inputs["kv_last_page_lens"],
+            split_indptr=split_indptr,
+            max_seqlen_q=inputs["max_seqlen_q"],
+            sink=inputs["sink"],
+            sm_scale=sm_scale,
+            out_16_nosplit=0,
+            num_kv_splits=num_kv_splits,
+            logits=logits_buf,
+            attn_lse=lse_buf,
+        )
+        torch.cuda.synchronize()
+        # The wrapper derives out_16_nosplit from the split count (mla.py), so
+        # `output` is the buffer it populated in either regime.
+        outs.append(output_buf.clone())
+
+    ref = outs[0]
+    per_seq = ref[0].numel()
+    for i, out in enumerate(outs[1:], 1):
+        if torch.equal(out, ref):
+            continue
+        differing = (out != ref).reshape(ref.size(0), -1)
+        bad_seqs = torch.nonzero(differing.sum(1)).flatten().tolist()
+        worst = float((out.float() - ref.float()).abs().max())
+        raise AssertionError(
+            f"v4 nm decode is not repeatable at gqa={gqa_ratio} "
+            f"kv_seq_lens={kv_seq_lens} batch={batch} "
+            f"num_kv_splits={num_kv_splits}: launch {i} of {reps} differs from "
+            f"the first.\n"
+            f"  sequences affected: {len(bad_seqs)} of {ref.size(0)} "
+            f"(indices {bad_seqs[:8]}{'...' if len(bad_seqs) > 8 else ''})\n"
+            f"  elements differing: {int(differing.sum())} "
+            f"({per_seq} per sequence)\n"
+            f"  max absolute delta: {worst:.3e}\n"
+            "Whole-tile divergence points at a workgroup reading state it did "
+            "not write; see the kernel's LDS producer/consumer pairing."
+        )
+
+
+@needs_gfx950
+def test_v4_nm_bitwise_repeatability():
+    """Repeated identical decodes must be bit-identical, on the split path.
+
+    batch=288 x 4 splits launches more workgroups than the GPU has CUs, so
+    workgroups get recycled onto a CU that another one just vacated — the
+    condition under which a kernel that reads uninitialised LDS picks up the
+    previous tenant's data. Shapes at or below one workgroup per CU miss it.
+    """
+    _assert_bitwise_repeatable(
+        gqa_ratio=64, kv_seq_lens=1024, batch=288, num_kv_splits=4
+    )
+
+
+@needs_gfx950
+def test_v4_nm_bitwise_repeatability_gqa128():
+    """Same repeatability contract for the gqa=128 entry point.
+
+    gqa=128 launches two workgroups per (seq, split) instead of one, doubling
+    the workgroup count at a given batch and giving the tile a different LDS
+    footprint, so it can expose a race the gqa=64 tiling happens to hide.
+    """
+    _assert_bitwise_repeatable(
+        gqa_ratio=128, kv_seq_lens=1024, batch=288, num_kv_splits=4
+    )
+
+
+def _decode_packed(inputs, q_packed, q_rope, kv_packed, kv_rope, gqa_ratio, splits):
+    """One decode into freshly zeroed buffers; returns the BF16 output tensor."""
+    total_q = inputs["q_bf16"].size(0)
+    num_seqs = inputs["qo_indptr"].size(0) - 1
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    output = torch.zeros(
+        (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+    )
+    logits = torch.zeros(
+        (total_q, splits, num_heads, V_HEAD_DIM), dtype=dtypes.fp32, device="cuda"
+    )
+    lse = torch.zeros((total_q, splits, num_heads, 1), dtype=dtypes.fp32, device="cuda")
+    aiter.mla.mla_decode_fwd_v4_nm(
+        q=q_packed,
+        qrope=q_rope,
+        kv_buffer=kv_packed,
+        kvrope=kv_rope,
+        output=output,
+        qo_indptr=inputs["qo_indptr"],
+        kv_indptr=inputs["kv_indptr"],
+        kv_page_indices=inputs["kv_page_indices"],
+        kv_last_page_lens=inputs["kv_last_page_lens"],
+        split_indptr=torch.tensor(
+            [i * splits for i in range(num_seqs + 1)],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        max_seqlen_q=inputs["max_seqlen_q"],
+        sink=inputs["sink"],
+        sm_scale=1.0 / (_QUANT_D**0.5),
+        out_16_nosplit=0,
+        num_kv_splits=splits,
+        logits=logits,
+        attn_lse=lse,
+    )
+    torch.cuda.synchronize()
+    # The wrapper derives out_16_nosplit from the split count, so `output` is the
+    # buffer it populated in either regime.
+    return output
+
+
+def _decode_poisoned(ctx, lo, hi, fill, target):
+    """Decode `ctx`'s inputs with packed-row bytes [lo, hi) overwritten by `fill`.
+
+    `target` selects which side is poisoned: "q", "kv" or "both". The originals
+    are cloned per call so each range is measured against the same baseline.
+    """
+    q, kv = ctx["q"].clone(), ctx["kv"].clone()
+    if target in ("q", "both"):
+        q.view(torch.uint8)[..., lo:hi] = fill
+    if target in ("kv", "both"):
+        kv.view(torch.uint8)[..., lo:hi] = fill
+    return _decode_packed(
+        ctx["inputs"], q, ctx["q_rope"], kv, ctx["kv_rope"], ctx["gqa"], ctx["splits"]
+    )
+
+
+@needs_gfx950
+def test_v4_nm_packed_byte_ranges():
+    """Each packed-row byte range is read, or ignored, exactly as the layout says.
+
+    Row layout: [ nope 448 fp8 | scale 14 e8m0 | pad 50 ] = 512 B. Bytes 448-461
+    are live; 462-511 are padding the kernel must never touch.
+
+    test_v4_nm_packed_pad_poison already fills the whole padding at once, which
+    cannot tell "reads nothing past 461" from "reads 462 but not 463" — and the
+    shipped bug was exactly a 2-byte over-read into 462/463, where 0xFF is the
+    e8m0 NaN encoding. So the ranges are poisoned separately.
+
+    The scale range is poisoned too, as a liveness control: it MUST change the
+    result. Without it a kernel that ignored the scales entirely would sail
+    through every padding assertion here.
+
+    Comparison is bitwise against an unpoisoned baseline rather than a
+    tolerance, because "the kernel did not read these bytes" admits no drift.
+    """
+    scale_off = _QUANT_D_NOPE  # 448
+    pad_off = _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES  # 462
+    inert_ranges = (
+        ("over-read pair 462:464", pad_off, pad_off + 2),
+        ("padding tail 464:512", pad_off + 2, _QUANT_D),
+        ("whole padding 462:512", pad_off, _QUANT_D),
+    )
+    splits = 4
+
+    for gqa in (64, 128):
+        inputs = _build_bf16_inputs(
+            batch=8, kv_seq_lens=1024, q_seq_logical=1, seed=0, gqa_ratio=gqa
+        )
+        q0, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+        kv0, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+        ctx = {
+            "inputs": inputs,
+            "q": q0,
+            "kv": kv0,
+            "q_rope": q_rope.contiguous(),
+            "kv_rope": kv_rope.contiguous(),
+            "gqa": gqa,
+            "splits": splits,
+        }
+        base = _decode_packed(
+            inputs, q0, ctx["q_rope"], kv0, ctx["kv_rope"], gqa, splits
+        )
+        assert torch.isfinite(base).all(), (
+            f"gqa={gqa}: baseline decode is not finite; the poison comparisons "
+            "below would be meaningless."
+        )
+
+        # 0xFF is the e8m0 NaN encoding (the byte pattern that broke the model);
+        # 0xA5 is an arbitrary non-NaN fill, to catch a read that merely skews.
+        for label, lo, hi in inert_ranges:
+            for fill in (0xFF, 0xA5):
+                for target in ("q", "kv", "both"):
+                    out = _decode_poisoned(ctx, lo, hi, fill, target)
+                    assert torch.isfinite(out).all(), (
+                        f"gqa={gqa}: poisoning {label} of {target} with "
+                        f"0x{fill:02X} produced non-finite output — the kernel "
+                        f"read packed-row bytes [{lo}, {hi}) that are padding."
+                    )
+                    n_diff = int((out != base).sum())
+                    assert n_diff == 0, (
+                        f"gqa={gqa}: poisoning {label} of {target} with "
+                        f"0x{fill:02X} changed {n_diff} of {out.numel()} output "
+                        f"elements (max delta "
+                        f"{float((out.float() - base.float()).abs().max()):.3e}). "
+                        f"Packed-row bytes [{lo}, {hi}) are padding and must not "
+                        "reach the result."
+                    )
+
+        for target in ("q", "kv"):
+            out = _decode_poisoned(ctx, scale_off, pad_off, 0xFF, target)
+            assert not torch.equal(out, base), (
+                f"gqa={gqa}: poisoning the LIVE scale bytes "
+                f"[{scale_off}, {pad_off}) of {target} left the output "
+                "unchanged. The kernel is not reading the e8m0 scales at all, "
+                "so the padding assertions above prove nothing."
+            )
+
+
+def _cos_diff(a, b):
+    """1 - cosine similarity; 0 when the two tensors point the same way."""
+    a, b = a.float().flatten(), b.float().flatten()
+    return float(1.0 - (a @ b) / (a.norm() * b.norm()).clamp_min(1e-12))
+
+
+def _assert_tail_kv_shape(kv_seq_lens, batch, num_kv_splits, gqa_ratio, reps=4):
+    """Accuracy and repeatability at a kv length with a remainder past the tile.
+
+    The inner loop consumes SUB_KV=32 tokens per pass, so a kv length that is
+    not a multiple of 32 makes every workgroup run a short final pass, and
+    splitting gives each split its own ragged tail. Both the accuracy of that
+    tail and its synchronisation are checked here: a tail that races shows up as
+    run-to-run divergence well before it moves a tolerance.
+
+    The tolerance compare alone would not prove the tail was processed. At
+    kv=1041 the 17 leftover tokens carry ~1.6% of the attention mass, so a
+    kernel that dropped them entirely still lands at an 0.0014 error ratio —
+    inside the 0.02 the check allows. So the result is also compared against a
+    reference built over only the tile-aligned prefix, and the kernel must sit
+    far closer to the full-length reference than to that truncated one. That
+    ratio is ~2000x when the tail is handled and ~1x when it is dropped, which
+    makes it a verdict rather than a threshold to calibrate.
+    """
+    assert kv_seq_lens % 32, f"kv_seq_lens={kv_seq_lens} divides the tile; no tail"
+    assert kv_seq_lens // num_kv_splits >= 32, (
+        f"smallest split = {kv_seq_lens // num_kv_splits} < SUB_KV=32: that "
+        "split drops its tail, which the operator does not support."
+    )
+
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=gqa_ratio,
+    )
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+    q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
+
+    # Same fp8 bytes the kernel reads, so the gap is kernel math, not quant noise.
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inputs["sink"],
+    )
+
+    outs = [
+        _decode_packed(
+            inputs, q_packed, q_rope, kv_packed, kv_rope, gqa_ratio, num_kv_splits
+        )
+        for _ in range(reps)
+    ]
+    shape = (
+        f"kv_seq_lens={kv_seq_lens} (tail {kv_seq_lens % 32}) batch={batch} "
+        f"num_kv_splits={num_kv_splits} gqa={gqa_ratio}"
+    )
+    assert torch.isfinite(outs[0]).all(), f"non-finite output at {shape}"
+
+    err = checkAllclose(
+        out_ref.float(),
+        outs[0].float(),
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm tail shape [fp8_dequant_ref vs asm] {shape}",
+    )
+    assert (err or 0) < 0.02, f"tail-shape accuracy failed at {shape}: err={err}"
+
+    # Reference over the tile-aligned prefix only: what a kernel that skipped
+    # the ragged final pass would converge to.
+    aligned = kv_seq_lens - kv_seq_lens % 32
+    ref_trunc, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        torch.arange(batch + 1, dtype=torch.int32, device="cuda") * aligned,
+        torch.cat(
+            [
+                inputs["kv_page_indices"][i * kv_seq_lens : i * kv_seq_lens + aligned]
+                for i in range(batch)
+            ]
+        ),
+        inputs["kv_last_page_lens"],
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inputs["sink"],
+    )
+    d_full = _cos_diff(out_ref, outs[0])
+    d_trunc = _cos_diff(ref_trunc, outs[0])
+    assert d_trunc > 100 * d_full, (
+        f"tail was not processed at {shape}: the result is {d_full:.3e} from "
+        f"the full-length reference but {d_trunc:.3e} from one truncated to "
+        f"{aligned} tokens. A kernel that handles the {kv_seq_lens % 32}-token "
+        "tail sits orders of magnitude closer to the full reference; these two "
+        "being comparable means the tail was dropped or mis-weighted."
+    )
+
+    for i, out in enumerate(outs[1:], 1):
+        assert torch.equal(out, outs[0]), (
+            f"tail shape is not repeatable at {shape}: launch {i} of {reps} "
+            f"differs from the first in {int((out != outs[0]).sum())} elements "
+            f"(max delta {float((out.float() - outs[0].float()).abs().max()):.3e})."
+        )
+
+
+@needs_gfx950
+def test_v4_nm_kv_tail_not_tile_multiple():
+    """kv lengths with a remainder past the 32-token tile, at several split counts.
+
+    The existing ragged tests vary kv per sequence; this varies the tile
+    remainder instead, and pairs each length with the split counts that stress
+    the tail differently: one split leaves the whole remainder to a single pass,
+    while kv//32 splits hand every split a 32-token slice plus the leftover.
+
+    kv=1041 at 32 splits is the extreme — a 17-token remainder spread across the
+    maximum number of splits the guard allows.
+    """
+    for kv_seq_lens, num_kv_splits in (
+        (34, 1),
+        (102, 3),
+        (200, 6),
+        (1041, 1),
+        (1041, 32),
+    ):
+        _assert_tail_kv_shape(
+            kv_seq_lens=kv_seq_lens,
+            batch=256,
+            num_kv_splits=num_kv_splits,
+            gqa_ratio=64,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Persistent kernel: mla_decode_fwd_v4_nm_ps (gqa=128, qlen=1, one launch).
+# ---------------------------------------------------------------------------
+_PS_HEADS = 128
+_PS_MAX_ROWS = 32768  # mla_decode_fwd_v4_nm_ps row limit
+_PS_SENTINEL = -3.0  # rows with K=0 must keep it (the kernel leaves them unwritten)
+
+
+def _ps_inputs(kv_lens, seed=0, pool=None, device="cuda"):
+    """Packed q / KV pool / tables for kv_lens; row j gathers kv_lens[j] random
+    rows of a shared pool (page_size 1)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    n, total = len(kv_lens), int(sum(kv_lens))
+    pool = pool or max(1, min(total, 20000)) + 97
+    qp, qr = _native_to_2buff_for_asm(
+        torch.randn(n, _PS_HEADS, _QUANT_D, generator=g, device=device).to(dtypes.bf16)
+    )
+    kp, kr = _native_to_2buff_for_asm(
+        torch.randn(
+            pool, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D, generator=g, device=device
+        ).to(dtypes.bf16)
+    )
+    kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.tensor(kv_lens, device=device).cumsum(0)
+    kv_page_indices = torch.randint(
+        0, pool, (max(total, 1),), generator=g, device=device, dtype=torch.int32
+    )
+    sink = torch.randn(_PS_HEADS, generator=g, device=device) * 2.0
+    return {
+        "q_packed": qp,
+        "q_rope": qr.contiguous(),
+        "kv_packed": kp,
+        "kv_rope": kr.contiguous(),
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "sink": sink,
+    }
+
+
+def _ps_call(inp, ws, out=None, lse=None, return_lse=True, kv_indptr=None):
+    n = inp["q_packed"].size(0)
+    if out is None:
+        out = torch.full(
+            (n, _PS_HEADS, V_HEAD_DIM), _PS_SENTINEL, dtype=dtypes.bf16, device="cuda"
+        )
+    if lse is None and return_lse:
+        lse = torch.full((n, _PS_HEADS), _PS_SENTINEL, device="cuda")
+    return aiter.mla.mla_decode_fwd_v4_nm_ps(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        inp["kv_indptr"] if kv_indptr is None else kv_indptr,
+        inp["kv_page_indices"],
+        inp["sink"],
+        ws,
+        out=out,
+        return_lse=return_lse,
+        lse=lse,
+    )
+
+
+def _ps_reference(inp, kv_indptr=None):
+    """(out bf16, lse fp32) of the fp8-dequant reference; lse includes the sink."""
+    n = inp["q_packed"].size(0)
+    kv_indptr = inp["kv_indptr"] if kv_indptr is None else kv_indptr
+    ones = torch.ones(n, dtype=torch.int32, device="cuda")
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device="cuda")
+    out, _ = _torch_attn_decode_fp8_dequant_ref(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        qo_indptr,
+        kv_indptr,
+        inp["kv_page_indices"],
+        ones,
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inp["sink"],
+    )
+    q = _quant_2buff_to_native(inp["q_packed"], inp["q_rope"]).float()
+    kv = (
+        _quant_2buff_to_native(inp["kv_packed"], inp["kv_rope"])
+        .float()
+        .view(-1, _QUANT_D)
+    )
+    lse = torch.empty(n, _PS_HEADS, dtype=torch.float32, device="cuda")
+    ip = kv_indptr.tolist()
+    for j in range(n):
+        k = kv[inp["kv_page_indices"][ip[j] : ip[j + 1]].long()]
+        s = (q[j] @ k.T) / (_QUANT_D**0.5)
+        lse[j] = torch.logsumexp(torch.cat([s, inp["sink"][:, None]], 1), 1)
+    return out, lse
+
+
+def _ps_check(inp, out, lse, ref=None, msg=""):
+    ref_out, ref_lse = ref or _ps_reference(inp)
+    ip = inp["kv_indptr"]
+    live = (ip[1:] - ip[:-1]) > 0
+    assert torch.all(out[~live] == _PS_SENTINEL), "K=0 rows must be left unwritten"
+    if lse is not None:
+        assert torch.all(lse[~live] == _PS_SENTINEL), "K=0 lse must be left unwritten"
+    if not bool(live.any()):
+        return
+    a, b = out[live].float(), ref_out[live].float()
+    assert torch.isfinite(a).all()
+    cos = torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1), dim=1)
+    rel = (a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1).clamp_min(1e-12)
+    assert float(cos.min()) >= 0.9999, f"{msg} min row cos {float(cos.min())}"
+    assert float(rel.max()) <= 1e-2, f"{msg} max row rel-L2 {float(rel.max())}"
+    err = checkAllclose(
+        b, a, rtol=3e-2, atol=3e-2, tol_err_ratio=0.02, msg=f"v4 nm ps {msg}"
+    )
+    assert float(err or 0) < 0.02
+    if lse is not None:
+        d = float((lse[live] - ref_lse[live]).abs().max())
+        assert d <= 2e-2, f"{msg} lse max abs err {d}"
+
+
+@pytest.fixture(scope="module")
+def ps_workspace():
+    if not torch.cuda.is_available() or not _on_gfx950():
+        pytest.skip("v4 nm shader is shipped only for gfx950")
+    return aiter.mla.get_mla_v4_nm_ps_workspace()
+
+
+def _ps_ragged(n, hi, seed, zero_every=0):
+    g = np.random.default_rng(seed)
+    lens = g.integers(1, hi + 1, size=n).tolist()
+    if zero_every:
+        lens[::zero_every] = [0] * len(lens[::zero_every])
+    return lens
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens",
+    [
+        [1],
+        [64] * 7,
+        [129] * 256,  # HCA window + one compressed token
+        [8320] * 4,
+        [0, 1, 33, 8320, 0, 500, 7],
+        _ps_ragged(1000, 2000, 1, zero_every=37),
+        _ps_ragged(3000, 300, 2),
+        [8320] * 3 + [5] * 600,
+    ],
+    ids=lambda v: f"N{len(v)}_Kmax{max(v)}",
+)
+def test_v4_nm_ps_accuracy(ps_workspace, kv_lens):
+    inp = _ps_inputs(kv_lens, seed=len(kv_lens))
+    out, lse = _ps_call(inp, ps_workspace)
+    torch.cuda.synchronize()
+    _ps_check(inp, out, lse, msg=f"N={len(kv_lens)}")
+    assert int(ps_workspace.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+def test_v4_nm_ps_indptr_offset_and_tail(ps_workspace):
+    """kv_indptr longer than N+1 and not starting at 0 (N comes from q)."""
+    kv_lens = [300, 0, 17, 1024, 64]
+    inp = _ps_inputs(kv_lens, seed=3)
+    base, base_lse = _ps_call(inp, ps_workspace)
+    off = 11
+    idx = inp["kv_page_indices"]
+    pad = torch.zeros(off, dtype=torch.int32, device="cuda")
+    shifted = dict(inp, kv_page_indices=torch.cat([pad, idx, pad]))
+    kv_indptr = torch.cat(
+        [inp["kv_indptr"] + off, (inp["kv_indptr"][-1:] + off + 5).repeat(3)]
+    )
+    out, lse = _ps_call(shifted, ps_workspace, kv_indptr=kv_indptr)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), base.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), base_lse.view(torch.int32))
+    _ps_check(inp, base, base_lse)
+
+
+@needs_gfx950
+def test_v4_nm_ps_workspace_reuse_across_batches(ps_workspace):
+    """One workspace across batch sizes: counters return to zero and results
+    match a fresh workspace bit for bit."""
+    for n, seed in ((1, 0), (700, 1), (5, 2), (2048, 3), (33, 4)):
+        inp = _ps_inputs(_ps_ragged(n, 1500, seed, zero_every=11), seed=seed)
+        out, lse = _ps_call(inp, ps_workspace)
+        fresh, fresh_lse = _ps_call(inp, aiter.mla.get_mla_v4_nm_ps_workspace())
+        torch.cuda.synchronize()
+        assert int(ps_workspace.cnt.abs().sum()) == 0
+        assert torch.equal(out.view(torch.int16), fresh.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), fresh_lse.view(torch.int32))
+
+
+@needs_gfx950
+def test_v4_nm_ps_partitions(ps_workspace):
+    """Non-default partition counts agree with the default one."""
+    inp = _ps_inputs(_ps_ragged(300, 3000, 5, zero_every=7), seed=5)
+    ref = _ps_reference(inp)
+    for p in (1, 37, 1024):
+        ws = aiter.mla.get_mla_v4_nm_ps_workspace(num_partitions=p)
+        out, lse = _ps_call(inp, ws)
+        torch.cuda.synchronize()
+        _ps_check(inp, out, lse, ref=ref, msg=f"P={p}")
+        assert int(ws.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
+def test_v4_nm_ps_cudagraph_replay(ps_workspace):
+    """Captured once, replayed with changing KV lengths (incl. K=0 rows)."""
+    n, kv_cap = 96, 2048
+    inp = _ps_inputs([kv_cap] * n, seed=6)
+    out = torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+    lse = torch.empty(n, _PS_HEADS, dtype=torch.float32, device="cuda")
+
+    def run():
+        _ps_call(inp, ps_workspace, out=out, lse=lse)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _ps_call(inp, ps_workspace)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    with pytest.raises(RuntimeError), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        aiter.mla.get_mla_v4_nm_ps_workspace()
+
+    g = np.random.default_rng(7)
+    for lens in (
+        [kv_cap] * n,
+        g.integers(0, kv_cap + 1, size=n).tolist(),
+        [1] * n,
+        [0] * (n // 2) + [kv_cap] * (n - n // 2),
+    ):
+        # rows read a dense prefix of the capacity-sized index table
+        inp["kv_indptr"][1:].copy_(torch.tensor(lens, device="cuda").cumsum(0))
+        out.fill_(_PS_SENTINEL)
+        lse.fill_(_PS_SENTINEL)
+        graph.replay()
+        torch.cuda.synchronize()
+        _ps_check(inp, out, lse, msg=f"graph lens={lens[:3]}")
+        eager, eager_lse = _ps_call(inp, ps_workspace)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), eager.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), eager_lse.view(torch.int32))
+        assert int(ps_workspace.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens", [[1152, 900, 64, 1152], [8320, 200], [100, 60, 128] * 50]
+)
+def test_v4_nm_ps_matches_split_kernel(ps_workspace, kv_lens):
+    """Agrees with mla_decode_fwd_v4_nm (non-persistent kernel + planned split)."""
+    inp = _ps_inputs(kv_lens, seed=8)
+    n = len(kv_lens)
+    out = _ps_call(inp, ps_workspace, return_lse=False)
+    ref = torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+    split = _uniform_split(n, _PS_HEADS, max(kv_lens))
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        ref,
+        torch.arange(n + 1, dtype=torch.int32, device="cuda"),
+        inp["kv_indptr"],
+        inp["kv_page_indices"],
+        1,
+        sink=inp["sink"],
+        **split,
+    )
+    if split["num_kv_splits"] == 1:
+        ref = logits[:, 0]
+    torch.cuda.synchronize()
+    assert _cos_diff(out, ref) < 1e-5
+    err = checkAllclose(
+        ref.float(),
+        out.float(),
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg="v4 nm ps vs split kernel",
+    )
+    assert float(err or 0) < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_ps_rejects_bad_args(ps_workspace):
+    inp = _ps_inputs([64, 64], seed=9)
+    with pytest.raises(RuntimeError):  # 64 heads
+        aiter.mla.mla_decode_fwd_v4_nm_ps(
+            inp["q_packed"][:, :64].contiguous(),
+            inp["q_rope"][:, :64].contiguous(),
+            inp["kv_packed"],
+            inp["kv_rope"],
+            inp["kv_indptr"],
+            inp["kv_page_indices"],
+            inp["sink"],
+            ps_workspace,
+        )
+    with pytest.raises(RuntimeError):  # kv_indptr shorter than N+1
+        _ps_call(inp, ps_workspace, kv_indptr=inp["kv_indptr"][:2])
+    with pytest.raises(ValueError):
+        aiter.mla.get_mla_v4_nm_ps_workspace(num_partitions=1025)
+
+
+def _ps_oob_worker_main():
+    """Subprocess body of test_v4_nm_ps_oob_guardpage. Every buffer the
+    persistent kernel reads or writes (q, qrope, KV pools, kv_indptr with
+    exactly N+1 entries, kv_page_indices, sink, out, lse) is placed at the
+    very end of its own allocation, rounded to 2 MiB, under the non-caching
+    allocator, so an access even one element past any of them crosses into an
+    unmapped page and faults the GPU. (A one-entry over-read of
+    kv_page_indices faults with this layout; a plain clone of the same tensor
+    leaves up to 2 MiB of slack and does not.)"""
+    granule = 2 << 20
+
+    def tail(t):
+        nbytes = t.numel() * t.element_size()
+        total = -(-nbytes // granule) * granule
+        buf = torch.empty(total, dtype=torch.uint8, device=t.device)
+        v = buf[total - nbytes :].view(t.dtype).view(t.shape)
+        v.copy_(t)
+        return v
+
+    for n, hi, zero_every, return_lse in (
+        (8192, 700, 13, True),
+        (_PS_MAX_ROWS, 64, 0, True),  # largest N: out ends at the 4 GiB offset limit
+        (3000, 4000, 0, False),
+    ):
+        inp = _ps_inputs(_ps_ragged(n, hi, n, zero_every=zero_every), seed=n)
+        inp = {k: tail(v) for k, v in inp.items()}
+        out = tail(
+            torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+        )
+        lse = tail(torch.empty(n, _PS_HEADS, device="cuda")) if return_lse else None
+        ws = aiter.mla.get_mla_v4_nm_ps_workspace()
+        _ps_call(inp, ws, out=out, lse=lse, return_lse=return_lse)
+        torch.cuda.synchronize()
+        assert int(ws.cnt.abs().sum()) == 0
+        del inp, out, lse, ws
+
+
+@needs_gfx950
+def test_v4_nm_ps_oob_guardpage():
+    """Guard-page out-of-bounds check for mla_decode_fwd_v4_nm_ps.
+
+    The persistent kernel runs the head 64..127 path of the ASM (the one the
+    gqa=128 Q_rope over-read regression lived on) and adds its own reads:
+    the kv_indptr scans of the in-kernel planner, the split partials and the
+    merge. An over-read there can be numerically silent, so this runs large
+    batches in a subprocess with every input and output in a tight
+    allocation and asserts a clean exit, like
+    test_v4_nm_gqa128_qrope_oob_guardpage.
+    """
+    _run_oob_guardpage_worker(
+        ["ps"],
+        "v4 nm ps OOB detected: the persistent kernel accessed memory past "
+        "one of its input / output buffers.",
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    import itertools
+
+    # The v4 nm kernel ships only for gfx950.
+    if not torch.cuda.is_available() or not _on_gfx950():
+        print(
+            "[v4 nm] skip: shipped only for gfx950; "
+            "current device is not gfx950. Exiting 0."
+        )
+        sys.exit(0)
+
+    # OOB guard-page worker (invoked as a SUBPROCESS by
+    # test_v4_nm_gqa128_qrope_oob_guardpage). Runs a large-batch gqa=128
+    # decode with the qrope tensor placed in its own tight allocation +
+    # non-caching allocator so any tg_idx=1 Q_rope over-read crosses into an
+    # unmapped page and faults the GPU (killing THIS process). A clean exit 0
+    # means no OOB. See the test's docstring for the full rationale.
+    if sys.argv[1:3] == ["--oob-worker", "ps"]:
+        _ps_oob_worker_main()
+        print("[v4 nm][oob-worker] COMPLETED no fault")
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--oob-worker":
+        _gqa = int(sys.argv[2]) if len(sys.argv) >= 3 else 128
+        _msq = int(sys.argv[3]) if len(sys.argv) >= 4 else 1
+        _oob_worker_main(gqa=_gqa, q_seq_logical=_msq)
+        print("[v4 nm][oob-worker] COMPLETED no fault")
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=(
+            "v4 nm MLA DIY driver: for each shape in the (batch x kv x q_seq)\n"
+            "cartesian product, run accuracy then perf. For the pytest smoke /\n"
+            "determinism / kernarg suite, invoke `pytest op_tests/test_mla_v4_nm.py`\n"
+            "directly."
+        ),
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 2, 3, 4, 8, 16, 32, 64, 128, 256],
+        help="Batch size(s). e.g. -b 1 2 4",
+    )
+    parser.add_argument(
+        "-c",
+        "--kv-seq-lens",
+        type=int,
+        nargs="*",
+        default=[100, 256, 300, 512, 700, 1024],
+        help="KV tokens per sequence. e.g. -c 64 256 1024",
+    )
+    parser.add_argument(
+        "-q",
+        "--q-seq-logical",
+        type=int,
+        nargs="*",
+        default=[4],
+        help="Q tokens per sequence (pre-GQA-broadcast). Must be <=4 for the "
+        "shipped qseqlen4 variant. e.g. -q 1 2 4",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--iters", type=int, default=50, help="Perf timed iterations")
+    parser.add_argument("--warmup", type=int, default=3, help="Perf warmup iterations")
+    parser.add_argument(
+        "--split-kv",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--gqa-ratio",
+        type=int,
+        default=16,
+        help="num_heads / num_kv_heads. Must satisfy (gqa_ratio, q_seq_logical) "
+        "in {(16,4), (64,1), (128,1)} — the three entry points the qh64 .co's "
+        "tile (64 q-rows) covers via the dispatcher's sub_Q=64 + "
+        "gdx=ceil(gqa*max_seqlen_q/64) launch geometry. The CSV in "
+        "hsa/gfx950/mla_v4/mla_v4_asm.csv ships a single (gqa=16, qSeqLen=4) "
+        "row; mla_decode_v4.py remaps gqa∈{64,128} to that row at lookup time.",
+    )
+    parser.add_argument(
+        "--attn-sink",
+        default=True,
+        type=dtypes.str2bool,
+        help="Enable attn sink. True by default."
+        "--attn-sink=False to disable attn sink.",
+    )
+    parser.add_argument(
+        "--out_16_nosplit",
+        "--out-16-nosplit",
+        dest="out_16_nosplit",
+        type=int,
+        default=0,
+        help="1 -> kernel single-pass packed-BF16 direct path (no stage2 "
+        "merge). Requires --split-kv 1. The wrapper unpacks the result into "
+        "the output buffer; accuracy compares against it automatically. "
+        "Default 0 (fp32 split path).",
+    )
+    args = parser.parse_args()
+
+    perf_rows = []
+    failures = []
+    for batch, kv_seq_lens, q_seq_logical in itertools.product(
+        args.batch, args.kv_seq_lens, args.q_seq_logical
+    ):
+        print(
+            f"\n========== batch={batch} kv_seq_lens={kv_seq_lens} "
+            f"q_seq_logical={q_seq_logical} =========="
+        )
+        try:
+            us_asm, us_ref = _run_one_point(
+                batch=batch,
+                kv_seq_lens=kv_seq_lens,
+                q_seq_logical=q_seq_logical,
+                seed=args.seed,
+                num_iters=args.iters,
+                num_warmup=args.warmup,
+                num_kv_splits=args.split_kv,
+                gqa_ratio=args.gqa_ratio,
+                attn_sink=args.attn_sink,
+                out_16_nosplit=args.out_16_nosplit,
+            )
+        except AssertionError as e:
+            # Keep sweeping so one bad shape doesn't hide the rest; the exit
+            # code below is what fails CI (aiter_test.sh runs this as a script).
+            failures.append(((batch, kv_seq_lens, q_seq_logical), str(e)))
+            continue
+        perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))
+
+    print("\n[v4 nm perf summary] (us; speedup = fp8_ref / asm_kernel)")
+    print(
+        f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} "
+        f"{'asm_k us':>10} {'fp8_ref us':>12} {'speedup':>9}"
+    )
+    for b, k, q, ua, ur in perf_rows:
+        print(f"  {b:>6d} {k:>8d} {q:>6d} {ua:>10.2f} {ur:>12.2f} {ur / ua:>8.1f}x")
+
+    if failures:
+        print(f"\n[v4 nm accuracy] {len(failures)} shape(s) FAILED:")
+        for (b, k, q), reason in failures:
+            print(f"  batch={b} kv_seq_lens={k} q_seq_logical={q}: {reason}")
+        sys.exit(1)

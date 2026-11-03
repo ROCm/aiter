@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import aiter
+from typing import Any, ClassVar
+
 import torch
 import torch.nn.functional as F
+from batched_gemm_bf16_common import kernels_list
+
+import aiter
+from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
 from aiter.utility.base_tuner import GemmCommonTuner
-from aiter import dtypes
-from batched_gemm_bf16_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -36,7 +39,7 @@ def generate_data(b, m, n, k, device="cuda"):
 
 
 class BatchedGemmBf16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_BF16_BATCHED_GEMM}",
         "untune_file": "aiter/configs/bf16_untuned_batched_gemm.csv",
@@ -58,7 +61,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
 
     def run_config(self, args):
         from aiter.ops.batched_gemm_op_bf16 import batched_gemm_bf16
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
@@ -91,17 +94,17 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
         return results
 
     def calculate(self, results, bpes=(2, 2, 2)):
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return -1, -1
-        gfx, cu_num, b, m, n, k = info[0]
+        _gfx, _cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes

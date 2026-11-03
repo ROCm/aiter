@@ -1,9 +1,57 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Common types shared across MoE FlyDSL kernel modules."""
+"""Shared types and activation configuration for MoE FlyDSL modules."""
 
+import math
+import os
 from enum import Enum
+
+import torch
+
+DEFAULT_SITUV2_BETA = 4.0
+DEFAULT_SITUV2_LINEAR_BETA = 25.0
+
+
+def resolve_swiglu_limit(
+    swiglu_limit: "object" = None,
+) -> "tuple[float | None, str]":
+    """Return the validated SiLU/SwiGLU clamp limit and the name it came from.
+
+    ``None`` falls back to AITER_MXFP4_TUNE_SWIGLU_LIMIT; an unset or empty
+    variable keeps the activation default (``None``).
+    """
+    source = "swiglu_limit"
+    if swiglu_limit is None:
+        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
+        source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
+    if swiglu_limit is None:
+        return None, source
+    try:
+        limit = float(swiglu_limit)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{source} must be a finite positive number") from error
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError(f"{source} must be a finite positive number")
+    return limit, source
+
+
+def get_flydsl_activation_name(activation) -> str:
+    # ActivationType is backed by module_aiter_core. Keep this import lazy because
+    # wheel AOT job discovery imports moe_common before that extension is importable.
+    from aiter.ops.enum import ActivationType
+
+    activation_names = {
+        ActivationType.Silu: "silu",
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.Situv2: "situv2",
+    }
+    try:
+        return activation_names[activation]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported FlyDSL MoE activation: {activation!r}"
+        ) from error
 
 
 class GateMode(str, Enum):
@@ -22,3 +70,33 @@ class GateMode(str, Enum):
     MOCK_GATE_ONLY = "mock_gate_only"
     GATE_ONLY = "gate_only"
     INTERLEAVE = "interleave"
+
+
+def apply_gate_up(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    act: str,
+    swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+) -> torch.Tensor:
+    """Torch reference for the stage1 gate/up activation.
+
+    ``situv2`` (Kimi-K3 ``hidden_act="situ"``) is the grouped TDM stage1
+    epilogue's ``stage1_act=3``; this is what that kernel is checked against.
+    """
+    lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
+    if act == "swiglu":
+        gate = gate.clamp(max=lim)
+        up = up.clamp(min=-lim, max=lim)
+        return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    if act == "situv2":
+        situ_gate = (
+            float(situ_beta) * torch.tanh(gate / float(situ_beta)) * torch.sigmoid(gate)
+        )
+        up_scaled = float(situ_linear_beta) * torch.tanh(up / float(situ_linear_beta))
+        return situ_gate * up_scaled
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=lim)
+        up = up.clamp(min=-lim, max=lim)
+    return torch.nn.functional.silu(gate) * up

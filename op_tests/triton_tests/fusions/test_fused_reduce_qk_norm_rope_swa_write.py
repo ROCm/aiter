@@ -10,6 +10,8 @@ from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     run_torch as run_torch_gemm_a8w8_blockscale,
 )
 

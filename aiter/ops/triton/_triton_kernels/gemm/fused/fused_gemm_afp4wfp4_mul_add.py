@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
 import triton
+import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_afp4wfp4_mul_add_repr = make_kernel_repr(
     "_fused_gemm_afp4wfp4_mul_add_kernel",
@@ -224,7 +228,7 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -505,7 +509,7 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
@@ -558,7 +562,7 @@ def _fused_gemm_afp4wfp4_mul_add_reduce_kernel(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -620,5 +624,9 @@ def _get_config(
             K,
             bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
         )
-    else:
-        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)
+    # The non-preshuffled mul_add path has its own gfx950 tuning: the shared
+    # GEMM-AFP4WFP4 config regresses this op's large-M (>256) shapes.
+    if arch_info.get_arch() == "gfx950":
+        return get_gemm_config("FUSED-GEMM-AFP4WFP4-MUL_ADD", M, N, K)
+    # Other arches keep the base config file for this family
+    return get_gemm_config("GEMM-AFP4WFP4", M, N, K)

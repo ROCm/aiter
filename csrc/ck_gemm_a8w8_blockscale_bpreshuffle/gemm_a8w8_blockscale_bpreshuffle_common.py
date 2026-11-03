@@ -33,36 +33,30 @@ class kernelInstance:
             [
                 "a8w8_blockscale_bpreshuffle",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.ScaleBlockM, self.ScaleBlockN, self.ScaleBlockK],
-                    )
+                    str(x)
+                    for x in [self.ScaleBlockM, self.ScaleBlockN, self.ScaleBlockK]
                 ),
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBLOCK,
-                            self.NPerBLOCK,
-                            self.KPerBLOCK,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBLOCK,
+                        self.NPerBLOCK,
+                        self.KPerBLOCK,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.AK1, self.BK1])),
-                ("x").join(map(lambda x: str(x), [self.MPerXDL, self.NPerXDL])),
-                ("x").join(map(lambda x: str(x), self.ABLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.BBLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.CBLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.CBLOCK_SPV)),
+                ("x").join(str(x) for x in [self.AK1, self.BK1]),
+                ("x").join(str(x) for x in [self.MPerXDL, self.NPerXDL]),
+                ("x").join(str(x) for x in self.ABLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.BBLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.CBLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.CBLOCK_SPV),
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-                            self.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
+                        self.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+                    ]
                 ),
                 self.PIPELINE_Sched.lower(),
                 f"v{self.PIPELINE_VERSION}",

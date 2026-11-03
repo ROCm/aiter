@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def cdiv_fn(x, y):
@@ -38,7 +40,23 @@ def find_seq_idx(
     return left - 1
 
 
-@triton.jit
+_kernel_unified_attention_sparse_mla_2d_repr = make_kernel_repr(
+    "_kernel_unified_attention_sparse_mla_2d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "topk_count",
+        "BLOCK_M",
+        "ROPE_RANK",
+        "KV_LORA_RANK",
+        "TILE_SIZE",
+        "ALL_DECODE",
+    ],
+)
+
+
+@triton.jit(repr=_kernel_unified_attention_sparse_mla_2d_repr)
 def _kernel_unified_attention_sparse_mla_2d(
     output_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     query_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
@@ -147,12 +165,12 @@ def _kernel_unified_attention_sparse_mla_2d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
 
-    block_table_offset = seq_idx * block_table_stride
+    seq_idx * block_table_stride
 
     # iterate topk indices in tiles of TILE_SIZE
     num_tiles = (topk_count + TILE_SIZE - 1) // TILE_SIZE
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    for t in range(0, num_tiles):
+    for t in range(num_tiles):
         tile_start = t * TILE_SIZE
         offs_t = tl.arange(0, TILE_SIZE)
         valid_t = (tile_start + offs_t) < topk_count

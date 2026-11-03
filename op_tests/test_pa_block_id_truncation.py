@@ -613,7 +613,13 @@ if __name__ == "__main__":
                 device="cuda",
             )
 
-            def _run():
+            def _run(
+                block_tables=block_tables,
+                context_lens=context_lens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_qlen=max_qlen,
+                query=query,
+            ):
                 return aiter.pa_fwd_asm(
                     query,
                     k_cache,

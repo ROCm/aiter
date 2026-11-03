@@ -8,20 +8,21 @@ This script tests the fully fused Triton kernel that combines multiple operation
 in a single kernel launch for optimal performance.
 """
 
-import torch
-import torch.distributed as dist
-import os
+import logging
 import multiprocessing as mp
+import os
 import sys
 import traceback
-import logging
+
+import torch
+import torch.distributed as dist
 
 import aiter
-from aiter.test_common import checkAllclose, perftest, ensure_spawn_method
 from aiter.ops.triton.comms import (
     IrisCommContext,
     reduce_scatter_rmsnorm_quant_all_gather,
 )
+from aiter.test_common import checkAllclose, ensure_spawn_method, perftest
 
 logger = logging.getLogger("aiter")
 
@@ -125,7 +126,7 @@ def run_fused_kernel(
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -196,13 +197,14 @@ def test_fused_without_quant(
     os.environ["MASTER_PORT"] = "49374"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gamma = torch.ones(N, dtype=dtype)
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype) * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Compute reference
@@ -290,13 +292,14 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
     os.environ["MASTER_PORT"] = "49375"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gamma = torch.ones(N, dtype=dtype)
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype) * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Run fused kernel on each GPU
@@ -470,9 +473,9 @@ if __name__ == "__main__":
         print("All tests passed!")
         print("=" * 80)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print("=" * 80)
-        print(f"TEST FAILED: {str(e)}")
+        print(f"TEST FAILED: {e!s}")
         print("=" * 80)
         traceback.print_exc()
         sys.exit(1)

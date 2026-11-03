@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
 import torch
 
 from aiter.ops.triton._triton_kernels.attention.block_lut import (
@@ -12,10 +12,10 @@ from aiter.ops.triton._triton_kernels.attention.block_lut import (
 
 def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
-    num_heads: Optional[int] = None,
+    num_heads: int | None = None,
     return_none_if_dense: bool = False,
     BLOCK_KB: int = 128,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
     indices per (batch, head, q_block). Used for block-sparse attention with no
@@ -53,12 +53,15 @@ def block_attn_mask_to_ragged_lut(
     if return_none_if_dense and block_attn_mask.all():
         return None
 
-    counts = block_attn_mask.to(torch.int32).sum(dim=-1)
+    counts = block_attn_mask.sum(dim=-1, dtype=torch.int32)
     lut_count = counts.reshape(-1)
-    lut_start = torch.cumsum(lut_count, dim=0) - lut_count
+    lut_start = torch.cumsum(lut_count, dim=0, dtype=torch.int32) - lut_count
 
     # NOTE: Overallocating the LUT is a waste of memory, but the
     # alternative lut_count.sum(), will cause graph break with torch compile.
+    # TODO(sparse refresh): entries past the used range stay uninitialized, and an empty row's
+    # lut_start points at them. Kernels that speculatively read LUT[lut_start] before testing
+    # lut_count must clamp the derived offsets, as the FP8 prologue does, or this must be zeroed.
     max_count = batch * num_heads * num_q_blocks * num_kv_blocks
     kv_block_indices = torch.empty(max_count, dtype=torch.int32, device=device)
     block_attn_mask_to_lut_kernel(

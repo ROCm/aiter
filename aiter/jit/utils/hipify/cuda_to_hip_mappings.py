@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import collections
 
@@ -11,11 +11,11 @@ from .constants import (
     API_FFT,
     API_PYTORCH,
     API_RAND,
+    API_ROCMSMI,
     API_ROCTX,
     API_RTC,
     API_RUNTIME,
     API_SPECIAL,
-    API_ROCMSMI,
     CONV_CACHE,
     CONV_CONTEXT,
     CONV_D3D9,

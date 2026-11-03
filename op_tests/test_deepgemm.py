@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
+import argparse
 import itertools
 import random
-import aiter
-from aiter import dtypes
-from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
-from aiter import deepgemm
+
 import pandas as pd
-import argparse
+import torch
+
+import aiter
+from aiter import deepgemm, dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)

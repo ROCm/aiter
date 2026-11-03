@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 # GAMMA rms norm
@@ -124,7 +126,30 @@ def _partial_gptj_rotated(
     return rotated
 
 
-@triton.jit
+_fused_qkv_split_qk_norm_rope_cache_kernel_repr = make_kernel_repr(
+    "_fused_qkv_split_qk_norm_rope_cache_kernel",
+    [
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "ENABLE_GATED_Q",
+        "QH",
+        "KVH",
+        "BLOCK_T",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "BLOCK_SIZE",
+        "ROTARY_DIM_EFFECTIVE",
+        "BLOCKED_GATED_LAYOUT",
+        "HAVE_K_SCALE",
+        "HAVE_V_SCALE",
+        "Q_SCALE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qkv_split_qk_norm_rope_cache_kernel_repr)
 def _fused_qkv_split_qk_norm_rope_cache_kernel(
     qkv_ptr,
     q_weight_ptr,
@@ -179,6 +204,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCKED_GATED_LAYOUT: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
+    Q_SCALE: tl.constexpr = 1.0,
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -280,6 +306,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         q, inv_rms_q = _rms_norm_returning_inv(q, q_weight, BLOCK_D, eps)
     else:
         q = _rms_norm(q, q_weight, BLOCK_D, eps)
+
+    # Muse scales the bf16-normalized query, rounds it to bf16 again, and only
+    # then applies RoPE. Keep the existing path unchanged when no scale is used.
+    if Q_SCALE != 1.0:
+        q = (q.to(tl.float32) * Q_SCALE).to(q.dtype)
 
     if ENABLE_GATED_Q:
         d_gate_offs = tl.arange(0, BLOCK_D)

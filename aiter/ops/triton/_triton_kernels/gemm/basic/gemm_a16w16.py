@@ -1,12 +1,15 @@
+import triton
 import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )
-
-import triton
 
 _gemm_a16w16_repr = make_kernel_repr(
     "_gemm_a16_w16_kernel",
@@ -169,7 +172,7 @@ def _gemm_a16_w16_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         if EVEN_MN:
             tl.store(c_ptrs, c)
@@ -183,5 +186,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
-    return compute_splitk_params(config, K), is_tunned
+    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
+    return compute_splitk_params(config, K), is_tuned

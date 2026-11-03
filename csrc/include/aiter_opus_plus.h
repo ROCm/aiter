@@ -4,10 +4,9 @@
 
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-// todo: remove this to use aiterTensor dtype
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 
 namespace aiter {
 using namespace opus;
@@ -51,6 +50,8 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
     constexpr float hi = 448.0f, lo = -448.0f;
 #endif
     float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -58,6 +59,11 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
+    // fp8 KV-cache is unused on these arches; never executed at runtime.
+    (void)a; (void)b; (void)lo; (void)hi; return fp8x2_t{};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -68,6 +74,19 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
     return fp8x4_t{lo[0], lo[1], hi[0], hi[1]};
 }
 
+// bf16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_bf16, 1 instr)
+// Scale semantics: result[i] = bf16[i] / scale (hardware divides, with saturation to ±448).
+// The caller's inverted_scale = 1/row_scale, so we pass 1/inverted_scale = row_scale.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+template <typename S, std::enable_if_t<std::is_same_v<S, bf16x8_t>, bool> = true>
+OPUS_D decltype(auto) bf16_to_fp8_scalef32_x8(const S& s, float scale)
+{
+    typedef int __attribute__((ext_vector_type(2))) i2;
+    i2 r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
+    return __builtin_bit_cast(vector_t<fp8_t, 8>, r);
+}
+#endif
+
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_bf8_f32
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
@@ -76,6 +95,8 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -83,6 +104,9 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+#else
+    (void)a; (void)b; (void)lo; (void)hi; return bf8x2_t{};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -122,7 +146,7 @@ OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x2(const S& s, float scale, n
 {
     u32_t w;
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, s, scale, sel);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S& s, float scale)
@@ -130,7 +154,7 @@ OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S& s, float scale)
     u32_t w;
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[0], s[1]}, scale, 0);
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 4>, static_cast<u16_t>(w));
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S& s, float scale)
@@ -140,33 +164,33 @@ OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S& s, float scale)
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[4], s[5]}, scale, 2);
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[6], s[7]}, scale, 3);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return __builtin_bit_cast(array<fp4_t, 8>, w);
 }
 #else
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x2(const S&, float)
 {
-    return array<fp4_t, 1>{};
+    return array<fp4_t, 2>{};
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S&, float)
 {
-    return array<fp4_t, 2>{};
+    return array<fp4_t, 4>{};
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S&, float)
 {
-    return array<fp4_t, 4>{};
+    return array<fp4_t, 8>{};
 }
 #endif
 
-// bf16 -> fp4 larger vectors (bf16x4/x8) using opus bf16_to_fp4_packed_x2
+// bf16 -> fp4 (bf16x4/x8): each bf16_to_fp4_packed_x2 yields array<fp4_t,2> (2 values / 1 byte); concat into the packed result.
 template <typename S, std::enable_if_t<std::is_same_v<S, bf16x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_scaled_x4(const S& s, float scale)
 {
     auto lo = bf16_to_fp4_packed_x2(bf16x2_t{s[0], s[1]}, scale);
     auto hi = bf16_to_fp4_packed_x2(bf16x2_t{s[2], s[3]}, scale);
-    return array<fp4_t, 2>{lo, hi};
+    return concat_array(lo, hi);   // array<fp4_t,4>
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, bf16x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_scaled_x8(const S& s, float scale)
@@ -175,41 +199,34 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_scaled_x8(const S& s, float scale)
     auto b = bf16_to_fp4_packed_x2(bf16x2_t{s[2], s[3]}, scale);
     auto c = bf16_to_fp4_packed_x2(bf16x2_t{s[4], s[5]}, scale);
     auto d = bf16_to_fp4_packed_x2(bf16x2_t{s[6], s[7]}, scale);
-    return array<fp4_t, 4>{a, b, c, d};
+    return concat_array(a, b, c, d);   // array<fp4_t,8>
 }
 
-// fp4 -> fp32/bf16/fp16 dequant helpers. Input fp4_t stores two packed fp4 values.
-template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+// fp4 -> fp32/bf16/fp16 dequant helpers. Input array<fp4_t,K> holds K packed fp4 values (K/2 bytes).
+template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_scaled_x2(const S& s, float scale)
 {
     return fp4_to_fp32_packed_x2(s, scale);
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_scaled_x4(const S& s, float scale)
 {
     return fp4_to_fp32_packed_x4(s, scale);
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_scaled_x8(const S& s, float scale)
 {
     return fp4_to_fp32_packed_x8(s, scale);
 }
 
-template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled_x2(const S& s, float scale)
 {
 #if defined(__gfx950__)
-    u32_t packed;
-    if constexpr(std::is_same_v<S, fp4_t>)
-    {
-        packed = static_cast<u32_t>(__builtin_bit_cast(u8_t, s));
-    }
-    else
-    {
-        packed = static_cast<u32_t>(__builtin_bit_cast(u8_t, s[0]));
-    }
+    // s is 1 byte (lone fp4_t or array<fp4_t,2>); bit-cast the whole object, not an indexed proxy.
+    u32_t packed = static_cast<u32_t>(__builtin_bit_cast(u8_t, s));
     return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed, scale, 0);
 #else
     auto x = fp4_to_fp32_scaled_x2(s, scale);
@@ -217,32 +234,32 @@ OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled_x2(const S& s, float scale)
 #endif
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled_x4(const S& s, float scale)
 {
-    auto lo = fp4_to_bf16_scaled_x2<fp4_t>(s[0], scale);
-    auto hi = fp4_to_bf16_scaled_x2<fp4_t>(s[1], scale);
+    auto lo = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[0], s[1]}, scale);
+    auto hi = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[2], s[3]}, scale);
     return bf16x4_t{lo[0], lo[1], hi[0], hi[1]};
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled_x8(const S& s, float scale)
 {
-    auto a = fp4_to_bf16_scaled_x2<fp4_t>(s[0], scale);
-    auto b = fp4_to_bf16_scaled_x2<fp4_t>(s[1], scale);
-    auto c = fp4_to_bf16_scaled_x2<fp4_t>(s[2], scale);
-    auto d = fp4_to_bf16_scaled_x2<fp4_t>(s[3], scale);
+    auto a = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[0], s[1]}, scale);
+    auto b = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[2], s[3]}, scale);
+    auto c = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[4], s[5]}, scale);
+    auto d = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[6], s[7]}, scale);
     return bf16x8_t{a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]};
 }
 
-template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template <typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled_x2(const S& s, float scale)
 {
     auto x = fp4_to_fp32_scaled_x2(s, scale);
     return fp16x2_t{static_cast<fp16_t>(x[0]), static_cast<fp16_t>(x[1])};
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled_x4(const S& s, float scale)
 {
     auto x = fp4_to_fp32_scaled_x4(s, scale);
@@ -252,7 +269,7 @@ OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled_x4(const S& s, float scale)
                     static_cast<fp16_t>(x[3])};
 }
 
-template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template <typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled_x8(const S& s, float scale)
 {
     auto x = fp4_to_fp32_scaled_x8(s, scale);
@@ -268,14 +285,15 @@ OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled_x8(const S& s, float scale)
 
 template <typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>>,
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>>,
                            bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_scaled(const S& s, float scale)
 {
-    constexpr index_t N = size<S>();
-    vector_t<fp32_t, N * 2> out;
-    static_for<N>([&](auto i) {
-        auto x = fp4_to_fp32_scaled_x2<fp4_t>(s[i.value], scale);
+    constexpr index_t N = size<S>();   // logical fp4 value count
+    static_assert(N % 2 == 0, "fp4 dequant processes 2 values at a time");
+    vector_t<fp32_t, N> out;
+    static_for<N / 2>([&](auto i) {
+        auto x = fp4_to_fp32_scaled_x2(array<fp4_t, 2>{s[i.value * 2], s[i.value * 2 + 1]}, scale);
         out[i.value * 2] = x[0];
         out[i.value * 2 + 1] = x[1];
     });
@@ -284,14 +302,15 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_scaled(const S& s, float scale)
 
 template <typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>>,
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>>,
                            bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled(const S& s, float scale)
 {
-    constexpr index_t N = size<S>();
-    vector_t<bf16_t, N * 2> out;
-    static_for<N>([&](auto i) {
-        auto x = fp4_to_bf16_scaled_x2<fp4_t>(s[i.value], scale);
+    constexpr index_t N = size<S>();   // logical fp4 value count
+    static_assert(N % 2 == 0, "fp4 dequant processes 2 values at a time");
+    vector_t<bf16_t, N> out;
+    static_for<N / 2>([&](auto i) {
+        auto x = fp4_to_bf16_scaled_x2(array<fp4_t, 2>{s[i.value * 2], s[i.value * 2 + 1]}, scale);
         out[i.value * 2] = x[0];
         out[i.value * 2 + 1] = x[1];
     });
@@ -300,14 +319,15 @@ OPUS_D constexpr decltype(auto) fp4_to_bf16_scaled(const S& s, float scale)
 
 template <typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>>,
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>>,
                            bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp16_scaled(const S& s, float scale)
 {
-    constexpr index_t N = size<S>();
-    vector_t<fp16_t, N * 2> out;
-    static_for<N>([&](auto i) {
-        auto x = fp4_to_fp16_scaled_x2<fp4_t>(s[i.value], scale);
+    constexpr index_t N = size<S>();   // logical fp4 value count
+    static_assert(N % 2 == 0, "fp4 dequant processes 2 values at a time");
+    vector_t<fp16_t, N> out;
+    static_for<N / 2>([&](auto i) {
+        auto x = fp4_to_fp16_scaled_x2(array<fp4_t, 2>{s[i.value * 2], s[i.value * 2 + 1]}, scale);
         out[i.value * 2] = x[0];
         out[i.value * 2 + 1] = x[1];
     });
@@ -434,7 +454,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 // --- fp4 source: dequant to fp32 ---
 template <typename D,
           typename S,
-          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, fp32_t>,
+          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
@@ -442,14 +462,14 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_fp32_scaled_x4(s, scale);
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp32_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_fp32_scaled_x8(s, scale);
@@ -457,7 +477,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 template <typename D,
           typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>> &&
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>> &&
                                std::is_same_v<D, fp32_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
@@ -468,7 +488,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 // --- fp4 source: dequant to bf16 ---
 template <typename D,
           typename S,
-          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, bf16_t>,
+          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>> && std::is_same_v<D, bf16_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
@@ -476,14 +496,14 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, bf16_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, bf16_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_bf16_scaled_x4(s, scale);
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, bf16_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>> && std::is_same_v<D, bf16_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_bf16_scaled_x8(s, scale);
@@ -491,7 +511,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 template <typename D,
           typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>> &&
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>> &&
                                std::is_same_v<D, bf16_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
@@ -502,7 +522,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 // --- fp4 source: dequant to fp16 ---
 template <typename D,
           typename S,
-          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, fp16_t>,
+          std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>> && std::is_same_v<D, fp16_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
@@ -510,14 +530,14 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, fp16_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp16_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_fp16_scaled_x4(s, scale);
 }
 template <typename D,
           typename S,
-          std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp16_t>, bool> = true>
+          std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>> && std::is_same_v<D, fp16_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 {
     return fp4_to_fp16_scaled_x8(s, scale);
@@ -525,7 +545,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
 template <typename D,
           typename S,
           std::enable_if_t<is_array_v<S> && std::is_same_v<get_value_t<S>, fp4_t> &&
-                               !is_any_of_v<S, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>> &&
+                               !is_any_of_v<S, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>> &&
                                std::is_same_v<D, fp16_t>,
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float scale)
@@ -573,6 +593,50 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
     return scaled_cast<D>(fp32_vec, inverted_scale);
 }
 
+// scaled_cast_div: same conversion, but `scale` is the DIVISOR (row scale) rather than
+// its reciprocal.
+//
+// CALLER CONTRACT: `scale` MUST be an exact power of two. On gfx1250 this lowers to
+// v_cvt_scalef32_pk8_fp8_bf16, whose scale operand is an MX E8M0 factor: the hardware
+// reads only the 8 exponent bits and DISCARDS the mantissa. Passing a general fp32 scale
+// silently quantizes it down to the enclosing power of two -- e.g. 0.006975 is applied as
+// 2^-8, a 1.79x error, which overflows the large codes to NaN. Only the e8m0 quant path
+// (where the row scale is ceil_pow2 by construction) may use this.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+template <typename D,
+          typename S,
+          std::enable_if_t<is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+                               std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0),
+                           bool> = true>
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    constexpr index_t N = size<S>();
+    vector_t<fp8_t, N> out;
+    static_for<N / 8>([&](auto i) {
+        bf16x8_t chunk;
+        static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
+        auto pk = bf16_to_fp8_scalef32_x8(chunk, scale);
+        static_for<8>([&](auto j) { out[i.value * 8 + j.value] = pk[j.value]; });
+    });
+    return out;
+}
+#endif
+
+// Fallback: no hardware divide-by-scale convert for this type/arch, so invert here.
+template <typename D,
+          typename S,
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+          std::enable_if_t<!(is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+                             std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0)),
+                           bool> = true>
+#else
+          bool = true>
+#endif
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    return scaled_cast<D>(s, 1.0f / scale);
+}
+
 // fp4 target: any fp32 vector size via x2 loop
 template <
     typename D,
@@ -582,12 +646,13 @@ template <
                      bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 {
-    constexpr index_t N = size<S>();
+    constexpr index_t N = size<S>();   // fp32 count == produced fp4 value count
     static_assert(N % 2 == 0);
-    array<fp4_t, N / 2> out;
+    array<fp4_t, N> out;   // packed: N values in N/2 bytes
     static_for<N / 2>([&](auto i) {
-        auto packed  = scaled_cast<D>(fp32x2_t{s[i.value * 2], s[i.value * 2 + 1]}, inverted_scale);
-        out[i.value] = packed[0];
+        auto packed          = scaled_cast<D>(fp32x2_t{s[i.value * 2], s[i.value * 2 + 1]}, inverted_scale); // array<fp4_t,2>
+        out[i.value * 2]     = packed[0];
+        out[i.value * 2 + 1] = packed[1];
     });
     return out;
 }
@@ -737,19 +802,20 @@ template <typename T,
           int aux                    = 0,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false>
 __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                                     const opus::vector_t<DTYPE_I, vec_size>& vec,
                                     int row_offset,
                                     float inverted_scale = 1.0f)
 {
-    static constexpr int32_t store_vec_size =
-        std::is_same_v<T_R, opus::fp4_t> ? vec_size / 2 : vec_size;
-    static_assert(store_vec_size * sizeof(T) % chunk_bytes == 0,
-                  "store_vec_size * sizeof(T) must be a multiple of chunk_bytes");
-    static constexpr index_t num_chunks                = store_vec_size * sizeof(T) / chunk_bytes;
-    static constexpr index_t chunk_size_elements       = vec_size / num_chunks;
-    static constexpr index_t store_chunk_size_elements = store_vec_size / num_chunks;
+    // Byte accounting uses the logical converted type T_R (fp4 = 4 bits/value); the gmem type T may differ (fp4 stored via a uint8 buffer). sizeof_bits/8 == sizeof for non-packed types, so this is a no-op there.
+    static constexpr index_t store_bytes               = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes
+    static_assert(store_bytes % chunk_bytes == 0,
+                  "store byte size must be a multiple of chunk_bytes");
+    static constexpr index_t num_chunks                = store_bytes / chunk_bytes;
+    static constexpr index_t chunk_size_elements       = vec_size / num_chunks;                          // DTYPE_I / T_R values per chunk
+    static constexpr index_t store_chunk_size_elements = chunk_bytes * 8 / opus::sizeof_bits<T>::value;  // T elements per chunk_bytes
     static constexpr index_t interleave_bytes          = interleave_thread_size * chunk_bytes;
     const DTYPE_I* vec_ptr                             = reinterpret_cast<const DTYPE_I*>(&vec);
     using chunk_type = opus::vector_t<DTYPE_I, chunk_size_elements>;
@@ -785,7 +851,10 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
             else
             {
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
-                chunk_convert           = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
+                if constexpr(scale_is_divisor)
+                    chunk_convert = scaled_cast_div<T_R>(*chunk_ptr, inverted_scale);
+                else
+                    chunk_convert = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
                 store<store_chunk_size_elements>(
                     buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
@@ -816,28 +885,28 @@ template <typename T,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
           int num_repeat             = 1,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false>
 __device__ void store_vector(opus::gmem<T>& buffer,
                              const opus::vector_t<DTYPE_I, vec_size>& vec,
                              int row_offset,
                              float inverted_scale = 1.0f)
 {
     static constexpr int32_t num_store_repeat = interleave ? num_repeat : 1;
-    static constexpr int32_t store_vec_size =
-        std::is_same_v<T_R, opus::fp4_t> ? vec_size / 2 : vec_size;
-    if constexpr((store_vec_size * sizeof(T) / num_store_repeat) % 16 == 0)
+    static constexpr index_t store_bytes      = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes (logical type T_R)
+    if constexpr((store_bytes / num_store_repeat) % 16 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
-    else if constexpr((store_vec_size * sizeof(T) / num_store_repeat) % 8 == 0)
+    else if constexpr((store_bytes / num_store_repeat) % 8 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
-    else if constexpr((store_vec_size * sizeof(T) / num_store_repeat) % 4 == 0)
+    else if constexpr((store_bytes / num_store_repeat) % 4 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
     else
@@ -855,7 +924,7 @@ __device__ void store_vector(opus::gmem<T>& buffer,
 template <index_t load_cnt, index_t async_load_cnt>
 OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     if constexpr(load_cnt >= 0)
         s_wait_loadcnt(number<load_cnt>{});
     if constexpr(async_load_cnt >= 0)
@@ -876,42 +945,13 @@ OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
 {
     if constexpr(ds_cnt >= 0)
     {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         s_wait_dscnt(number<ds_cnt>{});
 #else
         s_waitcnt_lgkmcnt(number<ds_cnt>{});
 #endif
     }
 }
-
-// todo: edit this to use aiterTensor dtype
-template <typename T>
-struct t2opus;
-template <>
-struct t2opus<float>
-{
-    using type = float;
-};
-template <>
-struct t2opus<c10::Half>
-{
-    using type = opus::fp16_t;
-};
-template <>
-struct t2opus<c10::BFloat16>
-{
-    using type = opus::bf16_t;
-};
-template <>
-struct t2opus<int32_t>
-{
-    using type = int32_t;
-};
-template <>
-struct t2opus<int8_t>
-{
-    using type = opus::i8_t;
-};
 
 // HIP native type -> opus type mapping
 template <typename T> struct hip2opus;

@@ -1,16 +1,17 @@
+import random
+import sys
+
+import torch
 import triton
 from utils.benchmark_utils import get_model_configs
-import torch
-import argparse
-from aiter.ops.triton.attention.pa_decode import paged_attention_decode
-from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
-import sys
-import random
 
+from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
+from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
 )
 
 
@@ -32,12 +33,14 @@ def input_helper(
         query = torch.randn(
             B, H_Q, D, dtype=torch.float16, device="cuda"
         )  # assumption dtype is 8bits or lower
-        query = query.to(dtype=dtype, device="cuda")
+        query = query.to(dtype=dtype)
     else:
         query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
 
     if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
+        x = min(
+            D, 16 // torch.tensor([], dtype=torch.float16, device="cuda").element_size()
+        )
         key_cache = torch.randn(
             num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
         )
@@ -55,7 +58,10 @@ def input_helper(
         key_cache = key_cache.to(dtype=kv_cache_dtype)
         value_cache = value_cache.to(dtype=kv_cache_dtype)
     else:
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
+        x = min(
+            D,
+            16 // torch.tensor([], dtype=kv_cache_dtype, device="cuda").element_size(),
+        )
         key_cache = torch.randn(
             num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
         )
@@ -69,8 +75,8 @@ def input_helper(
             value_cache, min=1e-3
         )  # For FP8 case, this is needed to prevent NANs
 
-    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
-    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
+    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous()
+    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous()
 
     context_lens = torch.full((B,), SEQ_LEN, device="cuda")
     max_context_len = max(context_lens)
@@ -78,7 +84,7 @@ def input_helper(
 
     block_tables = []
     for i in range(B):
-        block_table = random.sample(range(0, num_blocks), num_blocks) + [
+        block_table = random.sample(range(num_blocks), num_blocks) + [
             random.randint(0, num_blocks - 1)
             for _ in range(max_num_blks_per_seq - num_blocks)
         ]
@@ -116,7 +122,7 @@ def input_la_helper(
     BLOCK_M = 16
     BLOCK_N = KV_BLK_SZ
 
-    n_ctx = [SEQ_LEN for _ in range(0, B)]
+    n_ctx = [SEQ_LEN for _ in range(B)]
     N_CTX_Q = 16
 
     try:
@@ -140,8 +146,6 @@ def input_la_helper(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-    sm_scale = 0.5
-
     # Allocate Tensors
     q = torch.empty((H_Q, N_CTX_Q * B, D), dtype=dtype, device="cuda").normal_(
         mean=0.0, std=0.5
@@ -157,7 +161,7 @@ def input_la_helper(
 
     block_tables = []
     for head in range(H_Q):
-        b = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
 
@@ -269,8 +273,9 @@ def paged_attn_decode(
         num_blocks,
     )
     attn_scale = 1.0 / (D**0.5)
-    k_scale = torch.tensor([1.0])
-    v_scale = torch.tensor([1.0])
+    # Keep the scales on the CPU: the timed wrapper calls .item() on them.
+    k_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
+    v_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
 
     fn = None
     if OP == "PagedAttention":
@@ -385,10 +390,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Paged Attention decode",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="Paged Attention decode")
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -423,7 +425,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

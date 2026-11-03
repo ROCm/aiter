@@ -1,13 +1,18 @@
+import math
+
 import torch
 import triton
-import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-import argparse
+from triton.experimental import gluon
+
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
-import math
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -57,7 +62,7 @@ def make_kv_cache_shuffled_layout(
         for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
     ]
     if num_warps_log2 > 0:
-        warp_bases = [[1 << v, 0] for v in range(0, num_warps_log2)]
+        warp_bases = [[1 << v, 0] for v in range(num_warps_log2)]
     elif total_num_warps == 1:
         warp_bases = []
     else:
@@ -442,15 +447,11 @@ def benchmark(args):
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Unified Attention",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="Unified Attention")
     parser.add_argument("--num_blocks", type=int, default=16)
     parser.add_argument("--block_size", type=int, default=64)
     parser.add_argument("--num_kv_heads", type=int, default=2048)
@@ -458,13 +459,8 @@ def parse_args():
     parser.add_argument("--num_warps", type=int, default=1)
     parser.add_argument("--waves_per_eu", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="bandwidth",
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metrics for the kernel benchmark.",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="bandwidth"
     )
     parser.add_argument(
         "-o",

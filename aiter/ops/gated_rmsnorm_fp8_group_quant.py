@@ -20,7 +20,7 @@ from aiter.jit.core import compile_ops
 
 
 # This is the JIT-compiled binding to the C++ kernel
-@compile_ops("module_gated_rmsnorm_quant")
+@compile_ops("module_gated_rmsnorm_quant", develop=True)
 def gated_rmsnorm_fp8_group_quant(
     out: Tensor,
     scale: Tensor,
@@ -36,4 +36,3 @@ def gated_rmsnorm_fp8_group_quant(
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """
-    ...

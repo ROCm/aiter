@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 Fused Communication + Computation Kernels
@@ -11,12 +11,19 @@ Examples:
 - reduce_scatter + rmsnorm + quant + all_gather
 - all_reduce + rmsnorm + quant
 - reduce_scatter + gemm + all_gather
+
+The Iris-based kernels are exported only when Iris is installed.
 """
 
-from .reduce_scatter_rmsnorm_quant_all_gather import (
-    reduce_scatter_rmsnorm_quant_all_gather,
-)
+try:
+    import iris  # noqa: F401
+except ImportError:
+    __all__ = []
+else:
+    from aiter.ops.triton.comms.fused.reduce_scatter_rmsnorm_quant_all_gather import (
+        reduce_scatter_rmsnorm_quant_all_gather,
+    )
 
-__all__ = [
-    "reduce_scatter_rmsnorm_quant_all_gather",
-]
+    __all__ = [
+        "reduce_scatter_rmsnorm_quant_all_gather",
+    ]

@@ -311,6 +311,28 @@ __quickreduce_device_inline__ int packed_rcp<__hip_bfloat16>(int a)
     return R.i;
 }
 
+template <typename T>
+__quickreduce_device_inline__ int packed_from_int16_pair(int16_t low, int16_t high);
+
+template <>
+__quickreduce_device_inline__ int packed_from_int16_pair<half>(int16_t low, int16_t high)
+{
+    // Convert two signed integers to one fp16x2 packed 32-bit lane.
+    half2 h =
+        __halves2half2(__int2half_rn(static_cast<int>(low)), __int2half_rn(static_cast<int>(high)));
+    return __builtin_bit_cast(int, h);
+}
+
+template <>
+__quickreduce_device_inline__ int packed_from_int16_pair<__hip_bfloat16>(int16_t low, int16_t high)
+{
+    // Convert two signed integers to one bf16x2 packed 32-bit lane.
+    nv_bfloat16 bf_low  = __float2bfloat16(static_cast<float>(low));
+    nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+    nv_bfloat162 bf2    = __halves2bfloat162(bf_low, bf_high);
+    return *reinterpret_cast<int*>(&bf2);
+}
+
 // changes dtype
 __quickreduce_device_inline__ float T2float_cast(half a) { return __half2float(a); }
 
@@ -319,7 +341,11 @@ __quickreduce_device_inline__ float T2float_cast(__hip_bfloat16 a) { return __bf
 template <typename T>
 __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 {
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    const int group_leader = ((threadIdx.x % warpSize) / kThreadGroupSize) * kThreadGroupSize;
+#else
     const int group_leader = (threadIdx.x / kThreadGroupSize) * kThreadGroupSize;
+#endif
 
     int wmax, wmin, wblockmax;
     int a, b;
@@ -352,12 +378,20 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 
 __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    __scoped_atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+#else
     __atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE);
+#endif
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    while(__scoped_atomic_load_n(flag_ptr, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) != flag) {}
+#else
     while(__atomic_load_n(flag_ptr, __ATOMIC_RELAXED) != flag) {}
+#endif
 }
 
 } // namespace aiter

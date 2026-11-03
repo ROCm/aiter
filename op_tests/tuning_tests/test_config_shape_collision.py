@@ -1,0 +1,595 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""
+Cross-file shape-collision guard for tuned config CSVs.
+
+At runtime ``aiter.jit.core.AITER_CONFIGS.get_config_file`` merges, per family,
+the canonical ``aiter/configs/<name>.csv`` with every
+``aiter/configs/model_configs/*<name>*.csv``, then ``update_config_files``
+de-duplicates on a key derived from the matching *untuned* CSV's columns and
+**raises** if two rows collide.
+
+A single PR's CI only ever merges *its own* changed file with current ``main``,
+so two PRs that each add the same shape to different model files both pass, then
+break ``main`` once both land (cross-PR / merge-skew hazard). This test drives
+the **real runtime merge** so the collision is caught statically -- there is no
+re-implementation of the merge/dedup/key logic here, so it cannot drift.
+
+Families with no ``model_configs/`` sibling have nothing to merge and resolve to
+their canonical CSV directly. That file can still hold two rows with the same
+key, so it is checked too; the self-checks below cover both paths, since a
+family test only proves its CSVs are clean, not that anything inspected them.
+
+How it stays side-effect free: ``update_config_files`` writes de-duplicated CSVs
+back to their source paths when it finds collisions. We copy the entire
+``aiter/configs/`` tree to a temp dir and point ``core.AITER_ROOT_DIR`` at it, so
+all globbing, untuned-key lookups, and any write-backs hit the copy, never the
+real repo.
+
+Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. The
+level 0+1 tuning workflow runs it as a PR/main regression guard.
+
+Run:
+    python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
+"""
+
+import csv
+import errno
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+try:  # importing aiter requires torch; skip cleanly where it is unavailable.
+    from aiter.jit import core
+
+    _IMPORT_ERR = None
+except Exception as e:  # noqa: BLE001
+    core = None
+    _IMPORT_ERR = e
+
+AITER_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+# (env var name, tuned-file base name) for every family registered in
+# AITER_CONFIGS.*_FILE (aiter/jit/core.py). These are the families merged at
+# runtime; the merge set and dedup key are resolved entirely by get_config_file.
+FAMILIES = [
+    ("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
+    (
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+        "a8w8_blockscale_bpreshuffle_tuned_gemm",
+    ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+    ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+        "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+    ),
+    (
+        "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+        "a4w4_mxscale_bpreshuffle_tuned_gemm",
+    ),
+    ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
+    ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+        "batched_gemm_a8w8_blockscale_mxscale_tuned",
+    ),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+    ),
+    ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
+    ("AITER_CONFIG_FMOE", "tuned_fmoe"),
+    ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
+    ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+]
+
+
+def _cache_clear():
+    # get_config_file is an lru_cache-wrapped method; clear via the class object.
+    type(core.AITER_CONFIGS).get_config_file.cache_clear()
+
+
+@unittest.skipUnless(core is not None, f"aiter.jit.core not importable: {_IMPORT_ERR}")
+class TestConfigShapeCollision(unittest.TestCase):
+    """Drive the real runtime merge against a temp copy; fail on collisions."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="aiter_cfg_collision_")
+        shutil.copytree(
+            os.path.join(AITER_ROOT, "aiter", "configs"),
+            os.path.join(cls._tmp, "aiter", "configs"),
+        )
+        cls._orig_root = core.AITER_ROOT_DIR
+        core.AITER_ROOT_DIR = cls._tmp
+        _cache_clear()
+
+    @classmethod
+    def tearDownClass(cls):
+        core.AITER_ROOT_DIR = cls._orig_root
+        _cache_clear()
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _resolve(root, env_name, name):
+        """Drive the production (no-env) resolution path against `root`.
+        Raises RuntimeError on a duplicate-shape collision."""
+        os.environ.pop(env_name, None)
+        core.AITER_ROOT_DIR = root
+        _cache_clear()
+        default_file = os.path.join(root, "aiter", "configs", f"{name}.csv")
+        return core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
+
+    def _check_family(self, env_name, name):
+        try:
+            self._resolve(self._tmp, env_name, name)
+        except RuntimeError as e:
+            if "duplicate shape" in str(e).lower():
+                self.fail(
+                    f"{name}: runtime merge of configs/ + model_configs/ reports "
+                    f"duplicate shapes (same key across files):\n{e}"
+                )
+            raise
+
+    # ---- self-check / control: prove the harness itself detects collisions ----
+
+    @staticmethod
+    def _build_synthetic_family(
+        root, dup, *, with_model_file=True, canonical_raw=None, model_raw=None
+    ):
+        """Write a minimal isolated config tree for one family and return
+        (env_name, name). Uses the a8w8_blockscale family (untuned key = M,N,K).
+
+        `dup` makes the second row repeat the first row's key instead of using a
+        distinct shape. `with_model_file` decides which resolution path that
+        second row exercises: True puts it in a model_configs/ sibling, so
+        get_config_file merges two tables; False puts it in the canonical CSV
+        and writes no sibling at all, so there is nothing to merge and the file
+        is handed straight back. `canonical_raw` and `model_raw` override the
+        canonical and model_configs file contents verbatim, for malformed input
+        or cells written a particular way."""
+        name = "a8w8_blockscale_tuned_gemm"
+        env_name = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"
+        cfg = os.path.join(root, "aiter", "configs")
+        os.makedirs(os.path.join(cfg, "model_configs"), exist_ok=True)
+        # untuned header drives the dedup key columns.
+        with open(os.path.join(cfg, "a8w8_blockscale_untuned_gemm.csv"), "w") as f:
+            f.write("M,N,K\n")
+        header = "gfx,cu_num,M,N,K,us\n"
+        second_row = f"gfx950,256,{'1,64,128' if dup else '2,64,128'},20.0\n"
+        with open(os.path.join(cfg, f"{name}.csv"), "w") as f:
+            if canonical_raw is not None:
+                f.write(canonical_raw)
+            else:
+                f.write(header)
+                f.write("gfx950,256,1,64,128,10.0\n")
+                if not with_model_file:
+                    f.write(second_row)
+        if with_model_file:
+            with open(
+                os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv"), "w"
+            ) as f:
+                if model_raw is not None:
+                    f.write(model_raw)
+                else:
+                    f.write(header)
+                    f.write(second_row)
+        return env_name, name
+
+    def _run_synthetic(self, dup, **kwargs):
+        """Resolve a synthetic family: return None on success, else the error.
+
+        Catches Exception rather than RuntimeError because reading a tuned CSV
+        to check it must not introduce new failure modes; anything else it
+        raises has to be visible here instead of escaping as a test error."""
+        tmp = tempfile.mkdtemp(prefix="aiter_cfg_selfcheck_")
+        try:
+            env_name, name = self._build_synthetic_family(tmp, dup=dup, **kwargs)
+            try:
+                self._resolve(tmp, env_name, name)
+                return None
+            except Exception as e:  # noqa: BLE001
+                return f"{type(e).__name__}: {e}"
+        finally:
+            core.AITER_ROOT_DIR = self._tmp  # restore for other tests
+            _cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_selfcheck_detects_planted_duplicate(self):
+        """Positive control: a planted duplicate MUST be caught. If not, the
+        detection harness (temp copy / AITER_ROOT_DIR redirect / merge call) is
+        broken -- not the real config data."""
+        err = self._run_synthetic(dup=True)
+        self.assertIsNotNone(
+            err,
+            "harness FAILED to detect a planted duplicate shape -- the collision "
+            "check is broken; do not trust its PASS on real configs.",
+        )
+        self.assertIn("duplicate shape", err.lower())
+
+    def test_duplicate_error_names_key_and_env_var(self):
+        """The collision error must say which key matched and which env var
+        selects tables explicitly, so users outside a source checkout have a
+        way out (ROCm/aiter#5184)."""
+        err = self._run_synthetic(dup=True)
+        self.assertIsNotNone(err)
+        self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+        self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+
+    def test_duplicate_error_survives_read_only_sources(self):
+        """The dedup write-back runs before the diagnostic is raised, so on a
+        read-only install the write error would replace that diagnostic with a
+        bare PermissionError -- dropping the key and the env var hint in the
+        one environment that cannot act on them anyway (ROCm/aiter#5184), and
+        leaving any remaining source half-rewritten. Report the failure instead
+        and do not claim those files were updated."""
+
+        def _read_only(self, path_or_buf=None, *args, **kwargs):
+            raise PermissionError(errno.EROFS, "Read-only file system", path_or_buf)
+
+        import pandas as pd
+
+        for with_model_file in (True, False):
+            with self.subTest(with_model_file=with_model_file):
+                with mock.patch.object(pd.DataFrame, "to_csv", _read_only):
+                    err = self._run_synthetic(dup=True, with_model_file=with_model_file)
+                self.assertIsNotNone(err)
+                self.assertTrue(
+                    err.startswith("RuntimeError:"),
+                    f"write failure replaced the duplicate diagnostic:\n{err}",
+                )
+                self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+                self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+                # The unwritten source must not be listed as updated.
+                self.assertIn("Not updated:", err)
+                self.assertIn("(no files updated)", err)
+
+    def test_selfcheck_passes_on_clean(self):
+        """Negative control: distinct shapes must NOT be flagged (no false
+        positive)."""
+        err = self._run_synthetic(dup=False)
+        self.assertIsNone(err, f"harness false-positived on clean configs:\n{err}")
+
+    # ---- single-file path: no model_configs/ sibling, so nothing to merge ----
+
+    def test_selfcheck_detects_duplicate_in_single_file(self):
+        """Positive control for the single-file path. A family with no
+        model_configs/ sibling has nothing to merge, so get_config_file returns
+        the canonical CSV as-is -- but one file can still hold two rows with the
+        same key when a retune is appended instead of replacing the old row.
+
+        This path used to skip the check entirely, which is how
+        tuned_grouped_fmoe.csv kept a duplicate row (removed in #6332) while
+        every test in this file was green. Without this control the family
+        tests above only prove the CSVs are clean, not that anything looked."""
+        err = self._run_synthetic(dup=True, with_model_file=False)
+        self.assertIsNotNone(
+            err,
+            "a duplicate inside a single tuned CSV went undetected -- the check "
+            "is being skipped for families with no model_configs/ sibling, so a "
+            "PASS on their real configs means nothing.",
+        )
+        self.assertIn("duplicate shape", err.lower())
+
+    def test_selfcheck_passes_on_clean_single_file(self):
+        """Negative control for the same path: two distinct shapes in one file
+        must resolve normally."""
+        err = self._run_synthetic(dup=False, with_model_file=False)
+        self.assertIsNone(err, f"false-positived on a clean single file:\n{err}")
+
+    def test_selfcheck_tolerates_unparseable_single_file(self):
+        """Checking a single file means reading it, which must not become a new
+        way for a malformed table to fail, nor move that failure earlier. This
+        path previously handed the file back unread, so a parse error surfaced
+        from the op's own loader; keep it there."""
+        err = self._run_synthetic(
+            dup=False,
+            with_model_file=False,
+            # Unterminated quote: pandas raises ParserError, a ValueError
+            # subclass, so a bare `except RuntimeError` would not contain it.
+            canonical_raw='gfx,cu_num,M\n"unclosed,1,2\n,,,,,,\n1,2\n',
+        )
+        self.assertIsNone(
+            err,
+            "the duplicate-shape check turned an unparseable tuned CSV into an "
+            f"error raised from get_config_file:\n{err}",
+        )
+
+    # ---- merge output: cells as written, numeric keys, numeric us ----
+
+    def _merge_synthetic(self, canonical_raw, model_raw):
+        """Merge a synthetic family whose two tables are given verbatim.
+        Returns (error or None, merged text or None, canonical text, model
+        text); the sources are read back after any dedup rewrite."""
+        tmp = tempfile.mkdtemp(prefix="aiter_cfg_merge_")
+        try:
+            env_name, name = self._build_synthetic_family(
+                tmp, dup=False, canonical_raw=canonical_raw, model_raw=model_raw
+            )
+            err = merged = None
+            try:
+                with open(self._resolve(tmp, env_name, name)) as f:
+                    merged = f.read()
+            except Exception as e:  # noqa: BLE001
+                err = f"{type(e).__name__}: {e}"
+            cfg = os.path.join(tmp, "aiter", "configs")
+            with open(os.path.join(cfg, f"{name}.csv")) as f:
+                canonical = f.read()
+            with open(os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv")) as f:
+                model = f.read()
+            return err, merged, canonical, model
+        finally:
+            core.AITER_ROOT_DIR = self._tmp  # restore for other tests
+            _cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_merge_keeps_cells_as_written(self):
+        """Parsed, a column with a blank cell turned float and the merged table
+        wrote 4 as 4.0, which readers that take integers from the text (the
+        gfx1250 grouped MoE runtime) reject."""
+        err, merged, _, _ = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,splitK,us\n"
+            "gfx950,256,1,64,128,4,10.0\n"
+            "gfx950,256,2,64,128,,11.0\n",
+            "gfx,cu_num,M,N,K,splitK,us\ngfx950,256,3,64,128,8,12.0\n",
+        )
+        self.assertIsNone(err, err)
+        rows = list(csv.DictReader(merged.splitlines()))
+        self.assertEqual([row["splitK"] for row in rows], ["4", "", "8"])
+
+    def test_merge_compares_keys_as_numbers(self):
+        """Cells kept as text still compare as numbers: a shape written 256 in
+        one table and 256.0 in another is one shape."""
+        err, _, _, _ = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,10.0\n",
+            "gfx,cu_num,M,N,K,us\ngfx950,256.0,1,64,128,20.0\n",
+        )
+        self.assertIsNotNone(err, "256 and 256.0 were not seen as one shape")
+        self.assertIn("duplicate shape", err.lower())
+
+    def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
+        """A written us that is not a number, here nan on an unrelated row, must
+        not turn the lowest-us pick into a text sort, which keeps 10.5 over 9.5
+        and deletes the faster row from its source."""
+        err, _, canonical, model = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,us\n"
+            "gfx950,256,1,64,128,10.5\n"
+            "gfx950,256,3,64,128,nan\n",
+            "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,9.5\n",
+        )
+        self.assertIn("duplicate shape", (err or "").lower())
+        self.assertNotIn("10.5", canonical)
+        self.assertIn("9.5", model)
+
+    def test_a4w4_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
+
+    def test_a4w4_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    def test_a6w6_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
+
+    def test_a6w4_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm")
+
+    def test_a4w6_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm")
+
+    def test_a8w8(self):
+        self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")
+
+    def test_a8w8_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"
+        )
+
+    def test_a8w8_blockscale(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"
+        )
+
+    def test_a8w8_blockscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+            "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    def test_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    def test_a8w8_batched(self):
+        self._check_family("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm")
+
+    def test_bf16_batched(self):
+        self._check_family("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm")
+
+    def test_batched_gemm_a8w8_blockscale_mxscale(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns local-kid lookup.
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 256, 2, 1, 1024, 4096, "128x128")]["kernelId"],
+            63,
+            "saved OPUS row must select local kid 63 for CU=256",
+        )
+        self.assertEqual(
+            rows[("gfx950", 256, 8, 128, 1024, 4096, "128x128")]["kernelId"],
+            144,
+            "saved OPUS row must select local kid 144 for CU=256",
+        )
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+        )
+
+    def test_bf16(self):
+        self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
+
+    def test_conv3d_bf16(self):
+        self._check_family("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d")
+
+    def test_fmoe(self):
+        self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
+
+    def test_fhmoe(self):
+        merged = self._resolve(
+            self._tmp,
+            "AITER_CONFIG_FHMOE",
+            "tuned_fhmoe",
+        )
+        with open(merged, newline="") as f:
+            rows = list(csv.DictReader(f))
+        dsv4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "7168",
+                "384",
+                "385",
+                "7",
+                "384",
+                "torch.float4_e2m1fn_x2",
+            )
+        ]
+        hy4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "6144",
+                "256",
+                "257",
+                "9",
+                "256",
+                "torch.float8_e4m3fn",
+            )
+        ]
+        self.assertEqual(
+            {int(row["token"]) for row in dsv4_rows},
+            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
+        )
+        self.assertEqual(
+            {int(row["token"]) for row in hy4_rows},
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+            },
+        )
+        self.assertEqual(len(dsv4_rows), 12)
+        self.assertEqual(len(hy4_rows), 16)
+
+    def test_grouped_fmoe(self):
+        self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_gdn_k5_opt(self):
+        self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
+
+
+def _fix_real_tree():
+    """Resolve every family against the REAL checkout (not a temp copy) so
+    `update_config_files`' existing auto-dedup (keep lowest-`us` per shape) writes
+    the pruned CSVs back to the actual source files. Prints what changed; commit
+    the result and re-run without --fix to confirm clean.
+
+    This adds NO dedup logic -- it just triggers the write-back that
+    aiter/jit/core.py::update_config_files already performs, on real files."""
+    if core is None:
+        raise SystemExit(f"aiter.jit.core not importable: {_IMPORT_ERR}")
+    core.AITER_ROOT_DIR = AITER_ROOT  # operate on this checkout's real configs
+    fixed = []
+    for env_name, name in FAMILIES:
+        os.environ.pop(env_name, None)
+        _cache_clear()
+        default_file = os.path.join(AITER_ROOT, "aiter", "configs", f"{name}.csv")
+        try:
+            core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
+        except RuntimeError as e:
+            if "duplicate shape" in str(e).lower():
+                fixed.append((name, str(e)))
+            else:
+                raise
+    if not fixed:
+        print("No duplicate shapes found; nothing to fix.")
+        return
+    print(f"Resolved duplicate shapes in {len(fixed)} family(ies):\n")
+    for name, msg in fixed:
+        print(f"### {name}\n{msg}\n")
+    print(
+        "Source CSVs were rewritten (lowest-`us` row kept per shape). "
+        "Review `git diff`, commit, then re-run without --fix to confirm clean."
+    )
+
+
+if __name__ == "__main__":
+    if "--fix" in sys.argv:
+        # Modify the REAL config files in place. Read-only detection (the default)
+        # runs on a temp copy; --fix intentionally writes back to the checkout.
+        sys.argv.remove("--fix")
+        _fix_real_tree()
+    else:
+        unittest.main(verbosity=2)

@@ -1,8 +1,8 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from typing import Union
+from aiter.ops.triton.utils._triton import arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -13,7 +13,7 @@ def generate_batched_gemm_afp4wfp4_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[str, torch.dtype],
+    dtype: str | torch.dtype,
     layout: str = "TN",
     output: bool = False,
 ):
@@ -124,7 +124,7 @@ def get_x_vals():
     x_vals_with_batch += [
         (b, 2**m, n, k)
         for b in range(1, 17)
-        for m in range(0, 9)
+        for m in range(9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     return x_vals_with_batch
@@ -203,6 +203,40 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
     assert torch_out.shape == (B, M, N)
 
+    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
+
+    torch.testing.assert_close(torch_out, out)
+
+
+def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
+    """The same [B, rows, K // 32] scales, followed in memory by a full block of
+    `tail` bytes, so a read past K // 32 sees a known value."""
+    b, rows, groups = scales.shape
+    pad = 512 // SCALE_GROUP_SIZE
+    buf = torch.full((b, groups + pad, rows), tail, dtype=torch.uint8, device="cuda")
+    buf[:, :groups, :] = scales.transpose(1, 2)
+    return buf[:, :groups, :].transpose(1, 2)
+
+
+@pytest.mark.parametrize("scale_tail", ["x", "w"])
+@pytest.mark.parametrize("K", [2112, 2048])
+def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
+    """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
+    scale bytes past K // 32: 0xFF there is the e8m0 NaN."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    B, M, N, dtype = 2, 32, 64, torch.bfloat16
+    x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
+        B, M, N, K, dtype, layout="TN", output=True
+    )
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    if scale_tail == "x":
+        x_scales = _scales_with_tail(x_scales, 255)
+    else:
+        w_scales = _scales_with_tail(w_scales, 255)
+    # With the BLOCK_SIZE_K of 256 that the gfx950 and gfx1250 tables give for
+    # M = 32, K = 2112 leaves a partial last block and K = 2048 does not.
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)

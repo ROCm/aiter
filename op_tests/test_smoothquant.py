@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes
 import argparse
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 
 @perftest(num_iters=2)
@@ -92,7 +94,7 @@ def test_Smoothquant_instance(dtype, m, n, xscaleType, quant_dtype=dtypes.i8):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
-    (a, yscale_a), avg_a = run_torch(input, x_scale=xscale, quant_dtype=quant_dtype)
+    (a, yscale_a), _avg_a = run_torch(input, x_scale=xscale, quant_dtype=quant_dtype)
     (b, yscale_b), avg_b = run_ck(input, x_scale=xscale, quant_dtype=quant_dtype)
     (c, yscale_c), avg_c = run_hip(input, x_scale=xscale, quant_dtype=quant_dtype)
 
@@ -111,7 +113,7 @@ def test_topK_Smoothquant_instance(
     input = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn((expert, n), dtype=xscaleType, device="cuda")
     topk_id = torch.randint(0, expert, (m, topk), dtype=dtypes.i32, device="cuda")
-    (a, yscale_a), avg_a = run_torch_topk(
+    (a, yscale_a), _avg_a = run_torch_topk(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )
     (c, yscale_c), avg_c = run_hip(
@@ -131,8 +133,8 @@ def test_moe_Smoothquant_instance(
     input = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn((expert, n), dtype=xscaleType, device="cuda")
     # topk_id = torch.randint(0, expert, (m, topk), dtype=dtypes.i32, device="cuda")
-    topk_id = torch.tensor([list(range(0, topk))] * m, dtype=dtypes.i32, device="cuda")
-    (a, yscale_a), avg_a = run_torch_topk(
+    topk_id = torch.tensor([list(range(topk))] * m, dtype=dtypes.i32, device="cuda")
+    (a, yscale_a), _avg_a = run_torch_topk(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )
     (b, yscale_b), avg_b = run_hip(

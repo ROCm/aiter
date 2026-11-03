@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# NOTE: context_attention_fwd is a vLLM prefix-prefill helper that was never ported; this reference path cannot run until it is.
 
 # Copyright (C) 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -448,7 +449,7 @@ def redundant_attention(
         pt += cur_seq_len_extend
 
     o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
+    context_attention_fwd(  # noqa: F821
         q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
     )
 

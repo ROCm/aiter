@@ -1,11 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-import triton
+_fused_gemm_a8w8_blockscale_a16w16_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_a16w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "ADD_BIAS_FP8",
+        "ADD_BIAS_BF16",
+        "SKIP_REDUCE",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -17,7 +38,7 @@ import triton
         * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_repr)
 def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     # Pointers to matrices
     a_fp8_ptr,
@@ -146,12 +167,9 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
             )
 
             accumulator_fp8 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-            if ADD_BIAS_FP8:
-                if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
-                    bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(
-                        dtype=acc_dtype
-                    )
-                    accumulator_fp8 += bias_fp8_vals[None, :]
+            if ADD_BIAS_FP8 and (NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0)):
+                bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(dtype=acc_dtype)
+                accumulator_fp8 += bias_fp8_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
                 if EVEN_K:
@@ -192,7 +210,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 c_fp8_ptr
                 + stride_c_fp8_m * offs_cm[:, None]
                 + stride_c_fp8_n * offs_c_fp8_n[None, :]
-                + pid_k * stride_c_fp8_k
+                + pid_k.to(tl.int64) * stride_c_fp8_k
             )
             c_fp8_mask = (offs_cm[:, None] < M) & (offs_c_fp8_n[None, :] < N_fp8)
             tl.store(c_fp8_ptrs, c_fp8, mask=c_fp8_mask)
@@ -210,12 +228,11 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
             )
 
             accumulator_bf16 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-            if ADD_BIAS_BF16:
-                if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
-                    bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(
-                        dtype=acc_dtype
-                    )
-                    accumulator_bf16 += bias_bf16_vals[None, :]
+            if ADD_BIAS_BF16 and (NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0)):
+                bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(
+                    dtype=acc_dtype
+                )
+                accumulator_bf16 += bias_bf16_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
                 if EVEN_K:
@@ -250,13 +267,26 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 c_bf16_ptr
                 + stride_c_bf16_m * offs_cm[:, None]
                 + stride_c_bf16_n * offs_c_bf16_n[None, :]
-                + pid_k * stride_c_bf16_k
+                + pid_k.to(tl.int64) * stride_c_bf16_k
             )
             c_bf16_mask = (offs_cm[:, None] < M) & (offs_c_bf16_n[None, :] < N_bf16)
             tl.store(c_bf16_ptrs, c_bf16, mask=c_bf16_mask)
 
 
-@triton.jit
+_fused_gemm_a8w8_blockscale_a16w16_reduce_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "ADD_BIAS_FP8",
+        "ADD_BIAS_BF16",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_reduce_repr)
 def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
     bias_fp8_ptr,
     c_fp8_in_ptr,
@@ -313,7 +343,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
         offs_fp8_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N_fp8
         c_fp8_in_ptrs = (
             c_fp8_in_ptr
-            + (offs_k[:, None, None] * stride_c_fp8_in_k)
+            + (offs_k[:, None, None].to(tl.int64) * stride_c_fp8_in_k)
             + (offs_m[None, :, None] * stride_c_fp8_in_m)
             + (offs_fp8_n[None, None, :] * stride_c_fp8_in_n)
         )
@@ -345,7 +375,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
         offs_bf16_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N_bf16
         c_bf16_in_ptrs = (
             c_bf16_in_ptr
-            + (offs_k[:, None, None] * stride_c_bf16_in_k)
+            + (offs_k[:, None, None].to(tl.int64) * stride_c_bf16_in_k)
             + (offs_m[None, :, None] * stride_c_bf16_in_m)
             + (offs_bf16_n[None, None, :] * stride_c_bf16_in_n)
         )

@@ -4,7 +4,9 @@
 import argparse
 import itertools
 import random
+
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -21,18 +23,148 @@ torch.set_printoptions(sci_mode=False)
 
 
 def check_support(dtype, kv_dtype, nhead):
-    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
-        return False
-    return True
+    return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
+
+
+def check_asm_decode_rejects_unsupported_widths():
+    """The gfx942/gfx950 decode kernels take no row width: they assume 576-wide
+    rows (656 bytes per packed byte-KV token, dense within a page) and 512-wide
+    outputs."""
+    batch_size, nhead, ctx_lens = 4, 16, 300
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = qo_indptr * ctx_lens
+    kv_indices = torch.arange(batch_size * ctx_lens, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    scale = torch.ones(1, dtype=torch.float)
+
+    def decode(q, kv_buffer, v_head_dim=512):
+        out = torch.empty((batch_size, nhead, v_head_dim), dtype=torch.bfloat16)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer,
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            1,
+            q_scale=scale,
+            kv_scale=scale,
+        )
+
+    for dtype, kvtype in [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, dtypes.fp8),
+        (dtypes.fp8, dtypes.fp8),
+    ]:
+        q = torch.randn((batch_size, nhead, 512)).to(dtype)
+        kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 512)).to(kvtype)
+        with pytest.raises(RuntimeError, match="576-element MLA rows"):
+            decode(q, kv_buffer)
+
+    q = torch.randn((batch_size, nhead, 576), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 576), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="only support v_head_dim 512"):
+        decode(q, kv_buffer, v_head_dim=256)
+    # 512 fp8 latent + 4 fp32 scales per token, without the 64 bf16 RoPE elements.
+    with pytest.raises(RuntimeError, match="byte KV must be"):
+        decode(q, torch.zeros((batch_size * ctx_lens, 528), dtype=torch.uint8))
+    # The right shape, but every page aliases a single byte.
+    with pytest.raises(RuntimeError, match=r"byte KV must be.*stride\(1\) 0 "):
+        decode(q, torch.zeros(1, dtype=torch.uint8).expand(batch_size * ctx_lens, 656))
+
+    # mla_decode_fwd sizes splitData from the output, so only a direct call can
+    # pair a 512-wide output with a narrower splitData.
+    num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+        None, batch_size, batch_size * ctx_lens, nhead, 1, torch.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="splitData with v_head_dim 512"):
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            work_meta_data=None,
+            work_indptr=None,
+            work_info_set=None,
+            max_seqlen_q=1,
+            page_size=1,
+            nhead_kv=1,
+            softmax_scale=1.0 / 576**0.5,
+            splitData=torch.empty(
+                (batch_size, num_kv_splits, nhead, 256), dtype=torch.float
+            ),
+            splitLse=torch.empty(
+                (batch_size, num_kv_splits, nhead, 1), dtype=torch.float
+            ),
+            output=torch.empty((batch_size, nhead, 512), dtype=torch.bfloat16),
+        )
+
+
+def check_bf16_gqa32_merges_only_written_splits() -> None:
+    """bf16 gqa32 decode with more KV splits than a row's KV fills: stage 2 must
+    merge only the splits stage 1 wrote. The split buffers come from torch.empty,
+    so they are pre-filled with NaN to make an unwritten split visible."""
+    batch_size, nhead, num_kv_splits = 260, 32, 5
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    # 17-63 tokens per row: one or two 32-token tiles, never all 5 splits.
+    kv_lens = torch.randint(17, 64, (batch_size,), dtype=torch.int)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+    total_kv = int(kv_indptr[-1])
+    kv_indices = torch.randperm(total_kv, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    q = torch.randn((batch_size, nhead, qk_head_dim), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim), dtype=torch.bfloat16)
+    sm_scale = 1.0 / qk_head_dim**0.5
+
+    ref, _ = torch_mla_extend(
+        q,
+        kv_buffer.view(total_kv, 1, qk_head_dim),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        torch.bfloat16,
+    )
+
+    for shape in (
+        (batch_size, num_kv_splits, nhead, kv_lora_rank),
+        (batch_size, num_kv_splits, nhead, 1),
+    ):
+        torch.full(shape, float("nan"), dtype=torch.float)
+    out = torch.empty((batch_size, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        1,
+        sm_scale=sm_scale,
+        num_kv_splits=num_kv_splits,
+    )
+    assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
+    checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
+    cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
 
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    amax_diff = (x - y).abs().max().item()
+    (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -138,6 +270,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    is_causal=True,
     sequential_page_indices=False,
 ):
     ret = {}
@@ -230,6 +363,7 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
+    prefill_ref_token_cap = 512 * 1024
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
@@ -237,6 +371,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
@@ -302,7 +437,7 @@ def test_mla(
         # )
 
         out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm = run_perftest(
+        (_attn_logits, _attn_lse), us_asm = run_perftest(
             aiter.mla.mla_prefill_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -332,6 +467,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
@@ -359,7 +495,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=is_causal,
         dtype=out_dtype,
     )
 
@@ -400,7 +536,7 @@ def test_mla(
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -415,6 +551,7 @@ def test_mla(
             sm_scale,
             num_kv_splits=split_per_batch,
             return_lse=return_lse,
+            causal=is_causal,
         )
 
         err = checkAllclose(
@@ -448,7 +585,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -464,6 +601,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            causal=is_causal,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -481,7 +619,7 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_gluon():
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -503,8 +641,8 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        (attn_logits, attn_lse), us_gluon_decode = run_perftest(
-            mla_decode_gluon,
+        (_attn_logits, attn_lse), us_gluon_decode = run_perftest(
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
@@ -534,11 +672,22 @@ def test_mla(
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
         # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+        # MTP (decode_qlen>1): q is [total_q=batch*qlen, nhead, qk]; reshape to
+        # 4-D [batch, qlen, nhead, dim] so the kernel runs its causal tail path.
+        if decode_qlen > 1:
+            q4 = q.view(batch_size, decode_qlen, nhead, qk_head_dim)
+            q_nope = q4[..., :v_head_dim]
+            q_pe = q4[..., v_head_dim:]
+            o_arg = out_gluon.view(batch_size, decode_qlen, nhead, v_head_dim)
+        else:
+            q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+            q_pe = q[:, :, v_head_dim:].view(
+                batch_size, nhead, qk_head_dim - v_head_dim
+            )
+            o_arg = out_gluon.view(batch_size, nhead, v_head_dim)
 
         kv_c = kv_buffer.view(-1, qk_head_dim)
         if name == "bh16bn128":
@@ -554,11 +703,11 @@ def test_mla(
             use_2d_view = False
 
         (_, lse), us_decode = run_perftest(
-            mla_decode_gluon,
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
-            out_gluon.view(batch_size, nhead, v_head_dim),
+            o_arg,
             page_table,
             seq_info,
             sm_scale,
@@ -584,17 +733,52 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
+    # ASM/CK decode baseline only supports MTP up to qlen=4; skip it beyond that
+    # (gluon still validates against the torch reference).
+    asm_supports_mtp = decode_qlen <= 4
+    # --no-causal needs a non-masked (msk0) kernel. decode_qlen==1 always works:
+    # a single query token makes the mask a no-op, so the dispatch reuses the
+    # masked kernel. For longer queries, gfx950 ships a non-causal BF16 kernel
+    # for nhead=8 qlen=2, plus fp8/fp8 msk0 builds for nhead=128 (any qlen) and
+    # nhead=16 qlen 3/4 -- see the ps=0, causal=0 rows of
+    # hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
+    # get_heuristic_kernel_mla, so skip it instead of killing the sweep.
+    asm_supports_non_causal = (
+        is_causal
+        or decode_qlen == 1
+        or (
+            get_gfx() == "gfx950"
+            and dtype == dtypes.bf16
+            and kvtype == dtypes.bf16
+            and nhead == 8
+            and decode_qlen == 2
+        )
+        or (
+            dtype == dtypes.fp8
+            and kvtype == dtypes.fp8
+            and (nhead == 128 or (nhead == 16 and decode_qlen in (3, 4)))
+        )
+    )
     # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse:
+    if return_lse or not asm_supports_mtp or not asm_supports_non_causal:
         pass
-    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
-        16,
-        32,
-        64,
-        128,
-    ]:
+    elif (
+        (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
+        and nhead in [8, 16, 32, 64, 128]
+        # ASM decode faults on nhead=64 with qlen>1; skip that combo.
+        and not (nhead == 64 and decode_qlen > 1)
+    ):
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
+    elif kvtype == dtypes.fp8 and (
+        nhead in [8, 16, 32, 128]
+        # non-persistent qt64 kernel: gfx950 fp8/fp8 nhead=64 qlen=1 only
+        or (
+            nhead == 64
+            and dtype == dtypes.fp8
+            and decode_qlen == 1
+            and get_gfx() == "gfx950"
+        )
+    ):
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
@@ -611,6 +795,10 @@ def test_mla(
     ret["decode:bytes"] = bytes
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+    # Per-token throughput (Mtok/s = total_q / us, total_q = batch*qlen): the MTP
+    # figure-of-merit, implementation-agnostic unlike TB/s (under-counts qlen KV
+    # re-reads) and TFLOPS (over-counts via the decode_qlen factor).
+    ret["decode:Mtok/s"] = total_q / us_asm_decode
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
@@ -635,7 +823,7 @@ def test_mla(
         splits_needed = max(1, (256 + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
-        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
         min_ctx_required = num_kv_splits * (192 + num_kv_splits)
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()
@@ -643,16 +831,18 @@ def test_mla(
             ret["decode:gluon_576"] = us_gluon_decode
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+            # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+            ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
-    # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # Example: -c 10000000 -b 1 3 4 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == dtypes.fp8
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size == 1
+        and 1 <= batch_size <= 256
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
@@ -663,6 +853,8 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn64 decode test
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
@@ -670,8 +862,11 @@ def test_mla(
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
-        and nhead <= 16
-        and decode_qlen == 1
+        and nhead <= 96
+        and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
+        # mla_gluon has no causal switch and its MTP path is always the causal
+        # tail, so a non-causal golden would never match it for qlen>1.
+        and (is_causal or decode_qlen == 1)
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
@@ -683,6 +878,8 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     return ret
 
@@ -775,21 +972,18 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[
-        (4, 1),
-        (8, 1),
-        (12, 1),
-        (16, 1),
-        (16, 2),
-        (16, 4),
-        (32, 1),
-        (32, 2),
-        (32, 4),
-        (64, 1),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
+    choices=(
+        [(nh, q) for nh in (4, 8, 12, 16, 96) for q in range(1, 18)]
+        + [
+            (32, 1),
+            (32, 2),
+            (32, 4),
+            (64, 1),
+            (128, 1),
+            (128, 2),
+            (128, 4),
+        ]
+    ),
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
@@ -824,35 +1018,81 @@ parser.add_argument(
     help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
     Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
 )
+parser.add_argument(
+    "--causal",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="""Enable/disable causal masking. Default: True.
+    --causal / --no-causal""",
+)
 
 
-args = parser.parse_args()
+parser.add_argument(
+    "--softmax-underflow",
+    action="store_true",
+    help="Run gfx950 FP8 non-persistent uniform/long-tail checks (KV=2048, split=1).",
+)
 
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
-                dtype,
-                kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                split_per_batch=split_per_batch,
-                return_lse=args.return_lse,
-                sequential_page_indices=args.sequential_page_indices,
+
+def main():
+    args = parser.parse_args()
+    if args.softmax_underflow:
+        from op_tests.test_mla_persistent import test_mla_fp8_softmax_underflow
+
+        if not args.nhead or any(
+            nhead != 16 or q_len not in (1, 4) for nhead, q_len in args.nhead
+        ):
+            parser.error("For non-persistent underflow, specify -n 16,1 and/or 16,4")
+        if args.return_lse:
+            parser.error(
+                "Non-persistent single-split underflow checks do not return LSE"
             )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla summary (markdown):\n%s", df_md)
+        for nhead, q_len in args.nhead:
+            test_mla_fp8_softmax_underflow(
+                nhead=nhead,
+                q_len=q_len,
+                persistent=False,
+                return_lse=False,
+                cp_world_size=1,
+            )
+        return
+
+    if get_gfx() in ("gfx942", "gfx950"):
+        check_asm_decode_rejects_unsupported_widths()
+        aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
+        check_bf16_gqa32_merges_only_written_splits()
+        aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
+
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
+            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+        ):
+            if check_support(dtype, kvtype, nhead):
+                ret = test_mla(
+                    ctx_len,
+                    batch_size,
+                    nhead,
+                    args.kv_lora_rank,
+                    args.qk_nope_head_dim,
+                    args.qk_rope_head_dim,
+                    args.v_head_dim,
+                    dtype,
+                    kvtype,
+                    args.block_size,
+                    varlen=args.varlen,
+                    decode_qlen=decode_qlen,
+                    split_per_batch=split_per_batch,
+                    return_lse=args.return_lse,
+                    is_causal=args.causal,
+                    sequential_page_indices=args.sequential_page_indices,
+                )
+                df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("mla summary (markdown):\n%s", df_md)
+    return df if args.nhead else None
+
+
+if __name__ == "__main__":
+    df = main()

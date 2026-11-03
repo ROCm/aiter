@@ -2,10 +2,12 @@
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import torch
 import ctypes
+from collections.abc import Callable
+
+import torch
 from torch.library import Library
-from typing import Callable, Optional, Tuple
+
 from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger
 
 
@@ -52,8 +54,15 @@ def torch_to_c_types(*args):
             c_args.append(ctypes.POINTER(ctypes.c_int)())
         elif isinstance(arg, torch.Tensor):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
-        elif isinstance(arg, torch.cuda.Stream):
-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")
@@ -84,10 +93,10 @@ def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
     mutates_args: list[str],
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+    fake_impl: Callable | None = None,
+    target_lib: Library | None = None,
     dispatch_key: str = "CUDA",
-    tags: Tuple[torch.Tag, ...] = (),
+    tags: tuple[torch.Tag, ...] = (),
 ):
     """
     `torch.library.custom_op` can have significant overhead because it

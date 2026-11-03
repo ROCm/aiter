@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-    _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_preshuffle_split_cat,
+    _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_split_cat_reduce,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -24,8 +24,8 @@ def fused_gemm_afp4wfp4_split_cat(
     w_scale: torch.Tensor,
     S1: int,
     S2: int,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    config: dict | None = None,
 ):
     """
     Computes the 4 bit matmul C = X @ W^T using the block-scale quantization approach.
@@ -55,7 +55,12 @@ def fused_gemm_afp4wfp4_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -109,7 +114,7 @@ def fused_gemm_afp4wfp4_split_cat(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -204,8 +209,8 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     w_scale: torch.Tensor,
     S1: int,
     S2: int,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    config: dict | None = None,
 ):
     """
     Computes the 4 bit matmul C = X @ W^T using the block-scale quantization approach.
@@ -235,7 +240,12 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -288,7 +298,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

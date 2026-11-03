@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.attention.prefill_attention import (
     context_attention_fwd as prefill_triton,
 )
@@ -100,7 +101,7 @@ def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.floa
     prefill_triton(q, k, v, tri_out, b_start_loc, b_seq_len, SEQLEN, causal)
     sm_scale = 1.0 / (HEAD_DIM**0.5)
 
-    for i in range(0, Z):
+    for i in range(Z):
         start_q, start_k = b_start_loc[i], b_start_loc[i]
         seqlen_q, seqlen_k = b_seq_len[i], b_seq_len[i]
         end_q, end_k = start_q + seqlen_q, start_k + seqlen_k
@@ -111,7 +112,10 @@ def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.floa
             # Apply causal mask to scores (set future positions to -inf)
             # Create a causal mask
             causal_mask = torch.triu(
-                torch.ones(seqlen_q, seqlen_k, device=scores.device), diagonal=1
+                torch.ones(
+                    seqlen_q, seqlen_k, device=scores.device, dtype=torch.float32
+                ),
+                diagonal=1,
             ).bool()
             scores.masked_fill_(causal_mask.unsqueeze(1), float("-inf"))
         scores = scores.float()

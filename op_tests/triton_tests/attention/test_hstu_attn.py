@@ -1,6 +1,5 @@
 import pytest
 import torch
-from typing import Optional
 
 from aiter.ops.triton.attention.hstu_attention import (
     _AttentionFunction,
@@ -35,7 +34,7 @@ def generate_sparse_seq_len(
         return torch.ones(size=(size,), device=device, dtype=torch.int) * max_seq_len
     elif sparsity >= 0.5:
         min_seq_len: int = int((2 * sparsity - 1.0) * max_seq_len)
-        max_seq_len: int = max_seq_len
+        max_seq_len: int = max_seq_len  # noqa: PLW0127
     else:
         min_seq_len: int = 0
         max_seq_len: int = int(2 * sparsity * max_seq_len)
@@ -55,7 +54,7 @@ def apply_SL(
     max_seq_len: int,
 ) -> torch.Tensor:
     threshold = int(max_seq_len ** (alpha / 2.0))
-    no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2)
+    no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2).to(torch.float32)
     users_to_sample = torch.logical_and(
         lengths > threshold,
         torch.rand_like(no_sample_prob) < 1 - no_sample_prob,
@@ -72,9 +71,9 @@ def sanity_check_attention(
     seq_offsets: torch.Tensor,
     invalid_attn_mask_type: str,
     dropout_pr: float,
-    seq2_offsets: Optional[torch.Tensor] = None,
-    attn_bias: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    seq2_offsets: torch.Tensor | None = None,
+    attn_bias: torch.Tensor | None = None,
+    max_attn_len: int | None = None,
     contextual_seq_len: int = 0,
 ) -> None:
     _, H, _ = q.shape

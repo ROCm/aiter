@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from . import dtypes
 from .mx_types import (
@@ -156,6 +156,19 @@ def f32_to_mx_e8m0_scale(
         f"f32_to_mx_e8m0_scale: unknown mode {mode!r} "
         f"(expected 0=RoundDown, 1=RoundUp, 2=Even, 3=Ceil)"
     )
+
+
+def f32_to_fused_moe_mxfp8_scale(amax: Tensor) -> Tensor:
+    """Match the FlyDSL fused-MoE FP8 epilogue's E8M0 scale rounding.
+
+    The epilogue rounds ``amax`` to the nearest power of two with ties upward,
+    then reserves eight exponent steps (a factor of 2^8) of FP8 headroom. This
+    differs from the project-wide MXFP8 ``RoundUp`` default.
+    """
+    bits = amax.float().contiguous().view(torch.int32)
+    rounded = (bits + 0x400000) & -0x800000
+    exponent = ((rounded >> 23) - 8).clamp_(0, 255).to(torch.uint8)
+    return exponent.view(dtypes.fp8_e8m0)
 
 
 def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
@@ -824,13 +837,13 @@ def moe_mxfp4_sort(
         *blockscale_e8m0.stride(),
         *blockscale_e8m0_sorted.stride(),
     )
-    common_kwargs = dict(
-        token_num=token_num,
-        N_i=N_i,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        TOPK=topk,
-    )
+    common_kwargs = {
+        "token_num": token_num,
+        "N_i": N_i,
+        "BLOCK_SIZE_M": BLOCK_SIZE_M // 2,
+        "BLOCK_SIZE_N": BLOCK_SIZE_N // 2,
+        "TOPK": topk,
+    }
 
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)

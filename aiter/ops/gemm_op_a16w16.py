@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
-import functools
+from ..utility.graph_alloc import persistent_alloc
 
 
 @compile_ops(
@@ -18,9 +20,9 @@ def _gemm_a16w16_asm(
     B: Tensor,
     out: Tensor,
     semaphore: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
     bpreshuffle: bool = False,
 ) -> None: ...
 
@@ -34,7 +36,8 @@ ASM_SPLITK_MAX_GRID = _SEMA_SHAPE[0] * _SEMA_SHAPE[1]
 
 @functools.lru_cache(maxsize=64)
 def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
-    return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
+    with persistent_alloc(device):
+        return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
 def get_semaphore_workspace(device: torch.device) -> Tensor:
@@ -61,9 +64,9 @@ def gemm_a16w16_asm(
     A: Tensor,
     B: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
     bpreshuffle: bool = False,
 ):
     if splitK is None or splitK > 1:

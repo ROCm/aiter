@@ -1,26 +1,54 @@
+import os
+
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
+    PAD_SLOT_ID,
     _causal_conv1d_fwd_kernel,
     _causal_conv1d_update_kernel,
-    PAD_SLOT_ID,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from typing import List, Optional, Union
 
 _LOGGER = AiterTritonLogger()
+
+
+def _flydsl_conv1d_update_enabled() -> bool:
+    """Opt-in gate for the FlyDSL causal_conv1d update port.
+
+    Off by default, so Triton keeps serving every call. Not memoized, so the env
+    var can be toggled at runtime.
+    """
+    return os.environ.get("AITER_CONV1D_UPDATE_FLYDSL", "") == "1"
+
+
+def _assert_implemented_width(width: int, fn: str) -> None:
+    """Refuse the widths neither kernel in this file implements.
+
+    Both tap loops branch on 2/3/4 only and preload at most four weight columns,
+    so a wider weight matches no branch and the convolution silently degenerates
+    to the first tap repeated ``width`` times. The HIP entry point rejects it
+    (``csrc/kernels/causal_conv1d_update.cu``); do the same here rather than
+    return a wrong answer.
+
+    Spelled as a raised ``AssertionError`` rather than an ``assert`` statement
+    because ``python -O`` strips the statement form, and a guard against a
+    silent miscompute is exactly the kind that must not vanish under a flag.
+    """
+    if not 2 <= width <= 4:
+        raise AssertionError(f"{fn}: width must be 2, 3 or 4, got {width}")
 
 
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Union[torch.Tensor, None],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     **kwargs,
@@ -77,6 +105,7 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
+    _assert_implemented_width(width, "causal_conv1d_fn")
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
@@ -192,12 +221,12 @@ def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation: Union[bool, str, None] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,
-    conv_state_indices: Optional[torch.Tensor] = None,
-    num_accepted_tokens: Optional[torch.Tensor] = None,
-    intermediate_conv_window: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
@@ -234,12 +263,56 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
+
+    _, width = weight.shape
+    _assert_implemented_width(width, "causal_conv1d_update")
+
+    # FlyDSL port (opt-in). This signature is SGLang's, so it maps onto the
+    # SGLang-shaped wrapper and not the vLLM-shaped one, whose sentinel is a valid
+    # block index rather than pad_slot_id. out=x keeps the write-over-x contract.
+    # Anything outside the port's scope falls through to Triton below.
+    if _flydsl_conv1d_update_enabled():
+        from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+            _causal_conv1d_update_sglang_flydsl_supported,
+            causal_conv1d_update_sglang_flydsl,
+        )
+
+        if (
+            x.dtype == conv_state.dtype
+            and _causal_conv1d_update_sglang_flydsl_supported(
+                x,
+                conv_state,
+                weight,
+                bias=bias,
+                conv_state_indices=conv_state_indices,
+                num_accept_tokens=num_accepted_tokens,
+                cache_seqlens=cache_seqlens,
+                intermediate_conv_window=intermediate_conv_window,
+            )
+        ):
+            return causal_conv1d_update_sglang_flydsl(
+                x,
+                conv_state,
+                weight,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=conv_state_indices,
+                num_accept_tokens=num_accepted_tokens,
+                intermediate_conv_window=intermediate_conv_window,
+                # SGLang addresses the snapshot by its own index while the Triton
+                # kernel below reuses the conv_state cache line; forwarding the
+                # latter keeps both paths writing the same slots.
+                intermediate_state_indices=conv_state_indices,
+                pad_slot_id=pad_slot_id,
+                validate_data=validate_data,
+                out=x,
+            )
+
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
-    _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
 

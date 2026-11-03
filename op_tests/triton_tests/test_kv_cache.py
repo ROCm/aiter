@@ -1,15 +1,16 @@
-import torch
 import pytest
-
+import torch
 import triton
-from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
-from aiter.ops.triton.kv_cache import cat_and_cache_mla
-from op_tests.triton_tests.attention.test_mla import dynamic_nvfp4_quant_kv_buffer
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 
+from aiter.ops.triton.kv_cache import cat_and_cache_mla
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.test_common import checkAllclose
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.test_common import assertAllclose
+from op_tests.triton_tests.attention.test_mla import (
+    dynamic_nvfp4_quant_kv_buffer,
+    shuffle_kv_buffer,
+)
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -148,7 +149,7 @@ def check_kv_buffer(
         # reference can flip a small number of elements to an adjacent FP4 code.
         # Tolerate a tiny fraction of such mismatches instead of requiring an
         # exact match.
-        checkAllclose(
+        assertAllclose(
             gather_written_slots(ref_kv_buffer_lora_dquant),
             gather_written_slots(kv_buffer_lora_dquant),
             atol=1e-1,
@@ -156,7 +157,7 @@ def check_kv_buffer(
             tol_err_ratio=0.05,
             msg="NVFP4 kv_buffer lora dequant",
         )
-        checkAllclose(
+        assertAllclose(
             gather_written_slots(ref_kv_buffer_rope_dquant),
             gather_written_slots(kv_buffer_rope_dquant),
             atol=1e-1,
@@ -218,6 +219,8 @@ def test_cat_and_cache_mla(
     ):
         pytest.skip("FP4 KV cache is only supported in GFX950 and GFX1250")
 
+    torch.manual_seed(0)
+
     dtype = torch.bfloat16
     k_lora = torch.randn((T, KH, D_lora), dtype=torch.float32, device="cuda") / (
         20 if cache_dtype != torch.bfloat16 else 1
@@ -254,8 +257,8 @@ def test_cat_and_cache_mla(
     torch_k_pe = k_pe
 
     if cache_dtype == torch.bfloat16:
-        torch_k_lora = torch_k_lora
-        torch_k_pe = torch_k_pe
+        torch_k_lora = torch_k_lora  # noqa: PLW0127
+        torch_k_pe = torch_k_pe  # noqa: PLW0127
     elif cache_dtype == e4m3_dtype:
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
         torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(torch.bfloat16)

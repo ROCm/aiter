@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
+from pathlib import Path
 
 import pandas as pd
 
@@ -17,7 +18,6 @@ AITER_CORE_DIR = (
 )
 sys.path.insert(0, AITER_CORE_DIR)
 from chip_info import build_tune_dict, gen_lookup_header_map  # noqa: E402
-
 from gemm_a8w8_common import (  # noqa: E402
     default_kernels_dict,
     kernelInstance,
@@ -103,7 +103,7 @@ class gemm_a8w8_fwd_codegen:
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

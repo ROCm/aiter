@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copyright (c) 2024, Tri Dao.
+# Copyright (C) 2024-2026, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
@@ -8,6 +8,8 @@
 
 import triton
 import triton.language as tl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -74,7 +76,21 @@ def _feat_source_idx(
         return idx_feats.to(tl.int64)
 
 
-@triton.jit()
+_causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
+    "_causal_conv1d_update_single_token_kernel",
+    [
+        "BLOCK_N",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_APC_ENABLED",
+        "USE_PAD_SLOT",
+    ],
+)
+
+
+@triton.jit(repr=_causal_conv1d_update_single_token_kernel_repr)
 def _causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
@@ -115,7 +131,6 @@ def _causal_conv1d_update_single_token_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -271,7 +286,24 @@ def _causal_conv1d_update_single_token_kernel(
     tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-@triton.jit()
+_reshape_causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
+    "_reshape_causal_conv1d_update_single_token_kernel",
+    [
+        "BLOCK_N",
+        "BLOCK_Z",
+        "HV",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_APC_ENABLED",
+        "USE_PAD_SLOT",
+        "INTERLEAVED_QKVZ",
+    ],
+)
+
+
+@triton.jit(repr=_reshape_causal_conv1d_update_single_token_kernel_repr)
 def _reshape_causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (num_tokens, dim+z_dim, seqlen) where seqlen=1
@@ -331,7 +363,6 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     BLOCK_N: tl.constexpr,
     INTERLEAVED_QKVZ: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return

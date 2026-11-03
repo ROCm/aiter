@@ -1,7 +1,20 @@
+import functools
+
 import torch
-import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
+)
+from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
+    metric_to_scalar,
+    parse_fused_args,
+    run_fused_benchmark,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
@@ -9,43 +22,58 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
-)
 
 block_shape = (128, 128)  # matches module-level `block_shape` in similar kernels
 
+dimension = ["M", "N8", "N16", "K"]
+kernel_name = "Fused A8W8 Blockscale + A16W16 GEMM"
+kernel_label = "fused_gemm_a8w8_blockscale_a16w16"
+shape = "(N8=512, N16=256, K=7168)"
 
-def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
+
+def bench_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N8: int,
+    N16: int,
+    K: int,
+    metric: str,
+    **kwargs,
+):
     """
     Single-shape timing of the fused kernel via its public wrapper.
-    Shapes/dtypes/scale layouts match what the wrapper expects.
-    Output buffers are pre-allocated and passed in to keep allocation out of the timed
-    ``do_bench`` window.
+    Output buffers are pre-allocated and passed in to keep allocation out of the
+    timed ``do_bench`` window.
     """
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
     # FP8 branch inputs (N8 = N_fp8). ``output=True`` pre-allocates ``y_fp8``
-    x_fp8, w_fp8, _, x_fp8_scale, _, w_fp8_scale, y_fp8 = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N8,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=c_dtype,
-            output=True,
-        )
+    _p_gen_fp8 = functools.partial(
+        generate_gemm_a8w8_blockscale_inputs,
+        M,
+        N8,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=c_dtype,
+        output=True,
     )
+    # (x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y)
+    _out_vals_keys_fp8 = [
+        "x_fp8",
+        "w_fp8",
+        "_",
+        "x_fp8_scale",
+        "_",
+        "w_fp8_scale",
+        "y_fp8",
+    ]
+
     # BF16 branch inputs (N16 = N_bf16). Same M, same K, and no bias
-    x_bf16, w_bf16, _, _, y_bf16 = generate_gemm_a16w16_inputs(
+    _p_gen_bf16 = functools.partial(
+        generate_gemm_a16w16_inputs,
         M,
         N16,
         K,
@@ -53,58 +81,44 @@ def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
         output=True,
         bias=False,
     )
-    # flops
+    # (x, weight, bias, out_dtype, y)
+    _out_vals_keys_bf16 = ["x_bf16", "w_bf16", "_", "_", "y_bf16"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen_fp8, _p_gen_bf16],
+        [_out_vals_keys_fp8, _out_vals_keys_bf16],
+        **kwargs_rot_bufs,
+    )
+
+    kernel_fn = functools.partial(fused_gemm_a8w8_blockscale_a16w16, dtype=c_dtype)
+
     flops = 2.0 * M * (N8 + N16) * K  # summed across the two fused outputs
-    # memory transfer: numel * element_size() per tensor keeps the formula
-    # correct if dtypes change later (e.g. e5m2 / fp16 outputs).
+    # bytes moved, derived from M/N8/N16/K; the blockscale scale tensors keep
+    # their own numel (one scale per block, which doesn't reduce to a clean
+    # M/N/K product).
+    buf0 = rot_bufs[0]
     mem = (
-        x_fp8.numel() * x_fp8.element_size()
-        + w_fp8.numel() * w_fp8.element_size()
-        + x_fp8_scale.numel() * x_fp8_scale.element_size()
-        + w_fp8_scale.numel() * w_fp8_scale.element_size()
-        + x_bf16.numel() * x_bf16.element_size()
-        + w_bf16.numel() * w_bf16.element_size()
-        + y_fp8.numel() * y_fp8.element_size()
-        + y_bf16.numel() * y_bf16.element_size()
+        (M * K) * buf0["x_fp8"].element_size()
+        + (N8 * K) * buf0["w_fp8"].element_size()
+        + buf0["x_fp8_scale"].numel() * buf0["x_fp8_scale"].element_size()
+        + buf0["w_fp8_scale"].numel() * buf0["w_fp8_scale"].element_size()
+        + (M * K) * buf0["x_bf16"].element_size()
+        + (N16 * K) * buf0["w_bf16"].element_size()
+        + (M * N8) * buf0["y_fp8"].element_size()
+        + (M * N16) * buf0["y_bf16"].element_size()
     )
 
-    ms = triton.testing.do_bench(
-        lambda: fused_gemm_a8w8_blockscale_a16w16(  # noqa: E731
-            x_fp8,
-            w_fp8,
-            x_fp8_scale,
-            w_fp8_scale,
-            x_bf16,
-            w_bf16,
-            dtype=c_dtype,
-            y_fp8=y_fp8,
-            y_bf16=y_bf16,
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    return metric_to_scalar(metric, ms, flops, mem)
 
 
 def get_x_vals(args=None):
     """Default (M, N8, N16, K) benchmarking shapes for the fused kernel.
 
-    Analogous to ``utils.benchmark_utils.get_x_vals`` (which yields (M, N, K)
-    tuples), but specialized to the single shape family this fused op is tuned
-    for: the ``gfx950-FUSED-GEMM-A8W8_BLOCKSCALE-A16W16-N8=512-N16=256-K=7168``
-    config. N8, N16 and K are fixed and only M is swept based on the buckets.
-    As in the shared helper, ``-M`` selects a single M.
+    Specialized to the single shape family that this fused op is tuned for: the
+    ``gfx950-FUSED-GEMM-A8W8_BLOCKSCALE-A16W16-N8=512-N16=256-K=7168`` config.
+    N8, N16 and K are fixed and only M is swept, where ``-M`` selects a single M.
 
     The default M sweep hits every bucket of that dedicated config file -
     (M_LEQ_{8,16,32,64,128,256,1024,2048}) plus the ``any`` bucket (M=4096).
@@ -117,116 +131,24 @@ def get_x_vals(args=None):
     return [(m, n8, n16, k) for m in m_vals]
 
 
-def get_shape_benchmark_object(plot_name, args, x_names=None):
-    """Build the Benchmark object for the (M, N8, N16, K) shape sweep.
-
-    A similar metric/ylabel/style convention to
-    ``utils.benchmark_utils.get_shape_benchmark_object`` but that shared helper
-    cannot be reused as-is because it only models (M, N, K) or (B, M, N, K);
-    there are two independent output-N dims (N8 for the FP8 branch, N16 for the BF16 branch)
-    sharing M and K.
-
-    A 4-element ``--shape`` is therefore (M, N8, N16, K) here,
-    NOT the batched (B, M, N, K) that the shared helper / ``get_ff_args`` assume.
-    """
-    if x_names is None:
-        x_names = ["M", "N8", "N16", "K"]
-
-    if args.shape:
-        # enforce the fused 4-tuple here.
-        if len(args.shape) != 4:
-            raise ValueError(
-                f"--shape expects 4 ints (M N8 N16 K); "
-                f"got {len(args.shape)}: {args.shape}"
-            )
-        x_vals_list = [args.shape]
-    else:
-        x_vals_list = get_x_vals(args=args)
-
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",
-    }
-    benchmark = triton.testing.Benchmark(
-        x_names=x_names,
-        x_vals=x_vals_list,
-        x_log=True,
-        y_log=True,
-        line_arg="unit",
-        line_vals=[evaluation_metric_to_unit[args.metric]],
-        line_names=[evaluation_metric_to_unit[args.metric]],
-        styles=[("green", "-")],
-        ylabel=ylabel,
-        plot_name=plot_name,
-        args={"metric": args.metric},
-    )
-    return benchmark
-
-
-def run_shape_benchmark(args):
-    """Runs a benchmark with given tensor shapes."""
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
-
-    @triton.testing.perf_report([benchmark])
-    def bench_fused_gemm_a8w8_blockscale_a16w16(M, N8, N16, K, metric, **kwargs):
-        return bench_fn(M, N8, N16, K, metric)
-
-    bench_fused_gemm_a8w8_blockscale_a16w16.run(
-        save_path="." if args.o else None, print_data=True
-    )
-
-
-def run_benchmark(args, defaults):
-    assert not (args.shape and args.model) or not (
-        args.shape and args.M
-    ), "User can specify --shape or --model MODEL -M VAL exclusively"
-
-    # --model has no meaning here: the op is tuned for one fixed shape family
-    # (N8=512, N16=256, K=7168), not model-derived hidden/intermediate dims.
-    if args.model:  # TODO: add in --model argument (via run_model_benchmark())
-        raise NotImplementedError(
-            "--model is not supported for fused_gemm_a8w8_blockscale_a16w16; "
-            "it targets a single fixed shape family (N8=512, N16=256, K=7168). "
-            "Use --shape M N8 N16 K or -M."
-        )
-    else:
-        unsupported_args = ["fc1", "fc2", "no_glu", "tp", "layout"]
-        for arg in unsupported_args:
-            if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
-                    f"Argument '{arg}' is not supported for "
-                    f"fused_gemm_a8w8_blockscale_a16w16."
-                )
-        run_shape_benchmark(args)
-
-
-def parse_args(args: list[str] | None = None):
-    parser = get_parser(kernel_name="Fused A8W8 Blockscale + A16W16 GEMM")
-    parser = add_argparse_ff(parser)
-    # get_ff_args destructures a 4-element --shape as (B, M, N, K); for this op
-    # --shape is (M, N8, N16, K), so the shape path reads args.shape directly
-    # and ignores that (B, M, N, K) mapping.
-    return get_ff_args(parser, args=args)
-
-
 def main(args: list[str] | None = None) -> None:
-    parsed_args, defaults = parse_args(args=args)
+    parsed_args, defaults = parse_fused_args(kernel_name, args=args)
+    plot_name = get_caller_name_no_ext()
+    run = lambda: run_fused_benchmark(
+        parsed_args,
+        defaults,
+        kernel_label,
+        shape,
+        dimension,
+        bench_fn,
+        get_x_vals,
+        plot_name,
+    )
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
-        print_vgpr(fun, get_caller_name_no_ext())
+        print_vgpr(run, plot_name)
         return
-    run_benchmark(parsed_args, defaults)
+    run()
 
 
 if __name__ == "__main__":

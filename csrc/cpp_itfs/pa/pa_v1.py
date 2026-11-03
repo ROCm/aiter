@@ -1,7 +1,9 @@
-from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import ctypes
 import math
+
+from jinja2 import Template
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op, str_to_bool
 
 MD_NAME = "pa_v1"
 
@@ -23,7 +25,7 @@ def compile(
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window_enabled: bool = False,
-    folder: str = None,
+    folder: str | None = None,
 ):
     return compile_template_op(
         src_template,
@@ -130,6 +132,7 @@ def paged_attention_v1(
     sliding_window: int = 0,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
@@ -186,8 +189,8 @@ def paged_attention_v1(
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
     gqa_ratio = int(num_heads / num_kv_heads)
-    max_num_partitions = int(math.ceil(max_context_len / partition_size))
-    npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    npar_loops = math.ceil(max_num_partitions / warpSize)
     logits_soft_cap_enabled = logits_soft_cap > 0
     alibi_enabled = alibi_slopes is not None
     sliding_window_enabled = sliding_window > 0

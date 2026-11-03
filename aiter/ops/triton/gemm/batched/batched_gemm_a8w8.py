@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
     _get_config,
@@ -18,11 +18,11 @@ def batched_gemm_a8w8(
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    splitK: Optional[int] = None,
-    YQ: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    splitK: int | None = None,
+    YQ: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with per-batch scaling.
@@ -44,7 +44,11 @@ def batched_gemm_a8w8(
         torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
-        f"BATCHED_GEMM_A8W8: x={tuple(XQ.shape)} w={tuple(WQ.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "BATCHED_GEMM_A8W8: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(XQ.shape),
+        tuple(WQ.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     # Make sure XQ and WQ are contiguous in memory
@@ -75,7 +79,7 @@ def batched_gemm_a8w8(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )

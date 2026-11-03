@@ -1,28 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import os
-from typing import Optional, Callable
-from dataclasses import dataclass
 import functools
+import os
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import torch
+
 import aiter
-from aiter import logger
-from aiter import ActivationType, QuantType, dtypes
-from aiter.utility import fp4_utils
+from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.fused_moe import moe_sorting
 from aiter.jit.core import (
-    AITER_ROOT_DIR,
     AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
     PY,
     bd_dir,
     mp_lock,
 )
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, gfx_from_cu_num
-from aiter.fused_moe import moe_sorting
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 
@@ -117,25 +118,25 @@ def fused_moe_dp_share_expert(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
     w2,  # [expert(local_expert:EP), dim, inter_dim]
-    expert_mask: Optional[torch.tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
     # following for quant
-    w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
     dp_size=1,
     dp_rank=0,
-    moe_buf: Optional[
-        torch.tensor
-    ] = None,  # you can use no-shared expert result here, it will atomic add to it
+    moe_buf: (
+        torch.Tensor | None
+    ) = None,  # you can use no-shared expert result here, it will atomic add to it
 ):
     """user API"""
     orig_M, model_dim = hidden_states.shape
@@ -151,9 +152,8 @@ def fused_moe_dp_share_expert(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
 
-    global_E = E
     if expert_mask is not None:
-        global_E = expert_mask.numel()
+        expert_mask.numel()
     dtype = hidden_states.dtype if dtype is None else dtype
     assert dtype in [
         dtypes.fp16,
@@ -229,7 +229,7 @@ def fused_moe_1stage(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -267,7 +267,7 @@ def fused_moe_1stage(
                 a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
-        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        E, _model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
             a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
@@ -323,7 +323,7 @@ def get_block_size_M(token, topk, expert, inter_dim):
         rnd = (tg_num + cu_num - 1) // cu_num
         empty = cu_num - tg_num % cu_num
         tmp.append((rnd, empty, el))
-    return sorted(tmp, key=lambda x: x[:2])[0][-1]
+    return min(tmp, key=lambda x: x[:2])[-1]
 
 
 cfg_2stages = None
@@ -575,7 +575,7 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
 
     quant_func = get_quant(quant_type)
@@ -793,7 +793,7 @@ def asm_stage1(
         out = out.view(dtype)
     device = out.device
     token_num, _, _ = out.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, _model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)

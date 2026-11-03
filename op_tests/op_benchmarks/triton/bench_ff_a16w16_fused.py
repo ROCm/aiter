@@ -1,32 +1,33 @@
+import math
 import sys
+
+import matplotlib.pyplot as plt
 import torch
 import triton
-import math
+
+from aiter.ops.triton.gemm.feed_forward.ff_a16w16 import (
+    ff_a16w16_gated,
+    ff_a16w16_nogate,
+)
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_gated import (
     ff_a16w16_fused_gated,
 )
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_ungated import (
     ff_a16w16_fused_ungated,
 )
-from aiter.ops.triton.gemm.feed_forward.ff_a16w16 import (
-    ff_a16w16_gated,
-    ff_a16w16_nogate,
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_shape_benchmark_object,
+    model_benchmark_shapes,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     generate_ff_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    get_ff_args,
-    add_argparse_ff,
-)
-
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    model_benchmark_shapes,
-    get_shape_benchmark_object,
-    print_vgpr,
-)
-import matplotlib.pyplot as plt
 
 
 def get_model_benchmark_object(
@@ -86,13 +87,13 @@ def bench_fn(
     metric: str,
     layout: str,
     gating: bool,
-    activation: str = None,
+    activation: str | None = None,
     e2e_fused: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w1, w2, out_dtype, _, y = generate_ff_inputs(
+    x, w1, w2, _out_dtype, _, y = generate_ff_inputs(
         batch,
         hidden_dim,
         intermediate_dim,
@@ -136,7 +137,7 @@ def bench_fn(
     ms = triton.testing.do_bench(
         lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
         warmup=25,
-        rep=100,  # noqa: E731
+        rep=100,
     )
 
     # Return exactly one scalar depending on which metric is active
@@ -216,7 +217,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args)
@@ -224,7 +225,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args)
@@ -254,7 +255,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, "Fused FF")
         return 0
     run_benchmark(args, defaults)

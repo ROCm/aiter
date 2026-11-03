@@ -177,6 +177,156 @@ bool test_array_make_and_get() {
 }
 
 // =============================================================================
+// Sub-byte "pack" Tests (fp4_t / int4_t / uint4_t) -- cutlass-style packing.
+// One logical <8-bit element; opus::array/vector bit-pack it with a proxy. Host-only (no device intrinsics), exercising the container/proxy/layout refactor.
+// =============================================================================
+static inline unsigned fp4_code(const opus::fp4_t& v) { return v.value; }
+static inline opus::fp4_t mk_fp4(unsigned code) { opus::fp4_t v; v.value = (unsigned char)(code & 0xF); return v; }
+
+bool test_pack_traits() {
+    // one logical element, 4 bits wide, but a full byte standalone
+    TEST_ASSERT_EQ((int)sizeof(opus::fp4_t), 1, "sizeof(fp4_t) standalone");
+    TEST_ASSERT_EQ(opus::sizeof_bits<opus::fp4_t>::value, 4, "sizeof_bits<fp4_t>");
+    TEST_ASSERT_EQ(opus::num_packs_v<opus::fp4_t>, 2, "num_packs<fp4_t> (elems per byte)");
+    static_assert(opus::is_packs_v<opus::fp4_t>, "fp4_t is a pack");
+    static_assert(opus::is_packs_v<opus::int4_t>, "int4_t is a pack");
+    static_assert(opus::is_packs_v<opus::uint4_t>, "uint4_t is a pack");
+    static_assert(!opus::is_packs_v<int>, "int is not a pack");
+
+    // a plain C array is UNPACKED: one byte per element (contrast with opus::array)
+    TEST_ASSERT_EQ((int)sizeof(opus::fp4_t[4]), 4, "C array fp4_t[4] is unpacked (1 byte each)");
+    return true;
+}
+
+bool test_packed_array_sizes() {
+    // opus::array bit-packs: N values in ceil(N*4/8) bytes
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::fp4_t, 2>), 1, "array<fp4_t,2> bytes");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::fp4_t, 4>), 2, "array<fp4_t,4> bytes");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::fp4_t, 8>), 4, "array<fp4_t,8> bytes");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::int4_t, 8>), 4, "array<int4_t,8> bytes");
+    // size() reports the logical element count, not the byte count
+    constexpr int a8_size = opus::array<opus::fp4_t, 8>::size();
+    TEST_ASSERT_EQ(a8_size, 8, "array<fp4_t,8>::size()");
+    static_assert(opus::is_array_v<opus::array<opus::fp4_t, 8>>, "packed array is array");
+    return true;
+}
+
+bool test_packed_array_proxy() {
+    // proxy read / write round-trip
+    opus::array<opus::fp4_t, 8> a;
+    for (int i = 0; i < 8; ++i) a[i] = mk_fp4(i);
+    for (int i = 0; i < 8; ++i)
+        TEST_ASSERT_EQ((int)fp4_code(a[i]), i & 0xF, "proxy round-trip");
+
+    // number<> indexing
+    TEST_ASSERT_EQ((int)fp4_code(a[opus::number<5>{}]), 5, "proxy number<> index");
+
+    // proxy-to-proxy assignment must copy the VALUE (not rebind ptr/idx)
+    a[0] = mk_fp4(9);
+    a[1] = mk_fp4(3);
+    a[0] = a[1];                       // value copy
+    TEST_ASSERT_EQ((int)fp4_code(a[0]), 3, "proxy value-copy assign");
+    a[1] = mk_fp4(7);                  // mutating a[1] must NOT change a[0]
+    TEST_ASSERT_EQ((int)fp4_code(a[0]), 3, "proxy value-copy is independent");
+
+    // fill / clear
+    a.fill(mk_fp4(0xA));
+    TEST_ASSERT_EQ((int)fp4_code(a[0]), 0xA, "packed fill first");
+    TEST_ASSERT_EQ((int)fp4_code(a[7]), 0xA, "packed fill last");
+    a.clear();
+    TEST_ASSERT_EQ((int)fp4_code(a[0]), 0, "packed clear first");
+    TEST_ASSERT_EQ((int)fp4_code(a[7]), 0, "packed clear last");
+    return true;
+}
+
+bool test_packed_array_layout() {
+    // element i lives in byte i/2, nibble (i%2): low nibble first
+    opus::array<opus::fp4_t, 8> a;
+    for (int i = 0; i < 8; ++i) a[i] = mk_fp4(i);
+    unsigned char raw[4];
+    __builtin_memcpy(raw, &a, 4);
+    TEST_ASSERT_EQ((int)raw[0], 0x10, "byte0 = (elem1<<4)|elem0");
+    TEST_ASSERT_EQ((int)raw[1], 0x32, "byte1");
+    TEST_ASSERT_EQ((int)raw[2], 0x54, "byte2");
+    TEST_ASSERT_EQ((int)raw[3], 0x76, "byte3");
+
+    // bit_cast compatibility with an integer of the same byte size
+    unsigned short w = 0xABCD;
+    auto arr = __builtin_bit_cast(opus::array<opus::fp4_t, 4>, w);
+    TEST_ASSERT_EQ((int)fp4_code(arr[0]), 0xD, "bit_cast nibble0");
+    TEST_ASSERT_EQ((int)fp4_code(arr[1]), 0xC, "bit_cast nibble1");
+    TEST_ASSERT_EQ((int)fp4_code(arr[2]), 0xB, "bit_cast nibble2");
+    TEST_ASSERT_EQ((int)fp4_code(arr[3]), 0xA, "bit_cast nibble3");
+    return true;
+}
+
+bool test_packed_array_make_concat() {
+    // make_array of pack values -> packed array
+    auto a = opus::make_array(mk_fp4(1), mk_fp4(2), mk_fp4(3), mk_fp4(4));
+    static_assert(opus::is_packs_v<opus::get_value_t<decltype(a)>>, "make_array elem is pack");
+    TEST_ASSERT_EQ(a.size(), 4, "make_array<fp4> size");
+    TEST_ASSERT_EQ((int)sizeof(a), 2, "make_array<fp4,4> packed bytes");
+    TEST_ASSERT_EQ((int)fp4_code(opus::get<3>(a)), 4, "make_array<fp4> get<3>");
+
+    // concat two packed arrays
+    auto lo = opus::make_array(mk_fp4(1), mk_fp4(2));
+    auto hi = opus::make_array(mk_fp4(3), mk_fp4(4));
+    auto c  = opus::concat_array(lo, hi);
+    TEST_ASSERT_EQ(c.size(), 4, "concat packed size");
+    TEST_ASSERT_EQ((int)sizeof(c), 2, "concat packed bytes");
+    TEST_ASSERT_EQ((int)fp4_code(opus::get<0>(c)), 1, "concat[0]");
+    TEST_ASSERT_EQ((int)fp4_code(opus::get<3>(c)), 4, "concat[3]");
+    return true;
+}
+
+bool test_packed_vector() {
+    // vector_t<pack,N> falls back to a packed struct (not a native ext_vector)
+    static_assert(opus::is_vector_v<opus::vector_t<opus::fp4_t, 8>>, "packed vector is vector");
+    constexpr int pv_bytes = (int)sizeof(opus::vector_t<opus::fp4_t, 8>);
+    constexpr int pv_size  = (int)opus::size<opus::vector_t<opus::fp4_t, 8>>();
+    TEST_ASSERT_EQ(pv_bytes, 4, "vector_t<fp4_t,8> bytes");
+    TEST_ASSERT_EQ(pv_size, 8, "vector_t<fp4_t,8> size");
+    static_assert(std::is_same_v<opus::get_value_t<opus::vector_t<opus::fp4_t, 8>>, opus::fp4_t>,
+                  "packed vector value_type");
+
+    opus::vector_t<opus::fp4_t, 8> v;
+    for (int i = 0; i < 8; ++i) v[i] = mk_fp4(7 - i);
+    for (int i = 0; i < 8; ++i)
+        TEST_ASSERT_EQ((int)fp4_code(v[i]), (7 - i) & 0xF, "packed vector round-trip");
+    return true;
+}
+
+// Generic packing check for any sub-byte pack type (int4_t / uint4_t): full 4-bit range
+// round-trip through the array proxy, packed size + nibble layout, and packed vector.
+template <typename Pack>
+static bool check_pack(const char* name) {
+    // full 0..15 range round-trip in a 16-element packed array (16 * 4 / 8 = 8 bytes)
+    opus::array<Pack, 16> a;
+    for (int i = 0; i < 16; ++i) { Pack x; x.value = (unsigned char)i; a[i] = x; }
+    TEST_ASSERT_EQ((int)sizeof(a), 8, name);
+    for (int i = 0; i < 16; ++i) { Pack x = a[i]; TEST_ASSERT_EQ((int)(unsigned)x.value, i, name); }
+    // nibble layout: element i in byte i/2, low nibble first
+    unsigned char raw[8]; __builtin_memcpy(raw, &a, 8);
+    TEST_ASSERT_EQ((int)raw[0], 0x10, name);
+    TEST_ASSERT_EQ((int)raw[7], 0xFE, name);
+    // packed vector round-trip
+    opus::vector_t<Pack, 8> v;
+    for (int i = 0; i < 8; ++i) { Pack x; x.value = (unsigned char)(7 - i); v[i] = x; }
+    for (int i = 0; i < 8; ++i) { Pack x = v[i]; TEST_ASSERT_EQ((int)(unsigned)x.value, 7 - i, name); }
+    return true;
+}
+
+bool test_pack_int4_uint4() {
+    static_assert(opus::sizeof_bits<opus::int4_t>::value == 4, "sizeof_bits<int4_t>");
+    static_assert(opus::sizeof_bits<opus::uint4_t>::value == 4, "sizeof_bits<uint4_t>");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::int4_t, 16>), 8, "array<int4_t,16> bytes");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::uint4_t, 16>), 8, "array<uint4_t,16> bytes");
+    if (!check_pack<opus::int4_t>("int4_t pack")) return false;
+    if (!check_pack<opus::uint4_t>("uint4_t pack")) return false;
+    return true;
+}
+
+// =============================================================================
 // Tuple Tests
 // =============================================================================
 template <typename T>
@@ -370,6 +520,15 @@ int main() {
     std::cout << std::endl << "--- Array Tests ---" << std::endl;
     RUN_TEST(test_array_basic);
     RUN_TEST(test_array_make_and_get);
+
+    std::cout << std::endl << "--- Sub-byte Pack Tests (fp4/int4) ---" << std::endl;
+    RUN_TEST(test_pack_traits);
+    RUN_TEST(test_packed_array_sizes);
+    RUN_TEST(test_packed_array_proxy);
+    RUN_TEST(test_packed_array_layout);
+    RUN_TEST(test_packed_array_make_concat);
+    RUN_TEST(test_packed_vector);
+    RUN_TEST(test_pack_int4_uint4);
 
     std::cout << std::endl << "--- Tuple Tests ---" << std::endl;
     RUN_TEST(test_tuple_basic);

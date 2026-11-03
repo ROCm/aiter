@@ -3,8 +3,9 @@
 
 import pytest
 import torch
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+
 from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def generate_fused_rmsnorm_add_inputs(M, N, dtype, has_res):

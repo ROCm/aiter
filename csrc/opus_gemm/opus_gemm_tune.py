@@ -1,74 +1,108 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""[DEBUG-ONLY] Single-shape / single-kid opus a16w16 tuner.
+"""Debug-only single-shape OPUS A16W16 tuner.
 
-This script used to be the production opus tuning entry point and wrote
-directly into a private CSV under aiter/ops/opus/configs/. Production
-tuning has moved to gradlib:
-
-    python3 gradlib/gemm_tuner.py --libtype opus
-    # or as part of a multi-backend tune:
-    python3 gradlib/gemm_tuner.py --libtype all
-
-gradlib writes to aiter/configs/bf16_tuned_gemm.csv (or whatever the
-user passes via --tuned_file / GTUNE_TUNED), stamping every opus row
-with `libtype=='opus'`. The opus runtime dispatch
-(aiter/ops/opus/common.py) reads those rows from the global CSV.
-
-This file is retained for two reasons only:
-
-  1. **Single-(M,N,K) smoke / debug**: hand-running a specific kid against
-     a specific shape (-m M -n N -k K --kid K --splitK S) to compare
-     against the gradlib winner or to investigate a bug.
-  2. **Source of truth for tune-time helpers**: candidate_kids_for_shape,
-     candidate_splitK, kid_rejects_shape / kid_rejects_bias, and
-     _ensure_kids_compiled live here. They are imported by:
-       - gradlib's GemmTuner (gradlib/gradlib/GemmTuner.py) for the
-         production `--libtype opus` path,
-       - this script's own `tune()` for the single-shape debug path.
-     csrc/opus_gemm/opus_gemm_common.py only owns the data constants
-     (SPLITK_KIDS / NON_SPLITK_KIDS / BIAS_AWARE_KIDS /
-     HEURISTIC_DEFAULT_KIDS) plus _opus_sidecar_path(); it does NOT
-     re-export any tune-time helper.
-
-The default output path is /tmp/opus_debug_tuned.csv so this script can
-never accidentally pollute the global aiter/configs/ tree.
+Production tuning uses ``gradlib/gemm_tuner.py``. This module keeps the
+single-kid runner and candidate helpers imported by Gradlib; output defaults
+to ``/tmp``.
 """
 
 import json
 import logging
 import os
 import sys
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
-from aiter import dtypes, logger
-from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.opus.gemm_op_a16w16 import (
-    opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
-)
+
+
+def _patch_flaky_hip_device_count():
+    """TEMPORARY: this torch build (2.11.0+rocm7.14.0a, gfx1250) has a cold-init
+    race where torch.cuda.device_count() returns 0 (and get_device_properties
+    raises "Invalid device id") for file-run scripts even though HIP tensor ops
+    work. That breaks base_tuner.get_cu_num() and mp_tuner's gpu_num. If
+    enumeration is broken but a cuda tensor op succeeds, pin device_count() to the
+    rocminfo GPU count. Runs at import so mp_tuner spawn children inherit it.
+    Remove once the torch build's device enumeration is fixed.
+    """
+    try:
+        if torch.cuda.device_count() >= 1:
+            return
+        _t = torch.zeros(1, device="cuda")
+        torch.cuda.synchronize()
+        del _t
+    except Exception:  # noqa: BLE001
+        return
+    ngpu = 1
+    try:
+        import re
+        import subprocess
+
+        out = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, check=False
+        ).stdout
+        ngpu = max(
+            1,
+            sum(
+                "GPU" in d and "Device Type" in d for d in re.split(r"Agent\s*\d+", out)
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        ngpu = 1
+    torch.cuda.device_count = lambda: ngpu  # type: ignore[assignment]
+
+
+_patch_flaky_hip_device_count()
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
-    a16w16_kernels_list,
-    a16w16_kernels_list_nooob,
-    a16w16_kernels_list_cpol,
-    a16w16_kernels_list_cpol_nooob,
-    a16w16_flatmm_kernels_list,
-    a16w16_flatmm_splitk_kernels_list,
-    a16w16_flatmm_splitk_kernels_list_nooob,
-    a16w16_persistent_kernels_list,
-    a16w16_persistent_kernels_list_cpol,
-    a16w16_persistent_kernels_list_nooob,
-    a16w16_persistent_kernels_list_cpol_nooob,
-    gfx942_nosplit_kernels_list,
-    gfx942_splitk_kernels_list,
-    SPLITK_KIDS,
-    NON_SPLITK_KIDS,
-    BIAS_AWARE_KIDS,
-    HEURISTIC_DEFAULT_KIDS,
+    GFX942_BF16WS_EXACT_N,
+    GFX1250_CLUSTERLAUNCH_KID_OF,
+    GFX1250_PLAIN_KID_OF,
+    GFX1250_SPLITK_FUSE_ENABLED,
+    GFX1250_SPLITK_FUSE_KID_OF,
+    GFX1250_SPLITK_FUSE_KIDS,
     _opus_sidecar_path,
+    a16w16_flatmm_prefetch_k_iter,
+    get_registry,
+    group_kids,
+)
+
+from aiter import dtypes, logger
+from aiter.ops.opus._arch import _device_arch_and_cu
+
+_tune_arch, _tune_cu = _device_arch_and_cu(torch.cuda.current_device())
+kernels_list = get_registry("a16w16", _tune_arch, _tune_cu)
+SPLITK_KIDS = group_kids("SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
+NON_SPLITK_KIDS = group_kids("NON_SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
+BIAS_AWARE_KIDS = group_kids("BIAS_AWARE_KIDS", _tune_arch, cu_num=_tune_cu)
+from aiter.ops.opus import opus_bmm as _opus_bmm
+from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
+
+# gfx1250 candidate-filter knobs (see _gfx1250_select_candidates).
+GFX1250_TOP_TILES = 8  # top-N tiles by grid-occupancy fit
+GFX1250_MAX_CLUSTER_SIDE = 4  # sweep (cwm, cwn) over [1,4] x [1,4] minus (1,1)
+GFX1250_TOP_CLUSTERS = 6  # best-N cluster dims per tile (see the ranking below)
+# Round-up budget: a cluster dim may leave at most this share of the launched
+# workgroups tile-less (0.25 = at most one dead workgroup per three live ones).
+# Raise it to let looser-fitting clusters into the sweep, 0.0 to demand an exact
+# cluster fill.
+GFX1250_MAX_CLUSTER_WASTE = 0.25
+GFX1250_CLUSTER_WASTE_BUCKET = 0.05  # waste granularity the ranking distinguishes
+GFX1250_OCC_BETA_UNDER = 2.0  # under-occupancy penalty (idle CUs, linear loss)
+GFX1250_OCC_BETA_OVER = 1.0  # over-occupancy penalty (scheduling tail, sublinear)
+GFX1250_SPLITK_BIAS = 0.02  # tiny per-extra-split bias (splitk stays dynamic)
+# splitK admission window upper multiplier: keep splitK whose total grid WG lands
+# in [CU/2, HI_MULT*CU]. Tile *selection* still ranks on the tight [CU/2, CU]
+# occupancy fit; this only widens which splitK values get benchmarked on the
+# selected tiles (so some over-occupancy / higher-split candidates are explored).
+GFX1250_SPLITK_WINDOW_HI_MULT = 4
+GFX1250_CO_TOP_TILES = 6
+GFX1250_CO_TOP_CLUSTERS = 6
+_A16W16_CO_TAGS = frozenset(
+    {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
 
 # Tune-time host helpers (defined here, not in opus_gemm_common.py).
@@ -77,15 +111,12 @@ from opus_gemm_common import (
 OCCUPANCY_TILE_BM = 128
 OCCUPANCY_TILE_BN = 128
 
-BF16WS_EXACT_REDUCE_SHAPES = (
-    (64, 8),
-    (128, 4),
-    (256, 2),
-    (512, 1),
-    (1024, 4),
-    (1024, 2),
-    (1024, 1),
-    (2048, 1),
+EVEN_LOOP_SPLITK_TAGS = frozenset(
+    (
+        "a16w16_kbuf2v_sk",
+        "a16w16_kbuf2v_bk128_sk",
+        "a16w16_quad_mfma32_kbuf1_sk",
+    )
 )
 
 
@@ -93,36 +124,291 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
+def _round_up(a: int, b: int) -> int:
+    return _ceil_div(a, b) * int(b)
+
+
 def _kid_uses_bf16_workspace(k_inst):
-    return getattr(k_inst, "splitk_workspace_dtype", "fp32_t") == "bf16_t"
+    return k_inst.splitk_workspace_dtype == "bf16_t"
 
 
 def _kid_rejects_outdtype(k_inst, out_dtype):
-    return _kid_uses_bf16_workspace(k_inst) and out_dtype is not dtypes.bf16
+    # gfx942's bf16-workspace launchers currently require bf16 Y. gfx1250's
+    # #4246 two-stage path may write bf16 partials while reducing to bf16 or
+    # fp32 Y, so workspace dtype alone must not constrain the output dtype.
+    return (
+        k_inst.arch_prefix == "gfx942"
+        and _kid_uses_bf16_workspace(k_inst)
+        and out_dtype is not dtypes.bf16
+    )
 
 
 def _flatmm_splitk_pfk(k) -> int:
-    """Host-side computation of Traits::prefetch_k_iter for a splitk instance.
+    """Backward-compatible name for the canonical metadata calculation."""
+    return a16w16_flatmm_prefetch_k_iter(k)
 
-    Mirrors opus_flatmm_splitk_traits_gfx950's formula so the host can
-    pre-compute the per-split iter budget without a device call. Hardcodes
-    LDS=163840 (gfx950), same convention as the traits struct.
+
+def _gfx1250_occ_cost(total_wg: int, cu_num: int) -> float:
+    """Grid-occupancy cost for gfx1250 (lower = better; 0 inside the window).
+
+    Target window W = [CU/2, CU] (half..full machine, a 2x band). Padding is
+    deliberately NOT scored (per design). Under-occupancy (idle CUs) is a linear
+    throughput loss -> penalized GFX1250_OCC_BETA_UNDER (2x); over-occupancy is
+    only a scheduling tail the pipeline absorbs -> GFX1250_OCC_BETA_OVER (1x).
     """
-    sizeof_da = 2  # bf16
-    LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
-    LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
-    LOAD_GROUP_K = k.W_K * 2
-    num_m = k.B_M // LOAD_GROUP_M
-    num_n = k.B_N // LOAD_GROUP_N
-    num_k = k.B_K // LOAD_GROUP_K
-    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
-    smem_sub = smem_linear // LOAD_GROUP_K
-    slots = LOAD_GROUP_M // smem_sub
-    padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
-    per_glsz = slots * (smem_linear + padding) * sizeof_da
-    per_iter = (num_m + num_n) * num_k * per_glsz
-    lds_total = 163840
-    return max(1, (lds_total // max(k.WG_PER_CU, 1)) // max(per_iter, 1))
+    lo, hi = cu_num // 2, cu_num
+    if total_wg < lo:
+        return (lo - total_wg) / max(lo, 1) * GFX1250_OCC_BETA_UNDER
+    if total_wg > hi:
+        return (total_wg - hi) / max(hi, 1) * GFX1250_OCC_BETA_OVER
+    return 0.0
+
+
+def gfx1250_splitK_window(M, N, K, cu_num, k_inst, base_candidates):
+    """Prune a splitK candidate set to the grid-occupancy window for gfx1250.
+
+    grid total WG = ceil(M/B_M) * ceil(N/B_N) * splitK (gridz = splitK). splitK is
+    swept fully, then dynamically pruned: keep those landing in the window
+    [CU/2, GFX1250_SPLITK_WINDOW_HI_MULT * CU]; if none, keep the single splitK
+    closest to the window. (splitK stays the dynamic knob.)
+    """
+    gx = _ceil_div(M, k_inst.B_M)
+    gy = _ceil_div(N, k_inst.B_N)
+    base = gx * gy
+    lo = cu_num // 2
+    hi = GFX1250_SPLITK_WINDOW_HI_MULT * cu_num
+    nz = [sk for sk in base_candidates if sk >= 1]
+    if not nz:
+        return sorted(base_candidates)
+    core = [sk for sk in nz if lo <= base * sk <= hi]
+    if core:
+        return sorted(core)
+
+    def _dist(sk):
+        t = base * sk
+        return 0 if lo <= t <= hi else (lo - t if t < lo else t - hi)
+
+    return [min(nz, key=_dist)]
+
+
+GFX1250_FUSE_TOP_SPLITK = 3
+GFX1250_FUSE_MAX_SPLITK = max((key[4] for key in GFX1250_SPLITK_FUSE_KID_OF), default=0)
+
+
+def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
+    """Return a bounded exact-kid fused set for one tile.
+
+    SplitK and N-cluster geometry are compile-time, so candidate selection
+    chooses exact registry entries rather than sweeping a runtime splitK knob.
+    """
+    if N % bn != 0:
+        return []
+    layout = "tileN" if bm == 16 else "tileM"
+    num_tiles_n = N // bn
+    num_tiles_m = _ceil_div(M, bm)
+    base_wg = num_tiles_n * num_tiles_m
+    k_steps = _ceil_div(K, bk)
+    valid_n_cluster = [nc for nc in range(1, 6) if num_tiles_n % nc == 0]
+    selected_n_cluster = sorted({1, max(valid_n_cluster)}) if valid_n_cluster else [1]
+
+    out = []
+    for n_cluster in selected_n_cluster:
+        for workspace_dtype in ("bf16_t", "fp32_t"):
+            # Select SplitK independently for each exact registry family.
+            # BF16 and FP32 have different supported SplitK ranges (currently
+            # 2..15 versus 2..8), and the cluster budget narrows those ranges
+            # further.  Sharing one top-K list can therefore silently erase a
+            # valid dtype family when its occupancy optimum is outside that
+            # family's registry range.
+            valid_split_k = [
+                split_k
+                for split_k in range(2, min(k_steps, GFX1250_FUSE_MAX_SPLITK) + 1)
+                if (
+                    bm,
+                    bn,
+                    bk,
+                    layout,
+                    split_k,
+                    n_cluster,
+                    workspace_dtype,
+                )
+                in GFX1250_SPLITK_FUSE_KID_OF
+            ]
+            valid_split_k.sort(
+                key=lambda sk: (_gfx1250_occ_cost(base_wg * sk, cu_num), sk)
+            )
+            for split_k in sorted(valid_split_k[:GFX1250_FUSE_TOP_SPLITK]):
+                kid = GFX1250_SPLITK_FUSE_KID_OF.get(
+                    (
+                        bm,
+                        bn,
+                        bk,
+                        layout,
+                        split_k,
+                        n_cluster,
+                        workspace_dtype,
+                    )
+                )
+                if kid is not None:
+                    out.append(kid)
+    return out
+
+
+def _gfx1250_fuse_candidates(M, N, K, cu_num, top_tiles=GFX1250_TOP_TILES):
+    """Select fused exact kids when that experimental family is registered."""
+    fuse_tiles = sorted(
+        {(key[0], key[1], key[2]) for key in GFX1250_SPLITK_FUSE_KID_OF}
+    )
+    fuse_tiles = [tile for tile in fuse_tiles if N % tile[1] == 0]
+
+    def _score(tile):
+        bm, bn, bk = tile
+        base = (N // bn) * _ceil_div(M, bm)
+        k_steps = max(1, _ceil_div(K, bk))
+        return min(
+            (
+                _gfx1250_occ_cost(base * split_k, cu_num)
+                for split_k in range(2, min(GFX1250_FUSE_MAX_SPLITK, k_steps) + 1)
+            ),
+            default=float("inf"),
+        )
+
+    fuse_tiles.sort(key=_score)
+    out = set()
+    for tile in fuse_tiles[:top_tiles]:
+        out.update(_gfx1250_fuse_kids_for_tile(M, N, K, cu_num, *tile))
+    return out
+
+
+def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
+    """Return the fraction of rounded cluster workgroups with no output tile."""
+    launched = _round_up(gx, cwm) * _round_up(gy, cwn)
+    return (launched - gx * gy) / launched
+
+
+def _gfx1250_cluster_dims_for_grid(gx, gy, available, top_clusters, cu_num=0):
+    """Rank cluster dims by round-up waste; ``cu_num`` enables CO's CU-fit rule."""
+
+    def _roundup_is_free(cwm, cwn):
+        return cu_num > 0 and _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
+
+    feasible = [
+        (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
+        for cwm, cwn in available
+        if (cwm <= gx and cwn <= gy) or _roundup_is_free(cwm, cwn)
+    ]
+    if not feasible:
+        return []
+    admitted = [
+        candidate
+        for candidate in feasible
+        if candidate[0] <= GFX1250_MAX_CLUSTER_WASTE
+        or _roundup_is_free(candidate[1], candidate[2])
+    ]
+    if not admitted:
+        tightest = min(candidate[0] for candidate in feasible)
+        admitted = [candidate for candidate in feasible if candidate[0] == tightest]
+    bucket = GFX1250_CLUSTER_WASTE_BUCKET
+    admitted.sort(
+        key=lambda candidate: (
+            candidate[0] if bucket <= 0 else int(candidate[0] / bucket),
+            -(candidate[1] * candidate[2]),
+            abs(candidate[1] * gy - candidate[2] * gx),
+            (candidate[1], candidate[2]),
+        )
+    )
+    return [(cwm, cwn) for _waste, cwm, cwn in admitted[:top_clusters]]
+
+
+# tile -> cluster dims -> all exact kids. Multiple wave-layout variants for one
+# geometry remain together because only measurement can rank them.
+_GFX1250_CO_BY_TILE: dict[tuple[int, int, int], dict[tuple[int, int], list[int]]] = {}
+for _co_kid, _co_instance in kernels_list.items():
+    if _co_instance.kernel_tag not in _A16W16_CO_TAGS:
+        continue
+    _GFX1250_CO_BY_TILE.setdefault(
+        (_co_instance.B_M, _co_instance.B_N, _co_instance.B_K), {}
+    ).setdefault((_co_instance.cluster_wg_m, _co_instance.cluster_wg_n), []).append(
+        _co_kid
+    )
+
+
+def _gfx1250_co_candidates(
+    M,
+    N,
+    K,
+    cu_num,
+    top_tiles=GFX1250_CO_TOP_TILES,
+    top_clusters=GFX1250_CO_TOP_CLUSTERS,
+):
+    """Select a bounded tile/cluster subset of pre-built non-split-K kids."""
+
+    def _tile_score(tile):
+        bm, bn, _bk = tile
+        return _gfx1250_occ_cost(_ceil_div(M, bm) * _ceil_div(N, bn), cu_num)
+
+    selected = set()
+    tiles = sorted(_GFX1250_CO_BY_TILE, key=lambda tile: (_tile_score(tile), tile))
+    for tile in tiles[:top_tiles]:
+        bm, bn, _bk = tile
+        gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
+        available = _GFX1250_CO_BY_TILE[tile]
+        for dims in _gfx1250_cluster_dims_for_grid(
+            gx, gy, available, top_clusters, cu_num
+        ):
+            selected.update(available[dims])
+    return selected
+
+
+def _gfx1250_select_candidates(
+    M,
+    N,
+    K,
+    cu_num,
+    top_tiles=GFX1250_TOP_TILES,
+    top_clusters=GFX1250_TOP_CLUSTERS,
+    *,
+    include_fused=True,
+):
+    """Select top tiles and launcher-supported rounded cluster grids."""
+
+    def _tile_score(bm, bn, bk):
+        gx = _ceil_div(M, bm)
+        gy = _ceil_div(N, bn)
+        ks = max(1, _ceil_div(K, bk))
+        best = None
+        for sk in range(1, min(16, ks) + 1):
+            c = _gfx1250_occ_cost(gx * gy * sk, cu_num) + (sk - 1) * GFX1250_SPLITK_BIAS
+            best = c if best is None else min(best, c)
+        return best if best is not None else float("inf")
+
+    tiles = sorted(GFX1250_PLAIN_KID_OF.keys(), key=lambda t: _tile_score(*t))
+    sel = set()
+    for t in tiles[:top_tiles]:
+        sel.add(GFX1250_PLAIN_KID_OF[t])
+        bm, bn, _bk = t
+        gx = _ceil_div(M, bm)
+        gy = _ceil_div(N, bn)
+        available = {
+            (cwm, cwn): kid
+            for (tbm, tbn, tbk, cwm, cwn), kid in GFX1250_CLUSTERLAUNCH_KID_OF.items()
+            if (tbm, tbn, tbk) == t
+            and cwm <= GFX1250_MAX_CLUSTER_SIDE
+            and cwn <= GFX1250_MAX_CLUSTER_SIDE
+        }
+        for dims in _gfx1250_cluster_dims_for_grid(gx, gy, available, top_clusters):
+            sel.add(available[dims])
+
+    # Fused exact kids: bounded by tile, occupancy-fit compile-time SplitK,
+    # baseline/max feasible N-cluster, and both workspace dtypes.
+    if (
+        GFX1250_SPLITK_FUSE_ENABLED
+        and include_fused
+        and os.environ.get("OPUS_TUNE_NO_FUSE") != "1"
+    ):
+        sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
+    sel |= _gfx1250_co_candidates(M, N, K, cu_num)
+    return frozenset(sel)
 
 
 def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
@@ -136,14 +422,33 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
 
     Workspace size cap (added with the >4 GiB reduce-BR fix): each
     candidate splitK value must keep
-        split_k * batch * padded_M * padded_N * 4 <= UINT32_MAX
+        split_k * batch * padded_M * padded_N * sizeof(exact-kid D_WS)
+            <= UINT32_MAX
     so the splitk_reduce_kernel's buffer-resource num_records stays in
     range. We compute the same per-slice budget the host reject uses and
     silently drop any split_k that would push workspace past 4 GiB.
     """
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+        return [0]
+
+    if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+        # Runtime splitK is ignored by this family. Store the baked value in
+        # tuning rows so the CSV remains self-describing and never suggests a
+        # false dynamic choice.
+        return [int(k_inst.fuse_split_k)]
+
     B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
-    pfk = _flatmm_splitk_pfk(k_inst)
+    # gfx1250 cluster/TDM split-K triple-buffers but tolerates any k_steps>=1
+    # (the launcher clamps split_k so no split is empty); pfk=1. gfx950 flatmm
+    # split-K needs prefetch_k_iter iters per split.
+    if k_inst.kernel_tag in (
+        "a16w16_cluster_tdm_splitk_ws",
+        "a16w16_clusterlaunch_tdm_splitk_ws",
+    ):
+        pfk = 1
+    else:
+        pfk = _flatmm_splitk_pfk(k_inst)
 
     candidates = {0}
 
@@ -154,7 +459,8 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     # Workspace 4 GiB cap.
     padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
     padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
-    per_slice_bytes = batch * padded_M * padded_N * 4
+    workspace_bytes = 2 if _kid_uses_bf16_workspace(k_inst) else 4
+    per_slice_bytes = batch * padded_M * padded_N * workspace_bytes
     UINT32_MAX_BYTES = (1 << 32) - 1
     if per_slice_bytes > 0:
         ws_cap = UINT32_MAX_BYTES // per_slice_bytes
@@ -163,11 +469,25 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     if max_split_k < 1:
         return [0]
 
+    # 2-WG/CU co-residency cap: when wg_per_cu == 2 the grid (total workgroups,
+    # = ceil(M/B_M) * ceil(N/B_N) * split_k) MUST stay strictly < 512 (= 2 *
+    # 256-CU target) so the device holds it in a single 2-WG/CU wave and the
+    # per-CU TDM direct-copy request budget (2 * per-operand req < 256) is never
+    # oversubscribed across waves. Cap split_k accordingly; if even split_k==1
+    # already reaches 512 tiles, this wg==2 kid is not usable for this shape.
+    if getattr(k_inst, "wg_per_cu", 1) == 2:
+        num_tiles = _ceil_div(M, k_inst.B_M) * _ceil_div(N, k_inst.B_N)
+        grid_cap = (512 - 1) // num_tiles if num_tiles > 0 else 0
+        if grid_cap < 1:
+            return []
+        max_split_k = min(max_split_k, grid_cap)
+
     for kb in range(1, max_split_k + 1):
         candidates.add(kb)
 
-    # kbuf2v_sk family: launcher requires both iters_full and last_loops even AND >=2.
-    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+    # kbuf2v_sk and quad_mfma32 splitK families require both iters_full and
+    # last_loops even AND >=2.
+    if k_inst.kernel_tag in EVEN_LOOP_SPLITK_TAGS:
         total_iters = (K + k_inst.B_K - 1) // k_inst.B_K
 
         def _ok_sk(sk):
@@ -181,6 +501,14 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
             for sk in candidates
             if (sk == 0 and any_valid) or (sk >= 1 and _ok_sk(sk))
         }
+
+    # gfx1250: FULL splitK sweep -- every split_k in [1, min(16, k_steps)]
+    # (subject to the workspace / wg caps above) is benchmarked, NO
+    # grid-occupancy-window pruning. The clusterlaunch ws variant is NOT capped
+    # by 16 // (cwm*cwn): its split_k is an independent grid.z knob and the
+    # cluster (cwm x cwn <= 16) is already fixed per kid, so it sweeps full too.
+    if getattr(k_inst, "arch_prefix", "") == "gfx1250":
+        return sorted(candidates)
 
     return sorted(candidates)
 
@@ -212,6 +540,14 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    if k_inst.max_m is not None and M > k_inst.max_m:
+        return True
+
+    # CO pipelines use dimension-clamped TDM descriptors for A/B/C, have no
+    # split-K buffer, and support M/N/K tails. Their scalar extents remain int.
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+        return M < 1 or N < 1 or K < 1
+
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
     # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
     # is 32-bit -- any of the three exceeding UINT32_MAX bytes wraps and
@@ -234,59 +570,127 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
-    if _kid_uses_bf16_workspace(k_inst):
+    # The exact-N bf16-workspace restriction belongs only to the gfx942
+    # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.
+    if k_inst.arch_prefix == "gfx942" and _kid_uses_bf16_workspace(k_inst):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
             return True
-        return not any(
-            N == n_exact and M % rows == 0
-            for n_exact, rows in BF16WS_EXACT_REDUCE_SHAPES
-        )
+        return N not in GFX942_BF16WS_EXACT_N
 
     if k_inst.kernel_tag in (
         "a16w16",
         "a16w16_kbuf1_large_tile",
+        "a16w16_quad_mfma32_kbuf1",
         "a16w16_kbuf2v",
         "a16w16_kbuf2v_bk128",
-        "a16w16_kbuf1",
     ):
         # Non-splitK a16w16 family all share the same K-dbuf parity +
-        # MFMA layout constraints as a16w16 (10000).
+        # MFMA layout constraints as a16w16.
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
+
+    if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
+        waves_per_wg = k_inst.BLOCK_SIZE // 64
+        t_k = waves_per_wg // (k_inst.T_M * k_inst.T_N)
+        k_tile_full = k_inst.B_K * t_k
+        return bool(K < k_tile_full or K % k_tile_full != 0)
 
     if k_inst.kernel_tag == "a16w16_flatmm":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
         if N % 16 != 0:
             return True
-        if K % B_K != 0:
-            return True
-        return False
+        return K % B_K != 0
 
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
+        if not k_inst.has_oob and (
+            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
+        ):
+            return True
         # Workspace + reduce buffer-resource size limit.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
         per_slice_bytes = 1 * padded_M * padded_N * 4  # batch=1 in tune path
-        if per_slice_bytes > UINT32_MAX_BYTES:
-            return True
-        return False
+        return per_slice_bytes > UINT32_MAX_BYTES
 
-    # kbuf2v_sk family: launcher requires loops_per_split (both full and last) even AND >=2.
-    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+    if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+        # Fused SplitK/N-cluster values are compile-time. N must be tiled
+        # exactly because the final store has no intra-row N-tail predicate;
+        # ragged M remains safe through the bounded output descriptor.
+        if K % 2 != 0 or N % k_inst.B_N != 0:
+            return True
+        split_k = int(k_inst.fuse_split_k)
+        n_cluster = int(k_inst.fuse_m_cluster)
+        if split_k < 2 or split_k * n_cluster > 16:
+            return True
+        num_tiles_m = _ceil_div(M, k_inst.B_M)
+        num_tiles_n = N // k_inst.B_N
+        if num_tiles_n % n_cluster != 0:
+            return True
+        if split_k > _ceil_div(K, k_inst.B_K):
+            return True
+        # Mirror the exact tile-major capacity calculation. Python/C++ use
+        # size_t checks, but keep the tuner away from an unrepresentable tensor.
+        workspace_bytes = 2 if _kid_uses_bf16_workspace(k_inst) else 4
+        required_bytes = (
+            num_tiles_m
+            * num_tiles_n
+            * (split_k - 1)
+            * k_inst.B_M
+            * k_inst.B_N
+            * workspace_bytes
+        )
+        return required_bytes > (2**63 - 1)
+
+    if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
+        # gfx1250 WMMA kernel: ragged M/N ARE supported -- the main kernel
+        # TDM-clamps OOB global reads to the real (M, N) extents (tensor_dim1 =
+        # m - tile_row / n - tile_col), padded partials land in the typed
+        # workspace, and the reduce kernel only touches m in [0, M) / n in
+        # [0, N). So M=49 runs as a padded M=64 tile. Ragged K is handled via
+        # the TDM k_extent clamp. K must be even (a16w16 family). Workspace
+        # store BR is 32-bit (per-slice cap).
+        if K % 2 != 0:
+            return True
+        padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
+        padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
+        UINT32_MAX_BYTES = (1 << 32) - 1
+        # batch=1 in tune path; descriptor size follows exact-kid storage.
+        workspace_bytes = 2 if _kid_uses_bf16_workspace(k_inst) else 4
+        return padded_M * padded_N * workspace_bytes > UINT32_MAX_BYTES
+
+    if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_ws":
+        # Same numeric constraints as the plain cluster_tdm_splitk_ws variant.
+        if K % 2 != 0:
+            return True
+        padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
+        padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
+        UINT32_MAX_BYTES = (1 << 32) - 1
+        # Rounded OOB workgroups exit after the cluster barrier, so ragged and
+        # 2D cluster grids do not require exact fill.
+        # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used
+        # to fault at runtime, but the root cause was a clang<=22 (HIP<=7.2)
+        # codegen bug in the bounded-buffer C-store address lowering (it sank the
+        # uniform voffset into the unchecked buffer base and corrupted the high
+        # bits). That is now worked around in opus.hpp::gmem::_store (inline-asm
+        # voffset barrier, auto-gated to __clang_major__<=22), so large clusterlaunch
+        # tiles are safe to tune again. No tile-area cap here.
+        # batch=1 in tune path
+        return padded_M * padded_N * 4 > UINT32_MAX_BYTES
+
+    # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
+    # (both full and last) even AND >=2.
+    if k_inst.kernel_tag in EVEN_LOOP_SPLITK_TAGS:
         total_iters = _ceil_div(K, B_K)
         max_sk = max(1, min(16, total_iters // max(_flatmm_splitk_pfk(k_inst), 1)))
         for sk in range(1, max_sk + 1):
@@ -322,10 +726,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
         # mono_tile is divisible-only (has_oob=False is intrinsic; the
@@ -336,9 +740,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         # N%16 vector-store guard (same root cause as a16w16 family);
         # already implied by N%B_N==0 with B_N % 64 == 0, but keep the
         # explicit check for symmetry.
-        if N % 16 != 0:
-            return True
-        return False
+        return N % 16 != 0
 
     return False
 
@@ -347,16 +749,29 @@ def kid_rejects_bias(k_inst, bias):
     """Reject candidates that cannot consume a non-empty bias.
 
     Bias support (mirrors opus_kid_supports_bias in opus_gemm.cu):
-      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16", kid 4..9 + mirrors)
-      * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
+      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16")
+      * gfx950 a16w16_flatmm_splitk
     Rejected:
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
-      * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
-      * gfx942 splitk family (kid 10200+): silently ignored bias
-      * gfx942 non-splitK siblings (10002/03/11): no bias path
+      * gfx942 SB (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family: silently ignored bias
+      * gfx942 P1 non-splitK variants: no bias path
     """
     if not bias:
         return False
+    # gfx1250 two-stage families fold the public fp32/bf16, [N]/[batch,N]
+    # contract in the shared reducer. #4246 fused round-1 accepts only bf16
+    # [N], which the boolean tuned key cannot represent, so exclude it from
+    # bias-bearing tuning rather than producing a row that is unsafe to replay.
+    if k_inst.kernel_tag in (
+        "a16w16_cluster_tdm_splitk_ws",
+        "a16w16_clusterlaunch_tdm_splitk_ws",
+        # fuse folds a bf16 [N] bias in the last split WG (bias-aware).
+        "a16w16_clusterlaunch_tdm_splitk_fuse",
+    ):
+        return False
+    if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+        return True
     if k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk"):
         return True
     # arch_prefix distinguishes gfx942 (no bias) from gfx950 (has bias)
@@ -406,6 +821,13 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     bias = bool(bias)
     cu_num = int(cu_num)
 
+    # gfx1250: dedicated candidate filter (top-N tiles by grid-occupancy fit x
+    # {plain + top-N round-up-capable cluster dims}). Bias-bearing tuning retains
+    # the two-stage kids but omits fused round-1 kids because their bf16 [N]-only
+    # bias contract cannot be encoded by the tuned CSV's boolean bias key.
+    if _tune_arch == "gfx1250":
+        return _gfx1250_select_candidates(M, N, K, cu_num, include_fused=not bias)
+
     # Step 1: structural tile-align fallback for non-splitk pipelines.
     # K % 64 == 0 and (K // 64) % 2 == 0 required for non-splitk pipeline's
     # prefetch double-buffer + persistent ceil-K constraint.
@@ -425,21 +847,6 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         else:
             cands = narrowed
 
-    # Step 5: arch post-filter.
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-        from opus_gemm_common import kernels_list as _klist
-
-        _run_arch = get_gfx_runtime().lower()
-        cands = frozenset(
-            kid
-            for kid in cands
-            if (getattr(_klist.get(kid), "arch_prefix", "") or "gfx950").lower()
-            == _run_arch
-        )
-    except Exception:
-        pass  # unknown arch -> keep legacy multi-arch behaviour
-
     # Step 6: drop known-bad kids permanently.
     cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
@@ -455,30 +862,31 @@ def _ensure_kids_compiled(candidate_kids):
 
     Reads the subset-compile sidecar at ``_opus_sidecar_path()`` (lives in
     ``$JIT_BUILD/`` so it survives clear_build). If any kid in
-    ``candidate_kids`` (or in ``HEURISTIC_DEFAULT_KIDS``) is missing from
-    the sidecar, this function:
+    ``candidate_kids`` (or in ``DEFAULT_COMPILED_KIDS``) is missing, or its
+    receipt does not match the installed .so, this function:
 
-    1. Atomically expands the sidecar to the union of the existing
-       contents, the new candidates, and the heuristic defaults.
-    2. Clears the aiter.jit.core in-process module caches and removes
-       the on-disk .so so the next ``@compile_ops("module_deepgemm_opus")``
-       call rebuilds from scratch (the codegen step re-reads the sidecar).
+    1. Passes the new candidates as ``--extra_kernel_keys`` to codegen. The last
+       successful sidecar remains intact until the new binary is installed.
+    2. Clears the aiter.jit.core in-process module caches and requests a
+       synchronous rebuild, which removes the old .so and re-reads the
+       successful sidecar as a seed for codegen.
     3. **Synchronously triggers the rebuild here** by calling
        build_module() directly so subsequent ``mp_tuner`` spawn-ed
        children inherit a .so on disk that already contains every
        required kid. Without this synchronous step, children would race
        against the parent's lazy build and the first to dlopen() would
        get the stale subset .so and fail with
-       ``AITER_CHECK: Kernel id X not found in a16w16 tune lookup table``.
+       ``AITER_CHECK: unknown kid X for OPUS a16w16 in the launch table``.
 
     Concurrency model
     -----------------
     Two race vectors are explicitly defended against:
 
     A. **Concurrent GemmTuner / parent processes** (multi-GPU multi-script):
-       sidecar read + expand + write + build is wrapped in a ``FileBaton``
+       request + build + successful metadata publication is wrapped in a
+       ``FileBaton``
        (`$JIT_BUILD/lock_ensure_kids_opus`). One parent runs the full
-       expand+build; the rest spin on the baton, then re-read the sidecar
+       expand+build; the rest spin on the baton, then recheck the sidecar receipt
        (it may already contain what they need, in which case they skip).
 
     B. **mp_tuner spawn-ed children inheriting `AITER_REBUILD=1`**:
@@ -490,34 +898,32 @@ def _ensure_kids_compiled(candidate_kids):
        baked, and the rest then race against an in-flight build,
        producing intermittent `FileNotFoundError` / partial ELF errors.
        To shut this off we **also clear `os.environ["AITER_REBUILD"]`**
-       once our synchronous build succeeds, so every spawn child
+       once our synchronous build succeeds or a current binary is reused,
+       so every spawn child
        inherits a clean env (read: `AITER_REBUILD=0`) and goes straight
-       to `dlopen()` of the .so we just produced. The original env is
-       restored on the parent process only after this call returns;
-       the parent itself does not need the rebuild flag past this
+       to `dlopen()` of the ready .so. On build failure the original env is
+       restored; on success only the parent's in-process flag is restored.
+       The parent itself does not need the rebuild flag past this
        point because we already added ``module_deepgemm_opus`` to
        ``rebuilded_list``.
 
     Returns
     -------
     bool
-        True if a rebuild was triggered (sidecar grew), False if every
+        True if a rebuild was triggered, False if every
         required kid was already compiled.
     """
+    from opus_gemm_common import KERNEL_REGISTRY, KernelKey, default_compiled_keys
+
     from aiter.jit import core as _jit_core
+    from aiter.jit.utils.chip_info import get_build_targets
     from aiter.jit.utils.file_baton import FileBaton
-    from opus_gemm_common import heuristic_kids_for_arch
+    from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
-    # Restrict the heuristic-default kid set to the running GPU's arch.
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        _run_arch = get_gfx_runtime().lower()
-        _heuristic = heuristic_kids_for_arch({_run_arch})
-    except Exception:
-        _heuristic = HEURISTIC_DEFAULT_KIDS  # unknown -> multi-arch fallback
-    required = candidate_kids | _heuristic
+    gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
+    requests = {KernelKey("a16w16", gfx, cu, kid) for kid in candidate_kids}
+    required = {key.encode() for key in requests | default_compiled_keys(gfx, cu)}
 
     def _read_sidecar(path):
         if not os.path.exists(path):
@@ -525,14 +931,27 @@ def _ensure_kids_compiled(candidate_kids):
         try:
             with open(path) as f:
                 return set(json.load(f))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             return set()
 
     sidecar = _opus_sidecar_path()
+    artifact = os.path.join(_jit_core.get_user_jit_dir(), "module_deepgemm_opus.so")
+    rebuild_requested = _jit_core.AITER_REBUILD or int(os.getenv("AITER_REBUILD", "0"))
+    force_rebuild = (
+        rebuild_requested and "module_deepgemm_opus" not in _jit_core.rebuilded_list
+    )
 
-    # Fast path: no lock needed if we are already a strict subset of whatever sidecar happens to be
-    # on disk.
-    if required <= _read_sidecar(sidecar):
+    def _reuse_current_binary():
+        # A receipt proves kid membership, not that a user-requested source
+        # rebuild has run. Honor that request once in this parent before spawn.
+        if force_rebuild or not compiled_kids_are_current(sidecar, artifact, required):
+            return False
+        os.environ["AITER_REBUILD"] = "0"
+        return True
+
+    # A bare sidecar may come from an old version or a failed build. Require
+    # successful metadata for the currently installed artifact, not membership alone.
+    if _reuse_current_binary():
         return False
 
     os.makedirs(_jit_core.bd_dir, exist_ok=True)
@@ -543,7 +962,7 @@ def _ensure_kids_compiled(candidate_kids):
         # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
         # rebuilding.
         baton.wait()
-        if required <= _read_sidecar(sidecar):
+        if _reuse_current_binary():
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
@@ -552,23 +971,13 @@ def _ensure_kids_compiled(candidate_kids):
     try:
         compiled = _read_sidecar(sidecar)
         missing = required - compiled
-        if not missing:
+        if _reuse_current_binary():
             # Another writer beat us inside the critical section.
             return False
 
         sys.stderr.write(
-            f"[opus _ensure_kids_compiled] need to add {len(missing)} kids "
-            f"to sidecar (existing={len(compiled)}, target={len(compiled | required)})\n"
-        )
-
-        # Persist the expanded set.
-        new_set = sorted(compiled | required)
-        os.makedirs(os.path.dirname(sidecar), exist_ok=True)
-        with open(sidecar, "w") as f:
-            json.dump(new_set, f)
-        sys.stderr.write(
-            f"[opus _ensure_kids_compiled] wrote sidecar at {sidecar} with "
-            f"{len(new_set)} kids; triggering build...\n"
+            f"[opus _ensure_kids_compiled] rebuilding with {len(missing)} new kids "
+            f"(existing={len(compiled)}, target={len(compiled | required)})\n"
         )
 
         # Force a JIT rebuild scoped to JUST this build call.
@@ -589,35 +998,52 @@ def _ensure_kids_compiled(candidate_kids):
             _mds.clear()
         # Reset rebuilded_list (used by compile_ops to track "we already rebuilt this once in this process").
         _jit_core.rebuilded_list = ["module_aiter_enum"]
-        # Reset the in-process torch JIT extension versioner so the second synchronous rebuild here
-        # (sidecar grew between shape N and N+1...
-        try:
-            import sys as _sys
-
-            for _modname in ("cpp_extension", "aiter.jit.utils.cpp_extension"):
-                _mod = _sys.modules.get(_modname)
-                if _mod is None:
-                    continue
-                _jev = getattr(_mod, "JIT_EXTENSION_VERSIONER", None)
-                if _jev is None:
-                    continue
-                _entries = getattr(_jev, "entries", None)
-                if isinstance(_entries, dict):
-                    _entries.pop("module_deepgemm_opus", None)
-        except Exception:
-            pass
+        # build_module uses fixed target names and always enters incremental
+        # Ninja checks; no tuner-specific versioner reset is needed.
 
         # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
         # see a fully-baked .so on disk and...
         _build_exc = None
+        _build_succeeded = False
         try:
             d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
+            # Keep requests in this build invocation: clear_build cannot erase
+            # them, and a concurrent publisher cannot overwrite them. Codegen
+            # unions them with the current canonical seed under the build lock.
+            blob_gen_cmd = (
+                d_args["blob_gen_cmd"]
+                + " --extra_kernel_keys "
+                + " ".join(key.encode() for key in sorted(requests))
+            )
+            target_arches = {gfx} | {arch for arch, _cu in get_build_targets()}
+            targets = sorted(
+                (arch, count)
+                for arch in target_arches
+                for count in {
+                    cu
+                    for tables in KERNEL_REGISTRY.values()
+                    for cu in tables.get(arch, {})
+                }
+            )
+            blob_gen_cmd += " --targets " + " ".join(
+                f"{arch}/{count}" for arch, count in targets
+            )
+            flags_extra_hip = [*d_args["flags_extra_hip"], f"--offload-arch={gfx}"]
+            if "gfx1250" in target_arches:
+                flags_extra_hip += [
+                    "-mllvm -amdgpu-expert-scheduling-mode",
+                    "-mllvm -enable-post-misched=1",
+                ]
+                if _jit_core.parse(_jit_core.get_hip_version()) >= _jit_core.Version(
+                    "7.0.0"
+                ):
+                    flags_extra_hip.append("-DAITER_ENABLE_CLUSTER_LAUNCH")
             _jit_core.build_module(
                 md_name="module_deepgemm_opus",
                 srcs=d_args["srcs"],
                 flags_extra_cc=d_args["flags_extra_cc"],
-                flags_extra_hip=d_args["flags_extra_hip"],
-                blob_gen_cmd=d_args["blob_gen_cmd"],
+                flags_extra_hip=flags_extra_hip,
+                blob_gen_cmd=blob_gen_cmd,
                 extra_include=d_args["extra_include"],
                 extra_ldflags=d_args["extra_ldflags"],
                 verbose=d_args.get("verbose", False),
@@ -627,10 +1053,16 @@ def _ensure_kids_compiled(candidate_kids):
                 third_party=d_args.get("third_party", []),
                 hipify=d_args.get("hipify", False),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+                # A runtime builder may hold the module lock without our extra
+                # kids. Waiting for it is not evidence that our request ran.
+                build_after_wait=True,
             )
+            if not compiled_kids_are_current(sidecar, artifact, required):
+                raise RuntimeError("Opus build does not cover all tuning candidates")
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")
-        except Exception as exc:
+            _build_succeeded = True
+        except Exception as exc:  # noqa: BLE001
             _build_exc = exc
             import traceback
 
@@ -647,15 +1079,15 @@ def _ensure_kids_compiled(candidate_kids):
                 )
                 if os.path.exists(_so):
                     os.remove(_so)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
         finally:
             # Restore in-process flag for the parent (mp_tuner children
             # spawn from os.environ, not from this in-process value).
             _jit_core.AITER_REBUILD = _prev_rebuild
-            # For children: if build succeeded, force AITER_REBUILD=0 in env so spawned workers go straight
-            # to dlopen(); if build failed, res...
-            if _build_exc is None:
+            # Clear the child flag only after success. KeyboardInterrupt and
+            # SystemExit bypass the Exception handler but must restore it too.
+            if _build_succeeded:
                 os.environ["AITER_REBUILD"] = "0"
             else:
                 if _prev_rebuild_env is None:
@@ -666,9 +1098,8 @@ def _ensure_kids_compiled(candidate_kids):
         if _build_exc is not None:
             raise RuntimeError(
                 "opus_gemm subset-compile rebuild failed; see hipcc / "
-                "codegen error in stderr above. The expanded sidecar "
-                "has already been written (rerun will pick up where "
-                "this left off)."
+                "codegen error in stderr above. The successful sidecar "
+                "has not been advanced; rerun to retry the requested kids."
             ) from _build_exc
 
         return True
@@ -694,36 +1125,25 @@ OPUS_DEBUG_TUNED_CSV = os.getenv(
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 
-# Merge every a16w16-family kid into one tuner search space: * split-barrier a16w16: 4..9 legacy
-# cpol = (0, 17) (traits default) ...
+# Derive the tuner search space from the canonical registry.  Keeping a second
+# hand-maintained merge here previously omitted mono-tile and 4g-safe kids and
+# could retain stale metadata when a new family reused an existing numeric id.
 a16w16_all_kernels = {
-    **a16w16_kernels_list,
-    **a16w16_kernels_list_nooob,
-    **a16w16_kernels_list_cpol,
-    **a16w16_kernels_list_cpol_nooob,
-    **a16w16_flatmm_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list_nooob,
-    **a16w16_persistent_kernels_list,
-    **a16w16_persistent_kernels_list_cpol,
-    **a16w16_persistent_kernels_list_nooob,
-    **a16w16_persistent_kernels_list_cpol_nooob,
-    **gfx942_nosplit_kernels_list,
-    **gfx942_splitk_kernels_list,
+    kid: instance
+    for kid, instance in kernels_list.items()
+    if instance.kernel_tag.startswith("a16w16")
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
 # non-empty implementation on the run...
 try:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    _run_arch = get_gfx_runtime().lower()
+    _run_arch = _tune_arch
     a16w16_kernel_ids = sorted(
         kid
         for kid, k in a16w16_all_kernels.items()
         if (getattr(k, "arch_prefix", "") or "gfx950").lower() == _run_arch
     )
-except Exception:
+except Exception:  # noqa: BLE001
     # rocminfo unavailable -> fall back to enumerating everything so the
     # legacy multi-arch behaviour is preserved on build-only hosts.
     a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
@@ -802,9 +1222,11 @@ def generate_data(
     XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
     WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
     Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
-    # bias dtype matches Y (match_d_out convention).
+    # bias dtype matches Y (match_d_out convention). Opus bias is per-output-
+    # feature (per-N): the splitk reduce folds a [N] / [batch, N] vector
+    # (see splitk_reduce_*.cuh "per-output-feature bias"), NOT per-row (M).
     if bias:
-        bias_t = torch.randn((batch, m), dtype=outdtype, device=device)
+        bias_t = torch.randn((batch, n), dtype=outdtype, device=device)
     else:
         bias_t = None
     return XQ, WQ, Y, bias_t
@@ -814,7 +1236,7 @@ MAX_DELTA_SCALE = 0.1
 
 
 def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
-    """Reference matmul (+ optional per-row bias).
+    """Reference matmul (+ optional per-output-feature bias).
 
     out_dtype must match the tuner's Y.dtype so the post-run checkAllclose
     in mp_tuner.worker compares same-dtype tensors (mismatched dtype raises
@@ -823,27 +1245,23 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
     -> bf16 -> bf16 path.
 
     bias is summed in fp32 to match the kernel-side fp32 acc + cast order;
-    accepted shapes are [M] (broadcast across batch) or [batch, M].
+    accepted shapes are [N] (broadcast across batch) or [batch, N]. Opus folds
+    a per-output-feature (per-N) bias, matching splitk_reduce_*.cuh.
     """
     if out_dtype is None:
         out_dtype = XQ.dtype
     acc = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2))
     if bias is not None:
-        # Per-row broadcast: unsqueeze last dim so bias [..., M] -> [..., M, 1] and add across N.
-        acc = acc + bias.float().unsqueeze(-1)
+        # Per-N broadcast: unsqueeze the M axis so bias [..., N] -> [..., 1, N]
+        # and add across M (acc is [batch, M, N]).
+        acc = acc + bias.float().unsqueeze(-2)
     return acc.to(out_dtype)
 
 
 def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
-    """Eager-path tuner func: runs the kernel AND an on-the-fly max_delta check.
-
-    The check raises RuntimeError when the output is numerically off; mp_tuner's
-    worker catches it and marks the candidate invalid. Used when --no-graph is
-    passed (i.e. graph mode disabled) so the per-iter check is safe (no CUDA
-    graph capture).
-    """
+    """Launch one eager kid and reject excessive numerical error."""
     _quiet_aiter_logger_once()
-    _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
+    _opus_bmm(XQ, WQ, Y, family="a16w16", kid=kernelId, bias=bias, split_k=splitK)
     ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
@@ -876,7 +1294,7 @@ def _quiet_aiter_logger_once():
         return
     try:
         logger.setLevel(logging.WARNING)
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
 
 
@@ -884,33 +1302,9 @@ _bench_max_delta_checked = set()  # module-level per-subprocess cache
 
 
 def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
-    """Tuner bench func with capture-safe stream sync + per-task max_delta
-    safety check.
-
-    Stream sync rationale
-    ---------------------
-    When our custom run_perftest replacement (_opus_run_perftest below) uses
-    torch.cuda.Event to time the graph replay, the end-event record needs
-    the kernel in flight. The sync inside the bench func itself is for the
-    WARMUP phase (outside capture), so that max_delta check and torch.bmm
-    reference see a stable Y before validating.
-
-    The sync is gated on is_current_stream_capturing() because
-    cudaStreamSynchronize during CUDA graph capture invalidates the graph
-    (HIP returns hipErrorStreamCaptureInvalidated).
-
-    Correctness gate
-    ----------------
-    mp_tuner.worker's post-run checkAllclose(ref, Y, rtol, atol) gates on
-    *fraction* of cells above tolerance, not the max single-cell absolute
-    delta. We add a per-task max_delta check:
-      * Runs once per (XQ, WQ, Y, kid, splitK) tuple per subprocess.
-      * Skipped inside CUDA graph capture (.item() forbidden there).
-      * Raises RuntimeError on violation; mp_tuner.worker marks the
-        candidate us=-1, err_ratio=1.0.
-    """
+    """Benchmark one kid with a capture-safe, once-per-task accuracy check."""
     _quiet_aiter_logger_once()
-    _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
+    _opus_bmm(XQ, WQ, Y, family="a16w16", kid=kernelId, bias=bias, split_k=splitK)
 
     capturing = torch.cuda.is_current_stream_capturing()
 
@@ -934,7 +1328,7 @@ def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
                 raise RuntimeError(
                     f"maxDelta {max_delta:.1f} > bound {bound:.1f} "
                     f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE}) "
-                    f"for kid={kernelId} splitK={splitK} bias={bias is not None}"
+                    f"for kid={kernelId} split_k={splitK} bias={bias is not None}"
                 )
 
         # Capture-safe sync: guarantees the warmup kernel has completed before we read Y for the
@@ -1026,7 +1420,7 @@ def _install_opus_perftest_once():
         import aiter.test_common as _tc
 
         _tc.run_perftest = _opus_run_perftest
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"OpusGemmA16W16Tuner: failed to install custom run_perftest "
             f"({e}); falling back to stock version (expect empty-trace us=0 "
@@ -1035,7 +1429,8 @@ def _install_opus_perftest_once():
 
 
 class OpusGemmA16W16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": OPUS_DEBUG_TUNED_CSV,
         "untune_file": "aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv",
@@ -1046,7 +1441,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     }
 
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
-    OUT_COLUMNS = [
+    OUT_COLUMNS: ClassVar[list[Any]] = [
+        "gfx",
         "cu_num",
         "M",
         "N",
@@ -1065,6 +1461,18 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         "tflops",
         "bw",
     ]
+
+    def get_cu_num(self):
+        # base_tuner.get_cu_num() calls torch.cuda.get_device_properties(), which
+        # raises "Invalid device id" on this build's flaky device enumeration (see
+        # _patch_flaky_hip_device_count). Fall back to aiter's rocminfo-based CU
+        # probe when torch enumeration is broken. TEMPORARY.
+        try:
+            return super().get_cu_num()
+        except Exception:  # noqa: BLE001
+            from aiter.jit.utils.chip_info import get_cu_num as _cu
+
+            return _cu()
 
     def getKernelName(self, kernelId):
         k = a16w16_all_kernels.get(kernelId)
@@ -1191,7 +1599,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="Comma-separated kid id(s) to restrict the sweep to "
-            "(e.g. --kid 10201 or --kid 10200,10201). Kids must still pass "
+            "(e.g. --kid 5 or --kid 4,5). Kids must still pass "
             "the host-side shape / bias / outdtype filters; rejected kids "
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",
@@ -1235,6 +1643,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         ):
             # Build a one-row untunedf directly from CLI args.
             row = {
+                "gfx": self.get_gfx(),
                 "cu_num": self.get_cu_num(),
                 "M": int(args.shape_m),
                 "N": int(args.shape_n),
@@ -1262,6 +1671,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
+            self.untunedf["gfx"] = self.get_gfx()
             # Fill missing bias / dtype / outdtype columns with the CLI defaults so legacy CSVs (4-col key
             # without these) still tune.
             if "bias" not in self.untunedf.columns:
@@ -1291,8 +1701,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     cli_outdtype_str
                 )
 
-            self.untunedf = self.untunedf[list(self.keys)]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            self.untunedf = self.untunedf[self.keys]
 
             if len(self.tunedf) != 0:
                 # Dedup against the full 7-key.
@@ -1336,6 +1746,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         Callers outside tune() that pre-compute bpes (e.g. update_tflops_bw
         on a legacy 4/6-key CSV) can pass bpes=... explicitly to bypass.
         """
+        info, time, err = results
+        row_key = info[0]
+        gfx = row_key[7] if len(row_key) >= 8 else self.get_gfx()
         if bpes is None:
             info, _time, _err = results
             row_key = info[0]
@@ -1348,7 +1761,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             else:
                 dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
             bpes = self._bpes_from_dtype_strs(dtype_str, outdtype_str)
-        return super().calculate(results, bpes=bpes)
+        info = ((gfx, *row_key[:4]), *info[1:])
+        return super().calculate((info, time, err), bpes=bpes)
 
     def result_to_df(self, results):
         rows = []
@@ -1368,14 +1782,21 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "torch.bfloat16",
                     "torch.bfloat16",
                 )
+            gfx = keys[7] if len(keys) >= 8 else self.get_gfx()
+            instance = get_registry("a16w16", gfx, int(cu_num)).get(kernelId)
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME or time == self.INF_TIME
-                else (self.getKernelName(kernelId) if kernelName == "" else kernelName)
+                else (
+                    (instance.name if instance is not None else None)
+                    if kernelName == ""
+                    else kernelName
+                )
             )
             tflops, bw = self.calculate(el)
             rows.append(
                 {
+                    "gfx": gfx,
                     "cu_num": cu_num,
                     "M": M,
                     "N": N,
@@ -1417,7 +1838,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 if "outdtype" in df.columns
                 else "torch.bfloat16"
             )
-            keys_tuple = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            keys_tuple = (
+                cu_num,
+                M,
+                N,
+                K,
+                bias_v,
+                dtype_str,
+                outdtype_str,
+                self.get_gfx(),
+            )
             info = ((keys_tuple, df.loc[i, kid_col], df.loc[i, "splitK"], ""), us, 0)
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
@@ -1493,6 +1923,11 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
 
+        # gfx1250: the benchmark sweep is restricted per-shape to the candidate
+        # filter (top-N tiles x {plain + top-N cluster dims}); other arches keep
+        # the full per-kid reject flow.
+        _is_gfx1250 = _tune_arch == "gfx1250"
+
         # --kid filter (debug): parse the CSV list once.
         forced_kids: set[int] | None = None
         if getattr(args, "kid", None):
@@ -1514,32 +1949,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 f"OpusGemmA16W16Tuner: --kid filter active, restricting "
                 f"sweep to {sorted(forced_kids)}"
             )
-
-        # Subset-compile safety: collect every kid this debug tuner could touch (full a16w16 family
-        # minus host-side rejects per shape) an...
-        opus_candidate_kids: set[int] = set()
-        for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
-            bias_v = (
-                bool(untunedf.loc[i, "bias"])
-                if "bias" in untunedf.columns
-                else bool(args.bias)
-            )
-            shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
-            if forced_kids is not None:
-                # Make sure the requested kids are baked in even if the
-                # shape-driven candidate set would have excluded them.
-                shape_cands = shape_cands | forced_kids
-            opus_candidate_kids |= shape_cands
-        if opus_candidate_kids:
-            if _ensure_kids_compiled(opus_candidate_kids):
-                logger.info(
-                    f"opus_gemm_tune: expanded subset-compile sidecar to cover "
-                    f"{len(opus_candidate_kids)} candidate kids; "
-                    f"module_deepgemm_opus will rebuild on next call."
-                )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
@@ -1603,14 +2012,37 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
             seed = seed + 1
 
+            # gfx1250: restrict the sweep to the per-shape candidate set.
+            _gfx1250_sel = (
+                candidate_kids_for_shape(M, N, K, bias_v, cu_num)
+                if _is_gfx1250
+                else None
+            )
+
             total_kernel_nums = 0
             # 7-tuple matches self.keys; result_to_df / calculate read
             # bias / dtype / outdtype from slots 4 / 5 / 6.
-            info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            info_keys = (
+                cu_num,
+                M,
+                N,
+                K,
+                bias_v,
+                dtype_str,
+                outdtype_str,
+                self.get_gfx(),
+            )
 
             for kid in a16w16_kernel_ids:
                 # --kid filter (debug): skip everything outside the explicit set.
                 if forced_kids is not None and kid not in forced_kids:
+                    continue
+                # gfx1250 candidate filter (skipped when --kid forces a set).
+                if (
+                    _gfx1250_sel is not None
+                    and forced_kids is None
+                    and kid not in _gfx1250_sel
+                ):
                     continue
                 k_inst = a16w16_all_kernels[kid]
 
@@ -1631,7 +2063,10 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     dtypes.bf16: "bf16_t",
                     dtypes.fp32: "fp32_t",
                 }
-                _is_splitk_tag = kid in SPLITK_KIDS
+                # fuse kids carry output_dtypes=["fp32_t"] for the codegen split-K
+                # lookup invariant, but their launcher dispatches Y dtype at
+                # RUNTIME (bf16 or fp32), so exempt them from the narrowing too.
+                _is_splitk_tag = kid in SPLITK_KIDS or kid in GFX1250_SPLITK_FUSE_KIDS
                 _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
                 if _kid_rejects_outdtype(k_inst, out_dtype):
                     continue
@@ -1677,6 +2112,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
         ret = []
         if task:
+            opus_candidate_kids = {entry[0][1] for entry in task}
+            if _ensure_kids_compiled(opus_candidate_kids):
+                logger.info(
+                    f"opus_gemm_tune: synchronously rebuilt the module to cover "
+                    f"{len(opus_candidate_kids)} candidate kids; "
+                    f"module_deepgemm_opus is ready for spawned workers."
+                )
             # Silence per-task `avg: X us/iter with hipgraph` and `no valida data after post process!` spam
             # from aiter.test_common during the...
             prev_level = logger.level
@@ -1701,7 +2143,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             bad = 0
             fixed = []
             for item in ret:
-                info, us, err = item
+                info, us, _err = item
                 if us is not None and us == 0.0:
                     fixed.append((info, INVALID_TIME, 1.0))
                     bad += 1
@@ -1729,15 +2171,15 @@ if __name__ == "__main__":
         "  (or --libtype all to tune all backends in one pass).\n"
         "  gradlib writes to aiter/configs/bf16_tuned_gemm.csv (or the\n"
         "  path passed via --tuned_file / GTUNE_TUNED) and stamps every\n"
-        "  opus row with libtype='opus' so the opus runtime dispatch\n"
-        "  picks it up via aiter.ops.opus.common.lookup_tuned().\n"
+        "  opus row with libtype='opus' so aiter.tuned_gemm passes its\n"
+        "  resolved solidx directly to aiter.ops.opus.opus_gemm().\n"
+        "  This debug tuner itself uses batch-first opus_bmm() tensors.\n"
         f"  This script writes to {OPUS_DEBUG_TUNED_CSV} by default and\n"
         "  will not pollute the global aiter/configs/ tree.\n"
         "==============================================================\n"
         "\n"
     )
-    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv.
-    key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype"]
+    key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "gfx"]
     resultList = [
         "scaleAB",
         "bpreshuffle",

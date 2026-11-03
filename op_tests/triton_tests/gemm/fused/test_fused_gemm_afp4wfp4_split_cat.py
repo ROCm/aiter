@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
-from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-    fused_gemm_afp4wfp4_split_cat,
-    fused_gemm_afp4wfp4_preshuffle_split_cat,
-)
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
-    mxfp4_to_f32,
-    e8m0_to_f32,
-)
+import torch
 
-from aiter.ops.triton.utils.types import str_to_torch_dtype
-
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+    fused_gemm_afp4wfp4_preshuffle_split_cat,
+    fused_gemm_afp4wfp4_split_cat,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
+    e8m0_to_f32,
+    mxfp4_to_f32,
+)
 
 SCALE_GROUP_SIZE = 32
 
@@ -107,11 +106,11 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
 
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
-        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
-        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
 
     if layout[1] == "N":
         w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
@@ -120,10 +119,7 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
         w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
         w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
 
-    x = (
-        x_high << 4 | x_low
-    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
-    x = x.to(device="cuda")
+    x = x_high << 4 | x_low
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
@@ -137,11 +133,16 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     x_scale = x_scale.T
     w_scale = w_scale.T
     if shuffle:
+        # CDNA4-only triton kernel -> always the gfx950 scale layout.
         if M >= 32:
-            x_scales_shuffled = shuffle_scales(x_scale)
+            x_scales_shuffled = shuffle_scale_gemm(
+                x_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
         else:
             x_scales_shuffled = x_scale.contiguous()
-        w_scales_shuffled = shuffle_scales(w_scale)
+        w_scales_shuffled = shuffle_scale_gemm(
+            w_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         use_int4 = False
         weight_shuffle_layout = (16, 16)
         w_shuffed = shuffle_weight(

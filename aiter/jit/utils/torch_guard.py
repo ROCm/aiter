@@ -1,11 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+import importlib
+import types
+from collections.abc import Callable
+from typing import Any, Union, get_args, get_origin
+
 from packaging import version
 from packaging.version import Version
-import importlib
-from typing import Any, Callable, Optional, Union, List, get_args, get_origin
 
 aiter_lib = None
+_host_scalar_ops_real = False
+
+
+def run_host_scalar_ops_for_real(enabled: bool) -> bool:
+    """Make scalar-returning custom ops run their implementation instead of
+    dispatching, so they still answer under FakeTensorMode, whose fakes carry no
+    value. Returns the previous setting."""
+    global _host_scalar_ops_real
+    previous = _host_scalar_ops_real
+    _host_scalar_ops_real = enabled
+    return previous
 
 
 def is_torch_equal_or_newer(target: str) -> bool:
@@ -21,7 +35,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
 
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -44,8 +58,8 @@ MANUAL_SCHEMA_OPS = [
     "fmha_v3_varlen_bwd",
     "fmha_v3_varlen_fwd",
     "mha_batch_prefill",
-    "hipb_findallsols",
-    "rocb_findallsols",
+    "_hipb_findallsols",
+    "_rocb_findallsols",
     "_ActivationType",
     "_QuantType",
     "init_custom_ar",
@@ -65,6 +79,7 @@ NONE_WRAPPED_OP = [
     "get_graph_buffer_ipc_meta",
     "_ActivationType",
     "_QuantType",
+    "_MlaVersion",
     "_MxScaleRoundMode",
     "_MxDtype",
     # "dispose",
@@ -77,6 +92,7 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    "qr_uses_pull_q4",
     # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",
@@ -85,10 +101,13 @@ NONE_WRAPPED_OP = [
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",
+    "get_mla_decode_head_plan_v1",
+    "mla_metadata_cluster_multiplier_v1",
+    "mla_reduce_v1_supports",
 ]
 
 
-def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> str:
+def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
     import inspect
 
     import torch
@@ -107,33 +126,36 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
                 type_str = f"Tensor(a{idx}!)"
             else:
                 type_str = "Tensor"
-        elif param_type == Optional[torch.Tensor]:
-            if is_mutates:
-                type_str = f"Tensor(a{idx}!)?"
-            else:
-                type_str = "Tensor?"
-        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+        # Runtime comparison values, not annotations. Both spellings compare
+        # equal (Optional[T] == T | None), so either side may be written either way.
+        elif (
+            param_type == (torch.Tensor | None)
+            or get_origin(param_type) in (Union, types.UnionType)
+            and (torch.Tensor in get_args(param_type))
+        ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)?"
             else:
                 type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
+        elif param_type == (int | None):
+            type_str = "SymInt?"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
-        elif param_type == Optional[torch.Generator]:
+        elif param_type == (torch.Generator | None):
             type_str = "Generator?"
         elif (
-            get_origin(param_type) in (list, List)
+            get_origin(param_type) in (list, list)
             and get_args(param_type)[0] is torch.Tensor
         ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)[]"
             else:
                 type_str = "Tensor[]"
-        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+        elif get_origin(param_type) in (list, list) and get_args(param_type)[0] is int:
             type_str = "int[]"
-        elif param_type == Optional[torch.dtype]:
+        elif param_type == (torch.dtype | None):
             type_str = "ScalarType?"
         else:
             type_str = "*"
@@ -193,10 +215,10 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
 
 
 def torch_compile_guard(
-    mutates_args: Union[list[str], str] = "unknown",
+    mutates_args: list[str] | str = "unknown",
     device: str = "cpu",
-    calling_func_: Optional[Callable[..., Any]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    calling_func_: Callable[..., Any] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
 ):
     def decorator(func):
         # In core.py, we calling wrapper, but actually we need use aiter.op func
@@ -206,9 +228,10 @@ def torch_compile_guard(
             return func(*args, **kwargs)
 
         try:
-            import torch
-            from torch.library import Library
             import inspect
+
+            import torch
+            from torch.library import Library  # noqa: F401  availability probe
         except ImportError:
             return wrapper
 
@@ -293,6 +316,14 @@ def torch_compile_guard(
             )
             return result[1] if return_non_tensor else result
 
+        if return_non_tensor:
+            dispatch_custom = wrapper_custom
+
+            def wrapper_custom(*args, **kwargs):
+                if _host_scalar_ops_real:
+                    return func(*args, **kwargs)
+                return dispatch_custom(*args, **kwargs)
+
         if hasattr(torch.ops.aiter, loadName):
             return wrapper_custom
 
@@ -341,11 +372,17 @@ def torch_compile_guard(
                 tags = ()
             else:
                 tags = (torch.Tag.needs_fixed_stride_order,)
-            op_schema = f"aiter::{loadName}" + schema
+            # no ns prefix: aiter_lib adds it (torch>=2.13 won't strip dup)
+            op_schema = f"{loadName}" + schema
             aiter_lib.define(op_schema, tags=tags)
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CUDA")
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CPU")
+            aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CUDA")
+            aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
+            # The op dispatches to this very body, so a caller already running
+            # inside another aiter custom op may call it directly and skip the
+            # second torch.ops dispatch. Set only when this decorator registered
+            # the op: a pre-existing registration may run a different body.
+            wrapper_custom._eager_body = func
 
         return wrapper_custom
 

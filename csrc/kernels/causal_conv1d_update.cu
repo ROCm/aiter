@@ -2,8 +2,7 @@
 // Copyright (C) 2023-2026, Tri Dao.
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Causal 1D Convolution Update Kernel for AIter Framework
-// Adapted for AMD MI308 GPU (ROCm/HIP)
+// Causal 1D Convolution Update Kernel for AIter Framework (ROCm/HIP)
 //
 // This kernel implements causal 1D convolution update for autoregressive generation,
 // designed for Mamba-style models. It processes one or a few new tokens at a time
@@ -13,14 +12,13 @@
 // - Supports both circular and non-circular buffer modes
 // - Continuous batching support with flexible state indexing
 // - SiLU activation option
-// - Optimized for AMD MI308 GPU (64-thread wavefront)
 // - Supports fp16, bf16, and fp32 data types
 // - Convolution widths: 2, 3, 4
 
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
-#include "causal_conv1d.h"
+#include "causal_conv1d_update.h"
 #include "ck_tile/core.hpp"
 
 #define HIP_CHECK(err)                                                      \
@@ -249,7 +247,7 @@ void causal_conv1d_update_launch(ConvParamsBaseUpdate &params, hipStream_t strea
 // Dispatch based on convolution width
 template<typename input_t, typename weight_t>
 void causal_conv1d_update_dispatch(ConvParamsBaseUpdate &params, hipStream_t stream) {
-    constexpr int kNThreads = 64;  // Optimized for AMD wavefront size
+    constexpr int kNThreads = 64;
 
     if (params.width == 2) {
         causal_conv1d_update_launch<kNThreads, 2, input_t, weight_t>(params, stream);

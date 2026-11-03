@@ -5,10 +5,9 @@
 """Rotary Positional Embeddings."""
 
 import math
-from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 # from vllm.model_executor.custom_op import CustomOp
 
@@ -83,7 +82,7 @@ class RotaryEmbedding(nn.Module):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -92,7 +91,8 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device="cuda")
+                / self.rotary_dim
             )
         )
         return inv_freq
@@ -100,7 +100,7 @@ class RotaryEmbedding(nn.Module):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device="cuda")
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -113,8 +113,8 @@ class RotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
             positions = positions + offsets
@@ -164,7 +164,7 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     low = math.floor(
         _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     )
@@ -213,7 +213,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda",
+        device: str | None = "cuda",
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -278,8 +278,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
@@ -287,7 +287,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]

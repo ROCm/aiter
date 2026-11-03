@@ -1,15 +1,17 @@
+import inspect
+
 import torch
+import triton
+from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-import inspect
-from packaging.version import Version
-import triton
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
+TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
@@ -19,11 +21,11 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-        elif arch == "gfx1250":
+        elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
 
 
@@ -61,6 +63,36 @@ def _permute_accepts_constexpr_tuple() -> bool:
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
+# gfx942 (MI300X) LDS size per CU.
+_GFX942_CU_LDS_BYTES = 64 * 1024
+
+
+def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
+    """How many workgroups to put on one query row block's KV walk."""
+    MIN_SPLIT_KV = 16384
+    GFX950_SIMDS = 256 * 4
+    SPLIT_ROUNDS = 8
+    target_wgs = SPLIT_ROUNDS * waves_per_eu * GFX950_SIMDS // num_warps
+    num_blocks = triton.cdiv(seq_len, block_m)
+    if num_blocks >= target_wgs:
+        return 1
+    return min(
+        target_wgs // num_blocks,
+        max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
+    )
+
+
+def _gfx942_tile_fits_lds(
+    block_kv: int, head_size: int, num_stages: int, occupancy: int
+) -> bool:
+    # Only the double-buffered KV tile lives in LDS (Q and the fp32 scores
+    # accumulator stay in registers in Triton 3.6+). Account for `occupancy`
+    # co-resident workgroups and keep a 0.9 safety factor for compiler
+    # overhead.
+    # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
+    lds_bytes = occupancy * num_stages * block_kv * head_size
+    return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
 
 def fp8_mqa_logits(
     Q,
@@ -81,9 +113,8 @@ def fp8_mqa_logits(
     cu_starts:   [seq_len], dtype int32, start indices
     cu_ends:     [seq_len], dtype int32, end indices
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
-                  are explicitly written as -inf. If False, the kernel skips writing
-                  those positions and leaves whatever was in the output buffer there
-                  (the caller is responsible for pre-filling with -inf or ignoring them).
+                  are explicitly written as -inf. If False those positions are
+                  unspecified.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
@@ -117,12 +148,38 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        block_kv = 128
+        # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
+        # the default (128, 2) tile would not fit two co-resident workgroups
+        # on a CU; keep the default tile otherwise.
+        if arch == "gfx942" and not _gfx942_tile_fits_lds(
+            block_kv=128, head_size=head_size, num_stages=2, occupancy=2
+        ):
+            block_kv = 64
+            num_stages = 1
+        else:
+            block_kv = 128
+            num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
         if seq_len <= 1024:
             matrix_instr_nonkdim = 16
+
+        _fnuz = torch.float8_e4m3fnuz
+        # The FN->FNUZ recast + scale compensation is only correct on gfx942,
+        # whose fp8 MFMA interprets operands as FNUZ. Other fp8 archs read the
+        # operands' native dtype, so converting there would corrupt them.
+        convert_q_fn = arch == "gfx942" and Q.dtype != _fnuz
+        convert_kv_fn = arch == "gfx942" and KV.dtype != _fnuz
+        scale_mul = 1.0
+        if convert_q_fn:
+            scale_mul *= 2.0
+            Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
+        if convert_kv_fn:
+            scale_mul *= 2.0
+            KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
+        if scale_mul != 1.0:
+            kv_scales = kv_scales.to(torch.float32) * scale_mul
 
         _fp8_mqa_logits_kernel[(seq_len,)](
             Q_ptr=Q,
@@ -147,35 +204,105 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=2,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
+            enable_fp_fusion=True,
         )
     else:
+        # The buffer path keeps the row strides 32-bit and re-bases the pointer
+        # per row and per KV tile, so what must fit in int32 is the largest
+        # element offset the kernel forms, not the tensor's byte size. The
+        # fallback path widens those strides to int64 instead.
+        INT32_MAX = 2**31 - 1
+        max_kv_offset = (seq_len_kv - 1) * stride_kv_s + (head_size - 1) * stride_kv_d
+        max_logits_offset = (seq_len - 1) * stride_logits_s + (
+            seq_len_kv - 1
+        ) * stride_logits_k
+        use_buffer_load = max_kv_offset <= INT32_MAX
+        use_buffer_store = max_logits_offset <= INT32_MAX
+
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
         if arch == "gfx950":
+            MIN_BLOCK_M2_WGS = 1024
+
+            # Buffer store/load issues are resolved via changing pointer arithmetic
+            # so offsets are localized on a shifted pointer
+            use_buffer_load = True
+            use_buffer_store = True
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 3
-            num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 1
-            block_kv = 32
-            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            # Temporary workaround to handle register spill
+            waves_per_eu = 2 if TRITON_GE_38 else 3
+            num_warps = 2
+            block_kv = 64
+            # BLOCK_M=2 halves the grid, so it only pays once there are enough
+            # rows to spare or the split puts the workgroups back.
+            num_kv_splits = _gfx950_kv_splits(
+                seq_len, seq_len_kv, 2, num_warps, waves_per_eu
+            )
+            if (
+                num_heads <= 32
+                and seq_len >= 2
+                and (
+                    seq_len > 4096
+                    or triton.cdiv(seq_len, 2) * num_kv_splits >= MIN_BLOCK_M2_WGS
+                )
+            ):
+                block_m = 2
+            else:
+                block_m = 1
+                num_kv_splits = _gfx950_kv_splits(
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                )
+            # Single warp to save barrier cycles
+            if block_m == 1 and seq_len > 4096:
+                num_warps = 1
+                block_kv = 32
+                num_kv_splits = _gfx950_kv_splits(
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                )
+            # 32x32x64 over 16x16x128: its output layout leaves only one head
+            # bit in lanes, so the head sum needs one cross-lane step
+            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
+            num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
+            # Fold one head chunk at a time to lower reg. pressure
+            if (
+                num_chains >= 1
+                and num_heads > mfma_nonk_dim
+                and block_m == 1
+                and mfma_nonk_dim == 32
+            ):
+                m_chunk = mfma_nonk_dim
+            else:
+                m_chunk = 0
+            # Relax the store masking if we don't have to provide clean logits
+            relaxed_store = 0 if clean_logits else 1
+            other = {
+                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                "BLOCK_M": block_m,
+                "MFMA_NONK_DIM": mfma_nonk_dim,
+                "M_CHUNK": m_chunk,
+                # two KV tiles per loop body for the scheduler to interleave
+                "UNROLL": 2,
+                "RELAXED_STORE": relaxed_store,
+                "HAS_KV_SPLIT": 1 if num_kv_splits > 1 else 0,
+                "num_kv_splits": num_kv_splits,
+            }
+            grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
             loop_variant = 1
             waves_per_eu = 1
             num_chains = 8 if USE_FOLDED_REDUCTION else 0
             num_warps = 4
             block_kv = 128
+            # This kernel has no BLOCK_M: it walks one query row per program.
+            block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
+            grid = ((seq_len + block_m - 1) // block_m,)
 
-        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
-        # Fall back to plain global load/store when a tensor exceeds that.
-        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
+        _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
@@ -205,6 +332,7 @@ def fp8_mqa_logits(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             **other,
+            enable_fp_fusion=True,
         )
 
     return logits
