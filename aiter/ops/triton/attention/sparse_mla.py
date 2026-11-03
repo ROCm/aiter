@@ -476,16 +476,22 @@ def _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp
 _FP8_LAZY = 8
 
 
-def _fp8_heads_per_program(num_queries, num_heads, two_loops=False):
-    """64 once a row's 64-head programs alone fill the CUs (a key is then
-    gathered once per 64 heads), else up to 32, which leaves room for split-K to
-    fill them. The two-loop kernel spills at 64 heads: at 64 heads in all, two
-    32-head programs per row are faster (DSv4.1-Flash, 4-11%); at 128 the
-    64-head program still wins."""
-    if num_heads % 64 == 0 and num_queries * (num_heads // 64) >= get_num_sms():
+def _fp8_plan(num_queries, num_heads, avg_topk, two_loops=False):
+    """(heads per program, split count) for the fp8 kernel."""
+    num_cus = get_num_sms()
+    # 64 heads once that alone fills the CUs. Not for the two-loop kernel at 64
+    # heads: it spills there and 32 is faster.
+    if num_heads % 64 == 0 and num_queries * (num_heads // 64) >= num_cus:
         if not (two_loops and num_heads == 64):
-            return 64
-    return min(32, num_heads)
+            return 64, 1
+    # Short rows: fewer heads per program beats splitting, whose partials cost
+    # more than the extra gathers.
+    if math.ceil(avg_topk / 64) < 16:
+        for g in (32, 16, 8):
+            if num_heads % g == 0 and num_queries * (num_heads // g) >= num_cus // 2:
+                return g, 1
+    g = min(32, num_heads)
+    return g, _mla_num_splits(num_queries, num_heads // g, avg_topk)
 
 
 def _sparse_mla_fp8_launch(
@@ -514,15 +520,12 @@ def _sparse_mla_fp8_launch(
     out [C, H, >= 512] bf16, or None with out_mxfp8 (e4m3 data [C, H * 512],
     E8M0 scales [C, H * 16]). Returns (out, lse or None)."""
     C, H, _ = q.shape
-    G = _fp8_heads_per_program(C, H, segs is not None and segs.seg == 2)
+    avg_topk = kv_indices.numel() / max(1, C)
+    if segs is not None and segs.extra_indices is not None:
+        avg_topk += segs.extra_indices.numel() / max(1, C)
+    G, num_splits = _fp8_plan(C, H, avg_topk, segs is not None and segs.seg == 2)
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
-    else:
-        # the split count the generic kernel would take for H / G head blocks
-        avg_topk = kv_indices.numel() / max(1, C)
-        if segs is not None and segs.extra_indices is not None:
-            avg_topk += segs.extra_indices.numel() / max(1, C)
-        num_splits = _mla_num_splits(C, H // G, avg_topk)
     split = num_splits > 1
     P = _launch_splits(num_splits)
     q_bf16 = q.dtype == torch.bfloat16
