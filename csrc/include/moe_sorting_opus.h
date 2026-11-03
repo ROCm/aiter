@@ -823,7 +823,7 @@ struct MoeSortingKernel
                             smem_tokens(curr_token_id, eid)++;
                     }
                 }
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                 opus::s_wait_dscnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -952,7 +952,7 @@ struct MoeSortingKernel
                     // NOTE: this waitcnt is a must, compiler will not generate waitcnt lgkmcnt()
                     // for above write however __syncthreads will cause barrier with waves other
                     // than 0(which is not we want)
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                     opus::s_wait_dscnt(opus::number<0>{});
 #else
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -1482,8 +1482,9 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
     if(!is_oneshot)
         return false;
 
-    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
-    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8) ||
+                     (num_experts_ >= 128 && tokens_ >= 17);
     return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
 }
 
