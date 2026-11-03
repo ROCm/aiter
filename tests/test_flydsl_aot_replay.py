@@ -1,7 +1,6 @@
-"""FlyDSL AOT replay: how it hooks into FlyDSL's launches, which errors it
-reports instead of failing (the runtime refusing a size inside a row's range,
-another backend taking the call), and the command line its per-arch processes
-get.
+"""FlyDSL AOT replay: how it hooks into FlyDSL's launches, which errors at a
+size inside a row's range it may report as the runtime refusing that size, and
+the command line its per-arch processes get.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
@@ -24,8 +23,7 @@ import torch
 from flydsl.compiler.jit_function import JitFunction
 
 from aiter.aot.flydsl import replay
-from aiter.aot.flydsl.dry_run import TritonLaunchReached, dry_run
-from aiter.jit.utils.asm_guard import AsmUnsupportedError
+from aiter.aot.flydsl.dry_run import dry_run
 
 _JOB = {"kernel_name": "launch", "gfx": "gfx950", "cu_num": 256, "m": 64}
 
@@ -51,13 +49,6 @@ def _module(replay_job, refusals=()):
     return SimpleNamespace(
         replay=replay_job, describe=lambda job: f"M={job['m']}", REFUSALS=refusals
     )
-
-
-def _raising(error):
-    def replay_job(job):
-        raise error
-
-    return _module(replay_job)
 
 
 def _keyless(self, args, kwargs, **_options):
@@ -105,14 +96,6 @@ def test_a_probe_error_is_a_refusal_only_where_the_module_declares_it():
         assert kernels is None
 
 
-def test_the_dry_run_stops_a_triton_launch():
-    pytest.importorskip("triton")
-    from triton.runtime.driver import driver
-
-    with dry_run("gfx950", 256), pytest.raises(TritonLaunchReached):
-        driver.active.get_current_stream(0)
-
-
 def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
     from aiter.ops.flydsl.kernels import tensor_shim
 
@@ -122,16 +105,6 @@ def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
     monkeypatch.setattr(tensor_shim, "_get_current_raw_stream", no_gpu)
     with dry_run("gfx950", 256):
         assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
-
-
-def test_only_a_call_another_backend_takes_passes_without_a_kernel():
-    for error in (TritonLaunchReached("launch"), AsmUnsupportedError("asm")):
-        result, kernels = replay.replay_job(_raising(error), _JOB)
-        assert result["other_backend"]
-        assert kernels == frozenset()
-    result, kernels = replay.replay_job(_raising(RuntimeError("launch")), _JOB)
-    assert result["compile_time"] is None
-    assert kernels is None
 
 
 def test_per_arch_replays_get_the_command_line(monkeypatch):

@@ -9,10 +9,6 @@ logger = logging.getLogger("aiter")
 _A0_ALLOWLIST: frozenset[str] = frozenset()
 
 
-class AsmUnsupportedError(RuntimeError):
-    """The shipped gfx1250 asm kernels do not run on this device (A0)."""
-
-
 def _probe_arch_is_gfx1250() -> bool:
     # Arch undeterminable -> don't block; the C++ gate is authoritative for A0.
     try:
@@ -56,7 +52,7 @@ def require_gfx1250_asm(op_name: str) -> None:
     """Raise on gfx1250 A0 (shipped asm is B0+ only); no-op otherwise."""
     if _ASM_SUPPORTED or op_name in _A0_ALLOWLIST:
         return
-    raise AsmUnsupportedError(
+    raise RuntimeError(
         f"{op_name} asm is only supported on gfx1250 B0+ "
         "(current device is gfx1250 A0)."
     )

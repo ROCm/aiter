@@ -176,7 +176,7 @@ def replay_job(
     size inside a row's range rather than the row's own), is an error the
     module names in ``REFUSALS``: a limit the runtime meets there (e.g. no
     FlyDSL kernel that fits an untuned M)."""
-    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.dry_run import GpuRuntimeReached, dry_run
 
     arch = job_arch(job, getattr(module, "AOT_ARCH_DEFAULT", "gfx950"))
     description = module.describe(job)
@@ -196,7 +196,12 @@ def replay_job(
             result["compile_time"] = 0.0
             result["unsupported"] = str(error) or type(error).__name__
         except Exception as error:  # noqa: BLE001
-            if _in_other_backend(error) and not _in_flydsl(error) and not kernels:
+            if (
+                not isinstance(error, (GpuRuntimeReached, ReplayHookBroken))
+                and _in_other_backend(error)
+                and not _in_flydsl(error)
+                and not kernels
+            ):
                 # The runtime handed the call to another backend (Triton, or
                 # asm the arch gate refuses), whose launch the dry run cannot
                 # carry out; it has no FlyDSL kernel to compile. Any other
@@ -228,14 +233,17 @@ def replay_job(
 _AOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _in_other_backend(error: BaseException) -> bool:
-    """Whether ``error`` is a backend other than FlyDSL taking the call: a
-    Triton launch, which the dry run stops, or the gate in front of the asm
-    kernels refusing it."""
-    from aiter.aot.flydsl.dry_run import TritonLaunchReached
-    from aiter.jit.utils.asm_guard import AsmUnsupportedError
+# Code of the backends a replay hands calls to without reaching FlyDSL: Triton
+# (the package and aiter's Triton ops) and the gate in front of asm kernels.
+_OTHER_BACKENDS = (f"{os.sep}triton{os.sep}", f"{os.sep}asm_guard.py")
 
-    return isinstance(error, (TritonLaunchReached, AsmUnsupportedError))
+
+def _in_other_backend(error: BaseException) -> bool:
+    return any(
+        marker in frame.filename
+        for frame in traceback.extract_tb(error.__traceback__)
+        for marker in _OTHER_BACKENDS
+    )
 
 
 def _in_flydsl(error: BaseException) -> bool:

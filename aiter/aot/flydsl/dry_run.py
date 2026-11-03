@@ -55,11 +55,6 @@ class GpuRuntimeReached(RuntimeError):
     """Host code under :func:`dry_run` reached the GPU runtime."""
 
 
-class TritonLaunchReached(RuntimeError):
-    """Host code under :func:`dry_run` handed a call to Triton, whose launch
-    the dry run does not carry out."""
-
-
 def _forbid(*_args, **_kwargs):
     raise GpuRuntimeReached("FlyDSL AOT dry run reached the GPU runtime")
 
@@ -85,7 +80,7 @@ class _TritonDriver:
         return 0
 
     def __getattr__(self, name):
-        raise TritonLaunchReached(f"Triton {name} is outside the FlyDSL AOT dry run")
+        raise RuntimeError(f"Triton {name} is outside the FlyDSL AOT dry run")
 
 
 def _triton_driver_patches(arch: str) -> list:
