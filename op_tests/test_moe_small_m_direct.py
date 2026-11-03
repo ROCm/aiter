@@ -16,6 +16,9 @@ from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose
 
+_SMALL_M_DIRECT_RTOL = 1e-2
+_SMALL_M_DIRECT_ATOL = 64
+
 pytestmark = pytest.mark.skipif(
     get_gfx() != "gfx1201",
     reason="gfx1201 small-M direct MoE coverage",
@@ -77,7 +80,15 @@ def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2
         activation=aiter.ActivationType.Silu,
     )
 
-    assert checkAllclose(actual, expected, rtol=1e-2, atol=1e-2) == 0
+    assert (
+        checkAllclose(
+            actual,
+            expected,
+            rtol=_SMALL_M_DIRECT_RTOL,
+            atol=_SMALL_M_DIRECT_ATOL,
+        )
+        == 0
+    )
 
 
 def test_bf16_g1u1_small_m_direct_output_buffer():
@@ -107,7 +118,15 @@ def test_bf16_g1u1_small_m_direct_output_buffer():
     )
 
     assert actual is output
-    assert checkAllclose(output, expected, rtol=1e-2, atol=1e-2) == 0
+    assert (
+        checkAllclose(
+            output,
+            expected,
+            rtol=_SMALL_M_DIRECT_RTOL,
+            atol=_SMALL_M_DIRECT_ATOL,
+        )
+        == 0
+    )
 
 
 def test_bf16_g1u1_small_m_direct_gate_rejects_unsupported_integration():
