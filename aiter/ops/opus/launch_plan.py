@@ -591,7 +591,7 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
         return family
 
-    if has_workspace:
+    if has_workspace and family != _A8W8_BPRESHUFFLE_FAMILY:
         raise ValueError(f"OPUS family {family} does not use workspace")
     if split_k != 0:
         raise ValueError(f"OPUS family {family} does not accept split_k")

@@ -945,18 +945,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y);
-"""
-        MANIFEST_BLOCKSCALE_BPRESHUFFLE_WORKSPACE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &workspace);
+    aiter_tensor_t &Y{workspace_param});
 """
         # a8w8 noscale (3 args, no splitK) has its own exact-kid table.
         MANIFEST_NOSCALE_3ARG = """
@@ -1017,12 +1006,16 @@ void
             elif k.kernel_tag == "a8w8_scale":
                 parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                manifest = (
-                    MANIFEST_BLOCKSCALE_BPRESHUFFLE_WORKSPACE
+                workspace_param = (
+                    ",\n    aiter_tensor_t &workspace"
                     if _is_bpreshuffle_workspace_instance(k)
-                    else MANIFEST_BLOCKSCALE_BPRESHUFFLE
+                    else ""
                 )
-                parts.append(manifest.format(kernel_name=k.name))
+                parts.append(
+                    MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(
+                        kernel_name=k.name, workspace_param=workspace_param
+                    )
+                )
             else:
                 raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
         # Every TU includes this header, so rewriting it unconditionally would

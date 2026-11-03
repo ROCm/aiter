@@ -258,5 +258,6 @@ def _opus_dispatch(
             kid=kid,
             route_arch=route_arch,
             instance=instance,
+            workspace=workspace,
         )
     raise RuntimeError(f"unsupported canonical OPUS family {family!r}")

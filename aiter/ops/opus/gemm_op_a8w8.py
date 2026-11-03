@@ -99,6 +99,7 @@ def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_launch_fake_tensors(
     w_scale: Tensor,
     Y: Tensor,
     kid: int,
+    workspace: Tensor | None = None,
 ) -> Tensor:
     return Y
 
@@ -116,35 +117,7 @@ def _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
     w_scale: Tensor,
     Y: Tensor,
     kid: int,
-) -> Tensor: ...
-
-
-def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_fake_tensors(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Y: Tensor,
-    kid: int,
-    workspace: Tensor,
-) -> Tensor:
-    return Y
-
-
-@compile_ops(
-    "module_deepgemm_opus",
-    fc_name="opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch",
-    gen_fake=_gen_opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_fake_tensors,
-    develop=True,
-)
-def _opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_raw(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Y: Tensor,
-    kid: int,
-    workspace: Tensor,
+    workspace: Tensor | None = None,
 ) -> Tensor: ...
 
 
@@ -245,25 +218,15 @@ def _launch_a8w8_backend(
             raise RuntimeError(
                 "A8W8 blockscale-bpreshuffle backend received split-K state"
             )
-        if workspace is None:
-            _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-                XQ,
-                WQ,
-                x_scale,
-                w_scale,
-                Y,
-                kid,
-            )
-        else:
-            _opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_raw(
-                XQ,
-                WQ,
-                x_scale,
-                w_scale,
-                Y,
-                kid,
-                workspace,
-            )
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Y,
+            kid,
+            workspace,
+        )
         return
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
@@ -376,7 +339,7 @@ def _validate_a8w8_blockscale_bpreshuffle_workspace_tensors(
     route_arch: str | None,
 ) -> int:
     """Validate small-shape metadata before allocating FP32 workspace."""
-    entry = "opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch"
+    entry = "opus_gemm_a8w8_blockscale_bpreshuffle_launch"
     tensors = (XQ, WQ, Y, x_scale, w_scale)
     if any(not isinstance(tensor, Tensor) for tensor in tensors):
         raise TypeError(f"{entry}: XQ/WQ/Y/x_scale/w_scale must be Tensors")

@@ -9,7 +9,8 @@
 template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0,
     int WaveM = 4, int GroupM = 0, int CacheA = 0, int CacheB = 0,
     bool FragmentArrays = false,
-    bool XcdOrder = false, bool BoundedOutput = false, int PublishM = 0, int GroupN = 8>
+    bool XcdOrder = false, bool BoundedOutput = false, int PublishM = 0, int GroupN = 8,
+    bool RawScales = false>
 struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     // Wave64 topology and block/MFMA tile dimensions.
     static constexpr int BLOCK_SIZE = WaveM * 2 * 64;
@@ -41,7 +42,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int E_M = B_M / (T_M * W_M);
     static constexpr int E_N = B_N / (T_N * W_N);
     static constexpr int E_K = 1;
-    static constexpr int A_RING = E_M < 3 ? E_M : 3;
+    static constexpr int A_RING = RawScales ? E_M : (E_M < 3 ? E_M : 3);
 
     static_assert(E_M >= 2 && B_N >= NUM_WAVES * 16);
 
@@ -50,10 +51,11 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int GROUPED_M = GroupM;
     static constexpr int CACHE_A = CacheA;
     static constexpr int CACHE_B = CacheB;
+    static constexpr bool RAW_SCALES = RawScales;
 
     static_assert(GroupM == 0 || GroupM == 4 || GroupM == 8);
     static_assert(CacheA == 0 || CacheA == 1 || CacheA == 17);
-    static_assert(CacheB == 0 || CacheB == 1 || CacheB == 17);
+    static_assert(CacheB == 0 || CacheB == 1 || CacheB == 17 || (RawScales && CacheB == 2));
 
     // Keep fragments in separate arrays when requested by the JIT configuration.
     static constexpr bool FRAGMENT_ARRAYS = FragmentArrays;
@@ -113,7 +115,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int SFA_K_COLUMNS_PER_PASS = NUM_WAVES * SFA_K_COLUMNS_PER_WAVE;
     static constexpr int SFA_PASSES_PER_CACHE_PANEL = (SCALE_PANEL + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
     static constexpr int SFA_PANEL_PITCH = A_SCALE_PACKS * T_M * W_M * VEC_SF;
-    static constexpr int SFA_BYTES = SFA_PANEL_PITCH * SCALE_PANEL;
+    static constexpr int SFA_BYTES = RawScales ? B_M * SCALE_PANEL : SFA_PANEL_PITCH * SCALE_PANEL;
     static constexpr int SFB_BYTES = SCALE_PANEL * sizeof(unsigned);
 
     // Scale-panel passes must cover the K columns and M rows.
@@ -131,4 +133,40 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int OUTPUT_PASSES = B_M * B_N / (BLOCK_SIZE * VEC_OUTPUT);
     static_assert(B_M * C_LDS_ROW_STRIDE_ELEMS * sizeof(opus::bf16_t) <= LDS_BYTES);
     static_assert(B_M * B_N % (BLOCK_SIZE * VEC_OUTPUT) == 0);
+};
+
+// Compatibility argument order for the raw-scale ping-pong policy.
+template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0, int WaveM = 4,
+         int GroupM = 0, int CacheA = 0, int CacheB = 0, bool FragmentArrays = false,
+         bool PinA = false, bool PinB = false, bool PinC = false, bool XcdOrder = false>
+struct opus_gemm_bpreshuffle_lds_panel_traits
+    : opus_gemm_bpreshuffle_pingpong_lds_traits<BlockM, BlockN, ScalePanel, FixedK, WaveM, GroupM,
+                                                CacheA, CacheB, FragmentArrays, XcdOrder, false, 0,
+                                                8, true> {
+    using Base =
+        opus_gemm_bpreshuffle_pingpong_lds_traits<BlockM, BlockN, ScalePanel, FixedK, WaveM, GroupM,
+                                                  CacheA, CacheB, FragmentArrays, XcdOrder, false,
+                                                  0, 8, true>;
+    static_assert(!PinA && !PinB && !PinC, "Raw-scale ping-pong does not support AGPR pinning");
+    static_assert(ScalePanel > 0 && (FixedK == 0 || FixedK >= 128));
+    static constexpr bool PIN_A = false;
+    static constexpr bool PIN_B = false;
+    static constexpr bool PIN_C = false;
+    static constexpr int C_REGS = BlockM * BlockN / Base::BLOCK_SIZE;
+    static constexpr int MIN_K = 128;
+
+    // Raw M-scale vectors are transposed into the MFMA scale words on read.
+    static constexpr int SFA_K_PANEL = ScalePanel < 32 ? ScalePanel : 32;
+    static constexpr int SFA_K_PASSES = ScalePanel / SFA_K_PANEL;
+    static constexpr int SFA_THREADS_PER_GROUP = Base::BLOCK_SIZE / SFA_K_PANEL;
+    static constexpr int SFA_K_COLUMNS_PER_WAVE = Base::WARP_SIZE / SFA_THREADS_PER_GROUP;
+    static constexpr int SFA_ROWS_PER_PASS = SFA_THREADS_PER_GROUP * Base::VEC_SCALE_A;
+    static constexpr int SFA_PASSES = (BlockM + SFA_ROWS_PER_PASS - 1) / SFA_ROWS_PER_PASS;
+
+    static_assert(Base::BLOCK_SIZE % ScalePanel == 0);
+    static_assert(SFA_THREADS_PER_GROUP <= Base::WARP_SIZE);
+    static_assert(Base::WARP_SIZE % SFA_THREADS_PER_GROUP == 0);
+    static_assert(Base::T_N * Base::T_M * SFA_K_COLUMNS_PER_WAVE == SFA_K_PANEL);
+    static_assert(SFA_K_PANEL * SFA_K_PASSES == ScalePanel);
+    static_assert(SFA_PASSES * SFA_ROWS_PER_PASS >= BlockM);
 };

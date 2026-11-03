@@ -160,7 +160,7 @@ def test_a8w8_opus_families_use_explicit_exact_kids(
     called_name, raw_args, raw_kwargs = calls[0]
     assert called_name == raw_name
     assert raw_kwargs == {}
-    assert raw_args[-1] == kid
+    assert raw_args[-2 if layout == "bpreshuffle" else -1] == kid
 
     raw_xq, raw_wq = raw_args[:2]
     assert raw_xq.shape == (1, *XQ.shape)
@@ -170,6 +170,7 @@ def test_a8w8_opus_families_use_explicit_exact_kids(
 
     if layout == "bpreshuffle":
         raw_x_scale, raw_w_scale, raw_y = raw_args[2:5]
+        assert raw_args[-1] is None
     elif with_scale:
         raw_y, raw_x_scale, raw_w_scale = raw_args[2:5]
     else:
@@ -179,9 +180,67 @@ def test_a8w8_opus_families_use_explicit_exact_kids(
     assert raw_y.shape == (1, *Y.shape)
     assert raw_y.data_ptr() == Y.data_ptr()
     if with_scale:
-        assert len(raw_args) == 6
+        assert len(raw_args) == (7 if layout == "bpreshuffle" else 6)
         assert raw_x_scale is x_scale
         assert raw_w_scale is w_scale
+
+
+@pytest.mark.parametrize("split_k", (2, 4))
+def test_bpreshuffle_public_forwards_reusable_workspace(monkeypatch, split_k):
+    from aiter.ops.opus import dispatch
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", 256)
+    kid, instance = next(
+        (kid, instance)
+        for kid, instance in registry.items()
+        if instance.bpreshuffle_split_k == split_k
+    )
+    calls = []
+
+    def capture(XQ, WQ, x_scale, w_scale, Y, **kwargs):
+        calls.append(kwargs)
+        return Y
+
+    monkeypatch.setattr(dispatch, "_device_arch_and_cu", lambda _: ("gfx950", 256))
+    monkeypatch.setattr(opus_a8w8, "_launch_a8w8_blockscale_bpreshuffle_gemm", capture)
+    XQ = torch.empty((2, 128), dtype=dtypes.fp8)
+    WQ = torch.empty((128, 128), dtype=dtypes.fp8)
+    Y = torch.empty((2, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((2, 1), dtype=torch.uint8)
+    w_scale = torch.empty((1, 1), dtype=torch.uint8)
+    workspace = torch.empty((split_k * 2 * 128,), dtype=torch.float32)
+
+    assert opus_gemm(
+        XQ,
+        WQ,
+        Y,
+        family="a8w8_blockscale_bpreshuffle",
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        kid=kid,
+        workspace=workspace,
+    ) is Y
+    assert len(calls) == 1
+    assert calls[0]["kid"] == kid
+    assert calls[0]["instance"] is instance
+    assert calls[0]["workspace"] is workspace
+
+
+def test_bpreshuffle_direct_kid_rejects_workspace():
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx942", 304)
+    kid, instance = next(iter(registry.items()))
+    XQ = torch.empty((128, 128), dtype=dtypes.fp8)
+    Y = torch.empty((128, 128), dtype=torch.bfloat16)
+    scale = torch.empty((1, 1), dtype=torch.float32)
+    workspace = torch.empty((1,), dtype=torch.float32)
+    with pytest.raises(ValueError, match="does not use workspace"):
+        opus_a8w8._launch_a8w8_blockscale_bpreshuffle_gemm(
+            XQ, XQ, scale, scale, Y, kid=kid, instance=instance, workspace=workspace
+        )
 
 
 def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
