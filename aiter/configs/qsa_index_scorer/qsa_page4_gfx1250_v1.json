@@ -64,11 +64,12 @@
   "generated_by": {
     "tool": "aiter.ops.qsa_index_scorer.gen_profile",
     "version": 1,
-    "mode": "emit",
+    "mode": "check",
     "plan": "builtin (target buckets + Phase-1 GPU suite shapes)",
     "evidence": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
     "evidence_policy": "bf16 rows: Phase-1 GPU evidence on a78c285c carried by ISA identity; fp8 rows: pending fresh GPU evidence on 82c4dec5",
-    "note": "exact rows only; pending rows are never selected at runtime"
+    "note": "exact rows only; pending rows are never selected at runtime",
+    "checked_at": "2026-11-03T04:33:19+00:00"
   },
   "rows": [
     {
@@ -100,16 +101,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I1_e2e_decode_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 4194256,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.178571417927742,
+            "mean_abs_err": 2.0793191879420192e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I1_e2e_decode_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -142,16 +162,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I3_e2e_draft_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.draft.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 1048576,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.03448270261287689,
+            "mean_abs_err": 2.1017118001509516e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I3_e2e_draft_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -185,16 +224,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I14_decode_c32768_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 2097152,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.178571417927742,
+            "mean_abs_err": 2.0774069753315416e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I14_decode_c32768_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -226,7 +284,32 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending"
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.draft.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 524288,
+            "bad": 0,
+            "max_abs_err": 4.76837158203125e-06,
+            "max_rel_err": 0.003105593379586935,
+            "mean_abs_err": 2.0987566529129253e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
@@ -261,16 +344,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "prefill_chunk512_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32_persist.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 33537920,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.15625,
+            "mean_abs_err": 2.0518614007869473e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "prefill_chunk512_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -304,7 +406,32 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending"
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32_persist.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 20965040,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.06756757199764252,
+            "mean_abs_err": 2.055229231245903e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
@@ -339,15 +466,39 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 4194256,
+            "bad": 0,
+            "max_abs_err": 1.1444091796875e-05,
+            "max_rel_err": 0.09990641474723816,
+            "mean_abs_err": 6.247699388950423e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "I2_e2e_decode_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     },
     {
       "sig": "68858e6b8fa47ae6",
@@ -378,15 +529,39 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.draft.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 1048576,
+            "bad": 0,
+            "max_abs_err": 9.5367431640625e-06,
+            "max_rel_err": 0.13477279245853424,
+            "mean_abs_err": 6.307730018306756e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "I3_e2e_draft_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     },
     {
       "sig": "1f9409ec9139f01e",
@@ -418,7 +593,32 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending"
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 2097152,
+            "bad": 0,
+            "max_abs_err": 9.5367431640625e-06,
+            "max_rel_err": 0.09990641474723816,
+            "mean_abs_err": 6.247371402423596e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
@@ -452,7 +652,32 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending"
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.draft.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 524288,
+            "bad": 0,
+            "max_abs_err": 8.58306884765625e-06,
+            "max_rel_err": 0.005888954736292362,
+            "mean_abs_err": 6.297265144894482e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
@@ -486,15 +711,39 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32_fp8.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 33537920,
+            "bad": 0,
+            "max_abs_err": 1.33514404296875e-05,
+            "max_rel_err": 1.0,
+            "mean_abs_err": 6.220919317456719e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "prefill_chunk512_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     },
     {
       "sig": "0a918b666da3ae9e",
@@ -525,7 +774,32 @@
         "max_ctx": 262144
       },
       "golden": {
-        "status": "pending"
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32_fp8.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 20965040,
+            "bad": 0,
+            "max_abs_err": 9.5367431640625e-06,
+            "max_rel_err": 0.12334121763706207,
+            "mean_abs_err": 6.223112904990558e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": "not yet golden-checked on GPU for this kernel: run `gen_profile check`"
@@ -559,20 +833,39 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 253,
+            "bad": 0,
+            "max_abs_err": 1.9073486328125e-06,
+            "max_rel_err": 5.227502242632909e-06,
+            "mean_abs_err": 2.871271362892003e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "I5_min_decode_bf16",
           "edge_visible_zero_bf16",
           "edge_t2r_invalid_bf16",
           "edge_bad_page_bf16",
           "edge_page_oob_bf16"
         ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
-        "comparator": "qsa_golden.compare_logits",
-        "rtol": 0.0001,
-        "atol": 0.0001
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -607,18 +900,42 @@
         "max_ctx": 256
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 253,
+            "bad": 0,
+            "max_abs_err": 3.814697265625e-06,
+            "max_rel_err": 8.711358532309532e-05,
+            "mean_abs_err": 5.966464868834009e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "I5_min_decode_fp8",
           "edge_bad_page_fp8",
           "edge_page_oob_fp8",
           "edge_short_ctx_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     },
     {
       "sig": "a2d7dcdf0b62c8ad",
@@ -649,16 +966,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I6_2req_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 2028,
+            "bad": 0,
+            "max_abs_err": 2.86102294921875e-06,
+            "max_rel_err": 0.0001306366903008893,
+            "mean_abs_err": 1.965223788147341e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I6_2req_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -693,15 +1029,39 @@
         "max_ctx": 512
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 2028,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.0005728958640247583,
+            "mean_abs_err": 6.142548727439134e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "I6_2req_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     },
     {
       "sig": "4036750faef532a4",
@@ -731,16 +1091,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I7_64rows_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 16112,
+            "bad": 0,
+            "max_abs_err": 3.814697265625e-06,
+            "max_rel_err": 4.1392591811018065e-05,
+            "mean_abs_err": 2.0071119877229648e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I7_64rows_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -773,16 +1152,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "I8_272rows_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.r32.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 32470,
+            "bad": 0,
+            "max_abs_err": 3.814697265625e-06,
+            "max_rel_err": 0.0002070172195089981,
+            "mean_abs_err": 2.027403951387896e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "I8_272rows_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -816,16 +1214,35 @@
       },
       "golden": {
         "status": "pass",
-        "source": "phase1: _g2/run_gpu.py --stage correctness on kernel a78c285c (a08-1 GPU3, root, 2026-11-03, 22/22 PASS default env)",
-        "cases": [
-          "tail_columns_1000_bf16"
-        ],
-        "kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "kernel_git_rev": "a78c285c",
-        "isa_identity": "bf16 ISA byte-identical a78c285c -> 82c4dec5: 82c4dec5 commit body + _g2/ROUND_FP8PERF.md isa2 (38/38 bf16/legacy byte-identical vs 2e20f23b) + _g2/ROUND_W64FIX2.md (bf16 unchanged vs a78c285c); stage2r2 isa_audit_qsa_index_scorer.py --base-source a78c285c on the profiled bf16 rows",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 8000,
+            "bad": 0,
+            "max_abs_err": 2.86102294921875e-06,
+            "max_rel_err": 3.2848001865204424e-05,
+            "mean_abs_err": 2.0780986176305305e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
         "comparator": "qsa_golden.compare_logits",
         "rtol": 0.0001,
-        "atol": 0.0001
+        "atol": 0.0001,
+        "phase1_cases": [
+          "tail_columns_1000_bf16"
+        ],
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
       "notes": ""
@@ -860,15 +1277,39 @@
         "max_ctx": 4096
       },
       "golden": {
-        "status": "pending",
-        "stale_cases": [
+        "status": "pass",
+        "checked": {
+          "decision": "ok",
+          "vid": "qsa.page4.decg.v1",
+          "golden": {
+            "pass": true,
+            "visible_equal": true,
+            "checked": 8000,
+            "bad": 0,
+            "max_abs_err": 5.7220458984375e-06,
+            "max_rel_err": 0.0001349452941212803,
+            "mean_abs_err": 6.350111334540998e-07,
+            "rtol": 0.0001,
+            "atol": 0.0001
+          },
+          "outside_diff": 0,
+          "nan": 0,
+          "row_starts_zero": true
+        },
+        "checked_at": "2026-11-03T04:33:19+00:00",
+        "device": "gfx1250 cu=256",
+        "kernel_sha256": "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
+        "golden_revision": "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8",
+        "comparator": "qsa_golden.compare_logits",
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "phase1_cases": [
           "tail_columns_1000_fp8"
         ],
-        "stale_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c",
-        "stale_kernel_git_rev": "a78c285c"
+        "phase1_kernel_sha256": "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
       },
       "generated_by": "aiter.ops.qsa_index_scorer.gen_profile@1",
-      "notes": "82c4dec5 changed every fp8 kernel (fp8 WMMA-hazard fix: intrinsic pk8 converter; decode-group w64 + sched base; draft sched qpre): Phase-1 evidence on a78c285c does not apply -> run `gen_profile check` on GPU"
+      "notes": ""
     }
   ]
 }
