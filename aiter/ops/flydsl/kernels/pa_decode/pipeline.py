@@ -80,113 +80,123 @@ class PaDecodePipeline:
                     v_flat0.extend(self.kv.load_v(v_page_pf0, vh))
                 v_pf0 = fx.Vector.from_elements(v_flat0, dtype=fx.Int64)
             init_state.append(v_pf0)
-        # Single-tile plans eliminate loop/history but keep absolute tt for
-        # addressing and masks; the outer guard excludes padded tasks.
-        loop_start = (
-            0 if const_expr(self.traits.single_tile_plan) else self.ctx.part_start
-        )
-        loop_end = 1 if const_expr(self.traits.single_tile_plan) else self.ctx.part_end
         # The d256 pipe keeps its M-tiles on the single-tile schedule.
         multi_query = self.traits.M_TILES > 1 and not self.traits.D256_PIPE
-        for loop_i, ostate in range(loop_start, loop_end, 1, init=init_state):
-            k_cur = ostate[
-                self.traits.K_SLOT
-            ]  # this tile's prefetched K, as one (NCHUNK*N_SUBCHUNKS,) i64 vector
-            v_page_cur = ostate[
-                self.traits.V_SLOT
-            ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
-            tt = (
-                fx.Int32(self.ctx.part_start)
-                if const_expr(self.traits.single_tile_plan)
-                else fx.Int32(loop_i)
+        if const_expr(self.traits.single_tile_plan):
+            # Single-tile plans eliminate loop/history but keep absolute tt for
+            # addressing and masks; the outer guard excludes padded tasks.
+            o_final = self.tile(
+                init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
             )
-            tok0 = tt * self.traits.TILE_TOK
-            # Interleave MFMA with VALU/LDS or page16 V loads.
-            if const_expr(
-                (not self.traits.per_token_kv and multi_query)
-                or self.traits.PAGE16_VPIPE
+        else:
+            # Only a sequence's last tile reads rows past its context, so the
+            # loop leaves out the V tail mask and the task's last tile is
+            # peeled to carry it. The outer guard ensures part_start < part_end.
+            for loop_i, ostate in range(
+                self.ctx.part_start, self.ctx.part_end - 1, 1, init=init_state
             ):
-                fx.rocdl.iglp_opt(0)
-
-            tt1 = tt + 1
-
-            cur_kv_buf = self.kv.scale_buffer_offset(tt)
-
-            # Exclude unwritten-tail scales from FP8 normalization using the
-            # context bound, not a per-query causal bound, for shared MTP scales.
-            tile_valid = self.ctx.context_len - tok0
-            window_left = None
-            if const_expr(self.traits.sliding_window > 0):
-                # Clamp before subtracting MTP offsets to avoid int32 underflow;
-                # negative left edges exclude no tile-relative token.
-                window_left = tile_valid - self.traits.sliding_window
-                window_left = (window_left > 0).select(window_left, 0)
-
-            scale_bounds = None
-            if const_expr(self.traits.per_token_kv):
-                scale_bounds = self.softmax.scale_mask(tile_valid, window_left)
-
-            # Independent V loads overlap QK/softmax and are shared across M-tiles.
-            v_vh_shared = None
-            if const_expr(self.traits.MTP4_PREFETCH_V):
-                v_carried = ostate[self.traits.V_DATA_SLOT]
-                v_vh_shared = [
-                    [
-                        v_carried[vh * self.traits.NVOPS + i]
-                        for i in range_constexpr(self.traits.NVOPS)
-                    ]
-                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
-                ]
-            elif const_expr(
-                (self.traits.M_TILES > 1 and not self.traits.MTP4_FUSED)
-                or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
-            ):
-                v_vh_shared = [
-                    self.kv.load_v(v_page_cur, vh)
-                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
-                ]
-
-            q_scale_vec = None
-            if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
-                q_scale_vec = self.lds.load(
-                    self.traits.sQscale_off
-                    + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
-                    fx.Float32,
-                    self.traits.M_TILES,
+                next_state = self.tile(
+                    ostate, fx.Int32(loop_i), multi_query, q_ops_all, False
                 )
-
-            # All query tiles share one K/V tile; each path retains its publication barriers.
-            if const_expr(multi_query):
-                next_state = self.multi_query_tile(
-                    ostate,
-                    k_cur,
-                    v_page_cur,
-                    tt1,
-                    tile_valid,
-                    window_left,
-                    cur_kv_buf,
-                    scale_bounds,
-                    v_vh_shared,
-                    q_scale_vec,
-                    q_ops_all,
-                )
-            else:
-                next_state = self.single_query_tile(
-                    ostate,
-                    k_cur,
-                    v_page_cur,
-                    tt1,
-                    tile_valid,
-                    window_left,
-                    cur_kv_buf,
-                    scale_bounds,
-                    v_vh_shared,
-                    q_ops_all,
-                    q_scale_vec,
-                )
-            results = yield next_state
-        o_final = results
+                results = yield next_state
+            o_final = self.tile(
+                results, self.ctx.part_end - 1, multi_query, q_ops_all, True
+            )
         return o_final
+
+    @flyc.jit
+    def tile(self, ostate, tt, multi_query, q_ops_all, mask_tail):
+        """Run one KV tile; ``mask_tail`` emits the V mask for rows past the context."""
+        k_cur = ostate[
+            self.traits.K_SLOT
+        ]  # this tile's prefetched K, as one (NCHUNK*N_SUBCHUNKS,) i64 vector
+        v_page_cur = ostate[
+            self.traits.V_SLOT
+        ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
+        tok0 = tt * self.traits.TILE_TOK
+        # Interleave MFMA with VALU/LDS or page16 V loads.
+        if const_expr(
+            (not self.traits.per_token_kv and multi_query) or self.traits.PAGE16_VPIPE
+        ):
+            fx.rocdl.iglp_opt(0)
+
+        tt1 = tt + 1
+
+        cur_kv_buf = self.kv.scale_buffer_offset(tt)
+
+        # Exclude unwritten-tail scales from FP8 normalization using the
+        # context bound, not a per-query causal bound, for shared MTP scales.
+        tile_valid = self.ctx.context_len - tok0
+        window_left = None
+        if const_expr(self.traits.sliding_window > 0):
+            # Clamp before subtracting MTP offsets to avoid int32 underflow;
+            # negative left edges exclude no tile-relative token.
+            window_left = tile_valid - self.traits.sliding_window
+            window_left = (window_left > 0).select(window_left, 0)
+
+        scale_bounds = None
+        if const_expr(self.traits.per_token_kv):
+            scale_bounds = self.softmax.scale_mask(tile_valid, window_left)
+
+        # Independent V loads overlap QK/softmax and are shared across M-tiles.
+        v_vh_shared = None
+        if const_expr(self.traits.MTP4_PREFETCH_V):
+            v_carried = ostate[self.traits.V_DATA_SLOT]
+            v_vh_shared = [
+                [
+                    v_carried[vh * self.traits.NVOPS + i]
+                    for i in range_constexpr(self.traits.NVOPS)
+                ]
+                for vh in range_constexpr(self.traits.VHE_CHUNKS)
+            ]
+        elif const_expr(
+            (self.traits.M_TILES > 1 and not self.traits.MTP4_FUSED)
+            or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
+        ):
+            v_vh_shared = [
+                self.kv.load_v(v_page_cur, vh)
+                for vh in range_constexpr(self.traits.VHE_CHUNKS)
+            ]
+
+        q_scale_vec = None
+        if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
+            q_scale_vec = self.lds.load(
+                self.traits.sQscale_off
+                + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
+                fx.Float32,
+                self.traits.M_TILES,
+            )
+
+        # All query tiles share one K/V tile; each path retains its publication barriers.
+        if const_expr(multi_query):
+            return self.multi_query_tile(
+                ostate,
+                k_cur,
+                v_page_cur,
+                tt1,
+                tile_valid,
+                window_left,
+                cur_kv_buf,
+                scale_bounds,
+                v_vh_shared,
+                q_scale_vec,
+                q_ops_all,
+                mask_tail,
+            )
+        return self.single_query_tile(
+            ostate,
+            k_cur,
+            v_page_cur,
+            tt1,
+            tile_valid,
+            window_left,
+            cur_kv_buf,
+            scale_bounds,
+            v_vh_shared,
+            q_ops_all,
+            q_scale_vec,
+            mask_tail,
+        )
 
     @flyc.jit
     def multi_query_tile(
@@ -202,6 +212,7 @@ class PaDecodePipeline:
         v_vh_shared,
         q_scale_vec,
         q_ops_all,
+        mask_tail,
     ):
         """Publish all query maxima together, then consume shared K/V per query."""
         next_state = [None, None]
@@ -300,7 +311,7 @@ class PaDecodePipeline:
 
             gpu.barrier()
 
-            v_masks = self.kv.tail_masks(tile_valid)
+            v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
             v_next_chunks = []
             for m in range_constexpr(self.traits.M_TILES):
                 p_base = self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
@@ -338,7 +349,7 @@ class PaDecodePipeline:
                 )
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
-                    if const_expr(m == 0):
+                    if const_expr(mask_tail and m == 0):
                         v_vh_shared[vh] = self.kv.mask_v_chunk(
                             v_vh_shared[vh], v_masks, tile_valid
                         )
@@ -442,10 +453,10 @@ class PaDecodePipeline:
                 )
 
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
-                if const_expr(m == 0):
+                if const_expr(mask_tail and m == 0):
                     v_masks = self.kv.tail_masks(tile_valid)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
-                    if const_expr(m == 0):
+                    if const_expr(mask_tail and m == 0):
                         v_vh_shared[vh] = self.kv.mask_v_chunk(
                             v_vh_shared[vh], v_masks, tile_valid
                         )
@@ -486,6 +497,7 @@ class PaDecodePipeline:
         v_vh_shared,
         q_ops_all,
         q_scale_vec,
+        mask_tail,
     ):
         """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
 
@@ -614,11 +626,17 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
-        v_masks = self.kv.tail_masks(tile_valid)
+        v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
+        if const_expr(not mask_tail and self.traits.block_size >= 64):
+            # Without the tail-mask branch, the scheduler sinks page64/128 V
+            # loads next to their PV MFMAs and exposes their latency.
+            fx.rocdl.sched_barrier(0)
         # vh outer, m inner: each M-tile is a separate accumulator chain on the
         # same V operand.
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
-            v_vh = self.kv.mask_v_chunk(v_vh_batch[vh], v_masks, tile_valid)
+            v_vh = v_vh_batch[vh]
+            if const_expr(mask_tail):
+                v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
             for m in range_constexpr(self.traits.M_TILES):
                 op = self.gemm.pv(v_vh, p_ops[m])
                 if const_expr(self.traits.per_token_kv):
