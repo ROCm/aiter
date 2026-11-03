@@ -169,7 +169,9 @@ _OPUS_TRAIT_WRAPPERS = {
     ),
     "operand": ("opus_gemm_bpreshuffle_mfirst_traits",),
 }
-_OPUS_SMALL_PIPELINES = frozenset(("b_vgpr_panel", "m_repeat_scale", "operand", "m_repeat_stage"))
+_OPUS_SMALL_PIPELINES = frozenset(
+    ("b_vgpr_panel", "m_repeat_scale", "operand", "m_repeat_stage")
+)
 
 
 # Small-M resource limits used by the shared candidate workflow.
@@ -527,8 +529,11 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
             schedule = entry.get("b_vgpr_schedule", "fragment")
             pipeline = "b_vgpr" if schedule == "fragment" else "b_vgpr_" + schedule
         elif pipeline == "m_repeat":
-            pipeline = ("m_repeat_stage" if entry.get("m_repeat_schedule") == "staged"
-                        else "m_repeat_scale" if entry.get("scale_on_read") else "m_repeat")
+            pipeline = (
+                "m_repeat_stage"
+                if entry.get("m_repeat_schedule") == "staged"
+                else "m_repeat_scale" if entry.get("scale_on_read") else "m_repeat"
+            )
         geometry = (
             pipeline,
             instance.B_M,
@@ -724,7 +729,9 @@ def opus_candidates(m, n, k, *, cu_num, small_m=None):
             elif pipeline in ("b_vgpr_panel", "operand"):
                 em, en, _, _, c_registers, _ = tile_resources[geometry]
                 for kid in kids:
-                    ahead = int(profiles[kid][0][3 if pipeline == "b_vgpr_panel" else 12])
+                    ahead = int(
+                        profiles[kid][0][3 if pipeline == "b_vgpr_panel" else 12]
+                    )
                     live_registers[kid] = (
                         c_registers + 8 * (bk // 128) * (em + (ahead + 1) * en) + 48
                     )

@@ -3215,7 +3215,9 @@ def _gen_small_mxscale_bpreshuffle_instance(
     kernel, alias = entry["kernel"], f"{k.name}_Traits"
     header = entry["headers"][-1]
     host_kind = entry.get("host_kind")
-    workspace_extra = ",\n    aiter_tensor_t &workspace" if k.bpreshuffle_split_k > 1 else ""
+    workspace_extra = (
+        ",\n    aiter_tensor_t &workspace" if k.bpreshuffle_split_k > 1 else ""
+    )
     abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
     checks = [
         f"m % {k.m_align} == 0",
@@ -3289,7 +3291,9 @@ def _gen_small_mxscale_bpreshuffle_instance(
         grid_kind = "xcd" if host_kind is None else entry.get("grid_kind", "nm")
         n_tiles = "n / Traits::B_N"
         if grid_kind == "nm_tail":
-            n_tiles = "Traits::N_TAIL ? (n + Traits::B_N - 1) / Traits::B_N : n / Traits::B_N"
+            n_tiles = (
+                "Traits::N_TAIL ? (n + Traits::B_N - 1) / Traits::B_N : n / Traits::B_N"
+            )
         grid = "dim3(tiles_n, tiles_m)"
         if grid_kind == "mn":
             grid = "dim3(tiles_m, tiles_n)"
@@ -3313,7 +3317,7 @@ def _gen_small_mxscale_bpreshuffle_instance(
         )
     )
     pipeline_headers = "\n".join(f'#include "{name}"' for name in entry["headers"])
-    host_includes = '\n#include <climits>\n#include <type_traits>'
+    host_includes = "\n#include <climits>\n#include <type_traits>"
     if host_kind in ("xcd_ring", "reduce"):
         host_includes += '\n#include "opus_gemm_common.cuh"'
     preamble = instance_impl_preamble(host_includes)
@@ -3344,7 +3348,9 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         {
             "kid_name": k.name,
             "dtype": "bf16_t",
-            "host_decl": make_a8w8_bpreshuffle_host_decl(k.name, "bf16_t", workspace_extra),
+            "host_decl": make_a8w8_bpreshuffle_host_decl(
+                k.name, "bf16_t", workspace_extra
+            ),
         }
     )
     if device_decl is not None:
