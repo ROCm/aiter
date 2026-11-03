@@ -12,8 +12,10 @@ Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
 import importlib
+import math
 import multiprocessing as mp
 import os
+import pickle
 import subprocess
 import sys
 import time
@@ -467,6 +469,15 @@ class TestTypedCandidateStatus(unittest.TestCase):
             result("shape", -1, 1.0, "unsupported", True, "why"),
             ("shape", -1, 1.0, "unsupported", "why"),
         )
+
+    def test_typed_result_carries_watts_through_pickling(self):
+        result = self.tuner._format_worker_result
+        typed = pickle.loads(
+            pickle.dumps(result("shape", 1.0, 0.0, "ok", True, "", 512))
+        )
+        self.assertEqual(typed, ("shape", 1.0, 0.0, "ok", ""))
+        self.assertEqual(typed.watts, 512.0)
+        self.assertTrue(math.isnan(result("shape", 1.0, 0.0, "ok", True).watts))
 
     def test_failure_detail_is_one_bounded_line_naming_the_exception(self):
         detail = self.tuner._candidate_failure_detail
