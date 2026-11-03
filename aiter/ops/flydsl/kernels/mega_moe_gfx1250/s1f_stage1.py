@@ -143,6 +143,14 @@ MB_SM_B = 128
 #: of tile_info and of the per-source flags, whatever the GEMM1 tile_m (a
 #: multiple of it). A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+#: Flag tile of a GEMM1 tile_m that FLAG_M does not divide (96 = 3 x 32).
+FLAG_M_SMALL = 32
+
+
+def s1f_flag_m(tile_m: int) -> int:
+    """Flag-tile rows for a GEMM1 ``tile_m``: an m-tile is whole flag tiles,
+    each of one expert, so the plan's tile must divide the GEMM1 tile."""
+    return FLAG_M if int(tile_m) % FLAG_M == 0 else FLAG_M_SMALL
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
 #: has at most FLAG_M / run_rows = 8 runs, so a block of >= 8 runs always holds
 #: a piece start; the claimer owns the pieces that START in its block and
@@ -519,6 +527,8 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    tdm_b_th=0,
+    tdm_as_in_prologue=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -610,10 +620,11 @@ def make_s1f_stage1(
     run_hdr = compact_run_header_dwords(npes=npes, experts_per_rank=epr)
     run_cap = compact_run_capacity(max_routes=max_routes)
     # tile_info words and flags are per flag tile, GEMM1 items per m-tile.
-    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FLAG_M)
+    FM = s1f_flag_m(tile_m)
+    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FM)
     m_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
-    SUB = int(tile_m) // FLAG_M
-    FSH = FLAG_M.bit_length() - 1
+    SUB = int(tile_m) // FM
+    FSH = FM.bit_length() - 1
     SPAN = int(workers if ticket_span is None else ticket_span)
     if SPAN % int(workers):
         raise ValueError(f"ticket_span={SPAN} is not a multiple of workers={workers}")
@@ -636,7 +647,7 @@ def make_s1f_stage1(
     # Runs per W1 claim. A piece has at most FLAG_M / R = 8 runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
     RBK = int(block_runs)
-    assert 1 <= RBK and RBK + FLAG_M // R <= WAVE - 1, RBK
+    assert 1 <= RBK and RBK + FM // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
     # Storer w owns the ring slots s % 2 == w and blocks on its oldest
     # store only with all of them in flight (at most 3 TDM ops per wave):
@@ -651,9 +662,9 @@ def make_s1f_stage1(
         raise ValueError("the producer gathers with 16-bit token indices")
     if R != 8 or npes > 16:
         raise ValueError("the producer is laid out for 8-row runs")
-    if int(tile_m) % FLAG_M or not 1 <= SUB <= 4:
+    if int(tile_m) % FM or not 1 <= SUB <= 4:
         raise ValueError(
-            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FLAG_M} rows"
+            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
     if SUB > 1 and not POLL:
         raise ValueError(
@@ -706,6 +717,67 @@ def make_s1f_stage1(
     def _w1_blk0(nxt_, slot_):
         return _uniform(readlane(T.i32, arith.unwrap(nxt_), 0))
 
+    def _build_g1(asprol, lds_holder, ready_holder, meta_holder, hooks_holder):
+        return build_gemm_a8w4_tdm_task(
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=1,
+            n_warp=4,
+            out_is_f16=0,
+            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+            a_is_fp4=1,
+            n_experts=epr,
+            stage1_act=stage1_act,
+            has_bias=0,
+            stage1_quant_out=1,
+            quant_wmma_rep=quant_wmma_rep,
+            cluster_n=1,
+            cluster_m=1,
+            next_stage_prefetch=0,
+            num_waves_per_tensor_tdm=2,
+            tdm_as_in_prologue=asprol,
+            tdm_b_th=tdm_b_th,
+            enable_ep_scatter=0,
+            ep_arena_handle=0,
+            ep_combine_input_offset=0,
+            ep_slot_stride_bytes=0,
+            ep_destination_stride=0,
+            ep_world_size=0,
+            ep_quant_bits=0,
+            row_major_ascale=1,
+            a_row_stride_bytes=row_stride,
+            a_scale_row_stride_bytes=row_stride,
+            lds_soa_load_interleave=0,
+            persistent_workers=G,
+            rolled_drain=0,
+            a_preshuffled=0,
+            m_align=0,
+            explicit_tile=1,
+            lds_base=lds_holder,
+            a_ready=ready_holder,
+            tile_meta=meta_holder,
+            item_hooks=hooks_holder,
+            raw_drain=True,
+            defer_c_wait=True,
+            tdm_snop=True,
+        )
+
+    def _g1_asprol():
+        # The resident A-scale region grows the arena; a variant whose CTAs
+        # would no longer share the CU keeps the rotating A-scale stages.
+        if not tdm_as_in_prologue:
+            return 0
+        try:
+            arena_ = int(_build_g1(1, [None], [None], [None], [None])[4]["arena"])
+        except AssertionError:
+            return 0
+        fits = int(ctas_per_cu) * (((arena_ + 256) + 2047) // 2048 * 2048) <= 327680
+        return int(MB_END <= arena_ and fits)
+
+    G1_ASPROL = _g1_asprol()
+
     @flyc.jit
     def launch(
         arg_a2: fx.Tensor,
@@ -732,50 +804,9 @@ def make_s1f_stage1(
         ready_holder = [None]
         meta_holder = [None]
         hooks_holder = [None]
-        g1_task, block, g1_name, _, lay = build_gemm_a8w4_tdm_task(
-            K=model_dim,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
-            out_is_f16=0,
-            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
-            a_is_fp4=1,
-            n_experts=epr,
-            stage1_act=stage1_act,
-            has_bias=0,
-            stage1_quant_out=1,
-            quant_wmma_rep=quant_wmma_rep,
-            cluster_n=1,
-            cluster_m=1,
-            next_stage_prefetch=0,
-            num_waves_per_tensor_tdm=2,
-            tdm_as_in_prologue=0,
-            tdm_b_th=0,
-            enable_ep_scatter=0,
-            ep_arena_handle=0,
-            ep_combine_input_offset=0,
-            ep_slot_stride_bytes=0,
-            ep_destination_stride=0,
-            ep_world_size=0,
-            ep_quant_bits=0,
-            row_major_ascale=1,
-            a_row_stride_bytes=row_stride,
-            a_scale_row_stride_bytes=row_stride,
-            lds_soa_load_interleave=0,
-            persistent_workers=G,
-            rolled_drain=0,
-            a_preshuffled=0,
-            m_align=0,
-            explicit_tile=1,
-            lds_base=lds_holder,
-            a_ready=ready_holder,
-            tile_meta=meta_holder,
-            item_hooks=hooks_holder,
-            raw_drain=True,
-            defer_c_wait=True,
-            tdm_snop=True,
+
+        g1_task, block, g1_name, _, lay = _build_g1(
+            G1_ASPROL, lds_holder, ready_holder, meta_holder, hooks_holder
         )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")

@@ -239,10 +239,8 @@ def build_gemm_a8w4_tdm_task(
         assert stage1_quant_out and stage1_act and persistent_workers
         assert not enable_ep_scatter
     if a_ready is not None:
-        assert explicit_tile and not tdm_as_in_prologue, (
-            "a_ready gates the mainloop's first A issue; an A-scale prologue "
-            "load would run ahead of it"
-        )
+        # With the A-scale prologue on, the gate moves ahead of that load.
+        assert explicit_tile, "a_ready needs explicit tiles"
     if explicit_tile:
         assert persistent_workers and cluster_m == 1 and cluster_n == 1
     if persistent_workers:
@@ -408,8 +406,12 @@ def build_gemm_a8w4_tdm_task(
     # interleave into the per-lane ds_read below (lane == M row, stride
     # SA_KDW dwords -> a 2-way bank conflict on one b32 read per operand).
     SA_KDW = AS_KSTEPS  # scale dwords per row per k-tile (tile_k // 128)
+    # The A-scale prologue keeps the full K range resident (AS_FULL_B below)
+    # and never reads a rotating A-scale stage, so it gets no per-stage slot.
     STAGE_SA = (
-        ceildiv(tile_m * SA_KDW * 4, 16) * 16
+        0
+        if tdm_as_in_prologue
+        else ceildiv(tile_m * SA_KDW * 4, 16) * 16
         if row_major_ascale
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
@@ -474,9 +476,13 @@ def build_gemm_a8w4_tdm_task(
     # with defer_c_wait, so the next tile's prologue cannot overwrite it.
     C_Q_OFF = (num_buffers - 1) * PITCH if defer_c_wait else 0
     if defer_c_wait:
-        assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
+        assert not planar_lds_on and _mid_compute
         assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
         assert C_Q_OFF + tile_m * (tile_n // 4) <= ARENA_B, "C staging past arena"
+        # The next tile's A-scale prologue lands while this C store is in flight.
+        assert not tdm_as_in_prologue or (
+            C_Q_OFF + tile_m * (tile_n // 4) <= AS_FULL_OFF
+        ), "C staging overlaps the resident A-scale region"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -1654,7 +1660,15 @@ def build_gemm_a8w4_tdm_task(
                     _rm_weight_rows.append(
                         _weight_valid.select(_weight, fx.Float32(0.0))
                     )
+            def a_ready_gate():
+                # S1F: only the A / A-scale owners wait for the tile's rows.
+                if const_expr(a_ready is not None):  # noqa: SIM102
+                    if owns(tuple(sorted(set(waves[0]) | set(waves[2])))):
+                        a_ready[0]()
+
             if const_expr(tdm_as_in_prologue):
+                # The resident A-scale rows come from the same dispatch.
+                a_ready_gate()
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
             if const_expr(  # noqa: SIM102 - preserve DSL staging
@@ -1662,6 +1676,10 @@ def build_gemm_a8w4_tdm_task(
             ):
                 if full_cluster:
                     cluster_sync()
+
+            def mainloop_a_ready_gate():
+                if const_expr(not tdm_as_in_prologue):
+                    a_ready_gate()
 
             def stage_fence(outstanding):
                 # Drain-side pipeline fence. raw_drain: the barrier orders only
@@ -1675,18 +1693,12 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     pipeline_fence(outstanding=outstanding)
 
-            def a_ready_gate():
-                # S1F: only the A / A-scale owners wait for the tile's rows.
-                if const_expr(a_ready is not None):  # noqa: SIM102
-                    if owns(tuple(sorted(set(waves[0]) | set(waves[2])))):
-                        a_ready[0]()
-
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
-                    a_ready_gate()
+                    mainloop_a_ready_gate()
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
                     n_steady = K_TILES - num_buffers
@@ -1761,7 +1773,7 @@ def build_gemm_a8w4_tdm_task(
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
                     # resident before the loop and the issue lead; the carry adds one.
                     PRE = num_buffers if next_stage_on else num_buffers - 1
-                    a_ready_gate()
+                    mainloop_a_ready_gate()
                     for i in range_constexpr(PRE):
                         issue(i, i)
                     n_steady = K_TILES - PRE

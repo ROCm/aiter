@@ -823,9 +823,9 @@ class _CompactDispatch(_Dispatch):
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
             if plan_s1f:
-                from ..s1f_stage1 import FLAG_M
+                from ..s1f_stage1 import s1f_flag_m
 
-                tile_m = FLAG_M
+                tile_m = s1f_flag_m(align_m)
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,
