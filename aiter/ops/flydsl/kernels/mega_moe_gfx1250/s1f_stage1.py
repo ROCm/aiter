@@ -516,6 +516,8 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    tdm_b_th=0,
+    tdm_as_in_prologue=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -703,6 +705,67 @@ def make_s1f_stage1(
     def _w1_blk0(nxt_, slot_):
         return _uniform(readlane(T.i32, arith.unwrap(nxt_), 0))
 
+    def _build_g1(asprol, lds_holder, ready_holder, meta_holder, hooks_holder):
+        return build_gemm_a8w4_tdm_task(
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=1,
+            n_warp=4,
+            out_is_f16=0,
+            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+            a_is_fp4=1,
+            n_experts=epr,
+            stage1_act=stage1_act,
+            has_bias=0,
+            stage1_quant_out=1,
+            quant_wmma_rep=quant_wmma_rep,
+            cluster_n=1,
+            cluster_m=1,
+            next_stage_prefetch=0,
+            num_waves_per_tensor_tdm=2,
+            tdm_as_in_prologue=asprol,
+            tdm_b_th=tdm_b_th,
+            enable_ep_scatter=0,
+            ep_arena_handle=0,
+            ep_combine_input_offset=0,
+            ep_slot_stride_bytes=0,
+            ep_destination_stride=0,
+            ep_world_size=0,
+            ep_quant_bits=0,
+            row_major_ascale=1,
+            a_row_stride_bytes=row_stride,
+            a_scale_row_stride_bytes=row_stride,
+            lds_soa_load_interleave=0,
+            persistent_workers=G,
+            rolled_drain=0,
+            a_preshuffled=0,
+            m_align=0,
+            explicit_tile=1,
+            lds_base=lds_holder,
+            a_ready=ready_holder,
+            tile_meta=meta_holder,
+            item_hooks=hooks_holder,
+            raw_drain=True,
+            defer_c_wait=True,
+            tdm_snop=True,
+        )
+
+    def _g1_asprol():
+        # The resident A-scale region grows the arena; a variant whose CTAs
+        # would no longer share the CU keeps the rotating A-scale stages.
+        if not tdm_as_in_prologue:
+            return 0
+        try:
+            arena_ = int(_build_g1(1, [None], [None], [None], [None])[4]["arena"])
+        except AssertionError:
+            return 0
+        fits = int(ctas_per_cu) * (((arena_ + 256) + 2047) // 2048 * 2048) <= 327680
+        return int(MB_END <= arena_ and fits)
+
+    G1_ASPROL = _g1_asprol()
+
     @flyc.jit
     def launch(
         arg_a2: fx.Tensor,
@@ -729,50 +792,9 @@ def make_s1f_stage1(
         ready_holder = [None]
         meta_holder = [None]
         hooks_holder = [None]
-        g1_task, block, g1_name, _, lay = build_gemm_a8w4_tdm_task(
-            K=model_dim,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
-            out_is_f16=0,
-            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
-            a_is_fp4=1,
-            n_experts=epr,
-            stage1_act=stage1_act,
-            has_bias=0,
-            stage1_quant_out=1,
-            quant_wmma_rep=quant_wmma_rep,
-            cluster_n=1,
-            cluster_m=1,
-            next_stage_prefetch=0,
-            num_waves_per_tensor_tdm=2,
-            tdm_as_in_prologue=0,
-            tdm_b_th=0,
-            enable_ep_scatter=0,
-            ep_arena_handle=0,
-            ep_combine_input_offset=0,
-            ep_slot_stride_bytes=0,
-            ep_destination_stride=0,
-            ep_world_size=0,
-            ep_quant_bits=0,
-            row_major_ascale=1,
-            a_row_stride_bytes=row_stride,
-            a_scale_row_stride_bytes=row_stride,
-            lds_soa_load_interleave=0,
-            persistent_workers=G,
-            rolled_drain=0,
-            a_preshuffled=0,
-            m_align=0,
-            explicit_tile=1,
-            lds_base=lds_holder,
-            a_ready=ready_holder,
-            tile_meta=meta_holder,
-            item_hooks=hooks_holder,
-            raw_drain=True,
-            defer_c_wait=True,
-            tdm_snop=True,
+
+        g1_task, block, g1_name, _, lay = _build_g1(
+            G1_ASPROL, lds_holder, ready_holder, meta_holder, hooks_holder
         )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
