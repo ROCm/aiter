@@ -19,8 +19,31 @@ pytestmark = pytest.mark.skipif(
 
 _RTOL = 1e-2
 _ATOL = 128
-_SELECTED_TOKENS = [1152, 1543, 1728, 1799, 1803, 1815, 1837, 1945, 2048]
-_NEIGHBOR_TOKENS = [1151, 1153, 1542, 1544, 1944, 2047, 2049]
+_RANGE_TOKENS = [
+    1024,
+    1088,
+    1151,
+    1152,
+    1153,
+    1542,
+    1543,
+    1544,
+    1727,
+    1728,
+    1729,
+    1799,
+    1803,
+    1815,
+    1837,
+    1944,
+    1945,
+    2047,
+    2048,
+    2049,
+    2304,
+    2560,
+]
+_OUT_OF_RANGE_TOKENS = [1023, 2561]
 
 
 def _make_case(tokens: int):
@@ -87,7 +110,7 @@ def _force_validated_gfx1201_target(monkeypatch):
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
 
-@pytest.mark.parametrize("tokens", [1152, 1543, 1728, 2048])
+@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1944, 2048, 2560])
 def test_public_fused_moe_bf16_g1u1_selected_large_m(tokens):
     hidden, w1, w2, weights, ids = _make_case(tokens)
 
@@ -138,13 +161,13 @@ def test_public_fused_moe_bf16_g1u1_selected_large_m_output_buffer():
     assert checkAllclose(output, expected, rtol=_RTOL, atol=_ATOL) == 0
 
 
-@pytest.mark.parametrize("tokens", _SELECTED_TOKENS)
-def test_large_m_gate_accepts_selected_rows(tokens):
+@pytest.mark.parametrize("tokens", _RANGE_TOKENS)
+def test_large_m_gate_accepts_validated_range_rows(tokens):
     assert _large_m_gate(**_large_m_gate_inputs(tokens))
 
 
-@pytest.mark.parametrize("tokens", _NEIGHBOR_TOKENS)
-def test_large_m_gate_rejects_neighbor_rows(tokens):
+@pytest.mark.parametrize("tokens", _OUT_OF_RANGE_TOKENS)
+def test_large_m_gate_rejects_out_of_range_rows(tokens):
     assert not _large_m_gate(**_large_m_gate_inputs(tokens))
 
 
