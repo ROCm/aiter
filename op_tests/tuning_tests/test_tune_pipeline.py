@@ -53,6 +53,23 @@ def _get_platform_dtypes():
         return "torch.float8_e4m3fnuz", "QuantType.per_Token"
 
 
+def _is_gfx950():
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() == "gfx950"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Smoke: two kn1×kn2 pairs, not the full FlyDSL cartesian.
+_FHMOE_KN1 = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw4_fp8"
+_FHMOE_KN2 = "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic"
+_FHMOE_KERNEL_REGEX = (
+    rf"^{_FHMOE_KN1} {_FHMOE_KN2}_bnt2$|^{_FHMOE_KN1} {_FHMOE_KN2}_persist$"
+)
+
+
 def _write_csv(path, header, rows):
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -80,7 +97,9 @@ def _cleanup_stale_lock_files():
                 pass
 
 
-def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
+def _run_tuner(
+    script, untuned, tuned, extra_args=None, timeout=300, mp=1, extra_env=None
+):
     _cleanup_stale_lock_files()
     cmd = [
         sys.executable,
@@ -101,6 +120,8 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
     env = os.environ.copy()
     script_dir = os.path.dirname(os.path.join(AITER_ROOT, script))
     env["PYTHONPATH"] = script_dir + ":" + env.get("PYTHONPATH", "")
+    if extra_env:
+        env.update(extra_env)
     try:
         return subprocess.run(
             cmd,
@@ -358,6 +379,69 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 900,
                 "timeout_mp1": 900,
             },
+            "fhmoe_dsv4": {
+                "script": "csrc/ck_gemm_moe_2stages_codegen/fhmoe_tune.py",
+                "header": [
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "shared_expert_id",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
+                    "hidden_pad",
+                    "intermediate_pad",
+                    "gate_mode",
+                ],
+                "shapes": [
+                    (
+                        1,
+                        7168,
+                        384,
+                        385,
+                        7,
+                        384,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        "torch.float8_e4m3fn",
+                        "torch.float4_e2m1fn_x2",
+                        "QuantType.per_1x32",
+                        1,
+                        0,
+                        0,
+                        0,
+                        "GateMode.INTERLEAVE",
+                    ),
+                ],
+                "keys": [
+                    "gfx",
+                    "cu_num",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
+                    "shared_expert_id",
+                    "hidden_pad",
+                    "intermediate_pad",
+                    "gate_mode",
+                ],
+                "extra_env": {"TUNE_MOE_KERNEL_REGEX": _FHMOE_KERNEL_REGEX},
+                "timeout_mp1": 1200,
+            },
             "gdn_k5_opt": {
                 "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
                 "header": [
@@ -551,6 +635,7 @@ class TestTunePipeline(unittest.TestCase):
                 extra_args=cfg.get("extra_args"),
                 timeout=timeout,
                 mp=mp,
+                extra_env=cfg.get("extra_env"),
             )
             if result.returncode != 0:
                 print(f"\n=== {name} ({mp_label}) STDOUT ===\n{result.stdout[-2000:]}")
@@ -575,16 +660,18 @@ class TestTunePipeline(unittest.TestCase):
                 self.assertIn(
                     key, df.columns, f"{name} ({mp_label}): missing column {key}"
                 )
-            if name == "fhmoe":
+            if name in ("fhmoe", "fhmoe_dsv4"):
                 self.assertIn("kernelName1", df.columns)
                 self.assertIn("kernelName2", df.columns)
                 self.assertTrue(df["kernelName1"].fillna("").str.strip().ne("").all())
                 self.assertTrue(df["kernelName2"].fillna("").str.strip().ne("").all())
-            for _, row in df.iterrows():
-                us = float(row.get("us", -1))
-                self.assertNotEqual(
-                    us, 0, f"{name} ({mp_label}): us == 0 for {dict(row)}"
-                )
+            # fhmoe tuned rows carry no `us` column; only check families that do.
+            if "us" in df.columns:
+                for _, row in df.iterrows():
+                    us = float(row["us"])
+                    self.assertNotEqual(
+                        us, 0, f"{name} ({mp_label}): us == 0 for {dict(row)}"
+                    )
 
     def test_a8w8_mp1(self):
         self._run_one("a8w8", mp=1)
@@ -665,6 +752,11 @@ class TestTunePipeline(unittest.TestCase):
         if _get_gfx_runtime() != "gfx950":
             self.skipTest("FHMoE tuning requires gfx950")
         self._run_one("fhmoe", mp=1)
+
+    def test_fhmoe_dsv4_mp1(self):
+        if not _is_gfx950():
+            self.skipTest("FHMoE requires gfx950")
+        self._run_one("fhmoe_dsv4", mp=1)
 
     def test_a6w6_blockscale_mp1(self):
         self._run_one("a6w6_blockscale", mp=1)
