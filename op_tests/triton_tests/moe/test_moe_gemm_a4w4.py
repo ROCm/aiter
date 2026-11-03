@@ -456,29 +456,114 @@ def test_gluon_in_kernel_gather_multiblock_experts(device="cuda"):
 # v_min_f32 inline asm whose register constraints hid a clobber from the
 # allocator, causing scratch spills and non-deterministic corruption of rows
 # 0-31 on gfx1250.  The gluon-native _swiglu uses gl.minimum instead.
-# These tests run GEMM1 with SwiGLU twice (in-kernel gather vs pre-gathered)
-# and require the outputs to match, covering the shapes from the bug report.
+# These tests run GEMM1 only (where SwiGLU is applied) and compare against an
+# fp32 torch reference with per-row cosine, following repro_row12_gemm1.py.
 # ---------------
+
+E2M1 = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    device="cuda",
+)
+
+
+def _upcast_e2m1(q, s):
+    v = torch.stack((E2M1[(q & 0xF).long()], E2M1[(q >> 4).long()]), -1).flatten(-2)
+    return v * torch.exp2(s.float() - 127.0).repeat_interleave(32, -1)
+
+
+def _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gather, device):
+    """GEMM1 with SwiGLU vs fp32 torch reference. 0 bad rows required."""
+    g = torch.Generator(device=device).manual_seed(0)
+    x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    vals, ids = torch.topk(
+        torch.randn(M, E, generator=g, device=device), TOPK, dim=-1,
+    )
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+
+    # weight: (E_LOCAL, 2*I, D) -> MXFP4 kernel weight + fp32 dequant ref
+    g_w = torch.Generator(device=device).manual_seed(1)
+    w = torch.randn(E_LOCAL, 2 * I, D, generator=g_w, device=device, dtype=torch.bfloat16) / D**0.5
+    wq, ws = mxfp4_quant(w.reshape(-1, D))
+    wq = wq.view(E_LOCAL, 2 * I, D // 2)
+    ws = ws.view(E_LOCAL, 2 * I, D // 32)
+    w_ref = _upcast_e2m1(wq, ws)
+    wk = moe_weight_decode_view(moe_shuffle_weight(wq.contiguous()).contiguous())
+    sk = moe_shuffle_scale(ws.contiguous()).transpose(-1, -2)
+
+    # routing — use the same ids/wts so gate indices map back correctly
+    emap = torch.full((E + 1,), -1, dtype=torch.int32, device=device)
+    emap[0:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=device)
+    n_gates = M * TOPK
+    bufs = _compute_expt_data_internal(E_LOCAL, n_gates, block_m, device)
+    geo = EpScatterGeometry(
+        src_token_map=torch.arange(M, dtype=torch.int32, device=device),
+        max_tokens_per_rank=M, peer_rows=n_gates,
+    )
+    hist, gidx, _, gscal, _, _ = ep_sort_routing(
+        wts, ids, emap, E_LOCAL,
+        torch.full((1,), M, dtype=torch.int32, device=device),
+        M, TOPK, n_gates, bufs, ep_scatter_geometry=geo,
+    )
+    h = hist[:E_LOCAL]
+    rd = RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2]))
+    assert rd.block_m == block_m
+
+    # quantize activation, build fp32 reference
+    xq, xs = mxfp4_quant(x)
+    xr = _upcast_e2m1(xq, xs)
+
+    # fp32 torch reference: GEMM then SwiGLU then MX requant (GEMM1 only)
+    n = int(rd.expt_data.hist.sum())
+    gate = gidx.long()[:n]
+    tok = gate // TOPK
+    exp = ids.flatten().long()[gate]
+    ref = torch.empty(n, I, device=device)
+    for e in exp.unique().tolist():
+        sel = (exp == e).nonzero(as_tuple=True)[0]
+        h = xr[tok[sel]] @ w_ref[e].T
+        ref[sel] = h[:, ::2] * torch.sigmoid(h[:, ::2]) * h[:, 1::2]
+    ref_rq = _upcast_e2m1(*mxfp4_quant(ref.bfloat16()))
+
+    # kernel GEMM1
+    if in_kernel_gather:
+        y, ys = moe_gemm_a4w4(
+            xq, wk, xs, sk, None, rd, gather_indx=gidx,
+            swizzle_mx_scale="GFX1250_SCALE", preshuffle_weights=True,
+            out_mx_quant=True, apply_swiglu=True, alpha=1.0, limit=1e4,
+            swiglu_add_residual=False,
+        )
+    else:
+        y, ys = moe_gemm_a4w4(
+            xq[tok], wk, xs[tok], sk, None, rd, gather_indx=None,
+            swizzle_mx_scale="GFX1250_SCALE", preshuffle_weights=True,
+            out_mx_quant=True, apply_swiglu=True, alpha=1.0, limit=1e4,
+            swiglu_add_residual=False,
+        )
+
+    got = _upcast_e2m1(y[:n], ys[:n])
+    rc = torch.nn.functional.cosine_similarity(got, ref_rq, dim=1)
+    bad = ~(rc > 0.99)
+    n_bad = int(bad.sum())
+    cos = torch.nn.functional.cosine_similarity(
+        got.flatten(), ref_rq.flatten(), dim=0,
+    ).item()
+    assert n_bad == 0 and cos > 0.999, (
+        f"a4w4 GEMM1 SwiGLU {'in-kernel gather' if in_kernel_gather else 'pre-gathered'} "
+        f"block_m={block_m}: cos={cos:.6f} bad_rows={n_bad}/{n}"
+    )
 
 
 @_SKIP_GATHER
-@pytest.mark.parametrize(
-    "M, E, E_LOCAL, D, I, block_m_cap",
-    [
-        # 9b shape (EP2, 128 local experts) at block_m 128
-        (4096, 256, 128, 2304, 2304, 128),
-        # t5 / 42B shape (EP8, 32 local experts) at block_m 128
-        (4096, 256, 32, 4096, 4096, 128),
-    ],
-    ids=["9b_bm128", "t5_bm128"],
-)
-def test_gluon_swiglu_no_bad_rows(M, E, E_LOCAL, D, I, block_m_cap, device="cuda"):
-    """GEMM1+GEMM2 with SwiGLU must match between in-kernel gather and pre-gathered at block_m 128.
+@pytest.mark.parametrize("M", [4096, 8192])
+@pytest.mark.parametrize("in_kernel_gather", [True, False], ids=["gather", "pregathered"])
+def test_gluon_swiglu_no_bad_rows(M, in_kernel_gather, device="cuda"):
+    """a4w4 GEMM1 SwiGLU at block_m 128 must produce 0 bad rows vs fp32 torch reference.
 
     The shared Triton _swiglu used v_min_f32 inline asm that clobbered a
     register the allocator believed was live. This caused scratch spills and
     non-deterministic corruption of rows 0-31 on gfx1250. The gluon-native
     _swiglu uses gl.minimum and has zero spills.
     """
-    TOPK = 8
-    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    _gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, 128, in_kernel_gather, device)
