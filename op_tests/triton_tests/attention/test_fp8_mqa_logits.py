@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+import aiter.ops.triton.attention.fp8_mqa_logits as fp8_mqa_logits_module
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
@@ -250,3 +251,58 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
     assert diff < 1e-4, f"{diff=}"
+
+
+@pytest.mark.parametrize("s_k", [8192, 32768])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("gluon", [True, False])
+@torch.inference_mode()
+def test_fp8_mqa_logits_deterministic_rows(s_k, num_heads, gluon, monkeypatch):
+    """With deterministic=True a row's logits are bitwise the same whichever
+    rows share the call: the default picks the tile, warp count and MFMA shape
+    from seq_len. The full call has 8,192 rows, so it crosses every seq_len
+    threshold the default uses. Also as accurate as the default."""
+    if not gluon:
+        monkeypatch.setattr(fp8_mqa_logits_module, "_gluon_fp8_mqa_logits_kernel", None)
+    torch.manual_seed(0)
+    s_q, head_dim = 8192, 128
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    q_fp8 = q.to(e4m3_type)
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+
+    def call(rows, deterministic=True):
+        return fp8_mqa_logits(
+            q_fp8[rows].contiguous(),
+            kv_fp8,
+            scales,
+            weights[rows].contiguous(),
+            ks[rows],
+            ke[rows],
+            True,
+            deterministic=deterministic,
+        )
+
+    full = call(slice(None))
+    assert torch.equal(call(slice(None)), full), "differs from run to run"
+    for start, n in [
+        (0, 1),
+        (5, 1),
+        (0, 2),
+        (3, 7),
+        (0, 64),
+        (1, 255),
+        (0, 1023),
+        (100, 1500),
+        (0, 2048),
+        (2048, 4096),
+        (4095, 4097),
+        (7, 8185),
+    ]:
+        rows = slice(start, start + n)
+        assert torch.equal(call(rows), full[rows]), f"rows [{start}, {start + n})"
+    default = call(slice(None), deterministic=False)
+    check_logits(full, default, check_mask=True, tol=1e-6)

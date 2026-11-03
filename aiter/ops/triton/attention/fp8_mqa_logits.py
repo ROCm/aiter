@@ -102,6 +102,7 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
+    deterministic=False,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -115,6 +116,10 @@ def fp8_mqa_logits(
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
                   are explicitly written as -inf. If False those positions are
                   unspecified.
+    deterministic: bool. If True, the kernel configuration does not depend on
+                  seq_len, so a row's logits are bitwise the same whichever rows
+                  share the call. The default picks the tile, warp count and MFMA
+                  shape from seq_len, which changes the reduction order.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
@@ -162,7 +167,7 @@ def fp8_mqa_logits(
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
-        if seq_len <= 1024:
+        if seq_len <= 1024 and not deterministic:
             matrix_instr_nonkdim = 16
 
         _fnuz = torch.float8_e4m3fnuz
@@ -243,7 +248,8 @@ def fp8_mqa_logits(
                 seq_len, seq_len_kv, 2, num_warps, waves_per_eu
             )
             if (
-                num_heads <= 32
+                not deterministic
+                and num_heads <= 32
                 and seq_len >= 2
                 and (
                     seq_len > 4096
@@ -257,7 +263,7 @@ def fp8_mqa_logits(
                     seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
                 )
             # Single warp to save barrier cycles
-            if block_m == 1 and seq_len > 4096:
+            if block_m == 1 and seq_len > 4096 and not deterministic:
                 num_warps = 1
                 block_kv = 32
                 num_kv_splits = _gfx950_kv_splits(
