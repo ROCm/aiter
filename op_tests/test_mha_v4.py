@@ -1444,9 +1444,11 @@ def test_mha_v4_lse_is_gated_off_unsupported_architectures():
     q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx000"):
-        with expect_raises(NotImplementedError, match="not implemented on gfx000"):
-            mha_v4(q, q, q, *formats, return_lse=True)
+    with (
+        patched_attr(mha_v4_module, "get_gfx", lambda: "gfx000"),
+        expect_raises(NotImplementedError, match="not implemented on gfx000"),
+    ):
+        mha_v4(q, q, q, *formats, return_lse=True)
 
 
 @parametrize(
