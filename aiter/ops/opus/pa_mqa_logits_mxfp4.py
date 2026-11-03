@@ -52,8 +52,8 @@ padding) are untouched. The caller owes what the kernel cannot check: ``row_ends
 decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
 page's offset fits 32 bits -- on gfx950 its 64-row group's byte offset (group id x 4 KiB: a
 ``kv_cache`` under 4 GiB, which the launch checks), on gfx1250 its row (page id x
-``page_size``). ``max_seq_len`` is under 2^30 (a row's logits are addressed in 32 bits); the
-config checks it.
+``page_size``). ``max_seq_len`` is under 2^29 (a row's logits are addressed in 32 bits, with
+headroom for the stores the gfx950 kernels mask out); the config checks it.
 
 NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold
 0xFF, or a weight is NaN or Inf (the kernels compute relu as max_num and put the NaN back from the
@@ -131,7 +131,11 @@ _CAND_MAX_WALK = 32
 _GFX950_CAND_WALK = ((3072, 2), (8192, 4), (24576, 8), (49152, 16))
 _GFX950_XCDS = 8
 _MAX_PREFILL_PARTS = 65536  # the kernels' 32-bit split (part_point) needs parts <= 2^16
-_MAX_SEQ_LEN = 1 << 30  # a row's logits are bounded by a 32-bit byte count (4 B a key)
+# A row's logits are addressed in 32-bit byte offsets (4 B a key). The gfx950 one-row and qshare
+# kernels mask the lane group that must not store by moving its offsets below the row by up to a
+# chunk's keys; wrapped, they stay out of the row's V# only while window + chunk < 2^30 keys, which
+# a window under 2^29 guarantees.
+_MAX_SEQ_LEN = 1 << 29
 
 # Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
 # MFMA-permuted (4-D, kv_cache [groups, 4, 64, 16]); gfx1250's natural (3-D).
@@ -624,7 +628,7 @@ def _config(
     if max_seq_len >= _MAX_SEQ_LEN:
         raise ValueError(
             f"max_seq_len must be under {_MAX_SEQ_LEN} (a row's logits are addressed in 32 "
-            f"bits), got {max_seq_len}"
+            f"bits, with headroom for the masked stores), got {max_seq_len}"
         )
     arch = base_gfx_arch(_device_arch(dev))  # gfx1250-strict runs the gfx1250 kernels
     if _PERMUTE_ROWS.get(arch, page_size) % page_size:

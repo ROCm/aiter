@@ -274,9 +274,12 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                         odd |= (b < num_seqs) & ((c_qa[c] != b * nq) | (c_qb[c] != (b + 1) * nq));
                     }
                 });
+                // Uniform over the cached sequences; those past them are not checked, so their
+                // chunks read their own ends and count all GC groups.
                 const bool uniform = __builtin_amdgcn_ballot_w64(odd) == 0;
-                // Cached groups any lane has: uniform rows tell from the scalars (a bucket's
-                // instance caches its largest qlen's groups; smaller ones skip the rest's cuts).
+                // Cached groups any cached lane has: uniform rows tell from the scalars (a
+                // bucket's instance caches its largest qlen's groups; smaller ones skip the rest's
+                // cuts).
                 const int gc_live = uniform ? gq : GC;
                 opus::static_for<CHUNKS>([&](auto cc) {
                     constexpr int c = cc.value;
@@ -295,13 +298,14 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                         }
                     }
                 });
-                // visit(base, r0, n, ends) on each 64 sequences in order until it returns true.
+                // visit(base, r0, n, ends, live) on each 64 sequences in order until it returns
+                // true; live: how many of the ends any lane may have.
                 auto for_chunks = [&](auto&& visit) {
                     bool done = false;
                     opus::static_for<CHUNKS>([&](auto cc) {
                         constexpr int c = cc.value;
                         if (!done && c * WAVE < num_seqs)
-                            done = visit(c * WAVE, c_r0[c], c_n[c], c_e[c]);
+                            done = visit(c * WAVE, c_r0[c], c_n[c], c_e[c], gc_live);
                     });
                     for (int base = CHUNKS * WAVE; !done && base < num_seqs; base += WAVE) {
                         const int b = base + lane;
@@ -309,15 +313,15 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                         if (b < num_seqs) { r0 = qsl[b]; n = qsl[b + 1] - r0; }
                         load_ends(r0, n, v);
                         mask_ends(n, v, e);
-                        done = visit(base, r0, n, e);
+                        done = visit(base, r0, n, e, GC);
                     }
                 };
-                // pass 1: total tiles, and the groups that have any (uniform rows: every group, a
-                // bound read off the scalars, which spares a wave reduction)
+                // pass 1: total tiles, and the groups that have any (uniform rows all cached:
+                // every group, a bound read off the scalars, which spares a wave reduction)
                 int part = 0, ngroups = 0;
-                for_chunks([&](int, int r0, int n, const int (&e)[GC]) {
+                for_chunks([&](int, int r0, int n, const int (&e)[GC], int live) {
                     opus::static_for<GC>([&](auto jc) {
-                        if (jc.value >= gc_live) return;   // uniform
+                        if (jc.value >= live) return;   // uniform
                         const int t = tiles_of(e[jc.value]);
                         part += t;
                         ngroups += t > 0;
@@ -331,8 +335,9 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                 });
                 const int total = __builtin_amdgcn_readlane(wave64_incl_scan(part), WAVE - 1);
                 const int G =
-                    uniform ? num_seqs * gq
-                            : __builtin_amdgcn_readlane(wave64_incl_scan(ngroups), WAVE - 1);
+                    uniform && num_seqs <= CHUNKS * WAVE
+                        ? num_seqs * gq
+                        : __builtin_amdgcn_readlane(wave64_incl_scan(ngroups), WAVE - 1);
                 // The grid is max(target, groups) slots (the launcher's). Each group's last chunk
                 // rounds up, so ceil(total / target) cuts up to G chunks past the target; cutting
                 // for target - G bounds them by it, but needlessly coarsely where the groups split
@@ -348,9 +353,9 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                     if (lo < safe) {   // uniform: the count can only pick lo
                         const float lo_rcp = 1.0f / (float)lo;
                         int cnt = 0;
-                        for_chunks([&](int, int r0, int n, const int (&e)[GC]) {
+                        for_chunks([&](int, int r0, int n, const int (&e)[GC], int live) {
                             opus::static_for<GC>([&](auto jc) {
-                                if (jc.value < gc_live)   // uniform
+                                if (jc.value < live)   // uniform
                                     cnt += ceil_div_rcp(tiles_of(e[jc.value]), lo, lo_rcp);
                             });
                             for (int j = GC; j < groups_of(n); ++j)
@@ -368,10 +373,10 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                 bool fnd[W];
                 opus::static_for<W>([&](auto wc) { fnd[wc.value] = false; });
                 int carry = 0;
-                for_chunks([&](int base, int r0, int n, const int (&e)[GC]) {
+                for_chunks([&](int base, int r0, int n, const int (&e)[GC], int live) {
                     int s = 0;
                     opus::static_for<GC>([&](auto jc) {
-                        if (jc.value < gc_live)   // uniform
+                        if (jc.value < live)   // uniform
                             s += ceil_div_rcp(tiles_of(e[jc.value]), safe, rcp);
                     });
                     for (int j = GC; j < groups_of(n); ++j)

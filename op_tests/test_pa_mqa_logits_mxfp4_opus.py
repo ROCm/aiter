@@ -563,6 +563,11 @@ def rows_shapes(model):
                 full_layer("v4 dec tiers", [2048, 1500, 777, 3000], [2, 4, 6, 8], 4),
                 False,
             ),
+            # uniform over the first 256 sequences, ragged past them
+            (
+                full_layer("v4 dec 258 seqs", [512] * 258, [4] * 256 + [2, 6], 4),
+                False,
+            ),
             (full_layer("v4 dec r1 short", [70], [6], 1), False),
             (full_layer("v4 pre fresh 600", [600], [600], 4), False),
             (full_layer("v4 pre chunk 300@5000", [5300], [300], 4), False),
@@ -595,6 +600,12 @@ def rows_shapes(model):
                 (
                     full_layer(
                         "v41 dec r2 tiers", [2048, 1500, 777, 3000], [2, 3, 4, 8], 2
+                    ),
+                    False,
+                ),
+                (
+                    full_layer(
+                        "v41 dec r2 258 seqs", [512] * 258, [4] * 256 + [2, 6], 2
                     ),
                     False,
                 ),
@@ -960,6 +971,16 @@ def check_errors(model):
         ),
         "int64 row_ends": call(row_ends=ends.long()),
         "out narrower than cfg.max_seq_len": call(out=torch.empty(rows.rows, 1)),
+        "max_seq_len of 2^29": lambda: mqa_logits_mxfp4_config(
+            torch.cuda.current_device(),
+            heads=case.heads,
+            page_size=case.page_size,
+            pages_per_block=case.pages_per_block,
+            max_rows=64,
+            max_seqs=64,
+            max_qlen=4,
+            max_seq_len=1 << 29,
+        ),
         "table entries no instance reads": lambda: mqa_logits_mxfp4_config(
             torch.cuda.current_device(),
             heads=64,
