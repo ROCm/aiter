@@ -125,9 +125,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            # The registered input pool caps the largest custom all-gather.
+            # gfx1250's copy-in path stages the whole input into it and fails
+            # if it does not fit, and a DP-attention allgather LM head gathers
+            # [dp * rows, vocab] logits, which passes 1 GiB at large decode
+            # batches. AITER_CAR_POOL_BYTES raises it; the default is unchanged.
+            pool_bytes = int(os.environ.get("AITER_CAR_POOL_BYTES", str(1 << 30)))
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size=pool_bytes,
                 # symm_mem_enabled=(
                 #     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 # ),
