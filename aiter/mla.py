@@ -290,7 +290,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache
-def get_meta_param(
+def _get_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -379,6 +379,38 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
+    return num_kv_splits
+
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Pick the split count and build the matching uniform split indptr.
+
+    Only the split count is cached: an indptr returned from the cache is
+    captured into a CUDA graph as a bare pointer with no producing kernel, so
+    replay reads recycled storage once the entry is evicted. Eviction is
+    routine, since `total_kv` is part of the key and moves almost every decode
+    step. Rebuilding the indptr per call records `torch.arange` into the graph,
+    so every replay re-initialises the buffer.
+    """
+    num_kv_splits = _get_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
