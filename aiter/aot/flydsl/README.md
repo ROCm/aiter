@@ -11,6 +11,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
+| `gdn_fused_prefill.py` | `GDN_FUSED_PREFILL` | gfx950 single-kernel GDN prefill, every BV/track/init variant per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
@@ -135,6 +136,10 @@ python -m aiter.aot.flydsl.conv
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
+
+# single-kernel GDN prefill (DEFAULT_SHAPES, or ad hoc H:Hg)
+python -m aiter.aot.flydsl.gdn_fused_prefill
+python -m aiter.aot.flydsl.gdn_fused_prefill --shape 48:16
 
 # MegaMoE profile bundles (all token buckets and all eight ranks)
 python -m aiter.aot.flydsl.mega_moe
