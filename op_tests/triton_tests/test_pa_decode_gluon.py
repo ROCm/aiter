@@ -1265,10 +1265,9 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
         torch.testing.assert_close(output[i].float(), reference, atol=2e-2, rtol=2e-2)
 
 
-def _output_gate_inputs(query_length, kv_heads):
+def _output_gate_inputs(query_length, kv_heads, lengths=(1000, 37, 4096)):
     torch.manual_seed(0)
     group, head_size, page, x = 6, 256, 64, 8
-    lengths = [1000, 37, 4096]
     batch = len(lengths)
     tokens, heads = batch * query_length, kv_heads * group
     pages_per_seq = [triton.cdiv(n, page) for n in lengths]
@@ -1334,6 +1333,20 @@ def test_pa_decode_output_gate(query_length, kv_heads, splits):
     reference = reference * torch.sigmoid(gate.float())
     gated = _run_output_gate(inputs, query_length, splits, True, gate)
     torch.testing.assert_close(gated.float(), reference, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("splits", [2, 4])
+def test_pa_decode_output_gate_empty_sequence(splits):
+    """A zero-length sequence (a padded CUDA-graph row) gives 0, not NaN, in the gated PS reduce."""
+    inputs = _output_gate_inputs(1, 4, lengths=(1000, 0, 37))
+    gate = inputs[-1]
+    reference = _run_output_gate(inputs, 1, splits, True, None).float()
+    reference = reference * torch.sigmoid(gate.float())
+    gated = _run_output_gate(inputs, 1, splits, True, gate).float()
+    assert torch.isfinite(gated).all()
+    assert (gated[1] == 0).all()
+    live = [0, 2]
+    torch.testing.assert_close(gated[live], reference[live], atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

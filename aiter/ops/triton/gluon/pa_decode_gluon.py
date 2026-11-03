@@ -4157,6 +4157,8 @@ def paged_attention_decode_ps_reduce_kernel(
     final_output = tl.sum(
         partial_logits.to(tl.float32) * partition_weights[:, None], axis=0
     )
+    # A zero-length sequence (e.g. a padded CUDA-graph row) has no partitions: write 0, not NaN.
+    final_output = tl.where(global_exp_sum > 0, final_output, 0.0)
     if USE_OUTPUT_GATE:
         gate_offsets = (
             sequence_idx * stride_output_gate_bs
