@@ -1310,9 +1310,9 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     HipDeviceGuard device_guard(input.device_id);
     // Input, output and scale storage must be disjoint, as on the atomic path.
     // Four-byte row boundaries keep the existing vector loads/stores in bounds.
-    // The output holds one float per row until conversion overwrites it.
-    // Only gfx942 was measured: 512-row public calls regress, while tested
-    // 1024-row calls improve. Other architectures retain the atomic path.
+    // The output holds one float per row; same-stream reduction finishes before conversion.
+    // The 1024-row cutoff comes from gfx942 kernel timings, not a universal
+    // public-call latency crossover. Other architectures retain the atomic path.
     const bool use_partials = out.is_contiguous() && rows >= 1024 && cols % 4 == 0 &&
                               out.numel() * out.element_size() >=
                                   static_cast<size_t>(rows) * sizeof(float) &&
