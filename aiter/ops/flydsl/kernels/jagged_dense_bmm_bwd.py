@@ -411,7 +411,13 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds, arch):
                     fx.make_layout((GJ_BLOCK_N, N), (N, 1)),
                 )
 
-                def load_b_tile(k_tile):
+                def load_b_tile(
+                    k_tile,
+                    *,
+                    gB_full=gB_full,
+                    buffer_copy_128b=buffer_copy_128b,
+                    b_frags=b_frags,
+                ):
                     for p in fx.range_constexpr(4):
                         chunk = tid + fx.Int32(p * THREADS)
                         row = chunk // fx.Int32(4)
@@ -429,7 +435,13 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds, arch):
                             b_frags[p],
                         )
 
-                def store_b_tile(stage):
+                def store_b_tile(
+                    stage,
+                    *,
+                    sB=sB,
+                    uni_copy_128b=uni_copy_128b,
+                    b_frags=b_frags,
+                ):
                     for p in fx.range_constexpr(4):
                         chunk = tid + fx.Int32(p * THREADS)
                         row = chunk // fx.Int32(4)
@@ -471,6 +483,7 @@ def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds, arch):
                     mma_frag_B_retile=mma_frag_B_retile,
                     gB_k_stride=gB_k_stride,
                     uni_copy_128b=uni_copy_128b,
+                    copy_s2r_B=copy_s2r_B,
                     thr_sA_s2r=thr_sA_s2r,
                     mma_frag_A_retile=mma_frag_A_retile,
                     tiled_mma=tiled_mma,
