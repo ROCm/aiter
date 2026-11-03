@@ -728,7 +728,6 @@
             "*fused_norm_rope_attn_rope_cast/attention_64rows_*.cu": [
                 "-ffast-math",
                 "-fno-gpu-flush-denormals-to-zero",
-                "-mllvm --amdgpu-kernarg-preload-count=32",
                 "-mllvm -amdgpu-early-inline-all=false",
                 "-mllvm -amdgpu-function-calls=true",
                 "-mllvm -enable-post-misched=1"
