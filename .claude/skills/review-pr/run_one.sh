@@ -120,8 +120,16 @@ if [ -z "$W" ] || [ ! -d "$W" ]; then
     # does not itself count against the quota, so the exact refill time is readable even while
     # the quota is spent -- say the minute, and fall back to the vague form only if it cannot
     # be read. One line: what is wrong, how long, and that nothing was looked at.
-    _rs=$(GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" \
-      gh api rate_limit --jq '[.resources[].reset]|min' 2>/dev/null | grep -oE '^[0-9]+$' || true)
+    _rl=$(GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" \
+      gh api rate_limit --jq '"\(.resources.core.limit) \(.resources.graphql.limit) \([.resources[].reset]|min)"' 2>/dev/null || true)
+    _cl=${_rl%% *}; _gl=$(printf '%s' "$_rl" | cut -d" " -f2); _rs=$(printf '%s' "$_rl" | cut -d" " -f3)
+    _rs=$(printf '%s' "$_rs" | grep -oE '^[0-9]+$' || true)
+    # An authenticated account gets 5000/5000. 60 core with 0 graphql is the profile GitHub
+    # leaves on an account it has restricted, and waiting does not change it -- telling someone
+    # to come back in 40 minutes would send them to wait for something that never arrives.
+    if [ "$_cl" = "60" ] && [ "$_gl" = "0" ]; then
+      fail env 1 "GitHub is not throttling this bot, it has restricted the account: an authenticated token gets 5000 API calls an hour and this one is capped at 60 with GraphQL disabled entirely. Waiting will not clear it -- the account needs to be unflagged with GitHub, or the bot needs a different one. Nothing about this PR was examined."
+    fi
     if [ -n "$_rs" ]; then
       _mins=$(( (_rs - $(date +%s) + 59) / 60 )); [ "$_mins" -lt 1 ] && _mins=1
       fail env 1 "GitHub's API quota for this bot is spent (the token is fine) -- it refills at $(date -u -d "@$_rs" '+%H:%M UTC'), in about ${_mins} min; re-comment then. Nothing about this PR was examined."

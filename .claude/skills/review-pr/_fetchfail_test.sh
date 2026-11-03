@@ -37,6 +37,15 @@ _run "$T/bin"
 _want "within the hour" "the fallback wording was lost"
 _deny "in about" "" "an unreadable reset time still produced a number"
 
+# 2b) A RESTRICTED account, not a throttled one: 60 core with GraphQL at 0 is what GitHub
+# leaves on an account it has flagged. Telling that person to wait sends them to wait for
+# something that never arrives, so it must be named as the different thing it is.
+printf '#!/usr/bin/env bash\necho "60 0 $(( $(date +%%s) + 900 ))"\n' > "$T/bin/gh"
+_run "$T/bin"
+_want "restricted the account" "a restricted account was reported as throttling"
+_deny "re-comment then" "" "a restricted account was told to simply retry later"
+_want "Nothing about this PR was examined" "it did not say the PR went unexamined"
+
 # 3) A non-quota failure must keep its generic cause, not be mislabelled a quota.
 printf '#!/usr/bin/env bash\necho "fatal: could not read from remote"\nexit 1\n' > "$T/skill/fetch.sh"
 _run "$T/bin"
