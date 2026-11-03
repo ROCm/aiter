@@ -4,13 +4,15 @@
 """gfx942 FlyDSL absorbed sparse MLA.
 
 One CTA, two modes. BLOCK_Q==1 uses two waves that split D. BLOCK_Q==2/4 uses
-one wave per query over a shared KV tile. Both modes:
+one wave per query for QK and softmax over a shared KV tile, then each wave
+computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
 * gather the next 16 KV rows with coalesced dwordx4 loads while the current
   tile's MFMA chain runs
-* reduce the 16-token softmax with DPP (no LDS broadcast)
-* keep P in registers and transpose it with ds_bpermute, so each MFMA reads
-  only K or V from LDS
+* compute S^T (token on M, head on N): each lane owns one head, the softmax
+  reduces across lanes 16 and 32 apart, and P^T is already the PV B operand
+* compute out^T = V^T P^T; a lane owns four adjacent d, so one 8-byte V read
+  per token feeds four MFMAs
 
 ``v_mfma_f32_16x16x16_bf16`` fragment map (device probe):
 
@@ -26,7 +28,6 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -39,9 +40,16 @@ NUM_HEADS = 16
 VEC = 8
 NEG_INF = float("-inf")
 N_D_TILES = HEAD_DIM // 16
-# Eight bf16 elements of row padding spread column-wise MFMA reads across LDS
-# banks. This matches the 520-element pitch in the gfx942 gluon reference.
+# 520 is the gfx942 gluon reference pitch.
 LD_KV = HEAD_DIM + 8
+# Independent QK accumulator chains, summed after the chain.
+QK_ACCS = 2
+MFMA_CHUNK_ONE_Q = 8
+MFMA_CHUNK_QBLOCK = 4
+# Index vectors carried in loop state ahead of the tile being gathered.
+# Q-block only: one-query is 4% slower with it (measured on the S^T kernel).
+IDX_AHEAD_QBLOCK = 1
+RESCALE_TAU = 8.0
 
 
 def _mfma_ssa(mma, a, b, acc):
@@ -74,29 +82,23 @@ def _to_bf16(v):
     return (bits >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
 
 
-def _reduce16(val, add):
-    """All-reduce 16 lanes that share a head group. DPP does not touch LDS."""
-    val = fx.Float32(val)
-    for sh in (8, 4, 2, 1):
-        peer = fx.Float32(dpp_xor_f32(val, sh))
-        if const_expr(add):
-            val = val + peer
-        else:
-            val = (val > peer).select(val, peer)
-    return val
-
-
-def _bperm_f32(val, src_lane):
-    bits = fx.Float32(val).bitcast(fx.Int32)
-    recv = fx.rocdl.ds_bpermute(T.i32, src_lane * fx.Int32(4), bits)
-    return fx.Int32(recv).bitcast(fx.Float32)
-
-
 def _scale_acc(acc4, alphas):
     return fx.Vector.from_elements(
         [_elem(acc4, i) * alphas[i] for i in range_constexpr(4)],
         fx.Float32,
     )
+
+
+def _head_max(m):
+    # max over the four lanes (16 apart) that hold one head
+    for sh in (16, 32):
+        peer = m.shuffle_xor(sh, WAVE)
+        m = (m > peer).select(m, peer)
+    return m
+
+
+def _rescale_all(acc, alpha):
+    return [_scale_acc(a, [alpha] * 4) for a in acc]
 
 
 @lru_cache(maxsize=8)
@@ -113,21 +115,33 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
     BLOCK_THREADS = NWARP * WAVE
     BLOCK_K = 16
     QK_D_TILES = N_D_TILES // NWARP if ONE_Q else N_D_TILES
-    PV_D_TILES = QK_D_TILES
+    # Q-block: each wave owns a D/NWARP slice of the output for every query,
+    # so one V^T operand feeds BLOCK_Q MFMAs; P^T and alpha go through LDS.
+    PV_D_TILES = QK_D_TILES if ONE_Q else N_D_TILES // NWARP
+    N_ACC = PV_D_TILES * (1 if ONE_Q else BLOCK_Q)
     N_GATHER = (BLOCK_K * (HEAD_DIM // VEC) + BLOCK_THREADS - 1) // BLOCK_THREADS
-    # Eight PV MFMAs are 32 ds_read_u16s. On the four-query kernel that
-    # overflows the 15-deep lgkmcnt counter and spills Q out of the 256-VGPR
-    # occupancy-2 budget. Two MFMAs fit. The one-query kernel does not spill
-    # at eight, and the wider batch is faster there.
-    MFMA_CHUNK = 8 if ONE_Q else 2
+    MFMA_CHUNK = MFMA_CHUNK_ONE_Q if ONE_Q else MFMA_CHUNK_QBLOCK
+    IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
     )
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[fx.BFloat16, BLOCK_K * LD_KV, 16]
-        sred: fx.Array[fx.Float32, (NWARP * WAVE * 4) if ONE_Q else 1, 4]
+    # P^T (4 bf16) + alpha (f32) per lane in one 16-B slot.
+    XCH_ELEMS = 0 if ONE_Q else NWARP * WAVE * VEC
+    # One-query fits 16 KB (4 CTAs/CU on gfx942): unpadded rows with the 16-B
+    # column XORed by row & 7. Q-block keeps the padded row plus the exchange.
+    SWZ = ONE_Q
+    LD = HEAD_DIM if SWZ else LD_KV
+    TILE_ELEMS = BLOCK_K * LD
+
+    if const_expr(ONE_Q):
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[fx.BFloat16, TILE_ELEMS, 16]
+    else:
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[fx.BFloat16, TILE_ELEMS + XCH_ELEMS, 16]
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def sparse_mla_qblock_kernel(
@@ -141,7 +155,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
         sink_ptr: fx.Pointer,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
-        warp = tid // fx.Int32(WAVE)
+        # SGPR warp id: readlane lane selects then need no VALU->SGPR hazard nops.
+        warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(WAVE)))
         lane = tid - warp * fx.Int32(WAVE)
         lane_row = lane % fx.Int32(16)
         lane_k = (lane // fx.Int32(16)) * fx.Int32(4)
@@ -156,10 +171,6 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
 
         storage = fx.SharedAllocator().allocate(SharedStorage)
         lds_kv = storage.kv.peek().ptr
-        if const_expr(ONE_Q):
-            sred_lds = storage.sred.peek().view(
-                fx.make_layout(NWARP * WAVE * 4, 1)
-            )
 
         qk_scale = fx.Float32(scale) * fx.Float32(LOG2E)
         # Keep -inf / 0.0 as raw arith constants: ambient fast_fp_math would
@@ -167,40 +178,72 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
         # fused_compress_attn_hca).
         neg_inf = fx.Float32(arith.constant(NEG_INF, type=T.f32))
         zero_f = fx.Float32(arith.constant(0.0, type=T.f32))
+        one_f = fx.Float32(arith.constant(1.0, type=T.f32))
         n_u = fx.Int32(n_unique)
         n_kt = (n_u + fx.Int32(BLOCK_K - 1)) // fx.Int32(BLOCK_K)
         idx_row = q_row if const_expr(ONE_Q) else tile
         qk_d0 = warp * fx.Int32(QK_D_TILES * 16) if const_expr(ONE_Q) else fx.Int32(0)
-        pv_d0 = qk_d0
+        pv_d0 = qk_d0 if const_expr(ONE_Q) else warp * fx.Int32(PV_D_TILES * 16)
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         v4bf16 = fx.Vector.make_type(4, fx.BFloat16)
         v8bf16 = fx.Vector.make_type(VEC, fx.BFloat16)
 
+        def _halves(v8):
+            v8 = fx.Vector(v8)
+            return [
+                fx.Vector.from_elements([v8[h * 4 + e] for e in range_constexpr(4)], fx.BFloat16)
+                for h in range_constexpr(2)
+            ]
+
+        # QK pairs MFMAs 2p, 2p+1 over one 16-B load per lane: lane (g, s)
+        # owns dims 32p + 8g .. +7, low half for 2p and high half for 2p+1.
         q_frags = []
-        for dt in range_constexpr(QK_D_TILES):
+        for pr in range_constexpr(QK_D_TILES // 2):
             q_off = (
                 q_row * fx.Int32(NUM_HEADS * HEAD_DIM)
                 + lane_row * fx.Int32(HEAD_DIM)
                 + qk_d0
-                + fx.Int32(dt * 16)
-                + lane_k
+                + fx.Int32(pr * 32)
+                + lane_k * fx.Int32(2)
             )
-            q_frags.append(fx.ptr_load(q_ptr + q_off, result_type=v4bf16))
+            q8 = fx.ptr_load(q_ptr + q_off, result_type=v8bf16)
+            q_frags += _halves(q8)
 
         def _load_idx(k_base):
             # Address first, then load. A select around the load still issues
             # it for lanes 16..63 and walks off the end of the last query.
-            off = (lane < fx.Int32(16)).select(lane, fx.Int32(0))
+            # Past-the-end prefetches re-read tile 0 so the load stays in the row.
+            k_base = (k_base < n_u).select(k_base, fx.Int32(0))
+            ok = (lane < fx.Int32(BLOCK_K)) & (k_base + lane < n_u)
+            off = ok.select(lane, fx.Int32(0))
             return fx.ptr_load(
                 idx_ptr + idx_row * n_u + k_base + off,
                 result_type=fx.Int32,
             )
 
+        row0 = warp * fx.Int32(N_GATHER)
+
+        def _row(r):
+            return r * fx.Int32(LD)
+
+        def _c16(c, r):
+            # element offset of 16-B column c in row r
+            return ((c ^ (r & fx.Int32(7))) if const_expr(SWZ) else c) * fx.Int32(VEC)
+
+        if const_expr(SWZ):
+            # Element offsets; the XOR'd column lives in bits 3..5. K: c16 = 4 pr + lane_k / 4,
+            # so pr's parity flips bit 5. V: row lane_k + e flips c16 by e (lane_k % 4 == 0).
+            k_base = _row(lane_row) + _c16(lane_k // fx.Int32(4), lane_row)
+            v_base = (
+                _row(lane_k)
+                + _c16(lane_row // fx.Int32(2), lane_k)
+                + (lane_row % fx.Int32(2)) * fx.Int32(4)
+            )
+
         def _gather(idx_vec):
             frags = []
             for it in range_constexpr(N_GATHER):
-                row = warp + fx.Int32(it * NWARP)
-                slot = fx.Int32(fx.rocdl.readlane(T.i32, idx_vec, row))
+                slot = fx.Int32(fx.rocdl.readlane(T.i32, idx_vec, row0 + fx.Int32(it)))
                 frags.append(
                     fx.ptr_load(
                         kv_ptr + slot * fx.Int32(HEAD_DIM) + lane * fx.Int32(VEC),
@@ -211,45 +254,55 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
 
         def _store_kv(frags):
             for it in range_constexpr(N_GATHER):
-                row = warp + fx.Int32(it * NWARP)
                 fx.ptr_store(
                     frags[it],
-                    lds_kv + row * fx.Int32(LD_KV) + lane * fx.Int32(VEC),
+                    lds_kv + _row(row0 + fx.Int32(it)) + _c16(lane, row0 + fx.Int32(it)),
                 )
 
-        def _qk_b(dt):
-            return fx.ptr_load(
-                lds_kv + lane_row * fx.Int32(LD_KV) + qk_d0 + fx.Int32(dt * 16) + lane_k,
-                result_type=v4bf16,
-            )
+        def _k_a(pr):
+            # A operands for MFMAs 2pr, 2pr+1: K[token = lane_row][d of q_frags].
+            if const_expr(SWZ):
+                addr = lds_kv + ((k_base ^ fx.Int32((pr % 2) * 32)) + fx.Int32((pr // 2) * 64)) + qk_d0
+            else:
+                addr = lds_kv + _row(lane_row) + qk_d0 + fx.Int32(pr * 32) + lane_k * fx.Int32(2)
+            k8 = fx.ptr_load(addr, result_type=v8bf16)
+            return _halves(k8)
 
-        def _pv_b(dt):
-            d_row = pv_d0 + fx.Int32(dt * 16) + lane_row
-            cols = []
-            for e in range_constexpr(4):
-                cols.append(
-                    fx.ptr_load(
-                        lds_kv + (lane_k + fx.Int32(e)) * fx.Int32(LD_KV) + d_row,
-                        result_type=fx.BFloat16,
-                    )
+        def _vt_rows(g):
+            return [
+                fx.ptr_load(
+                    (lds_kv + (((v_base + fx.Int32(e * LD)) ^ fx.Int32(e * 8)) + fx.Int32(g * 64)) + pv_d0) if const_expr(SWZ) else
+                    (lds_kv + _row(lane_k + fx.Int32(e)) + pv_d0 + fx.Int32(g * 64) + lane_row * fx.Int32(4)),
+                    result_type=v4bf16,
                 )
-            return fx.Vector.from_elements(cols, fx.BFloat16)
+                for e in range_constexpr(4)
+            ]
 
-        m_i = [neg_inf for _ in range_constexpr(4)]
-        l_i = [zero_f for _ in range_constexpr(4)]
-        acc = [_zero4() for _ in range_constexpr(PV_D_TILES)]
+        def _vt_group(g, raw=None):
+            # A operands for tiles 4g .. 4g+3: tile 4g + h, row r is d = 64g + 4r + h.
+            rows = [fx.Vector(r) for r in (raw if raw is not None else _vt_rows(g))]
+            return [
+                fx.Vector.from_elements([rows[e][h] for e in range_constexpr(4)], fx.BFloat16)
+                for h in range_constexpr(4)
+            ]
+
+        # Scores come out as S^T (token = lane_k + i, head = lane_row): every
+        # lane owns one head, and P^T is already the PV B operand.
+        m_i = neg_inf
+        l_i = zero_f
+        acc = [_zero4() for _ in range_constexpr(N_ACC)]
         prefetched = _gather(_load_idx(fx.Int32(0)))
-        loop_init = m_i + l_i + acc + prefetched
+        idx_q = [_load_idx(fx.Int32((a + 1) * BLOCK_K)) for a in range_constexpr(IDX_AHEAD)]
+        loop_init = [m_i, l_i] + acc + prefetched + idx_q
         for kt, state in range(fx.Int32(0), n_kt, fx.Int32(1), init=loop_init):
-            state_off = 0
-            m_i = [fx.Float32(state[state_off + i]) for i in range_constexpr(4)]
-            state_off += 4
-            l_i = [fx.Float32(state[state_off + i]) for i in range_constexpr(4)]
-            state_off += 4
-            acc = [fx.Vector(state[state_off + i]) for i in range_constexpr(PV_D_TILES)]
-            state_off += PV_D_TILES
+            m_i = fx.Float32(state[0])
+            l_i = fx.Float32(state[1])
+            acc = [fx.Vector(state[2 + i]) for i in range_constexpr(N_ACC)]
             prefetched = [
-                fx.Vector(state[state_off + i]) for i in range_constexpr(N_GATHER)
+                fx.Vector(state[2 + N_ACC + i]) for i in range_constexpr(len(prefetched))
+            ]
+            idx_q = [
+                fx.Int32(state[2 + N_ACC + len(prefetched) + a]) for a in range_constexpr(IDX_AHEAD)
             ]
             kt_i32 = fx.Int32(kt)
             k0 = kt_i32 * fx.Int32(BLOCK_K)
@@ -260,126 +313,182 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
             # Issue the next tile's gather before any LDS read so the bytes
             # stay outstanding across QK, softmax, and PV.
             next_prefetched = prefetched
+            if const_expr(IDX_AHEAD == 0):
+                idx_q = [_load_idx(k0 + fx.Int32(BLOCK_K))]
+            idx_cur = idx_q[0]
+            idx_q = idx_q[1:]
+            if const_expr(IDX_AHEAD > 0):
+                idx_q.append(_load_idx(k0 + fx.Int32((IDX_AHEAD + 1) * BLOCK_K)))
             if kt_i32 + fx.Int32(1) < n_kt:
-                next_prefetched = _gather(_load_idx(k0 + fx.Int32(BLOCK_K)))
+                next_prefetched = _gather(idx_cur)
             fx.rocdl.sched_barrier(0)
 
-            s_acc = _zero4()
-            for chunk in range_constexpr(QK_D_TILES // MFMA_CHUNK):
-                base = chunk * MFMA_CHUNK
-                buf = [_qk_b(base + i) for i in range_constexpr(MFMA_CHUNK)]
+            s_accs = [_zero4() for _ in range_constexpr(QK_ACCS)]
+            fx.rocdl.s_setprio(1)
+            n_qk = len(q_frags)
+            qk_chunk = MFMA_CHUNK
+            for chunk in range_constexpr(n_qk // qk_chunk):
+                base = chunk * qk_chunk
+                buf = []
+                for i in range_constexpr(MFMA_CHUNK // 2):
+                    buf += _k_a(chunk * (MFMA_CHUNK // 2) + i)
                 fx.rocdl.sched_barrier(0)
-                for i in range_constexpr(MFMA_CHUNK):
-                    s_acc = _mfma_ssa(mma, q_frags[base + i], buf[i], s_acc)
+                for i in range_constexpr(qk_chunk):
+                    a = (base + i) % QK_ACCS
+                    s_accs[a] = _mfma_ssa(
+                        mma, buf[i], q_frags[base + i], s_accs[a]
+                    )
+            s_acc = s_accs[0]
+            for a in range_constexpr(1, QK_ACCS):
+                s_acc = fx.Vector.from_elements(
+                    [_elem(s_acc, i) + _elem(s_accs[a], i) for i in range_constexpr(4)], fx.Float32
+                )
+
+            fx.rocdl.s_setprio(0)
+            if const_expr(ONE_Q):
+                # Read this wave's whole V^T slice first: the partial below overwrites
+                # rows 0-1 of the same D half (LDS ops retire in order per wave).
+                v_raw = [_vt_rows(g) for g in range_constexpr(PV_D_TILES // 4)]
+
+                def _part_addr(w):
+                    return lds_kv + (lane // fx.Int32(32)) * fx.Int32(HEAD_DIM) + w * fx.Int32(HEAD_DIM // 2) + (lane % fx.Int32(32)) * fx.Int32(8)
+
+                fx.ptr_store(fx.Vector(s_acc).bitcast(fx.BFloat16), _part_addr(warp))
+                gpu.barrier()
+                peer = fx.Vector(fx.ptr_load(_part_addr(warp ^ fx.Int32(1)), result_type=v8bf16)).bitcast(fx.Float32)
+                s_acc = fx.Vector.from_elements(
+                    [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
+                )
+
+            scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
+            m_w = scores[0]
+            for i in range_constexpr(1, 4):
+                m_w = (m_w > scores[i]).select(m_w, scores[i])
+            # Lazy rescale: keep the stale head max until some lane's local max grows by
+            # more than RESCALE_TAU (log2 units), so p <= 2**RESCALE_TAU. Only then is the
+            # cross-lane head max needed. -inf - -inf is NaN -> no move.
+            moved = fx.Int64(fx.rocdl.ballot(fx.Int64.ir_type, (m_w - m_i) * qk_scale > fx.Float32(RESCALE_TAU)))
+            m_n = m_i
+            alpha = one_f
+            if moved != fx.Int64(0):
+                m_h = _head_max(m_w)
+                m_n = (m_h > m_i).select(m_h, m_i)
+                alpha = (m_n == neg_inf).select(zero_f, _exp2((m_i - m_n) * qk_scale))
+                if const_expr(ONE_Q):
+                    acc = _rescale_all(acc, alpha)
+            empty = m_n == neg_inf
+
+            p_t = []
+            for i in range_constexpr(4):
+                p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
+                p_t.append(live.select(p, zero_f))
+            # l stays a per-lane partial (alpha is uniform across the head's
+            # four lanes); the cross-lane sum happens once after the loop.
+            l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
+            m_i = m_n
+            p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
 
             if const_expr(ONE_Q):
-                for i in range_constexpr(4):
-                    sred_lds[
-                        (warp * fx.Int32(WAVE) + lane) * fx.Int32(4) + fx.Int32(i)
-                    ] = _elem(s_acc, i)
-                gpu.barrier()
-                summed = []
-                for i in range_constexpr(4):
-                    score = zero_f
-                    for w in range_constexpr(NWARP):
-                        score = score + sred_lds[
-                            (fx.Int32(w) * fx.Int32(WAVE) + lane) * fx.Int32(4)
-                            + fx.Int32(i)
-                        ]
-                    summed.append(score)
-                s_acc = fx.Vector.from_elements(summed, fx.Float32)
-
-            scores = []
-            for i in range_constexpr(4):
-                scores.append(live.select(_elem(s_acc, i), neg_inf))
-
-            # Every lane in the 16-wide head group already holds the reduced
-            # max and sum, so the old LDS broadcast is unnecessary.
-            m_new = []
-            alphas = []
-            for i in range_constexpr(4):
-                m_w = _reduce16(scores[i], False)
-                m_old = m_i[i]
-                m_n = (m_w > m_old).select(m_w, m_old)
-                empty = m_n == neg_inf
-                al = empty.select(zero_f, _exp2((m_old - m_n) * qk_scale))
-                alphas.append(al)
-                m_new.append(m_n)
-
-            for dt in range_constexpr(PV_D_TILES):
-                acc[dt] = _scale_acc(acc[dt], alphas)
-
-            p_heads = []
-            for i in range_constexpr(4):
-                empty = m_new[i] == neg_inf
-                p = empty.select(zero_f, _exp2((scores[i] - m_new[i]) * qk_scale))
-                p = live.select(p, zero_f)
-                p_heads.append(p)
-                l_add = _reduce16(p, True)
-                l_i[i] = l_i[i] * alphas[i] + l_add
-                m_i[i] = m_new[i]
-
-            # QK left P as (head = lane_k+i, token = lane_row). PV wants
-            # (head = lane_row, token = lane_k .. lane_k+3) packed as A.
-            elem = lane_row % fx.Int32(4)
-            src_base = (lane_row // fx.Int32(4)) * fx.Int32(16) + lane_k
-            a_elems = []
-            for e in range_constexpr(4):
-                src_lane = src_base + fx.Int32(e)
-                recvs = [_bperm_f32(p_heads[s], src_lane) for s in range_constexpr(4)]
-                got = fx.Float32(recvs[0])
-                for s in range_constexpr(1, 4):
-                    got = (elem == fx.Int32(s)).select(fx.Float32(recvs[s]), got)
-                a_elems.append(_to_bf16(got))
-            p_a = fx.Vector.from_elements(a_elems, fx.BFloat16)
-
-            for chunk in range_constexpr(PV_D_TILES // MFMA_CHUNK):
-                base = chunk * MFMA_CHUNK
-                vb = [_pv_b(base + i) for i in range_constexpr(MFMA_CHUNK)]
+                fx.rocdl.s_setprio(1)
+                for chunk in range_constexpr(PV_D_TILES // MFMA_CHUNK):
+                    base = chunk * MFMA_CHUNK
+                    va = []
+                    for g in range_constexpr(MFMA_CHUNK // 4):
+                        va += _vt_group(base // 4 + g, v_raw[base // 4 + g])
+                    fx.rocdl.sched_barrier(0)
+                    for i in range_constexpr(MFMA_CHUNK):
+                        acc[base + i] = _mfma_ssa(mma, va[i], p_b, acc[base + i])
+                fx.rocdl.s_setprio(0)
+            else:
+                xch = lds_kv + fx.Int32(TILE_ELEMS)
+                pf = p_b.bitcast(fx.Float32)
+                fx.ptr_store(
+                    fx.Vector.from_elements([pf[0], pf[1], alpha, zero_f], fx.Float32).bitcast(fx.BFloat16),
+                    xch + tid * fx.Int32(VEC),
+                )
                 fx.rocdl.sched_barrier(0)
-                for i in range_constexpr(MFMA_CHUNK):
-                    acc[base + i] = _mfma_ssa(mma, p_a, vb[i], acc[base + i])
+                gpu.barrier()
+                fx.rocdl.sched_barrier(0)
+                xs = [
+                    fx.Vector(fx.ptr_load(xch + fx.Int32(j * WAVE * VEC) + lane * fx.Int32(VEC), result_type=v8bf16)).bitcast(fx.Float32)
+                    for j in range_constexpr(BLOCK_Q)
+                ]
+                p_bs = [fx.Vector.from_elements([x[0], x[1]], fx.Float32).bitcast(fx.BFloat16) for x in xs]
+                for j in range_constexpr(BLOCK_Q):
+                    alpha_j = fx.Float32(xs[j][2])
+                    # alpha is exactly 1 unless query j's max moved: skip when no lane's did.
+                    moved_j = fx.Int64(fx.rocdl.ballot(fx.Int64.ir_type, alpha_j != one_f))
+                    if moved_j != fx.Int64(0):
+                        acc[j * PV_D_TILES:(j + 1) * PV_D_TILES] = _rescale_all(
+                            acc[j * PV_D_TILES:(j + 1) * PV_D_TILES], alpha_j
+                        )
+                fx.rocdl.s_setprio(1)
+                for g in range_constexpr(PV_D_TILES // 4):
+                    va = _vt_group(g)
+                    fx.rocdl.sched_barrier(0)
+                    for j in range_constexpr(BLOCK_Q):
+                        for h in range_constexpr(4):
+                            t = j * PV_D_TILES + 4 * g + h
+                            acc[t] = _mfma_ssa(mma, va[h], p_bs[j], acc[t])
+                fx.rocdl.s_setprio(0)
             gpu.barrier()
             prefetched = next_prefetched
-            results = yield m_i + l_i + acc + prefetched
+            results = yield [m_i, l_i] + acc + prefetched + idx_q
 
-        result_off = 0
-        m_i = [fx.Float32(results[result_off + i]) for i in range_constexpr(4)]
-        result_off += 4
-        l_i = [fx.Float32(results[result_off + i]) for i in range_constexpr(4)]
-        result_off += 4
-        acc = [fx.Vector(results[result_off + i]) for i in range_constexpr(PV_D_TILES)]
+        m_i = fx.Float32(results[0])
+        l_i = fx.Float32(results[1])
+        acc = [fx.Vector(results[2 + i]) for i in range_constexpr(N_ACC)]
+        for sh in (16, 32):
+            l_i = l_i + l_i.shuffle_xor(sh, WAVE)
+        if const_expr(not ONE_Q):
+            # Every wave stores some query's slice: publish (m, l) per query through LDS.
+            gpu.barrier()
+            fx.ptr_store(fx.Vector.from_elements([m_i, l_i], fx.Float32).bitcast(fx.BFloat16), lds_kv + tid * fx.Int32(4))
+            gpu.barrier()
+            # Re-derive lane ids after the loop: hoisted copies spill at the 256 cap on gfx942.
+            m1 = fx.Int32(-1).ir_value()
+            lane = fx.Int32(fx.rocdl.mbcnt_hi(T.i32, m1, fx.rocdl.mbcnt_lo(T.i32, m1, fx.Int32(0).ir_value())))
+            lane_row = lane % fx.Int32(16)
+            lane_k = (lane // fx.Int32(16)) * fx.Int32(4)
 
         tiny = fx.Float32(1.0e-30)
+        head = lane_row
 
-        def _output_scale(i):
-            denom = fx.Float32(l_i[i])
-            alpha = fx.Float32(1.0)
+        def _inv(m_q, l_q):
+            denom = l_q
+            alpha_q = fx.Float32(1.0)
             if const_expr(HAS_SINK):
-                head = lane_k + fx.Int32(i)
                 sink = fx.ptr_load(sink_ptr + head, result_type=fx.Float32)
-                m_scaled = fx.Float32(m_i[i]) * fx.Float32(scale)
+                m_scaled = m_q * fx.Float32(scale)
                 m_final = (sink > m_scaled).select(sink, m_scaled)
-                alpha = _exp2((m_scaled - m_final) * fx.Float32(LOG2E))
+                alpha_q = _exp2((m_scaled - m_final) * fx.Float32(LOG2E))
                 sink_term = _exp2((sink - m_final) * fx.Float32(LOG2E))
-                denom = denom * alpha + sink_term
+                denom = denom * alpha_q + sink_term
             denom = (denom > tiny).select(denom, tiny)
-            return alpha / denom
+            return alpha_q / denom
 
-        if live:
-            for i in range_constexpr(4):
-                inv = _output_scale(i)
-                head = lane_k + fx.Int32(i)
-                for dt in range_constexpr(PV_D_TILES):
-                    v = _elem(acc[dt], i) * inv
-                    d = pv_d0 + fx.Int32(dt * 16) + lane_row
+        def _store_out(t_q, acc_q, inv):
+            out_row = out_ptr + t_q * fx.Int32(NUM_HEADS * HEAD_DIM) + head * fx.Int32(HEAD_DIM) + pv_d0
+            # acc[4g + h][i] = out[head = lane_row][d = d0 + 64 g + 4 (lane_k + i) + h]
+            for g in range_constexpr(PV_D_TILES // 4):
+                for i in range_constexpr(4):
+                    vals = [_to_bf16(_elem(acc_q[4 * g + h], i) * inv) for h in range_constexpr(4)]
                     fx.ptr_store(
-                        _to_bf16(v),
-                        out_ptr
-                        + t_idx * fx.Int32(NUM_HEADS * HEAD_DIM)
-                        + head * fx.Int32(HEAD_DIM)
-                        + d,
+                        fx.Vector.from_elements(vals, fx.BFloat16),
+                        out_row + fx.Int32(g * 64) + (lane_k + fx.Int32(i)) * fx.Int32(4),
                     )
+
+        if const_expr(ONE_Q):
+            inv = _inv(m_i, l_i)
+            if live:
+                _store_out(t_idx, acc, inv)
+        else:
+            for j in range_constexpr(BLOCK_Q):
+                t_j = tile * fx.Int32(BLOCK_Q) + fx.Int32(j)
+                ml = fx.Vector(fx.ptr_load(lds_kv + fx.Int32(j * WAVE * 4) + lane * fx.Int32(4), result_type=v4bf16)).bitcast(fx.Float32)
+                inv_j = _inv(fx.Float32(ml[0]), fx.Float32(ml[1]))
+                if t_j < n_tok_i:
+                    _store_out(t_j, acc[j * PV_D_TILES:(j + 1) * PV_D_TILES], inv_j)
 
     @flyc.jit
     def launch_sparse_mla_qblock(
