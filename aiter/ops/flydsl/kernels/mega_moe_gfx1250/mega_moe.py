@@ -382,7 +382,18 @@ class MegaMoEGfx1250:
         )
         target = ep.prepare(batch, quant_bits)
         if hook is not None and target.scatter is not None:
-            target.scatter = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            # The grouped GEMM reads the hook off the dispatch context, which
+            # is the same scatter object on an expert-grouped batch.
+            scatter = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            target = dataclasses.replace(
+                target,
+                scatter=scatter,
+                dispatch_context=(
+                    scatter
+                    if target.dispatch_context is target.scatter
+                    else target.dispatch_context
+                ),
+            )
         expert_out = self._compute(
             batch,
             target,
