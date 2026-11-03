@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host side of the gfx1250 stage-1 kernel (``AITER_MEGA_S1F=1``).
+"""Host side of the gfx1250 stage-1 kernel (on by default, ``AITER_MEGA_S1F=0``
+turns it off).
 
-The compact dispatch owns one ``_Stage1Fusion``. When the env switch is on and
-the shape fits, the compact plan emits the run table the kernel gathers from,
-and GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1
-as separate launches.
+The compact dispatch owns one ``_Stage1Fusion``. When the switch is on and the
+shape fits, the compact plan emits the run table the kernel gathers from, and
+GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1 as
+separate launches.
 """
 
 from __future__ import annotations
@@ -63,15 +64,22 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 # waits out dispatch first. At or below this token count the next layer's plan
 # starts before dispatch returns and overlaps both.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
+# The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
+# route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
+# Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
+#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
+#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
+_S1F_MAX_RECV = 4096
 
 
 def read_s1f_mode() -> bool:
-    """``AITER_MEGA_S1F=1``: dispatch and GEMM1 as one persistent stage-1 kernel.
+    """Dispatch and GEMM1 as one persistent stage-1 kernel; on by default.
 
-    Compact flydsl path on the fp4 wire only. Unset (or 0) keeps dispatch and
-    GEMM1 as separate launches.
+    Compact flydsl path on the fp4 wire only: a config or step that does not
+    fit keeps dispatch and GEMM1 as separate launches. ``AITER_MEGA_S1F=0``
+    turns it off.
     """
-    mode = os.environ.get("AITER_MEGA_S1F", "0").strip() or "0"
+    mode = os.environ.get("AITER_MEGA_S1F", "1").strip() or "1"
     if mode not in ("0", "1"):
         raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
     return mode == "1"
@@ -89,9 +97,8 @@ def _fallback_warn(owner, reasons) -> None:
     if not reasons or getattr(owner, "_warned", False):
         return
     owner._warned = True
-    _log.warning(
-        "AITER_MEGA_S1F=1 falls back to dispatch + GEMM1: %s", "; ".join(reasons)
-    )
+    # S1F is on by default, so a config that does not fit is not a warning.
+    _log.info("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
 
 
 def tile_flag_nbytes(*, compact_rows: int, world_size: int) -> int:
@@ -289,8 +296,29 @@ class _Stage1Fusion:
         step = self.d._step
         return (int(step.align_m), int(step.recv_bound))
 
+    def _recv_too_big(self) -> bool:
+        # The receive bound is identical on every rank.
+        step = getattr(self.d, "_step", None)
+        return step is not None and int(step.recv_bound) > _S1F_MAX_RECV
+
+    def step_off(self) -> bool:
+        """A step over _S1F_MAX_RECV runs exactly the S1F=0 path.
+
+        Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
+        kernel per alignment and slot, instead of one per launch width, block
+        count, tok_map and fused-quant choice) and it never probes. Before,
+        every new prefill width JIT-compiled a stage-1 plan inside the serving
+        loop (first ~100 s of a c512 run: 250-470 ms prefill steps), and the
+        wide stage-1 plan left the remaining prefill steps ~6% slower.
+        """
+        return self.enabled and self._recv_too_big()
+
     def _gemm1_reasons(self) -> list:
         reasons = self.tile_reasons(self.d._step.align_m)
+        if self._recv_too_big():
+            reasons = reasons + [
+                f"recv_bound {int(self.d._step.recv_bound)} > {_S1F_MAX_RECV}"
+            ]
         seen = self.g1_seen.get(self._g1_key())
         if seen is None:
             return reasons + [_S1F_PROBING]
@@ -335,11 +363,14 @@ class _Stage1Fusion:
             seen is not None
             and not seen
             and not self.tile_reasons(self.d._step.align_m)
+            and not self._recv_too_big()
         )
 
     def should_probe(self) -> bool:
         """The first step at this alignment records the real GEMM1 tile."""
         if not self.enabled or torch.cuda.is_current_stream_capturing():
+            return False
+        if self.step_off():
             return False
         return self.g1_seen.get(self._g1_key()) is None
 
@@ -352,6 +383,7 @@ class _Stage1Fusion:
             and self.wire is not None
             and not d._plan_pending
             and self.plan_mode(d._step.align_m)
+            and not self.step_off()
         )
 
     def quantize(self, hidden, token_count: int, run: bool):
@@ -410,11 +442,10 @@ class _Stage1Fusion:
 
     @staticmethod
     def _mismatches(got: dict, align_m: int) -> tuple:
-        want = {
-            "tile_m": int(align_m),
-            "tile_n": _S1F_TILE_N,
-            "tile_k": _S1F_TILE_K,
-        }
+        # Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel
+        # then runs its own 256x256 n/k tiles instead of the tuned GEMM1's
+        # (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
+        want = {"tile_m": int(align_m)}
         return tuple(
             f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
         )
@@ -593,6 +624,8 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
+        # The stage-1 kernel runs its own 256x256 n/k tiles.
+        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
