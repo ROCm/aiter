@@ -224,6 +224,14 @@ def flagged_citations(pr):
         return None
     if not text.strip():
         return None
+    # A traceback is not a verdict. The checker runs under `|| true` with its output
+    # tee'd here, so a crash leaves a Python traceback and nothing else -- which read
+    # as "no citation was flagged" and let every finding anchor with no checking at
+    # all. This module's own contract above is the opposite: if the checker could not
+    # run, nothing is anchored. No verdict line IS that case, however the file got
+    # that way. Measured on this bot's own PR, where citations.txt was such a crash.
+    if not any(ln.startswith("CITATIONS") for ln in text.split("\n")):
+        return None
     out = set()
     # Hard failures only. A `CITATIONS BAD:` entry means the citation resolves to
     # nothing -- absent file, or a line past the end of it -- so anchoring there would

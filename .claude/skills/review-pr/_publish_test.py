@@ -194,6 +194,27 @@ def test_no_citation_check_means_nothing_is_anchored(report, monkeypatch):
     assert _publish.flagged_citations("9999") is None
 
 
+def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
+    """A traceback in citations.txt must forbid anchoring, not permit it.
+
+    This is how it actually failed: check_citations.py raised NameError on every
+    invocation, run_one's `|| true` swallowed it, and the traceback was tee'd here.
+    An empty flagged-set then read as "nothing wrong with any citation", so every
+    finding anchored with no checking at all -- the precise failure the checker
+    exists to prevent, reached by the checker being broken.
+    """
+    (report / "citations.txt").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "check_citations.py", line 205, in <module>\n'
+        "    sys.exit(main(sys.argv))\n"
+        "NameError: name 'tree_for' is not defined\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    assert _publish.flagged_citations("9999") is None
+    assert _publish.review_payload("9999")["comments"] == []
+
+
 def test_summary_indexes_every_anchored_finding(report, monkeypatch):
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     pl = _publish.review_payload("9999")
