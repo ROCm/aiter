@@ -16,13 +16,13 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, gen_lookup_header_map  # noqa: E402
-from gemm_a8w8_common import (  # noqa: E402
+from chip_info import build_tune_dict, gen_lookup_header_map
+from gemm_a8w8_common import (
     default_kernels_dict,
     kernelInstance,
     kernels_list,
 )
-from template_env import stream as stream_template  # noqa: E402
+from template_env import stream as stream_template
 
 
 class gemm_a8w8_fwd_codegen:
