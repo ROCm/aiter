@@ -873,7 +873,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
 # over the macro. The CO loader resolves the current HIP device's ASIC Revision:
-# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# A0 uses this root's gfx1250-strict directory, B0+ uses gfx1250. A direct profile
 # override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
