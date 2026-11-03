@@ -13,6 +13,61 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
+def _store_nvfp4_shuffled_row(
+    cache_ptrs,
+    x,
+    pid_b,
+    cache_stride_d,
+    BLOCK_D_pe: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE_K_WIDTH: tl.constexpr,
+    SCALE_PRESHUFFLE: tl.constexpr,
+):
+    """NVFP4-quantize one token row x [BLOCK_D_pe] and store it at row pid_b of the
+    page at cache_ptrs, in the shuffled layout the gfx1250 attention kernels read:
+    [BLOCK_SIZE * BLOCK_D_pe // 2] packed e2m1 shuffled in (16, 16) tiles, then
+    [BLOCK_SIZE * BLOCK_D_pe // 16] e4m3 scales preshuffled in SCALE_PRESHUFFLE-row groups
+    (min(128, page)), matching dynamic_nvfp4_quant_kv_cache / nvfp4_quant_shuffle_cache.
+    """
+    K_WIDTH: tl.constexpr = 16
+    NVFP4_QUANT_BLOCK_SIZE: tl.constexpr = 16
+    BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe // 2
+    BLOCK_D_pe_scales: tl.constexpr = BLOCK_D_pe // NVFP4_QUANT_BLOCK_SIZE
+    P: tl.constexpr = SCALE_PRESHUFFLE
+    P_QUARTER: tl.constexpr = SCALE_PRESHUFFLE // 4
+
+    x, x_scales = _nvfp4_quant_op(x, BLOCK_D_pe, 1, NVFP4_QUANT_BLOCK_SIZE)
+
+    d_offs_shfl = tl.arange(0, BLOCK_D_pe_STORE // K_WIDTH).to(tl.int64)
+    k_width_shfl = tl.arange(0, K_WIDTH).to(tl.int64)
+    x = x.reshape((BLOCK_D_pe_STORE // K_WIDTH, K_WIDTH))
+    data_offs = (
+        (pid_b // 16) * BLOCK_D_pe_STORE * 16
+        + (pid_b % 16) * K_WIDTH
+        + d_offs_shfl[:, None] * K_WIDTH * 16
+        + k_width_shfl[None, :]
+    ) * cache_stride_d
+    tl.store(cache_ptrs + data_offs, x.to(cache_ptrs.dtype.element_ty))
+
+    d_offs_shfl = tl.arange(0, BLOCK_D_pe_scales // SCALE_K_WIDTH).to(tl.int64)
+    s_width_shfl = tl.arange(0, SCALE_K_WIDTH).to(tl.int64)
+    x_scales = x_scales.reshape((BLOCK_D_pe_scales // SCALE_K_WIDTH, SCALE_K_WIDTH))
+    pid_sub_blk = pid_b % P
+    scales_offs = (
+        BLOCK_SIZE * BLOCK_D_pe_STORE
+        + (pid_b // P) * BLOCK_D_pe_scales * P
+        + d_offs_shfl[:, None] * SCALE_K_WIDTH * P
+        + (pid_sub_blk % P_QUARTER) * 4 * SCALE_K_WIDTH
+        + (pid_sub_blk // P_QUARTER) * SCALE_K_WIDTH
+        + s_width_shfl[None, :]
+    ) * cache_stride_d
+    tl.store(
+        cache_ptrs + scales_offs,
+        x_scales.to(tl.float8e4nv).to(cache_ptrs.dtype.element_ty, bitcast=True),
+    )
+
+
+@triton.jit
 def _store_kv_cache_kernel(
     key_cache_ptr,
     value_cache_ptr,
@@ -39,72 +94,54 @@ def _store_kv_cache_kernel(
     FLASH_LAYOUT: tl.constexpr,
     VALUE_SHUFFLE_LAYOUT: tl.constexpr,
     SCALE_K_WIDTH: tl.constexpr,
+    SCALE_PRESHUFFLE: tl.constexpr = 128,
 ):
     if key_cache_ptr.dtype.element_ty == tl.uint8:
-        K_WIDTH: tl.constexpr = 16
-        NVFP4_QUANT_BLOCK_SIZE: tl.constexpr = 16
-        BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe // 2
-        BLOCK_D_pe_scales: tl.constexpr = BLOCK_D_pe // NVFP4_QUANT_BLOCK_SIZE
-
-        k_pe, k_pe_scales = _nvfp4_quant_op(k_pe, BLOCK_D_pe, 1, NVFP4_QUANT_BLOCK_SIZE)
-        v, v_scales = _nvfp4_quant_op(v, BLOCK_D_pe, 1, NVFP4_QUANT_BLOCK_SIZE)
-
-        d_pe_offs_shfl = tl.arange(0, BLOCK_D_pe_STORE // K_WIDTH).to(tl.int64)
-        k_width_shfl = tl.arange(0, K_WIDTH).to(tl.int64)
-        k_pe = k_pe.reshape((BLOCK_D_pe_STORE // K_WIDTH, K_WIDTH))
-        v = v.reshape((BLOCK_D_pe_STORE // K_WIDTH, K_WIDTH))
-
+        # NVFP4 K (always shuffled)
         key_cache_ptrs = (
             key_cache_ptr
             + pid_t_slot * key_cache_stride_t
             + pid_hk * key_cache_stride_h
         )
-        value_cache_ptrs = (
-            value_cache_ptr
-            + pid_t_slot * value_cache_stride_t
-            + pid_hk * value_cache_stride_h
+        _store_nvfp4_shuffled_row(
+            key_cache_ptrs,
+            k_pe,
+            pid_b,
+            key_cache_stride_d,
+            BLOCK_D_pe,
+            BLOCK_SIZE,
+            SCALE_K_WIDTH,
+            SCALE_PRESHUFFLE,
         )
-
-        key_value_cache_offs = (
-            (pid_b // 16) * BLOCK_D_pe_STORE * 16
-            + (pid_b % 16) * K_WIDTH
-            + d_pe_offs_shfl[:, None] * K_WIDTH * 16
-            + k_width_shfl[None, :]
-        ) * key_cache_stride_d
-
-        tl.store(
-            key_cache_ptrs + key_value_cache_offs,
-            k_pe.to(key_cache_ptr.dtype.element_ty),
-        )
-        tl.store(
-            value_cache_ptrs + key_value_cache_offs,
-            v.to(value_cache_ptr.dtype.element_ty),
-        )
-
-        d_pe_offs_shfl = tl.arange(0, BLOCK_D_pe_scales // SCALE_K_WIDTH).to(tl.int64)
-        k_pe_width_shfl = tl.arange(0, SCALE_K_WIDTH).to(tl.int64)
-        k_pe_scales = k_pe_scales.reshape(
-            (BLOCK_D_pe_scales // SCALE_K_WIDTH, SCALE_K_WIDTH)
-        )
-        v_scales = v_scales.reshape((BLOCK_D_pe_scales // SCALE_K_WIDTH, SCALE_K_WIDTH))
-        pid_sub_blk = pid_b % 128
-        key_cache_pe_scales_offs = (
-            BLOCK_SIZE * BLOCK_D_pe_STORE
-            + (pid_b // 128) * BLOCK_D_pe_scales * 128
-            + d_pe_offs_shfl[:, None] * SCALE_K_WIDTH * 128
-            + (pid_sub_blk % 32) * 4 * SCALE_K_WIDTH
-            + (pid_sub_blk // 32) * SCALE_K_WIDTH
-            + k_pe_width_shfl[None, :]
-        ) * key_cache_stride_d
-        e4m3_dtype = tl.float8e4nv
-        tl.store(
-            key_cache_ptrs + key_cache_pe_scales_offs,
-            k_pe_scales.to(e4m3_dtype).to(key_cache_ptr.dtype.element_ty, bitcast=True),
-        )
-        tl.store(
-            value_cache_ptrs + key_cache_pe_scales_offs,
-            v_scales.to(e4m3_dtype).to(value_cache_ptr.dtype.element_ty, bitcast=True),
-        )
+        if value_cache_ptr.dtype.element_ty == tl.uint8:
+            # NVFP4 V, same layout as K
+            value_cache_ptrs = (
+                value_cache_ptr
+                + pid_t_slot * value_cache_stride_t
+                + pid_hk * value_cache_stride_h
+            )
+            _store_nvfp4_shuffled_row(
+                value_cache_ptrs,
+                v,
+                pid_b,
+                value_cache_stride_d,
+                BLOCK_D_pe,
+                BLOCK_SIZE,
+                SCALE_K_WIDTH,
+                SCALE_PRESHUFFLE,
+            )
+        else:
+            # A8K4V8: fp8 V in the shuffled layout
+            # (num_blocks, KH, BLOCK_SIZE // X_SIZE, D, X_SIZE), as shuffle_kv_cache builds it
+            v_out_ptrs = (
+                value_cache_ptr
+                + pid_t_slot * value_cache_stride_t
+                + pid_hk * value_cache_stride_h
+                + (pid_b // X_SIZE) * value_cache_stride_slot_chunk
+                + d_pe_offs * value_cache_stride_d
+                + (pid_b % X_SIZE) * value_cache_stride_x
+            )
+            tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
     else:
 
         if FLASH_LAYOUT:
@@ -649,6 +686,7 @@ _fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
         "FLASH_LAYOUT",
         "VALUE_SHUFFLE_LAYOUT",
         "SCALE_K_WIDTH",
+        "SCALE_PRESHUFFLE",
         "HAVE_POS",
         "HAVE_K_SCALE",
         "HAVE_V_SCALE",
@@ -728,6 +766,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     UPCAST_OPERAND: tl.constexpr = False,
     BLOCK_H: tl.constexpr = 1,
     KH_BLOCK: tl.constexpr = 1,
+    SCALE_PRESHUFFLE: tl.constexpr = 128,
 ):
 
     tl.assume(q_stride_t >= 0)
@@ -907,6 +946,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                         FLASH_LAYOUT,
                         VALUE_SHUFFLE_LAYOUT,
                         SCALE_K_WIDTH,
+                        SCALE_PRESHUFFLE,
                     )
     else:
         pid = pid - T * HB + T * KH
@@ -980,6 +1020,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     FLASH_LAYOUT,
                     VALUE_SHUFFLE_LAYOUT,
                     SCALE_K_WIDTH,
+                    SCALE_PRESHUFFLE,
                 )
 
 
