@@ -12,6 +12,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter.utility.tune_result import TuneResult, TuneStatusResult
 from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
@@ -145,11 +146,9 @@ def _format_worker_result(
 ):
     result = (info, us, round(max_err_ratio, 4))
     if return_status:
-        return (*result, status, detail)
+        return TuneStatusResult(*result, status, detail, watts)
     if watts is None:
         return result
-    from aiter.utility.tune_result import TuneResult
-
     return TuneResult(*result, watts)
 
 
@@ -612,7 +611,8 @@ def mp_tuner(
         status is one of ok, mismatch, unsupported, crash, timeout,
         zero_time, oom_runtime, oom_preflight (outside a candidate's run, e.g.
         generating inputs) or not_run (never run: its group kept faulting
-        before measuring anything).
+        before measuring anything). Either form carries ``.watts`` when the power
+        policy measured it; a typed result has ``.watts`` NaN otherwise.
     """
     from aiter.utility.selection_policy import LATENCY, active_policy
 
