@@ -12,13 +12,13 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
+from flydsl.expr.rocdl import SyncScope, cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
-from .buffer_ops import buffer_store, create_buffer_resource_from_addr
+from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -117,6 +117,10 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
+# gfx1250 SCOPE_DEV: publish route rows at the device coherence point so a
+# last-arriving CTA can read siblings on another XCD without an agent-wide
+# cache-flushing fence.
+TP_REDUCE_CPOL_DEVICE = 16
 
 
 def _pack_bytes_i32(byte_vals):
@@ -166,6 +170,9 @@ def build_gemm_a8w4_tdm_task(
     ep_destination_stride,
     ep_world_size,
     ep_quant_bits,
+    enable_tp_reduce,
+    tp_topk,
+    tp_counter_stride,
     row_major_ascale,
     a_row_stride_bytes,
     a_scale_row_stride_bytes,
@@ -323,6 +330,9 @@ def build_gemm_a8w4_tdm_task(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        enable_tp_reduce,
+        tp_topk,
+        tp_counter_stride,
         sched_mma_group,
         sched_first_group,
         sched_ds_first,
@@ -343,6 +353,11 @@ def build_gemm_a8w4_tdm_task(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if enable_tp_reduce:
+        if enable_ep_scatter or stage1_act or stage1_quant_out:
+            raise ValueError("TP reduction is a GEMM2-only non-EP epilogue")
+        if tp_topk <= 0 or tp_counter_stride <= 0:
+            raise ValueError("TP reduction requires positive topk/counter stride")
     if ep_quant_bits not in (0, 8, 4):
         raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
     if ep_quant_bits:
@@ -505,6 +520,7 @@ def build_gemm_a8w4_tdm_task(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _tpr = f"_tpreduce{tp_topk}" if enable_tp_reduce else ""
     _mma_group = (
         f"_mg{sched_mma_group}"
         if sched_first_group == sched_mma_group
@@ -524,7 +540,7 @@ def build_gemm_a8w4_tdm_task(
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
         f"{_next_stage}{_as_prologue}"
-        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
+        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}{_tpr}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}"
@@ -551,6 +567,12 @@ def build_gemm_a8w4_tdm_task(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
+        arg_tp_output: fx.Pointer,
+        arg_tp_row_to_token: fx.Pointer,
+        arg_tp_topids_to_rows: fx.Pointer,
+        arg_tp_weights: fx.Pointer,
+        arg_tp_counters: fx.Pointer,
+        i32_tp_tokens: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -763,12 +785,13 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
+        def make_tdm_store(gt, outer, stride, cache_modifier=0):
             return fx.rocdl.make_tdm_atom(
                 gt,
                 [outer, None],
                 strides=[stride, None],
                 num_warps=num_waves,
+                cache_modifier=cache_modifier,
             )
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
@@ -2445,6 +2468,9 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
+                _store_cpol = (
+                    TP_REDUCE_CPOL_DEVICE if const_expr(enable_tp_reduce) else 0
+                )
                 if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
                     # M is allocated in complete M16 blocks. The final block's
                     # padding rows are unused, so transfer whole K32/M16 slabs.
@@ -2467,7 +2493,9 @@ def build_gemm_a8w4_tdm_task(
                         gtC = tensor_view(
                             c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
                         )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                        atomC = make_tdm_store(
+                            gtC, mn_oob, out_stride, cache_modifier=_store_cpol
+                        )
                         src = tensor_view(
                             fx.recast_iter(oc_store, c_q_base_ptr),
                             (tile_m, STORE_N),
@@ -2484,6 +2512,7 @@ def build_gemm_a8w4_tdm_task(
                             [mn_oob, STORE_N],
                             strides=[out_stride, None],
                             num_warps=num_waves,
+                            cache_modifier=_store_cpol,
                         )
                         src = tensor_view(
                             fx.recast_iter(oc_store, base_ptr),
@@ -2497,6 +2526,126 @@ def build_gemm_a8w4_tdm_task(
                     if const_expr(stage1_quant_out and stage1_act):
                         rocdl.s_wait_storecnt(0)
                     tdm_ops.tensor_wait(0)
+                if const_expr(enable_tp_reduce):
+                    # The coherent TDM store above publishes every route row to
+                    # the device coherence point. Retire it before announcing
+                    # this route tile; the agent-scope atomic then elects the
+                    # last route for each (token, N-tile) without any waiter.
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Release,
+                        syncscope="workgroup",
+                    )
+                    _last_tokens = fx.recast_iter(fx.Int32, base_ptr)
+                    if tid == fx.Int32(0):
+                        _last_tokens[0] = fx.Int32(0)
+                    workgroup_barrier()
+
+                    _r2t = fx.recast_iter(fx.Int32, arg_tp_row_to_token)
+                    _counters = fx.recast_iter(fx.Int32, arg_tp_counters)
+                    _n_tiles = i32_n // fx.Int32(tile_n)
+                    _n_tile = blk_n // fx.Int32(tile_n)
+                    for _row_pass in range_constexpr(ceildiv(tile_m, block)):
+                        _row = tid + fx.Int32(_row_pass * block)
+                        if _row < fx.Int32(mn_oob):
+                            _token = fx.Int32(_r2t[blk_m + _row])
+                            _counter_idx = (
+                                (_token * _n_tiles + _n_tile)
+                                * fx.Int32(tp_counter_stride)
+                            )
+                            _counter = _counters + _counter_idx
+                            _ticket = fx.Int32(
+                                fx.atomic_add(
+                                    _counter,
+                                    fx.Int32(1),
+                                    syncscope=SyncScope.Agent,
+                                )
+                            )
+                            _is_last = _ticket == fx.Int32(tp_topk - 1)
+                            if _is_last:
+                                # Self-reset for the next eager call / graph
+                                # replay. Same-stream launches cannot overlap.
+                                fx.atomic_add(
+                                    _counter,
+                                    fx.Int32(-tp_topk),
+                                    syncscope=SyncScope.Agent,
+                                )
+                                _slot = fx.Int32(
+                                    fx.atomic_add(
+                                        _last_tokens,
+                                        fx.Int32(1),
+                                        syncscope="workgroup",
+                                    )
+                                )
+                                _last_tokens[1 + _slot] = _token
+                    workgroup_barrier()
+
+                    # Only the elected CTA writes a token's output tile. Source
+                    # rows are loaded in route-slot order and each product is
+                    # accumulated in FP32 before the final BF16/F16 cast, exactly
+                    # matching moe_gather_reduce's deterministic k=0..topk-1
+                    # arithmetic.
+                    _rows = fx.recast_iter(fx.Int32, arg_tp_topids_to_rows)
+                    _weights = fx.recast_iter(fx.Float32, arg_tp_weights)
+                    _reduce_vec = tile_n // block
+                    _out_rsrc = create_buffer_resource_from_addr(
+                        fx.ptrtoint(arg_tp_output),
+                        num_records_bytes=(
+                            fx.Int64(i32_tp_tokens)
+                            * fx.Int64(i32_n)
+                            * fx.Int64(2)
+                        ).ir_value(),
+                    )
+                    _last_count = fx.Int32(_last_tokens[0])
+                    for _slot in range(_last_count):
+                        _token = fx.Int32(_last_tokens[1 + _slot])
+                        _col = tid * fx.Int32(_reduce_vec)
+                        _acc = [
+                            fx.Float32(0.0) for _ in range_constexpr(_reduce_vec)
+                        ]
+                        for _k in range_constexpr(tp_topk):
+                            _route = _token * fx.Int32(tp_topk) + fx.Int32(_k)
+                            _src_row = fx.Int32(_rows[_route])
+                            _row_rsrc = create_buffer_resource_from_addr(
+                                fx.Int64(fx.ptrtoint(arg_c))
+                                + fx.Int64(_src_row)
+                                * fx.Int64(i32_n)
+                                * fx.Int64(2),
+                                num_records_bytes=(
+                                    fx.Int64(i32_n) * fx.Int64(2)
+                                ).ir_value(),
+                            )
+                            _raw_c = buffer_load(
+                                _row_rsrc,
+                                blk_n + _col,
+                                vec_width=_reduce_vec,
+                                dtype=oc,
+                                cache_modifier=TP_REDUCE_CPOL_DEVICE,
+                            )
+                            _weight = fx.Float32(_weights[_route])
+                            if const_expr(_reduce_vec == 1):
+                                _acc[0] = _acc[0] + _weight * oc(_raw_c).to(
+                                    fx.Float32
+                                )
+                            else:
+                                _values = Vec(_raw_c)
+                                for _v in range_constexpr(_reduce_vec):
+                                    _acc[_v] = _acc[_v] + _weight * oc(
+                                        _values[_v]
+                                    ).to(fx.Float32)
+                        _out_off = _token * i32_n + blk_n + _col
+                        if const_expr(_reduce_vec == 1):
+                            buffer_store(
+                                _acc[0].to(oc).ir_value(),
+                                _out_rsrc,
+                                _out_off,
+                            )
+                        else:
+                            _out_vec = Vec.from_elements(_acc, fx.Float32).to(oc)
+                            buffer_store(
+                                _out_vec.ir_value(),
+                                _out_rsrc,
+                                _out_off,
+                            )
             if const_expr(item_hooks is not None):
                 # Same region as drain_start / epi_start (inside has_work).
                 item_hooks[0]["epi_end"]()
@@ -2568,6 +2717,15 @@ def launch_gemm_a8w4_tdm(
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
+    enable_tp_reduce: Constexpr[int] = 0,
+    tp_topk: Constexpr[int] = 0,
+    tp_counter_stride: Constexpr[int] = 0,
+    i32_tp_tokens: fx.Int32 = 0,
+    arg_tp_output: fx.Tensor = None,
+    arg_tp_row_to_token: fx.Tensor = None,
+    arg_tp_topids_to_rows: fx.Tensor = None,
+    arg_tp_weights: fx.Tensor = None,
+    arg_tp_counters: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
@@ -2633,6 +2791,9 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride=ep_destination_stride,
         ep_world_size=ep_world_size,
         ep_quant_bits=ep_quant_bits,
+        enable_tp_reduce=enable_tp_reduce,
+        tp_topk=tp_topk,
+        tp_counter_stride=tp_counter_stride,
         row_major_ascale=row_major_ascale,
         a_row_stride_bytes=a_row_stride_bytes,
         a_scale_row_stride_bytes=a_scale_row_stride_bytes,
@@ -2654,6 +2815,12 @@ def launch_gemm_a8w4_tdm(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
+        arg_tp_output: fx.Pointer,
+        arg_tp_row_to_token: fx.Pointer,
+        arg_tp_topids_to_rows: fx.Pointer,
+        arg_tp_weights: fx.Pointer,
+        arg_tp_counters: fx.Pointer,
+        i32_tp_tokens: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -2673,6 +2840,12 @@ def launch_gemm_a8w4_tdm(
                 arg_bias,
                 arg_quant_scale,
                 arg_ep_row_map,
+                arg_tp_output,
+                arg_tp_row_to_token,
+                arg_tp_topids_to_rows,
+                arg_tp_weights,
+                arg_tp_counters,
+                i32_tp_tokens,
                 i32_m,
                 i32_n,
                 f32_swiglu_limit,
@@ -2705,6 +2878,16 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_tp_output is None:
+        arg_tp_output = arg_c
+    if arg_tp_row_to_token is None:
+        arg_tp_row_to_token = arg_c
+    if arg_tp_topids_to_rows is None:
+        arg_tp_topids_to_rows = arg_c
+    if arg_tp_weights is None:
+        arg_tp_weights = arg_c
+    if arg_tp_counters is None:
+        arg_tp_counters = arg_c
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -2715,6 +2898,12 @@ def launch_gemm_a8w4_tdm(
         arg_bias,
         fx.get_iter(arg_quant_scale),
         fx.get_iter(arg_ep_row_map),
+        fx.get_iter(arg_tp_output),
+        fx.get_iter(arg_tp_row_to_token),
+        fx.get_iter(arg_tp_topids_to_rows),
+        fx.get_iter(arg_tp_weights),
+        fx.get_iter(arg_tp_counters),
+        i32_tp_tokens,
         i32_m,
         N,
         f32_swiglu_limit,

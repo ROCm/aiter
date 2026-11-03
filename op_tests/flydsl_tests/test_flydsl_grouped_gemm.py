@@ -1062,7 +1062,7 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monke
     )
 
 
-@pytest.mark.parametrize("tokens", [1, 16])
+@pytest.mark.parametrize("tokens", [1, 4, 16, 64])
 def test_grouped_swiglu_m3_tp_decode(tokens):
     # MiniMax-M3 per-rank TP4 shape (128 routed + 1 shared expert, top-5) at
     # decode, where the TP path routes all tokens in one fused launch.
@@ -1076,6 +1076,49 @@ def test_grouped_swiglu_m3_tp_decode(tokens):
         activation=ActivationType.Swiglu,
         check_aot_cache=False,
     )
+
+
+def test_grouped_tp_gemm2_reduce_matches_gather_and_replays(monkeypatch):
+    """The fused epilogue preserves gather order and self-resets its counters."""
+    public = fused_moe
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return public(*args, **kwargs)
+
+    with monkeypatch.context() as old_path:
+        old_path.setenv("AITER_FLYDSL_TP_GEMM2_REDUCE", "0")
+        old_path.setattr(sys.modules[__name__], "fused_moe", capture)
+        baseline, reference, _, _ = _run_grouped_via_fused_moe(
+            experts=8,
+            tokens=16,
+            topk=2,
+            model_dim=256,
+            inter_dim=256,
+            data_format="a4w4",
+            activation=ActivationType.Swiglu,
+            use_bias=True,
+            seed=393,
+        )
+
+    with monkeypatch.context() as fused_path:
+        fused_path.setenv("AITER_FLYDSL_TP_GEMM2_REDUCE", "1")
+        first = public(*captured["args"], **captured["kwargs"])
+        second = public(*captured["args"], **captured["kwargs"])
+        destination = torch.empty_like(first)
+        into_destination = public(
+            *captured["args"],
+            **captured["kwargs"],
+            output=destination,
+        )
+
+    assert _logits_diff(first, reference) < LOGITS_DIFF_TOL
+    assert torch.equal(first, baseline)
+    assert torch.equal(second, first)
+    assert into_destination.data_ptr() == destination.data_ptr()
+    assert torch.equal(into_destination, first)
 
 
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
