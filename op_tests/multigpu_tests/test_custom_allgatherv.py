@@ -13,6 +13,10 @@ over the ranks:
     scattering through the same registered pool, every layer's rows made in
     the graph from the previous layer's output.
 And times one launch against one custom gather per tensor, both captured.
+At a group size with no gather / scatter kernel (6 ranks, where the custom
+all-reduce still runs) the custom all-gatherv, all-gather and reduce-scatter
+all decline, and `all_gatherv` / `reduce_scatter_tensor` still come out right
+through NCCL, eager only.
 
 Usage: python test_custom_allgatherv.py [-t TP] [-r ROWS ...]
 """
@@ -81,6 +85,43 @@ def custom_gatherv(group, inputs, sizes):
 def check_eager(group, sizes, seed):
     mine = routed_rows(sizes[group.rank_in_group], seed, group.rank_in_group)
     return bytes_differ(custom_gatherv(group, mine, sizes), reference(sizes, seed))
+
+
+def check_declined(group, sizes, seed):
+    """No kernel for this group size: the custom path declines and
+    `all_gatherv` falls back to NCCL, bytes intact."""
+    ca_comm = group.device_communicator.ca_comm
+    assert ca_comm is not None and not ca_comm.disabled, "no custom all-reduce"
+    mine = routed_rows(sizes[group.rank_in_group], seed, group.rank_in_group)
+    assert ca_comm.custom_all_gatherv(mine, sizes) is None
+    outs = group.device_communicator.all_gatherv(mine, dim=0, sizes=sizes)
+    return bytes_differ(outs, reference(sizes, seed))
+
+
+def check_rs_declined(group, rows, seed):
+    """No reduce-scatter or all-gather kernel either: the custom ones decline
+    (they used to launch nothing and hand back uninitialized memory), the
+    reduce-scatter is the ranks' sum and the all-gather their rows. Small
+    integers, so every sum is exact in bf16."""
+    rank, world = group.rank_in_group, group.world_size
+
+    def part(r):
+        gen = torch.Generator(device="cuda").manual_seed(seed * 1000 + r)
+        return torch.randint(
+            -4, 5, (rows * world, 64), device="cuda", generator=gen
+        ).to(torch.bfloat16)
+
+    ca_comm = group.device_communicator.ca_comm
+    assert not ca_comm.should_custom_rs(part(rank), 0)
+    assert not ca_comm.should_custom_ag(part(rank))
+    out = group.reduce_scatter_tensor(part(rank))
+    ref = sum(part(r).float() for r in range(world)).view(world, rows, 64)[rank]
+    # `all_gather(use_custom=True)` reaches the custom kernel without
+    # `should_custom_ag`, so it is gated on its own.
+    gathered = group.all_gather(part(rank), use_custom=True, dim=0)
+    return int((out.float() != ref).sum()) + bytes_differ(
+        [gathered], [torch.cat([part(r) for r in range(world)])]
+    )
 
 
 def layer_inputs(base, carry, layer):
@@ -166,8 +207,21 @@ def rank_main(rank, world, init_method, row_counts):
     # peer IPC addresses by local pointer (see test_allgather.py).
     graphs = []
     results = []
+    has_kernel = group.device_communicator.ca_comm._has_gather_scatter_kernel()
+    check = check_eager if has_kernel else check_declined
     for i, rows in enumerate(row_counts):
         ragged = [rows + 5 * r for r in range(world)]
+        if not has_kernel:
+            results.append(
+                {
+                    "uniform": check(group, [rows] * world, i),
+                    "ragged": check(group, ragged, i),
+                    "rs": check_rs_declined(group, rows, i),
+                    "one_us": 0.0,
+                    "per_tensor_us": 0.0,
+                }
+            )
+            continue
         one_us, per_tensor_us = time_graphs(group, rows, i, graphs)
         results.append(
             {
@@ -178,7 +232,7 @@ def rank_main(rank, world, init_method, row_counts):
                 "per_tensor_us": per_tensor_us,
             }
         )
-    empty = check_eager(group, [0] + [3] * (world - 1), 999)
+    empty = check(group, [0] + [3] * (world - 1), 999)
 
     torch.cuda.synchronize()
     group.barrier()
@@ -204,7 +258,8 @@ def main():
     failed = False
     for i, rows in enumerate(args.rows):
         cells = [results[i] for results, _ in per_rank]
-        bad = {k: sum(c[k] for c in cells) for k in ("uniform", "ragged", "graph")}
+        keys = [k for k in ("uniform", "ragged", "graph", "rs") if k in cells[0]]
+        bad = {k: sum(c[k] for c in cells) for k in keys}
         failed |= any(bad.values())
         print(
             f"rows={rows:4d} bad_bytes={bad} "
