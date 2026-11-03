@@ -438,6 +438,13 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
 // grid-stride loop stays correct if the two disagree.
 constexpr int32_t kWorkTableWave = 64;
+// Longest LUT a row declares (lut_max in the manifest). HEAD_LOCAL keys hold the complemented
+// count in a 17-bit field, so every count in [0, kWorkTableMaxCount] keeps a distinct rank.
+constexpr int32_t kWorkTableMaxCount  = 65536;
+constexpr int32_t kWorkTableCountBits = 17;
+static_assert(kWorkTableMaxCount < (1 << kWorkTableCountBits) &&
+                  16 + kWorkTableCountBits + 31 == 64,
+              "HEAD_LOCAL key fields must not overlap");
 // Work-table order. LPT is the global longest-first order the table was built for. HEAD_LOCAL
 // keeps heads in raster order and sorts longest-first within each one, so the work items in
 // flight share a head's K/V in L2 while every head still starts its heavy tiles first. RASTER is
@@ -493,11 +500,13 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
         const uint32_t level = static_cast<uint32_t>(lut_count[slot]);
         if(order == static_cast<int32_t>(WorkOrder::HeadLocal))
         {
-            // (batch, head) in the top 16 bits, the complemented level below it; batch < 256 and
-            // heads < 256 keep the group in range, and a LUT is never longer than 65536.
-            const uint64_t group = static_cast<uint32_t>(slot / q_tiles);
-            const uint64_t rank  = 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
-            keys[slot] = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
+            // (batch, head) in the top 16 bits, the complemented level in the 17 bits below it and
+            // the slot in the low 31. batch < 256 and heads < 256 keep the group in range, and the
+            // slot is below kWorkTableFusedMax.
+            const int32_t clamped = min(max(lut_count[slot], 0), kWorkTableMaxCount);
+            const uint64_t group  = static_cast<uint32_t>(slot / q_tiles);
+            const uint64_t rank   = static_cast<uint32_t>(kWorkTableMaxCount - clamped);
+            keys[slot] = (group << 48) | (rank << 31) | static_cast<uint32_t>(slot);
         }
         else if(order == static_cast<int32_t>(WorkOrder::Raster))
             keys[slot] = static_cast<uint32_t>(slot);
@@ -575,7 +584,9 @@ build_sorted_work_table(const at::Tensor& lut_count,
     else if(order == WorkOrder::HeadLocal)
     {
         const auto group = at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
-        const auto key   = group * 65536 + (65535 - flat.to(at::kLong).clamp_max(65535));
+        const auto level = flat.to(at::kLong).clamp(0, kWorkTableMaxCount);
+        const auto key =
+            group * (int64_t{1} << kWorkTableCountBits) + (kWorkTableMaxCount - level);
         permutation      = at::argsort(key, /*stable=*/true, /*dim=*/0, /*descending=*/false);
     }
     else
