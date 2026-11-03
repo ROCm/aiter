@@ -1749,11 +1749,10 @@ class AttentionProgram:
         BQ: gl.constexpr = cfg.BLOCK_M // cfg.NUM_QUERIES_PER_KV
         ROW_STRIDE: gl.constexpr = cfg.NUM_SEGMENTS_PER_SEQ * cfg.HEAD_SIZE
         out_ty = self.output_ptr.type.element_ty
-        PAD: gl.constexpr = 128 // out_ty.primitive_bitwidth  # 16 bytes per row
-        O_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[PIECE, PAD]],
-            [BQ, cfg.NUM_QUERIES_PER_KV, PIECE],
-            [2, 1, 0],
+        # Unpadded: a padded layout on this 3D box puts columns in the wrong place once the head dim
+        # holds more than 4 query heads, and the TDM store then writes outside its box.
+        O_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[2, 1, 0]
         )
         base = (
             self.output_ptr
