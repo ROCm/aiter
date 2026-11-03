@@ -3,9 +3,12 @@
 
 """The recipe's dispatch and combine stages over one shared arena."""
 
+import contextlib
+
 import torch
 
 from .arena import SymmetricArena, _ArenaLayout
+from .decode_mega import DecodeMega, decode_mega_reason, decode_mega_regions
 from .mori_caps import _mori_capabilities, _MoriCapabilities
 from .recipe import MegaMoEConfig, MegaMoERecipe, _stage_classes
 from .stages.base import (
@@ -31,7 +34,9 @@ def _arena_layout(config: MegaMoEConfig, caps) -> _ArenaLayout:
     ``required_vmm_bytes`` reports."""
     dispatch, combine = _stage_classes(config.recipe)
     return _ArenaLayout.merge(
-        dispatch.regions(config, caps), combine.regions(config, caps)
+        dispatch.regions(config, caps),
+        combine.regions(config, caps),
+        decode_mega_regions(config),
     )
 
 
@@ -64,10 +69,13 @@ class _EpDispatcher:
             )
         self.layout = _arena_layout(config, caps)
         self.res = _EpResources(SymmetricArena(communicator, self.layout))
+        self.decode_mega = None
         try:
             self.res.allocate(config, self.device)
             self._dispatch.build(self.res)
             self._combine.build(self.res)
+            if decode_mega_reason(config) is None:
+                self.decode_mega = DecodeMega(config, self.res, self.device)
         except BaseException:
             self.close()
             raise
@@ -103,6 +111,13 @@ class _EpDispatcher:
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
         self._dispatch.prefetch(topk_ids, recv_token_bound)
 
+    def drop_pending_plan(self) -> None:
+        """Retire a compact plan started for a step another path runs: the
+        stream waits for it (its slot may be reused) and nothing reads it."""
+        wait = getattr(self._dispatch, "_wait_plan", None)
+        if wait is not None:
+            wait()
+
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         self._dispatch.warmup(recv_token_bound, token_count)
 
@@ -110,6 +125,10 @@ class _EpDispatcher:
         if self._closed:
             return
         self._closed = True
+        if self.decode_mega is not None:
+            # Diagnostics only (AITER_DMK_TRACE): never fail a close over them.
+            with contextlib.suppress(Exception):
+                self.decode_mega.report()
         try:
             # A launch still in flight (a graph replay, say) reads the window:
             # let it finish before anything it reads is freed.
