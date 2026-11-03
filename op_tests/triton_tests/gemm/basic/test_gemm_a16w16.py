@@ -285,3 +285,65 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# gfx1250 gluon compute_bound epilogues (REGISTER_STORE): 0 = LDS + TDM store, 1 = register store from the WMMA
+# layout, 2 = coalesced register store.  Shapes cover the gpt-oss bucket edges (1024/1025, 2048/2049, 3072/3073) and
+# M/N tails that a 256x256 or 128x128 tile leaves partial.
+_STORE_CONFIG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 64,
+    "NUM_BUFFERS": 4,
+    "num_warps": 4,
+    "waves_per_eu": 1,
+    "kernel_type": "compute_bound",
+}
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 128, 2880),
+        (97, 2880, 4096),
+        (1025, 5120, 2880),
+        (2049, 2560, 2880),
+        (3073, 2880, 2048),
+        (300, 200, 2880),
+    ],
+)
+@pytest.mark.parametrize("register_store", [0, 1, 2])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16w16_gfx1250_register_store(M, N, K, register_store, dtype, bias):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda") / K**0.5
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    config = dict(_STORE_CONFIG, REGISTER_STORE=register_store)
+    out = gemm_a16w16(x, w, bias=b, dtype=dtype, config=config, backend="gluon")
+    torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=1e-1, rtol=1e-2)
+
+
+def test_gemm_a16w16_gfx1250_store_env_override(monkeypatch):
+    """AITER_GFX1250_A16W16_STORE overrides the entry's REGISTER_STORE (A/B only) and rejects other values."""
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((257, 2880), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn((640, 2880), dtype=torch.bfloat16, device="cuda") / 2880**0.5
+    ref = F.linear(x, w)
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("AITER_GFX1250_A16W16_STORE", mode)
+        out = gemm_a16w16(
+            x, w, config=dict(_STORE_CONFIG, REGISTER_STORE=0), backend="gluon"
+        )
+        torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-2)
+    monkeypatch.setenv("AITER_GFX1250_A16W16_STORE", "3")
+    with pytest.raises(ValueError):
+        gemm_a16w16(x, w, config=dict(_STORE_CONFIG), backend="gluon")
+    monkeypatch.delenv("AITER_GFX1250_A16W16_STORE")
+    with pytest.raises(ValueError):
+        gemm_a16w16(x, w, config=dict(_STORE_CONFIG, REGISTER_STORE=5), backend="gluon")
