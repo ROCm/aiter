@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, presorted_moe
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
@@ -1528,7 +1528,9 @@ def test_presorted_moe_hook():
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
-            for token in (1, 4):
+            # 512 is past the Opus crossover (3 * M * topk >= 4 * E), where
+            # fused_moe's own BM=16 sort is Opus rather than the adaptive one.
+            for token in (1, 4, 512):
                 # gate+up+down GEMMs per route; bytes are bf16 hidden in/out plus
                 # the fp4x2 weights and e8m0 scales of at most token*topk experts.
                 flops = 2 * 3 * token * topk * model_dim * inter_dim
@@ -1669,7 +1671,9 @@ def test_presorted_moe_hook():
             fm.register_presorted_moe(aux)
             fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
             assert len(sort_calls) == 1, f"a presort with a stale {key} was used"
-            assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed"
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), "not consumed"
 
         # A call that fails before sorting still consumes the registration.
         fm.register_presorted_moe(presort(topk_ids, topk_weights))
@@ -1680,7 +1684,9 @@ def test_presorted_moe_hook():
             pass
         else:
             raise AssertionError("a wrong-shape output was accepted")
-        assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed on error"
+        assert (
+            getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+        ), "not consumed on error"
     finally:
         fm.moe_sorting = real_sorting
         fm.register_presorted_moe(None)
@@ -1697,10 +1703,7 @@ def test_presorted_moe_wrapper_error():
     calls _fused_moe_impl directly, must drop it too when it rejects its
     arguments. Rejected before any MoE kernel launches.
     """
-    from aiter.ops.comm_fused_moe_runtime import (
-        CommFusedMoeRuntime,
-        _dispatch_presorted,
-    )
+    from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
 
     fm = aiter.fused_moe
     x = torch.zeros((1, 1))
@@ -1715,7 +1718,7 @@ def test_presorted_moe_wrapper_error():
             else:
                 raise AssertionError(f"activation='silu' was accepted ({extra})")
             assert (
-                getattr(fm._PRESORTED_MOE, "aux", None) is None
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
             ), f"registration left live after a wrapper error ({extra})"
         runtime_errors = {
             "negative reduce_scatter_sizes": {"reduce_scatter_sizes": [-1]},
@@ -1735,19 +1738,8 @@ def test_presorted_moe_wrapper_error():
             else:
                 raise AssertionError(f"{case} were accepted")
             assert (
-                getattr(fm._PRESORTED_MOE, "aux", None) is None
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
             ), f"registration left live after a CommFusedMoeRuntime error ({case})"
-        # A moe_args missing w1/w2/... fails while binding _fused_moe_impl's
-        # arguments, after run() has re-registered the presort for dispatch.
-        try:
-            _dispatch_presorted({"M": 1}, {"hidden_states": x})
-        except TypeError:
-            pass
-        else:
-            raise AssertionError("moe_args without w1/w2 were accepted")
-        assert (
-            getattr(fm._PRESORTED_MOE, "aux", None) is None
-        ), "registration left live after a CommFusedMoeRuntime dispatch error"
     finally:
         fm.register_presorted_moe(None)
     aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
@@ -1790,7 +1782,6 @@ def test_presorted_moe_layout_mismatch():
     with a wrong dtype, device, length or a missing tensor must fall back to
     fused_moe's own sort rather than reach a kernel. No MoE kernel launch.
     """
-    fm = aiter.fused_moe
     M, E, topk = 4, 8, 2
     ids = torch.zeros((M, topk), dtype=torch.int32)
     weights = torch.zeros((M, topk))
@@ -1798,7 +1789,7 @@ def test_presorted_moe_layout_mismatch():
     max_sorted = good["sorted_token_ids"].numel()
 
     def match(aux):
-        return fm._match_presorted_moe(
+        return presorted_moe.match_presorted_moe(
             aux, ids, weights, block_m=16, num_experts=E, topk=topk
         )
 
@@ -1885,20 +1876,19 @@ def test_presorted_moe_output_overlap():
     The stages zero or write output while still reading the sort tensors, so
     the call must fall back to fused_moe's own sort. No MoE kernel launch.
     """
-    fm = aiter.fused_moe
     M, E, topk, model_dim = 4, 8, 2, 8
     ids = torch.zeros((M, topk), dtype=torch.int32)
     weights = torch.zeros((M, topk))
     aux = _presorted_aux_stub(ids, weights, E)
 
     def match(output):
-        return fm._match_presorted_moe(
+        return presorted_moe.match_presorted_moe(
             aux, ids, weights, block_m=16, num_experts=E, topk=topk, output=output
         )
 
     own = torch.empty((M, model_dim), dtype=dtypes.bf16)
     assert match(own) is not None, "a presort with a separate output was rejected"
-    for key in fm._PRESORTED_MOE_SORT_KEYS:
+    for key in presorted_moe._PRESORTED_MOE_SORT_KEYS:
         t = aux[key]
         backing = torch.empty(t.nbytes + M * model_dim * 2, dtype=torch.uint8)
         aux[key] = backing[: t.nbytes].view(t.dtype)
@@ -1916,14 +1906,13 @@ def test_presorted_moe_block_m():
     so a registration labelled block_m=32 that matches the call must still be
     ignored. Checks the matcher fused_moe uses; no MoE kernel launches.
     """
-    fm = aiter.fused_moe
     M, E, topk = 4, 8, 2
     ids = torch.zeros((M, topk), dtype=torch.int32)
     weights = torch.zeros((M, topk))
 
     def match(block_m):
         aux = _presorted_aux_stub(ids, weights, E, block_m=block_m)
-        return fm._match_presorted_moe(
+        return presorted_moe.match_presorted_moe(
             aux, ids, weights, block_m=block_m, num_experts=E, topk=topk
         )
 
@@ -1939,14 +1928,13 @@ def test_presorted_moe_masked_call():
     moe_sorting honors both, so such calls must fall back to moe_sorting.
     Checks the matcher fused_moe uses; no MoE kernel launches.
     """
-    fm = aiter.fused_moe
     M, E, topk = 4, 8, 2
     ids = torch.zeros((M, topk), dtype=torch.int32)
     weights = torch.zeros((M, topk))
     aux = _presorted_aux_stub(ids, weights, E)
 
     def match(**kw):
-        return fm._match_presorted_moe(
+        return presorted_moe.match_presorted_moe(
             aux, ids, weights, block_m=16, num_experts=E, topk=topk, **kw
         )
 
@@ -1981,12 +1969,12 @@ def test_presorted_moe_ignored_is_logged():
             self.messages.append(record.getMessage())
 
     collect = Collect()
-    fm._PRESORTED_MOE_IGNORED.clear()
+    presorted_moe._PRESORTED_MOE_IGNORED.clear()
     fm.logger.addHandler(collect)
     try:
         for _ in range(3):
             assert (
-                fm._match_presorted_moe(
+                presorted_moe.match_presorted_moe(
                     aux, ids, weights, block_m=16, num_experts=E, topk=topk
                 )
                 is None
@@ -1999,6 +1987,22 @@ def test_presorted_moe_ignored_is_logged():
     aiter.logger.info("moe_2stage: presorted MoE ignored-registration log passed")
 
 
+# Module scope: registering the op again in the same process raises.
+_CONSUMED_PRESORT_LAYERS = []
+
+
+@torch.library.custom_op("aiter_test::consume_presort", mutates_args=())
+def _consume_presort(x: torch.Tensor) -> torch.Tensor:
+    aux = presorted_moe.pop_presorted_moe()
+    _CONSUMED_PRESORT_LAYERS.append(aux and aux["layer"])
+    return x + 1
+
+
+@_consume_presort.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
 def test_presorted_moe_compile_order():
     """Under torch.compile each registration still reaches the next consumer.
 
@@ -2008,22 +2012,12 @@ def test_presorted_moe_compile_order():
     fused_moe_ does; no MoE kernel launches.
     """
     fm = aiter.fused_moe
-    seen = []
-
-    @torch.library.custom_op("aiter_test::consume_presort", mutates_args=())
-    def consume(x: torch.Tensor) -> torch.Tensor:
-        aux = fm._pop_presorted_moe()
-        seen.append(aux and aux["layer"])
-        return x + 1
-
-    @consume.register_fake
-    def _(x):
-        return torch.empty_like(x)
+    seen = _CONSUMED_PRESORT_LAYERS
 
     def layers(x):
         for layer in range(3):
             fm.register_presorted_moe({"layer": layer})
-            x = consume(x)
+            x = _consume_presort(x)
         return x
 
     compiled = torch.compile(layers, backend="aot_eager")

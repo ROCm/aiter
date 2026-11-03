@@ -2878,7 +2878,7 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
             topk_ids=all_ids,
             **kwargs,
         )
-    assert aiter.fused_moe._pop_presorted_moe() is None, "presort survived the error"
+    assert aiter.presorted_moe.pop_presorted_moe() is None, "presort survived the error"
 
 
 def test_a4w4_routed_fp8_shared_heterogeneous_path(

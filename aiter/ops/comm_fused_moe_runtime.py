@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from aiter.presorted_moe import drop_presort_on_error
+
 _BeforeStage2 = Callable[[], torch.Tensor]
 _BeforeStage2ForRows = Callable[[int], torch.Tensor]
 _BeforeSharedAdd = Callable[[], None]
@@ -64,6 +66,7 @@ class CommFusedMoeRuntime:
             return False
         return self.runners[bucket].supports_ragged_m
 
+    @drop_presort_on_error
     def run(
         self,
         *,
@@ -96,15 +99,13 @@ class CommFusedMoeRuntime:
         sorted work; full-topk calls do not launch this preparation.
         """
 
-        from aiter.fused_moe import _pop_presorted_moe
-
-        # Hold a register_presorted_moe() registration until dispatch, so a
-        # validation error below drops it instead of leaving it for a later call.
-        presorted_aux = _pop_presorted_moe()
         if before_stage2 is not None and before_stage2_for_rows is not None:
             raise ValueError(
                 "before_stage2 and before_stage2_for_rows are mutually exclusive"
             )
+
+        from aiter.fused_moe import _fused_moe_impl
+
         hidden_states = moe_args["hidden_states"]
         raw_tokens = int(hidden_states.shape[0])
         runner_kwargs = {}
@@ -247,33 +248,13 @@ class CommFusedMoeRuntime:
             caller_stream.wait_stream(stage2_stream)
             return output
 
-        output = _dispatch_presorted(
-            presorted_aux, moe_args, _stage2_override=stage2_override
+        output = _fused_moe_impl(
+            **moe_args,
+            _stage2_override=stage2_override,
         )
         if final_output is not None:
             output = final_output
         return output if output_rows == output.shape[0] else output[:output_rows]
-
-
-def _dispatch_presorted(presorted_aux, moe_args, **impl_kwargs):
-    """Re-register ``presorted_aux`` and run ``_fused_moe_impl`` with ``moe_args``.
-
-    ``_fused_moe_impl`` consumes the registration as its first statement, but a
-    ``moe_args`` it cannot bind (a missing ``w2``, say) raises before that, so
-    drop the registration here on any error.
-    """
-    from aiter.fused_moe import (
-        _fused_moe_impl,
-        _pop_presorted_moe,
-        register_presorted_moe,
-    )
-
-    register_presorted_moe(presorted_aux)
-    try:
-        return _fused_moe_impl(**moe_args, **impl_kwargs)
-    except BaseException:
-        _pop_presorted_moe()
-        raise
 
 
 __all__ = ["CommFusedMoeRuntime"]
