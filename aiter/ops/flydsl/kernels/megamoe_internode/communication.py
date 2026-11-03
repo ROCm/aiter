@@ -5,31 +5,17 @@ Primitives: the generic helpers are imported from AITER's shared communication
 module; the acquire polling and last-arriver operations this operator's
 protocol needs live here so it does not alter shared kernels.
 
-Rail GDA externs (``RailGda`` / ``checked`` / ``release``): the one piece of CCO
-this operator cannot get from MORI's public binding.
-``mori.cco.device.flydsl`` covers everything else the kernels need
--- ``Window.lsa_ptr`` for node-local addressing, the signal/wait ops, and the
-whole host side (``Communicator``/``alloc_mem``/``register_window``/
-``create_dev_comm``). Two gaps remain on the cross-node return path, both in
-MORI's *wrapper*, not in its C++ API:
-
-* every exported GDA symbol takes the ``ccoTeamMode`` default ``CCO_TEAM_WORLD``
-  (``cco_scale_out.hpp:212``), so ``peer`` is a world rank -- the rail team,
-  whose ``peer`` is a node index, is unreachable; and
-* ``ccoGdaOptFlagsAggregateRequests`` (post the WQE, do not ring the doorbell)
-  is passed for SDMA but never for GDA. This is a different axis from the
-  ``at`` symbol's ``ccoGdaThreadAggregate``, which coalesces a warp's lanes
-  and defers nothing.
-
-``gda_rail.cpp`` instantiates exactly the (rail, warp) combination the kernels
-use. Delete it and ``RailGda`` once MORI's wrapper takes a team and optFlags.
+Rail GDA (``rail``): MORI's public FlyDSL binding (``mori.cco.device.flydsl``,
+ROCm/mori PR 895 and later) with the rail team (``Team.GDA``: ``peer`` is a node
+index) and ``defer_doorbell`` (post WQEs without ringing; the next flush rings
+once per QP). When the installed MORI also has ``posted_before_flush``
+(``ccoGdaOptFlagsPostedBeforeFlush``), deferred posts skip the per-post ready
+mark and its system fence; see ``_PBF``.
 """
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
+import mori.cco.device.flydsl as cco
 from flydsl import expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
@@ -172,7 +158,12 @@ def load_i64_global_system_relaxed(addr_i64):
 
 
 def store_i64_global_relaxed(addr_i64, value):
-    """Store a diagnostic timestamp without adding a system fence."""
+    """Plain (non-atomic) i64 global store, no fence and no ordering.
+
+    For words whose visibility is published by a later release in the same
+    thread: stage1's ``expert_tile_map_ready`` generations and the stage2
+    peer-address table filled before launch.
+    """
 
     _llvm_d.StoreOp(
         value.ir_value(),
@@ -245,47 +236,14 @@ def spin_until_ge_i64_sleep_rx(addr_i64, expected, sleep):
     return fx.Int64(load_i64_global_system(addr_i64))
 
 
-_U64, _I32 = "uint64", "int32"
-# (devComm, ctx, peer, dstWin, dstOff, srcWin, srcOff, nbytes, aggregate)
-_PUT_ARGS = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64, _I32]
-# (devComm, ctx, peer, dstWin, dstOff, value, aggregate)
-_PUT_VALUE_ARGS = [_U64, _I32, _I32, _U64, _U64, _U64, _I32]
-# (devComm, ctx, peer)
-_FLUSH_ARGS = [_U64, _I32, _I32]
-# (devComm, ctx, packedRequest)
-_WAIT_ARGS = [_U64, _I32, _U64]
-
-_bitcode: dict[tuple[int, bool], str] = {}
-
-
-def _sdma_enabled() -> bool:
-    """Mirror the installed MORI host build flag in this private device TU.
-
-    This TU only instantiates GDA and ``ccoDevComm``'s layout is stable either
-    way; matching the host flag keeps a stale cache entry from masking a
-    packaging mismatch.
-    """
-    import os
-
-    env = os.environ.get("BUILD_CCO_SDMA")
-    if env is not None:
-        return env.strip().upper() in {"1", "ON", "TRUE", "YES"}
-    try:
-        from mori.cco.device._build_flags import BUILD_CCO_SDMA
-
-        return bool(BUILD_CCO_SDMA)
-    except (ImportError, AttributeError):
-        return False
-
-
 def ccqe_enabled() -> bool:
     """Whether MORI creates this host's ionic CQs in CCQE (collapsed) mode.
 
-    The shim's CQ poll is compiled two ways (``-DIONIC_CCQE``) and MORI picks
-    the CQ mode at runtime from the NIC firmware (>= 1.117.5-a-58). A bitcode or
-    kernel cached under the other mode polls the wrong CQ layout: it keeps
-    working for a while and then hangs on a completion it misreads. So the mode
-    has to be part of every cache key that ends up containing the poll.
+    MORI keys its own GDA bitcode on the CQ mode, but a FlyDSL kernel that
+    inlined the CQ poll is cached by its name and closure, not by MORI's mode.
+    A kernel compiled under the other mode polls the wrong CQ layout: it keeps
+    working for a while and then hangs on a completion it misreads. So kernels
+    that flush the rail carry the mode in their name.
     """
     try:
         from mori.jit.core import is_ccqe_enabled
@@ -294,107 +252,32 @@ def ccqe_enabled() -> bool:
     return bool(is_ccqe_enabled())
 
 
-def get_bitcode_path(cov: int = 6, *, ndebug: bool = False) -> str:
-    """JIT ``gda_rail.cpp`` for the active arch/NIC, once per process."""
-    key = (int(cov), bool(ndebug))
-    if key in _bitcode:
-        return _bitcode[key]
-
-    from mori.jit.cache import get_cache_dir
-    from mori.jit.config import (
-        detect_build_config,
-        detect_nic_type,
-        get_mori_source_root,
-    )
-    from mori.jit.core import (
-        FileBaton,
-        _collect_include_dirs,
-        _hipcc_device_bc,
-        _strip_lifetime_intrinsics,
-    )
-
-    source = Path(__file__).with_name("gda_rail.cpp")
-    mori_root = get_mori_source_root()
-    if mori_root is None:
-        raise RuntimeError("MORI JIT sources are required for the rail GDA shim")
-
-    cfg = detect_build_config()
-    sdma = _sdma_enabled()
-    cache = get_cache_dir(
-        cfg.arch,
-        [
-            source,
-            mori_root / "include" / "mori" / "cco",
-            mori_root / "include" / "mori" / "core",
-        ],
-        detect_nic_type(),
-        cov=cov,
-        ccqe=ccqe_enabled(),
-    )
-    cache = cache / f"megamoe_gda_rail_{'ndebug_' if ndebug else ''}sdma{int(sdma)}"
-    cache.mkdir(parents=True, exist_ok=True)
-    output = cache / "libmegamoe_gda_rail.bc"
-    lock = cache / ".libmegamoe_gda_rail.bc.lock"
-
-    with FileBaton(lock, wait_for=str(output)) as baton:
-        if not baton.skipped and not output.is_file():
-            with tempfile.TemporaryDirectory() as td:
-                raw = Path(td) / "gda_rail.bc"
-                defines = [f"-DBUILD_CCO_SDMA={int(sdma)}"]
-                if ndebug:
-                    defines.append("-DNDEBUG")
-                _hipcc_device_bc(
-                    cfg,
-                    source,
-                    _collect_include_dirs(mori_root),
-                    raw,
-                    cov=cov,
-                    extra_defines=defines,
-                )
-                _strip_lifetime_intrinsics(cfg, raw, output)
-
-    _bitcode[key] = str(output)
-    return _bitcode[key]
+_WARP = cco.CoopScope.WARP
+_GDA = cco.Team.GDA
 
 
-class _LazyExtern:
-    """Link one shim symbol on first use, not at import time."""
+def _posted_before_flush_supported() -> bool:
+    try:
+        from mori.cco.device.ops import GdaFlags
+    except ImportError:
+        return False
+    return hasattr(GdaFlags, "POSTED_BEFORE_FLUSH")
 
-    def __init__(self, symbol, args, ndebug, ret="void"):
-        self._ret = ret
-        self._symbol, self._args, self._ndebug = symbol, args, bool(ndebug)
-        self._fn = None
 
-    def __call__(self, *args):
-        if self._fn is None:
-            from flydsl.compiler.extern_link import link_extern
-            from flydsl.expr.extern import ffi
-
-            self._fn = link_extern(
-                ffi(self._symbol, self._args, self._ret),
-                bitcode_path=get_bitcode_path(ndebug=self._ndebug),
-                module_init_fn=None,
-            )
-        return self._fn(*args)
+# Caller-ordered posting (``ccoGdaOptFlagsPostedBeforeFlush``) when this MORI has
+# it. Every rail QP here meets its contract: stage2 k2's flushing wave waits for
+# the WQE_POSTED count before it flushes, and stage1 posts a credit on a QP only
+# after that QP's dispatch request has completed. Without it a deferred post
+# publishes a ready mark behind a system fence and the flush sweeps the marks.
+_PBF = {"posted_before_flush": True} if _posted_before_flush_supported() else {}
 
 
 class RailGda:
-    """The (rail team, warp coop) GDA ops, bound to one bitcode build."""
+    """The (rail team, warp coop) GDA ops the kernels use.
 
-    def __init__(self, *, ndebug: bool = False):
-        self._put = _LazyExtern("megamoe_gda_put_rail_warp", _PUT_ARGS, ndebug)
-        self._put_value = _LazyExtern(
-            "megamoe_gda_put_value_rail_warp", _PUT_VALUE_ARGS, ndebug
-        )
-        self._flush_peer = _LazyExtern(
-            "megamoe_gda_flush_peer_rail_warp", _FLUSH_ARGS, ndebug
-        )
-        self._flush_async = _LazyExtern(
-            "megamoe_gda_flush_async_rail_warp", _FLUSH_ARGS, ndebug, "uint64"
-        )
-        self._wait_request = _LazyExtern(
-            "megamoe_gda_wait_request_warp", _WAIT_ARGS, ndebug
-        )
+    ``peer`` is a NODE index (``Team.GDA`` on a ``GDA_CONNECTION_RAIL``
+    DevComm) and ``ctx`` the QP context of this one call, a runtime Int32.
+    """
 
     def put(
         self,
@@ -409,34 +292,46 @@ class RailGda:
         *,
         aggregate=True,
     ):
-        """Post a window-to-window RDMA write to ``peer`` (a NODE index).
+        """Post a window-to-window RDMA write to ``peer``.
 
         ``aggregate=True`` leaves the doorbell unrung: the transfer is only
-        released by a later :meth:`flush_peer` on the same ctx.
+        released by a later flush on the same ctx.
         """
-        return self._put(
-            dev_comm,
-            ctx,
+        cco.DevComm(dev_comm).gda(0).put(
             peer,
             dst_win,
             dst_off,
             src_win,
             src_off,
             nbytes,
-            int(aggregate),
+            coop=_WARP,
+            team=_GDA,
+            defer_doorbell=bool(aggregate),
+            ctx=ctx,
+            **(_PBF if aggregate else {}),
         )
 
     def put_value(
         self, dev_comm, ctx, peer, dst_win, dst_off, value, *, aggregate=True
     ):
         """Post an inline 8-byte write; same doorbell rule as :meth:`put`."""
-        return self._put_value(
-            dev_comm, ctx, peer, dst_win, dst_off, value, int(aggregate)
+        cco.DevComm(dev_comm).gda(0).put_value(
+            peer,
+            dst_win,
+            dst_off,
+            value,
+            coop=_WARP,
+            team=_GDA,
+            defer_doorbell=bool(aggregate),
+            ctx=ctx,
+            **(_PBF if aggregate else {}),
         )
 
     def flush_peer(self, dev_comm, ctx, peer):
         """Ring the doorbell for ctx/peer and poll its CQ to completion."""
-        return self._flush_peer(dev_comm, ctx, peer)
+        cco.DevComm(dev_comm).gda(0).flush_peer(
+            peer, coop=_WARP, team=_GDA, ctx=ctx, **_PBF
+        )
 
     def flush_async(self, dev_comm, ctx, peer):
         """Ring the doorbell and return a request handle for :meth:`wait`.
@@ -444,15 +339,18 @@ class RailGda:
         Only worth the split when real work sits between the two; stage1 does
         interleave a credit request with the original one.
         """
-        return self._flush_async(dev_comm, ctx, peer)
+        return (
+            cco.DevComm(dev_comm)
+            .gda(0)
+            .flush_async(peer, coop=_WARP, team=_GDA, ctx=ctx, **_PBF)
+        )
 
     def wait(self, dev_comm, ctx, request):
-        """Block until the batch named by a :meth:`flush_async` handle lands."""
-        return self._wait_request(dev_comm, ctx, request)
+        """Block until the batch named by a :meth:`flush_async` handle lands.
+
+        The request names its own QP; ``ctx`` is accepted for symmetry.
+        """
+        cco.DevComm(dev_comm).gda(0).wait(request, coop=_WARP)
 
 
-# Two builds, matching what the kernels used before: the rail-critical kernel2
-# takes the NDEBUG one (MORI's device asserts compiled out), stage1/stage2 keep
-# the checked build.
-checked = RailGda(ndebug=False)
-release = RailGda(ndebug=True)
+rail = RailGda()
