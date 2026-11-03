@@ -785,6 +785,7 @@ class Gfx1250Traits:
     compute_dtype: str = "fp8"
     direct_output: bool = False
     query_splits: int = 1
+    causal: bool = True
 
     WAVE = 32
     NWARP = 4

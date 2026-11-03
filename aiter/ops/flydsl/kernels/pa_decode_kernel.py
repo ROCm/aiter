@@ -67,6 +67,7 @@ from .pa_decode.traits import (
     Gfx1250Traits,
     PaDecodeSchedule,
     PaDecodeTraits,
+    resolve_causal,
 )
 
 __all__ = [
@@ -221,6 +222,7 @@ def compile_pa_decode_tile(
             compute_dtype=kv_dtype,
             direct_output=direct_output,
             query_splits=query_splits,
+            causal=resolve_causal(causal, query_length),
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -467,6 +469,7 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
+    causal=True,
 ):
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
@@ -483,6 +486,7 @@ def compile_gfx1250_pa_decode(
         compute_dtype,
         direct_output,
         query_splits,
+        causal,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
