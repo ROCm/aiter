@@ -5359,6 +5359,9 @@ class FmoeTuner(TunerCommon):
                     # v2 enumerates fp4/fp8 activations only. This shape is the
                     # FlyDSL a16w4 port, and CK has no b16 x fp4x2 kernel.
                     tune_only = "flydsl"
+                elif is_gfx942_a16wi4:
+                    # Same a16w-mix port, selected by gen_flydsl_i4_2stages_task.
+                    tune_only = "flydsli4"
                 else:
                     tune_only = ""
             _tune_only = {s for s in tune_only.split(",") if s}
