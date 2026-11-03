@@ -293,7 +293,7 @@ def gemm_a4w4(
     n = B.shape[0]
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
-    if gfx_arch in ["gfx1250"]:
+    if gfx_arch in ["gfx1250", "gfx1250-strict"]:
         # FlyDSL serves plain MXFP4 with row-major A and a bf16 output; the rest is asm.
         plain_mxfp4 = (
             dtype == dtypes.bf16
