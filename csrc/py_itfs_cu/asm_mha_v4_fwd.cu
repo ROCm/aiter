@@ -75,8 +75,6 @@ struct MhaV4Recipe
     int64_t v_scale_mode;
 };
 
-constexpr int64_t kHeadDim = 128;
-
 struct PointerSlot
 {
     void* value;
@@ -348,6 +346,7 @@ void check_lut_capacity(const fmha_v4_fwdConfig& cfg, int64_t kv_tiles, const ch
 const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      const MhaV4Recipe& recipe,
                                      int64_t mode,
+                                     int64_t head_dim,
                                      int64_t ts_qo,
                                      int64_t ts_kv)
 {
@@ -367,8 +366,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
            cfg.v_pack == recipe.v_pack && cfg.q_scale_mode == recipe.q_scale_mode &&
            cfg.k_scale_mode == recipe.k_scale_mode && cfg.v_scale_mode == recipe.v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
-           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
-           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode &&
+           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == head_dim &&
+           cfg.hdim_v == head_dim && cfg.mask == 0 && cfg.mode == mode &&
            (ts_qo == 0 || cfg.ts_qo == ts_qo) && (ts_kv == 0 || cfg.ts_kv == ts_kv))
             return cfg;
     }
@@ -389,7 +388,9 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 recipe.k_scale_mode,
                 ", v_scale_mode=",
                 recipe.v_scale_mode,
-                ", output=BF16, head_dim=128, mode=",
+                ", output=BF16, head_dim=",
+                head_dim,
+                ", mode=",
                 mode,
                 " (0=dense, 1=sorted-sparse, 2=sol-attn), tile=",
                 ts_qo,
@@ -399,18 +400,24 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
 
 // E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
 // running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
-constexpr int64_t kMxScaleBlocksPerRow      = 4;
+constexpr int64_t kMxScaleBlockElements     = 32;
 constexpr int64_t kQueryScaleTileRows       = 256;
+// The PRODUCER tile, which is 128 tokens whatever KV tile the kernel itself runs.
 constexpr int64_t kKvScaleTileRows          = 128;
 constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
 constexpr int64_t kKvScaleTrailingDwordSlack = 4;
-// MXFP4 V scales are gathered two 512-byte tiles ahead of the tile being run, so the last tiles
-// address bytes past the final one whatever the sequence length. Mirrors FP4_V_SCALE_SLACK_BYTES.
-constexpr int64_t kMxFp4VScaleSlackBytes = 2 * 512;
+// The 64x64 sparse and Sol-Attn MX-V objects gather V scales through a raw pointer, 512 bytes from
+// the first token of each 64-token block. For a block in the second half of a 128-token scale
+// tile that ends 256 bytes past the tile, so the last (batch, head) reads past the tensor. The
+// dense and 256-row objects bound the gather with a buffer descriptor and need nothing. Mirrors the
+// producers' MHA_V4_MXFP4_V_SCALE_SLACK_BYTES and MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES.
+constexpr int64_t kMxVScaleSlackBytes = 1024;
+constexpr int64_t kMxVUnboundedKvTile = 64;
 
 void check_scale_backing_storage(const at::Tensor& descale,
                                  int64_t sequence,
                                  int64_t heads,
+                                 int64_t blocks_per_row,
                                  int64_t tile_rows,
                                  int64_t lookahead_rows,
                                  int64_t trailing_slack,
@@ -418,7 +425,7 @@ void check_scale_backing_storage(const at::Tensor& descale,
 {
     const int64_t padded = ((sequence + tile_rows - 1) / tile_rows) * tile_rows + lookahead_rows;
     const int64_t required =
-        descale.numel() + (padded - sequence) * heads * kMxScaleBlocksPerRow + trailing_slack;
+        descale.numel() + (padded - sequence) * heads * blocks_per_row + trailing_slack;
     const int64_t backed = static_cast<int64_t>(descale.storage().nbytes()) -
                            descale.storage_offset() * descale.element_size();
     TORCH_CHECK(backed >= required,
@@ -427,6 +434,30 @@ void check_scale_backing_storage(const at::Tensor& descale,
                 " descale needs ",
                 required,
                 " mapped bytes so the kernel's speculative tile gather stays in bounds, but only ",
+                backed,
+                " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
+                "zeroed slack");
+}
+
+void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
+                                      const MhaV4Recipe& recipe,
+                                      const at::Tensor& v_descale)
+{
+    const bool mx_v = recipe.v_format == format_id(AttentionFormat::Fp6E2M3) ||
+                      recipe.v_format == format_id(AttentionFormat::Fp4E2M1);
+    if(!mx_v || cfg.ts_kv != kMxVUnboundedKvTile)
+        return;
+    const int64_t required = v_descale.numel() + kMxVScaleSlackBytes;
+    const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
+                           v_descale.storage_offset() * v_descale.element_size();
+    TORCH_CHECK(backed >= required,
+                "MX V descale needs ",
+                required,
+                " mapped bytes so the ",
+                cfg.ts_qo,
+                "x",
+                cfg.ts_kv,
+                " kernel's speculative tile gather stays in bounds, but only ",
                 backed,
                 " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
                 "zeroed slack");
@@ -492,6 +523,13 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
 // grid-stride loop stays correct if the two disagree.
 constexpr int32_t kWorkTableWave = 64;
+// Longest LUT a row declares (lut_max in the manifest). HEAD_LOCAL keys hold the complemented
+// count in a 17-bit field, so every count in [0, kWorkTableMaxCount] keeps a distinct rank.
+constexpr int32_t kWorkTableMaxCount  = 65536;
+constexpr int32_t kWorkTableCountBits = 17;
+static_assert(kWorkTableMaxCount < (1 << kWorkTableCountBits) &&
+                  16 + kWorkTableCountBits + 31 == 64,
+              "HEAD_LOCAL key fields must not overlap");
 // Sol-Attn's LPT order sorts on lut_count in this many levels of the KV length rather than on the
 // count itself, raster order within a level. Coarse levels still start an all-exact (sink) row
 // first, which is the straggler the table is for, and at 256x128 measured within about 1% of an
@@ -586,14 +624,16 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
            order == static_cast<int32_t>(WorkOrder::HeadPromoted))
         {
             // The group in the top 16 bits: 0 for a promoted row, else 1 + (batch, head), which
-            // batch < 256 and heads < 256 keep in range. Below it the complemented level, or for a
-            // promoted row its (batch, head), so promoted rows run head by head; a LUT is never
-            // longer than 65536.
-            const uint32_t head  = static_cast<uint32_t>(slot / q_tiles);
-            const bool promoted  = promote > 0 && lut_count[slot] >= promote;
-            const uint64_t group = promoted ? 0u : head + 1u;
-            const uint64_t rank  = promoted ? head : 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
-            keys[slot]           = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
+            // batch < 256 and heads < 256 keep in range. Below it, in 17 bits, the complemented
+            // level, or for a promoted row its (batch, head), so promoted rows run head by head.
+            // The slot takes the low 31 bits; it is below kWorkTableFusedMax.
+            const uint32_t head   = static_cast<uint32_t>(slot / q_tiles);
+            const bool promoted   = promote > 0 && lut_count[slot] >= promote;
+            const int32_t clamped = min(max(lut_count[slot], 0), kWorkTableMaxCount);
+            const uint64_t group  = promoted ? 0u : head + 1u;
+            const uint64_t rank =
+                promoted ? head : static_cast<uint32_t>(kWorkTableMaxCount - clamped);
+            keys[slot] = (group << 48) | (rank << 31) | static_cast<uint32_t>(slot);
         }
         else if(order == static_cast<int32_t>(WorkOrder::Raster))
             keys[slot] = static_cast<uint32_t>(slot);
@@ -680,15 +720,17 @@ build_sorted_work_table(const at::Tensor& lut_count,
         const auto head =
             at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
         auto group = head + 1;
-        auto rank  = 65535 - flat.to(at::kLong).clamp_max(65535);
+        auto rank  = kWorkTableMaxCount - flat.to(at::kLong).clamp(0, kWorkTableMaxCount);
         if(promote > 0)
         {
             const auto promoted = flat >= promote;
             group               = at::where(promoted, at::zeros_like(group), group);
             rank                = at::where(promoted, head, rank);
         }
-        permutation =
-            at::argsort(group * 65536 + rank, /*stable=*/true, /*dim=*/0, /*descending=*/false);
+        permutation = at::argsort(group * (int64_t{1} << kWorkTableCountBits) + rank,
+                                  /*stable=*/true,
+                                  /*dim=*/0,
+                                  /*descending=*/false);
     }
     else
         permutation = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
@@ -807,6 +849,7 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
                             int64_t seqlen_k,
                             int64_t nhead_q,
                             int64_t gqa_ratio,
+                            int64_t head_dim,
                             double softmax_scale)
 {
     const bool bf16_qk = recipe.q_format == format_id(AttentionFormat::Bf16);
@@ -837,8 +880,8 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     // against the manifest rather than against the pointer being non-null.
     args.s_lse.value         = 0;
     args.s_kv_seq_len.value  = fit_u32(seqlen_k, "key length");
-    args.s_qk_head_dim.value = kHeadDim;
-    args.s_v_head_dim.value  = kHeadDim;
+    args.s_qk_head_dim.value = head_dim;
+    args.s_v_head_dim.value  = head_dim;
     args.s_q_head_num.value  = nhead_q;
     args.s_v_Seqs.value      = byte_stride(v, 1, "V sequence stride");
     args.s_v_Hs.value        = byte_stride(v, 2, "V head stride");
@@ -875,15 +918,15 @@ struct PackedMhaV4Shapes
     int64_t seqlen_k;
     int64_t nhead_k;
     int64_t gqa_ratio;
+    int64_t head_dim;
 };
 
 // Point the kernel's LSE slots at `lse`, or leave the launch writing no LSE when it is nullopt.
 //
 // The kernel writes row (b, h) as seqlen_q unit-stride floats at ptr_lse + (b * nhead_q + h) *
-// s_lse_Hs, and writes nothing past seqlen_q. So the rows must be unit-stride float32 and the batch
-// stride is not independently settable: a tensor whose batch stride is not nhead_q * head stride
-// would have its heads written over each other. A contiguous [batch, nhead_q, seqlen_q] tensor
-// satisfies both.
+// s_lse_Hs, and writes nothing past seqlen_q. The batch stride is therefore not independently
+// settable, and a head stride below seqlen_q -- an expanded view's 0, say -- writes the rows over
+// each other. Only a contiguous [batch, nhead_q, seqlen_q] tensor is safe on every count.
 void set_lse_kernarg(FmhaV4Kernarg& args,
                      const std::optional<at::Tensor>& lse,
                      const fmha_v4_fwdConfig& cfg,
@@ -920,11 +963,12 @@ void set_lse_kernarg(FmhaV4Kernarg& args,
                 seqlen_q,
                 "], got ",
                 t.sizes());
-    TORCH_CHECK(t.stride(2) == 1, mode_name, " MHA v4 LSE rows must be unit-stride");
-    TORCH_CHECK(t.stride(0) == nhead_q * t.stride(1),
+    TORCH_CHECK(t.is_contiguous(),
                 mode_name,
-                " MHA v4 LSE batch stride must be nhead_q * head stride; the kernel derives the "
-                "batch offset from the head stride and cannot honour an independent one");
+                " MHA v4 LSE must be contiguous, got strides ",
+                t.strides(),
+                "; the kernel derives every row's offset from the head stride, so any other "
+                "layout writes rows over each other or into the wrong place");
 
     args.ptr_lse.value  = t.data_ptr();
     args.s_lse.value    = 1;
@@ -974,10 +1018,13 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     shapes.nhead_q             = q.size(2);
     shapes.seqlen_k            = k.size(1);
     shapes.nhead_k             = k.size(2);
+    // V carries the LOGICAL head dim in its last axis while its row stride stays the packed one,
+    // so it is the only operand that names the head dim directly.
+    shapes.head_dim = v.size(3);
     const int64_t packed_width =
-        recipe.q_format == format_id(AttentionFormat::Fp6E2M3)   ? 96
-        : recipe.q_format == format_id(AttentionFormat::Fp4E2M1) ? 64
-                                                                 : 128;
+        recipe.q_format == format_id(AttentionFormat::Fp6E2M3)   ? shapes.head_dim * 3 / 4
+        : recipe.q_format == format_id(AttentionFormat::Fp4E2M1) ? shapes.head_dim / 2
+                                                                 : shapes.head_dim;
 
     TORCH_CHECK(shapes.batch > 0 && shapes.seqlen_q > 0 && shapes.seqlen_k > 0 &&
                     shapes.nhead_q > 0,
@@ -994,20 +1041,28 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     TORCH_CHECK(k.size(1) == v.size(1), "K and V sequence lengths must match");
     TORCH_CHECK(q.size(3) == packed_width && k.size(3) == packed_width,
                 "Q/K packed width does not match the explicit format");
-    TORCH_CHECK(v.size(3) == kHeadDim, "V must have logical head dimension 128");
+    TORCH_CHECK(shapes.head_dim == 128 || shapes.head_dim == 256,
+                "MHA v4 supports head dimension 128 or 256, got ",
+                shapes.head_dim);
     if(recipe.q_format == format_id(AttentionFormat::Fp4E2M1))
     {
-        const int64_t tiles       = (shapes.seqlen_k + 127) / 128;
-        const int64_t head_stride = tiles * 8192;
-        TORCH_CHECK(k.stride(0) == shapes.nhead_k * head_stride && k.stride(1) == 64 &&
+        // The MXFP4 K producer tiles 128 tokens whatever KV tile the kernel runs, so the backing
+        // stride follows the producer and not cfg.ts_kv.
+        const int64_t tiles       = (shapes.seqlen_k + kKvScaleTileRows - 1) / kKvScaleTileRows;
+        const int64_t row_bytes   = shapes.head_dim / 2;
+        const int64_t head_stride = tiles * kKvScaleTileRows * row_bytes;
+        TORCH_CHECK(k.stride(0) == shapes.nhead_k * head_stride && k.stride(1) == row_bytes &&
                         k.stride(2) == head_stride,
                     "MXFP4 K must use the coalesced MHA v4 tile layout");
     }
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
                 "MHA v4 currently supports BF16 output only");
-    TORCH_CHECK(out.sizes() ==
-                    torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, kHeadDim}),
-                "out must have shape [batch, query_length, query_heads, 128]");
+    TORCH_CHECK(
+        out.sizes() ==
+            torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, shapes.head_dim}),
+        "out must have shape [batch, query_length, query_heads, ",
+        shapes.head_dim,
+        "]");
 
     const bool mx_qk_format = recipe.q_format == format_id(AttentionFormat::Fp6E2M3) ||
                               recipe.q_format == format_id(AttentionFormat::Fp4E2M1);
@@ -1029,18 +1084,26 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     }
     else if(e8m0_qk_scales)
     {
+        const int64_t blocks_per_row = shapes.head_dim / kMxScaleBlockElements;
         TORCH_CHECK(q_descale.scalar_type() == at::ScalarType::Byte &&
                         k_descale.scalar_type() == at::ScalarType::Byte,
                     "MX Q/K descales must be uint8 E8M0 tensors");
-        TORCH_CHECK(q_descale.sizes() ==
-                        torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, 4}),
-                    "MX Q descale must have shape [batch, query_length, query_heads, 4]");
-        TORCH_CHECK(k_descale.sizes() ==
-                        torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
-                    "MX K descale must have shape [batch, key_length, key_heads, 4]");
+        TORCH_CHECK(
+            q_descale.sizes() ==
+                torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, blocks_per_row}),
+            "MX Q descale must have shape [batch, query_length, query_heads, ",
+            blocks_per_row,
+            "]");
+        TORCH_CHECK(
+            k_descale.sizes() ==
+                torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, blocks_per_row}),
+            "MX K descale must have shape [batch, key_length, key_heads, ",
+            blocks_per_row,
+            "]");
         check_scale_backing_storage(q_descale,
                                     shapes.seqlen_q,
                                     shapes.nhead_q,
+                                    blocks_per_row,
                                     kQueryScaleTileRows,
                                     0,
                                     0,
@@ -1050,6 +1113,7 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
             check_scale_backing_storage(k_descale,
                                         shapes.seqlen_k,
                                         shapes.nhead_k,
+                                        blocks_per_row,
                                         kKvScaleTileRows,
                                         kKvScaleLookaheadRows,
                                         kKvScaleTrailingDwordSlack,
@@ -1077,35 +1141,28 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     }
     else if(mx_v)
     {
-        const int64_t tiles = (shapes.seqlen_k + 127) / 128;
+        // One E8M0 byte per 32 V elements, over the producer's padded sequence.
+        const int64_t tiles = (shapes.seqlen_k + kKvScaleTileRows - 1) / kKvScaleTileRows;
+        const int64_t scale_bytes =
+            tiles * kKvScaleTileRows * shapes.head_dim / kMxScaleBlockElements;
         TORCH_CHECK(recipe.v_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
                 v_descale.scalar_type() == at::ScalarType::Byte,
                     "MX V descale must use uint8 E8M0 per-1x32 scales");
         TORCH_CHECK(v_descale.sizes() ==
-                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, tiles * 512}),
-                    "MX V descale must have shape [batch, key_heads, tiles * 512]");
-        if(recipe.v_format == format_id(AttentionFormat::Fp4E2M1))
-        {
-            const int64_t required = v_descale.numel() + kMxFp4VScaleSlackBytes;
-            const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
-                                   v_descale.storage_offset() * v_descale.element_size();
-            TORCH_CHECK(backed >= required,
-                        "MX V descale needs ",
-                        required,
-                        " mapped bytes so the kernel's speculative tile gather stays in bounds, "
-                        "but only ",
-                        backed,
-                        " are backed; allocate it with the aiter.ops.mha_v4_quant producers, "
-                        "which reserve zeroed slack");
-        }
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, scale_bytes}),
+                    "MX V descale must have shape [batch, key_heads, ",
+                    scale_bytes,
+                    "]");
     }
     else if(mx_qk_format)
     {
         TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
                     "MX FP8 V descale must be a float32 tensor");
         TORCH_CHECK(v_descale.sizes() ==
-                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, kHeadDim}),
-                    "MX V descale must have shape [batch, key_heads, 128]");
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, shapes.head_dim}),
+                    "MX V descale must have shape [batch, key_heads, ",
+                    shapes.head_dim,
+                    "]");
     }
     else
     {
@@ -1171,7 +1228,8 @@ void fmha_v4_fwd(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(arch, recipe, /*mode=*/0, /*ts_qo=*/0, /*ts_kv=*/0);
+    const auto& cfg =
+        find_config(arch, recipe, /*mode=*/0, shapes.head_dim, /*ts_qo=*/0, /*ts_kv=*/0);
 
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
@@ -1188,6 +1246,7 @@ void fmha_v4_fwd(const at::Tensor& q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
+                           shapes.head_dim,
                            softmax_scale);
     set_lse_kernarg(
         args, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "dense");
@@ -1269,7 +1328,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(arch, recipe, /*mode=*/1, q_tile, kv_tile);
+    const auto& cfg = find_config(arch, recipe, /*mode=*/1, shapes.head_dim, q_tile, kv_tile);
+    check_mx_v_scale_backing_storage(cfg, recipe, v_descale);
     TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 row ",
                 cfg.knl_name,
@@ -1338,6 +1398,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
+                           shapes.head_dim,
                            softmax_scale);
     set_lse_kernarg(
         args.dense, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "sorted-sparse");
@@ -1411,7 +1472,8 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(arch, recipe, /*mode=*/2, q_tile, kv_tile);
+    const auto& cfg = find_config(arch, recipe, /*mode=*/2, shapes.head_dim, q_tile, kv_tile);
+    check_mx_v_scale_backing_storage(cfg, recipe, v_descale);
     // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
     // pass. A short last block is only ever computed there: sol_prepare() forces it exact,
     // since the pooled xts_kv factor only holds for a full block.
@@ -1535,7 +1597,8 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
         // the column out. Those have to pass a zero-padded image, so accept either height.
         const int64_t padded_rows = bitmap_groups * blocks_per_tile;
         TORCH_CHECK(ks.dim() == 4 && ks.size(0) == shapes.batch &&
-                        ks.size(2) == shapes.nhead_k && ks.size(3) == kHeadDim / 32 &&
+                        ks.size(2) == shapes.nhead_k &&
+                        ks.size(3) == shapes.head_dim / kMxScaleBlockElements &&
                         (ks.size(1) == kv_tiles || ks.size(1) == padded_rows),
                     "mean_k_scale must have shape [batch, rows, key_heads, 4] with rows either "
                     "num_kv_blocks (",
@@ -1664,6 +1727,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
+                           shapes.head_dim,
                            softmax_scale);
     // The Sol-Attn LSE is the denominator of the ONE softmax the two branches share, so it counts
     // the pooled proxy columns as well as the exact ones. That is the quantity partial outputs

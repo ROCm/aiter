@@ -506,6 +506,32 @@ def test_mha_v4_sparse_work_table_defaults_by_query_tile(
     assert visited == _expected_work_order(order, counts.tolist(), q_tiles, 64)
 
 
+# 65536 is the largest lut_max a manifest declares, so every count up to it must keep its rank.
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@parametrize(("batch", "nhead", "q_tiles"), [(2, 5, 7), (8, 32, 64)])
+@parametrize("order", ["lpt", "head"])
+def test_mha_v4_sparse_work_table_orders_counts_through_65536(
+    batch, nhead, q_tiles, order
+):
+    torch.manual_seed(7)
+    total = batch * nhead * q_tiles
+    counts = _work_table_counts(total, "random")
+    # Shorter first in the first and last (batch, head) groups, so a shared rank leaves them be.
+    boundary = torch.tensor([65535, 65536, 0, 65536, 65534], dtype=torch.int32)
+    counts[:5] = boundary
+    counts[total - q_tiles : total - q_tiles + 5] = boundary
+    with mock.patch.dict(os.environ, {"AITER_MHA_V4_WORK_ORDER": order}):
+        table = mha_v4_sparse_work_table(counts, batch, nhead, q_tiles)
+
+    lengths = counts.tolist()
+    key = {
+        "lpt": lambda slot: (-lengths[slot], slot),
+        "head": lambda slot: (slot // q_tiles, -lengths[slot], slot),
+    }[order]
+    visited = _unpack_work_table(table, nhead, q_tiles).tolist()
+    assert visited == sorted(range(total), key=key)
+
+
 @skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 def test_mha_v4_sparse_work_table_rejects_an_unknown_work_order():
     counts = torch.ones(4, device="cuda", dtype=torch.int32)
