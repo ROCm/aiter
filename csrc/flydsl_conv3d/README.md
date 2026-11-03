@@ -97,13 +97,15 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
     |-------|----------|----------------------|-----------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
     |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
 
-   `us`, `tflops` and `bw` are end-to-end, timed NDHWC in and out, so there is
-   no layout transpose in them. The entry point still runs the weight repack
-   before the kernel, and where C/groups is not a multiple of 8 a channel pad
-   that copies the whole input on every call -- the `C=3` input conv of both
-   VAEs. That is a constant per shape, so the ranking is unaffected, but the
-   three columns are a floor rather than a kernel figure and are not
-   comparable with another implementation's kernel-only numbers.
+   `us`, `tflops` and `bw` are the conv kernel alone, timed NDHWC in and out.
+   The timed call gets its operands prepared once per shape -- the channel pad
+   where C/groups is not a multiple of 8, the packed weight and the fp32 bias --
+   the way a deployed layer holds them, and writes into a caller-owned output
+   that is NaN-filled before each candidate. The per-call host work of the
+   entry point is therefore not in them; `--run_config` times the entry point
+   and reports it next to the table's `us`. A split-K candidate is the
+   exception: its fp32 staging buffer is converted outside the kernel, so it is
+   timed through the entry point.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
@@ -199,10 +201,11 @@ Number of GPUs for parallel tuning. Default: all available.
 
 ### `--errRatio`
 Tolerable error ratio against the `torch.nn.functional.conv3d` reference
-(default 0.0, not the usual 0.05). The reference is bf16 rather than fp32 on
-purpose: the tuner needs to catch a config that computes the wrong thing, not to
-measure bf16 rounding, and a matching rounding regime puts every correct
-candidate at exactly 0. Raise it only to investigate a specific failure --
+(default 0.0, not the usual 0.05). The reference is computed in fp32 (bias
+included) and rounded to bf16 once, and every candidate is scored by
+`strict_compare`: 1.0 if any element is outside `rtol=atol=2e-2`, else 0.0, so
+mp_tuner's four-decimal rounding of the error ratio cannot hide sparse errors.
+Raise it only to investigate a specific failure --
 `op_tests/test_flydsl_conv_implicit.py` fails on any mismatched element, so a
 row tuned under a looser bar is a row that test will reject.
 

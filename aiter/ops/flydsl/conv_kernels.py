@@ -652,30 +652,62 @@ def _big_in(n, c, groups, d, h, w, pt, ph, pw):
     return n * cp * (d + 2 * pt) * (h + 2 * ph) * (w + 2 * pw) > 0x7FFFFFFF
 
 
-def _evict_weight(key, _ref):
-    """weakref callback: drop the entry the dead weight was pinning."""
-    ent = _WEIGHT_CACHE.get(key)
+def _evict_cached(cache, key, _ref):
+    """weakref callback: drop the entry the dead source tensor was pinning."""
+    ent = cache.get(key)
     if ent is not None and ent[0]() is None:
-        del _WEIGHT_CACHE[key]
+        del cache[key]
+
+
+def _memoized_on_tensor(cache, t, build):
+    """``build()``, memoized on ``t``: storage, version, shape, stride and dtype.
+
+    An in-place update bumps ``_version`` and a new tensor at a reused address
+    fails the weakref check, so a stale entry is rebuilt rather than reused.
+    """
+    anchor = t._base if t._base is not None else t
+    key = t.data_ptr()
+    stamp = (t._version, tuple(t.shape), t.stride(), t.dtype)
+    ent = cache.get(key)
+    if ent is not None and ent[0]() is anchor and ent[2] == stamp:
+        return ent[1]
+    out = build()
+    cache[key] = (
+        weakref.ref(anchor, functools.partial(_evict_cached, cache, key)),
+        out,
+        stamp,
+    )
+    return out
 
 
 def _prep_weight(w, k, kt, kh, kw, c):
     """Pack (K, C, T, R, S) -> (K, T*R*S*Cpad), memoized on the source weight."""
-    anchor = w._base if w._base is not None else w
-    key = w.data_ptr()
-    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype)
-    ent = _WEIGHT_CACHE.get(key)
-    if ent is not None and ent[0]() is anchor and ent[2] == stamp:
-        return ent[1]
-    cp = _pad_channels(c)
-    wsrc = torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cp - c)) if cp != c else w
-    wk = wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cp)
-    _WEIGHT_CACHE[key] = (
-        weakref.ref(anchor, functools.partial(_evict_weight, key)),
-        wk,
-        stamp,
+
+    def build():
+        cp = _pad_channels(c)
+        wsrc = (
+            torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cp - c)) if cp != c else w
+        )
+        return wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cp)
+
+    return _memoized_on_tensor(_WEIGHT_CACHE, w, build)
+
+
+# The epilogue adds bias in fp32. A model passes the same bias every call, and
+# converting it is a kernel launch of its own (~4.5 us on gfx950) -- as long as
+# the whole convolution on the small VAE layers -- so it is memoized like the
+# packed weight.
+_BIAS_CACHE = {}
+
+
+def _prep_bias(bias):
+    """``bias`` as a contiguous fp32 vector, memoized on the source tensor."""
+    if bias.dtype == torch.float32 and bias.is_contiguous():
+        # Already the kernel's operand; caching it would only pin it alive.
+        return bias
+    return _memoized_on_tensor(
+        _BIAS_CACHE, bias, lambda: bias.to(torch.float32).contiguous()
     )
-    return wk
 
 
 def _resolve_splitk(
@@ -910,7 +942,7 @@ def _conv3d_impl(
     launch_stream = torch.cuda.current_stream() if stream is None else stream
     has_bias = bias is not None
     bias_arg = (
-        bias.to(torch.float32).contiguous()
+        _prep_bias(bias)
         if has_bias
         else torch.empty(1, device=x.device, dtype=torch.float32)
     )
