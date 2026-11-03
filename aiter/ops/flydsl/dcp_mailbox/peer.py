@@ -39,6 +39,7 @@ class PeerBuffer:
         self.local = UncachedIpcHeap.alloc_uncached(nbytes)
         # a view, not an owner: close() frees the memory under it
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        self.device = device
         self.rank = rank
         self._opened: list[int] = []
         addresses = [self.local]
@@ -65,6 +66,9 @@ class PeerBuffer:
                     " TP rank"
                 ) from failure
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
+        self.bytes.zero_()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
 
     def close(self) -> None:
         """Close peer mappings and free the local buffer."""
@@ -75,6 +79,7 @@ class PeerBuffer:
             self.bytes = None
             UncachedIpcHeap.free_device_mem(self.local)
             self.local = 0
+        self.addresses = None
 
 
 def _all_ok(ok: bool, group) -> bool:

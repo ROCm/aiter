@@ -76,6 +76,7 @@ def worker(rank, world):
                     f"heads={hl} dim={dim} {combine_us:.2f} us",
                     flush=True,
                 )
+            cws.close()
         dim = 512
         gws = GatherWorkspace(
             group, torch.device("cuda"), hl, dim, torch.bfloat16, world * hl, 64
@@ -88,6 +89,7 @@ def worker(rank, world):
                 f"heads={hl} dim={dim} {gather_us:.2f} us",
                 flush=True,
             )
+        gws.close()
     finally:
         dist.destroy_process_group()
 

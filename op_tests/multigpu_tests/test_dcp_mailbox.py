@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.dcp_mailbox import (
     CombineWorkspace,
     GatherWorkspace,
@@ -107,6 +108,7 @@ def worker(rank, world):
                     if not masked:
                         plain = dcp_lse_combine(cws, out, lse, base_e=base_e)
                         torch.testing.assert_close(plain, res, rtol=0, atol=0)
+            cws.close()
 
         dim = 512
         gws = GatherWorkspace(
@@ -142,12 +144,22 @@ def worker(rank, world):
         dist.all_gather(refs, ref)
         exp_fp8 = torch.cat(refs, dim=1)
         torch.testing.assert_close(qgot.float(), exp_fp8.float(), rtol=0.1, atol=1.0)
+        qws.close()
+        gws.close()
         if rank == 0:
             print("DCP_MAILBOX OK", flush=True)
     finally:
         dist.destroy_process_group()
 
 
-if __name__ == "__main__":
+def main():
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        print(f"SKIP DCP_MAILBOX: unsupported architecture {arch}", flush=True)
+        return
     world = int(os.environ.get("WORLD", "8"))
     mp.spawn(worker, args=(world,), nprocs=world, join=True)
+
+
+if __name__ == "__main__":
+    main()
