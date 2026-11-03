@@ -25,8 +25,11 @@ rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
 # agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
 # itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
 # instead of dying silently. Trap both the exit and the terminating signals.
-_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; return 0; }
-_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
+# "see the job log" is the one thing this must not say silently: the log is where the reader
+# already is. An unclassified exit wrote STATUS and printed nothing, so a run that died inside
+# the fetch pipeline ended the log mid-sentence after "fetch..." with no line saying so.
+_on_exit() { local ec=$?; if [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ]; then printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; echo "run_one exited unexpectedly (code $ec) with no classified failure -- the last line above is where it stopped" >&2; fi; return 0; }
+_on_signal() { [ -f "$STATUS" ] || { printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; echo "run_one was killed by a signal (likely the job or agent timeout)" >&2; }; exit 143; }
 trap _on_exit EXIT
 trap _on_signal TERM INT
 
@@ -96,14 +99,30 @@ fi
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
 say "fetch..."
 FL="$(mktemp)"
+# errexit must not win here. A failing fetch aborts run_one inside this pipeline, before the
+# classification below can run -- so the log ends mid-sentence after "fetch..." and the reader
+# is left to guess. Take the status as a value and classify it.
+set +e
 if [ -n "$GH_FALLBACK_TOK" ]; then
   (cd "$PROJ" && GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 else
   (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 fi
+set -e
 W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
+if [ -z "$W" ] || [ ! -d "$W" ]; then
+  # Name the cause the runner can act on. "check gh auth/token, network, git and disk" sends
+  # someone hunting a broken credential when the credential is fine and a quota is empty --
+  # that one resets on a clock and the only correct response is to wait and re-run.
+  if grep -qi 'rate limit' "$FL" 2>/dev/null; then
+    _rl=$(grep -i -m1 'rate limit' "$FL")
+    rm -f "$FL"
+    fail env 1 "GitHub refused the fetch on a spent API quota, not a bad token: ${_rl}. The quota resets on GitHub's own clock (an hour at most); re-comment to retry after it does. Nothing about this PR was examined."
+  fi
+  rm -f "$FL"
+  fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
+fi
 rm -f "$FL"
-[ -n "$W" ] && [ -d "$W" ] || fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
 
 # applies.txt fix: the skill's fetch.sh checks `git apply` against PROJECT_ROOT's worktree but
 # reports it as the merge target; re-check on the merge-target worktree checked out at BASE_SHA.

@@ -193,6 +193,14 @@ t "a silent downgrade is rejected" "$rc" "1"
 t "rejected validation evidence degrades instead of aborting" \
   "$(bash "$S/_degrade_test.sh" "$S" 2>&1 | tail -1)" "ok"
 
+# A fetch that dies must say why, in the log, in terms the runner can act on. The live run
+# this pins happened on ATOM: a spent GitHub API quota ended the log mid-sentence after
+# "fetch..." -- errexit aborted inside the pipeline before the classification could run, and
+# the exit trap wrote a status file while printing nothing. "Check gh auth/token" would also
+# have been the wrong advice: the token was fine and a quota was empty, which resets on a clock.
+t "a dead fetch names the cause the runner can act on" \
+  "$(bash "$S/_fetchfail_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
 echo "[watchdog]"
 # The watchdog is the one guard that cannot be tested by running it: `issue_comment` workflows
 # only ever run from the default branch, so GitHub will not execute that job until this merges.
