@@ -1,6 +1,0 @@
-  files=10  types=5  rules=6/54
-    [new-env-var         ] HK9 D2
-    [temp-script         ] HK1
-    [syspath-mutation    ] HK3
-    [conditional-binding ] D1b
-    [defaulted-param     ] E2
