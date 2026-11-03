@@ -873,7 +873,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
 # over the macro. The CO loader resolves the current HIP device's ASIC Revision:
-# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# A0 uses this root's gfx1250-strict directory, B0+ uses gfx1250. A direct profile
 # override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
@@ -1295,54 +1295,21 @@ def clone_3rdparty(third_party: str) -> None:
                     ]
                 )
             else:
-                # Save current git config value for advice.detachedHead, set to false
-                prev_detached_head = None
-                try:
-                    try:
-                        prev_detached_head = subprocess.check_output(
-                            ["git", "config", "--get", "advice.detachedHead"], text=True
-                        ).strip()
-                    except subprocess.CalledProcessError:
-                        prev_detached_head = None  # not set before
-                    # Set to false before clone
-                    subprocess.call(
-                        ["git", "config", "--global", "advice.detachedHead", "false"]
-                    )
-
-                    subprocess.call(
-                        [
-                            "git",
-                            "clone",
-                            "-q",
-                            f"--revision={third_party_info['commit']}",
-                            "--depth=1",
-                            "--recurse-submodules",
-                            third_party_info["url"],
-                            dir_path,
-                        ]
-                    )
-                finally:
-                    # Restore config after clone
-                    if prev_detached_head is not None:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "advice.detachedHead",
-                                prev_detached_head,
-                            ]
-                        )
-                    else:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "--unset",
-                                "advice.detachedHead",
-                            ]
-                        )
+                # Keep the detached-HEAD advice setting local to this clone.
+                subprocess.call(
+                    [
+                        "git",
+                        "-c",
+                        "advice.detachedHead=false",
+                        "clone",
+                        "-q",
+                        f"--revision={third_party_info['commit']}",
+                        "--depth=1",
+                        "--recurse-submodules",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
 
     if third_party == "HipKittens":
         dir_path = HIP_KITTENS_DIR
