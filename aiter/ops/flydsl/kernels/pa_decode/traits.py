@@ -945,6 +945,12 @@ class Gfx1250Traits:
         return 16 * self.v_stride
 
     @property
+    def causal_rows(self):
+        # The per-wave tiles bound every row causally. One query token sees the
+        # same keys either way; longer non-causal blocks keep the shared tiles.
+        return self.causal or self.query_length == 1
+
+    @property
     def wave_query_tiles(self):
         # One D128 query tile per wave keeps scores, P and output in registers:
         # softmax needs no cross-wave exchange, only the page buffers are shared.
@@ -953,6 +959,7 @@ class Gfx1250Traits:
             and self.m_tiles == self.NWARP
             and self.head_dim == 128
             and self.async_page
+            and self.causal_rows
         )
 
     @property
@@ -963,6 +970,7 @@ class Gfx1250Traits:
             self.bf16_page128_packed
             and self.m_tiles == self.NWARP
             and self.head_dim == 128
+            and self.causal_rows
         )
 
     @property
