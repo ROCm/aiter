@@ -898,19 +898,24 @@ class GemmA16W16Tuner(GemmCommonTuner):
             verbose=args.verbose,
             rtol=rtol,
             atol=atol,
+            policy=self.policy_for(args),
         )
         rets = gemmobj.run_solutions()
         gemmobj.cleanup()
 
         result = []
-        for info, us, err_ratio in rets:
+        from aiter.utility.tune_result import TuneResult
+
+        for el in rets:
+            info, us, err_ratio = el
             shape_tuple, solidx, splitK, kernelName, libtype, bpreshuffle = info
             keys_10 = (gfx, cu_num) + shape_tuple
             result.append(
-                (
+                TuneResult(
                     (keys_10, solidx, splitK, kernelName, libtype, bpreshuffle),
                     us,
                     err_ratio,
+                    getattr(el, "watts", float("nan")),
                 )
             )
         return result
@@ -1025,25 +1030,26 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     kernelName = "None"
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
+            metrics = {
+                "libtype": [libtype],
+                "solidx": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "err_ratio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "
                     f"libtype={libtype} kernelId={kernelId} {kernelName} "
                     f"splitK={splitK}, {time}us, err_ratio={err_ratio}, "
-                    f"tflops={tflops} TFLOPS, bw={bw} GB/s"
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "libtype": [libtype],
-                    "solidx": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "err_ratio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
