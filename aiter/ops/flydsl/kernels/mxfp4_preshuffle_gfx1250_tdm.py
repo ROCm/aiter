@@ -388,6 +388,14 @@ def launch_gemm_a8w4_tdm(
                           and cluster_n == 4 and not row_major_ascale
                           and not tdm_as_in_prologue and K % tile_k == 0)
     M_ROW_STEP = 32 if interleaved_m_rows else 16
+    new_auto_stage1 = bool(interleaved_m_rows and not explicit_vgpr_partition
+                          and callable(getattr(rocdl, "sched_vgpr", None)))
+    narrow_stage1_row_skip = bool(a_is_fp4 and a_preshuffled
+                                 and not persistent_workers and not enable_ep_scatter
+                                 and stage1_act and stage1_quant_out
+                                 and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+                                     == (64, 256, 256, 1, 4, 3)
+                                 and callable(getattr(rocdl, "sched_vgpr", None)))
     fp4_prefill = use_spec_prefill_opt and cluster_m > 1
     quant_gemm1_prefill = fp4_prefill and stage1_act == 1 and bool(stage1_quant_out)
     reuse_lds_stage_base = fp4_prefill and bool(planar_lds_on)
@@ -1254,6 +1262,12 @@ def launch_gemm_a8w4_tdm(
                             constraints=f"={{v{32 + address_slot * 4 + component}}},0",
                             has_side_effects=True, is_align_stack=False,
                         ).res)
+                    if const_expr(new_auto_stage1):
+                        # Pin only the live DS addresses; A/B/C still use the
+                        # automatic allocator. Consume the returned SSA value.
+                        value = fx.Int32(rocdl.sched_vgpr(
+                            _raw(fx.Int32(value)), 32 + address_slot * 4 + component
+                        ))
                     values.append(value)
                 return LdsAddr(*values)
             if const_expr(isinstance(slot, int)):
@@ -2098,8 +2112,17 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(peel_last):
                         compute_drain_tile(PRE - 1, False, kws=KWS_TAIL)
 
+            # The route's live extent is shared by multicast peers. Retain the
+            # full descriptor and output layouts while skipping only M16 rows
+            # wholly beyond the expert's live rows. Other row counts use the
+            # complete original body, including ragged K and activation logic.
+            if const_expr(narrow_stage1_row_skip):
+                if mn_oob <= 2 * M_ROW_STEP:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=2)
+                else:
+                    run_mainloop(bool(interleaved_lds_load_on))
             # Keep the v80 six/seven bodies adjacent and emit the output tail once.
-            if const_expr(interleaved_m_rows and not explicit_vgpr_partition):
+            elif const_expr(interleaved_m_rows and not explicit_vgpr_partition):
                 if fx.Boolean(llvm_dialect.intr_expect(
                     ((4 * M_ROW_STEP < mn_oob) & (7 * M_ROW_STEP >= mn_oob)).ir_value(),
                     fx.Boolean(True).ir_value(),
