@@ -15,20 +15,33 @@ B=$(awk -v a="$A" 'NR>a && /^rm -f "\$FL"$/{print NR; exit}' "$S/run_one.sh")
 
 mkdir -p "$T/skill"; printf '#!/usr/bin/env bash\necho "GraphQL: API rate limit already exceeded for user ID 1."\nexit 1\n' > "$T/skill/fetch.sh"
 export SKILL="$T/skill" PROJ="$T" GH_FALLBACK_TOK="" PR=1 REPO=x/y STATUS="$T/status"
-out=$(bash "$T/region.sh" 2>&1); rc=$?
 fails=0
+
+_run() { out=$(PATH="$1:$PATH" bash "$T/region.sh" 2>&1); rc=$?; }
+_want() { printf '%s\n' "$out" | grep -q "$1" || { echo "  ❌ $2"; fails=1; }; }
+_deny() { printf '%s\n' "$out" | grep -q "$1" && { echo "  ❌ $3"; fails=1; }; }
+
+# 1) Quota spent, and the refill time is readable: say the minute, not "within the hour".
+mkdir -p "$T/bin"
+printf '#!/usr/bin/env bash\necho $(( $(date +%%s) + 900 ))\n' > "$T/bin/gh"; chmod +x "$T/bin/gh"
+_run "$T/bin"
 [ "$rc" -ne 0 ] || { echo "  ❌ a failed fetch was treated as success"; fails=1; }
-printf '%s\n' "$out" | grep -q "spent API quota" \
-  || { echo "  ❌ the quota was not named — got: $(printf '%s' "$out" | head -1)"; fails=1; }
-printf '%s\n' "$out" | grep -q "Nothing about this PR was examined" \
-  || { echo "  ❌ it did not say the PR went unexamined"; fails=1; }
+_want "quota for this bot is spent" "the quota was not named"
+_want "refills at .*UTC, in about [0-9]\+ min" "the refill time was not stated as a minute"
+_want "Nothing about this PR was examined" "it did not say the PR went unexamined"
 grep -q "^env" "$STATUS" 2>/dev/null || { echo "  ❌ no classified status was written"; fails=1; }
 
-# A non-quota failure must still fall through to the generic cause, not be mislabelled a quota.
+# 2) Quota spent and the refill time cannot be read: the vague form, never a wrong number.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/gh"
+_run "$T/bin"
+_want "within the hour" "the fallback wording was lost"
+_deny "in about" "" "an unreadable reset time still produced a number"
+
+# 3) A non-quota failure must keep its generic cause, not be mislabelled a quota.
 printf '#!/usr/bin/env bash\necho "fatal: could not read from remote"\nexit 1\n' > "$T/skill/fetch.sh"
-out2=$(bash "$T/region.sh" 2>&1) || true
-printf '%s\n' "$out2" | grep -q "check gh auth/token" \
-  || { echo "  ❌ a non-quota failure lost its generic cause"; fails=1; }
-printf '%s\n' "$out2" | grep -q "spent API quota" && { echo "  ❌ a non-quota failure was mislabelled a quota"; fails=1; }
+_run "$T/bin"
+_want "check gh auth/token" "a non-quota failure lost its generic cause"
+_deny "quota for this bot is spent" "" "a non-quota failure was mislabelled a quota"
+
 rm -rf "$T"
 [ "$fails" -eq 0 ] && echo "ok" || echo "FAILED"

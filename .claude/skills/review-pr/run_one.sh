@@ -115,9 +115,18 @@ if [ -z "$W" ] || [ ! -d "$W" ]; then
   # someone hunting a broken credential when the credential is fine and a quota is empty --
   # that one resets on a clock and the only correct response is to wait and re-run.
   if grep -qi 'rate limit' "$FL" 2>/dev/null; then
-    _rl=$(grep -i -m1 'rate limit' "$FL")
     rm -f "$FL"
-    fail env 1 "GitHub refused the fetch on a spent API quota, not a bad token: ${_rl}. The quota resets on GitHub's own clock (an hour at most); re-comment to retry after it does. Nothing about this PR was examined."
+    # "an hour at most" is not an answer anyone can plan around. GitHub's /rate_limit endpoint
+    # does not itself count against the quota, so the exact refill time is readable even while
+    # the quota is spent -- say the minute, and fall back to the vague form only if it cannot
+    # be read. One line: what is wrong, how long, and that nothing was looked at.
+    _rs=$(GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" \
+      gh api rate_limit --jq '[.resources[].reset]|min' 2>/dev/null | grep -oE '^[0-9]+$' || true)
+    if [ -n "$_rs" ]; then
+      _mins=$(( (_rs - $(date +%s) + 59) / 60 )); [ "$_mins" -lt 1 ] && _mins=1
+      fail env 1 "GitHub's API quota for this bot is spent (the token is fine) -- it refills at $(date -u -d "@$_rs" '+%H:%M UTC'), in about ${_mins} min; re-comment then. Nothing about this PR was examined."
+    fi
+    fail env 1 "GitHub's API quota for this bot is spent (the token is fine) -- it refills on GitHub's own clock, within the hour; re-comment then. Nothing about this PR was examined."
   fi
   rm -f "$FL"
   fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
