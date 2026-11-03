@@ -20,7 +20,11 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    current_stream_arg,
+    ptr_arg,
+)
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -276,7 +280,7 @@ def _find_grouped_config(
 
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
-    is_gfx1250 = get_gfx() == "gfx1250"
+    is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
     return env_enabled or is_gfx1250
 
 
@@ -714,6 +718,7 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    _gemm2_m_align = 0
     if cluster_n2 is None:
         # The two stages want different cluster widths: gemm1 gains from the
         # multicast of its shared A operand, while gemm2 loses more than it
@@ -728,10 +733,12 @@ def _grouped_a8w4_tdm_moe(
         _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
         if _plan_align:
             tile_m = min(int(tile_m), _plan_align)
+            tile_m2 = min(int(tile_m2), _plan_align)
             # psum holds each expert's unpadded end, so a gemm2 tile narrower
-            # than the alignment can start in an expert's padding, map to the
-            # next expert, and scatter stale ep_rowmap rows into live slots.
-            tile_m2 = _plan_align
+            # than the alignment can start in an expert's padding; gemm2 must
+            # skip those or it scatters stale ep_rowmap rows into live slots.
+            if tile_m2 < _plan_align:
+                _gemm2_m_align = _plan_align
             if _plan_align % tile_m or _plan_align % tile_m2:
                 raise ValueError(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
@@ -1002,6 +1009,8 @@ def _grouped_a8w4_tdm_moe(
         if enable_ep_scatter
         else {}
     )
+    if _gemm2_m_align:
+        _ep_gemm2_kwargs["m_align"] = _gemm2_m_align
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -1196,8 +1205,12 @@ def _grouped_a8w4_tdm_moe(
         )
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
-        # quant_scale / arg_quant_scale).
-        flydsl_grouped_gemm_a8w4_masked(
+        # quant_scale / arg_quant_scale). Under S1F the compact context swaps
+        # in the fused dispatch + GEMM1 stage-1 kernel with the same signature.
+        _stage1_gemm1 = (
+            getattr(stage2_scatter, "stage1_gemm1", None) if _compact else None
+        )
+        (_stage1_gemm1 or flydsl_grouped_gemm_a8w4_masked)(
             a2_payload.view(torch.uint8),
             a1_payload,
             w1_u8,
@@ -1683,7 +1696,7 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     # The env overrides only matter off gfx1250 (same condition, evaluated
     # lazily so the native-arch path skips the four env reads).
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         _gfx_env = ";".join(
             str(os.environ.get(k, "")).lower()
             for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
@@ -2032,7 +2045,7 @@ def fused_route_psum_remap(
         experts,
         int(max_m),
         int(tile_m),
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
@@ -2202,7 +2215,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
             ptr_arg(row_to_token_i32),
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return starts, psum, contiguous_m_t
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
@@ -2226,7 +2239,7 @@ def contiguous_psum_remap(
         ptr_arg(num_valid_routes_i32),
         ptr_arg(row_to_token_i32),
         int(topk),
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return starts, psum, contiguous_m_t
 
@@ -2330,7 +2343,7 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return out
 
@@ -2457,7 +2470,7 @@ def flydsl_moe_scatter_preshuffle_scale(
         max_m,
         E,
         tiles_per_expert,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return grouped_a1_scale
 
