@@ -57,11 +57,13 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #:   of 398 VGPRs a SIMD.
 #: * 256 rows: ~800 VGPRs leave one wave per SIMD, so the CTA has the CU to
 #:   itself; 3 buffers (221,184 B) beat 4 at tpr 1536.
+#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
+#:   tiles are 32 rows (``s1f_flag_m``).
 #:
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
-_S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
+_S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 96: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
