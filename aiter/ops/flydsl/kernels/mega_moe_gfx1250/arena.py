@@ -91,6 +91,12 @@ _ARENA_REGION_ORDER = (
     "dmk_disp",
     "dmk_rowmap",
     "dmk_ctl",
+    # large_m's control region (its X1 rows, peer flags); it shares the
+    # staged compact rows (disp_out / ep_rowmap) and comb_inp, unless
+    # AITER_LM_OWN_ROWS gives it its own (debug).
+    "lm_disp",
+    "lm_rowmap",
+    "lm_ctl",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

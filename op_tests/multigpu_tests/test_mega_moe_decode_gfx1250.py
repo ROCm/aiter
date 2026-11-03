@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MegaMoEGfx1250's decode megakernel (AITER_MEGA_DECODE) on gfx1250.
+"""MegaMoEGfx1250's single-kernel paths on gfx1250: small_m (AITER_MEGA_DECODE)
+and large_m (AITER_MEGA_LARGE).
 
     python3 test_mega_moe_decode_gfx1250.py [--world N]
 
@@ -9,14 +10,14 @@ gfx1250, fewer than two GPUs, no mori -- it prints why and exits 0, since CI's
 MULTIGPU job runs every file in this directory on its gfx950 runners.
 
 Covered, on the compact dispatch with the fp4 wire (a4w4) and the fused bf16
-combine, with and without a fused shared expert:
+combine, with and without a fused shared expert, for each megakernel:
   * the megakernel against the fp32 reference;
   * the megakernel against the staged path of the same instance (its per-call
     switch), bit for bit and both ways round, at several token counts per
     rank, uneven across ranks;
-  * the path follows the step's receive bound: an instance sized for more
-    tokens than AITER_MEGA_DECODE runs the megakernel only for steps bounded
-    to it, and a compact plan started for a step it serves is dropped;
+  * the path follows the step's receive bound: small_m runs the steps bounded
+    to AITER_MEGA_DECODE, large_m every larger one, and a compact plan started
+    for a step small_m serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
 """
 
@@ -43,6 +44,9 @@ MAX_TOKENS = 64
 SMALL_TOKENS = 32
 # Tokens per rank of each step: rank r runs max(1, t - r), so the ranks differ.
 STEPS = (1, 7, 16, 32)
+# large_m's steps (unbounded, so past small_m): few tokens, then up to the
+# instance's MAX_TOKENS.
+LARGE_STEPS = (5, 33, 48, 64)
 
 
 def _skip_reason() -> str | None:
@@ -127,7 +131,9 @@ class _Case:
         )
         self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
         self.dmk = self.mega._ep.decode_mega
-        assert self.dmk is not None, "AITER_MEGA_DECODE did not build the megakernel"
+        self.lmk = self.mega._ep.large_mega
+        assert self.dmk is not None, "AITER_MEGA_DECODE did not build small_m"
+        assert self.lmk is not None, "AITER_MEGA_LARGE did not build large_m"
 
     def step(self, tokens, seed):
         """(x, dispatch ids, weights, logical ids) of one step on this rank."""
@@ -152,10 +158,12 @@ class _Case:
     def small_bound(self):
         return self.world * SMALL_TOKENS
 
-    def layer(self, x, ids, wts, *, mega=True, bound="small"):
+    def layer(self, x, ids, wts, *, mega=True, bound="small", large=False):
         """One layer; ``bound`` is the step's recv_token_bound ("small": the
-        largest the megakernel serves)."""
+        largest small_m serves). ``mega`` switches the megakernels on, large_m
+        only with ``large`` (otherwise larger steps run the staged path)."""
         self.dmk.enabled = mega
+        self.lmk.enabled = mega and large
         w1, w2, w1s, w2s = self.weights
         y = self.mega(
             self.B._rmsnorm(x),
@@ -169,12 +177,20 @@ class _Case:
         )
         return x + y
 
+    def scramble(self, seed, tokens, **kw):
+        """One staged step on other inputs: the regions the paths share
+        (comb_inp, and large_m's rows / rowmap) then hold none of the next
+        step's bytes, so a megakernel that skipped a write cannot pass on
+        leftovers."""
+        x, ids, wts, _, _ = self.step(max(1, tokens - self.rank), seed=seed)
+        self.layer(x, ids, wts, mega=False, **kw)
+
     def close(self):
         self.mega.close()
 
 
-def _check_case(case, comm):
-    label = f"decode megakernel, shared={case.n_shared}"
+def _check_small(case, comm):
+    label = f"small_m, shared={case.n_shared}"
     check = _Checks(label)
     B = case.B
     for i, t in enumerate(STEPS):
@@ -182,6 +198,7 @@ def _check_case(case, comm):
         x, ids, wts, l_ids, l_wts = case.step(tokens, seed=17 * (i + 1))
         mega = case.layer(x, ids, wts, mega=True).clone()
         staged = case.layer(x, ids, wts, mega=False).clone()
+        case.scramble(seed=1000 + i, tokens=SMALL_TOKENS)
         again = case.layer(x, ids, wts, mega=True).clone()
         torch.cuda.synchronize()
         what = f"tokens={tokens}"
@@ -232,6 +249,59 @@ def _check_case(case, comm):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = case.layer(x, ids, wts, mega=True)
+    case.scramble(seed=3001, tokens=SMALL_TOKENS)
+    graph.replay()
+    torch.cuda.synchronize()
+    check(torch.equal(captured, eager), "graph replay != eager")
+    check.settle()
+    del graph
+
+
+def _check_large(case, comm):
+    label = f"large_m, shared={case.n_shared}"
+    check = _Checks(label)
+    B = case.B
+    ep = case.mega._ep
+    case.dmk.enabled = case.lmk.enabled = True
+    check(ep.mega_for(case.small_bound) is case.dmk, "small bound not on small_m")
+    check(ep.mega_for(case.small_bound + 1) is case.lmk, "larger bound not on large_m")
+    check(ep.mega_for(None) is case.lmk, "unbounded step not on large_m")
+    check.settle()
+    # Unbounded steps, then one bounded between small_m's and the instance's.
+    steps = [(t, None) for t in LARGE_STEPS] + [(40, case.world * 48)]
+    for i, (t, bound) in enumerate(steps):
+        tokens = max(1, t - case.rank)
+        x, ids, wts, l_ids, l_wts = case.step(tokens, seed=23 * (i + 1))
+        mega = case.layer(x, ids, wts, bound=bound, large=True).clone()
+        staged = case.layer(x, ids, wts, mega=False, bound=bound).clone()
+        case.scramble(seed=2000 + i, tokens=MAX_TOKENS, bound=None)
+        again = case.layer(x, ids, wts, bound=bound, large=True).clone()
+        torch.cuda.synchronize()
+        what = f"tokens={tokens} bound={bound}"
+        check(torch.equal(mega, staged), f"{what}: large_m != staged")
+        check(torch.equal(mega, again), f"{what}: large_m not deterministic")
+        ref = (x.float() + case.ref.layer(x.float(), l_ids, l_wts)).to(torch.bfloat16)
+        diff = B._calc_diff(mega, ref)
+        tol = B.default_logits_tol("a4w4_mxfp4", "none", 1)
+        check(diff <= tol, f"{what}: diff {diff:.5f} > tol {tol:.5f}")
+        check.settle()
+
+    # A captured step replays the eager bits.
+    x, ids, wts, _, _ = case.step(MAX_TOKENS - case.rank, seed=97)
+    eager = case.layer(x, ids, wts, bound=None, large=True).clone()
+    torch.cuda.synchronize()
+    comm.barrier()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        case.layer(x, ids, wts, bound=None, large=True)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    comm.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = case.layer(x, ids, wts, bound=None, large=True)
+    case.scramble(seed=3002, tokens=MAX_TOKENS, bound=None)
     graph.replay()
     torch.cuda.synchronize()
     check(torch.equal(captured, eager), "graph replay != eager")
@@ -248,6 +318,7 @@ def _worker(local_rank, world, port, failures):
         LOCAL_RANK=str(local_rank),
         AITER_FORCE_A8W4="0",
         AITER_MEGA_DECODE=str(SMALL_TOKENS),
+        AITER_MEGA_LARGE="1",
     )
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -260,12 +331,13 @@ def _worker(local_rank, world, port, failures):
     comm.barrier()
     failed = []
     for n_shared in (0, 1):
-        name = f"decode megakernel shared={n_shared}"
+        name = f"megakernels shared={n_shared}"
         case = None
         try:
             case = _Case(local_rank, world, comm, device, n_shared)
             comm.barrier()
-            _check_case(case, comm)
+            _check_small(case, comm)
+            _check_large(case, comm)
             status = "ok"
         except Exception:  # noqa: BLE001
             failed.append(name)

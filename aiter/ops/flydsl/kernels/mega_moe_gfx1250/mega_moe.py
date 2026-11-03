@@ -354,18 +354,12 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
-        dmk = ep.decode_mega
-        if (
-            dmk is not None
-            and dmk.serves(recv_token_bound)
-            and not quant_bits
-            and bias1 is None
-            and bias2 is None
-        ):
+        mk = ep.mega_for(recv_token_bound)
+        if mk is not None and not quant_bits and bias1 is None and bias2 is None:
             # Every rank passes the same bound, so the ranks agree on the path.
             # A plan an earlier staged layer started for this step is dropped.
             ep.drop_pending_plan()
-            return dmk.forward(
+            return mk.forward(
                 hidden_states,
                 topk_weights,
                 topk_ids,
@@ -373,6 +367,7 @@ class MegaMoEGfx1250:
                 w2=w2,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                recv_token_bound=recv_token_bound,
             )
         step_kw = {}
         s1f = False
@@ -605,11 +600,10 @@ class MegaMoEGfx1250:
         bound's token bucket, so a captured batch whose bucket never ran eagerly
         would reach the JIT inside the capture -- which the plan refuses. A
         caller that captures a ladder of batch sizes warms every rung through
-        here first. A no-op off the compact path.
+        here first. A no-op off the compact path. Bounds a megakernel serves
+        are warmed too: a step with a quantized combine wire or biases still
+        runs the staged path.
         """
-        dmk = self._ep.decode_mega
-        if dmk is not None and dmk.serves(recv_token_bound):
-            return
         self._ep.warmup(recv_token_bound, token_count)
 
     def prefetch_compact_plan(
@@ -622,10 +616,11 @@ class MegaMoEGfx1250:
         The plan only needs ``topk_ids``, so the caller can hide the first
         layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
         to ``forward`` so the plan overlaps the previous expert GEMM instead.
-        A no-op off the compact path.
+        A no-op off the compact path, and for a bound a megakernel serves (a
+        side-stream plan must not hold CUs while it runs; a step that falls
+        back to the staged path plans in its own forward).
         """
-        dmk = self._ep.decode_mega
-        if dmk is not None and dmk.serves(recv_token_bound):
+        if self._ep.mega_for(recv_token_bound) is not None:
             return
         self._ep.prefetch(topk_ids, recv_token_bound)
 
