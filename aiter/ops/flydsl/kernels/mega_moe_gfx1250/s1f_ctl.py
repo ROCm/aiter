@@ -73,9 +73,10 @@ _DECODE_PLAN_OVERLAP_TOKENS = 128
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
 _S1F_MAX_RECV = 4096
 #: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
-#: EP2 top-6 runs stage-1 fused at every width (8192 tokens/rank: 886 vs 959
-#: us/layer).
-_S1F_MAX_RECV_BY_SHAPE: dict = {(2, 6): 1 << 30}
+#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
+#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Past
+#: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+_S1F_MAX_RECV_BY_SHAPE: dict = {(2, 6): 1 << 30, (4, 6): 1 << 30}
 
 
 def s1f_max_recv(world_size: int, topk: int) -> int:
