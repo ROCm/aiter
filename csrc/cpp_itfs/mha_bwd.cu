@@ -410,6 +410,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+    // The 7-GEMM kernels compute no d_sink: sink calls fall back to CK as before.
+    if(is_g7 && (a.sink_ptr != nullptr || a.d_sink_ptr != nullptr))
+    {
+        return -1;
+    }
     if(need_post_processing && (post_kernel == ""))
     {
         // gfx1250 dqdkdv only ever writes dq_acc, so dq is unusable without dq_convert.

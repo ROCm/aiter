@@ -3352,9 +3352,10 @@ def _flash_attn_varlen_backward(
         # bwd_hd192_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
         # bwd_hd192_hd128_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
         # a16 7-GEMM kernels: dq / dk / dv are written once in bf16 (no dq_acc), so they are
-        # also deterministic
+        # also deterministic.  They compute no d_sink, so sink calls keep their previous route.
         ret = hdim_q == 192 and hdim_v in (192, 128)
         ret &= q.dtype == dtypes.bf16
+        ret &= sink is None and d_sink is None
 
         return ret
 
@@ -3430,7 +3431,7 @@ def _flash_attn_varlen_backward(
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
     can_impl_fmha_bwd_flydsl_ = (
-        not can_impl_fmha_v3_bwd_ and _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
+        _FLYDSL_AVAILABLE and not can_impl_fmha_v3_bwd_ and can_impl_fmha_bwd_flydsl()
     )
 
     if can_impl_fmha_bwd_flydsl_:
