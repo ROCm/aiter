@@ -2153,7 +2153,8 @@ def _inv_rope(x, cs_row, ROPE_DIM: gl.constexpr):
         ptr=cs_row + ROPE_DIM // 2, offsets=k, mask=k >= 0, other=0.0
     )
     cos, sin = cos[None, :], sin[None, :]
-    return gl.reshape(gl.join(even * cos + odd * sin, odd * cos - even * sin), [M, D])
+    rot = gl.join(gl.fma(even, cos, odd * sin), gl.fma(odd, cos, -(even * sin)))
+    return gl.reshape(rot, [M, D])
 
 
 @gluon.jit

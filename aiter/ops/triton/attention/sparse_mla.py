@@ -15,6 +15,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
     _FN_ATTRS as _FP8_FN_ATTRS,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
     LOG2E,
     _sparse_mla_fp8,
 )
@@ -400,7 +402,9 @@ def _fp8_kernel_caches(
     limit = 2**31 - 2  # Triton's buffer num_records: offsets past it read 0
     if extra_kv is None:
         if block_size == 1:
-            if not (cache.ndim == 2 and cache.stride(0) == row and cache.stride(1) == 1):
+            if not (
+                cache.ndim == 2 and cache.stride(0) == row and cache.stride(1) == 1
+            ):
                 return None
             return cache, None, cache.numel() >= limit
         got = _fp8_paged_map(cache, cache.data_ptr(), row)
@@ -409,9 +413,7 @@ def _fp8_kernel_caches(
         return cache, _Fp8Segments(1, got[0]), got[1] >= limit
     cache = kv_buffer.view(torch.uint8)
     x_u8 = extra_kv.view(torch.uint8)
-    one_alloc = (
-        cache.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
-    )
+    one_alloc = cache.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
     one_scale = extra_kv_scale.data_ptr() == kv_scale.data_ptr()
     if one_alloc and one_scale:
         base = cache if cache.data_ptr() <= x_u8.data_ptr() else x_u8
@@ -451,7 +453,9 @@ def _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp
         if cs.dtype != torch.float32 or cs.ndim != 2 or cs.shape[1] != 64:
             raise ValueError("inv_rope_cos_sin_cache must be [P, 64] f32 (cos | sin)")
         if cs.stride(1) != 1 or cs.device != q.device:
-            raise ValueError("inv_rope_cos_sin_cache rows must be contiguous, on q's device")
+            raise ValueError(
+                "inv_rope_cos_sin_cache rows must be contiguous, on q's device"
+            )
     if out_mxfp8 is not None:
         if out is not None:
             raise ValueError("out and out_mxfp8 are mutually exclusive")
@@ -525,14 +529,14 @@ def _sparse_mla_fp8_launch(
         else None
     )
     if segs is None:
-        seg = dict(SEG=0, MB_SH=0, XB_SH=0)
+        seg = {"SEG": 0, "MB_SH": 0, "XB_SH": 0}
         sargs = (None,) * 8
     else:
-        seg = dict(
-            SEG=segs.seg,
-            MB_SH=segs.main_map[2].bit_length() - 1,
-            XB_SH=segs.extra_map[2].bit_length() - 1,
-        )
+        seg = {
+            "SEG": segs.seg,
+            "MB_SH": segs.main_map[2].bit_length() - 1,
+            "XB_SH": segs.extra_map[2].bit_length() - 1,
+        }
         x_kv = None if segs.extra_kv is None else segs.extra_kv.view(torch.uint8)
         sargs = (
             segs.extra_indptr,
@@ -563,8 +567,8 @@ def _sparse_mla_fp8_launch(
         part_acc = torch.empty((C, P, H, 512), dtype=torch.bfloat16, device=q.device)
     else:
         part_m = part_l = part_acc = None
-    # A row's head blocks run back to back on one XCD (the kernel's _program),
-    # so the later blocks' gathers hit its L2.
+    # A row's head blocks run back to back on one XCD (_Program.initialize), so
+    # the later blocks' gathers hit its L2.
     hblk = H // G
     if hblk > 1:
         grid = (-(-C // 8) * 8 * hblk, 1, P)
@@ -602,6 +606,9 @@ def _sparse_mla_fp8_launch(
         num_warps=8 if (rope and G == 64) else 4,
         waves_per_eu=2,
         llvm_fn_attrs=_FP8_FN_ATTRS,
+        # The FMAs are written as gl.fma and nothing else may contract (3.8 would
+        # by default, 3.9 does not), so results do not depend on the Triton version.
+        enable_fp_fusion=False,
         **seg,
     )
     if split:
@@ -637,6 +644,7 @@ def _sparse_mla_fp8_launch(
             OUT_MXFP8=mx,
             # a 2-split tile spans two warps; more would hold duplicate lanes
             num_warps=min(4, P),
+            enable_fp_fusion=False,
         )
     return out, lse
 
