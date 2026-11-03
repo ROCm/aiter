@@ -11,14 +11,16 @@ pattern and head count, so only the head dims differ between them:
   ``192/128``  the shape this kernel exists for (d_qk=192, d_v=128)
 
       flydsl     the FlyDSL backward, native to the unpadded d_v = 128 shape
+      asm        ASM v3 7-GEMM kernels (`*_g7_group`), native to d_v = 128:
+                 a16 rows (`is_v3_atomic_fp32=False`) that write dq/dk/dv once
+                 in bf16.  What the router reaches for this shape in bf16.
       asm_vpad   ASM v3 with v zero-padded 128 -> 192 to open its gate.  v/out
                  come pre-padded from the padded forward such a model would
                  already run; padding dout and narrowing dv back to 128 are
                  charged to the backward.  Runs the rtz dS -> bf16 conversion
                  (`how_v3_bf16_cvt=2`, see `V3_BF16_CVT_RTZ`).
-      ck         what the router reaches without FlyDSL -- the varlen ASM v3
-                 gate requires hdim_q == hdim_v, so d_qk=192 / d_v=128 falls
-                 through to generic CK-tile.  The group's speedup baseline.
+      ck         generic CK-tile, what the router falls back to when neither
+                 ASM v3 nor FlyDSL takes the call.  The group's speedup baseline.
 
   ``128/128``  the square shape, as a reference point rather than an
                alternative: no model runs 192/128 attention at d=128.  It says
@@ -93,6 +95,7 @@ GROUPS = {
 # Backend -> group, and the backend each group's speedup column divides by.
 BACKEND_GROUP = {
     "flydsl": "192/128",
+    "asm": "192/128",
     "asm_vpad": "192/128",
     "ck": "192/128",
     "asm_128": "128/128",
@@ -173,6 +176,37 @@ def candidates_192(x, dq, dk, dv, names):
             return dq, dk, dv
 
         cand["flydsl"] = _flydsl
+
+    if "asm" in names:
+
+        def _asm():
+            fmha_v3_varlen_bwd(
+                x.dout,
+                x.q,
+                x.k,
+                x.v,
+                x.out,
+                x.lse,
+                x.cu_seqlens,
+                x.cu_seqlens,
+                x.max_seqlen,
+                x.max_seqlen,
+                dropout_p=0.0,
+                softmax_scale=x.scale,
+                zero_tensors=False,
+                is_causal=True,
+                window_size_left=-1,
+                window_size_right=-1,
+                deterministic=False,
+                is_v3_atomic_fp32=False,
+                how_v3_bf16_cvt=V3_BF16_CVT_RTZ,
+                dq=dq,
+                dk=dk,
+                dv=dv,
+            )
+            return dq, dk, dv
+
+        cand["asm"] = _asm
 
     if "asm_vpad" in names:
         # v/out are padded once, outside the timed callable: a model on this
