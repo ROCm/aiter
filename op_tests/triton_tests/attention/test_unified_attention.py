@@ -1259,3 +1259,98 @@ def test_unified_attn_spec_verify_gfx1250(
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("num_heads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],  # decode
+        [(4, 3000)] * 8,  # spec-decode verify
+        [(512, 512), (1024, 2048), (37, 1500)],  # prefill, with a cached prefix
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v8(
+    path: str,
+    block_size: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """A8K4V8 on gfx1250: fp8 Q, NVFP4 K (e2m1 values, one e4m3 scale per 16, shuffled; scales preshuffled per
+    min(128, page) rows) and fp8 V (shuffled), through the 2D and 3D kernels. The reference reads the dequantized
+    K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    torch.manual_seed(0)
+    num_blocks = len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+    inp = bench.make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    output = torch.full_like(inp["output"], float("nan"))
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=inp["max_query_len"],
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    out = output.float()
+    assert not out.isnan().any()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, f"relative L2 error {rel:.4f}"
+    assert (out - ref).abs().max().item() < 0.15
