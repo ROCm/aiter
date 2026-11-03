@@ -1,0 +1,9 @@
+{
+    "_step5_paged_mqa_logits_kernel": {
+        "BLOCK_M": 128,
+        "TILE": 128,
+        "TILES_PER_PROGRAM": 8,
+        "num_warps": 8,
+        "num_stages": 2
+    }
+}
