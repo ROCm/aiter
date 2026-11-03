@@ -754,6 +754,139 @@ def _fmha_varlen_asm_d192_operands_ok(q, k, v, out=None, dense_last_dim_later=Fa
 
 
 # ---------------------------------------------------------------------------
+# fmha_fwd_fp8_varlen_asm (gfx1250) — FP8 (e4m3fn) per-tensor-descale varlen
+# forward, qk head dim 192 / v head dim 128, bf16 output.
+#
+# Separate from the bf16 varlen ASM path: its own kernarg ABI (136 B, the bf16
+# D192x128 strided layout with q/k/v descale pointers), its own C++ translation
+# unit (csrc/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu) and kernels
+# (hsa/gfx1250/fmha_fwd_fp8_varlen).  P is rounded to fp8 before PV and the row
+# sum is taken over the rounded P, so the LSE is the log of that sum, an
+# approximation of the exact log-sum-exp.
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_fmha_fwd_fp8_varlen_asm",
+    fc_name="fmha_fwd_fp8_varlen_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_fp8_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_fp8_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    out: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Public wrapper: varlen / packed FP8 ASM forward (gfx1250), D192x128.
+
+    Layout is packed [token, head, dim] (THD), batch folded into the token axis:
+      * q   : (total_q, nheads,   192) float8_e4m3fn
+      * k   : (total_k, nheads_k, 192) float8_e4m3fn
+      * v   : (total_k, nheads_k, 128) float8_e4m3fn
+      * q/k/v_descale : one fp32 element each (per-tensor dequant scale)
+      * out : (total_q, nheads, 128) bf16
+      * lse : (total_q, nheads, 1) fp32, natural log
+      * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
+
+    q/k/v/out are used in place through their strides (contiguous last dim;
+    `_fmha_varlen_asm_d192_operands_ok` lists the limits).  `max_seqlen_q` sets
+    the launch tile count; with `max_seqlen_k`, the head count and the batch it
+    also picks the launch order (csrc/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu).  Causal is
+    bottom-right aligned.  The kernel always writes `lse`.
+    """
+    require_gfx1250_asm("fmha_fwd_fp8_varlen_asm")
+    if softmax_scale is None:
+        softmax_scale = q.size(-1) ** (-0.5)
+    cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
+    cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
+
+    total_q, q_head_num, _qk_head_dim = q.shape
+    v_head_dim = v.size(2)
+
+    if out is None:
+        out = torch.empty(
+            (total_q, q_head_num, v_head_dim), dtype=torch.bfloat16, device=q.device
+        )
+
+    lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
+
+    _fmha_fwd_fp8_varlen_asm(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        out,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
+
+
+def _fmha_fp8_varlen_asm_operands_ok(
+    q, k, v, q_descale, k_descale, v_descale, out=None, dense_last_dim_later=False
+):
+    """True if the gfx1250 FP8 D192x128 varlen kernel can take these operands.
+
+    Covers dtypes, head dims, GQA ratio, per-tensor fp32 descales and strides;
+    the attention options (mask, window, sink, ...) are checked by the callers.
+    """
+    if get_gfx() not in ("gfx1250", "gfx1250-strict") or not is_gfx1250_asm_supported():
+        return False
+    if not all(x.dtype == torch.float8_e4m3fn and x.dim() == 3 for x in (q, k, v)):
+        return False
+    if q.size(-1) != 192 or k.size(-1) != 192 or v.size(-1) != 128:
+        return False
+    if q.size(1) % k.size(1) != 0:
+        return False
+    for d in (q_descale, k_descale, v_descale):
+        if (
+            d is None
+            or d.dtype != torch.float32
+            or d.numel() != 1
+            or d.device != q.device
+        ):
+            return False
+    if out is not None and out.dtype != torch.bfloat16:
+        return False
+    return _fmha_varlen_asm_d192_operands_ok(q, k, v, out, dense_last_dim_later)
+
+
+# ---------------------------------------------------------------------------
 # fmha_fwd_mxfp8_asm (gfx1250) — dedicated MXFP8 FMHA forward.
 #
 # This is an intentionally separate integration path from both the bf16
@@ -3104,6 +3237,25 @@ def _flash_attn_varlen_forward(
             ret = ret and (sink_ptr is not None)
         return ret
 
+    def can_impl_fmha_fwd_fp8_varlen_asm():
+        # gfx1250 ASM fp8 (e4m3fn) per-tensor-descale packed/varlen forward,
+        # D192x128 (fmha_fwd_fp8_varlen_asm).  bf16 output; causal is
+        # bottom-right aligned; no dropout / swa / sink / alibi / bias / paged /
+        # logits-soft-cap / padded cu_seqlens.
+        ret = _fmha_fp8_varlen_asm_operands_ok(
+            q, k, v, q_descale, k_descale, v_descale, out
+        )
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0 and sink_ptr is None)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
+        ret = ret and (block_table is None)
+        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
+        ret = ret and (not return_softmax)
+        ret = ret and (max_seqlen_q > 0)
+        return ret
+
     def can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT
         # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded),
@@ -3178,6 +3330,30 @@ def _flash_attn_varlen_forward(
         # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
         # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
         # and the autograd backward see a consistent layout regardless of path.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_fp8_varlen_asm():
+        # gfx1250 packed/varlen ASM fp8 path (D192x128, per-tensor descales,
+        # strided views used in place).  Output is bf16; softmax_scale is
+        # forwarded as-is and the descales are applied inside the kernel.
+        out, lse_asm = fmha_fwd_fp8_varlen_asm(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            float(softmax_scale),
+            bool(causal),
+            bool(return_lse),
+            out,
+        )
+        # packed (total_q, nheads, 1) -> the varlen API's (nheads, total_q)
         softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -3827,6 +4003,30 @@ def flash_attn_varlen_func(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
 
+    def can_try_gfx1250_fmha_fwd_fp8_varlen_asm():
+        # gfx1250 FP8 D192x128 ASM (per-tensor descales).  Same conditions as
+        # its branch in _flash_attn_varlen_forward, on the public arguments;
+        # it serves these calls with or without CK.
+        if not has_all_descales:
+            return False
+        if dropout_p != 0.0 or logits_soft_cap != 0.0:
+            return False
+        if window_size[0] != -1 or window_size[1] != -1:
+            return False
+        if len(window_size) > 2 and window_size[2] != 0:
+            return False
+        if bias is not None or alibi_slopes is not None or block_table is not None:
+            return False
+        if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+            return False
+        if sink_ptr is not None or return_attn_probs or max_seqlen_q <= 0:
+            return False
+        return _fmha_fp8_varlen_asm_operands_ok(
+            q, k, v, q_descale, k_descale, v_descale, out, dense_last_dim_later=True
+        )
+
+    use_fp8_varlen_asm = can_try_gfx1250_fmha_fwd_fp8_varlen_asm()
+
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
         # Keep this public-router gate intentionally narrow so the PR3039
@@ -3870,7 +4070,9 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if use_fp8_varlen_asm or (
+        not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -4375,7 +4577,19 @@ def flash_attn_varlen_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
-    if not ENABLE_CK and sink_ptr is None:
+    # The gfx1250 FP8 D192x128 ASM kernel is reached through
+    # _flash_attn_varlen_forward, which takes it before CK; with CK disabled,
+    # go there only for calls that kernel accepts.
+    use_fp8_varlen_asm = (
+        sink_ptr is None
+        and logits_soft_cap == 0.0
+        and window_size[0] == -1
+        and window_size[1] == -1
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and max_seqlen_q > 0
+        and _fmha_fp8_varlen_asm_operands_ok(q, k, v, q_descale, k_descale, v_descale)
+    )
+    if not ENABLE_CK and sink_ptr is None and not use_fp8_varlen_asm:
         from .triton.attention.mha_v3 import (
             flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
         )
