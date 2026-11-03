@@ -25,9 +25,11 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
     compile_only_env,
     dedupe_jobs,
     override_env,
+    resolve_target_arch,
     run_jobs_parallel,
 )
 
@@ -281,6 +283,13 @@ def main():
     )
     parser.add_argument("--list", action="store_true", help="print the jobs and exit")
     args = parser.parse_args()
+    targets = aot_target_archs()
+    if targets and resolve_target_arch(AOT_ARCH, targets) is None:
+        print(
+            f"[aiter] FlyDSL FP8 FMHA AOT: skipped, GPU_ARCHS omits {AOT_ARCH}",
+            flush=True,
+        )
+        return
     if args.shape:
         jobs = []
         for spec in args.shape:

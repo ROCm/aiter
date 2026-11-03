@@ -67,15 +67,18 @@ from unittest import mock
 
 from aiter.aot.flydsl.common import (
     aot_target_archs,
+    assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
     dedupe_jobs,
     get_max_workers,
     replay_env,
+    resolve_target_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -164,7 +167,7 @@ def _caller_gate_mode(row: dict):
     gu-interleaved layout."""
     from aiter.ops.flydsl.moe_common import GateMode
 
-    if job_arch(row) == "gfx1250":
+    if is_gfx1250_family(job_arch(row)):
         return GateMode.INTERLEAVE
     q_dtype_a, q_dtype_w = _name(row["q_dtype_a"]), _name(row["q_dtype_w"])
     mxfp8 = q_dtype_w in _FP8 and _name(row["q_type"]) == "per_1x32"
@@ -298,7 +301,7 @@ def _caller_inputs(job: dict) -> dict:
     q_dtype_w = _dtype(job["q_dtype_w"])
 
     if (
-        job_arch(job) == "gfx1250"
+        is_gfx1250_family(job_arch(job))
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
     ):
@@ -681,10 +684,24 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     archs whose replay failed."""
     jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
     targets = aot_target_archs()
-    skipped = Counter(
-        job_arch(job) for job in jobs if targets and job_arch(job) not in targets
+    available = [job_arch(job) for job in jobs]
+    # Keep rows whose tuned arch shares a requested target's kernel family,
+    # retargeting each to the exact requested arch so it replays and compiles
+    # for that identity (a gfx1250 row serves a gfx1250-strict build -> 0xeb).
+    retargeted = []
+    skipped = Counter()
+    for job in jobs:
+        target = resolve_target_arch(job_arch(job), targets)
+        if target is None:
+            skipped[job_arch(job)] += 1
+            continue
+        if targets and target != job_arch(job):
+            job = {**job, "gfx": target}
+        retargeted.append(job)
+    jobs = retargeted
+    assert_targets_covered(
+        targets, available, [job_arch(job) for job in jobs], "FlyDSL MoE AOT"
     )
-    jobs = [job for job in jobs if job_arch(job) not in skipped]
     archs = sorted({job_arch(job) for job in jobs})
     rows = {tuple(job[f] for f in _ROW_KEY) for job in jobs}
     print(
@@ -765,7 +782,16 @@ def main():
 
     if args.arch:
         jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
-        jobs = [job for job in jobs if job_arch(job) == args.arch]
+        # args.arch is the exact requested target; keep family-matching rows
+        # and retarget them so they compile for that arch (strict -> 0xeb).
+        kept = []
+        for job in jobs:
+            if resolve_target_arch(job_arch(job), {args.arch}) != args.arch:
+                continue
+            if job_arch(job) != args.arch:
+                job = {**job, "gfx": args.arch}
+            kept.append(job)
+        jobs = kept
         sys.exit(1 if jobs and _replay_arch(jobs, args.arch) else 0)
 
     cache_dir = os.path.expanduser(

@@ -34,11 +34,14 @@ from typing import Any
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
+    assert_targets_covered,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_target_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -303,9 +306,17 @@ def _format_shape_str(job: dict) -> str:
     )
 
 
-def compile_one_config(*, cu_num: int = 0, **kwargs) -> dict:
-    """Compile one opt configuration and save it to cache."""
-    aot_arch = cu_num_to_arch(cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT)
+def compile_one_config(
+    *, cu_num: int = 0, target_arch: str | None = None, **kwargs
+) -> dict:
+    """Compile one opt configuration and save it to cache.
+
+    ``target_arch`` is the exact requested GPU_ARCHS target (e.g. gfx1250-strict)
+    the job was retargeted to; without it the arch is derived from ``cu_num``.
+    """
+    aot_arch = target_arch or cu_num_to_arch(
+        cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT
+    )
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str(kwargs)
     result = {
@@ -359,13 +370,34 @@ def main():
 
     jobs = collect_aot_jobs(csv_paths, parse_csv)
 
+    # Honor GPU_ARCHS: keep only jobs whose cu_num-derived arch shares a
+    # requested target's kernel family, and retarget each to the exact requested
+    # arch so the artifact carries that identity (previously every job compiled
+    # at cu_num_to_arch -- e.g. gfx942 -- regardless of GPU_ARCHS).
+    targets = aot_target_archs()
+    if targets:
+        bases = [
+            cu_num_to_arch(int(j.get("cu_num") or 0), CHUNK_GDN_H_AOT_ARCH_DEFAULT)
+            for j in jobs
+        ]
+        kept = []
+        for j, base in zip(jobs, bases):
+            target = resolve_target_arch(base, targets)
+            if target is None:
+                continue
+            kept.append({**j, "target_arch": target})
+        jobs = kept
+        assert_targets_covered(
+            targets, bases, [j["target_arch"] for j in jobs], "FlyDSL chunk-gdn-h AOT"
+        )
+
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h opt (K5) AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
     print(f"  Total jobs:   {len(jobs)}")
-    print("  Compile arch: (from cu_num)")
+    print(f"  Compile arch: {arch if arch != '(auto-detect)' else '(from cu_num)'}")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)

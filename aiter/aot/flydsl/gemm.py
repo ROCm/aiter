@@ -53,11 +53,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    assert_targets_covered,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_target_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -1376,10 +1378,29 @@ def main():
         # GPU_ARCHS may be a ';'- or ','-separated list (e.g. "gfx942;gfx950").
         arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
         n_before = len(all_jobs)
-        all_jobs = [
-            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
-        ]
+        available = [job_arch(j["cu_num"], j.get("gfx", "")) for j in all_jobs]
+        # Keep each job whose tuned arch shares a requested target's kernel
+        # family, retargeting it to the exact requested arch so the artifact
+        # carries that identity (gfx1250-strict -> 0xeb, not gfx1250 0x49). A
+        # gfx1250-tuned row thus serves a gfx1250-strict build.
+        retargeted = []
+        for j in all_jobs:
+            target = resolve_target_arch(
+                job_arch(j["cu_num"], j.get("gfx", "")), arch_set
+            )
+            if target is None:
+                continue
+            if target != j.get("gfx", ""):
+                j = {**j, "gfx": target}
+            retargeted.append(j)
+        all_jobs = retargeted
         print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
+        assert_targets_covered(
+            arch_set,
+            available,
+            [job_arch(j["cu_num"], j.get("gfx", "")) for j in all_jobs],
+            "FlyDSL GEMM AOT",
+        )
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")

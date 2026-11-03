@@ -28,11 +28,13 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_target_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -209,7 +211,11 @@ def parse_csv(csv_path: str):
 
             cu_num = int(row.get("cu_num") or 0)
             gfx = row.get("gfx", "")
-            if keep_archs is not None and job_arch(cu_num, gfx) not in keep_archs:
+            # family-aware: a gfx1250 row serves a gfx1250-strict build too.
+            if (
+                keep_archs is not None
+                and resolve_target_arch(job_arch(cu_num, gfx), keep_archs) is None
+            ):
                 continue
 
             groups = shape["groups"]
@@ -431,7 +437,9 @@ def compile_one_config(
     **kwargs,
 ) -> dict:
     """Compile one conv or transpose configuration into the cache."""
-    aot_arch = job_arch(cu_num, gfx)
+    aot_arch = resolve_target_arch(
+        job_arch(cu_num, gfx), aot_target_archs()
+    ) or job_arch(cu_num, gfx)
     if kind == "transpose":
         shape_str = (
             f"{kernel_name}  N={kwargs['N']} C={kwargs['c_padded']} S={kwargs['s']}"
