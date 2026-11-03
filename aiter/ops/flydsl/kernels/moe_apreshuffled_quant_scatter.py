@@ -113,75 +113,95 @@ def build_moe_apre_quant_module(
         block_id = fx.Uint32(fx.block_idx.x)
         wave_id = thread_id // fx.Uint32(quant_layout.wave_size)
         lane_id = thread_id - wave_id * fx.Uint32(quant_layout.wave_size)
-        first_source_token = block_id * fx.Uint32(waves_per_block) + wave_id
-        source_token_stride = fx.Uint32(num_workgroups) * fx.Uint32(waves_per_block)
-        for source_token in range(
-            first_source_token, fx.Uint32(num_tokens), source_token_stride
-        ):
-            for k256_group in range(fx.Uint32(0), fx.Uint32(num_k256_groups), 1):
-                mx_block_in_wave = lane_id // fx.Uint32(quant_layout.lanes_per_mx_block)
-                lane_in_mx_block = lane_id - mx_block_in_wave * fx.Uint32(
-                    quant_layout.lanes_per_mx_block
-                )
-                # Field names follow the shared quant-emitter interface.
-                quant_context = types.SimpleNamespace(
-                    i32=i32,
-                    f32=f32,
-                    block_iters=1,
-                    payload_base=fx.Int64(ptrtoint(compact_payload)),
-                    payload_bytes_per_row=payload_bytes_per_row,
-                    hidden_base=fx.Int64(ptrtoint(hidden)),
-                    feat_bytes_per_row=feat_dim * 2,
-                    feat_row_i32=source_token,
-                    payload_num_records=payload_bytes_per_row,
-                    prequantized=False,
-                    mx_blocks_per_wave_iter=(quant_layout.mx_blocks_per_wave_iter),
-                    mx_blocks_per_row=quant_layout.mx_blocks_per_row,
-                    amax_shuffle_dists=quant_layout.amax_shuffle_dists,
-                    is_fp8=False,
-                    use_native=quant_layout.use_native,
-                    use_pk8=True,
-                    mx_dtype=quant_layout.mx_dtype,
-                    c0_i32=zero_i32,
-                    c1_i32=one_i32,
-                    c4_i32=four_i32,
-                    c23_i32=mantissa_bits_i32,
-                    c254_i32=reciprocal_exponent_bias_i32,
-                    c0_f32=zero_f32,
-                    c_wave=wave_size_i32,
-                    c_elems_per_lane=arith.constant(
-                        quant_layout.elems_per_lane, type=i32
-                    ),
-                    c_payload_bytes_per_block=arith.constant(
-                        quant_layout.payload_bytes_per_block, type=i32
-                    ),
-                    c_payload_bytes_per_lane=arith.constant(
-                        quant_layout.payload_bytes_per_lane, type=i32
-                    ),
-                    c_wmma_rep=arith.constant(wmma_rep, type=i32),
-                    block_in_wave=mx_block_in_wave,
-                    lane_in_block=lane_in_mx_block,
-                    is_block_lead=lane_in_mx_block == zero_i32,
-                    payload_dests=[types.SimpleNamespace(payload_row_i32=source_token)],
-                    dests=[
-                        types.SimpleNamespace(
-                            payload_row_i32=source_token,
-                            scale_row_dword_base=zero_i32,
-                        )
-                    ],
-                    scale_t=tensor_shim.ptr_buf_tensor(compact_scale, fx.Int8),
-                    scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
-                        fx.Int64(ptrtoint(compact_scale)),
-                        num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
-                    ),
-                    scale_pack_dwords=True,
-                    compact_scale=True,
-                    c_scale_dwords_per_row=arith.constant(
-                        scale_dwords_per_row, type=i32
-                    ),
-                    mx_group_base=k256_group,
-                )
-                route_quant._emit_quant_one_k_group(quant_context, k256_group)
+        # Split each row into just enough K256 runs to occupy every wave. Few
+        # tokens need several waves per row; many tokens keep one wave per row
+        # so a wave streams consecutive K256 groups.
+        num_groups = fx.Uint32(num_k256_groups)
+        num_waves = fx.Uint32(num_workgroups) * fx.Uint32(waves_per_block)
+        num_tokens_u32 = fx.Uint32(num_tokens)
+        waves_per_token = num_waves // fx.max(num_tokens_u32, fx.Uint32(1))
+        runs_per_token = fx.min(fx.max(waves_per_token, fx.Uint32(1)), num_groups)
+        groups_per_run = fx.ceildiv(num_groups, runs_per_token)
+        runs_per_token = fx.ceildiv(num_groups, groups_per_run)
+
+        def quantize_k256_group(source_token, k256_group):
+            mx_block_in_wave = lane_id // fx.Uint32(quant_layout.lanes_per_mx_block)
+            lane_in_mx_block = lane_id - mx_block_in_wave * fx.Uint32(
+                quant_layout.lanes_per_mx_block
+            )
+            # Field names follow the shared quant-emitter interface.
+            quant_context = types.SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=1,
+                payload_base=fx.Int64(ptrtoint(compact_payload)),
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=fx.Int64(ptrtoint(hidden)),
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=source_token,
+                payload_num_records=payload_bytes_per_row,
+                prequantized=False,
+                mx_blocks_per_wave_iter=(quant_layout.mx_blocks_per_wave_iter),
+                mx_blocks_per_row=quant_layout.mx_blocks_per_row,
+                amax_shuffle_dists=quant_layout.amax_shuffle_dists,
+                is_fp8=False,
+                use_native=quant_layout.use_native,
+                use_pk8=True,
+                mx_dtype=quant_layout.mx_dtype,
+                c0_i32=zero_i32,
+                c1_i32=one_i32,
+                c4_i32=four_i32,
+                c23_i32=mantissa_bits_i32,
+                c254_i32=reciprocal_exponent_bias_i32,
+                c0_f32=zero_f32,
+                c_wave=wave_size_i32,
+                c_elems_per_lane=arith.constant(
+                    quant_layout.elems_per_lane, type=i32
+                ),
+                c_payload_bytes_per_block=arith.constant(
+                    quant_layout.payload_bytes_per_block, type=i32
+                ),
+                c_payload_bytes_per_lane=arith.constant(
+                    quant_layout.payload_bytes_per_lane, type=i32
+                ),
+                c_wmma_rep=arith.constant(wmma_rep, type=i32),
+                block_in_wave=mx_block_in_wave,
+                lane_in_block=lane_in_mx_block,
+                is_block_lead=lane_in_mx_block == zero_i32,
+                payload_dests=[types.SimpleNamespace(payload_row_i32=source_token)],
+                dests=[
+                    types.SimpleNamespace(
+                        payload_row_i32=source_token,
+                        scale_row_dword_base=zero_i32,
+                    )
+                ],
+                scale_t=tensor_shim.ptr_buf_tensor(compact_scale, fx.Int8),
+                scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(compact_scale)),
+                    num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
+                ),
+                scale_pack_dwords=True,
+                compact_scale=True,
+                c_scale_dwords_per_row=arith.constant(
+                    scale_dwords_per_row, type=i32
+                ),
+                mx_group_base=k256_group,
+            )
+            route_quant._emit_quant_one_k_group(quant_context, k256_group)
+
+        first_run = block_id * fx.Uint32(waves_per_block) + wave_id
+        # A constant K256 trip count lets the compiler overlap group loads.
+        if runs_per_token == fx.Uint32(1):
+            for source_token in range(first_run, num_tokens_u32, num_waves):
+                for k256_group in range(fx.Uint32(0), num_groups, 1):
+                    quantize_k256_group(source_token, k256_group)
+        else:
+            for run in range(first_run, num_tokens_u32 * runs_per_token, num_waves):
+                source_token = run // runs_per_token
+                first_group = (run - source_token * runs_per_token) * groups_per_run
+                last_group = fx.min(first_group + groups_per_run, num_groups)
+                for k256_group in range(first_group, last_group, 1):
+                    quantize_k256_group(source_token, k256_group)
 
     @flyc.jit
     def launch_quant(
