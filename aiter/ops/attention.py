@@ -29,7 +29,12 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
-from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
+from .opus.mla import (  # noqa: F401
+    opus_mla_decode_flat_fwd,
+    opus_mla_decode_flat_plan,
+    opus_mla_decode_fwd,
+    opus_mla_decode_mxfp8_fwd,
+)
 
 MD_NAME = "module_attention"
 _PA_FWD_ASM_SUPPORTED_ARCHS = ("gfx942", "gfx950")
