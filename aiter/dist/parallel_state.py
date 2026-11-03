@@ -748,6 +748,20 @@ class GroupCoordinator:
         with torch.cuda.stream(stream), maybe_ca_context:
             yield graph_capture_context
 
+    def lease_registered_input_buffer(self):
+        """Lease this group's custom-AR input arena for a direct producer.
+
+        This is intentionally a setup-time Python API, not a graph op: the
+        returned stable tensor is held by the model and viewed inside compiled
+        forwards, so repeated producer uses retain their true alias identity.
+        """
+        if self.device_communicator is None:
+            return None
+        lease = getattr(
+            self.device_communicator, "lease_registered_input_buffer", None
+        )
+        return None if lease is None else lease()
+
     def all_reduce(
         self,
         input_: torch.Tensor,

@@ -979,9 +979,8 @@ def gemm_a8w8_bpreshuffle_out(
     column slice of a wider buffer) is rejected instead of being written past
     its bounds. A dense view into a larger buffer is fine if it starts 16-byte
     aligned; CK split-K faults on an out at an odd bf16 offset. Every check runs
-    before any kernel launch. Only gfx942 and gfx950 are accepted: elsewhere the
-    shared dispatch reaches backends this op was never validated on (the gfx1250
-    WMMA backend, or the CK MFMA fallback on RDNA).
+    before any kernel launch. gfx942, gfx950 and gfx1250 are accepted; elsewhere
+    the shared dispatch reaches backends this op was never validated on.
     """
     # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
     # so any other rank would tune for one K and launch with another.
@@ -1032,7 +1031,7 @@ def gemm_a8w8_bpreshuffle_out(
     # Checked after the arguments, so a call that could never launch (for
     # example CPU tensors on a host with no GPU) gets the ValueError above.
     gfx = get_gfx()
-    if gfx not in ("gfx942", "gfx950"):
+    if gfx not in ("gfx942", "gfx950", "gfx1250"):
         raise NotImplementedError(
             f"gemm_a8w8_bpreshuffle_out is not supported on {gfx}; "
             "use gemm_a8w8_bpreshuffle"
