@@ -1,0 +1,14 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE) \
+    {                                               \
+{%- for id, kernel_name in kernels_dict %}
+        { {{id}}, {{kernel_name}}<ABTYPE, DTYPE, ETYPE> }, \
+{%- endfor %}
+    }
+
+#endif // USE_ROCM

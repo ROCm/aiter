@@ -81,7 +81,7 @@ class gemm_a8w8_fwd_codegen:
     def gen_lookup_dict(self, kernels_dict):
         kernels_dict = gen_lookup_header_map(kernels_dict, self.istune)
         stream_template(
-            "lookup.cuh.j2",
+            "lookup-tune.cuh.j2" if self.istune else "lookup.cuh.j2",
             os.path.join(self.working_path, "gemm_a8w8_lookup.h"),
             kernels_dict=kernels_dict,
         )
