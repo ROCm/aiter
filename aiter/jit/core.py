@@ -267,6 +267,11 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
+)
+
 
 def _runtime_power_selection() -> bool:
     """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
@@ -468,6 +473,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
@@ -1942,17 +1955,6 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
-    # Avoid constructing a Python Stream object on every ctypes invocation.
-    # Keep the public API fallback for torch versions without the private raw
-    # stream getter, and preserve the first tensor's device selection.
-    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw_stream is None:
-
-        def raw_stream(device_index):
-            return torch.cuda.current_stream(device_index).cuda_stream
-
-    current_device = torch.cuda.current_device
-
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -2187,6 +2189,12 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
+        # The same stream/device getters as the develop pybind path (no Python
+        # Stream object per call), read per call so an AOT dry run can swap
+        # them; the first tensor's device still selects the stream.
+        _, _, raw_stream, current_device = (
+            _pybind_develop_hooks_cache or _pybind_develop_hooks()
+        )
         if tensor_device is None:
             tensor_device = current_device()
         c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
@@ -2238,8 +2246,8 @@ def _pybind_develop_hooks():
         raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
         if raw_stream is None:
 
-            def raw_stream(_device_index):
-                return torch.cuda.current_stream().cuda_stream
+            def raw_stream(device_index):
+                return torch.cuda.current_stream(device_index).cuda_stream
 
         _pybind_develop_hooks_cache = (
             torch_to_aiter_pybind,
