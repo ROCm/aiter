@@ -190,6 +190,91 @@ def _store_kv_cache_kernel(
 
 
 @triton.jit
+def _reshape_and_cache_k4v8_kernel(
+    k_ptr,
+    v_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    k_stride_t,
+    k_stride_h,
+    k_stride_d,
+    v_stride_t,
+    v_stride_h,
+    v_stride_d,
+    key_cache_stride_t,
+    key_cache_stride_h,
+    key_cache_stride_d,
+    value_cache_stride_t,
+    value_cache_stride_h,
+    value_cache_stride_d,
+    value_cache_stride_x,
+    value_cache_stride_slot_chunk,
+    KH: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    X_SIZE: tl.constexpr,
+    SCALE_K_WIDTH: tl.constexpr,
+    SCALE_PRESHUFFLE: tl.constexpr,
+    HAVE_K_SCALE: tl.constexpr,
+    HAVE_V_SCALE: tl.constexpr,
+):
+    """One (token, KV head) row: K / k_scale NVFP4-quantized into the shuffled NVFP4 K cache,
+    V / v_scale cast into the shuffled FP8 V cache -- the A8K4V8 store of
+    _fused_qk_rope_reshape_and_cache_kernel, without the RoPE (K arrives roped)."""
+    pid = tl.program_id(0)
+    pid_t = pid // KH
+    pid_hk = pid % KH
+    slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
+    if slot >= 0:
+        pid_t_slot = slot // BLOCK_SIZE
+        pid_b = slot % BLOCK_SIZE
+        d_offs = tl.arange(0, BLOCK_D).to(tl.int64)
+        if HAVE_K_SCALE:
+            k_scale = tl.load(k_scale_ptr)
+        else:
+            k_scale = 1
+        if HAVE_V_SCALE:
+            v_scale = tl.load(v_scale_ptr)
+        else:
+            v_scale = 1
+        k = tl.load(k_ptr + pid_t * k_stride_t + pid_hk * k_stride_h + d_offs * k_stride_d)
+        v = tl.load(v_ptr + pid_t * v_stride_t + pid_hk * v_stride_h + d_offs * v_stride_d)
+        k = k * (1 / k_scale)
+        v = v * (1 / v_scale)
+        _store_kv_cache_kernel(
+            key_cache_ptr,
+            value_cache_ptr,
+            pid_t_slot,
+            pid_hk,
+            pid_b,
+            d_offs,
+            k,
+            v,
+            key_cache_stride_t,
+            key_cache_stride_h,
+            key_cache_stride_d,
+            0,
+            0,
+            value_cache_stride_t,
+            value_cache_stride_h,
+            value_cache_stride_d,
+            0,
+            value_cache_stride_x,
+            value_cache_stride_slot_chunk,
+            BLOCK_D,
+            BLOCK_SIZE,
+            X_SIZE,
+            False,
+            True,
+            SCALE_K_WIDTH,
+            SCALE_PRESHUFFLE,
+        )
+
+
+@triton.jit
 def _unit_cat(
     x1_ptr,
     x2_ptr,

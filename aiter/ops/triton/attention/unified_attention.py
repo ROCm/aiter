@@ -905,8 +905,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
             # an NVFP4 V (A8W4, BF16 PV) runs the double-buffered loop variant 0 with one 128-token page per tile
             TILE_SIZE = params.block_size
             loop_variant = 0
-        elif loop_variant not in (0, 1):
-            # NVFP4 K with an fp8 V (A8K4V8): loop variants 0 and 1, tiles of one or more pages
+        elif loop_variant not in (0, 1, 2):
+            # NVFP4 K with an fp8 V (A8K4V8): loop variants 0, 1 and 2, tiles of one or more pages
             loop_variant = 1
         # the NVFP4 path (packed K, scale layouts; the V upcast for an NVFP4 V) needs the whole VGPR file:
         # one wave per SIMD (2 is 28x slower for A8K4V8 prefill, ~20x for A8W4 decode)

@@ -1354,3 +1354,108 @@ def test_triton_unified_attn_k4v8(
     rel = ((out - ref).norm() / ref.norm()).item()
     assert rel < 0.04, f"relative L2 error {rel:.4f}"
     assert (out - ref).abs().max().item() < 0.15
+
+
+@pytest.mark.parametrize("loop_variant", [1, 2])
+@pytest.mark.parametrize("tile_size, block_m", [(128, 128), (256, 64)])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("num_heads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(512, 512), (1024, 2048), (37, 1500)],  # prefill on cached prefixes
+        [(2000, 9000), (129, 129), (700, 4097)],  # ragged tails, page-crossing lengths
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v8_loop_variant(
+    loop_variant: int,
+    tile_size: int,
+    block_m: int,
+    block_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """A8K4V8 prefill through the 2D kernel with the loop variant forced (1: reordered; 2: tensor-subtile split
+    with the scaled QK WMMA on each key half), tiles of one or several pages, causal masks."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    mod = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(mod, "use_2d_kernel", lambda params, backend="triton": True)
+    orig = mod.get_unified_attention_config
+
+    def forced(op, params, backend="triton", arch=None):
+        cfg = orig(op, params, backend=backend, arch=arch)
+        if op == "attn_2d":
+            cfg.update(
+                LOOP_VARIANT=loop_variant,
+                TILE_SIZE=max(tile_size, block_size),
+                BLOCK_M=block_m,
+                NUM_BUFFERS=2,
+                num_warps=4,
+            )
+        return cfg
+
+    monkeypatch.setattr(mod, "get_unified_attention_config", forced)
+    torch.manual_seed(0)
+    num_blocks = len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+    inp = bench.make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=256,
+        head_size_v=256,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    output = torch.full_like(inp["output"], float("nan"))
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=inp["max_query_len"],
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    out = output.float()
+    assert not out.isnan().any()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, f"relative L2 error {rel:.4f}"
+    assert (out - ref).abs().max().item() < 0.15
