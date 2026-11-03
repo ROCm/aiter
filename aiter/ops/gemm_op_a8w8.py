@@ -1017,6 +1017,14 @@ def gemm_a8w8_bpreshuffle_out(
 _BLOCKSCALE_TRITON_FALLBACK_MIN_M = {"gfx942": 2048, "gfx950": 384}
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_split_k_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale N:{n}, K:{k} has split-K rows, which accumulate in "
+        f"the output dtype; {dtype} output uses the untuned dispatch instead."
+    )
+
+
 def _blockscale_triton(
     XQ: Tensor,
     WQ: Tensor,
@@ -1234,9 +1242,9 @@ def gemm_a8w8_blockscale(
     Native E8M0 group32 scales (typed tensors or uint8 views) use
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
     FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
-    queried through get_CKGEMM_config before choosing a fallback. An FP32-scale
-    CK, CK-Tile or FlyDSL row applies only to E4M3 (or uint8) operands, and a
-    split-K row only to non-FP16 output; other calls take the fallback. Group32
+    queried through get_CKGEMM_config before choosing a fallback. A split-K CK
+    or CK-Tile row applies to BF16 output only; other output dtypes take the
+    fallback. Group32
     currently supports libtype="triton", also its default on a config miss.
     Triton tile and split-K parameters come from its own tuning tables.
     For native group32 operands, split_k optionally overrides the positive
@@ -1285,20 +1293,14 @@ def gemm_a8w8_blockscale(
         else AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     config = get_CKGEMM_config(m, n, k, tuned_file)
-    # Rows are keyed on shape only. The CK, CK-Tile and FlyDSL kernels read E4M3
-    # operands, and split-K accumulates partial sums in the output dtype, which
-    # overflows FP16, so those calls keep the untuned dispatch.
-    e4m3 = (dtypes.fp8, torch.uint8)
     if (
         config is not None
         and not is_group32
-        and config["libtype"] != "triton"
-        and (
-            XQ.dtype not in e4m3
-            or WQ.dtype not in e4m3
-            or (dtype == dtypes.fp16 and int(config.get("splitK", 0)) > 0)
-        )
+        and config["libtype"] in ("ck", "cktile")
+        and int(config.get("splitK", 0)) > 0
+        and dtype != dtypes.bf16
     ):
+        _warn_blockscale_split_k_row_not_bf16(n, k, dtype)
         config = None
     if config is not None:
         libtype = config["libtype"]

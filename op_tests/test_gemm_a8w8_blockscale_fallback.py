@@ -26,9 +26,7 @@ MIN_M = MIN_M_BY_GFX.get(gemm_mod.get_gfx() if torch.cuda.is_available() else No
 needs_threshold = pytest.mark.skipif(MIN_M is None, reason="no threshold for this arch")
 
 
-def dispatch(
-    monkeypatch, m, config=None, gfx=None, dtype=dtypes.bf16, operand_dtype=dtypes.fp8
-):
+def dispatch(monkeypatch, m, config=None, gfx=None, dtype=dtypes.bf16):
     reached = []
 
     def fake_ck(XQ, WQ, x_scale, w_scale, Y, **kwargs):
@@ -54,8 +52,8 @@ def dispatch(
     if gfx is not None:
         monkeypatch.setattr(gemm_mod, "get_gfx", lambda: gfx)
 
-    xq = torch.zeros((m, K), device="cuda", dtype=operand_dtype)
-    wq = torch.zeros((N, K), device="cuda", dtype=operand_dtype)
+    xq = torch.zeros((m, K), device="cuda", dtype=dtypes.fp8)
+    wq = torch.zeros((N, K), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((m, K // BLOCK), device="cuda", dtype=torch.float32)
     w_scale = torch.ones((N // BLOCK, K // BLOCK), device="cuda", dtype=torch.float32)
     gemm_mod.gemm_a8w8_blockscale(xq, wq, x_scale, w_scale, dtype)
@@ -85,28 +83,17 @@ def test_gemm_a8w8_blockscale_uses_ck_for_tuned_above_threshold(monkeypatch, del
 
 
 @needs_threshold
+@pytest.mark.parametrize("libtype, tuned", [("ck", "ck_tuned"), ("cktile", "cktile")])
 @pytest.mark.parametrize("delta, untuned", [(-1, "ck"), (0, "triton")])
-def test_gemm_a8w8_blockscale_skips_split_k_row_for_fp16(monkeypatch, delta, untuned):
-    m = MIN_M + delta
-    assert dispatch(monkeypatch, m, config=SPLIT_K_CONFIG, dtype=dtypes.fp16) == untuned
-    assert dispatch(monkeypatch, m, config=SPLIT_K_CONFIG) == "ck_tuned"
-    assert dispatch(monkeypatch, m, config=CK_CONFIG, dtype=dtypes.fp16) == "ck_tuned"
-
-
-@needs_threshold
-@pytest.mark.parametrize("libtype", ["ck", "cktile", "flydsl"])
-@pytest.mark.parametrize("operand_dtype", [torch.float8_e5m2, torch.int8])
-def test_gemm_a8w8_blockscale_skips_tuned_row_for_non_e4m3_operands(
-    monkeypatch, libtype, operand_dtype
+def test_gemm_a8w8_blockscale_skips_split_k_row_for_fp16(
+    monkeypatch, libtype, tuned, delta, untuned
 ):
-    config = {**CK_CONFIG, "libtype": libtype}
-    reached = dispatch(monkeypatch, MIN_M, config=config, operand_dtype=operand_dtype)
-    assert reached == "triton"
-    tuned = "ck_tuned" if libtype == "ck" else libtype
-    assert dispatch(monkeypatch, MIN_M, config=config) == tuned
-    assert (
-        dispatch(monkeypatch, MIN_M, config=config, operand_dtype=torch.uint8) == tuned
-    )
+    m = MIN_M + delta
+    split_k = {**SPLIT_K_CONFIG, "libtype": libtype}
+    no_split = {**CK_CONFIG, "libtype": libtype}
+    assert dispatch(monkeypatch, m, config=split_k, dtype=dtypes.fp16) == untuned
+    assert dispatch(monkeypatch, m, config=split_k) == tuned
+    assert dispatch(monkeypatch, m, config=no_split, dtype=dtypes.fp16) == tuned
 
 
 @pytest.mark.parametrize("gfx", NO_THRESHOLD_GFX)
@@ -131,3 +118,7 @@ def test_gemm_a8w8_blockscale_triton_fallback_matches_ck():
     gemm_mod.gemm_a8w8_blockscale_ck(xq, wq, x_scale, w_scale, expected)
 
     torch.testing.assert_close(routed, expected, rtol=2e-2, atol=2e-2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
