@@ -137,6 +137,9 @@ CASE_SETS = {
             "sliding_window": [0, 128],
             "ps": [True],
         },
+        # One context partition: ps=False also selects the PS kernel, and the
+        # kernel stores the output directly.
+        {"num_heads": [(8, 1), (16, 1)], "context_length": [256], "ps": [False]},
     ],
     "sliding_window_accuracy": [
         {
