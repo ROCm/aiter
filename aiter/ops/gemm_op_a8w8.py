@@ -545,6 +545,38 @@ _GEMM_QUANT_TYPE_CACHE: dict = {}
 _GEMM_QUANT_TYPE_HAS_GFX: dict = {}
 
 
+_GFX1250_UNTUNED_BPRESHUFFLE_WARNED: set[tuple[int, int, str]] = set()
+
+
+def _warn_gfx1250_untuned_bpreshuffle(
+    m: int, n: int, k: int, kernel_name: str
+) -> None:
+    """Log once per projection geometry/kernel, not per dynamic token count."""
+    key = (n, k, kernel_name)
+    if key in _GFX1250_UNTUNED_BPRESHUFFLE_WARNED:
+        return
+    _GFX1250_UNTUNED_BPRESHUFFLE_WARNED.add(key)
+    logger.warning(
+        f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
+        f"falling back to flydsl kernel '{kernel_name}'."
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _gfx1250_untuned_bpreshuffle_kernel(m: int, n: int, k: int):
+    """Select the fallback once per runtime shape, not once per layer call."""
+    from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+        kernel_fits_shape,
+        kernels_list,
+    )
+
+    fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
+    if not fits:
+        return None
+    want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+    return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
+
+
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config_with_quant_type(
     M: int,
@@ -807,21 +839,9 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
     if get_gfx() == "gfx1250":
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
-            kernel_fits_shape,
-            kernels_list,
-        )
-
-        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
-        if fits:
-            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
-            ki = min(
-                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
-            )
-            logger.warning(
-                f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
-                f"falling back to flydsl kernel '{ki.name}'."
-            )
+        ki = _gfx1250_untuned_bpreshuffle_kernel(m, n, k)
+        if ki is not None:
+            _warn_gfx1250_untuned_bpreshuffle(m, n, k, ki.name)
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(
