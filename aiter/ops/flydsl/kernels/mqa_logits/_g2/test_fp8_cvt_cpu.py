@@ -277,13 +277,59 @@ class _Asm:
         raise AssertionError("unmodeled inline assembly: " + text)
 
 
+# ROUND-W64FIX2: mocked compiler-visible intrinsics of ``_e4m3x8_to_bf16x4_intrin``
+# (the default converter). Types are tagged tuples; the pk8 model is the same
+# ``native_positive_bf16`` (incl. NaN payload / source-FTZ knobs) as the asm mock.
+_I16X2, _BF16X8 = ("v", 2, "i16"), ("v", 8, "bf16")
+
+
+class _Intrin:
+    @staticmethod
+    def call_intrinsic(result_type, name, args, _attrs, _types):
+        _Asm.operations.append(name)
+        if name == "llvm.amdgcn.cvt.scale.pk8.bf16.fp8":
+            assert result_type == _BF16X8
+            src, scale, sel = args
+            assert (int(scale), int(sel)) == (0x7F, 0)
+            assert len(src.data) == 2 and all(int(w) & 0x80808080 == 0 for w in src.data)
+            return ("bf16x8", [native_positive_bf16(int(w) >> (8 * i) & 255, _Asm.nan_payload,
+                                                    flush_fp8_source=_Asm.flush_fp8_source)
+                               for w in src.data for i in range(4)])
+        if name == "llvm.umin.v2i16":
+            assert result_type == _I16X2 and args[0][0] == args[1][0] == "i16x2"
+            return ("i16x2", pk_min_u16(args[0][1], args[1][1]))
+        if name == "llvm.amdgcn.perm":
+            assert result_type == "i32"
+            x, y, sel = (int(a) for a in args)
+            return _I32(perm_bytes(x, y, sel))
+        raise AssertionError("unmodeled intrinsic: " + name)
+
+    @staticmethod
+    def bitcast(result_type, value):
+        if result_type == _I16X2:
+            return ("i16x2", int(value))
+        if result_type == "i32":
+            assert value[0] == "i16x2"
+            return _I32(value[1])
+        if result_type == (4, _I32):
+            assert value[0] == "bf16x8"
+            v = value[1]
+            return _Vector([v[i] | v[i + 1] << 16 for i in range(0, 8, 2)], _I32)
+        raise AssertionError(result_type)
+
+
 @contextmanager
 def mocked_llvm_import():
     names = ("flydsl", "flydsl._mlir", "flydsl._mlir.dialects")
     previous = {name: sys.modules.get(name) for name in names}
     for name in names:
         sys.modules[name] = types.ModuleType(name)
-    sys.modules[names[-1]].llvm = types.SimpleNamespace(inline_asm=_Asm.inline_asm)
+    sys.modules[names[-1]].llvm = types.SimpleNamespace(
+        inline_asm=_Asm.inline_asm, call_intrinsic=_Intrin.call_intrinsic, bitcast=_Intrin.bitcast)
+    sys.modules["flydsl._mlir"].ir = types.SimpleNamespace(
+        VectorType=types.SimpleNamespace(get=lambda shape, et: ("v", shape[0], et)),
+        IntegerType=types.SimpleNamespace(get_signless=lambda bits: f"i{bits}"),
+        BF16Type=types.SimpleNamespace(get=lambda: "bf16"))
     try:
         yield
     finally:
@@ -294,14 +340,16 @@ def mocked_llvm_import():
                 sys.modules[name] = module
 
 
-def load_actual_fast_helpers():
+def load_actual_fast_helpers(asm=False):
+    """Actual source; ``asm`` = the QSA_FP8_CVT_ASM=1 opt-out (default: intrinsic)."""
     tree = ast.parse(KERNEL_PATH.read_text(encoding="utf-8"))
-    wanted = {"_e4m3x8_to_bf16x4_fast", "_pair_frag_tdm_fast", "_pair_frag_tdm"}
+    wanted = {"_e4m3x8_to_bf16x4_fast", "_pair_frag_tdm_fast", "_pair_frag_tdm",
+              "_e4m3x8_to_bf16x4_asm", "_e4m3x8_to_bf16x4_intrin"}
     nodes = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in wanted]
     if {node.name for node in nodes} != wanted:
         raise AssertionError("actual fast helpers are missing")
     fx = types.SimpleNamespace(Int32=_I32, ptr_load=lambda ptr, result_type: ptr.load(result_type))
-    namespace = {"fx": fx, "Vec": _Vector, "range_constexpr": range,
+    namespace = {"fx": fx, "Vec": _Vector, "range_constexpr": range, "_FP8_CVT_ASM": bool(asm),
                  "_s32": lambda value: value - 2**32 if value >= 2**31 else value,
                  "_e4m3x4_to_bf16x2": load_actual_legacy_helper()}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(KERNEL_PATH), "exec"), namespace)
@@ -336,6 +384,7 @@ def actual_cvt_route(value, rows, k_load, access="raw"):
         elif isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "fast_cvt":
             selected.append(node)
     namespace = dict(helpers, _FP8_CVT=actual_cvt_environment(value), _FP8_K_LOAD="auto",
+                     _CVT_ASM_TAG="",
                      _ACCESS=access, rows_per_block=rows, k_load=k_load,
                      HEAD_DIM=128, NUM_HEADS=4, PAGE_SIZE=4, WMMA_COLS=64)
     ensure_i32(namespace)
@@ -440,7 +489,13 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(native_pk8_min_model(*words), reference_pk8(*words))
 
     def test_actual_fast_source_all_codes_all_positions_both_ambient_modes(self):
-        helper, _, _ = load_actual_fast_helpers()
+        for asm in (False, True):
+            with self.subTest(asm=asm):
+                self._all_codes(asm)
+
+    def _all_codes(self, asm):
+        helper, _, _ = load_actual_fast_helpers(asm)
+        pk8 = "v_cvt_scale_pk8" if asm else "llvm.amdgcn.cvt.scale.pk8.bf16.fp8"
         with mocked_llvm_import():
             for ambient_half_ftz in (False, True):
                 _Vector.ftz_input = ambient_half_ftz
@@ -453,8 +508,11 @@ class ConversionTests(unittest.TestCase):
                         _Asm.operations = []
                         actual = helper(*words)
                         self.assertEqual(tuple(map(int, actual.data)), reference_pk8(*words))
-                        self.assertEqual(len(_Asm.operations), 13)  # plus two DSL source masks
-                        self.assertEqual(sum(op.startswith("v_cvt_scale_pk8") for op in _Asm.operations), 1)
+                        # asm: 13 statements (plus two DSL source masks); intrinsic:
+                        # 1 pk8 + 4 umin + 4 perm, no inline asm (and/or are plain IR).
+                        self.assertEqual(len(_Asm.operations), 13 if asm else 9)
+                        self.assertEqual(sum(op.startswith(pk8) for op in _Asm.operations), 1)
+                        self.assertEqual(any(op.startswith("v_") for op in _Asm.operations), asm)
                         reference_old = existing_half_slot_model(b, position % 2, ambient_half_ftz)
                         if reference_old != e4m3_byte_to_bf16_bits(b):
                             legacy_mismatches.add(b)
@@ -463,17 +521,23 @@ class ConversionTests(unittest.TestCase):
         _Vector.ftz_input = False
 
     def test_actual_fast_source_all_nan_payloads(self):
-        helper, _, _ = load_actual_fast_helpers()
-        with mocked_llvm_import():
-            for payload in tuple(range(0x7f81, 0x8000)) + tuple(range(0xff81, 0x10000)):
-                _Asm.nan_payload = payload
-                # Every pair combines both endpoints, exercising both half slots/signs.
-                words = (0xff7fff7f, 0x7fff7fff)
-                self.assertEqual(tuple(map(int, helper(*words).data)), reference_pk8(*words))
-        _Asm.nan_payload = 0x7fc0
+        for asm in (False, True):
+            helper, _, _ = load_actual_fast_helpers(asm)
+            with mocked_llvm_import():
+                for payload in tuple(range(0x7f81, 0x8000)) + tuple(range(0xff81, 0x10000)):
+                    _Asm.nan_payload = payload
+                    # Every pair combines both endpoints, exercising both half slots/signs.
+                    words = (0xff7fff7f, 0x7fff7fff)
+                    self.assertEqual(tuple(map(int, helper(*words).data)), reference_pk8(*words))
+            _Asm.nan_payload = 0x7fc0
 
     def test_actual_fast_tdm_consumer_all_rows_chunks_lanes(self):
-        _, fast_consumer, old_consumer = load_actual_fast_helpers()
+        for asm in (False, True):
+            with self.subTest(asm=asm):
+                self._tdm_consumer(asm)
+
+    def _tdm_consumer(self, asm):
+        _, fast_consumer, old_consumer = load_actual_fast_helpers(asm)
         # Load the existing independent FP8 TDM CPU model without aiter/FlyDSL/GPU.
         model_path = Path(__file__).with_name("test_fp8_k_tdm_cpu.py")
         module_name = "_qsa_fp8_cvt_tdm_reference"

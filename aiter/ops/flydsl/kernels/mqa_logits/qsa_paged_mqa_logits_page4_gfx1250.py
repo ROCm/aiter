@@ -2127,9 +2127,10 @@ def _e4m3x4_to_bf16x2(x):
     return lo, hi
 
 
-def _e4m3x8_to_bf16x4_fast(src0, src1):
-    """Eight exact legacy E4M3 codes -> four bf16 pairs on stock gfx1250.
+def _e4m3x8_to_bf16x4_asm(src0, src1):
+    """Eight exact legacy E4M3 codes -> four bf16 pairs on stock gfx1250 (inline asm).
 
+    ROUND-W64FIX2: opt-out only (``QSA_FP8_CVT_ASM=1``); see ``_e4m3x8_to_bf16x4_fast``.
     Native E4M3FN treats 0x7f/0xff as NaN, while this kernel deliberately
     treats them as +/-480. Convert *positive* magnitudes, then packed unsigned
     min with bf16(480): all finite magnitudes are <=448, and every bf16 NaN
@@ -2166,6 +2167,76 @@ def _e4m3x8_to_bf16x4_fast(src0, src1):
         )
         words.append(fx.Int32(word))
     return Vec.from_elements(words, dtype=fx.Int32)
+
+
+# ROUND-W64FIX2: the pk8 converter is compiler-visible by default.
+#
+# Root cause (GPU-confirmed, root a08-1 GPU3 2026-11-03: the inline-asm fp8 w64
+# decode-group build failed 5/22 cases, the 4-v_nop asm build and the intrinsic
+# build passed 22/22): every instruction of ``_e4m3x8_to_bf16x4_asm`` is an
+# inline asm statement, which LLVM's hazard recognizer does not treat as a VALU.
+# gfx1250 dense bf16 WMMA has *software-enforced* hazards (kernel-wiki
+# mi400-wmma-hazards §1.2 row B1): a VALU whose vdst overlaps the previous
+# WMMA's Matrix A/B (WAR) or Matrix D (WAW), or that reads D (RAW), needs 4
+# V_NOPs or independent VALUs in between. Register allocation decided whether
+# the unpadded asm landed inside that window (w64: yes -> wrong results; w32 /
+# draft / r32: latent violations, correct by luck).
+#
+# ``_e4m3x8_to_bf16x4_intrin`` emits the same instructions as compiler-visible
+# IR (llvm.amdgcn.cvt.scale.pk8.bf16.fp8 with the same scale 0x7f / sel 0,
+# llvm.amdgcn.perm, llvm.umin.v2i16, and/or), so GCNHazardRecognizer pads the
+# WMMA hazards itself. Bit-identical results: same pk8 conversion,
+# perm(x, x, sel) == v_perm_b32 x, x, sel, umin on u16 lanes == v_pk_min_u16,
+# (sign & 0x80008000) | mag == v_and_or_b32. Every fp8 WMMA kernel that used the
+# asm converter (r32 TDM ``_cvtfast``, draft tdm/raw, decode-group w32/w64)
+# calls ``_e4m3x8_to_bf16x4_fast`` -> intrinsic. ``QSA_FP8_CVT_ASM=1`` restores
+# the asm converter (debug / A-B only; kernel names gain ``_cvtasm``; fp8
+# decode-group w64 then stays disabled because it is GPU-incorrect).
+# The ROUND-W64FIX bisect knob QSA_DECG_FP8_W64_DEBUG (asis/nop4/intrin/tdmwait)
+# is removed: its question is answered.
+_FP8_CVT_ASM = os.environ.get("QSA_FP8_CVT_ASM", "0").strip()
+if _FP8_CVT_ASM not in ("0", "1"):
+    raise ValueError(f"QSA_FP8_CVT_ASM must be '0' or '1', got {_FP8_CVT_ASM!r}")
+_FP8_CVT_ASM = _FP8_CVT_ASM == "1"
+_CVT_ASM_TAG = "_cvtasm" if _FP8_CVT_ASM else ""
+
+
+def _e4m3x8_to_bf16x4_intrin(src0, src1):
+    """``_e4m3x8_to_bf16x4_asm`` as compiler-visible intrinsics (no inline asm)."""
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm
+
+    i16x2 = ir.VectorType.get([2], ir.IntegerType.get_signless(16))
+    src = (fx.Int32(src0), fx.Int32(src1))
+    magnitudes = Vec.from_elements([v & fx.Int32(0x7F7F7F7F) for v in src], dtype=fx.Int32)
+    bf = llvm.call_intrinsic(
+        ir.VectorType.get([8], ir.BF16Type.get()), "llvm.amdgcn.cvt.scale.pk8.bf16.fp8",
+        [magnitudes.ir_value(), fx.Int32(0x7F).ir_value(), fx.Int32(0).ir_value()], [], [],
+    )
+    converted = Vec(llvm.bitcast(Vec.make_type(4, fx.Int32), bf))
+    cap = llvm.bitcast(i16x2, fx.Int32(0x43F043F0).ir_value())
+    words = []
+    for j in range_constexpr(4):
+        pair = llvm.bitcast(i16x2, fx.Int32(converted[j]).ir_value())
+        magnitude = fx.Int32(llvm.bitcast(fx.Int32.ir_type, llvm.call_intrinsic(
+            i16x2, "llvm.umin.v2i16", [pair, cap], [], [])))
+        selector = 0x01010000 if j % 2 == 0 else 0x03030202
+        x = src[j // 2].ir_value()
+        sign = fx.Int32(llvm.call_intrinsic(
+            fx.Int32.ir_type, "llvm.amdgcn.perm", [x, x, fx.Int32(selector).ir_value()], [], []))
+        words.append((sign & fx.Int32(_s32(0x80008000))) | magnitude)
+    return Vec.from_elements(words, dtype=fx.Int32)
+
+
+def _e4m3x8_to_bf16x4_fast(src0, src1):
+    """The exact pk8 E4M3 -> bf16 converter used by every fp8 WMMA kernel.
+
+    ROUND-W64FIX2: compiler-visible intrinsics by default (WMMA hazards padded by
+    LLVM); ``QSA_FP8_CVT_ASM=1`` selects the original inline-asm sequence.
+    """
+    if _FP8_CVT_ASM:
+        return _e4m3x8_to_bf16x4_asm(src0, src1)
+    return _e4m3x8_to_bf16x4_intrin(src0, src1)
 
 
 @lru_cache(maxsize=None)
@@ -2275,7 +2346,7 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}"
         f"_r{rows_per_block}_c{WMMA_COLS}_flydsl"
         + ("_tdm" if use_tdm else "")
-        + ("_cvtfast" if fast_cvt else "")
+        + ("_cvtfast" + _CVT_ASM_TAG if fast_cvt else "")
         + qp_tag
     )
 
@@ -2772,6 +2843,39 @@ if _DRAFT_COLS not in ("auto", "32", "64"):
     raise ValueError(f"QSA_DRAFT_COLS must be 'auto', '32' or '64', got {_DRAFT_COLS!r}")
 
 
+# ROUND-FP8PERF: draft fp8 schedule (intrinsic converter only; QSA_FP8_CVT_ASM=1
+# keeps the champion order 'base'). Root GPU (a08-1 GPU3, 5fb8740e): the hazard-
+# free intrinsic converter regressed draft fp8 c65536 19.3 -> 20.6 us. ISA cause:
+# with the compiler-visible converter the machine scheduler sank the 4 Q-fragment
+# buffer loads next to their WMMAs (VGPR 106 -> 91) -> 4 serial
+# ``s_wait_loadcnt 0x0`` round trips per wave, after ``s_wait_tensorcnt 0``
+# (the asm build issued all 8 Q loads at once). Variants:
+#   qpre  (default) Q fragments are issued between the TDM gathers and
+#         ``s_wait_tensorcnt 0`` (the decode-group order): the wait is a
+#         side-effecting fence the scheduler cannot sink loads across, so the Q
+#         latency hides under the gather latency; LLVM interleaves freely
+#         (and pads the WMMA hazards of its register reuse with v_nop).
+#   kall  qpre + every K fragment of the slab converted before a
+#         ``sched_barrier`` and an uninterrupted WMMA burst (no VALU can land in
+#         a WMMA hazard window -> no conversion padding; no co-execution).
+#   kpipe qpre + software pipeline: tile t's WMMAs share a scheduling
+#         region with tile t+1's conversion (WMMA / VALU co-execution, kernel-wiki
+#         mi400-valu-coexec §2.2), separated by ``sched_barrier``s; conversion
+#         temps of tile t+1 are distinct from tile t's live A/B/D registers.
+#   base  5fb8740e order (Q loaded after ``s_wait_tensorcnt 0``).
+# Non-default get a ``_s<variant>`` tag. FP8PERF2 GPU c65536/c32768: qpre 18.4/11.6 kpipe 20.6/11.9
+_DRAFT_FP8_SCHED_DEFAULT = "qpre"
+_DRAFT_FP8_SCHED = os.environ.get("QSA_DRAFT_FP8_SCHED", _DRAFT_FP8_SCHED_DEFAULT).strip().lower()
+if _DRAFT_FP8_SCHED not in ("qpre", "kall", "kpipe", "base"):
+    raise ValueError(
+        f"QSA_DRAFT_FP8_SCHED must be 'qpre', 'kall', 'kpipe' or 'base', got {_DRAFT_FP8_SCHED!r}")
+
+
+def draft_fp8_sched() -> str:
+    """Effective draft fp8 schedule: the knob, or 'base' with the asm converter."""
+    return "base" if _FP8_CVT_ASM else _DRAFT_FP8_SCHED
+
+
 def draft_wave_cols(k_load: str) -> int:
     """Per-wave column slab: auto = 32 for TDM (8.7/4.6 KB LDS per wave), 64 raw."""
     if _DRAFT_COLS != "auto":
@@ -2855,11 +2959,15 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
     tile_bytes = wave_cols * pitch                    # per wave
     gather = _tdm_fp8_k_gather if is_fp8 else _tdm_k_gather
     dtag = "fp8" if is_fp8 else "bf16"
+    # ROUND-FP8PERF: bf16 always keeps the champion order ('base').
+    sched = draft_fp8_sched() if is_fp8 else "base"
+    sched_tag = (f"_s{sched}" if (is_fp8 and not _FP8_CVT_ASM and sched != _DRAFT_FP8_SCHED_DEFAULT)
+                 else "")
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtag}_draft"
         f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_w{wave_cols}_flydsl"
         + ("_tdm" if use_tdm else "_raw")
-    ) + qp_tag
+    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag
 
     def _frag(rsrc, byte_off):
         lo = _ld_vec(rsrc, byte_off, 4, fx.Int32)
@@ -2893,11 +3001,16 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
                 for r in range_constexpr(PAGE_SIZE):
                     row_ids.append(phys * PAGE_SIZE + r)
             gather(KV, storage, row_ids, num_pages, wave * tile_bytes + group * 8 * pitch)
+
+    def _wait_tdm():
         # Same-wave consumer: data is in LDS once TENSORcnt reaches 0 (tensor
         # done); the tile is wave-private and never reused, so no WG barrier.
         fx.rocdl.tdm_ops.tensor_wait(0)
 
     def _stage_raw(KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave):
+        pass
+
+    def _wait_raw():
         pass
 
     def _kbase_raw(phys, off, local, kgrp):
@@ -2970,6 +3083,7 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
     storage_fn = _storage_tdm if use_tdm else _storage_raw
     wave_src = _wave_src_tdm if use_tdm else _wave_src_raw
     stage = _stage_tdm if use_tdm else _stage_raw
+    stage_wait = _wait_tdm if use_tdm else _wait_raw
     kbase = _kbase_tdm if use_tdm else _kbase_raw
     if is_fp8:
         kfrag = _kfrag_fp8_tdm if use_tdm else _kfrag_fp8_raw
@@ -2978,32 +3092,79 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
         kfrag = _kfrag_bf16_tdm if use_tdm else _kfrag_bf16_raw
         ks_bytes, finish = _ks_bytes_bf16, _finish_bf16
 
-    def _values(atom, ksrc, ks_rsrc, pt_rsrc, q_rsrc, safe_row, safe_req, req_ok, col0,
+    def _q_frags(q_rsrc, safe_row, n_in, kgrp):
+        base_q = safe_row * q_row_bytes + (n_in % NUM_HEADS) * head_bytes + kgrp * 16
+        return [_frag(q_rsrc, base_q + s * kstep_q) for s in range_constexpr(WMMA_K_STEPS)]
+
+    def _wait_and_q(q_rsrc, safe_row, n_in, kgrp):
+        """K staging wait + Q fragments, in the schedule's order (plain Python)."""
+        if sched == "base":
+            stage_wait()
+            return _q_frags(q_rsrc, safe_row, n_in, kgrp)
+        # ROUND-FP8PERF qpre: the Q loads are in flight under the TDM gathers.
+        qf = _q_frags(q_rsrc, safe_row, n_in, kgrp)
+        stage_wait()
+        return qf
+
+    def _tile_k(ksrc, pt_rsrc, safe_req, req_ok, col0, n_in, kgrp, width, num_pages, nt):
+        """Page lookup + the WMMA_K_STEPS (converted) K fragments of N tile ``nt``."""
+        local = nt * WMMA_N + n_in
+        c = col0 + local
+        logical = c // PAGE_SIZE
+        off = c % PAGE_SIZE
+        logical_ok = logical < width
+        safe_logical = logical_ok.select(logical, 0)
+        phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
+        page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+        phys = page_ok.select(phys, 0)
+        k_base = kbase(phys, off, local, kgrp)
+        kf = [kfrag(ksrc, k_base + s * kstep_k, kgrp) for s in range_constexpr(WMMA_K_STEPS)]
+        return kf, page_ok, phys
+
+    def _tile_mma(atom, qf, kf):
+        acc_t = fx.make_rmem_tensor(8, fx.Float32)
+        acc_t.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            fx.gemm(atom, acc_t, _rmem8(qf[s]), _rmem8(kf[s]), acc_t)
+        return acc_t.load()
+
+    def _values(atom, ksrc, ks_rsrc, pt_rsrc, qf, safe_row, safe_req, req_ok, col0,
                 lane, n_in, kgrp, width, num_pages, vis):
         """[value] per store pair j: column col0 + 32 j + lane (tile 2 j + kgrp)."""
-        base_q = safe_row * q_row_bytes + (n_in % NUM_HEADS) * head_bytes + kgrp * 16
-        qf = [_frag(q_rsrc, base_q + s * kstep_q) for s in range_constexpr(WMMA_K_STEPS)]
         g0 = kgrp == 0
         accs, oks, physs = [], [], []
-        for nt in range_constexpr(n_tiles):
-            local = nt * WMMA_N + n_in
-            c = col0 + local
-            logical = c // PAGE_SIZE
-            off = c % PAGE_SIZE
-            logical_ok = logical < width
-            safe_logical = logical_ok.select(logical, 0)
-            phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
-            page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-            phys = page_ok.select(phys, 0)
-            k_base = kbase(phys, off, local, kgrp)
-            kf = [kfrag(ksrc, k_base + s * kstep_k, kgrp) for s in range_constexpr(WMMA_K_STEPS)]
-            acc_t = fx.make_rmem_tensor(8, fx.Float32)
-            acc_t.store(Vec.filled(8, 0.0, fx.Float32))
-            for s in range_constexpr(WMMA_K_STEPS):
-                fx.gemm(atom, acc_t, _rmem8(qf[s]), _rmem8(kf[s]), acc_t)
-            accs.append(acc_t.load())
-            oks.append(page_ok.select(fx.Int32(1), fx.Int32(0)))
-            physs.append(phys)
+        if sched in ("base", "qpre"):
+            # Champion structure (LLVM schedules conversion / WMMA freely).
+            for nt in range_constexpr(n_tiles):
+                kf, page_ok, phys = _tile_k(ksrc, pt_rsrc, safe_req, req_ok, col0, n_in, kgrp,
+                                            width, num_pages, nt)
+                accs.append(_tile_mma(atom, qf, kf))
+                oks.append(page_ok.select(fx.Int32(1), fx.Int32(0)))
+                physs.append(phys)
+        elif sched == "kall":
+            # Every K fragment of the slab converted, then one WMMA burst.
+            tiles = [_tile_k(ksrc, pt_rsrc, safe_req, req_ok, col0, n_in, kgrp, width,
+                             num_pages, nt) for nt in range_constexpr(n_tiles)]
+            fx.rocdl.sched_barrier(0)
+            for nt in range_constexpr(n_tiles):
+                accs.append(_tile_mma(atom, qf, tiles[nt][0]))
+            fx.rocdl.sched_barrier(0)
+            for nt in range_constexpr(n_tiles):
+                oks.append(tiles[nt][1].select(fx.Int32(1), fx.Int32(0)))
+                physs.append(tiles[nt][2])
+        else:
+            # kpipe: region t = WMMAs of tile t-1 + conversion of tile t.
+            tiles = []
+            for nt in range_constexpr(n_tiles + 1):
+                if nt < n_tiles:
+                    tiles.append(_tile_k(ksrc, pt_rsrc, safe_req, req_ok, col0, n_in, kgrp,
+                                         width, num_pages, nt))
+                if nt > 0:
+                    accs.append(_tile_mma(atom, qf, tiles[nt - 1][0]))
+                fx.rocdl.sched_barrier(0)
+            for nt in range_constexpr(n_tiles):
+                oks.append(tiles[nt][1].select(fx.Int32(1), fx.Int32(0)))
+                physs.append(tiles[nt][2])
         neg_inf = fx.Float32(_NEG_INF)
         out = []
         for j in range_constexpr(n_pairs):
@@ -3060,7 +3221,8 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
         live = (col0 < vis) & (row < rows)
         if live:
             stage(KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave)
-            vals = _values(atom, ksrc, ks_rsrc, pt_rsrc, q_rsrc, safe_row, safe_req, req_ok,
+            qf = _wait_and_q(q_rsrc, safe_row, n_in, kgrp)
+            vals = _values(atom, ksrc, ks_rsrc, pt_rsrc, qf, safe_row, safe_req, req_ok,
                            col0, lane, n_in, kgrp, width, num_pages, vis)
             for j1 in range_constexpr(n_pairs):
                 if out_cols[j1] < columns:
@@ -3134,22 +3296,44 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
 #
 # ROUND-DECG2: default ON (QSA_DECODE_GROUP=all; '0' opts out to the previous
 # c45b24e0 routing). GPU (a08-1 GPU3, root run 2026-11-03): 22/22 correct with
-# all/w32, decode 0.64-0.74x ATOM. QSA_DECODE_GROUP_COLS=64 is honoured for
-# bf16 only: fp8 w64 GPU-incorrect (root run 2026-11-03), disabled -- the fp8
-# route always uses w32 (_DECODE_GROUP_FP8_COLS) and the builder rejects fp8 w64.
+# all/w32, decode 0.64-0.74x ATOM. QSA_DECODE_GROUP_COLS (ROUND-FP8PERF default
+# 'auto' = bf16 w32 / fp8 w64; '32' / '64' force both dtypes) selects the slab. ROUND-W64FIX2: fp8 w64 is re-enabled with the
+# compiler-visible pk8 converter (GPU root a08-1 GPU3 2026-11-03: 22/22, decode
+# fp8 c65536 26.8 vs w32 26.6 us); its earlier failure was the unpadded WMMA
+# hazard of the inline-asm converter, so with QSA_FP8_CVT_ASM=1 fp8 stays w32
+# and the builder rejects fp8 w64.
 DECG_ROWS = WMMA_ROWS_PER_WAVE       # 4 rows x 4 heads = WMMA M 16
 DECG_WAVES = 4
-_DECODE_GROUP_FP8_COLS = 32          # fp8 w64 GPU-incorrect (root run 2026-11-03), disabled
 _DECODE_GROUP = os.environ.get("QSA_DECODE_GROUP", "all").strip().lower()
 if _DECODE_GROUP not in ("0", "1", "bf16", "fp8", "all"):
     raise ValueError(
         f"QSA_DECODE_GROUP must be '0', '1' (= bf16), 'bf16', 'fp8' or 'all', got {_DECODE_GROUP!r}")
 _DECODE_GROUP_BF16 = _DECODE_GROUP in ("1", "bf16", "all")
 _DECODE_GROUP_FP8 = _DECODE_GROUP in ("fp8", "all")
-_DECODE_GROUP_COLS = os.environ.get("QSA_DECODE_GROUP_COLS", "32").strip()
-if _DECODE_GROUP_COLS not in ("32", "64"):
-    raise ValueError(f"QSA_DECODE_GROUP_COLS must be '32' or '64', got {_DECODE_GROUP_COLS!r}")
-_DECODE_GROUP_COLS = int(_DECODE_GROUP_COLS)
+# ROUND-FP8PERF: per-dtype default ('auto'): bf16 w32, fp8 w64 (root GPU a08-1
+# GPU3, 5fb8740e: decode fp8 c65536 w64 26.6 vs w32 27.6 us, c32768 14.7 vs 15.5;
+# bf16 w64 is slower: 29.0 / 16.1 vs 27.0 / 15.4). '32' / '64' force both dtypes.
+_DECODE_GROUP_COLS = os.environ.get("QSA_DECODE_GROUP_COLS", "auto").strip().lower()
+if _DECODE_GROUP_COLS not in ("auto", "32", "64"):
+    raise ValueError(
+        f"QSA_DECODE_GROUP_COLS must be 'auto', '32' or '64', got {_DECODE_GROUP_COLS!r}")
+_DECODE_GROUP_COLS = None if _DECODE_GROUP_COLS == "auto" else int(_DECODE_GROUP_COLS)
+_DECODE_GROUP_AUTO_COLS = {False: 32, True: 64}          # is_fp8 -> wave_cols
+# ROUND-FP8PERF: decode-group fp8 tile schedule (intrinsic converter only).
+#   base  (default) 5fb8740e structure (per tile: convert, 4 WMMAs, epilogue;
+#         LLVM interleaves and pads the WMMA hazards with v_nop);
+#   kpipe software pipeline as the draft kernel's: tile t's WMMAs share a
+#         sched_barrier-fenced region with tile t+1's K conversion, epilogues
+#         after the last WMMA. Non-default get ``_s<variant>``. FP8PERF2 GPU: base 27.0/14.7 us
+_DECG_FP8_SCHED_DEFAULT = "base"
+_DECG_FP8_SCHED = os.environ.get("QSA_DECG_FP8_SCHED", _DECG_FP8_SCHED_DEFAULT).strip().lower()
+if _DECG_FP8_SCHED not in ("base", "kpipe"):
+    raise ValueError(f"QSA_DECG_FP8_SCHED must be 'base' or 'kpipe', got {_DECG_FP8_SCHED!r}")
+
+
+def decg_fp8_sched() -> str:
+    """Effective decode-group fp8 schedule: the knob, or 'base' with the asm converter."""
+    return "base" if _FP8_CVT_ASM else _DECG_FP8_SCHED
 
 
 def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
@@ -3160,8 +3344,9 @@ def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
     rows % 4 == 0, the champion would pick an r16 kernel (rows < 32 * requests:
     prefill keeps r32/persist), and a 128 B aligned cache base (TDM). The
     kernel itself is exact for any token_to_request (mixed groups fall back
-    in-kernel). wave_cols = QSA_DECODE_GROUP_COLS for bf16; fp8 is always 32
-    (fp8 w64 GPU-incorrect (root run 2026-11-03), disabled).
+    in-kernel). wave_cols = QSA_DECODE_GROUP_COLS ('auto' default: bf16 32,
+    fp8 64); fp8 is 32 whenever the inline-asm converter is forced
+    (QSA_FP8_CVT_ASM=1: its w64 build is GPU-wrong).
     """
     if not (_DECODE_GROUP_FP8 if is_fp8 else _DECODE_GROUP_BF16):
         return None
@@ -3174,7 +3359,11 @@ def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
         wmma_bf16_rows_per_block(rows, num_requests)
     if rpb != 16 or int(kv_ptr) % 128:
         return None
-    return _DECODE_GROUP_FP8_COLS if is_fp8 else _DECODE_GROUP_COLS
+    if is_fp8 and _FP8_CVT_ASM:
+        return 32                        # asm-converter fp8 w64 is GPU-incorrect
+    if _DECODE_GROUP_COLS is None:
+        return _DECODE_GROUP_AUTO_COLS[bool(is_fp8)]
+    return _DECODE_GROUP_COLS
 
 
 def decode_group_grid(rows: int, columns: int, wave_cols: int) -> tuple[int, int]:
@@ -3235,8 +3424,9 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
     _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
     if wave_cols not in (32, 64):
         raise ValueError("decode-group wave_cols must be 32 or 64")
-    if is_fp8 and wave_cols != _DECODE_GROUP_FP8_COLS:
-        raise ValueError("fp8 decode-group w64 is GPU-incorrect (root run 2026-11-03), disabled")
+    if is_fp8 and wave_cols == 64 and _FP8_CVT_ASM:
+        raise ValueError("fp8 decode-group w64 with the inline-asm converter (QSA_FP8_CVT_ASM=1) "
+                         "is GPU-incorrect (unpadded WMMA hazard), disabled")
     if _ACCESS != "raw":
         raise ValueError("the decode-group kernel requires QSA_G2_ACCESS=raw")
     n_tiles = wave_cols // WMMA_N                     # 2 / 4 WMMA N tiles per wave
@@ -3252,10 +3442,13 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
     tile_bytes = wave_cols * pitch                    # per wave
     gather = _tdm_fp8_k_gather if is_fp8 else _tdm_k_gather
     dtag = "fp8" if is_fp8 else "bf16"
+    sched = decg_fp8_sched() if is_fp8 else "base"      # ROUND-FP8PERF; bf16 unchanged
+    sched_tag = (f"_s{sched}" if (is_fp8 and not _FP8_CVT_ASM and sched != _DECG_FP8_SCHED_DEFAULT)
+                 else "")
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtag}_decg"
         f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_w{wave_cols}_flydsl_tdm"
-    ) + qp_tag
+    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag
 
     def _i01(cond):
         return cond.select(fx.Int32(1), fx.Int32(0))
@@ -3418,8 +3611,8 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
                      width, num_pages):
         """[(store_ok, byte_off, value)]: rows a/b of every tile column (r16 order)."""
         neg_inf = fx.Float32(_NEG_INF)
-        out = []
-        for nt in range_constexpr(n_tiles):
+
+        def _tile_k(nt):
             c = cols[nt]
             local = nt * WMMA_N + n_in
             logical = c // PAGE_SIZE
@@ -3432,12 +3625,34 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
             k_base = local * pitch + pp.kgrp * kgrp_bytes
             kf = [kfrag(ksrc, k_base + s * kstep_k, pp.kgrp) for s in range_constexpr(WMMA_K_STEPS)]
             scale = scale_fn(ks_rsrc, phys, off)
+            return kf, page_ok, scale
+
+        def _tile_mma(kf):
             acc_t = fx.make_rmem_tensor(8, fx.Float32)
             acc_t.store(Vec.filled(8, 0.0, fx.Float32))
             for s in range_constexpr(WMMA_K_STEPS):
                 # D[m = 4*row + head, n = column] += Q[m, k] * K[n, k]
                 fx.gemm(atom, acc_t, _rmem8(qf[s]), _rmem8(kf[s]), acc_t)
-            acc = acc_t.load()
+            return acc_t.load()
+
+        if sched == "kpipe":
+            # ROUND-FP8PERF: region t = WMMAs of tile t-1 + K conversion of tile t
+            # (co-execution, kernel-wiki mi400-valu-coexec §2.2), sched_barrier-fenced.
+            tiles, accs = [], []
+            for nt in range_constexpr(n_tiles + 1):
+                if nt < n_tiles:
+                    tiles.append(_tile_k(nt))
+                if nt > 0:
+                    accs.append(_tile_mma(tiles[nt - 1][0]))
+                fx.rocdl.sched_barrier(0)
+        out = []
+        for nt in range_constexpr(n_tiles):
+            c = cols[nt]
+            if sched == "kpipe":
+                page_ok, scale, acc = tiles[nt][1], tiles[nt][2], accs[nt]
+            else:
+                kf, page_ok, scale = _tile_k(nt)
+                acc = _tile_mma(kf)
             sa = finish([fx.Float32(acc[h]) for h in range_constexpr(4)], scale)
             sb = finish([fx.Float32(acc[4 + h]) for h in range_constexpr(4)], scale)
             col_ok = c < columns

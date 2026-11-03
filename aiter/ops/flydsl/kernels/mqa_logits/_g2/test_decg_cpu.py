@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Round DECG CPU gates: opt-in decode row-group kernel (QSA_DECODE_GROUP).
 
-Routing/knobs (ROUND-DECG2: default 'all', '0' opts out, fp8 never w64),
+Routing/knobs (ROUND-DECG2: default 'all', '0' opts out; ROUND-W64FIX2: fp8 w64
+re-enabled with the intrinsic pk8 converter, never w64 with QSA_FP8_CVT_ASM=1),
 wrapper placement (flag-gated block), pass plan incl.
 mixed-request groups, exactly-once stores incl. tails and partial groups, and
 a lane-level emulation of the WMMA A/B/C layouts against the contract formula
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import itertools
 import math
 import os
 import random
@@ -29,7 +31,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import _load  # noqa: E402
 
-KEYS = ("QSA_DECODE_GROUP", "QSA_DECODE_GROUP_COLS", "QSA_DRAFT_PATH", "QSA_G2_ACCESS",
+KEYS = ("QSA_DECODE_GROUP", "QSA_DECODE_GROUP_COLS", "QSA_FP8_CVT_ASM",
+        "QSA_DRAFT_FP8_SCHED", "QSA_DECG_FP8_SCHED", "QSA_DRAFT_K_LOAD", "QSA_DRAFT_COLS",
+        "QSA_DRAFT_PATH", "QSA_G2_ACCESS",
         "QSA_FP8_PATH", "QSA_BF16_PATH", "QSA_R16_NOBAR", "QSA_BF16_R64", "QSA_BF16_K_LOAD")
 _N = [0]
 
@@ -71,14 +75,17 @@ def _inner(builder, name):
 
 class Routing(unittest.TestCase):
     def test_default_on_all(self):
-        # ROUND-DECG2: default flipped to 'all' (was '0'), COLS default stays 32.
+        # ROUND-DECG2: default flipped to 'all' (was '0'). ROUND-FP8PERF: COLS default
+        # 'auto' = per dtype: bf16 w32, fp8 w64 (QSA_FP8_CVT_ASM=1 keeps fp8 w32).
         k = load()
         self.assertEqual(k._DECODE_GROUP, "all")
         self.assertTrue(k._DECODE_GROUP_BF16 and k._DECODE_GROUP_FP8)
-        self.assertEqual(k._DECODE_GROUP_COLS, 32)
+        self.assertIsNone(k._DECODE_GROUP_COLS)
+        self.assertEqual(k._DECODE_GROUP_AUTO_COLS, {False: 32, True: 64})
         for fp8 in (False, True):
-            self.assertEqual(k.decode_group_route(64, 16, fp8, 0x1000), 32)
-            self.assertEqual(k.decode_group_route(16, 4, fp8, 0x1000), 32)
+            want = 64 if fp8 else 32
+            self.assertEqual(k.decode_group_route(64, 16, fp8, 0x1000), want)
+            self.assertEqual(k.decode_group_route(16, 4, fp8, 0x1000), want)
             self.assertIsNone(k.decode_group_route(64, 64, fp8, 0x1000))   # draft
             self.assertIsNone(k.decode_group_route(10, 2, fp8, 0x1000))    # rows % 4
 
@@ -91,19 +98,44 @@ class Routing(unittest.TestCase):
             for fp8 in (False, True):
                 self.assertIsNone(k.decode_group_route(rows, reqs, fp8, 0x1000))
 
-    def test_fp8_never_w64(self):
-        # ROUND-DECG2: fp8 w64 GPU-incorrect (root run 2026-11-03), disabled.
+    def test_fp8_w64_intrinsic_only(self):
+        # ROUND-W64FIX2: fp8 w64 re-enabled (intrinsic converter, GPU 22/22); the
+        # inline-asm converter (QSA_FP8_CVT_ASM=1) keeps fp8 on w32.
         for env in ({"QSA_DECODE_GROUP_COLS": "64"},
                     {"QSA_DECODE_GROUP": "all", "QSA_DECODE_GROUP_COLS": "64"},
                     {"QSA_DECODE_GROUP": "fp8", "QSA_DECODE_GROUP_COLS": "64"}):
             k = load(**env)
-            self.assertEqual(k._DECODE_GROUP_FP8_COLS, 32)
-            self.assertEqual(k.decode_group_route(64, 16, True, 0x1000), 32)
+            self.assertFalse(k._FP8_CVT_ASM)
+            self.assertEqual(k.decode_group_route(64, 16, True, 0x1000), 64)
+            a = load(QSA_FP8_CVT_ASM="1", **env)
+            self.assertTrue(a._FP8_CVT_ASM)
+            self.assertEqual(a.decode_group_route(64, 16, True, 0x1000), 32)
+            self.assertIsNone(a.decode_group_route(64, 64, True, 0x1000))    # draft unchanged
         self.assertEqual(load(QSA_DECODE_GROUP_COLS="64").decode_group_route(64, 16, False, 0), 64)
+        self.assertEqual(load(QSA_DECODE_GROUP_COLS="64", QSA_FP8_CVT_ASM="1")
+                         .decode_group_route(64, 16, False, 0), 64)       # bf16 unaffected
         src = ast.unparse(_top("_build_decode_group_kernel"))
-        self.assertIn("if is_fp8 and wave_cols != _DECODE_GROUP_FP8_COLS:", src)
-        self.assertIn("return _DECODE_GROUP_FP8_COLS if is_fp8 else _DECODE_GROUP_COLS",
-                      ast.unparse(_top("decode_group_route")))
+        self.assertIn("if is_fp8 and wave_cols == 64 and _FP8_CVT_ASM:", src)
+        self.assertIn("qp_tag + (_CVT_ASM_TAG if is_fp8 else '')", src)
+        ids = {n.id for n in ast.walk(ast.parse(_src())) if isinstance(n, ast.Name)}
+        self.assertNotIn("_DECODE_GROUP_FP8_COLS", ids)
+        self.assertNotIn("_DECG_FP8_W64_DEBUG", ids)
+        route = ast.unparse(_top("decode_group_route"))
+        self.assertIn("if is_fp8 and _FP8_CVT_ASM:\n        return 32", route)
+        self.assertIn("if _DECODE_GROUP_COLS is None:\n        return _DECODE_GROUP_AUTO_COLS[bool(is_fp8)]",
+                      route)
+        self.assertTrue(route.rstrip().endswith("return _DECODE_GROUP_COLS"))
+
+    def test_per_dtype_default_cols(self):
+        # ROUND-FP8PERF: 'auto' (default) -> bf16 32 / fp8 64; '32' forces both to w32.
+        for env in ({}, {"QSA_DECODE_GROUP_COLS": "auto"}, {"QSA_DECODE_GROUP_COLS": " AUTO "}):
+            k = load(**env)
+            self.assertEqual(k.decode_group_route(64, 16, False, 0), 32)
+            self.assertEqual(k.decode_group_route(64, 16, True, 0), 64)
+            self.assertEqual(load(QSA_FP8_CVT_ASM="1", **env).decode_group_route(64, 16, True, 0), 32)
+        w32 = load(QSA_DECODE_GROUP_COLS="32")
+        self.assertEqual(w32.decode_group_route(64, 16, True, 0), 32)
+        self.assertEqual(w32.decode_group_route(64, 16, False, 0), 32)
 
     def test_opt_in_routes(self):
         k = load(QSA_DECODE_GROUP="1")
@@ -118,10 +150,10 @@ class Routing(unittest.TestCase):
         self.assertIsNone(k.decode_group_route(64, 16, False, 0x1010))     # TDM alignment
 
     def test_knobs(self):
-        self.assertEqual(load(QSA_DECODE_GROUP="fp8").decode_group_route(64, 16, True, 0), 32)
+        self.assertEqual(load(QSA_DECODE_GROUP="fp8").decode_group_route(64, 16, True, 0), 64)
         self.assertIsNone(load(QSA_DECODE_GROUP="fp8").decode_group_route(64, 16, False, 0))
         both = load(QSA_DECODE_GROUP="all", QSA_DECODE_GROUP_COLS="64")
-        self.assertEqual(both.decode_group_route(64, 16, True, 0), 32)   # DECG2: fp8 never w64
+        self.assertEqual(both.decode_group_route(64, 16, True, 0), 64)   # W64FIX2: fp8 w64 back
         self.assertEqual(both.decode_group_route(64, 16, False, 0), 64)
         self.assertEqual(load(QSA_DECODE_GROUP="bf16").decode_group_route(64, 16, False, 0), 32)
         self.assertIsNone(load(QSA_DECODE_GROUP="all", QSA_FP8_PATH="scalar")
@@ -196,7 +228,11 @@ class Source(unittest.TestCase):
         self.assertIn("pos = ld_uniform_pos(qp_rsrc, safe_row)", src)
         self.assertNotIn("_ld_uniform_i32(qp_rsrc", src)
         self.assertNotIn("_ld_i32(qp_rsrc", src)
-        self.assertNotIn("barrier", src.replace("no WG barrier", ""))
+        # ROUND-FP8PERF: the only 'barrier' is the kpipe scheduling fence (no ISA, no WG barrier).
+        self.assertEqual(src.count("fx.rocdl.sched_barrier(0)"), 1)
+        self.assertIn("fx.rocdl.sched_barrier(0)",
+                      ast.unparse(_inner("_build_decode_group_kernel", "_pass_values")))
+        self.assertNotIn("barrier", src.replace("no WG barrier", "").replace("fx.rocdl.sched_barrier(0)", ""))
 
     def test_metadata_is_sgpr_and_descriptors_uniform(self):
         meta = ast.unparse(_inner("_build_decode_group_kernel", "_group_meta"))
@@ -227,7 +263,9 @@ class Source(unittest.TestCase):
         # fp8 K fragment converter == the GPU-verified draft TDM converter
         d = ast.unparse(_inner("_build_draft_kernel", "_kfrag_fp8_tdm").body)
         g = ast.unparse(_inner("_build_decode_group_kernel", "_kfrag_fp8").body)
+        # ROUND-W64FIX2: both call the shared dispatcher (intrinsic by default).
         self.assertEqual(d, g)
+        self.assertIn("_e4m3x8_to_bf16x4_fast(src0, src1)", g)
 
     def test_kernel_war_guard_and_tensor_wait_in_live_pass(self):
         body = ast.unparse(_inner("_build_decode_group_kernel", "kernel"))
@@ -447,6 +485,366 @@ class LaneEmulation(unittest.TestCase):
 
     def test_fp8_w64_decode(self):
         self._case(True, 64, 5, self.DECODE, 12)
+
+    def test_fp8_w64_mixed_partial(self):
+        # ROUND-W64FIX: the bisect variants keep the w64 index math; cover mixed + partial.
+        self._case(True, 64, 6, self.MIXED, 20)
+        self._case(True, 64, 7, self.PARTIAL, 10)
+
+
+class FP8CvtIntrinsic(unittest.TestCase):
+    """ROUND-W64FIX2: intrinsic pk8 converter default, QSA_FP8_CVT_ASM opt-out."""
+
+    def test_knob_default_and_invalid(self):
+        k = load()
+        self.assertFalse(k._FP8_CVT_ASM)
+        self.assertEqual(k._CVT_ASM_TAG, "")
+        for v in ("1", " 1 "):
+            k = load(QSA_FP8_CVT_ASM=v)
+            self.assertTrue(k._FP8_CVT_ASM)
+            self.assertEqual(k._CVT_ASM_TAG, "_cvtasm")
+        self.assertFalse(load(QSA_FP8_CVT_ASM="0")._FP8_CVT_ASM)
+        for bad in ("", "2", "yes", "asm"):
+            with self.assertRaisesRegex(ValueError, "QSA_FP8_CVT_ASM"):
+                load(QSA_FP8_CVT_ASM=bad)
+
+    def test_every_fp8_converter_call_goes_through_dispatcher(self):
+        src = _src()
+        tree = ast.parse(src)
+        names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        self.assertTrue({"_e4m3x8_to_bf16x4_asm", "_e4m3x8_to_bf16x4_intrin",
+                         "_e4m3x8_to_bf16x4_fast"} <= names)
+        self.assertNotIn("_e4m3x8_to_bf16x4_nop4", names)
+        calls = Counter()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
+                    and n.func.id.startswith("_e4m3x8_to_bf16x4"):
+                calls[n.func.id] += 1
+        # r32 _pair_frag_tdm_fast, draft raw + tdm, decg -> dispatcher; only the
+        # dispatcher calls the two implementations.
+        self.assertEqual(calls, Counter({"_e4m3x8_to_bf16x4_fast": 4,
+                                         "_e4m3x8_to_bf16x4_asm": 1,
+                                         "_e4m3x8_to_bf16x4_intrin": 1}))
+        fast = ast.unparse(_top("_e4m3x8_to_bf16x4_fast"))
+        self.assertIn("if _FP8_CVT_ASM:\n        return _e4m3x8_to_bf16x4_asm(src0, src1)\n"
+                      "    return _e4m3x8_to_bf16x4_intrin(src0, src1)", fast)
+        # inline asm only inside the opt-out converter
+        asm_users = {f.name for f in tree.body if isinstance(f, ast.FunctionDef)
+                     and "inline_asm" in ast.unparse(f)}
+        self.assertEqual(asm_users, {"_e4m3x8_to_bf16x4_asm"})
+
+    def test_kernel_names_tagged_only_for_asm(self):
+        for builder in ("_build_draft_kernel", "_build_decode_group_kernel"):
+            self.assertIn("qp_tag + (_CVT_ASM_TAG if is_fp8 else '')", ast.unparse(_top(builder)))
+        self.assertIn("('_cvtfast' + _CVT_ASM_TAG if fast_cvt else '')",
+                      ast.unparse(_top("_build_wmma_fp8_kernel")))
+    # -- executed converter variants (actual source, mocked LLVM) -------------
+    def _cvt_env(self):
+        import test_fp8_cvt_cpu as T
+        return T
+
+    def _load_fn(self, name, namespace):
+        tree = ast.parse(_src())
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), _load.KERNEL_PATH, "exec"), namespace)
+        return namespace[name]
+
+    def _words(self):
+        rng = random.Random(1250)
+        out = []
+        for position in range(8):
+            for b in range(256):
+                codes = [0, 0x80, 0x7f, 0xff, 1, 0x87, 0x7e, 0xfe]
+                codes[position] = b
+                out.append(tuple(sum(codes[j + i] << (8 * i) for i in range(4)) for j in (0, 4)))
+        out += [(rng.getrandbits(32), rng.getrandbits(32)) for _ in range(3000)]
+        return out
+
+    def _ns(self, T):
+        import types
+        fx = types.SimpleNamespace(Int32=T._I32)
+        return {"fx": fx, "Vec": T._Vector, "range_constexpr": range,
+                "_s32": lambda value: value - 2**32 if value >= 2**31 else value}
+
+    def test_asm_converter_bitwise(self):
+        T = self._cvt_env()
+        fn = self._load_fn("_e4m3x8_to_bf16x4_asm", self._ns(T))
+        with T.mocked_llvm_import():
+            for w in self._words():
+                T._Asm.operations = []
+                got = tuple(map(int, fn(*w).data))
+                self.assertEqual(got, T.reference_pk8(*w))
+                self.assertEqual(len(T._Asm.operations), 13)
+
+    def test_dispatcher_selects_intrin_by_default(self):
+        tree = ast.parse(_src())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_e4m3x8_to_bf16x4_fast")
+        for flag, want in ((False, "intrin"), (True, "asm")):
+            ns = {"_FP8_CVT_ASM": flag,
+                  "_e4m3x8_to_bf16x4_asm": lambda a, b: ("asm", a, b),
+                  "_e4m3x8_to_bf16x4_intrin": lambda a, b: ("intrin", a, b)}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), _load.KERNEL_PATH, "exec"), ns)
+            self.assertEqual(ns["_e4m3x8_to_bf16x4_fast"](1, 2), (want, 1, 2))
+    def test_intrin_converter_bitwise_no_asm(self):
+        T = self._cvt_env()
+        import types
+        calls = []
+        i16x2, bf16x8 = ("v", 2, "i16"), ("v", 8, "bf16")
+
+        def call_intrinsic(rtype, name, args, _a, _b):
+            calls.append(name)
+            if name == "llvm.amdgcn.cvt.scale.pk8.bf16.fp8":
+                self.assertEqual(rtype, bf16x8)
+                src, scale, sel = args
+                self.assertEqual((int(scale), int(sel)), (0x7F, 0))
+                self.assertTrue(all(int(x) & 0x80808080 == 0 for x in src.data))
+                return ("bf16x8", [T.native_positive_bf16(int(x) >> (8 * i) & 255)
+                                   for x in src.data for i in range(4)])
+            if name == "llvm.umin.v2i16":
+                self.assertEqual(rtype, i16x2)
+                return ("i16x2", T.pk_min_u16(args[0][1], args[1][1]))
+            if name == "llvm.amdgcn.perm":
+                x, y, sel = (int(a) for a in args)
+                return T._I32(T.perm_bytes(x, y, sel))
+            raise AssertionError(name)
+
+        def bitcast(rtype, value):
+            if rtype == i16x2:
+                return ("i16x2", int(value))
+            if rtype == "i32":
+                self.assertEqual(value[0], "i16x2")
+                return T._I32(value[1])
+            if rtype == (4, T._I32):
+                self.assertEqual(value[0], "bf16x8")
+                v = value[1]
+                return T._Vector([v[i] | v[i + 1] << 16 for i in range(0, 8, 2)], T._I32)
+            raise AssertionError(rtype)
+
+        def no_asm(*a, **kw):
+            raise AssertionError("intrin converter must not use inline asm")
+
+        ir = types.SimpleNamespace(
+            VectorType=types.SimpleNamespace(get=lambda shape, et: ("v", shape[0], et)),
+            IntegerType=types.SimpleNamespace(get_signless=lambda bits: f"i{bits}"),
+            BF16Type=types.SimpleNamespace(get=lambda: "bf16"))
+        fn = self._load_fn("_e4m3x8_to_bf16x4_intrin", self._ns(T))
+        with T.mocked_llvm_import():
+            sys.modules["flydsl._mlir"].ir = ir
+            sys.modules["flydsl._mlir.dialects"].llvm = types.SimpleNamespace(
+                inline_asm=no_asm, call_intrinsic=call_intrinsic, bitcast=bitcast)
+            for w in self._words():
+                calls.clear()
+                got = tuple(map(int, fn(*w).data))
+                self.assertEqual(got, T.reference_pk8(*w))
+                self.assertEqual(Counter(calls), Counter({"llvm.amdgcn.cvt.scale.pk8.bf16.fp8": 1,
+                                                          "llvm.umin.v2i16": 4,
+                                                          "llvm.amdgcn.perm": 4}))
+
+
+class _Sym:
+    """Symbolic IR value: every op builds an expression string (dataflow witness)."""
+    __hash__ = object.__hash__
+
+    def __init__(self, text):
+        self.t = text
+
+    def __repr__(self):
+        return self.t
+
+    def _b(op):
+        def f(self, other):
+            return _Sym(f"({self!r} {op} {other!r})")
+
+        def r(self, other):
+            return _Sym(f"({other!r} {op} {self!r})")
+        return f, r
+    __add__, __radd__ = _b("+")
+    __sub__, __rsub__ = _b("-")
+    __mul__, __rmul__ = _b("*")
+    __floordiv__, __rfloordiv__ = _b("//")
+    __mod__, __rmod__ = _b("%")
+    __and__, __rand__ = _b("&")
+    __lt__, _ = _b("<")
+    __ge__, _ = _b(">=")
+    __eq__, _ = _b("==")
+    __ne__, _ = _b("!=")
+
+    def select(self, a, b):
+        return _Sym(f"sel({self!r}, {a!r}, {b!r})")
+
+    def maximumf(self, z):
+        return _Sym(f"max({self!r}, {z!r})")
+
+    def __getitem__(self, i):
+        return _Sym(f"{self!r}[{i}]")
+
+
+class FP8Sched(unittest.TestCase):
+    """ROUND-FP8PERF: draft / decode-group fp8 schedules (knobs, names, dataflow)."""
+
+    def test_knobs_defaults_invalid_and_asm(self):
+        k = load()
+        # ROUND-FP8PERF2 GPU decision: draft qpre, decode-group base.
+        self.assertEqual((k._DRAFT_FP8_SCHED_DEFAULT, k._DECG_FP8_SCHED_DEFAULT), ("qpre", "base"))
+        self.assertEqual((k.draft_fp8_sched(), k.decg_fp8_sched()), ("qpre", "base"))
+        for v in ("qpre", "kall", "kpipe", "base", " KALL "):
+            self.assertEqual(load(QSA_DRAFT_FP8_SCHED=v).draft_fp8_sched(), v.strip().lower())
+        for v in ("base", "kpipe"):
+            self.assertEqual(load(QSA_DECG_FP8_SCHED=v).decg_fp8_sched(), v)
+        for key, bad in (("QSA_DRAFT_FP8_SCHED", "nop"), ("QSA_DRAFT_FP8_SCHED", ""),
+                         ("QSA_DECG_FP8_SCHED", "kall"), ("QSA_DECG_FP8_SCHED", "qpre")):
+            with self.assertRaisesRegex(ValueError, key):
+                load(**{key: bad})
+        a = load(QSA_FP8_CVT_ASM="1", QSA_DRAFT_FP8_SCHED="kall", QSA_DECG_FP8_SCHED="kpipe")
+        self.assertEqual((a.draft_fp8_sched(), a.decg_fp8_sched()), ("base", "base"))
+
+    def test_names_and_bf16_untouched(self):
+        for builder, fn, dflt in (("_build_draft_kernel", "draft_fp8_sched", "_DRAFT_FP8_SCHED_DEFAULT"),
+                                  ("_build_decode_group_kernel", "decg_fp8_sched",
+                                   "_DECG_FP8_SCHED_DEFAULT")):
+            src = ast.unparse(_top(builder))
+            self.assertIn(f"sched = {fn}() if is_fp8 else 'base'", src)
+            tag = next(ast.unparse(n.value) for n in ast.walk(_top(builder))
+                       if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "sched_tag")
+            self.assertTrue(tag.startswith("f'_s{sched}' if is_fp8 and"), tag)
+            self.assertIn("_FP8_CVT_ASM", tag)
+            self.assertIn(f"sched != {dflt}", tag)
+            self.assertTrue(tag.endswith("else ''"), tag)
+            self.assertIn("qp_tag + (_CVT_ASM_TAG if is_fp8 else '') + sched_tag", src)
+            # ROUND-FP8PERF2: tags mark exactly the non-default choices (default name untagged).
+            k = load()
+            dv = getattr(k, dflt)
+            values = ("qpre", "kall", "kpipe", "base") if "draft" in builder else ("base", "kpipe")
+            for is_fp8, asm, sched in itertools.product((False, True), (False, True), values):
+                got = eval(tag, {dflt: dv, "is_fp8": is_fp8, "_FP8_CVT_ASM": asm, "sched": sched})
+                want = f"_s{sched}" if (is_fp8 and not asm and sched != dv) else ""
+                self.assertEqual(got, want, (builder, is_fp8, asm, sched))
+            self.assertNotIn(f"_s{dv}", [eval(tag, {dflt: dv, "is_fp8": True, "_FP8_CVT_ASM": False,
+                                                     "sched": s}) for s in values])
+        # base order (bf16 always): wait, then Q; others: Q under the gathers, then wait.
+        w = ast.unparse(_inner("_build_draft_kernel", "_wait_and_q").body)
+        self.assertIn("if sched == 'base':\n    stage_wait()\n    return _q_frags(", w)
+        self.assertIn("qf = _q_frags(q_rsrc, safe_row, n_in, kgrp)\nstage_wait()\nreturn qf", w)
+        body = ast.unparse(_inner("_build_draft_kernel", "kernel"))
+        self.assertLess(body.index("stage(KV,"), body.index("_wait_and_q("))
+        self.assertLess(body.index("_wait_and_q("), body.index("_values("))
+        self.assertIn("fx.rocdl.tdm_ops.tensor_wait(0)", ast.unparse(_inner("_build_draft_kernel", "_wait_tdm")))
+
+    # -- executed dataflow: the actual nested sources with symbolic fx ----------
+    def _fx(self, log):
+        import types
+
+        class Tensor:
+            def __init__(self):
+                self.v = None
+
+            def store(self, v):
+                self.v = v
+
+            def load(self):
+                return self.v
+
+        def gemm(atom, acc, a, b, acc2):
+            self.assertIs(acc, acc2)
+            log.append(f"mma {b!r}")
+            acc.v = _Sym(f"mma({acc.v!r}, {a!r}, {b!r})")
+        return types.SimpleNamespace(
+            Int32=lambda v: _Sym(f"i32({v!r})"), Float32=lambda v: _Sym(f"f32({v!r})"),
+            make_rmem_tensor=lambda n, t: Tensor(), gemm=gemm,
+            rocdl=types.SimpleNamespace(sched_barrier=lambda m: log.append(f"barrier {m}")))
+
+    def _ns(self, log, sched, n_tiles):
+        import types
+        K = load()
+        ns = {"fx": self._fx(log), "range_constexpr": range, "sched": sched, "n_tiles": n_tiles,
+              "n_pairs": n_tiles // 2, "WMMA_N": K.WMMA_N, "WMMA_WAVE": K.WMMA_WAVE,
+              "WMMA_K_STEPS": K.WMMA_K_STEPS, "PAGE_SIZE": K.PAGE_SIZE, "_NEG_INF": K._NEG_INF,
+              "kstep_k": 32, "pitch": 144, "kgrp_bytes": 0,
+              "Vec": types.SimpleNamespace(filled=lambda n, v, t: _Sym("zeros")),
+              "_rmem8": lambda v: v,
+              "_ld_i32": lambda r, off: _Sym(f"pt[{off!r}]"),
+              "kbase": lambda phys, off, local, kgrp: _Sym(f"kb({phys!r},{off!r},{local!r})"),
+              "finish": lambda acc, *a: _Sym(f"fin({acc!r},{a!r})"),
+              "scale_fn": lambda r, phys, off: _Sym(f"scale({phys!r},{off!r})")}
+
+        def kfrag(src, off, kgrp):
+            log.append(f"cvt {off!r}")
+            return _Sym(f"K({off!r})")
+        ns["kfrag"] = kfrag
+        return ns
+
+    def _exec(self, builder, names, ns):
+        nodes = [_inner(builder, n) for n in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), _load.KERNEL_PATH, "exec"), ns)
+
+    def _draft(self, sched, n_tiles):
+        log = []
+        ns = self._ns(log, sched, n_tiles)
+        self._exec("_build_draft_kernel", ("_tile_k", "_tile_mma", "_values"), ns)
+        S = _Sym
+        qf = [S(f"Q{s}") for s in range(4)]
+        out = ns["_values"](S("atom"), S("ksrc"), S("ks"), S("pt"), qf, S("row"), S("req"),
+                            S("req_ok"), S("col0"), S("lane"), S("n_in"), S("kgrp"), S("width"),
+                            S("pages"), S("vis"))
+        return repr(out), log
+
+    def _decg(self, sched, n_tiles):
+        import types
+        log = []
+        ns = self._ns(log, sched, n_tiles)
+        self._exec("_build_decode_group_kernel", ("_pass_values",), ns)
+        S = _Sym
+        pp = types.SimpleNamespace(safe_req=S("req"), req_ok=S("req_ok"), kgrp=S("kgrp"),
+                                   vis_a=S("va"), vis_b=S("vb"), own_a=S("oa"), own_b=S("ob"))
+        cols = [S(f"c{nt}") for nt in range(n_tiles)]
+        offs = [S(f"o{i}") for i in range(2 * n_tiles)]
+        qf = [S(f"Q{s}") for s in range(4)]
+        out = ns["_pass_values"](S("atom"), S("ksrc"), S("ks"), S("pt"), qf, pp, S("col0"), cols,
+                                 offs, S("n_in"), S("columns"), S("width"), S("pages"))
+        return repr(out), log
+
+    @staticmethod
+    def _phases(log):
+        """Collapse the event log to [(kind, tile)] runs: cvt t / mma t / barrier."""
+        out = []
+        for e in log:
+            if e.startswith("barrier"):
+                out.append("|")
+                continue
+            kind = e.split()[0]
+            if not out or out[-1] != kind:
+                out.append(kind)
+        return out
+
+    def test_draft_variants_identical_dataflow(self):
+        for n_tiles in (2, 4):                         # w32 tdm, w64 (raw default / COLS=64)
+            ref, ref_log = self._draft("base", n_tiles)
+            self.assertEqual(ref_log.count("barrier 0"), 0)
+            self.assertEqual(sum(e.startswith("mma") for e in ref_log), 4 * n_tiles)
+            for sched in ("qpre", "kall", "kpipe"):
+                got, log = self._draft(sched, n_tiles)
+                self.assertEqual(got, ref, sched)          # same per-tile chains, same wiring
+                self.assertEqual(Counter(log), Counter(ref_log + [e for e in log if e.startswith("barrier")]))
+            _, log = self._draft("kall", n_tiles)
+            self.assertEqual(self._phases(log), ["cvt", "|", "mma", "|"])
+            _, log = self._draft("kpipe", n_tiles)
+            self.assertEqual(self._phases(log), ["cvt", "|"] + ["cvt", "mma", "|"] * (n_tiles - 1)
+                             + ["mma", "|"])
+            _, log = self._draft("qpre", n_tiles)
+            self.assertEqual(self._phases(log), ["cvt", "mma"] * n_tiles)
+
+    def test_decg_kpipe_identical_dataflow(self):
+        for n_tiles in (2, 4):                         # w32 / w64
+            ref, ref_log = self._decg("base", n_tiles)
+            got, log = self._decg("kpipe", n_tiles)
+            self.assertEqual(got, ref)
+            self.assertEqual(Counter(e for e in log if not e.startswith("barrier")), Counter(ref_log))
+            self.assertEqual(log.count("barrier 0"), n_tiles + 1)
+            self.assertEqual(self._phases(ref_log), ["cvt", "mma"] * n_tiles)
+            self.assertEqual(self._phases(log), ["cvt", "|"] + ["cvt", "mma", "|"] * (n_tiles - 1)
+                             + ["mma", "|"])
 
 
 if __name__ == "__main__":

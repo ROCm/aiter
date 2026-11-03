@@ -1,0 +1,408 @@
+{
+ "identity": {
+  "bf16-r16-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "9730c7a27e23ba6d"
+  },
+  "bf16-r16-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "3bfb460b4ea52858"
+  },
+  "bf16-r16-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "9730c7a27e23ba6d"
+  },
+  "bf16-r16-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "3bfb460b4ea52858"
+  },
+  "bf16-r32-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl_tdm",
+   "sha256": "d7c94c5784259c8e"
+  },
+  "bf16-r32-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl_tdm_qp64",
+   "sha256": "6c220f7c8a70da50"
+  },
+  "bf16-r32-persist8-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl_tdm_persist8",
+   "sha256": "4b151a0156eb2876"
+  },
+  "bf16-r32-persist8-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl_tdm_persist8_qp64",
+   "sha256": "987427314bb0565f"
+  },
+  "bf16-r32-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl",
+   "sha256": "2229a6d757e6e0bf"
+  },
+  "bf16-r32-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r32_c64_flydsl_qp64",
+   "sha256": "5871978064523b70"
+  },
+  "bf16-r64-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r64_c64_flydsl_tdm",
+   "sha256": "21c014ac587096f5"
+  },
+  "bf16-r64-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4_r64_c64_flydsl_tdm_qp64",
+   "sha256": "6d1782e2f7bdc12f"
+  },
+  "fp8-r16-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "4065150615a05c98"
+  },
+  "fp8-r16-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "612b8e5c96ad59b3"
+  },
+  "fp8-r16-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "4065150615a05c98"
+  },
+  "fp8-r16-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "612b8e5c96ad59b3"
+  },
+  "fp8-r32-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4_r32_c64_flydsl_tdm_cvtfast",
+   "sha256": "cfe0c11463e0f3f2"
+  },
+  "fp8-r32-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4_r32_c64_flydsl_tdm_cvtfast_qp64",
+   "sha256": "be2694e00bb04e4b"
+  },
+  "fp8-r32-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4_r32_c64_flydsl",
+   "sha256": "a9565e40bb0771cf"
+  },
+  "fp8-r32-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4_r32_c64_flydsl_qp64",
+   "sha256": "79b4e23bb20b8a56"
+  },
+  "bf16-scalar-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_D128_H4_P4_t256_flydsl",
+   "sha256": "c0e01f6d0e72b435"
+  },
+  "bf16-scalar-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_D128_H4_P4_t256_flydsl_qp64",
+   "sha256": "30eccbe76b503466"
+  },
+  "fp8-scalar-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_D128_H4_P4_t256_flydsl",
+   "sha256": "c8808b30382e5856"
+  },
+  "fp8-scalar-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_D128_H4_P4_t256_flydsl_qp64",
+   "sha256": "1752e320bd5f0686"
+  },
+  "draft-bf16-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_draft_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "3c2c7c53f26fff10"
+  },
+  "draft-bf16-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_draft_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "4616d8ab48027e55"
+  },
+  "draft-fp8-tdm-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "2079c957ef60b6a4"
+  },
+  "draft-fp8-tdm-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "96cc51b2a23539a5"
+  },
+  "draft-bf16-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_draft_D128_H4_P4_w64_flydsl_raw",
+   "sha256": "e7d7955172bab6f9"
+  },
+  "draft-bf16-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_draft_D128_H4_P4_w64_flydsl_raw_qp64",
+   "sha256": "a98f642a80d6c6d2"
+  },
+  "draft-fp8-raw-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w64_flydsl_raw",
+   "sha256": "e766f3cf085e36f6"
+  },
+  "draft-fp8-raw-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w64_flydsl_raw_qp64",
+   "sha256": "4334064353ea83d0"
+  },
+  "decode-bf16-64x16-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "9730c7a27e23ba6d"
+  },
+  "decode-bf16-64x16-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "3bfb460b4ea52858"
+  },
+  "decode-fp8-64x16-i32": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm",
+   "sha256": "4065150615a05c98"
+  },
+  "decode-fp8-64x16-qp64": {
+   "equal": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm_qp64",
+   "sha256": "612b8e5c96ad59b3"
+  },
+  "cols64-fp8-off-i32": {
+   "equal_to_default_w32": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm"
+  },
+  "cols64-fp8-off-qp64": {
+   "equal_to_default_w32": true,
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm_qp64"
+  }
+ },
+ "variants": {
+  "asis-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_dbgasis",
+   "sha256": "cb723aca651df5fa",
+   "instructions": 5720,
+   "resources": {
+    "next_free_vgpr": 192,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 22,
+   "pk8": 128,
+   "hazards": {
+    "violations": 31,
+    "asm_violations": 31,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "asis-qp64": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_qp64_dbgasis",
+   "sha256": "5e4ae878c90a6fa3",
+   "instructions": 5752,
+   "resources": {
+    "next_free_vgpr": 192,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 22,
+   "pk8": 128,
+   "hazards": {
+    "violations": 31,
+    "asm_violations": 31,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "nop4-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_dbgnop4",
+   "sha256": "3acb35026b66607b",
+   "instructions": 12376,
+   "resources": {
+    "next_free_vgpr": 192,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 6678,
+   "pk8": 128,
+   "hazards": {
+    "violations": 0,
+    "asm_violations": 0,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "nop4-qp64": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_qp64_dbgnop4",
+   "sha256": "3df1ae4e2f89af30",
+   "instructions": 12408,
+   "resources": {
+    "next_free_vgpr": 192,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 6678,
+   "pk8": 128,
+   "hazards": {
+    "violations": 0,
+    "asm_violations": 0,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "intrin-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_dbgintrin",
+   "sha256": "2b7479425fc32544",
+   "instructions": 5774,
+   "resources": {
+    "next_free_vgpr": 229,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 31,
+   "pk8": 128,
+   "hazards": {
+    "violations": 0,
+    "asm_violations": 0,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "intrin-qp64": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_qp64_dbgintrin",
+   "sha256": "fa656b65474b738d",
+   "instructions": 5807,
+   "resources": {
+    "next_free_vgpr": 229,
+    "next_free_sgpr": 105,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 32,
+   "v_nop": 31,
+   "pk8": 128,
+   "hazards": {
+    "violations": 0,
+    "asm_violations": 0,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "tdmwait-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_dbgtdmwait",
+   "sha256": "d65a4f1a62c10ede",
+   "instructions": 5679,
+   "resources": {
+    "next_free_vgpr": 193,
+    "next_free_sgpr": 72,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 36,
+   "v_nop": 43,
+   "pk8": 128,
+   "hazards": {
+    "violations": 33,
+    "asm_violations": 33,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  },
+  "tdmwait-qp64": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w64_flydsl_tdm_qp64_dbgtdmwait",
+   "sha256": "9c311cfcab87704a",
+   "instructions": 5711,
+   "resources": {
+    "next_free_vgpr": 193,
+    "next_free_sgpr": 72,
+    "group_segment_fixed_size": 36864,
+    "private_segment_fixed_size": 0
+   },
+   "wmma": 64,
+   "tensor_load_to_lds": 32,
+   "s_wait_tensorcnt": 36,
+   "v_nop": 43,
+   "pk8": 128,
+   "hazards": {
+    "violations": 33,
+    "asm_violations": 33,
+    "compiler_violations": 0
+   },
+   "name_ok": true
+  }
+ },
+ "scans": {
+  "dflt/decode-fp8-64x16-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_decg_D128_H4_P4_w32_flydsl_tdm",
+   "wmma": 32,
+   "violations": 28,
+   "asm_violations": 28
+  },
+  "dflt/decode-bf16-64x16-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w32_flydsl_tdm",
+   "wmma": 32,
+   "violations": 0,
+   "asm_violations": 0
+  },
+  "dflt/draft-fp8-tdm-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w32_flydsl_tdm",
+   "wmma": 8,
+   "violations": 15,
+   "asm_violations": 15
+  },
+  "dflt/draft-fp8-raw-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_draft_D128_H4_P4_w64_flydsl_raw",
+   "wmma": 16,
+   "violations": 20,
+   "asm_violations": 20
+  },
+  "dflt/fp8-r32-tdm-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4_r32_c64_flydsl_tdm_cvtfast",
+   "wmma": 160,
+   "violations": 0,
+   "asm_violations": 0
+  },
+  "var/bf16-w64-i32": {
+   "kernel": "qsa_paged_mqa_logits_page4_gfx1250_bf16_decg_D128_H4_P4_w64_flydsl_tdm",
+   "wmma": 64,
+   "violations": 0,
+   "asm_violations": 0
+  }
+ }
+}
