@@ -145,11 +145,19 @@ MB_SM_B = 128
 #: multiple of it; a smaller tile_m is its own flag tile, see s1f_flag_m).
 #: A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+#: Flag tile of a GEMM1 tile_m above FLAG_M that FLAG_M does not divide
+#: (96 = 3 x 32).
+FLAG_M_SMALL = 32
 
 
 def s1f_flag_m(tile_m: int) -> int:
-    """Flag tile rows for a GEMM1 tile: FLAG_M, or the whole tile below it."""
-    return min(int(tile_m), FLAG_M)
+    """Flag tile rows for a GEMM1 tile: the whole tile below FLAG_M, else
+    FLAG_M or, when that does not divide it, FLAG_M_SMALL. An m-tile is whole
+    flag tiles, each of one expert."""
+    t = int(tile_m)
+    if t < FLAG_M:
+        return t
+    return FLAG_M if t % FLAG_M == 0 else FLAG_M_SMALL
 
 
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
