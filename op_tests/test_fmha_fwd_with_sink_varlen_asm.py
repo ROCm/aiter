@@ -548,6 +548,90 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
     }
 
 
+# Attention options _select_gfx1250_fmha_fwd_varlen_asm checks the same way for
+# both kernels.  The gate tests use one sequence of 2 query and 2 key tokens, so
+# max_seqlen_k is 2.  name -> (gate arguments, accepted)
+_ASM_GATE_OPTION_CASES = {
+    "causal": ({"causal": True}, True),
+    "causal, right window 0": ({"causal": True, "window_size_right": 0}, True),
+    "left window >= max_seqlen_k": ({"window_size_left": 2}, True),
+    "non-causal, right window 0": ({"window_size_right": 0}, False),
+    "sliding window": ({"window_size_left": 1}, False),
+    "sink tokens": ({"sink_size": 1}, False),
+    "dropout": ({"dropout_p": 0.1}, False),
+    "soft-cap": ({"logits_soft_cap": 30.0}, False),
+    "no query rows": ({"max_seqlen_q": 0}, False),
+}
+
+
+def _asm_gate_args(case):
+    """Attention-option arguments of the gate for `case`: non-causal plain
+    attention unless the case says otherwise."""
+    args = {
+        "causal": False,
+        "max_seqlen_q": 2,
+        "max_seqlen_k": 2,
+        "window_size_left": -1,
+        "window_size_right": -1,
+        "sink_size": 0,
+        "dropout_p": 0.0,
+        "logits_soft_cap": 0.0,
+        "bias": None,
+        "alibi_slopes": None,
+        "block_table": None,
+        "cu_seqlens_q_padded": None,
+        "cu_seqlens_k_padded": None,
+        "return_softmax": False,
+    }
+    args.update(_ASM_GATE_OPTION_CASES.get(case, ({}, None))[0])
+    return args
+
+
+# name -> served by the bf16 kernel (_select_gfx1250_fmha_fwd_varlen_asm)
+_BF16_GATE_CASES = {
+    "D192x128": True,
+    "D128": True,
+    "D64 with sink logits": True,
+    "D64 without sink logits": False,
+    "D128 with sink logits": False,
+    "D192x128 with sink logits": False,
+    "head dim 256": False,
+    "fp32 descales": False,
+    **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
+}
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_gate(case):
+    """The gate every dispatch site asks must pick the bf16 kernel for exactly what
+    it serves.  Option cases use D192x128.  Not timed: nothing is launched."""
+    if case.startswith("D64"):
+        d, dv = 64, 64
+    elif case.startswith("D128"):
+        d, dv = 128, 128
+    elif case == "head dim 256":
+        d, dv = 256, 256
+    else:
+        d, dv = 192, 128
+    q, k, v, _ = make_varlen_packed([2], 4, 4, d, dv)
+    sink = torch.zeros(4, dtype=dtypes.fp32) if "with sink" in case else None
+    descale = torch.ones(1, dtype=dtypes.fp32) if case == "fp32 descales" else None
+    mha = aiter.ops.mha
+    routed = mha._GFX1250_VARLEN_ASM_BF16 == mha._select_gfx1250_fmha_fwd_varlen_asm(
+        q,
+        k,
+        v,
+        None,
+        sink_ptr=sink,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+        **_asm_gate_args(case),
+    )
+    assert routed == _BF16_GATE_CASES[case], f"{case}: gate returned {routed}"
+    return {"gfx": get_gfx(), "routed to asm": routed}
+
+
 _STRIDED_LAYOUTS = [
     "kv_split",
     "fused_qkv",
@@ -1107,24 +1191,27 @@ def test_fmha_fwd_fp8_varlen_asm_chunked(hq, hk, prefix_lens, chunk_lens, n_ctx)
     return ret
 
 
-_FP8_UNSUPPORTED_CASES = [
-    "supported",
-    "per-head descale",
-    "fp64 descale",
-    "no descale",
-    "head dim 128",
-    "bf16 q",
-    "k token stride 2^24 B",
-    "fp32 out",
-]
+# name -> served by the fp8 kernel (_select_gfx1250_fmha_fwd_varlen_asm)
+_FP8_GATE_CASES = {
+    "supported": True,
+    "per-head descale": False,
+    "fp64 descale": False,
+    "no descale": False,
+    "head dim 128": False,
+    "bf16 q": False,
+    "k token stride 2^24 B": False,
+    "fp32 out": False,
+    "sink logits": False,
+    **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
+}
 
 
 @benchmark()
-def test_fmha_fwd_fp8_varlen_asm_unsupported(case):
-    """The fp8 dispatch gate must refuse what the kernel cannot take
-    ("supported" is the control).  Not timed: nothing is launched."""
+def test_fmha_fwd_fp8_varlen_asm_gate(case):
+    """The gate every dispatch site asks must pick the fp8 kernel for exactly what
+    it serves.  Not timed: nothing is launched."""
     q8, k8, v8, qd, kd, vd, _, _ = make_fp8_varlen([2], [2], 4, 4)
-    out = None
+    out, sink = None, None
     if case == "per-head descale":
         qd = qd.expand(4).contiguous()
     elif case == "fp64 descale":
@@ -1140,10 +1227,21 @@ def test_fmha_fwd_fp8_varlen_asm_unsupported(case):
         k8 = far.as_strided(k8.shape, (1 << 24, 192, 1))
     elif case == "fp32 out":
         out = torch.empty(2, 4, 128, dtype=dtypes.fp32)
-    routed = aiter.ops.mha._fmha_fp8_varlen_asm_operands_ok(
-        q8, k8, v8, qd, kd, vd, out=out
+    elif case == "sink logits":
+        sink = torch.zeros(4, dtype=dtypes.fp32)
+    mha = aiter.ops.mha
+    routed = mha._GFX1250_VARLEN_ASM_FP8 == mha._select_gfx1250_fmha_fwd_varlen_asm(
+        q8,
+        k8,
+        v8,
+        out,
+        sink_ptr=sink,
+        q_descale=qd,
+        k_descale=kd,
+        v_descale=vd,
+        **_asm_gate_args(case),
     )
-    assert routed == (case == "supported"), f"{case}: gate returned {routed}"
+    assert routed == _FP8_GATE_CASES[case], f"{case}: gate returned {routed}"
     return {"gfx": get_gfx(), "routed to asm": routed}
 
 
@@ -1331,6 +1429,10 @@ def main():
             "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
+        summarize(
+            "bf16 gate",
+            [test_fmha_fwd_with_sink_varlen_asm_gate(c) for c in _BF16_GATE_CASES],
+        )
 
         # ---- D192x128 strided q/k/v/out ----
         if 192 in args.head_dim:
@@ -1401,11 +1503,8 @@ def main():
                 [test_fmha_fwd_fp8_varlen_asm_chunked(*s) for s in _FP8_CHUNKED_SHAPES],
             )
         summarize(
-            "fp8 D192x128 unsupported",
-            [
-                test_fmha_fwd_fp8_varlen_asm_unsupported(c)
-                for c in _FP8_UNSUPPORTED_CASES
-            ],
+            "fp8 D192x128 gate",
+            [test_fmha_fwd_fp8_varlen_asm_gate(c) for c in _FP8_GATE_CASES],
         )
         summarize(
             "fp8 D192x128 perf",
