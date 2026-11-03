@@ -765,10 +765,9 @@ struct PackedMhaV4Shapes
 // Point the kernel's LSE slots at `lse`, or leave the launch writing no LSE when it is nullopt.
 //
 // The kernel writes row (b, h) as seqlen_q unit-stride floats at ptr_lse + (b * nhead_q + h) *
-// s_lse_Hs, and writes nothing past seqlen_q. So the rows must be unit-stride float32 and the batch
-// stride is not independently settable: a tensor whose batch stride is not nhead_q * head stride
-// would have its heads written over each other. A contiguous [batch, nhead_q, seqlen_q] tensor
-// satisfies both.
+// s_lse_Hs, and writes nothing past seqlen_q. The batch stride is therefore not independently
+// settable, and a head stride below seqlen_q -- an expanded view's 0, say -- writes the rows over
+// each other. Only a contiguous [batch, nhead_q, seqlen_q] tensor is safe on every count.
 void set_lse_kernarg(FmhaV4Kernarg& args,
                      const std::optional<at::Tensor>& lse,
                      const fmha_v4_fwdConfig& cfg,
@@ -805,11 +804,12 @@ void set_lse_kernarg(FmhaV4Kernarg& args,
                 seqlen_q,
                 "], got ",
                 t.sizes());
-    TORCH_CHECK(t.stride(2) == 1, mode_name, " MHA v4 LSE rows must be unit-stride");
-    TORCH_CHECK(t.stride(0) == nhead_q * t.stride(1),
+    TORCH_CHECK(t.is_contiguous(),
                 mode_name,
-                " MHA v4 LSE batch stride must be nhead_q * head stride; the kernel derives the "
-                "batch offset from the head stride and cannot honour an independent one");
+                " MHA v4 LSE must be contiguous, got strides ",
+                t.strides(),
+                "; the kernel derives every row's offset from the head stride, so any other "
+                "layout writes rows over each other or into the wrong place");
 
     args.ptr_lse.value  = t.data_ptr();
     args.s_lse.value    = 1;

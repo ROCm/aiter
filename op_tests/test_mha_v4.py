@@ -1495,6 +1495,48 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
         )
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+def test_mha_v4_packed_rejects_overlapping_lse_views():
+    """An expanded [1, 1, Sq] buffer has strides [0, 0, 1], so every (batch, head) row would write
+    the same Sq floats. The dense and the sparse launch must both refuse it, and still take a
+    contiguous buffer of the same shape."""
+    batch, heads, sequence = 2, 3, 256
+    q = torch.randn(
+        (batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    fp8, per_tensor = AttentionFormat.FP8, AttentionScaleMode.F32_PER_TENSOR
+    q_tile, kv_tile = 256, 128
+    mask = torch.ones(
+        (batch, heads, sequence // q_tile, sequence // kv_tile),
+        device="cuda",
+        dtype=torch.bool,
+    )
+    indices, start, count = block_attn_mask_to_ragged_lut(
+        mask, num_heads=heads, return_none_if_dense=False
+    )
+    sparse = {
+        "kv_block_indices": indices,
+        "lut_start": start,
+        "lut_count": count,
+        "block_tile": (q_tile, kv_tile),
+    }
+
+    def launch(lse, **lut):
+        args = (q, q, q, scale, scale, scale, fp8, fp8, fp8, per_tensor, per_tensor)
+        mha_v4_packed(*args, per_tensor, lse=lse, return_lse=True, **lut)
+        torch.cuda.synchronize()
+
+    overlapping = torch.empty((1, 1, sequence), device="cuda").expand(
+        batch, heads, sequence
+    )
+    assert overlapping.stride() == (0, 0, 1)
+    for lut in ({}, sparse):
+        with expect_raises(RuntimeError, match="LSE must be contiguous"):
+            launch(overlapping, **lut)
+        launch(torch.empty((batch, heads, sequence), device="cuda"), **lut)
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
