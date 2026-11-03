@@ -9,8 +9,8 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.typing import Int32
+from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -286,6 +286,129 @@ def build_moe_topids_to_rows_lds_module(n_buckets: int):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_topids_to_rows.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_topids_to_rows
+
+
+def build_moe_topids_to_rows_block_counts_module(n_buckets: int):
+    """Route with per-workgroup histograms, without a global counter fill.
+
+    Every workgroup writes its complete ``(n_buckets,)`` histogram to
+    ``block_counts`` and encodes each route with its workgroup-local rank.  A
+    following prefix/remap kernel combines the block histograms in block-index
+    order.  This removes the zero-fill required by the device-atomic router
+    while retaining one route thread per input.
+    """
+    tp_route_bucket_capacity(n_buckets)
+    capacity = n_buckets
+    wave_size = 32
+    num_waves = BLOCK_THREADS // wave_size
+
+    @fx.struct
+    class TpRouteWaveCntStorage:
+        cnt: fx.Array[fx.Int32, capacity * num_waves, 16]
+
+    storage = TpRouteWaveCntStorage
+
+    @flyc.kernel(
+        name="moe_route_lds_nofill",
+        known_block_size=[BLOCK_THREADS, 1, 1],
+    )
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        block_counts: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+    ):
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        route = bid * BLOCK_THREADS + tid
+        wave_counts = fx.SharedAllocator().allocate(storage).peek().cnt.ptr
+        wave = tid // wave_size
+        lane = fx.Int32(tid % wave_size)
+        for i in range(
+            tid,
+            fx.Uint32(capacity * num_waves),
+            BLOCK_THREADS,
+        ):
+            wave_counts[i] = fx.Int32(0)
+        gpu.barrier()
+
+        in_range = route < fx.Uint32(numel)
+        expert = fx.Int32(-1)
+        if in_range:
+            expert = fx.Int32(ptr_buf_tensor(topk_ids)[route])
+        kept = (expert >= 0) & (expert < n_buckets)
+        local_rank = fx.Uint32(0)
+        if kept:
+            fx.atomic_add(
+                wave_counts + wave * fx.Uint32(capacity) + fx.Uint32(expert),
+                fx.Int32(1),
+                syncscope="workgroup",
+            )
+        # Count equal experts in lower-numbered lanes. The fixed lane order
+        # makes the local route rank independent of atomic issue order.
+        for source_lane in range_constexpr(wave_size):
+            peer_expert = fx.Int32(rocdl.readlane(T.i32, expert, fx.Int32(source_lane)))
+            earlier_match = (
+                kept & (lane > fx.Int32(source_lane)) & (peer_expert == expert)
+            )
+            local_rank = local_rank + earlier_match.select(
+                fx.Uint32(1),
+                fx.Uint32(0),
+            )
+        gpu.barrier()
+
+        if kept:
+            for previous_wave in range(0, wave, 1):
+                local_rank = local_rank + fx.Uint32(
+                    wave_counts[previous_wave * fx.Uint32(capacity) + fx.Uint32(expert)]
+                )
+
+        block_counts_p = ptr_buf_tensor(block_counts)
+        block_base = bid * fx.Uint32(n_buckets)
+        for b in range(tid, fx.Uint32(n_buckets), BLOCK_THREADS):
+            # Every entry is overwritten by its owning workgroup; the workspace
+            # can therefore be torch.empty and needs no initialization launch.
+            count = fx.Int32(0)
+            for source_wave in range_constexpr(num_waves):
+                count = count + wave_counts[fx.Uint32(source_wave * capacity) + b]
+            block_counts_p[block_base + b] = count
+
+        if in_range:
+            row = fx.Int32(DROPPED_ROUTE_ROW)
+            if kept:
+                row = fx.Int32(local_rank + fx.Uint32(expert) * fx.Uint32(max_m))
+            ptr_buf_tensor(topids_to_rows)[route] = row
+
+    @flyc.jit
+    def launch_topids_to_rows(
+        topk_ids: fx.Pointer,
+        block_counts: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(
+            topk_ids,
+            block_counts,
+            topids_to_rows,
+            numel,
+            max_m,
+        ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

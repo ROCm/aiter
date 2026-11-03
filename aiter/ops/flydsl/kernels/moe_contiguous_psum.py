@@ -35,6 +35,7 @@ MAX_EXPERTS_PER_BLOCK = 512
 # correct for any token count. Shared by the plain and the ep_rowmap remap.
 REMAP_NBLK = 256
 EP_REMAP_NBLK = REMAP_NBLK
+ROUTE_BLOCK_THREADS = 256
 
 # Widest E the remap can serve: it keeps one exclusive start per expert in LDS so
 # the scatter never reads them back from global. The bound is LDS, not the
@@ -106,6 +107,20 @@ class _PsumRemapStorage:
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     carry: fx.Array[fx.Int32, 1, 16]
     starts: fx.Array[fx.Int32, MAX_REMAP_EXPERTS, 16]
+
+
+@fx.struct
+class _BlockCountsPsumRemapStorage:
+    """LDS for deterministic block-histogram prefix/remap.
+
+    This path is limited to one expert chunk (E <= 512). ``starts`` is separate
+    from the scan ping-pong arrays so every lane can publish its exclusive
+    prefix before any route consumes it.
+    """
+
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    starts: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
 
 
 # The chunked scan below is written out in both kernels rather than shared:
@@ -414,6 +429,186 @@ def build_moe_contiguous_psum_remap_module():
         },
     }
 
+    return launch_psum_remap
+
+
+def build_moe_block_counts_psum_remap_module():
+    """Combine per-route-block histograms, prefix-sum and remap in one launch.
+
+    The preceding router writes every ``block_counts[route_block, expert]``
+    entry, so neither the histogram workspace nor the final ``masked_m`` needs
+    a standalone fill.  Block prefixes are accumulated in route-block order;
+    this removes the split router's cross-workgroup atomic reservation order
+    from the route-row result.
+    """
+    use_wave_scan = get_rocm_arch().split(":")[0] == "gfx1250"
+    wave_size = 32
+    num_waves = MAX_EXPERTS_PER_BLOCK // wave_size
+
+    @flyc.kernel(
+        name="moe_block_counts_psum_remap",
+        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+    )
+    def psum_remap_kernel(
+        block_counts: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
+        numel: Int32,
+        experts: Int32,
+        route_max_m: Int32,
+        tile_m: Int32,
+        num_route_blocks: Int32,
+    ):
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
+        is_blk0 = bid == 0
+        in_expert = tid < fx.Uint32(experts)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
+
+        lds = fx.SharedAllocator().allocate(_BlockCountsPsumRemapStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
+        starts_lds = lds.starts.ptr
+
+        block_counts_p = ptr_buf_tensor(block_counts)
+        rows_p = ptr_buf_tensor(topids_to_rows)
+        masked_m_p = ptr_buf_tensor(masked_m)
+        starts_p = ptr_buf_tensor(starts)
+        psum_p = ptr_buf_tensor(psum)
+        contiguous_m_p = ptr_buf_tensor(contiguous_m)
+
+        m_e = fx.Uint32(0)
+        if in_expert:
+            for route_block in range(0, fx.Uint32(num_route_blocks), 1):
+                m_e = m_e + fx.Uint32(
+                    block_counts_p[route_block * fx.Uint32(experts) + tid]
+                )
+
+        aligned = fx.Int32(0)
+        if in_expert:
+            aligned = fx.Int32((m_e + tile_minus_1) // tile_v * tile_v)
+
+        if const_expr(use_wave_scan):
+            lane = fx.Int32(tid % wave_size)
+            wave = fx.Int32(tid // wave_size)
+            inclusive = _warp_inclusive_prefix_i32(aligned, lane, wave_size)
+            if lane == fx.Int32(wave_size - 1):
+                lds1[wave] = inclusive
+            gpu.barrier()
+            if wave == fx.Int32(0):
+                active = lane < fx.Int32(num_waves)
+                safe_lane = active.select(lane, fx.Int32(0))
+                wave_total = active.select(lds1[safe_lane], fx.Int32(0))
+                prefix = _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
+                if active:
+                    lds1[lane] = prefix
+            gpu.barrier()
+            prev_wave = (wave > fx.Int32(0)).select(wave - 1, fx.Int32(0))
+            cross = (wave > fx.Int32(0)).select(
+                lds1[prev_wave],
+                fx.Int32(0),
+            )
+            lds0[tid] = inclusive + cross
+            gpu.barrier()
+            src = lds0
+        else:
+            lds0[tid] = aligned
+            gpu.barrier()
+            src = lds0
+            dst = lds1
+            for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+                if const_expr((offset & (offset - 1)) != 0):
+                    continue
+                val = src[tid]
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = src[tid - offset]
+                dst[tid] = val + prev
+                gpu.barrier()
+                src, dst = dst, src
+
+        if in_expert:
+            start = fx.Int32(0)
+            if tid != 0:
+                start = src[tid - 1]
+            starts_lds[tid] = start
+            if is_blk0:
+                masked_m_p[tid] = fx.Int32(m_e)
+                starts_p[tid] = start
+                psum_p[tid] = start + fx.Int32(m_e)
+        gpu.barrier()
+
+        if is_blk0 & (tid == 0):
+            total = fx.Int32(src[MAX_EXPERTS_PER_BLOCK - 1])
+            contiguous_m_p[0] = (total > fx.Int32(tile_v)).select(
+                total,
+                fx.Int32(tile_v),
+            )
+
+        for route in range(
+            gtid,
+            fx.Uint32(numel),
+            fx.Uint32(num_route_blocks) * MAX_EXPERTS_PER_BLOCK,
+        ):
+            row_raw = rows_p[route]
+            if fx.Int32(row_raw) >= 0:
+                row = fx.Uint32(row_raw)
+                route_stride = fx.Uint32(route_max_m)
+                expert = row // route_stride
+                local_rank = row - expert * route_stride
+                route_block = route // ROUTE_BLOCK_THREADS
+                block_base = fx.Uint32(0)
+                for previous_block in range(0, route_block, 1):
+                    block_base = block_base + fx.Uint32(
+                        block_counts_p[previous_block * fx.Uint32(experts) + expert]
+                    )
+                rows_p[route] = fx.Uint32(starts_lds[expert]) + block_base + local_rank
+
+    @flyc.jit
+    def launch_psum_remap(
+        block_counts: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
+        numel: fx.Int32,
+        experts: fx.Int32,
+        route_max_m: fx.Int32,
+        tile_m: fx.Int32,
+        num_route_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        psum_remap_kernel(
+            block_counts,
+            topids_to_rows,
+            masked_m,
+            starts,
+            psum,
+            contiguous_m,
+            numel,
+            experts,
+            route_max_m,
+            tile_m,
+            num_route_blocks,
+        ).launch(
+            grid=(fx.Int64(num_route_blocks), 1, 1),
+            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    launch_psum_remap.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
     return launch_psum_remap
 
 
