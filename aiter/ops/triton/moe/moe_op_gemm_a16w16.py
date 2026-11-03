@@ -78,20 +78,11 @@ def get_kernel_config_gluon(m, n, k, routing_data, apply_swiglu=False):
     # pipeline cannot be deeper than the number of K tiles.
     num_buffers = min(cfg["num_buffers"], triton.cdiv(k, block_k))
 
-    return {
-        "block_m": block_m,
-        "block_n": cfg["block_n"],
-        "block_k": block_k,
-        "num_buffers": num_buffers,
-        "num_subtiles": cfg.get("num_subtiles", 1),
-        "group_m": cfg.get("group_m", 1),
-        "num_ctas": cfg.get("num_ctas", 1),
-        "cluster_split": cfg.get("cluster_split", "auto"),
-        "num_warps": cfg["num_warps"],
-        "xcd_swizzle": 1,
-        "split_k": 1,
-        "waves_per_eu": 0,
-    }
+    config = dict(cfg)
+    # block_m comes from routing, and the pipeline cannot be deeper than K.
+    config["block_m"] = block_m
+    config["num_buffers"] = num_buffers
+    return config
 
 
 def moe_gemm_a16w16(

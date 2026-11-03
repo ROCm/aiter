@@ -145,3 +145,33 @@ def test_rejects_non_contiguous_weights(device="cuda"):
         moe_gemm_a16w16(
             x, w_bad, routing_data=rdata, gather_indx=gindx, scatter_indx=sindx
         )
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_out_dtype(out_dtype, device="cuda"):
+    """The result must come back in the requested dtype, not always bf16."""
+    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
+        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
+
+    m, n, k, n_expts_tot, n_expts_act = 256, 512, 512, 8, 2
+    torch.manual_seed(0)
+    rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, False, False, device
+    )
+    x, w, _, _ = init_compute_data(
+        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
+    )
+
+    ref_y = moe_gemm_torch(x, w, None, rdata, gindx, sindx, None, False)
+    tri_y = moe_gemm_a16w16(
+        x,
+        w,
+        routing_data=rdata,
+        gather_indx=gindx,
+        scatter_indx=sindx,
+        apply_swiglu=False,
+        out_dtype=out_dtype,
+    )
+
+    assert tri_y.dtype == out_dtype
+    assert_close(ref_y.to(out_dtype), tri_y, description=f"a16w16 {out_dtype}")
