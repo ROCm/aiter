@@ -286,9 +286,7 @@ def shuffle_scale_n32k4(
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
     if k_scale % 2 != 0:
-        raise ValueError(
-            f"B-scale K//32 must be even (K%64==0), got {k_scale}"
-        )
+        raise ValueError(f"B-scale K//32 must be even (K%64==0), got {k_scale}")
     if k_scale % 4 != 0:
         # K % 128 == 64: the weights keep their half-k128 tail unpadded, and only
         # the scales round up to a whole k128 with a finite e8m0 (1.0) that the

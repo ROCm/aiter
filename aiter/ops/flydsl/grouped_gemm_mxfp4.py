@@ -131,20 +131,6 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
-# Split-K scratch: 1024 per-tile arrival counters (the kernel re-arms each to
-# zero) followed by fp32 partial tiles. Kept per device and only grown, so a
-# warm call allocates nothing and stays CUDA-graph safe.
-_SPLITK_COUNTERS = 1024
-_SPLITK_WS: dict = {}
-
-
-def _splitk_workspace(device, nbytes: int) -> torch.Tensor:
-    ws = _SPLITK_WS.get(device)
-    if ws is None or ws.numel() * 4 < nbytes:
-        ws = torch.zeros((nbytes + 3) // 4, dtype=torch.int32, device=device)
-        _SPLITK_WS[device] = ws
-    return ws
-
 
 def flydsl_grouped_gemm_a8w4_masked(
     out,
@@ -191,7 +177,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
-    split_k=1,
     k_waves=1,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
@@ -231,22 +216,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
-    split_k = int(
-        os.environ.get(f"AITER_FLYDSL_SPLIT_K{1 if stage1_act else 2}", split_k)
-    )
-    if split_k > 1 and (k_tiles % split_k or K % tile_k):
-        split_k = 1
-    k_waves = int(
-        os.environ.get(f"AITER_FLYDSL_K_WAVES{1 if stage1_act else 2}", k_waves)
-    )
-    if k_waves > 1 and (
-        split_k > 1
-        or k_tiles % k_waves
-        or K % tile_k
-        or stage2_scatter is not None
-    ):
+    k_waves = int(k_waves)
+    if k_waves > 1 and (k_tiles % k_waves or K % tile_k or stage2_scatter is not None):
         k_waves = 1
-    num_buffers = min(num_buffers, max(1, k_tiles // split_k // k_waves))
+    num_buffers = min(num_buffers, max(1, k_tiles // k_waves))
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:
@@ -260,16 +233,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         out if quant_scale is None else quant_scale.view(torch.uint8)
     ).view(-1)
     n_tiles = (N + tile_n - 1) // tile_n
-    splitk_ws = None
-    if split_k > 1:
-        tiles = (contiguous_m + tile_m - 1) // tile_m * n_tiles
-        if tiles > _SPLITK_COUNTERS:
-            split_k = 1
-            num_buffers = min(num_buffers, max(1, k_tiles))
-        else:
-            splitk_ws = _splitk_workspace(
-                out.device, 4 * (_SPLITK_COUNTERS + tiles * split_k * tile_m * tile_n)
-            )
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     stage = 1 if stage1_act else 2
@@ -291,8 +254,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers = (
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
-    if split_k > 1 or k_waves > 1:
-        # Split-K owns the grid: no clusters, no persistent workers, no As prologue.
+    if k_waves > 1:
+        # k_waves owns the grid: no clusters, no persistent workers, no As prologue.
         cluster_n = cluster_m = 1
         persistent_workers = 0
         tdm_as_in_prologue = 0
@@ -357,7 +320,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers,
         rolled_drain,
         int(a_preshuffled),
-        int(split_k),
+        k_waves,
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
@@ -382,8 +345,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
-        splitk_ws if splitk_ws is not None else out.view(-1),
-        int(k_waves),
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -391,7 +352,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
-            int(k_waves),
         ),
     )
     return out

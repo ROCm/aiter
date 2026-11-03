@@ -661,8 +661,6 @@ def _grouped_a8w4_tdm_moe(
     a_preshuffle=0,
     persistent_workers=0,
     persistent_workers2=0,
-    split_k1=1,
-    split_k2=1,
     k_waves1=1,
     k_waves2=1,
     data_format="a8w4",
@@ -744,6 +742,11 @@ def _grouped_a8w4_tdm_moe(
     # 256-wide default at inter_dim=576 (N=1152), to one that divides N.
     tile_n, n_warp = _fit_tile_n(2 * inter_dim, tile_n, n_warp)
     tile_n2, n_warp2 = _fit_tile_n(model_dim, tile_n2, n_warp2)
+    # A half-k128 K tail (inter_dim % 128 == 64) only runs with a k128 tile.
+    if model_dim % 128:
+        tile_k = 128
+    if inter_dim % 128:
+        tile_k2 = 128
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
@@ -1229,7 +1232,6 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
-            split_k=split_k1,
             k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1271,7 +1273,6 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
-            split_k=split_k1,
             k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1323,7 +1324,6 @@ def _grouped_a8w4_tdm_moe(
         tdm_b_th=tdm_b_th,
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
-        split_k=split_k2,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
     )
@@ -1412,7 +1412,6 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
-                        split_k=split_k1,
                         k_waves=k_waves1,
                         **_situ_kw,
                     ),
@@ -1456,7 +1455,6 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
-                        split_k=split_k1,
                         k_waves=k_waves1,
                         **_situ_kw,
                     ),
@@ -1497,7 +1495,6 @@ def _grouped_a8w4_tdm_moe(
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
-                    split_k=split_k2,
                     k_waves=k_waves2,
                 ),
             )
@@ -1807,8 +1804,6 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
-            _tdm_kw["split_k1"] = _as_int(cfg_row.get("split_k1"), 1)
-            _tdm_kw["split_k2"] = _as_int(cfg_row.get("split_k2"), 1)
             _tdm_kw["k_waves1"] = _as_int(cfg_row.get("k_waves1"), 1)
             _tdm_kw["k_waves2"] = _as_int(cfg_row.get("k_waves2"), 1)
             # Follow the matched CSV bucket, including padded token counts
