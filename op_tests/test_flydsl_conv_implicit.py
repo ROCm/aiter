@@ -745,6 +745,15 @@ _SPLITK_CASES = (
 
 def check_splitk_contract(dtype):
     """What a caller asks for must be what the kernel is compiled with."""
+    if not get_gfx().startswith("gfx1250"):
+        # The shared resolver and the compile hook below belong to the gfx1250
+        # backend; on gfx950 the same shapes take the MFMA path, whose split-K
+        # is derived inside _implicit_param_from_problem.
+        aiter.logger.info(
+            "split-K contract is gfx1250-specific; skipping on %s", get_gfx()
+        )
+        return []
+
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl import conv3d_gfx1250, conv_kernels
 
