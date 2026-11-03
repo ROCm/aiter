@@ -24,7 +24,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
+from flydsl.expr import arith, const_expr, range_constexpr, tdm_ops
 from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
@@ -155,6 +155,8 @@ def _make_combine_fused_reduce(
     quant_bits=0,
     tokens_per_block=2,
     chunks_per_iter=4,
+    mask_invalid_routes=0,
+    experts=0,
 ):
     """Stage B of the GEMM2-fused scatter combine: the per-token topk sum.
 
@@ -296,6 +298,7 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_topk_ids: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -405,14 +408,14 @@ def _make_combine_fused_reduce(
             """-- global -> LDS: T*topk slot rows, one copy per wire plane --
 
             ``live`` false means the work item does not exist -- the prefetch on
-            a block's last trip, or the literal ``False`` used to pad the
-            prologue. The copy is still issued, because every iteration must
-            contribute the same amount to tensorcnt for the wait below to be a
-            constant, but it shrinks to a single row so it costs nothing. Its
+            a block's last trip. The copy is still issued, because every
+            iteration must contribute the same amount to tensorcnt for the
+            wait below to be a constant, but it shrinks to a single row so it
+            costs nothing. Its
             index is pinned in range too, so the address stays valid.
 
-            The prologue's pad is the exception: it is one copy whatever the
-            wire, which is what makes ``WAIT_N`` uniform from trip 0 on.
+            The first trip has no preceding output store and uses one fewer
+            outstanding operation in its wait.
             """
             work = (work > last_work).select(last_work, work)
             tok0, q0 = tile_origin(work)
@@ -465,10 +468,29 @@ def _make_combine_fused_reduce(
                 )
                 fx.copy(atom_sc, gt_sc, lds_scale_view(buf))
 
-        def reduce_tile(buf):
+        def reduce_tile(work, buf):
             """-- dequantize and sum the topk slots out of LDS --"""
             in_idx = ptr_to_idx(in_buf_ptr(buf))
             out_idx = ptr_to_idx(out_buf_ptr(buf))
+            tok0, _ = tile_origin(work)
+
+            def route_value(value, row, k_slot):
+                if const_expr(mask_invalid_routes):
+                    token = tok0 + row
+                    safe_token = (token < cur_rank_num_token).select(token, 0)
+                    ptr_type = fx.PointerType.get(
+                        elem_ty=fx.Int32.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=4,
+                    )
+                    ids = fx.inttoptr(ptr_type, addr_topk_ids)
+                    expert = fx.ptr_load(ids + safe_token * topk + k_slot)
+                    live = (token < cur_rank_num_token) & (expert >= 0) & (expert < experts)
+                    bits = Vec.from_elements([live.select(fx.Int32(-1), fx.Int32(0))] * 8)
+                    # Mask bits after conversion: multiplying a poisoned NaN
+                    # slot by zero would still make the live result NaN.
+                    return (value.bitcast(fx.Int32) & bits).bitcast(fx.Float32)
+                return value
             for r in range_constexpr(ROUNDS):
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
@@ -497,14 +519,14 @@ def _make_combine_fused_reduce(
                         dw = lds_load_b32(in_idx, sc_dw + k_slot * S_ROW_BYTES)[0]
                         e8m0 = (dw >> sc_sh) & 0xFF
                         for j in range_constexpr(2):
-                            accs[j] = accs[j] + _dequant_pk8(
+                            accs[j] = accs[j] + route_value(_dequant_pk8(
                                 (
                                     [payload[j * 2], payload[j * 2 + 1]]
                                     if quant_bits == 8
                                     else payload[j]
                                 ),
                                 e8m0,
-                            )
+                            ), lane_tok[r], k_slot)
                 else:
                     # No scale plane, so the lane's 16 elements are a plain
                     # 32-byte run: one b128 per accumulator.
@@ -513,7 +535,9 @@ def _make_combine_fused_reduce(
                         row_b = k_slot * P_ROW_BYTES
                         for j in range_constexpr(2):
                             raw = lds_load_b128(in_idx, base_in + row_b + j * 16)
-                            accs[j] = accs[j] + raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            accs[j] = accs[j] + route_value(
+                                raw.bitcast(fx.BFloat16).to(fx.Float32), lane_tok[r], k_slot
+                            )
 
                 out_b = (
                     lane_tok[r] * OUT_ROW_BYTES
@@ -560,16 +584,9 @@ def _make_combine_fused_reduce(
         # Prime buffer 0. bid < block_num, so work // block_num is the trip count
         # and its parity picks the buffer -- trip 0 reads what this load writes.
         issue_load(bid, 0, bid <= last_work)
-        # A trip issues a load then a store, so from trip 1 on there are two
-        # newer TDMs sitting behind the load being waited for. Repeat the prime
-        # so trip 0 carries that depth too and the wait count stays uniform
-        # without peeling the loop.
-        #
-        # It has to be this same load, into this same buffer. ``row_oob`` is the
-        # copy's row extent, and the rows past it land zero-filled, so a short
-        # copy aimed at buffer 1 wipes most of the tile trip 1 is about to read
-        # -- the two copies race, and whichever retires last wins.
-        issue_load(bid, 0, bid <= last_work)
+        # Do not duplicate the prime to equalize the wait count: a duplicate
+        # still in flight after trip 0 can overwrite another wave's trip-2
+        # prefetch into buffer 0. Tensor completion is ordered per wave only.
         for work in range(bid, total_work, block_num):
             buf = (work // block_num) % 2
             nxt = work + block_num
@@ -581,9 +598,17 @@ def _make_combine_fused_reduce(
             # this tile's own load, so its input buffer is readable, and the
             # store from two trips back, which is the one that owned the output
             # buffer about to be rewritten.
-            tdm_ops.tensor_wait(WAIT_N)
+            # Trip 0 has only the next input load behind its current load.
+            # Later trips also have the previous output store. Waiting for
+            # the smaller first-trip count retires every prime before the
+            # workgroup barrier permits cross-wave reuse of input buffer 0.
+            fx.rocdl.s_nop(0)
+            if work == bid:
+                tdm_ops.tensor_wait(WAIT_N - 1)
+            else:
+                tdm_ops.tensor_wait(WAIT_N)
             workgroup_barrier()
-            reduce_tile(buf)
+            reduce_tile(work, buf)
             workgroup_barrier()
             store_tile(work, buf)
         tdm_ops.tensor_wait(0)
@@ -594,11 +619,13 @@ def _make_combine_fused_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         stream=fx.Stream(None),  # noqa: B008
+        addr_topk_ids: Int64 = 0,
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
+            addr_topk_ids,
         ).launch(
             grid=(block_num, 1, 1),
             block=[lanes, 1, 1],

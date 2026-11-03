@@ -67,6 +67,8 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -148,16 +150,24 @@ FLAG_M = 64
 #: a piece start; the claimer owns the pieces that START in its block and
 #: reads up to 31 - block_runs runs past it to find where the last one ends.
 MB_RB = 8
-#: TDM ops in flight: per storer wave (2 storers over the S-slot ring) and for
-#: the loader wave (the per-wave hardware cap is 3).
-MB_ST_INFL = 2
+#: Software issue-to-DONE limits for each storer and the loader wave.
+#: Hardware's 3/wave limit applies only until XACK, not DONE; tensorcnt
+#: can track 63 pending completions (Shader Programming Guide 4.10.8).
+#: The conservative software caps below remain at most three.
+# 0 preserves the slot-limited storer pipeline; 1-3 set an explicit cap.
+MB_ST_INFL = int(os.environ.get("AITER_MEGA_S1F_APRE_STORE_INFLIGHT", "0"))
+if not 0 <= MB_ST_INFL <= 3:
+    raise ValueError("AITER_MEGA_S1F_APRE_STORE_INFLIGHT must be in [0, 3]")
 MB_LD_INFL = 3
 #: Mailbox spins (s_sleep 1 each) before a wait traps.
 MB_SPIN = 1 << 26
 
-#: Producer ring: R = 8 rows x 3840 B per 2-D TDM store, 3 runs in flight
-#: over a 4-slot ring (the ring fits inside the GEMM1 LDS arena).
-S1F_SLOTS = 4
+#: Producer ring: eight rows at the model's wire pitch per 2-D store.
+#: Four slots by default; APRE t256/w2x2/b4 may opt into eight slots.
+#: The producer footprint is covered by the GEMM1 LDS arena/residency guard.
+S1F_SLOTS = int(os.environ.get("AITER_MEGA_S1F_APRE_RING_SLOTS", "4"))
+if S1F_SLOTS not in (4, 8):
+    raise ValueError("AITER_MEGA_S1F_APRE_RING_SLOTS must be 4 or 8")
 S1F_DEPTH = 3
 _MD_STRIDE = 128
 _MD_DESC = 96
@@ -200,6 +210,16 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
 S1F_PRODUCERS = (64, 64, 64, 64)
 S1F_BLOCK_RUNS = (4, 8, 8, 8)
+if "AITER_MEGA_S1F_PRODUCERS" in os.environ:
+    producer_override = int(os.environ["AITER_MEGA_S1F_PRODUCERS"])
+    if producer_override < N_XCC or producer_override % N_XCC:
+        raise ValueError("AITER_MEGA_S1F_PRODUCERS must be a positive multiple of 8")
+    S1F_PRODUCERS = (producer_override,) * 4
+if "AITER_MEGA_S1F_BLOCK_RUNS" in os.environ:
+    runs_override = int(os.environ["AITER_MEGA_S1F_BLOCK_RUNS"])
+    if not 1 <= runs_override <= WAVE - 1 - FLAG_M // PLAN_RUN_ROWS:
+        raise ValueError("AITER_MEGA_S1F_BLOCK_RUNS is outside the mailbox run limit")
+    S1F_BLOCK_RUNS = (runs_override,) * 4
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
@@ -511,6 +531,9 @@ def make_s1f_stage1(
     tile_n=256,
     tile_k=256,
     num_buffers=3,
+    m_warp=1,
+    n_warp=4,
+    a_preshuffled=0,
     run_rows=PLAN_RUN_ROWS,
     depth=S1F_DEPTH,
     block_runs=MB_RB,
@@ -570,7 +593,11 @@ def make_s1f_stage1(
     """
     if WAVE != 32:
         raise ValueError("S1F requires gfx1250 wave32")
-    R, S, D = int(run_rows), S1F_SLOTS, int(depth)
+    _ring_geometry = bool(a_preshuffled and
+                          (int(tile_m), int(tile_n), int(tile_k), int(m_warp),
+                           int(n_warp), int(num_buffers)) == (256, 256, 256, 2, 2, 4))
+    R, S, D = int(run_rows), (S1F_SLOTS if _ring_geometry else 4), int(depth)
+    _st_limit = MB_ST_INFL if _ring_geometry else 0
     if not 1 <= R <= 15:
         raise ValueError(f"run_rows={R} must fit the plan's 4-bit run field")
     if not (1 <= D and S >= D + 1):
@@ -635,11 +662,12 @@ def make_s1f_stage1(
     RBK = int(block_runs)
     assert 1 <= RBK and RBK + FLAG_M // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
-    # Storer w owns the ring slots s % 2 == w and blocks on its oldest
-    # store only with all of them in flight (at most 3 TDM ops per wave):
-    # its next op's slot is then held by its own oldest op, never by one
-    # it would wait for. Fewer in flight, it only polls FULL.
-    ST_CAP = (min(3, (S + 1) // 2), min(3, S // 2))
+    # Storer w owns ring slots s % 2 == w. At the completion cap it
+    # retires its oldest store; the cap never exceeds its owned slots.
+    # At a full ring this frees its own next slot, so forward progress
+    # never depends on the other storer. Below cap it only polls FULL.
+    ST_CAP = (min(_st_limit or 3, (S + 1) // 2),
+              min(_st_limit or 3, S // 2))
     # Live pieces never exceed (records W1 may run ahead) + (ring slots) +
     # (pieces one block starts), so a counter slot is always free again by
     # the time W1 reuses it: W1's reuse wait never depends on itself.
@@ -667,7 +695,8 @@ def make_s1f_stage1(
     MB_FREE = MB_CTL + 32
     MB_RSEQ = MB_CTL + 64
     MB_RCONS = MB_CTL + 68
-    MB_WSEQ = MB_CTL + 48  # records whose rowmap pairs are in
+    # FREE[4:8] occupies offsets 48-63 in an eight-slot ring.
+    MB_WSEQ = MB_CTL + (48 if S == 4 else 80)  # rowmap records ready
     MB_RTOT = MB_CTL + 72
     MB_NBLK = MB_CTL + 76
     MB_PC = MB_CTL + 128
@@ -734,8 +763,8 @@ def make_s1f_stage1(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
+            m_warp=m_warp,
+            n_warp=n_warp,
             out_is_f16=0,
             num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
             a_is_fp4=1,
@@ -746,7 +775,9 @@ def make_s1f_stage1(
             quant_wmma_rep=quant_wmma_rep,
             cluster_n=1,
             cluster_m=1,
-            next_stage_prefetch=0,
+            next_stage_prefetch=int(a_preshuffled and os.environ.get(
+                "AITER_MEGA_S1F_APRE_PREFETCH", "0"
+            ) == "1"),
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
             tdm_b_th=0,
@@ -757,13 +788,16 @@ def make_s1f_stage1(
             ep_destination_stride=0,
             ep_world_size=0,
             ep_quant_bits=0,
-            row_major_ascale=1,
+            row_major_ascale=int(not a_preshuffled),
             a_row_stride_bytes=row_stride,
             a_scale_row_stride_bytes=row_stride,
             lds_soa_load_interleave=0,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=0,
+            a_preshuffled=a_preshuffled,
+            wire_preshuffle=(2 if a_preshuffled and os.environ.get(
+                "AITER_MEGA_S1F_APRE_TDM", "0"
+            ) == "1" else a_preshuffled),
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,
@@ -791,7 +825,7 @@ def make_s1f_stage1(
             )
         kname = (
             f"s1f_stage1_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
-            + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
+            + f"_mb{RBK}i{max(ST_CAP)}l{MB_LD_INFL}"
             + f"_poll{POLL}"
             + (f"_ts{SPAN}" if SPAN != G else "")
             + f"_{g1_name}"

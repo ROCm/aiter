@@ -154,6 +154,8 @@ class _FusedScatterCombine:
                 quant_bits=bits,
                 tokens_per_block=toks,
                 chunks_per_iter=chunks,
+                mask_invalid_routes=1,
+                experts=config.geometry.experts,
             )
         self._sync = _make_combine_fused_sync(
             rank=config.rank,
@@ -194,13 +196,18 @@ class _FusedScatterCombine:
             self.config.rank,
             stream,
         )
-        _run_compiled(
-            self._reduces[quant_bits],
-            res.arena.local_ptr("comb_inp"),
-            res.combine_output.data_ptr(),
-            routing.token_count,
-            stream,
-        )
+        # An empty source still participates in the cross-device barrier and
+        # may have computed rows for its peers. There are no local slots to
+        # reduce, and an empty top-k tensor can have a null data pointer.
+        if routing.token_count:
+            _run_compiled(
+                self._reduces[quant_bits],
+                res.arena.local_ptr("comb_inp"),
+                res.combine_output.data_ptr(),
+                routing.token_count,
+                stream,
+                routing.topk_ids.data_ptr(),
+            )
         return res.output(routing.token_count)
 
     def close(self) -> None:

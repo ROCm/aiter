@@ -684,8 +684,13 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    _apre_override = os.environ.get("AITER_TDM_A_PRESHUFFLE")
+    if _apre_override not in (None, ""):
+        if _apre_override not in ("0", "1"):
+            raise ValueError("AITER_TDM_A_PRESHUFFLE must be 0 or 1")
+        a_preshuffle = int(_apre_override)
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
-    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    a_preshuffled = bool(_a_preshuffle_requested)
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -898,7 +903,7 @@ def _grouped_a8w4_tdm_moe(
             }
     _apre_row_to_token = (
         torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
-        if a_preshuffled
+        if a_preshuffled and not _compact
         else None
     )
     _fuse_psum_quant = (
@@ -1085,6 +1090,22 @@ def _grouped_a8w4_tdm_moe(
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
+        if a_preshuffled:
+            if getattr(stage2_scatter, "stage1_a_row_major", False):
+                # Dispatch and GEMM1 share one launch. Do not read the previous
+                # replay's wire here; S1F repacks each stage after its flags land.
+                pass
+            else:
+                from .kernels.mega_moe_gfx1250.compact_preshuffle import (
+                    compact_fp4_preshuffle,
+                )
+
+                a1_payload, a1_scale = compact_fp4_preshuffle(
+                    a1_payload, a1_scale, psum, rows=contiguous_m, k=model_dim,
+                    experts=E, align=_align_m, wmma_rep=wmma_rep,
+                )
+                _a1_wire_stride = 0
+                _row_major_ascale = False
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
         (

@@ -382,7 +382,14 @@ class MegaMoEGfx1250:
         )
         target = ep.prepare(batch, quant_bits)
         if hook is not None and target.scatter is not None:
-            target.scatter = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            target.scatter = dataclasses.replace(
+                target.scatter, stage1_gemm1=hook, stage1_a_row_major=s1f
+            )
+            # Compact compute reads dispatch_context before the scatter arg.
+            # Both must carry the current hook; otherwise every eager call
+            # remains a probe and capture silently keeps separate dispatch/G1.
+            if target.dispatch_context is not None:
+                target.dispatch_context = target.scatter
         expert_out = self._compute(
             batch,
             target,
