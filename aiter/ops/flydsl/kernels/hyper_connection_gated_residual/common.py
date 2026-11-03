@@ -59,6 +59,20 @@ def arch_name(device=None) -> str:
     return get_gfx_runtime()
 
 
+def require_supported_arch(device=None) -> str:
+    """Live arch, or ``NotImplementedError`` if no kernel path was validated on it.
+
+    Every public entry point calls this before dispatch: the skinny decode relies
+    on the gfx942/gfx950 cache policy and the tiled paths on their MFMA shapes.
+    """
+    arch = arch_name(device)
+    if arch not in _MFMA_BF16:
+        raise NotImplementedError(
+            f"two-stage HC gated-residual supports {sorted(_MFMA_BF16)}, got {arch!r}"
+        )
+    return arch
+
+
 def mfma_bf16(arch: str | None = None) -> MfmaConfig:
     """bf16 MFMA shape for ``arch`` (defaults to the live device)."""
     if arch is None:
@@ -107,16 +121,45 @@ def stream_scope(stream: torch.cuda.Stream | int | None, device: torch.device):
     them. ``None`` selects ``device``'s current stream; an ``int`` is a raw
     handle already resolved by an enclosing scope. The raw handle avoids
     constructing a ``torch.cuda.Stream`` per call on the latency-bound path.
+
+    A ``torch.cuda.Stream`` must belong to ``device``. When ``device`` is not the
+    current device the context also makes it current, so launches and
+    temporaries land on the tensors' device.
     """
     if isinstance(stream, int):
         return _NO_SCOPE, stream
+    if stream is not None and stream.device != device:
+        raise ValueError(
+            f"stream is on {stream.device}, but the tensors are on {device}"
+        )
     current = torch._C._cuda_getCurrentRawStream(device.index)
-    if stream is None:
-        return _NO_SCOPE, current
-    raw = stream.cuda_stream
+    raw = current if stream is None else stream.cuda_stream
+    if device.index != torch.cuda.current_device():
+        ctx = contextlib.ExitStack()
+        ctx.enter_context(torch.cuda.device(device))
+        if raw != current:
+            ctx.enter_context(torch.cuda.stream(stream))
+        return ctx, raw
     if raw == current:
         return _NO_SCOPE, raw
     return torch.cuda.stream(stream), raw
+
+
+# The combine/RMS prologue covers a stream with one wave of 8-wide bf16 loads.
+STREAM_DIM_ALIGN = 64 * 8
+
+
+def check_hidden(hidden: int, hc_count: int) -> int:
+    """Return ``stream_dim``; reject widths the combine/RMS prologue cannot tile."""
+    if hc_count <= 0 or hidden % hc_count:
+        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
+    stream_dim = hidden // hc_count
+    if stream_dim % STREAM_DIM_ALIGN:
+        raise ValueError(
+            f"stream_dim=hidden/hc_count={stream_dim} must be a multiple of "
+            f"{STREAM_DIM_ALIGN}"
+        )
+    return stream_dim
 
 
 def check_tensor(

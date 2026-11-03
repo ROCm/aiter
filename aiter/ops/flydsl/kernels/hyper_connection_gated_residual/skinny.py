@@ -17,13 +17,15 @@ owns one output channel and splits its lanes into ``hc`` groups, one stream per
 group, so the ``hc`` low-rank dots reduce together in ``log2(WAVE / hc)`` steps
 instead of one full-wave reduction per stream.
 
-Branch-free by construction: stores that only one wave (or lane) may perform go
-through a buffer view bounded to the tensor, with the other lanes' offsets
-pushed past the end so the hardware drops them.
+Stores that only one wave or lane may perform go through a buffer view bounded
+to the tensor, with the other offsets pushed past the end so the hardware drops
+them. The partial stores and the arrival atomic take global addresses, so they
+run under a lane-0 branch.
 """
 
 import math
 import os
+from collections import OrderedDict
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -53,6 +55,9 @@ CPOL_AGENT = 0x10
 DOWN_VEC = 8  # bf16 per 16-byte load
 UP_VEC = 4
 PART_M = 4  # partial slots per column; bounds m_rows
+# i32 per arrival slot: one 128-byte line each, so columns' atomics don't
+# serialize on a shared line.
+COUNTER_STRIDE = 32
 
 
 def _bounded(t, elem, n_elems, unit_elems=1):
@@ -119,7 +124,7 @@ def _build_down_fused(
         rrms_out: fx.Tensor,  # [m_rows, hc] f32
         partial: fx.Tensor,  # [hc, n_pad, PART_M] f32
         packed: fx.Tensor,  # [m_rows, n_pad] bf16
-        counters: fx.Tensor,  # [n_pad * WAVE] i32, persistent; one slot set per wave
+        counters: fx.Tensor,  # [m_groups * n_pad * COUNTER_STRIDE] i32, persistent
     ):
         tid = fx.thread_idx.x
         wid = tid // WAVE
@@ -226,48 +231,52 @@ def _build_down_fused(
                 for cc in range_constexpr(cols_per_wave):
                     acc[cc][m] = acc[cc][m] + fx.gpu.shuffle_xor(acc[cc][m], off, WAVE)
 
+        # After the butterfly every lane holds the same rstd and dots, so lane 0
+        # alone stores them and arrives.
+        is_lane0 = lane == fx.Int32(0)
         rstds = []
         for m in range_constexpr(m_rows):
             gm = m_base + m
             rstd = fmath.rsqrt(sq[m] * fx.Float32(inv_hs) + fx.Float32(eps))
             buf_copy_store(
                 rrms_t,
-                is_n0.select(gm * hc_count + s, fx.Int32(rrms_elems)),
+                (is_n0 & is_lane0).select(gm * hc_count + s, fx.Int32(rrms_elems)),
                 rstd,
                 elem=fx.Float32,
             )
             rstds.append(rstd)
-        for cc in range_constexpr(cols_per_wave):
-            alldots = [acc[cc][m] * rstds[m] for m in range_constexpr(m_rows)]
-            for ch in range_constexpr(n_chunks):
-                dots = [
-                    alldots[ch * PART_M + mm]
-                    for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M))
-                ]
-                for _ in range_constexpr(PART_M - len(dots)):
-                    dots.append(fx.Float32(0.0))
-                av_store_b128(
-                    part_addr(
-                        mg * part_group_elems
-                        + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M
-                    ),
-                    fx.Vector.from_elements(dots, dtype=fx.Float32),
-                )
 
         # Partials are written with agent-scope AV stores, and the acq_rel
         # arrival RMW is tagged amdgcn-av:none, so it orders them without L2
         # maintenance. The partial loads below are raw sc1 buffer loads rather
         # than AV loads: visibility on that side relies on the gfx942/gfx950
-        # cache policy, not on the LLVM memory model.
-        #
-        # One counter per lane of a column, so lanes don't contend on an address.
-        # Every lane of the last-arriving wave sees hc-1 (mod hc) on its own slot.
+        # cache policy, not on the LLVM memory model. Only lane 0 arrives and
+        # only lane 0 of the last wave writes, so the lane that acquires is the
+        # lane whose loads reach ``packed``.
         slot = fx.Int64(fx.ptrtoint(fx.get_iter(counters))) + fx.Int64(
-            (mg * n_pad + grp) * WAVE + lane
+            (mg * n_pad + grp) * COUNTER_STRIDE
         ) * fx.Int64(4)
-        arrival = fx.Int32(atomic_add_agent_acq_rel_av_none(slot, fx.Int32(1)))
+        arrival = fx.Int32(0)
+        if is_lane0:
+            for cc in range_constexpr(cols_per_wave):
+                alldots = [acc[cc][m] * rstds[m] for m in range_constexpr(m_rows)]
+                for ch in range_constexpr(n_chunks):
+                    dots = [
+                        alldots[ch * PART_M + mm]
+                        for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M))
+                    ]
+                    for _ in range_constexpr(PART_M - len(dots)):
+                        dots.append(fx.Float32(0.0))
+                    av_store_b128(
+                        part_addr(
+                            mg * part_group_elems
+                            + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M
+                        ),
+                        fx.Vector.from_elements(dots, dtype=fx.Float32),
+                    )
+            arrival = fx.Int32(atomic_add_agent_acq_rel_av_none(slot, fx.Int32(1)))
         is_last = (arrival & fx.Int32(hc_count - 1)) == fx.Int32(hc_count - 1)
-        writer = is_last & (lane == fx.Int32(0))
+        writer = is_last & is_lane0
 
         for cc in range_constexpr(cols_per_wave):
             n = n0 + cc
@@ -486,7 +495,13 @@ def skinny_supported(
     )
 
 
-_COUNTERS: dict[tuple[int | None, int, int, int, int], torch.Tensor] = {}
+# Arrival-counter sets, least recently used first. Sets referenced by a captured
+# CUDA graph are pinned; the others are bounded by _MAX_COUNTER_SETS.
+_COUNTERS: OrderedDict[tuple[int | None, int, int, int, int], torch.Tensor] = (
+    OrderedDict()
+)
+_PINNED_COUNTERS: set[tuple[int | None, int, int, int, int]] = set()
+_MAX_COUNTER_SETS = 64
 
 
 def _counters(
@@ -500,13 +515,34 @@ def _counters(
     # never mix. Calls on one stream are serialized; separate streams need
     # separate storage so concurrently active invocations cannot race.
     # ``stream`` is the raw handle of the current stream (see ``stream_scope``),
-    # so the zero-fill is ordered before the first launch that uses it.
+    # so the zero-fill is ordered before the first launch that uses it, and an
+    # evicted set returns to the allocator in that stream's order: no launch
+    # still in flight can see it reused.
     key = (device.index, n_pad, m_groups, hc_count, stream)
     c = _COUNTERS.get(key)
     if c is None:
-        c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
+        c = torch.zeros(
+            m_groups * n_pad * COUNTER_STRIDE, dtype=torch.int32, device=device
+        )
         _COUNTERS[key] = c
+        unpinned = [k for k in _COUNTERS if k not in _PINNED_COUNTERS]
+        for old in unpinned[: max(0, len(unpinned) - _MAX_COUNTER_SETS)]:
+            del _COUNTERS[old]
+    else:
+        _COUNTERS.move_to_end(key)
+    if torch.cuda.is_current_stream_capturing():
+        _PINNED_COUNTERS.add(key)
     return c
+
+
+def release_counters() -> None:
+    """Drop every cached arrival-counter set, including graph-pinned ones.
+
+    Call only when no skinny launch is in flight and no captured graph that
+    used the skinny decode will be replayed.
+    """
+    _COUNTERS.clear()
+    _PINNED_COUNTERS.clear()
 
 
 def skinny_two_kernel(

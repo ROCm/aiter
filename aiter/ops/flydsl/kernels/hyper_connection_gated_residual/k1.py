@@ -45,10 +45,12 @@ from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
+    check_hidden,
     check_norm_weight,
     check_tensor,
     mfma_bf16,
     norm_weight_f32,
+    require_supported_arch,
     stream_scope,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
@@ -75,12 +77,14 @@ def _build_down_norm_pipe(
     mma_n: int,
     mma_k: int,
     fold_w: bool = False,
+    w_lds: bool = True,
     _skip_norm: bool = False,
 ):
     """Async-LDS pipelined down+inject GEMM with the norm folded into the A-load.
 
     ``_skip_norm`` is diagnostic and produces invalid output by omitting the
-    A-transform.
+    A-transform. ``w_lds=False`` reads a shared ``(1+w)`` from global memory
+    instead of staging it, for widths whose weight does not fit beside the panels.
 
     A separate combine/RMS prologue emits ``r2`` and ``rrms``. This kernel forms
     ``xn = r2*rrms*(1+w)`` while loading A and reduces K through an async
@@ -128,10 +132,12 @@ def _build_down_norm_pipe(
         block_m * block_k >= block_threads * 8
     ), "async-LDS pipe needs block_m*block_k >= block_threads*async_vec"
     k_tiles = hidden // block_k
+    # The prologue preloads stages-1 tiles before the main loop.
+    assert k_tiles >= stages - 1, f"k_tiles={k_tiles} too short for stages={stages}"
     # Stage (1+w) in LDS only for an unfolded shared [stream_dim] weight. A full
     # [hidden] weight does not fit alongside the A/B panels at large M. Folded
     # weights need no staging because (1+w) is already baked into w_dn.
-    stage_w = (not fold_w) and w_len != hidden
+    stage_w = w_lds and (not fold_w) and w_len != hidden
     assert not stage_w or w_len % block_threads == 0
     w_stage_iters = (w_len // block_threads) if stage_w else 0
     w1_len = w_len if stage_w else 1
@@ -164,7 +170,7 @@ def _build_down_norm_pipe(
 
     @flyc.kernel(
         name=f"gr_downnormpipe_hc{hc_count}_h{hidden}_n{block_n}_s{silu_cols}"
-        f"_bm{block_m}_bk{block_k}_nw{n_waves}_st{stages}",
+        f"_bm{block_m}_bk{block_k}_nw{n_waves}_st{stages}{'' if w_lds else '_wg'}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -424,11 +430,13 @@ def _build_down_norm_partial_pipe(
     mma_n: int,
     mma_k: int,
     fold_w: bool = False,
+    w_lds: bool = True,
 ):
     """Async-LDS pipelined split-K partial.
 
     Each ``grid.y`` workgroup reduces a disjoint K-slice and writes an f32
     partial. The reduction applies SiLU after combining the K-slices.
+    ``w_lds`` is as in :func:`_build_down_norm_pipe`.
     """
     if mma_k == 16:  # gfx942 uses the architecture-specific GEMM helpers.
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.gemm_a16w16_gfx942 import (
@@ -465,7 +473,7 @@ def _build_down_norm_partial_pipe(
     # Stage (1+w) in LDS only for an unfolded shared [stream_dim] weight. A full
     # [hidden] weight does not fit alongside the A/B panels at large M. Folded
     # weights need no staging because (1+w) is already baked into w_dn.
-    stage_w = (not fold_w) and w_len != hidden
+    stage_w = w_lds and (not fold_w) and w_len != hidden
     assert not stage_w or w_len % block_threads == 0
     w_stage_iters = (w_len // block_threads) if stage_w else 0
     w1_len = w_len if stage_w else 1
@@ -494,7 +502,7 @@ def _build_down_norm_partial_pipe(
 
     @flyc.kernel(
         name=f"gr_downnormpartpipe_hc{hc_count}_h{hidden}_np{n_pad}_n{block_n}"
-        f"_bm{block_m}_bk{block_k}_sk{split_k}_st{stages}",
+        f"_bm{block_m}_bk{block_k}_sk{split_k}_st{stages}{'' if w_lds else '_wg'}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -1019,6 +1027,7 @@ def flydsl_k1k2_skinny_decode(
     Inputs must satisfy :func:`validate_k1_inputs`; the op checks them before
     dispatch. ``block_output=None`` normalizes ``residual`` without a combine.
     """
+    require_supported_arch()
     ctx, stream = stream_scope(stream, residual.device)
     with ctx:
         return _skinny_decode(
@@ -1153,6 +1162,7 @@ def _build_combine_rms(
     inj_stride: int = 0,
     combine: bool = True,
     write_r2: bool = True,
+    write_rrms: bool = True,
 ):
     """Prologue for the split-K K1 path: combine + per-stream RMS, emit r2 + rrms.
 
@@ -1160,9 +1170,12 @@ def _build_combine_rms(
     The following GEMM reconstructs ``xn`` while loading A. ``combine=False``
     normalizes ``residual`` as-is (``block_output``/``injection`` are unread);
     ``write_r2=False`` then skips the copy when the GEMM reads ``residual``.
+    ``write_rrms=False`` is the write-only combine: no RMS is computed and
+    ``rrms_out`` is unread.
     """
     assert combine or inj_stride == 0
     assert write_r2 or not combine
+    assert write_rrms or combine
     hidden = hc_count * stream_dim
     assert stream_dim % (WAVE * CHUNK) == 0
     chunks = stream_dim // (WAVE * CHUNK)
@@ -1174,6 +1187,8 @@ def _build_combine_rms(
     istride = inj_stride or hc_count
     stride_tag = f"_is{istride}" if inj_stride else ""
     mode_tag = "" if combine else ("_rms_copy" if write_r2 else "_rms")
+    if not write_rrms:
+        mode_tag = "_norms"
 
     @flyc.kernel(
         name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}{mode_tag}",
@@ -1193,7 +1208,8 @@ def _build_combine_rms(
         y = GTensor(block_output, T.bf16, (1, stream_dim))
         inj = GTensor(injection, T.bf16, (1, hc_count))
         r2 = GTensor(r2_out, T.bf16, (1, hidden))
-        rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
+        if const_expr(write_rrms):
+            rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
 
         if const_expr(combine):
             inj_val = fx.BFloat16(inj.load(tok * istride + stream, vec_size=1)).to(
@@ -1217,15 +1233,17 @@ def _build_combine_rms(
                 comb_bf16 = fx.Vector(r_raw)
             if const_expr(write_r2):
                 r2.store(row_r + off, comb_bf16)
-            comb_r = comb_bf16.to(fx.Float32)
-            for i in range_constexpr(CHUNK):
-                sq = sq + comb_r[i] * comb_r[i]
-        for sh in range_constexpr(log2_wave):
-            sq = sq + fx.gpu.shuffle_xor(sq, WAVE // (2 << sh), WAVE)
-        rstd = fmath.rsqrt(sq * fx.Float32(inv_hs) + fx.Float32(eps))
-        # Every lane has the same rstd. Redundant identical stores avoid
-        # divergent control flow.
-        rrms_g.store(tok * hc_count + stream, rstd, vec_size=1)
+            if const_expr(write_rrms):
+                comb_r = comb_bf16.to(fx.Float32)
+                for i in range_constexpr(CHUNK):
+                    sq = sq + comb_r[i] * comb_r[i]
+        if const_expr(write_rrms):
+            for sh in range_constexpr(log2_wave):
+                sq = sq + fx.gpu.shuffle_xor(sq, WAVE // (2 << sh), WAVE)
+            rstd = fmath.rsqrt(sq * fx.Float32(inv_hs) + fx.Float32(eps))
+            # Every lane has the same rstd. Redundant identical stores avoid
+            # divergent control flow.
+            rrms_g.store(tok * hc_count + stream, rstd, vec_size=1)
 
     @flyc.jit
     def launch(
@@ -1440,11 +1458,12 @@ def _build_down_norm_partial(
     return launch
 
 
-def _k1_auto_split_k(tokens: int, block_m: int, k_tiles: int) -> int:
+def _k1_auto_split_k(tokens: int, block_m: int, k_tiles: int, stages: int = 2) -> int:
     """Choose a K divisor that fills the GPU without excess partial traffic.
 
     Small token grids target up to 256 workgroups and cap split-K at 16.
-    Grids with at least 48 token blocks use the decoupled path.
+    Grids with at least 48 token blocks use the decoupled path. Each K-slice
+    keeps at least ``stages - 1`` tiles for the pipeline prologue.
     """
     grid_m = (tokens + block_m - 1) // block_m
     if grid_m >= 48:
@@ -1452,7 +1471,7 @@ def _k1_auto_split_k(tokens: int, block_m: int, k_tiles: int) -> int:
     target = max(1, min(16, 256 // grid_m))
     best = 1
     for d in range(1, target + 1):
-        if k_tiles % d == 0:
+        if k_tiles % d == 0 and k_tiles // d >= stages - 1:
             best = d
     return best
 
@@ -1463,6 +1482,70 @@ def _decouple_block_n(n_pad: int, preferred: int = 128) -> int:
         if block_n <= preferred and n_pad % block_n == 0:
             return block_n
     return n_pad
+
+
+def _pipe_lds_bytes(stages, block_m, block_n, block_k, w1_len, hc_count):
+    """LDS of the async pipelines' ``Smem`` struct (16-byte aligned arrays)."""
+
+    def _aligned(nbytes):
+        return ((nbytes + 15) // 16) * 16
+
+    return (
+        _aligned(stages * block_m * block_k * 2)
+        + _aligned(stages * block_n * block_k * 2)
+        + _aligned(w1_len * 4)
+        + _aligned(block_m * hc_count * 4)
+    )
+
+
+def _fit_pipe_tile(
+    arch,
+    n_pad,
+    block_n,
+    block_m,
+    block_k,
+    stages,
+    m_waves,
+    n_waves,
+    mma_n,
+    w_len,
+    hc_count,
+    stage_w,
+):
+    """Largest ``(block_n, n_waves, w_lds)`` the async-LDS pipeline can run.
+
+    ``block_n`` is the preferred N tile. Candidates are MMA-aligned divisors of
+    ``n_pad`` no wider than it, whose A/B tiles are whole async loads and whose
+    LDS (A/B panels, staged ``(1+w)``, rrms scratch) fits the device. A shared
+    unfolded ``(1+w)`` (``stage_w``) is staged when some tile fits beside it;
+    otherwise ``w_lds=False`` makes the builder read it from global memory.
+    """
+    cap = get_lds_capacity_bytes(arch)
+    # gfx942 issues 32-bit async loads, gfx950 128-bit ones.
+    async_vec = 2 if arch == "gfx942" else CHUNK
+    start = min(block_n, n_pad) // mma_n * mma_n
+    cands = [bn for bn in range(start, 0, -mma_n) if n_pad % bn == 0]
+    for w_lds in (True, False) if stage_w else (True,):
+        staged = w_lds and stage_w
+        for bn in cands:
+            nw = n_waves
+            while nw > 1 and bn % (nw * mma_n):
+                nw //= 2
+            threads = m_waves * nw * WAVE
+            if bn % (nw * mma_n) or (block_m * block_k) % (threads * async_vec):
+                continue
+            if (bn * block_k) % (threads * async_vec):
+                continue
+            if staged and w_len % threads:
+                continue
+            w1_len = w_len if staged else 1
+            lds = _pipe_lds_bytes(stages, block_m, bn, block_k, w1_len, hc_count)
+            if lds <= cap:
+                return bn, nw, w_lds
+    raise ValueError(
+        f"no K1 pipeline N tile fits {cap} B LDS on {arch}: n_pad={n_pad}, "
+        f"block_m={block_m}, block_k={block_k}, stages={stages}"
+    )
 
 
 def flydsl_k1_combine_norm_down(
@@ -1510,6 +1593,7 @@ def flydsl_k1_combine_norm_down(
     the raw next-injection logits (slice with
     :func:`~...common.split_down_inject`).
     """
+    require_supported_arch()
     validate_k1_inputs(
         residual, block_output, injection, norm_weight, w_dn_merged, lowrank, hc_count
     )
@@ -1558,15 +1642,16 @@ def validate_k1_inputs(
 
     ``block_output``/``injection`` are ``None`` for the no-combine (mix-only)
     variant. ``injection`` may be a column slice with unit inner stride.
+    ``hidden / hc_count`` must be a multiple of
+    :data:`~.common.STREAM_DIM_ALIGN` and ``w_dn_merged`` must have a multiple
+    of 16 rows (one MFMA N tile).
     """
     if residual.ndim != 2 or residual.dtype != torch.bfloat16:
         raise ValueError("residual must be a 2-D bf16 tensor")
     if not residual.is_contiguous():
         raise ValueError("residual must be row-major contiguous")
     tokens, hidden = residual.shape
-    if hc_count <= 0 or hidden % hc_count:
-        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
-    stream_dim = hidden // hc_count
+    stream_dim = check_hidden(hidden, hc_count)
     dev = residual.device
     if (block_output is None) != (injection is None):
         raise ValueError("block_output and injection must both be given or omitted")
@@ -1582,6 +1667,8 @@ def validate_k1_inputs(
     check_tensor("w_dn_merged", w_dn_merged, (n_pad, hidden), dev)
     if n_pad < lowrank:
         raise ValueError(f"w_dn_merged has {n_pad} rows < lowrank={lowrank}")
+    if n_pad % 16:
+        raise ValueError(f"w_dn_merged rows={n_pad} must be a multiple of 16")
 
 
 @lru_cache(maxsize=256)
@@ -1599,10 +1686,9 @@ def _k1_tuned_plan(arch, gemm_tokens, n_pad, hidden, stream_dim):
         return None
     k_tiles = hidden // block_k
     stages = int(plan.get("stages", 2))
-    if plan.get("method") != "decouple":
-        split_k = int(plan.get("split_k", 1))
-        if k_tiles % split_k or k_tiles // split_k < stages - 1:
-            return None
+    split_k = 1 if plan.get("method") == "decouple" else int(plan.get("split_k", 1))
+    if k_tiles % split_k or k_tiles // split_k < stages - 1:
+        return None
     return plan
 
 
@@ -1709,7 +1795,7 @@ def _k1_combine_norm_down(
         sk_block_m = 64 if gemm_tokens % 64 == 0 else block_m
     assert gemm_tokens % sk_block_m == 0
     if split_k == "auto":
-        split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles)
+        split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles, stages)
     use_splitk = isinstance(split_k, int) and split_k > 1
     # split_k=1 separates the memory-bound combine/RMS prologue from the
     # pipelined down GEMM while keeping xn implicit.
@@ -1719,7 +1805,17 @@ def _k1_combine_norm_down(
             f"async-LDS pipeline (stages={stages}) needs block_m*block_k >= "
             f"block_threads*async_vec; got block_m={block_m}, block_k={block_k}"
         )
+    # The async pipelines preload stages-1 K tiles (per K-slice for split-K).
+    k_tiles_slice = k_tiles // split_k if use_splitk else k_tiles
+    if (use_splitk or use_decouple) and k_tiles_slice < stages - 1:
+        raise ValueError(
+            f"stages={stages} needs at least {stages - 1} K tiles per slice; "
+            f"hidden={hidden}, block_k={block_k} and split_k={split_k} give "
+            f"{k_tiles_slice}"
+        )
     w_len = norm_weight.numel()
+    # The pipelines stage an unfolded shared (1+w) in LDS when it fits.
+    stage_w = (not fold_w) and w_len != hidden
     assert (
         gemm_tokens % block_m == 0
     ), f"gemm_tokens={gemm_tokens} must be a multiple of block_m={block_m}"
@@ -1799,6 +1895,21 @@ def _k1_combine_norm_down(
         # Reduce N waves until each wave owns whole MMA columns.
         while _sk_nw > 1 and sk_bn % (_sk_nw * mma.mma_n):
             _sk_nw //= 2
+        if not _gfx942_regp_partial:
+            sk_bn, _sk_nw, sk_w_lds = _fit_pipe_tile(
+                arch,
+                n_pad,
+                sk_bn,
+                sk_block_m,
+                block_k,
+                stages,
+                _sk_mw,
+                _sk_nw,
+                mma.mma_n,
+                w_len,
+                hc_count,
+                stage_w,
+            )
         if _gfx942_regp_partial:
             part = _build_down_norm_partial(
                 hidden,
@@ -1833,6 +1944,7 @@ def _k1_combine_norm_down(
                 mma.mma_n,
                 mma.mma_k,
                 fold_w=fold_w,
+                w_lds=sk_w_lds,
             )
         total = gemm_tokens * n_pad
         # f32 buffer loads are at most 128 bits.
@@ -1859,23 +1971,23 @@ def _k1_combine_norm_down(
         if _dn_bm is None or gemm_tokens % _dn_bm:
             _dn_bm = 64 if gemm_tokens % 64 == 0 else block_m
         assert gemm_tokens % _dn_bm == 0
-        if arch == "gfx942":
-            # A/B panels share gfx942's 64 KiB LDS with norm scratch.
-            stage_weight = (not fold_w) and w_len != hidden
-            w1_len = w_len if stage_weight else 1
-            aux_lds = ((w1_len * 4 + 15) // 16) * 16
-            aux_lds += ((_dn_bm * hc_count * 4 + 15) // 16) * 16
-            fixed_lds = stages * _dn_bm * block_k * 2 + aux_lds
-            bytes_per_n = stages * block_k * 2
-            max_block_n = (get_lds_capacity_bytes(arch) - fixed_lds) // bytes_per_n
-            if _dn_bn > max_block_n:
-                _dn_bn = _decouple_block_n(n_pad, min(_dn_bn, max_block_n))
-            assert _dn_bn <= max_block_n, "decoupled K1 exceeds gfx942 LDS capacity"
         _dn_mw = dn_m_waves if dn_m_waves is not None else 2
         _dn_nw = dn_n_waves if dn_n_waves is not None else 2
-        # Reduce N waves until each wave owns whole MMA columns.
-        while _dn_nw > 1 and _dn_bn % (_dn_nw * mma.mma_n):
-            _dn_nw //= 2
+        # A/B panels share LDS with the staged (1+w) and rrms scratch.
+        _dn_bn, _dn_nw, dn_w_lds = _fit_pipe_tile(
+            arch,
+            n_pad,
+            _dn_bn,
+            _dn_bm,
+            block_k,
+            stages,
+            _dn_mw,
+            _dn_nw,
+            mma.mma_n,
+            w_len,
+            hc_count,
+            stage_w,
+        )
         downpipe = _build_down_norm_pipe(
             hidden,
             n_pad,
@@ -1892,6 +2004,7 @@ def _k1_combine_norm_down(
             mma.mma_n,
             mma.mma_k,
             fold_w=fold_w,
+            w_lds=dn_w_lds,
         )
         fx_stream = fx.Stream(stream)
         _run_compiled(prologue, *prologue_args, rrms, fx_stream)

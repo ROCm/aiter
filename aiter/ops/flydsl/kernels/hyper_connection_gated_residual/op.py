@@ -20,9 +20,11 @@ import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .common import (
+    check_hidden,
     check_norm_weight,
     check_tensor,
     merge_down_inject,
+    require_supported_arch,
     split_down_inject,
     stream_scope,
 )
@@ -245,6 +247,7 @@ def flydsl_gr_two_stage_combine_and_mix(
     :func:`fold_norm_weight`) to keep the fold off the timed path, or let this
     build it. ``fold_w=False`` (default) applies the affine inside K1.
     """
+    require_supported_arch()
     lowrank = w_down.shape[0]
     need_inj = w_inject is not None
     ctx, stream = stream_scope(stream, residual.device)
@@ -296,6 +299,7 @@ def flydsl_gr_two_stage_mix(
     Returns ``(residual, block_input, inj_next)``. The kernels skip the combine,
     so no block output or injection is read and no ``r2`` copy is written.
     """
+    require_supported_arch()
     lowrank = w_down.shape[0]
     need_inj = w_inject is not None
     ctx, stream = stream_scope(stream, residual.device)
@@ -334,17 +338,16 @@ def flydsl_gr_two_stage_combine(
 ) -> torch.Tensor:
     """Write-only combine: inject the pending block output, return ``R2``.
 
-    Runs K1's combine+RMS prologue and keeps only ``r2``. ``norm_weight`` is
-    unused because the combine result is not normalized.
+    Runs K1's combine prologue without the RMS. ``norm_weight`` and ``eps``
+    are unused because the combine result is not normalized.
     """
+    require_supported_arch()
     if residual.ndim != 2 or residual.dtype != torch.bfloat16:
         raise ValueError("residual must be a 2-D bf16 tensor")
     if not residual.is_contiguous():
         raise ValueError("residual must be row-major contiguous")
     tokens, hidden = residual.shape
-    if hc_count <= 0 or hidden % hc_count:
-        raise ValueError(f"hidden={hidden} must be a multiple of hc_count={hc_count}")
-    stream_dim = hidden // hc_count
+    stream_dim = check_hidden(hidden, hc_count)
     dev = residual.device
     check_tensor("block_output", block_output, (tokens, stream_dim), dev)
     check_tensor("injection", injection, (tokens, hc_count), dev, contiguous=False)
@@ -355,15 +358,16 @@ def flydsl_gr_two_stage_combine(
         r2 = torch.empty_like(residual)
         if tokens == 0:
             return r2
-        rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
         inj_stride = injection.stride(0) if tokens > 1 else hc_count
         launch = _build_combine_rms(
             hc_count,
             stream_dim,
-            float(eps),
+            0.0,
             0 if inj_stride == hc_count else inj_stride,
+            write_rrms=False,
         )
+        # The rrms argument is unread without write_rrms; any tensor fills it.
         _run_compiled(
-            launch, residual, block_output, injection, r2, rrms, fx.Stream(stream)
+            launch, residual, block_output, injection, r2, r2, fx.Stream(stream)
         )
     return r2

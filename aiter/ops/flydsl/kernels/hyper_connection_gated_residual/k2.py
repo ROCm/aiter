@@ -30,10 +30,12 @@ from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
+    check_hidden,
     check_norm_weight,
     check_tensor,
     mfma_bf16,
     norm_weight_f32,
+    require_supported_arch,
     stream_scope,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
@@ -315,22 +317,33 @@ def flydsl_up_gate_mix_norm(
     """K2: fused up-GEMM + gated mean that re-forms ``xn`` from ``r2`` + ``rrms``.
 
     Takes K1's stored combined residual and per-stream reciprocal RMS instead of
-    a materialized ``xn``. Returns ``block_input`` [M, stream_dim] bf16.
+    a materialized ``xn``. Returns ``block_input`` [M, stream_dim] bf16, written
+    into ``block_input`` when given.
+
+    Stores are not row-masked: ``M`` must be a multiple of the tile height
+    (64 by default, or ``block_m``). Callers with a row tail pad every input to
+    a multiple of 64 rows and slice the result, as the fused op does.
     """
+    require_supported_arch()
     # lora may be a strided view of K1's packed [M, lowrank+hc] output (the
     # first ``lowrank`` columns). Only the inner (lowrank) dim must be
     # contiguous; a non-unit row stride (= packed width) is read directly, so
     # the fused tail skips a full ``.contiguous()`` copy of lora.
-    assert lora.dtype == torch.bfloat16 and lora.stride(1) == 1
-    assert r2.dtype == torch.bfloat16 and r2.is_contiguous()
-    assert rrms.dtype == torch.float32 and rrms.is_contiguous()
+    if lora.ndim != 2 or lora.dtype != torch.bfloat16 or lora.stride(1) != 1:
+        raise ValueError("lora must be 2-D bf16 with a contiguous inner dimension")
     tokens, lowrank = lora.shape
+    dev = lora.device
+    if r2.ndim != 2 or r2.shape[0] != tokens:
+        raise ValueError(f"r2 must be 2-D with {tokens} rows")
     hidden = r2.shape[1]
-    stream_dim = hidden // hc_count
-    _validate_w_up(w_up, hidden, lowrank, lora.device)
-    check_norm_weight(norm_weight, stream_dim, hidden, lora.device)
-    assert rrms.shape == (tokens, hc_count)
-    ctx, stream = stream_scope(stream, lora.device)
+    stream_dim = check_hidden(hidden, hc_count)
+    check_tensor("r2", r2, (tokens, hidden), dev)
+    check_tensor("rrms", rrms, (tokens, hc_count), dev, dtype=torch.float32)
+    _validate_w_up(w_up, hidden, lowrank, dev)
+    check_norm_weight(norm_weight, stream_dim, hidden, dev)
+    if block_input is not None:
+        check_tensor("block_input", block_input, (tokens, stream_dim), dev)
+    ctx, stream = stream_scope(stream, dev)
     with ctx:
         return _up_gate_mix_norm(
             lora,
@@ -403,7 +416,11 @@ def _up_gate_mix_norm(
         m_waves,
         n_waves,
     )
-    assert tokens % block_m == 0
+    if tokens % block_m:
+        raise ValueError(
+            f"tokens={tokens} must be a multiple of block_m={block_m}; pad the "
+            "rows to a multiple of 64"
+        )
     err = _k2_tile_error(arch, stream_dim, lowrank, block_m, block_n, m_waves, n_waves)
     if err is not None:
         raise ValueError(f"invalid K2 tile {block_m}x{block_n}: {err}")

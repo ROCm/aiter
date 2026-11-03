@@ -621,11 +621,31 @@ def _run_counter_hc_isolation():
         _check_case(case, 4, result, f"counter_stream{index}")
 
 
-def _run_direct_k1_untiled_tokens():
-    """A nearest tuned split-K tile must not overrun a direct M=224 call."""
-    tokens = 224
-    inp = _make_inputs(tokens, seed=18)
-    merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+def _check_direct_k1(inp, merged, hc_count, r2, packed, label):
+    """Compare a direct unfolded K1 call against the oracle."""
+    r2_ref = gr_combine(
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        hc_count,
+        round_bf16=True,
+    )
+    xn = gr_grouped_rmsnorm(r2_ref, inp["norm_weight"], hc_count, EPS)
+    raw = xn.bfloat16().float() @ merged.t().float()
+    lora = raw[:, :LOWRANK] / hc_count
+    lora = lora * torch.sigmoid(lora)
+    _check(r2_ref.to(r2.dtype), r2, f"{label} r2", atol=0.05, rtol=0.02)
+    _check(lora.to(packed.dtype), packed[:, :LOWRANK], f"{label} lora")
+    _check(
+        raw[:, LOWRANK : LOWRANK + hc_count].to(packed.dtype),
+        packed[:, LOWRANK : LOWRANK + hc_count],
+        f"{label} inj",
+        atol=0.05,
+    )
+
+
+def _run_direct_k1(inp, hc_count, label, **kwargs):
+    merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], hc_count)
     r2, packed = flydsl_k1_combine_norm_down(
         inp["residual"],
         inp["block_output"],
@@ -633,29 +653,315 @@ def _run_direct_k1_untiled_tokens():
         inp["norm_weight"],
         merged,
         LOWRANK,
-        HC,
+        hc_count,
         EPS,
+        **kwargs,
     )
     torch.cuda.synchronize()
-    r2_ref = gr_combine(
+    _check_direct_k1(inp, merged, hc_count, r2, packed, label)
+
+
+def _run_direct_k1_untiled_tokens():
+    """A nearest tuned split-K tile must not overrun a direct M=224 call."""
+    _run_direct_k1(_make_inputs(224, seed=18), HC, "direct_k1[M=224]")
+
+
+def _run_wide_stream_lds():
+    """Staged ``(1+w)`` and rrms scratch count against LDS on every arch.
+
+    ``stream_dim=8192`` unfolded makes the M=24576 tuned decoupled tile
+    (128x384x64, 2 stages) need 165,888 B > gfx950's 163,840 B, so the N tile
+    must shrink. ``stream_dim=40960`` cannot stage ``(1+w)`` beside any tile,
+    so both pipelines must read it from global memory instead (on gfx942 the
+    split-K path keeps its register-prefetch kernel, which never stages it).
+    """
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.k1 import (
+        _fit_pipe_tile,
+        _pipe_lds_bytes,
+    )
+
+    arch = get_gfx()
+    cap = get_lds_capacity_bytes(arch)
+    if arch == "gfx950":
+        full = _pipe_lds_bytes(2, 128, 384, 64, 8192, 4)
+        bn, nw, w_lds = _fit_pipe_tile(
+            arch, 384, 384, 128, 64, 2, 4, 2, 16, 8192, 4, True
+        )
+        used = _pipe_lds_bytes(2, 128, bn, 64, 8192 if w_lds else 1, 4)
+        if full <= cap or used > cap or not w_lds:
+            print(f"[FAIL] lds_fit: full={full} fit=({bn},{nw},{w_lds}) used={used}")
+            _FAILURES.append("lds_fit")
+        inp = _make_shape_inputs(24576, 4, 8192, seed=31)
+        _run_combine_and_mix_shape(inp, 4, False, "wide_stream[M=24576,HS=8192]")
+        del inp
+        torch.cuda.empty_cache()
+    # hc_count=2 keeps the [stream_dim] weight distinct from a full [hidden] one.
+    inp = _make_shape_inputs(64, 2, 40960, seed=32)
+    for split_k in (1, "auto"):
+        _run_direct_k1(
+            inp, 2, f"wide_stream_k1[HS=40960][sk={split_k}]", split_k=split_k
+        )
+
+
+def _run_combine_and_mix_shape(inp, hc_count, fold_w, label):
+    merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], hc_count)
+    if fold_w:
+        merged = fold_norm_weight(merged, inp["norm_weight"], hc_count)
+    r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
         inp["residual"],
         inp["block_output"],
         inp["injection"],
-        HC,
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        hc_count,
+        EPS,
+        w_down_merged=merged,
+        fold_w=fold_w,
+    )
+    torch.cuda.synchronize()
+    r2_ref, x_ref, inj_ref = gr_combine_and_mix(
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        hc_count,
+        EPS,
         round_bf16=True,
     )
-    xn = gr_grouped_rmsnorm(r2_ref, inp["norm_weight"], HC, EPS).bfloat16().float()
-    raw = xn @ merged.t().float()
-    lora = raw[:, :LOWRANK] / HC
-    lora = lora * torch.sigmoid(lora)
-    _check(r2_ref.to(r2.dtype), r2, "direct_k1[M=224] r2", atol=0.05, rtol=0.02)
-    _check(lora.to(packed.dtype), packed[:, :LOWRANK], "direct_k1[M=224] lora")
-    _check(
-        raw[:, LOWRANK : LOWRANK + HC].to(packed.dtype),
-        packed[:, LOWRANK : LOWRANK + HC],
-        "direct_k1[M=224] inj",
-        atol=0.05,
+    _check(r2_ref.to(r2.dtype), r2, f"{label} r2", atol=0.05, rtol=0.02)
+    del r2_ref
+    _check(x_ref.to(x.dtype), x, f"{label} x")
+    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"{label} inj", atol=0.05)
+
+
+def _run_pipeline_depth():
+    """Deep pipelines must cover their preload; short K is rejected, not read."""
+    # stream_dim=512, block_k=256 -> 4 K tiles: 5 stages preload exactly 4.
+    inp = _make_shape_inputs(64, 2, 512, seed=33)
+    kwargs = {"split_k": 1, "block_k": 256, "dn_block_m": 32, "use_tuned": False}
+    _run_direct_k1(inp, 2, "pipe_depth[stages=5]", stages=5, **kwargs)
+    merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], 2)
+    for split_k, stages in ((1, 6), (2, 4)):
+        _expect_value_error(
+            f"pipe_depth[sk={split_k}][stages={stages}]",
+            lambda split_k=split_k, stages=stages: flydsl_k1_combine_norm_down(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                merged,
+                LOWRANK,
+                2,
+                EPS,
+                **{**kwargs, "split_k": split_k, "stages": stages},
+            ),
+        )
+
+
+def _run_stream_dim_validation():
+    """A width the prologue cannot tile is a ValueError on every entry point."""
+    hs = HS + 64  # multiple of hc_count but not of 512
+    inp = _make_shape_inputs(4, HC, hs, seed=34)
+    _expect_value_error(
+        "stream_dim[cmix]",
+        _cmix_call(inp, fold_w=False),
     )
+    _expect_value_error(
+        "stream_dim[mix]",
+        lambda: flydsl_gr_two_stage_mix(
+            inp["residual"],
+            inp["norm_weight"],
+            inp["w_down"],
+            inp["w_up"],
+            inp["w_inject"],
+            HC,
+            EPS,
+        ),
+    )
+    _expect_value_error(
+        "stream_dim[combine]",
+        lambda: flydsl_gr_two_stage_combine(
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            HC,
+            EPS,
+        ),
+    )
+
+
+def _run_arch_gating():
+    """Unvalidated architectures are rejected before any dispatch."""
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import common
+
+    inp = _make_inputs(1, seed=35)
+    calls = {
+        "skinny": _cmix_call(inp, fold_w=True),
+        "combine": lambda: flydsl_gr_two_stage_combine(
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            HC,
+            EPS,
+        ),
+    }
+    real = common.arch_name
+    common.arch_name = lambda device=None: "gfx1100"
+    try:
+        for name, fn in calls.items():
+            try:
+                fn()
+            except NotImplementedError:
+                continue
+            print(f"[FAIL] arch_gating[{name}]: expected NotImplementedError")
+            _FAILURES.append(f"arch_gating[{name}]")
+    finally:
+        common.arch_name = real
+
+
+def _run_stream_device_mismatch():
+    """A launch stream on another device is rejected."""
+    if torch.cuda.device_count() < 2:
+        print("[skip] stream_device: needs two visible devices")
+        return
+    inp = _make_inputs(1, seed=36)
+    other = torch.cuda.Stream(device=1)
+    args = (
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        HC,
+        EPS,
+    )
+    _expect_value_error(
+        "stream_device[combine]",
+        lambda: flydsl_gr_two_stage_combine(*args, stream=other),
+    )
+
+
+def _run_counter_cache_bound():
+    """Transient streams must not grow the skinny counter cache without bound."""
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import skinny
+
+    inp = _make_inputs(2, seed=37)
+    merged = _merged(inp, True)
+    out = None
+    for _ in range(skinny._MAX_COUNTER_SETS + 16):
+        stream = torch.cuda.Stream()
+        out = flydsl_gr_two_stage_combine_and_mix(
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            inp["w_down"],
+            inp["w_up"],
+            inp["w_inject"],
+            HC,
+            EPS,
+            w_down_merged=merged,
+            fold_w=True,
+            stream=stream,
+        )
+        stream.synchronize()
+    unpinned = [k for k in skinny._COUNTERS if k not in skinny._PINNED_COUNTERS]
+    if len(unpinned) > skinny._MAX_COUNTER_SETS:
+        print(f"[FAIL] counter_cache: {len(unpinned)} unpinned sets retained")
+        _FAILURES.append("counter_cache")
+    _, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+    _check(x_ref.to(out[1].dtype), out[1], "counter_cache x")
+    _check(
+        inj_ref.to(out[2].dtype), out[2].contiguous(), "counter_cache inj", atol=0.05
+    )
+
+
+def _run_heuristic_marker():
+    """A tuner ``heuristic`` entry must route to the heuristic, not a neighbour."""
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import tuned
+
+    real = tuned._table
+    table = {
+        "gfxtest": {
+            "k1": {
+                "256": {"method": "splitk", "split_k": 4},
+                "512": {"method": "heuristic"},
+            }
+        }
+    }
+    tuned._table = lambda: table
+    try:
+        got = (tuned.k1_plan("gfxtest", 512), tuned.k1_plan("gfxtest", 256))
+    finally:
+        tuned._table = real
+    if got[0] is not None or got[1] is None:
+        print(f"[FAIL] heuristic_marker: {got}")
+        _FAILURES.append("heuristic_marker")
+
+
+def _k2_inputs(tokens, seed):
+    """Valid K2 operands and the oracle ``block_input``."""
+    torch.manual_seed(seed)
+    hidden = HC * HS
+    lora = (torch.randn(tokens, LOWRANK, device="cuda") * 0.5).bfloat16()
+    r2 = torch.randn(tokens, hidden, device="cuda").bfloat16()
+    rrms = torch.rsqrt(r2.float().view(tokens, HC, HS).pow(2).mean(-1) + EPS)
+    norm_weight = (torch.randn(HS, device="cuda") * 0.1).bfloat16()
+    w_up = (torch.randn(hidden, LOWRANK, device="cuda") * LOWRANK**-0.5).bfloat16()
+    xn = r2.float().view(tokens, HC, HS) * rrms.unsqueeze(-1)
+    xn = (xn * (1.0 + norm_weight.float())).bfloat16().float()
+    gate = (lora.float() @ w_up.float().t()).view(tokens, HC, HS)
+    ref = (torch.sigmoid(gate) * xn).mean(1)
+    return (lora, r2, rrms.contiguous(), norm_weight, w_up), ref
+
+
+def _run_direct_k2():
+    """Public K2: fresh and caller-provided outputs, row-tail rejection/padding."""
+    args, ref = _k2_inputs(128, seed=38)
+    out = flydsl_up_gate_mix_norm(*args, HC)
+    torch.cuda.synchronize()
+    _check(ref.to(out.dtype), out, "direct_k2[M=128]")
+
+    block_input = torch.full_like(out, float("nan"))
+    got = flydsl_up_gate_mix_norm(*args, HC, block_input=block_input)
+    torch.cuda.synchronize()
+    if got.data_ptr() != block_input.data_ptr():
+        print("[FAIL] direct_k2[out]: did not write the caller's buffer")
+        _FAILURES.append("direct_k2[out] buffer")
+    _check(ref.to(got.dtype), block_input, "direct_k2[out]")
+    for name, bad in {
+        "out_shape": block_input[:-1],
+        "out_dtype": block_input.float(),
+        "out_strided": torch.empty(128, 2 * HS, device="cuda").bfloat16()[:, ::2],
+    }.items():
+        _expect_value_error(
+            f"direct_k2[{name}]",
+            lambda bad=bad: flydsl_up_gate_mix_norm(*args, HC, block_input=bad),
+        )
+
+    tail = 100
+    (lora, r2, rrms, norm_weight, w_up), ref = _k2_inputs(tail, seed=39)
+    _expect_value_error(
+        "direct_k2[tail]",
+        lambda: flydsl_up_gate_mix_norm(lora, r2, rrms, norm_weight, w_up, HC),
+    )
+    pad = 128 - tail
+
+    def _pad(t):
+        return torch.cat([t, t.new_zeros(pad, *t.shape[1:])])
+
+    padded = flydsl_up_gate_mix_norm(
+        _pad(lora), _pad(r2), _pad(rrms), norm_weight, w_up, HC
+    )
+    torch.cuda.synchronize()
+    _check(ref.to(padded.dtype), padded[:tail], "direct_k2[padded tail]")
 
 
 def _run_final_mixer_no_inject(tokens, fold_w):
@@ -834,6 +1140,14 @@ def main():
     _run_skinny_publication_stress()
     _run_untuned_hidden()
     _run_counter_hc_isolation()
+    _run_counter_cache_bound()
+    _run_wide_stream_lds()
+    _run_pipeline_depth()
+    _run_stream_dim_validation()
+    _run_arch_gating()
+    _run_stream_device_mismatch()
+    _run_heuristic_marker()
+    _run_direct_k2()
     for m in args.decode_tokens:
         # Unfolded decode uses the padded tail because skinny K1 requires folding.
         for fold_w in (False, True):

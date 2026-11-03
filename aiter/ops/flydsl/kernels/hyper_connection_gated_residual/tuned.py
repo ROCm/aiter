@@ -99,7 +99,8 @@ def k1_plan(arch: str, tokens: int, n_pad: int | None = None):
     keep the kernel's heuristic default. ``_us`` is provenance only.
 
     Counts below the smallest measured entry return ``None`` to preserve the
-    low-token split-K heuristic.
+    low-token split-K heuristic, as does an entry with ``method="heuristic"``
+    (a count where the tuner measured the heuristic as fastest).
     """
     arch_table = _table().get(arch, {})
     # A shape-specific table must remain active outside its measured range
@@ -112,4 +113,7 @@ def k1_plan(arch: str, tokens: int, n_pad: int | None = None):
     if tokens < keys[0]:
         return None
     key = _nearest_tokens(tbl, tokens)
-    return tbl[str(key)] if key is not None else None
+    plan = tbl[str(key)] if key is not None else None
+    if plan is not None and plan.get("method") == "heuristic":
+        return None
+    return plan

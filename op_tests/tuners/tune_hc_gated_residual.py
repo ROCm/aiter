@@ -17,6 +17,7 @@ explicit arg > tuned plan > heuristic).
 
 import argparse
 import json
+import math
 import os
 
 import torch
@@ -191,8 +192,11 @@ def _entry_from_cfg(cfg, us):
 
 
 def validate(inp, cfg, ref_r2, ref_packed):
+    """Max abs error vs the reference; ``inf`` if any output is non-finite."""
     r2, packed = k1(inp, **cfg)
     torch.cuda.synchronize()
+    if not (r2.isfinite().all() and packed.isfinite().all()):
+        return math.inf
     e_r2 = (r2.float() - ref_r2.float()).abs().max().item()
     e_pk = (packed.float() - ref_packed.float()).abs().max().item()
     return max(e_r2, e_pk)
@@ -230,13 +234,17 @@ for M in args.tokens:
     inp = make_inputs(M)
     ref_r2, ref_packed = k1(inp)  # trusted heuristic default (use_tuned=False)
     torch.cuda.synchronize()
+    if not (ref_r2.isfinite().all() and ref_packed.isfinite().all()):
+        print(f"\nM={M}: heuristic reference is non-finite; skipping")
+        continue
     t_def = timeit(lambda inp=inp: k1(inp))
     print(f"\nM={M}  heuristic-default={t_def:.1f}u")
     best = (t_def, None)
     for cfg in candidates(M):
         try:
             err = validate(inp, cfg, ref_r2, ref_packed)
-            if err > args.tol:
+            # NaN compares False against the tolerance, so test finiteness.
+            if not math.isfinite(err) or err > args.tol:
                 continue
             t = timeit(lambda inp=inp, cfg=cfg: k1(inp, **cfg))
             if cfg["method"] == "decouple":
@@ -253,6 +261,9 @@ for M in args.tokens:
     bt, bc = best
     if bc is None:
         print(f"   -> M={M}: heuristic default already best ({bt:.1f}u)")
+        # Nearest-neighbour lookup would otherwise route M to a stale or
+        # neighbouring entry; this marker makes k1_plan use the heuristic.
+        results[str(M)] = {"method": "heuristic", "_us": round(bt, 3)}
     else:
         print(f"   -> M={M}: best {bt:.1f}u ({t_def / bt:.2f}x vs default) {bc}")
         results[str(M)] = _entry_from_cfg(bc, bt)
@@ -265,5 +276,3 @@ if args.export and results:
         json.dump(tbl, f, indent=2)
         f.write("\n")
     print(f"\nexported {len(results)} entries to {TABLE} under {arch}/k1")
-elif args.export:
-    print("\nnothing to export (heuristic default won everywhere)")
