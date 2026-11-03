@@ -1277,6 +1277,8 @@ class Gfx1250WavePipeline:
 
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
+        # One K128 WMMA spans each query tile's QK contraction.
+        assert self.t.head_dim == 128, "the FP8 wave pipeline requires D128"
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
