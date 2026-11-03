@@ -1,4 +1,5 @@
 import argparse
+import functools
 import itertools
 import sys
 
@@ -8,8 +9,14 @@ import triton
 from aiter.ops.triton.attention.mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -18,6 +25,7 @@ from op_tests.triton_tests.attention.test_mla_decode_rope import (
     input_helper,
     ref_preprocess,
 )
+from op_tests.triton_tests.utils.rotary_embedding import DeepseekScalingRotaryEmbedding
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -135,8 +143,239 @@ def create_benchmark_configs(args: argparse.Namespace):
     return configs
 
 
+def _generate_inputs(
+    BATCH: int,
+    H: int,  # number of query heads, equal to the number of k/v heads
+    S: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    rotary_dim: int,
+    dtype: torch.dtype,
+    rotary_emb,
+    num_kv_splits: int = 2,
+    device="cuda",
+):
+    # input_helper builds its own rotary_emb (and cos_sin_cache) per call, but
+    # it is input-independent -- a fresh copy per pool entry bloats the pool
+    # well past its target size. Discard it and reuse the one shared instance
+    # passed in instead.
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, _, positions, _ = input_helper(
+        BATCH,
+        H,
+        S,
+        kv_lora_rank,
+        rotary_dim,
+        qk_rope_head_dim,
+        num_kv_splits,
+        dtype,
+        device,
+        equal_seqlens=True,
+    )
+
+    k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
+
+    tri_o = torch.empty(BATCH, H, kv_lora_rank, dtype=kv_cache.dtype, device=device)
+    # we need to return the rope'd k_pe_tokens to be saved in cache
+    k_pe_tokens = torch.empty(
+        BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device
+    )
+
+    return (
+        kv_indptr,
+        kv_indices,
+        q,
+        kv_cache,
+        attn_logits,
+        rotary_emb,
+        positions,
+        k_input,
+        v_input,
+        tri_o,
+        k_pe_tokens,
+    )
+
+
+def bench_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    BATCH: int,
+    H: int,  # number of query heads, equal to the number of k/v heads
+    S: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    rotary_dim: int,
+    dtype: torch.dtype,
+    use_rope: bool,
+    is_neox_style: bool = False,
+    num_kv_splits: int = 2,
+    sm_scale: float = 1.0,
+    logit_cap: float = 0.0,
+    device="cuda",
+    metric: str = "throughput",
+):
+    """
+    Benchmarks our multi-head latent attention decode kernel.
+
+    Todo:
+    - Support variable length sequences (by writing new data generation fns that generate the
+    appropriate paged kv cache).
+    - Support GQA benchmarking (e.g generate inputs where q_heads = kv_heads * N.
+    Right now q_heads == kv_heads).
+    """
+    # Built once and shared by every rotating-buffer pool entry: the RoPE
+    # cos/sin cache only depends on these fixed args, not on the random data
+    # input_helper generates per entry. Args match input_helper's own
+    # defaults (rope_max_seq_len, rope_base, is_neox_style, rope_scaling).
+    rotary_emb = DeepseekScalingRotaryEmbedding(
+        qk_rope_head_dim, rotary_dim, 16324, 10, True, 1.0, dtype, device=device
+    )
+    _p_gen = functools.partial(
+        _generate_inputs,
+        BATCH,
+        H,
+        S,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        rotary_dim,
+        dtype,
+        rotary_emb,
+        num_kv_splits,
+        device,
+    )
+    _out_val_keys = [
+        "kv_indptr",
+        "kv_indices",
+        "q",
+        "kv_cache",
+        "attn_logits",
+        "rotary_emb",
+        "positions",
+        "k_input",
+        "v_input",
+        "tri_o",
+        "k_pe_tokens",
+    ]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
+
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+    q = sample["q"]
+    k_input = sample["k_input"]
+    tri_o = sample["tri_o"]
+    k_pe_tokens = sample["k_pe_tokens"]
+    rotary_emb = sample["rotary_emb"]
+
+    # FLOPS calculation
+    num_q_heads = H
+    num_kv_heads = k_input.shape[1]
+    assert num_q_heads >= num_kv_heads
+
+    # Note: As far as I understand it, rotary_dim <= qk_rope_head_dim,
+    # with the latter being the portion of the query/key dim reserved for RoPE
+    # and the former being the number of dims that RoPE is actually applied to.
+    # Please correct the following calculations if the above is incorrect.
+
+    # per batch:
+    attn_nope_flops = num_q_heads * kv_lora_rank * S * 2
+    attn_rope_flops = num_q_heads * qk_rope_head_dim * S * 2
+    av_flops = num_q_heads * kv_lora_rank * S * 2  # multiplying attention map with v
+
+    # flops to apply RoPE (per batch)
+    rope_q_flops = 2 * num_q_heads * rotary_dim
+    rope_k_flops = (
+        2 * num_kv_heads * rotary_dim
+    )  # only one token, since prev. rotated ks are cached
+
+    total_flops = BATCH * (
+        attn_nope_flops + attn_rope_flops + av_flops + rope_q_flops + rope_k_flops
+    )
+
+    # Memory transfer calculations (per batch)
+    # bytes read:
+    q_elems_read = num_q_heads * (kv_lora_rank + qk_rope_head_dim)
+    k_rope_elems_read = num_kv_heads * qk_rope_head_dim * S
+    kv_nope_elems_read = num_kv_heads * kv_lora_rank * S
+    cos_sine_cache_read = (num_q_heads + num_kv_heads) * rotary_dim
+
+    # total indices read (across the full batch)
+    kv_indptrs_read = BATCH + 1
+    kv_indices_read = BATCH * S
+
+    bytes_read = (
+        BATCH * q_elems_read * q.element_size()
+        + BATCH * k_rope_elems_read * k_input.element_size()
+        + BATCH * kv_nope_elems_read * k_input.element_size()
+        + BATCH * cos_sine_cache_read * rotary_emb.cos_sin_cache.element_size()
+        + kv_indptrs_read
+        + kv_indices_read
+    )
+
+    # bytes written:
+    out_elems = num_q_heads * kv_lora_rank
+    new_k_pe_elems = qk_rope_head_dim  # to add to kv cache
+
+    bytes_written = (
+        BATCH * out_elems * tri_o.element_size()
+        + BATCH * new_k_pe_elems * k_pe_tokens.element_size()
+    )
+
+    mem = bytes_read + bytes_written
+
+    def _run(
+        kv_indptr,
+        kv_indices,
+        q,
+        kv_cache,
+        attn_logits,
+        rotary_emb,
+        positions,
+        k_input,
+        v_input,
+        tri_o,
+        k_pe_tokens,
+    ):
+        decode_attention_fwd_grouped_rope(
+            q,
+            k_input,
+            v_input,
+            tri_o,
+            kv_indptr,
+            kv_indices,
+            k_pe_tokens if use_rope else None,
+            kv_lora_rank,
+            rotary_dim if use_rope else None,
+            rotary_emb.cos_sin_cache if use_rope else None,
+            positions if use_rope else None,
+            attn_logits,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            use_rope,
+            is_neox_style,
+        )
+
+    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+
+    # Return exactly one scalar depending on which metric is active
+    if metric == "time":
+        return ms
+    elif metric == "throughput":
+        tflops = total_flops / ms * 1e-9
+        return tflops
+    elif metric == "bandwidth":
+        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        return bandwidth
+    else:
+        raise ValueError("Unknown metric: " + metric)
+
+
 def run_benchmark(args: argparse.Namespace):
     torch.manual_seed(20)
+
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mla(
@@ -156,131 +395,25 @@ def run_benchmark(args: argparse.Namespace):
         metric: str = "throughput",
         **kwargs,
     ):
-        """
-        Benchmarks our multi-head latent attention decode kernel.
 
-        Todo:
-        - Support variable length sequences (by writing new data generation fns that generate the
-        appropriate paged kv cache).
-        - Support GQA benchmarking (e.g generate inputs where q_heads = kv_heads * N.
-        Right now q_heads == kv_heads).
-        """
-
-        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
-            input_helper(
-                BATCH,
-                H,
-                S,
-                kv_lora_rank,
-                rotary_dim,
-                qk_rope_head_dim,
-                num_kv_splits,
-                dtype,
-                device,
-            )
+        return bench_fn(
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            H,
+            S,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            rotary_dim,
+            dtype,
+            use_rope,
+            is_neox_style,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            device=args.device,
+            metric=metric,
         )
-
-        k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
-
-        tri_o = torch.empty(BATCH, H, kv_lora_rank, dtype=kv_cache.dtype, device=device)
-        # we need to return the rope'd k_pe_tokens to be saved in cache
-        k_pe_tokens = torch.empty(
-            BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device
-        )
-
-        # FLOPS calculation
-        num_q_heads = H
-        num_kv_heads = k_input.shape[1]
-        assert num_q_heads >= num_kv_heads
-
-        # Note: As far as I understand it, rotary_dim <= qk_rope_head_dim,
-        # with the latter being the portion of the query/key dim reserved for RoPE
-        # and the former being the number of dims that RoPE is actually applied to.
-        # Please correct the following calculations if the above is incorrect.
-
-        # per batch:
-        attn_nope_flops = num_q_heads * kv_lora_rank * S * 2
-        attn_rope_flops = num_q_heads * qk_rope_head_dim * S * 2
-        av_flops = (
-            num_q_heads * kv_lora_rank * S * 2
-        )  # multiplying attention map with v
-
-        # flops to apply RoPE (per batch)
-        rope_q_flops = 2 * num_q_heads * rotary_dim
-        rope_k_flops = (
-            2 * num_kv_heads * rotary_dim
-        )  # only one token, since prev. rotated ks are cached
-
-        total_flops = BATCH * (
-            attn_nope_flops + attn_rope_flops + av_flops + rope_q_flops + rope_k_flops
-        )
-
-        # Memory transfer calculations (per batch)
-        # bytes read:
-        q_elems_read = num_q_heads * (kv_lora_rank + qk_rope_head_dim)
-        k_rope_elems_read = num_kv_heads * qk_rope_head_dim * S
-        kv_nope_elems_read = num_kv_heads * kv_lora_rank * S
-        cos_sine_cache_read = (num_q_heads + num_kv_heads) * rotary_dim
-
-        # total indices read (across the full batch)
-        kv_indptrs_read = BATCH + 1
-        kv_indices_read = BATCH * S
-
-        bytes_read = (
-            BATCH * q_elems_read * q.element_size()
-            + BATCH * k_rope_elems_read * k_input.element_size()
-            + BATCH * kv_nope_elems_read * k_input.element_size()
-            + BATCH * cos_sine_cache_read * rotary_emb.cos_sin_cache.element_size()
-            + kv_indptrs_read
-            + kv_indices_read
-        )
-
-        # bytes written:
-        out_elems = num_q_heads * kv_lora_rank
-        new_k_pe_elems = qk_rope_head_dim  # to add to kv cache
-
-        bytes_written = (
-            BATCH * out_elems * tri_o.element_size()
-            + BATCH * new_k_pe_elems * k_pe_tokens.element_size()
-        )
-
-        mem = bytes_read + bytes_written
-
-        ms = triton.testing.do_bench(
-            lambda: decode_attention_fwd_grouped_rope(
-                q,
-                k_input,
-                v_input,
-                tri_o,
-                kv_indptr,
-                kv_indices,
-                k_pe_tokens if use_rope else None,
-                kv_lora_rank,
-                rotary_dim if use_rope else None,
-                rotary_emb.cos_sin_cache if use_rope else None,
-                positions if use_rope else None,
-                attn_logits,
-                num_kv_splits,
-                sm_scale,
-                logit_cap,
-                use_rope,
-                is_neox_style,
-            ),
-            warmup=25,
-            rep=100,
-        )
-
-        # Return exactly one scalar depending on which metric is active
-        if metric == "time":
-            return ms
-        elif metric == "throughput":
-            tflops = total_flops / ms * 1e-9
-            return tflops
-        elif metric == "bandwidth":
-            bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-            return bandwidth
-        else:
-            raise ValueError("Unknown metric: " + metric)
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)
 
@@ -331,6 +464,7 @@ def parse_args():
         default=False,
         help="Print VGPR usage for Triton kernels.",
     )
+    parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
 
@@ -353,8 +487,6 @@ def main():
 
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
-
-    # print(args)
 
     run_benchmark(args)
 

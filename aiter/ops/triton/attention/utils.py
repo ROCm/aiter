@@ -466,20 +466,32 @@ def _sol_attn_pack_k(
 
 
 def _sol_attn_pool_packed_k(
-    k_source: torch.Tensor, fmt: str, BLOCK_N: int, variance: bool = False
+    k_source: torch.Tensor,
+    fmt: str,
+    BLOCK_N: int,
+    variance: bool = False,
+    shift: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Pool a packed (MXFP4 or MXFP6) K into one row per KV block, WITH a pooled E8M0 scale.
 
     Source-side pooling as in :func:`_sol_attn_pool_mxfp4_k`. Returns (mean_data, mean_scale,
-    mean_pooled), and with `variance` also (var_data, var_scale) in mean_k's layouts.
+    mean_pooled), and with `variance` also (var_data, var_scale) in mean_k's layouts and var_pooled,
+    the fp32 variance in the rotated basis before packing.
 
     The variance is the one the kernel's Jensen term needs, which is of K as the kernel holds it:
     in the basis the packer's Hadamard rotation moves it to, where q_d^2 * var[d] is summed. A
     variance is not linear, so it cannot be taken unrotated and left to the packer the way the mean
     can. It is taken in the rotated basis and rotated back before packing, so the packer's own
     rotation lands it where the kernel reads it; the normalized Hadamard is its own inverse.
+
+    `shift` is the vector the exact pass's packer subtracted from every token. A block mean is
+    linear, so the pooled K of the shifted source is the pooled K minus `shift`, taken here on the
+    pooled rows rather than on a shifted copy of the whole source. A variance does not see it.
     """
-    pooled = _sol_attn_block_mean(k_source.float(), BLOCK_N).to(torch.bfloat16)
+    pooled = _sol_attn_block_mean(k_source.float(), BLOCK_N)
+    if shift is not None:
+        pooled = pooled - shift.float().unsqueeze(1)
+    pooled = pooled.to(torch.bfloat16)
     result = (*_sol_attn_pack_k(pooled, fmt, BLOCK_N), pooled)
     if not variance:
         return result
@@ -493,8 +505,10 @@ def _sol_attn_pool_packed_k(
     rotated_var = _sol_attn_block_variance(
         rotate(k_source.contiguous()).float(), BLOCK_N
     )
-    return result + _sol_attn_pack_k(
-        rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
+    return (
+        *result,
+        *_sol_attn_pack_k(rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N),
+        rotated_var,
     )
 
 
@@ -672,6 +686,7 @@ def sol_prepare(
     router: str = "mean",
     routing_scale: float | torch.Tensor | None = None,
     q_scale: torch.Tensor | None = None,
+    k_shift: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """
     Build every host-side input of the gfx950 Sol-Attn kernel (arXiv 2607.24027) from Q and the
@@ -749,6 +764,11 @@ def sol_prepare(
         one-element tensor, so a device-side descale needs no host read.
     q_scale: Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32) uint8, for an
         MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q.
+    k_shift: (batch, nheads_kv, d), the vector a packed K's quantizer subtracted from every token
+        (the `mean` its quantize_*_k took, for K smoothing). The stored codes are of
+        k_source - k_shift, so pooling subtracts it from k_source's block means to match; the
+        Jensen variance is unaffected by a shift. It needs k_packed_format: an addressable K pools
+        its stored codes, which already carry the shift.
 
     Returns a dict with:
         mean_k, mean_v: pooled K/V in K's / V's own dtype, BSHD
@@ -764,6 +784,9 @@ def sol_prepare(
             takes it as mean_k_var.
         mean_k_var_scale: mean_k_var's E8M0 scale in mean_k_scale's layout when k_variance is set
             and K is block-scaled (k_scale given, or packed); otherwise None. mha_v4_packed takes it as mean_k_var_scale.
+        mean_k_var_pooled: for a packed K with k_variance, the fp32 variance in the rotated basis
+            before packing, (batch, num_kv_blocks, nheads_kv, d), since the packed codes cannot be
+            read back; otherwise None. sol_jensen_cap takes it.
         mean_k_pooled, mean_v_pooled: the pooled operand as the packer saw it, before quantization,
             for a packed operand whose mean_k / mean_v cannot be read back and dequantized. None
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
@@ -841,6 +864,18 @@ def sol_prepare(
         raise ValueError(
             "q_scale must be Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32)"
         )
+    if k_shift is not None:
+        if k_packed_format is None:
+            raise ValueError(
+                "k_shift goes with k_packed_format: an addressable K pools its stored codes, "
+                "which already carry the shift its quantizer subtracted"
+            )
+        expected_shift = (batch, nhead_kv, q.shape[3])
+        if tuple(k_shift.shape) != expected_shift:
+            raise ValueError(
+                f"k_shift must be (batch, nheads_kv, d) = {expected_shift}, got "
+                f"{tuple(k_shift.shape)}"
+            )
 
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (seqlen_k + BLOCK_N - 1) // BLOCK_N
@@ -849,15 +884,15 @@ def sol_prepare(
     # other: mxfp8 has an E8M0 K and a per-tensor V, f8f6 the reverse.
     mean_k_scale = mean_v_scale = None
     mean_k_pooled = mean_v_pooled = None
-    mean_k_var = mean_k_var_scale = None
+    mean_k_var = mean_k_var_scale = mean_k_var_pooled = None
     k_routing_var = None
     if k_packed_format is not None:
         pooled_k = _sol_attn_pool_packed_k(
-            k_source, k_packed_format, BLOCK_N, variance=k_variance
+            k_source, k_packed_format, BLOCK_N, variance=k_variance, shift=k_shift
         )
         mean_k, mean_k_scale, mean_k_pooled = pooled_k[:3]
         if k_variance:
-            mean_k_var, mean_k_var_scale = pooled_k[3:]
+            mean_k_var, mean_k_var_scale, mean_k_var_pooled = pooled_k[3:]
         k_routing = mean_k_pooled
     elif k_scale is None and (k_variance or error_router):
         mean_k, stored_var = _sol_attn_pool_reuse_descale(
@@ -985,6 +1020,7 @@ def sol_prepare(
         "mean_v_pooled": mean_v_pooled,
         "mean_k_var": mean_k_var,
         "mean_k_var_scale": mean_k_var_scale,
+        "mean_k_var_pooled": mean_k_var_pooled,
         "block_bitmap": block_bitmap,
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,

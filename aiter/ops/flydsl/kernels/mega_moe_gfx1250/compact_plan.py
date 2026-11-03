@@ -224,9 +224,7 @@ def compile_tdm_compact_plan(
             lds_recv = fx.Int64(fx.ptrtoint(recv_ptr))
 
         for s in range(tid, segs, plan_threads):
-            comm_ops.store_i32_lds(
-                lds_hist + fx.Int64(s) * fx.Int64(4), arith.constant(0)
-            )
+            comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * 4, arith.constant(0))
         fx.barrier()
 
         n_routes = inp_cur_tok * fx.Int32(topk)
@@ -239,7 +237,7 @@ def compile_tdm_compact_plan(
             intra = arith.constant(0)
             if valid:
                 intra = comm_ops.atomic_add_lds(
-                    lds_hist + fx.Int64(segment) * fx.Int64(4), arith.constant(1)
+                    lds_hist + fx.Int64(segment) * 4, arith.constant(1)
                 )
             packed = arith.select(
                 valid,
@@ -247,9 +245,7 @@ def compile_tdm_compact_plan(
                 arith.constant(dropped),
             )
             if const_expr(merge_routes):
-                comm_ops.store_i32_lds(
-                    lds_routes + fx.Int64(route) * fx.Int64(4), packed
-                )
+                comm_ops.store_i32_lds(lds_routes + fx.Int64(route) * 4, packed)
             else:
                 buffer_store(packed, rsrc_map, route)
 
@@ -276,7 +272,7 @@ def compile_tdm_compact_plan(
         fx.barrier()
         if const_expr(plan_blocks > 1):
             for s in range(tid, segs, plan_threads):
-                cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * fx.Int64(4))
+                cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * 4)
                 buffer_store(cnt, rsrc_bhist, bid * segs + s)
             comm_ops.waitcnt_stores()
             fx.barrier()
@@ -285,7 +281,7 @@ def compile_tdm_compact_plan(
                 next_gen = gen + arith.constant(1)
                 arrive = comm_ops.atomic_add_system(addr_barrier, arith.constant(1))
                 if arrive != plan_blocks - 1:
-                    comm_ops.spin_until_eq_i32(addr_barrier + fx.Int64(4), next_gen)
+                    comm_ops.spin_until_eq_i32(addr_barrier + 4, next_gen)
                     comm_ops.fence_agent_acquire()
                 else:
                     comm_ops.fence_system_release()
@@ -326,16 +322,16 @@ def compile_tdm_compact_plan(
             if const_expr(use_sparse):
                 for s in range(tid, row_dwords, plan_threads):
                     comm_ops.store_i32_lds(
-                        lds_pack + fx.Int64(s) * fx.Int64(4), arith.constant(0)
+                        lds_pack + fx.Int64(s) * 4, arith.constant(0)
                     )
                 fx.barrier()
                 for s in range(tid, segs, plan_threads):
-                    cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * fx.Int64(4))
+                    cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * 4)
                     if cnt != 0:
                         slot = comm_ops.atomic_add_lds(lds_pack, arith.constant(1))
                         packed = fx.Int32(s) | (cnt << arith.constant(16))
                         comm_ops.store_i32_lds(
-                            lds_pack + fx.Int64(slot + 1) * fx.Int64(4), packed
+                            lds_pack + fx.Int64(slot + 1) * 4, packed
                         )
                 fx.barrier()
                 tdm_rows = row_dwords // 32
@@ -377,9 +373,7 @@ def compile_tdm_compact_plan(
                         plan_threads * hist_vec,
                     ):
                         vals = [
-                            comm_ops.load_i32_lds(
-                                lds_hist + fx.Int64(s + i) * fx.Int64(4)
-                            )
+                            comm_ops.load_i32_lds(lds_hist + fx.Int64(s + i) * 4)
                             for i in range_constexpr(hist_vec)
                         ]
                         buffer_store(
@@ -419,24 +413,22 @@ def compile_tdm_compact_plan(
                 TDM.tdm_wait(0)
                 for s in range(tid, npes * segs, plan_threads):
                     comm_ops.store_i32_lds(
-                        lds_matrix + fx.Int64(s) * fx.Int64(4), arith.constant(0)
+                        lds_matrix + fx.Int64(s) * 4, arith.constant(0)
                     )
                 fx.barrier()
                 for src in range_constexpr(npes):
                     src_base = fx.Int32(src * row_dwords)
                     nnz = comm_ops.load_i32_lds(
-                        lds_recv + fx.Int64(src * row_dwords) * fx.Int64(4)
+                        lds_recv + fx.Int64(src * row_dwords) * 4
                     )
                     for i in range(tid, nnz, plan_threads):
                         packed = comm_ops.load_i32_lds(
-                            lds_recv + fx.Int64(src_base + i + 1) * fx.Int64(4)
+                            lds_recv + fx.Int64(src_base + i + 1) * 4
                         )
                         seg = packed & arith.constant(0xFFFF)
                         cnt = packed >> arith.constant(16)
                         comm_ops.store_i32_lds(
-                            lds_matrix
-                            + fx.Int64(src * segs) * fx.Int64(4)
-                            + fx.Int64(seg) * fx.Int64(4),
+                            lds_matrix + fx.Int64(src * segs) * 4 + fx.Int64(seg) * 4,
                             cnt,
                         )
                 fx.barrier()
@@ -457,7 +449,7 @@ def compile_tdm_compact_plan(
                     )
                     for s in range(tid, matrix_n, plan_threads):
                         comm_ops.store_i32_lds(
-                            lds_matrix + fx.Int64(s) * fx.Int64(4),
+                            lds_matrix + fx.Int64(s) * 4,
                             buffer_load(local_hist_rsrc, s, vec_width=1, dtype=T.i32),
                         )
                 fx.barrier()
@@ -468,16 +460,13 @@ def compile_tdm_compact_plan(
                 my_prefix = arith.constant(0)
                 for src in range_constexpr(npes):
                     cnt = comm_ops.load_i32_lds(
-                        lds_matrix
-                        + fx.Int64(src * segs + dest * fx.Int32(epr) + e) * fx.Int64(4)
+                        lds_matrix + fx.Int64(src * segs + dest * fx.Int32(epr) + e) * 4
                     )
                     if src == rank:
                         my_prefix = total
                     total = total + cnt
-                comm_ops.store_i32_lds(lds_total + fx.Int64(idx) * fx.Int64(4), total)
-                comm_ops.store_i32_lds(
-                    lds_pref + fx.Int64(idx) * fx.Int64(4), my_prefix
-                )
+                comm_ops.store_i32_lds(lds_total + fx.Int64(idx) * 4, total)
+                comm_ops.store_i32_lds(lds_pref + fx.Int64(idx) * 4, my_prefix)
                 if dest == rank:
                     buffer_store(total, rsrc_mm, e)
             fx.barrier()
@@ -492,12 +481,8 @@ def compile_tdm_compact_plan(
                     total = arith.constant(0)
                     my_prefix = arith.constant(0)
                     if in_expert:
-                        total = comm_ops.load_i32_lds(
-                            lds_total + fx.Int64(idx) * fx.Int64(4)
-                        )
-                        my_prefix = comm_ops.load_i32_lds(
-                            lds_pref + fx.Int64(idx) * fx.Int64(4)
-                        )
+                        total = comm_ops.load_i32_lds(lds_total + fx.Int64(idx) * 4)
+                        my_prefix = comm_ops.load_i32_lds(lds_pref + fx.Int64(idx) * 4)
                     aligned = (total + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
                     aligned = aligned * fx.Int32(tile_m)
                     inclusive = _wave32_inclusive_scan_i32(aligned, lane)
@@ -507,9 +492,7 @@ def compile_tdm_compact_plan(
                         if dest == rank:
                             buffer_store(expert_start + total, rsrc_psum, e)
                         buffer_store(send, rsrc_base, idx)
-                        comm_ops.store_i32_lds(
-                            lds_hist + fx.Int64(idx) * fx.Int64(4), send
-                        )
+                        comm_ops.store_i32_lds(lds_hist + fx.Int64(idx) * 4, send)
                     carry = carry + readlane(T.i32, inclusive, WAVE - 1)
             comm_ops.waitcnt_stores()
             fx.barrier()
@@ -520,7 +503,7 @@ def compile_tdm_compact_plan(
                 next_gen = gen + arith.constant(1)
                 arrive = comm_ops.atomic_add_system(addr_barrier, arith.constant(1))
                 if arrive != plan_blocks - 1:
-                    comm_ops.spin_until_eq_i32(addr_barrier + fx.Int64(4), next_gen)
+                    comm_ops.spin_until_eq_i32(addr_barrier + 4, next_gen)
                     comm_ops.fence_agent_acquire()
                 else:
                     comm_ops.fence_system_release()
@@ -532,18 +515,14 @@ def compile_tdm_compact_plan(
 
         for route in range(bid * plan_threads + tid, n_routes, plan_threads):
             if const_expr(merge_routes):
-                packed = comm_ops.load_i32_lds(
-                    lds_routes + fx.Int64(route) * fx.Int64(4)
-                )
+                packed = comm_ops.load_i32_lds(lds_routes + fx.Int64(route) * 4)
             else:
                 packed = buffer_load(rsrc_map, route, vec_width=1, dtype=T.i32)
             valid = packed >= 0
             segment = packed & arith.constant(0xFFFF)
             intra = packed >> arith.constant(16)
             dest_pe = segment // fx.Int32(epr)
-            send_base = comm_ops.load_i32_lds(
-                lds_hist + fx.Int64(segment) * fx.Int64(4)
-            )
+            send_base = comm_ops.load_i32_lds(lds_hist + fx.Int64(segment) * 4)
             dest_row = send_base + intra
             in_cap = dest_row < compact_cap
             flat = (dest_row << fx.Int32(peer_bits)) | (dest_pe & fx.Int32(peer_mask))

@@ -1,120 +1,13 @@
 #include "mha_bwd.h"
 #include "aiter_hip_common.h"
 #include "asm_fmha_v3_bwd_configs.hpp"
-#include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <string>
-#include <vector>
 
 namespace aiter {
-namespace {
-
-struct KernelArgBufferWriter
-{
-    template <typename T>
-    void append_raw(const T& value)
-    {
-        const auto* bytes = reinterpret_cast<const std::byte*>(&value);
-        storage.insert(storage.end(), bytes, bytes + sizeof(T));
-    }
-
-    template <typename PtrT>
-    void append_ptr(PtrT ptr, bool compact)
-    {
-        append_raw(ptr);
-        if(!compact)
-        {
-            append_raw(uint32_t{0});
-            append_raw(uint32_t{0});
-        }
-    }
-
-    void append_u32(uint32_t value, bool compact)
-    {
-        append_raw(value);
-        if(!compact)
-        {
-            append_raw(uint32_t{0});
-            append_raw(uint32_t{0});
-            append_raw(uint32_t{0});
-        }
-    }
-
-    std::vector<std::byte> storage;
-};
-
-struct fmha_bwd_odo_logical_args
-{
-    const void* ptr_o;
-    const void* ptr_do;
-    void* ptr_d;
-    uint32_t Hs_o;
-    uint32_t BAs_o;
-    uint32_t Seqs_o;
-    uint32_t Hs_do;
-    uint32_t BAs_do;
-    uint32_t Seqs_do;
-    uint32_t Hs_d;
-    uint32_t BAs_d;
-    uint32_t Seqs_d;
-    uint32_t seqlen_q;
-    uint32_t head_dim;
-    const void* ptr_qseq;
-    const void* ptr_qseq_padded;
-};
-
-bool use_compact_fmha_bwd_kernel_args(const std::string& arch_id)
-{
-    return arch_id == "gfx1250";
-}
-
-fmha_bwd_odo_logical_args make_fmha_bwd_odo_logical_args(const mha_bwd_args& a)
-{
-    return {
-        a.o_ptr,
-        a.do_ptr,
-        a.d_ptr,
-        static_cast<uint32_t>(a.nhead_stride_o * 2),
-        static_cast<uint32_t>(a.batch_stride_o * 2),
-        static_cast<uint32_t>(a.stride_o * 2),
-        static_cast<uint32_t>(a.nhead_stride_do * 2),
-        static_cast<uint32_t>(a.batch_stride_do * 2),
-        static_cast<uint32_t>(a.stride_do * 2),
-        static_cast<uint32_t>(a.nhead_stride_lsed * 4),
-        static_cast<uint32_t>(a.batch_stride_lsed * 4),
-        1u * 4u,
-        static_cast<uint32_t>(a.seqlen_q),
-        static_cast<uint32_t>(a.hdim_q),
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr,
-        a.seqstart_q_ptr,
-    };
-}
-
-std::vector<std::byte> pack_fmha_bwd_odo_args(const fmha_bwd_odo_logical_args& args, bool compact)
-{
-    KernelArgBufferWriter writer;
-    writer.append_ptr(args.ptr_o, compact);
-    writer.append_ptr(args.ptr_do, compact);
-    writer.append_ptr(args.ptr_d, compact);
-    writer.append_u32(args.Hs_o, compact);
-    writer.append_u32(args.BAs_o, compact);
-    writer.append_u32(args.Seqs_o, compact);
-    writer.append_u32(args.Hs_do, compact);
-    writer.append_u32(args.BAs_do, compact);
-    writer.append_u32(args.Seqs_do, compact);
-    writer.append_u32(args.Hs_d, compact);
-    writer.append_u32(args.BAs_d, compact);
-    writer.append_u32(args.Seqs_d, compact);
-    writer.append_u32(args.seqlen_q, compact);
-    writer.append_u32(args.head_dim, compact);
-    writer.append_ptr(args.ptr_qseq, compact);
-    writer.append_ptr(args.ptr_qseq_padded, compact);
-    return writer.storage;
-}
-
-} // namespace
 
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
 {
@@ -150,6 +43,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
                                                                        bool atomic32,
                                                                        int bf16_cvt,
                                                                        bool mode,
+                                                                       bool det,
                                                                        CFG* pre_cfgs,
                                                                        CFG* cfgs,
                                                                        CFG* post_cfgs)
@@ -187,7 +81,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
         if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) &&
            (cfg.hdim_v == padded_hdim_v) && (cfg.mask == mask_type) && (cfg.atomic32 == atomic32) &&
            ((cfg.bf16_cvt == 3) || (cfg.bf16_cvt == bf16_cvt)) &&
-           (cfg.mode == mode))
+           (cfg.mode == mode) && (cfg.det == det))
         {
             int tmp_ts_kv = 0;
             if(ts_kv == 0)
@@ -225,7 +119,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             continue;
         const auto& cfg = el.second;
 
-        if((cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
+        if((cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) && (cfg.det == det) &&
            ((cfg.bf16_cvt == 3) || (cfg.bf16_cvt == bf16_cvt)))
         {
             if((cfg.dtype == data_type) || (atomic32 == 0))
@@ -398,7 +292,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
-       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
+       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && arch_id != "gfx1250") ||
        ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")) ||
        (!is_gfx1250_asm_supported()))
     {
@@ -493,6 +387,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
     }
+    // gfx1250 only has bottom-right causal kernels, so the same equivalence runs the other way.
+    // Group mode is left out: there a batch's seqlen_q and seqlen_k can differ.
+    if(arch_id == "gfx1250" && mt == 1 && !a.is_group_mode && a.seqlen_q == a.seqlen_k)
+    {
+        mt = 2;  // top-left → bottom-right (equivalent when sq == sk)
+    }
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
@@ -504,6 +404,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          a.v3_atomic_fp32,
                                                                          a.v3_bf16_cvt,
                                                                          a.is_group_mode,
+                                                                         a.is_deterministic,
                                                                          pre_cfgs,
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
@@ -514,6 +415,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     if(need_post_processing && (post_kernel == ""))
     {
+        // gfx1250 dqdkdv only ever writes dq_acc, so dq is unusable without dq_convert.
+        if(arch_id == "gfx1250")
+        {
+            return -1;
+        }
         need_post_processing = false;
     }
 
@@ -521,7 +427,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_kv;
     int ts_dq;
     size_t arg_size;
-    const bool compact_odo_args = use_compact_fmha_bwd_kernel_args(arch_id);
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
@@ -582,18 +487,34 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     if(a.v3_api_check)
         return 1;
 
-    const auto odo_args  = make_fmha_bwd_odo_logical_args(a);
-    auto odo_arg_storage = pack_fmha_bwd_odo_args(odo_args, compact_odo_args);
+    fmha_bwd_odo_args odo_args;
+
+    odo_args.ptr_o           = a.o_ptr;
+    odo_args.ptr_do          = a.do_ptr;
+    odo_args.ptr_d           = a.d_ptr;
+    odo_args.Hs_o            = a.nhead_stride_o * 2;
+    odo_args.BAs_o           = a.batch_stride_o * 2;
+    odo_args.Seqs_o          = a.stride_o * 2;
+    odo_args.Hs_do           = a.nhead_stride_do * 2;
+    odo_args.BAs_do          = a.batch_stride_do * 2;
+    odo_args.Seqs_do         = a.stride_do * 2;
+    odo_args.Hs_d            = a.nhead_stride_lsed * 4;
+    odo_args.BAs_d           = a.batch_stride_lsed * 4;
+    odo_args.Seqs_d          = 1 * 4;
+    odo_args.seqlen_q        = a.seqlen_q;
+    odo_args.head_dim        = a.hdim_q;
+    odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
+    odo_args.ptr_qseq =
+        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
-        arg_size = odo_arg_storage.size();
+        arg_size = sizeof(odo_args);
         int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        impl_ptr_pre->launch_kernel(
-            {odo_arg_storage.data(), &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
 
     // ASM dq_accum layout (a.seqlen_q is total_q in group mode):
@@ -601,13 +522,66 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     //   atomic16    batch:  (1, batch, nhead_q, ceil16(seqlen_q),     pad_hdim_q)    [q-dtype]
     //   atomic_fp32 group:  (1,        nhead_q, total_q,              hdim_q)        [fp32]
     //   atomic16    group:  (1, batch, nhead_q, ceil16(max_seqlen_q), 128)           [q-dtype]
+    // gfx1250 dqdkdv derives its layout itself instead of taking strides, in whole 32-row tiles:
+    //   gfx1250     batch:  (nsplit, batch, nhead_q, round32(seqlen_q),    hdim_q)  [fp32]
+    //   gfx1250     group:  (nsplit,        nhead_q, total_q + 32 * batch, hdim_q)  [fp32]
+    // Group mode addresses dq_acc by seqstart_q (the padded prefix sum) like the other tensors,
+    // plus one 32-row tile of slack per batch for the swizzled trailing tile, so batch b starts at
+    // row seqstart_q[b] + 32 * b. nsplit is 1 unless deterministic, where each dqdkdv workgroup
+    // owns one plane and dq_convert folds them in order.
     void* dq_acc_ptr           = nullptr;
     size_t stride_dq_acc       = 0;
     size_t nhead_stride_dq_acc = 0;
     size_t batch_stride_dq_acc = 0;
     size_t dq_acc_element_size = 0;
+    size_t dq_acc_rows         = 0;
+    size_t dq_acc_plane        = 0; // bytes, also the stride between deterministic planes
+    uint32_t nsplit            = 1;
 
-    if(need_post_processing)
+    if(need_post_processing && arch_id == "gfx1250")
+    {
+        constexpr size_t kTileRows = 32;
+        dq_acc_rows         = a.is_group_mode ? a.seqlen_q + kTileRows * a.batch
+                                              : (a.seqlen_q + kTileRows - 1) / kTileRows * kTileRows;
+        dq_acc_element_size = 4;
+        stride_dq_acc       = a.hdim_q;
+        nhead_stride_dq_acc = dq_acc_rows * a.hdim_q;
+        batch_stride_dq_acc = a.is_group_mode ? 0 : a.nhead_q * nhead_stride_dq_acc;
+        dq_acc_plane =
+            (a.is_group_mode ? 1 : a.batch) * a.nhead_q * nhead_stride_dq_acc * dq_acc_element_size;
+
+        // dqdkdv computes the bytes of one head plane in 32 bits.
+        if(nhead_stride_dq_acc * dq_acc_element_size > UINT32_MAX)
+        {
+            AITER_LOG_WARNING("fmha_v3_bwd: dq_acc head plane of "
+                              << nhead_stride_dq_acc * dq_acc_element_size
+                              << " bytes exceeds the 32-bit range the kernel addresses it in");
+            return -1;
+        }
+        if(a.is_deterministic)
+        {
+            // The shader reaches a plane through a 32-bit stride.
+            if(dq_acc_plane > UINT32_MAX)
+            {
+                AITER_LOG_WARNING("fmha_v3_bwd: deterministic dq_acc plane of "
+                                  << dq_acc_plane << " bytes exceeds the 32-bit plane stride");
+                return -1;
+            }
+            const uint32_t kv_blocks = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+            uint32_t want            = a.det_split;
+            if(want == 0)
+            {
+                // Planes are the only parallelism left along kv, so aim at one workgroup per CU.
+                const uint32_t wg_per_plane = a.batch * a.nhead_q;
+                want = (get_num_cu_func() + wg_per_plane - 1) / wg_per_plane;
+            }
+            nsplit = std::clamp(want, 1u, std::max(kv_blocks, 1u));
+        }
+
+        // ASM kernel atomically accumulates into dq_accum; require zero-init.
+        dq_acc_ptr = a.workspace_alloc(nsplit * dq_acc_plane, /*zero_init=*/true);
+    }
+    else if(need_post_processing)
     {
         dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
 
@@ -628,7 +602,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dq_acc_ptr = a.workspace_alloc(dq_acc_bytes, /*zero_init=*/true);
     }
 
-    fmha_bwd_dqdkdv_args dqdkdv_args;
+    fmha_bwd_dqdkdv_args dqdkdv_args{};
     dqdkdv_args.ptr_dq     = need_post_processing ? dq_acc_ptr : a.dq_ptr;
     dqdkdv_args.ptr_dk     = a.dk_ptr;
     dqdkdv_args.ptr_dv     = a.dv_ptr;
@@ -689,6 +663,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dqdkdv_args.ptr_qseq_padded = a.seqstart_q_ptr;
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
+    if(arch_id == "gfx1250")
+    {
+        dqdkdv_args.max_seqlen_dq = dq_acc_rows;
+        dqdkdv_args.nsplit        = a.is_deterministic ? nsplit : 0;
+        dqdkdv_args.split_stride  = a.is_deterministic ? dq_acc_plane : 0;
+    }
 
     if(mt == 3)
     {
@@ -716,7 +696,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
 
     auto dqdkdv_kernel_launch = [&]() {
-        arg_size                  = sizeof(dqdkdv_args);
+        arg_size = sizeof(dqdkdv_args);
         int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q == 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         if (a.hdim_q == 256) {
@@ -726,7 +706,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        if((mt == 1) || (mt == 2))
+        if(a.is_deterministic)
+        { // each workgroup walks its own share of the kv blocks
+            gdx = nsplit;
+        }
+        else if((mt == 1) || (mt == 2))
         { // mask kb
             gdx = (gdx + 1) / 2;
         }
@@ -743,21 +727,27 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); });
     }
 
-    fmha_bwd_post_kernel_args post_args;
+    fmha_bwd_post_kernel_args post_args{};
 
     post_args.ptr_dq_acc      = dq_acc_ptr;
     post_args.ptr_dq          = a.dq_ptr;
     post_args.Hs_dq_acc       = nhead_stride_dq_acc * dq_acc_element_size;
     post_args.BAs_dq_acc      = batch_stride_dq_acc * dq_acc_element_size;
     post_args.Seqs_dq_acc     = stride_dq_acc * dq_acc_element_size;
-    post_args.Hs_dq           = a.nhead_stride_dq * 2;
-    post_args.BAs_dq          = a.batch_stride_dq * 2;
+    post_args.Hs_dq           = static_cast<uint64_t>(a.nhead_stride_dq) * 2;
+    post_args.BAs_dq          = static_cast<uint64_t>(a.batch_stride_dq) * 2;
     post_args.Seqs_dq         = a.stride_dq * 2;
     post_args.seqlen_q        = a.seqlen_q;
     post_args.head_dim        = a.hdim_q;
     post_args.ptr_qseq_padded = a.seqstart_q_ptr;
     post_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    if(arch_id == "gfx1250")
+    {
+        post_args.max_seqlen_dq = a.max_seqlen_q;
+        post_args.nsplit        = a.is_deterministic ? nsplit : 0;
+        post_args.split_stride  = a.is_deterministic ? dq_acc_plane : 0;
+    }
 
     auto post_kernel_launch = [&]() {
         arg_size = sizeof(post_args);

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8/BF16 operand conversion and QK/PV MFMA operations."""
+"""FP8/BF16 operand conversion and QK/PV MFMA/WMMA operations."""
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
@@ -80,7 +81,7 @@ class PaDecodeGemm:
     def qk(self, k_ops, q_ops, m):
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
-            acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+            acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
             acc = self.mfma(
                 k_ops,
                 q_ops,
@@ -93,6 +94,36 @@ class PaDecodeGemm:
         return frag_Ss
 
     def pv(self, v_ops, p_ops):
-        acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+        acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
         acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
         return fx.Vector(acc)
+
+
+class Gfx1250Gemm:
+    @staticmethod
+    def mma(a, b, acc, k, bf16=False):
+        if const_expr(bf16):
+            result = fx.rocdl.wmma_f32_16x16x32_bf16(
+                fx.Vector.make_type(8, fx.Float32),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
+                modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
+                reuseA=False,
+                reuseB=False,
+            ).result
+        elif const_expr(k == 128):
+            result = fx.rocdl.wmma_f32_16x16x128_fp8_fp8(
+                fx.Vector.make_type(8, fx.Float32), a, b, acc
+            )
+        else:
+            result = fx.rocdl.wmma_f32_16x16x64_fp8_fp8(
+                fx.Vector.make_type(8, fx.Float32),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
+                modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
+                reuseA=False,
+                reuseB=False,
+            ).result
+        return fx.Vector(result)

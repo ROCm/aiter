@@ -11,10 +11,15 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths via `seqlens_k`, on the dense `BF16 Q/K` rows of GFX942 and GFX950 only.
-  Every other recipe and the sorted-sparse path reject it.
+- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row and the dense `BF16 Q/K` rows
+  of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve dense
+  and varlen. Every other GFX942 recipe and the sorted-sparse path reject it.
 - Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 that is
   every row; on GFX942 every row except the FP8/FP8 and INT8/FP8 dense and 256x64 sparse ones.
+  The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
+  format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
+  nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
+  mixed recipes.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
 Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
@@ -28,7 +33,7 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 | MXFP8 | FP8 | dense, sparse, Sol-Attn |
 | FP8 | FP8 | dense, sparse, Sol-Attn |
 | FP8 | MXFP6 | dense, sparse, Sol-Attn |
-| MXFP6 | FP8 | dense, sparse |
+| MXFP6 | FP8 | dense, sparse, Sol-Attn |
 | MXFP6 | MXFP6 | dense, sparse, Sol-Attn |
 | MXFP6 | MXFP4 | dense, sparse, Sol-Attn |
 | MXFP4 | MXFP4 | dense, sparse, Sol-Attn |
@@ -144,8 +149,7 @@ Raw callers pass an optional boolean `block_mask`:
 - geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
 - gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8,
-  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8. MXFP6/FP8's
-  Sol-Attn row is 64x64 only, so a Sol-Attn launch of it must pass `block_tile=(64, 64)`;
+  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8;
 - gfx942 ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16 and BF16/FP8.
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
@@ -176,7 +180,12 @@ passes share one online-softmax state, and `return_lse` reports that one softmax
 Raw API: `mha_v4_sol(..., beta=0.4)`. It takes no selection, because routing has to see the
 quantized K the kernel will read; `beta` sets the per-query-tile threshold at
 `mean_j(proxy) + beta * std_j(proxy)`, so it selects a block density rather than a block count.
-It always uses the canonical scale modes and does not apply `mha_v4`'s K-mean smoothing.
+It always uses the canonical scale modes, and applies `mha_v4`'s K-mean smoothing: the shared
+component is a constant shift of every score in a query row, pooled columns included, and of every
+block's routing proxy for a query tile, so neither the output nor the selection sees it, and the
+exported LSE is corrected for it as in `mha_v4`. A packed K pools from its unshifted source, so
+`sol_prepare(k_shift=...)` takes the shift its quantizer removed. It serves every recipe with a
+mode-2 row except MXFP8, whose formats are FP8's; MXFP8 runs through the packed API.
 
 Packed API: the LUT triple plus `mean_k`, `mean_v`, and `block_bitmap`, all set or all omitted, and
 rejected without a LUT triple. `aiter.ops.triton.attention.utils.sol_prepare()` produces all
@@ -189,16 +198,22 @@ kernel, so pool at `mha_v4_block_tile()`'s answer.
 Pooled scales: a per-tensor or per-channel descale survives pooling over the sequence, so BF16,
 BF16/FP8, FP8, and INT8/FP8 leave `mean_k_scale` and `mean_v_scale` unset. An E8M0 1x32 operand
 pools in dequantized space and is requantized, so its pooled scale must be passed: an MX Q/K
-recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The requirement is checked against the scale
-modes, because an unset slot means "read the source scale", not "error". MX operands are not
-element addressable, so name them in `k_packed_format` / `v_packed_format` and pass the
-pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
-`mxfp6_fp6_p`. A pooled V keeps V's 128-token packing whatever the KV tile, so at 64x64 its scale
-image covers the pooled rows rounded up to 128.
+recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The
+requirement is checked against the scale modes, because an unset slot means "read the source
+scale", not "error". MXFP6/FP8's V descale is per channel, so it passes `mean_k_scale` only. MX
+operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
+pass the pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
+`mxfp6_fp6_p`, and MXFP6/FP8's FP8 V needs neither. A pooled V keeps V's 128-token packing
+whatever the KV tile, so at 64x64 its scale image covers the pooled rows rounded up to 128.
 
-Rows declaring `sorted` launch over a work table ordered by `lut_count` (`sorted_dispatch`); the
-order changes only scheduling, and the output is bitwise identical either way. `kv_range_tokens`
-splits the softmax into LSE-merged key ranges on rows declaring `kv_range`.
+Rows declaring `sorted` launch over a work table ordered by `lut_count` (`sorted_dispatch`), as
+sorted-sparse rows always do. A 256-row query tile reuses each K/V tile enough that load balance
+decides, so its table is longest first (Sol-Attn in four levels of the KV length). A 64-row tile
+leans on neighbouring tiles sharing a head's K/V in L2, so its table starts every tile with at
+least 90% of the KV tiles in its LUT, head by head, then runs the heads in raster order, longest
+first within each. `AITER_MHA_V4_WORK_ORDER=lpt|head|head-promoted|raster` overrides the order per
+call. The order changes only scheduling, and the output is bitwise identical either way.
+`kv_range_tokens` splits the softmax into LSE-merged key ranges on rows declaring `kv_range`.
 
 ## Compile And ABI Rules
 
@@ -217,6 +232,11 @@ Run `pytest op_tests/test_mha_v4.py op_tests/test_mha_v4_sparse.py` for entrypoi
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
+
+`_VARLEN_CAPABLE_QV` is a claim about the deployed dense objects, keyed on `(q_format, v_format)`
+alone -- a new object for an already-claimed pair inherits the claim without being rebuilt, and
+answers stay plausible because the feature is simply ignored. The suite disassembles every claimed
+row rather than trusting the table. LSE is claimed per row instead, by the manifest's `lse` column.
 
 Key implementation locations:
 

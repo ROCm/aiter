@@ -121,15 +121,26 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                      int64_t sorted_dispatch = -1,
                      // mean_k_var's E8M0 scale in mean_k_scale's layout, exactly when K's
                      // scale mode is E8M0_PER_1X32 and mean_k_var is given.
-                     const std::optional<at::Tensor>& mean_k_var_scale = std::nullopt);
+                     const std::optional<at::Tensor>& mean_k_var_scale = std::nullopt,
+                     // Low-rank tilt PoC: factor planes 1..rank behind mean_k / mean_v,
+                     // tilt_plane_stride bytes apart, and a one- to eight-element int32 device
+                     // tensor the kernel reads: the score and value GEMMs' E8M0 shifts, then the
+                     // row's score multiplier and other plane strides (see fmha_v4_fwd_sol).
+                     int64_t tilt_rank                              = 0,
+                     int64_t tilt_plane_stride                      = 0,
+                     const std::optional<at::Tensor>& tilt_shift = std::nullopt);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each
 // entry names the tile one workgroup claims, so a duplicated entry leaves another tile unwritten.
+// q_tile picks the default order the launchers would (see AITER_MHA_V4_WORK_ORDER), and
+// kv_tiles the lut_count from which the head-promoted order starts a row first.
 at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
                                     int64_t batch,
                                     int64_t nhead,
-                                    int64_t q_tiles);
+                                    int64_t q_tiles,
+                                    int64_t q_tile   = 256,
+                                    int64_t kv_tiles = 0);
 
 } // namespace torch_itfs
 } // namespace aiter

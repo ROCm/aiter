@@ -17,6 +17,7 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.utils import env
 
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
@@ -35,7 +36,7 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 # kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 # to enable it.
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
@@ -144,7 +145,21 @@ def ptr_buf_tensor(
 
 
 def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
-    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
+    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt).
+
+    ``cache_modifier`` is the instruction's raw aux/CPOL field, and its width is
+    architecture-dependent: two bits (sc0, nt) on CDNA3, but gfx1250 puts scope
+    bits above them and passes values like ``CPOL_DEV`` (0x10). It is therefore
+    NOT range-checked here -- a bound that fits one generation rejects a legal
+    value on another, which is what happened when this was briefly capped at 3
+    and five gfx1250 mxfp8 GEMM kernels stopped building. Callers that know
+    their own encoding bound it themselves; the M3 scorers do.
+    """
+    if unit_bytes not in _BUF_COPY_ATOM:
+        raise ValueError(
+            f"unit_bytes {unit_bytes} is not a buffer access width; "
+            f"expected one of {sorted(_BUF_COPY_ATOM)}"
+        )
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 
@@ -295,6 +310,11 @@ def _run_compiled(exe, *args, specialization_key=None):
     A specialization key gives a multi-constexpr JitFunction one compiled
     callable per configuration. Factory-style launchers should leave it unset.
     """
+    if env.compile.compile_only:
+        # A callable warmed during execution must not dispatch when a later
+        # preload switches to compile-only. Preserve it for execution to resume.
+        _compile_and_run(exe, *args)
+        return
     if specialization_key is None:
         cf = getattr(exe, "_cf", None)
     else:

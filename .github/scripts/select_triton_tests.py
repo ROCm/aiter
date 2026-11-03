@@ -21,6 +21,14 @@ SRC = "aiter/ops/triton/"
 KERNELS = SRC + "_triton_kernels/"
 GLUON_KERNELS = SRC + "_gluon_kernels/"
 CONFIGS = SRC + "configs/"
+# Ops whose Triton launch path is only exercised on MI300X (MI35X takes a
+# Gluon branch instead), so a change to them needs the MI300X job even without
+# a gfx942 config or Gluon-kernel change.
+GFX942_LAUNCH_PATHS = (
+    SRC + "attention/pa_prefill_sparse.py",
+    SRC + "_triton_kernels/attention/sparse_attention_dsv4.py",
+    "op_tests/triton_tests/attention/test_pa_prefill_sparse.py",
+)
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"
 ROOT = Path(__file__).resolve().parents[2]
@@ -349,8 +357,10 @@ def select(diff):
             raise RuntimeError(f"{path}: package initializer changed")
 
         if path.startswith(CONFIGS):
-            # configs/<arch>/<backend>/<op>/<family>/<file>.json
+            # configs/<arch>[/<cu_num>cu]/<backend>/<op>/<family>/<file>.json
             parts = path[len(CONFIGS) :].split("/")
+            if len(parts) > 1 and re.fullmatch(r"[1-9][0-9]*cu", parts[1]):
+                del parts[1]  # a CU tree has the default tree's layout below the arch
             if not (
                 path.endswith(".json")
                 and len(parts) >= 5
@@ -436,6 +446,7 @@ def main():
             diff = changed_files(args.merge_ref)
             needs_mi300x = any(
                 path.startswith((CONFIGS + "gfx942/", GLUON_KERNELS + "gfx942/"))
+                or path in GFX942_LAUNCH_PATHS
                 for path in diff
             )
             if not args.all:

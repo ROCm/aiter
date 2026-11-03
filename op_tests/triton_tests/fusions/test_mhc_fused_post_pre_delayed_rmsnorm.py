@@ -70,17 +70,28 @@ def ref_mhc_fused_post_pre_delayed_rmsnorm(
 
 def make_inputs(T, H, device="cuda", seed=0):
     g = torch.Generator(device=device).manual_seed(seed)
-    residual = (torch.randn(T, 4, H, device=device, generator=g) * 1.5).to(
+    residual = (
+        torch.randn(T, 4, H, device=device, generator=g, dtype=torch.float32) * 1.5
+    ).to(torch.bfloat16)
+    y = torch.randn(T, H, device=device, generator=g, dtype=torch.float32).to(
         torch.bfloat16
     )
-    y = torch.randn(T, H, device=device, generator=g).to(torch.bfloat16)
-    fn = torch.randn(24, 4 * H, device=device, generator=g) * 0.01
-    hc_scale = torch.tensor([0.7, 1.3, 0.9], device=device)
-    hc_base = torch.randn(24, device=device, generator=g) * 0.5
-    post = torch.rand(T, 4, 1, device=device, generator=g) * 2
-    comb = torch.softmax(torch.randn(T, 4, 4, device=device, generator=g), -1)
-    pre = torch.sigmoid(torch.randn(T, 4, device=device, generator=g)) + 1e-6
-    w = (1 + 0.2 * torch.randn(H, device=device, generator=g)).to(torch.bfloat16)
+    fn = torch.randn(24, 4 * H, device=device, generator=g, dtype=torch.float32) * 0.01
+    hc_scale = torch.tensor([0.7, 1.3, 0.9], device=device, dtype=torch.float32)
+    hc_base = torch.randn(24, device=device, generator=g, dtype=torch.float32) * 0.5
+    post = torch.rand(T, 4, 1, device=device, generator=g, dtype=torch.float32) * 2
+    comb = torch.softmax(
+        torch.randn(T, 4, 4, device=device, generator=g, dtype=torch.float32), -1
+    )
+    pre = (
+        torch.sigmoid(
+            torch.randn(T, 4, device=device, generator=g, dtype=torch.float32)
+        )
+        + 1e-6
+    )
+    w = (1 + 0.2 * torch.randn(H, device=device, generator=g, dtype=torch.float32)).to(
+        torch.bfloat16
+    )
     return residual, y, fn, hc_scale, hc_base, post, comb, pre, w
 
 

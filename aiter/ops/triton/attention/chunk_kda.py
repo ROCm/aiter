@@ -223,16 +223,25 @@ def chunk_kda_walk(
         ), "initial_state must be [N, H, V, K]"
         state_in = initial_state
         state_out = final_state = (
-            qg.new_empty(N, *state_shape, dtype=torch.float32)
+            qg.new_empty(
+                N,
+                *state_shape,
+                dtype=(
+                    initial_state.dtype if initial_state is not None else torch.float32
+                ),
+            )
             if output_final_state
             else None
         )
         num_slots = N
+    state_dtypes = (
+        (torch.float32, torch.bfloat16) if _ARCH == "gfx950" else (torch.float32,)
+    )
     for s in (state_in, state_out):
         if s is not None:
             assert (
-                s.dtype == torch.float32 and s.shape[1:] == state_shape
-            ), f"state must be fp32 [*, {H}, {V}, {K}]"
+                s.dtype in state_dtypes and s.shape[1:] == state_shape
+            ), f"state must have dtype in {state_dtypes} and shape [*, {H}, {V}, {K}]"
             assert s.stride()[1:] == (V * K, K, 1), "state must be dense [*, H, V, K]"
             assert s.stride(0) >= H * V * K, "state rows must not overlap"
     if fuse_norm:
@@ -393,10 +402,13 @@ def chunk_kda(
             per sequence; built by prepare_chunk_kda_metadata (a host sync) if None.
         scale: q scale, K**-0.5 if None.
         out: [1, T, H, 128] output, may alias v; allocated if None.
-        initial_state: fp32 [N, H, V, K] start state, zeros if None.
-        output_final_state: return a new fp32 [N, H, V, K] final state.
-        state_cache: fp32 [slots, H, V, K] paged state, read and written in place at
-            state_indices; replaces initial_state and output_final_state.
+        initial_state: [N, H, V, K] start state, zeros if None. The Gluon path accepts
+            fp32, or bf16 on gfx950. Other archs use the Triton dtype contract.
+        output_final_state: return a new [N, H, V, K] final state with initial_state's
+            dtype, or fp32 without initial_state.
+        state_cache: [slots, H, V, K] state, with the same dtype limits as
+            initial_state. Updated in place at state_indices; replaces initial_state
+            and output_final_state.
         state_indices: [N] distinct cache rows; a row outside [0, slots) is not read or
             written (that sequence starts from zeros).
         has_initial_state: bool [N]; False starts that sequence from zeros.

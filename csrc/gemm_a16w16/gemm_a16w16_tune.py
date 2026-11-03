@@ -32,6 +32,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm_kernel_name,
 )
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
+from aiter.ops.opus._arch import _device_arch_and_cu
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -45,14 +46,13 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
     if _opus_csrc not in sys.path:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import (
-        SPLITK_KIDS as _opus_splitk_kids,
-    )
-    from opus_gemm_common import (
-        kernels_list as _opus_kernels_list,
-    )
+    from opus_gemm_common import get_registry as _opus_get_registry
     from opus_gemm_tune import (
         _ensure_kids_compiled as _opus_ensure_kids_compiled,
+    )
+    from opus_gemm_tune import (
+        _tune_arch,
+        _tune_cu,
     )
     from opus_gemm_tune import (
         candidate_kids_for_shape as _opus_candidate_kids_for_shape,
@@ -69,11 +69,11 @@ try:
 
     from aiter.ops.opus import opus_gemm as _opus_gemm
 
-    _opus_all_kernels = dict(_opus_kernels_list)
+    _opus_tune_identity = (_tune_arch, _tune_cu)
 except Exception as _opus_exc:  # noqa: BLE001
     _opus_gemm = None
-    _opus_all_kernels = None
-    _opus_splitk_kids = frozenset()
+    _opus_tune_identity = None
+    _opus_get_registry = None
     _opus_candidate_kids_for_shape = None
     _opus_kid_rejects_shape = None
     _opus_kid_rejects_bias = None
@@ -207,6 +207,7 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
         weight,
         out,
         bias=bias,
+        family="a16w16",
         kid=kid,
         split_k=splitK,
     )
@@ -407,6 +408,9 @@ def libtype_list(string):
 
 
 class GemmA16W16Tuner(GemmCommonTuner):
+    def get_gfx(self):
+        return _device_arch_and_cu(torch.cuda.current_device())[0]
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
@@ -685,19 +689,22 @@ class GemmA16W16Tuner(GemmCommonTuner):
         if scaleAB or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        cu_num = get_cu_num()
+        gfx, cu_num = info_keys[0], int(info_keys[1])
+        if (gfx, cu_num) != _opus_tune_identity:
+            raise ValueError("Opus task namespace disagrees with the tuner catalog")
+        kernels = _opus_get_registry("a16w16", gfx, cu_num)
         rtol, atol = _default_tol(outdtype)
         cand_kids = _opus_candidate_kids_for_shape(M, N, K, has_bias, cu_num)
         tasks = []
         for kid in sorted(cand_kids):
-            k_inst = _opus_all_kernels.get(kid)
+            k_inst = kernels.get(kid)
             if k_inst is None:
                 continue
             if _opus_kid_rejects_shape(k_inst, M, N, K):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
-            if kid in _opus_splitk_kids:
+            if k_inst.splitk_workspace_dtype is not None:
                 splitK_range = _opus_candidate_splitK(M, N, K, 1, cu_num, k_inst)
             else:
                 splitK_range = [0]
@@ -831,7 +838,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_triton_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or outdtype == dtypes.fp32 or indtype != dtypes.bf16:
+        if scaleAB or is_shuffle or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, _ = _default_tol(outdtype)
@@ -922,6 +929,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         task = []
         tasks_data = []
         hipblaslt_rets = []
+        opus_kids = set()
 
         for i in range(len(untunedf)):
             ds = untunedf.loc[i, :]
@@ -967,13 +975,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_triton_tasks(*common))
             if "all" in libtype or "opus" in libtype:
                 opus_tasks = self._get_opus_tasks(*common)
-                if opus_tasks and _opus_ensure_kids_compiled is not None:
-                    opus_kids = {t[0][1] for t in opus_tasks}
-                    if _opus_ensure_kids_compiled(opus_kids):
-                        logger.info(
-                            f"opus subset-compile: expanded sidecar to cover "
-                            f"{len(opus_kids)} candidate kids"
-                        )
+                opus_kids.update(t[0][1] for t in opus_tasks)
                 task.extend(opus_tasks)
 
             shape_kernel_nums = len(task) - prev_count
@@ -981,6 +983,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
 
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
+
+        if (
+            opus_kids
+            and _opus_ensure_kids_compiled is not None
+            and _opus_ensure_kids_compiled(opus_kids)
+        ):
+            logger.info(
+                f"opus subset-compile: prepared module for "
+                f"{len(opus_kids)} candidate kids"
+            )
 
         ret = []
         if task:

@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ast
+import inspect
 import itertools
 
 import pandas as pd
@@ -11,6 +13,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import mha as mha_ops
 from aiter.ops.mha import fmha_fwd_bf16_opus_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
@@ -1225,3 +1228,93 @@ def test_flash_attn_func_opus_d192_v128(
     _run_opus_batch_case(
         batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 192, 128, causal
     )
+
+
+# ---------------------------------------------------------------------------
+# Sink forward dispatch: the fmha_v3_fwd ASM kernels take no sink arguments,
+# so any call with sink_ptr or sink_size must route to CK (mha_fwd) instead.
+# ---------------------------------------------------------------------------
+
+
+def _sink_dispatch_param_names(fn_name):
+    """Parameter names of an op stub in aiter.ops.mha (compile_ops hides them)."""
+    for node in ast.parse(inspect.getsource(mha_ops)).body:
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            return [arg.arg for arg in node.args.args]
+    raise LookupError(fn_name)
+
+
+def _sink_dispatch_record(monkeypatch, asm_name, ck_name):
+    """Wrap the ASM and CK entry points; return the calls each receives."""
+    calls = {"asm": 0, "ck": []}
+    asm_fn = getattr(mha_ops, asm_name)
+    ck_fn = getattr(mha_ops, ck_name)
+    ck_params = _sink_dispatch_param_names(ck_name)
+
+    def asm_spy(*args, **kwargs):
+        calls["asm"] += 1
+        return asm_fn(*args, **kwargs)
+
+    def ck_spy(*args, **kwargs):
+        calls["ck"].append({**dict(zip(ck_params, args)), **kwargs})
+        return ck_fn(*args, **kwargs)
+
+    monkeypatch.setattr(mha_ops, asm_name, asm_spy)
+    monkeypatch.setattr(mha_ops, ck_name, ck_spy)
+    return calls
+
+
+_SINK_DISPATCH_CASES = [
+    ("none", "unbounded"),
+    ("none", "covers_seq"),
+    ("sink_ptr", "unbounded"),
+    ("sink_ptr", "covers_seq"),
+    ("sink_size", "covers_seq"),
+]
+
+
+@pytest.mark.parametrize("sink,window", _SINK_DISPATCH_CASES)
+def test_flash_attn_func_sink_bypasses_v3_asm(sink, window, monkeypatch):
+    """BF16 D128 calls that qualify for fmha_v3_fwd must go to CK with a sink.
+
+    `sink="none"` is the control proving the shape takes the ASM path. A window
+    covering the whole sequence is normalized to -1, so it is not SWA and does
+    not exclude ASM on its own.
+    """
+    if get_gfx() not in ("gfx942", "gfx950"):
+        pytest.skip("fmha_v3_fwd ASM kernels require gfx942/gfx950")
+    batch_size, seqlen, nheads, nheads_k, hdim = 2, 256, 8, 2, 128
+    sink_size = 4 if sink == "sink_size" else 0
+    left = -1 if window == "unbounded" else seqlen
+    window_size = (left, 0, sink_size)
+
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, seqlen, nheads, hdim, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, hdim, device="cuda", dtype=dtypes.bf16
+    )
+    v = torch.randn_like(k)
+    sink_ptr = (
+        torch.randn(nheads, device="cuda", dtype=torch.float32)
+        if sink == "sink_ptr"
+        else None
+    )
+
+    calls = _sink_dispatch_record(monkeypatch, "fmha_v3_fwd", "mha_fwd")
+    out = aiter.flash_attn_func(
+        q, k, v, causal=True, window_size=window_size, sink_ptr=sink_ptr
+    )
+    assert torch.isfinite(out).all()
+
+    if sink == "none":
+        assert calls["asm"] == 1 and not calls["ck"]
+        return
+    assert calls["asm"] == 0, "sink call was dispatched to fmha_v3_fwd ASM"
+    assert len(calls["ck"]) == 1
+    ck_args = calls["ck"][0]
+    assert ck_args["window_size_left"] == -1
+    assert ck_args["sink_size"] == sink_size
+    if sink_ptr is None:
+        assert ck_args["sink_ptr"] is None
+    else:
+        assert torch.equal(ck_args["sink_ptr"], sink_ptr)

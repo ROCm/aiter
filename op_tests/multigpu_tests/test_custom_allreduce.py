@@ -2,8 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ctypes
 import logging
+import mmap
 import os
+import threading
+import time
 from multiprocessing import Pool, freeze_support, set_start_method
 
 import pandas as pd
@@ -51,11 +55,8 @@ def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, grap
     Each rank regenerates all ``tp_size`` inputs from the same ``case_idx``
     seed and keeps its own, so the reference is available locally and only
     scalars go back to the parent. In graph mode the captured graph and its
-    buffers are appended to ``graphs`` and must outlive the whole sweep:
-    custom all-reduce caches the peer IPC address of every captured buffer by
-    its local pointer, so freeing one and capturing a later shape at the
-    same address would replay with stale peer pointers. A model keeps all
-    its captured graphs alive the same way.
+    buffers are appended to ``graphs`` and outlive the whole sweep, the way a
+    model keeps all its captured graphs alive.
     """
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     ref = torch.zeros(shape, dtype=dtype, device="cuda")
@@ -282,6 +283,156 @@ def test_allreduce_tail_regression(tp_size, dtype, iterations=20, shapes=None):
     )
 
 
+# Back-to-back LL128 messages of different sizes per TP size (see the LL / LL128
+# dispatch in custom_all_reduce.cuh). Three calls per round alternate the bank
+# each size lands in, which the overlap needs. TP8 has no LL128 range.
+_LL128_MIXED_SIZES = {
+    2: [16 * 7168, 16 * 7168, 8 * 7168],
+    4: [4 * 8192, 4 * 8192, 28800],
+}
+
+# Back-to-back gfx1250 LL messages of different sizes (bf16 elements), any TP
+# size. The kernel picks 512 threads below 64 KiB and 256 at or above it, and
+# sizes the grid from the message, so these sizes give each packet a different
+# owning block (16, 32 and 1 blocks) from one call to the next.
+_LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
+
+
+def _is_gfx1250() -> bool:
+    return (
+        torch.cuda.is_available()
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+
+
+def _start_queue_evictions(stop):
+    """Repeatedly evict this process's GPU queues so its kernels pause mid-flight.
+
+    Toggling the protection of registered host memory makes KFD preempt every
+    queue of the process, which lets the peers run ahead as on a busy host.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    hip = ctypes.CDLL("libamdhip64.so")
+    buf = mmap.mmap(-1, 256 << 20)
+    buf.write(b"\1" * len(buf))
+    view = ctypes.c_char.from_buffer(buf)
+    nbytes = ctypes.c_size_t(len(buf))
+    assert hip.hipHostRegister(ctypes.c_void_p(ctypes.addressof(view)), nbytes, 0) == 0
+
+    def evict():
+        # Referencing view keeps the mapping alive for the thread's lifetime.
+        addr = ctypes.c_void_p(ctypes.addressof(view))
+        while not stop.is_set():
+            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 1) == 0
+            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 3) == 0
+            time.sleep(0.002)
+
+    threading.Thread(target=evict, daemon=True).start()
+
+
+def _allreduce_mixed_size_regression(
+    rank, tp_size, sizes, iterations, distributed_init_method, stop, name, check_every
+):
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = CustomAllreduce(dist.group.WORLD, device)
+    assert not ca_comm.disabled, f"The {name} regression requires custom allreduce"
+    generator = torch.Generator().manual_seed(2026)
+    inputs, refs = [], []
+    for n in sizes:
+        x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
+        inputs.append(x[rank].to(device, torch.bfloat16))
+        refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    # Opt-in: how the evictions behave depends on the host's KFD driver.
+    evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
+    # Rank 1 reads the peer slots that a faster rank's next call overlaps.
+    if evict and rank == 1:
+        _start_queue_evictions(stop)
+    dist.barrier()
+    done = torch.cuda.Event()
+    for iteration in range(iterations):
+        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
+        if iteration % check_every != check_every - 1:
+            continue
+        done.record()
+        deadline, evicting = time.time() + 30, evict and not stop.is_set()
+        while not done.query():
+            if time.time() > deadline:
+                if not evicting:
+                    logger.error(f"{rank=} {name} hang before {iteration=} {sizes=}")
+                    os._exit(1)
+                logger.warning(f"{rank=} stalled before {iteration=}; stop evicting")
+                stop.set()
+                deadline, evicting = time.time() + 60, False
+            time.sleep(0.001)
+        for n, out, ref in zip(sizes, outs, refs):
+            context = f"{name} {rank=} {iteration=} numel={n}"
+            torch.testing.assert_close(
+                out,
+                ref,
+                rtol=0,
+                atol=0,
+                msg=lambda msg, context=context: f"{context}\n{msg}",
+            )
+    stop.set()
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 0:
+        logger.info(
+            "%s mixed-size regression passed: TP%d, %d rounds of %s",
+            name,
+            tp_size,
+            iterations,
+            sizes,
+        )
+    ca_comm.close()
+    dist.destroy_process_group()
+
+
+def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
+    # A rank that finished one call used to overwrite a slower peer's unread
+    # LL128 slots when the next call had a different size, hanging both ranks.
+    sizes = _LL128_MIXED_SIZES.get(tp_size)
+    if sizes is None:
+        return
+    _run_mixed_size_regression(tp_size, sizes, iterations, "LL128", 100)
+
+
+def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
+    # The gfx1250 LL kernel kept one epoch per block while the grid followed the
+    # message size, so a packet's owning block could reuse a stale epoch and
+    # bank when the size changed: the first rounds could accept the previous
+    # call's lines, and later rounds could overwrite a slower peer's unread
+    # lines. Check every round so the early stale reads are not skipped.
+    if not _is_gfx1250():
+        return
+    _run_mixed_size_regression(
+        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
+    )
+
+
+def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
+    torch.multiprocessing.spawn(
+        _allreduce_mixed_size_regression,
+        args=(
+            tp_size,
+            sizes,
+            iterations,
+            get_distributed_init_method(get_ip(), get_open_port()),
+            torch.multiprocessing.get_context("spawn").Event(),
+            name,
+            check_every,
+        ),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
 # Custom-AR size cutoff (bytes). Mirrors _DEFAULT_CAR_MAX_SIZE in
 # aiter/dist/device_communicators/custom_all_reduce.py and honors the same
 # AITER_CUSTOM_AR_MAX_SIZE override. Inputs at or below this run on the custom
@@ -363,7 +514,8 @@ parser.add_argument(
 parser.add_argument(
     "--regression",
     action="store_true",
-    help="run only tail correctness checks in both eager and graph modes",
+    help="run only the correctness checks: tail (eager and graph), LL128 and "
+    "gfx1250 LL mixed sizes",
 )
 parser.add_argument(
     "--iterations",
@@ -398,6 +550,12 @@ if __name__ == "__main__":
             args.iterations,
             shapes=[args.shape] if args.shape is not None else None,
         )
+        if dtype == torch.bfloat16:
+            # CI runs this file at the default TP8, which has no LL128 range.
+            for tp in _LL128_MIXED_SIZES:
+                if tp <= args.tp_size:
+                    test_allreduce_ll128_mixed_size_regression(tp)
+            test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"

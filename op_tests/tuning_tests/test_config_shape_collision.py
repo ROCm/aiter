@@ -77,6 +77,10 @@ FAMILIES = [
         "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
         "a8w8_mxfp8_bpreshuffle_tuned_gemm",
     ),
+    (
+        "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+        "a4w4_mxscale_bpreshuffle_tuned_gemm",
+    ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
     (
@@ -146,7 +150,9 @@ class TestConfigShapeCollision(unittest.TestCase):
     # ---- self-check / control: prove the harness itself detects collisions ----
 
     @staticmethod
-    def _build_synthetic_family(root, dup, *, with_model_file=True, canonical_raw=None):
+    def _build_synthetic_family(
+        root, dup, *, with_model_file=True, canonical_raw=None, model_raw=None
+    ):
         """Write a minimal isolated config tree for one family and return
         (env_name, name). Uses the a8w8_blockscale family (untuned key = M,N,K).
 
@@ -155,8 +161,9 @@ class TestConfigShapeCollision(unittest.TestCase):
         second row exercises: True puts it in a model_configs/ sibling, so
         get_config_file merges two tables; False puts it in the canonical CSV
         and writes no sibling at all, so there is nothing to merge and the file
-        is handed straight back. `canonical_raw` overrides the canonical file
-        contents verbatim, for malformed input."""
+        is handed straight back. `canonical_raw` and `model_raw` override the
+        canonical and model_configs file contents verbatim, for malformed input
+        or cells written a particular way."""
         name = "a8w8_blockscale_tuned_gemm"
         env_name = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"
         cfg = os.path.join(root, "aiter", "configs")
@@ -178,8 +185,11 @@ class TestConfigShapeCollision(unittest.TestCase):
             with open(
                 os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv"), "w"
             ) as f:
-                f.write(header)
-                f.write(second_row)
+                if model_raw is not None:
+                    f.write(model_raw)
+                else:
+                    f.write(header)
+                    f.write(second_row)
         return env_name, name
 
     def _run_synthetic(self, dup, **kwargs):
@@ -301,8 +311,80 @@ class TestConfigShapeCollision(unittest.TestCase):
             f"error raised from get_config_file:\n{err}",
         )
 
+    # ---- merge output: cells as written, numeric keys, numeric us ----
+
+    def _merge_synthetic(self, canonical_raw, model_raw):
+        """Merge a synthetic family whose two tables are given verbatim.
+        Returns (error or None, merged text or None, canonical text, model
+        text); the sources are read back after any dedup rewrite."""
+        tmp = tempfile.mkdtemp(prefix="aiter_cfg_merge_")
+        try:
+            env_name, name = self._build_synthetic_family(
+                tmp, dup=False, canonical_raw=canonical_raw, model_raw=model_raw
+            )
+            err = merged = None
+            try:
+                with open(self._resolve(tmp, env_name, name)) as f:
+                    merged = f.read()
+            except Exception as e:  # noqa: BLE001
+                err = f"{type(e).__name__}: {e}"
+            cfg = os.path.join(tmp, "aiter", "configs")
+            with open(os.path.join(cfg, f"{name}.csv")) as f:
+                canonical = f.read()
+            with open(os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv")) as f:
+                model = f.read()
+            return err, merged, canonical, model
+        finally:
+            core.AITER_ROOT_DIR = self._tmp  # restore for other tests
+            _cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_merge_keeps_cells_as_written(self):
+        """Parsed, a column with a blank cell turned float and the merged table
+        wrote 4 as 4.0, which readers that take integers from the text (the
+        gfx1250 grouped MoE runtime) reject."""
+        err, merged, _, _ = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,splitK,us\n"
+            "gfx950,256,1,64,128,4,10.0\n"
+            "gfx950,256,2,64,128,,11.0\n",
+            "gfx,cu_num,M,N,K,splitK,us\ngfx950,256,3,64,128,8,12.0\n",
+        )
+        self.assertIsNone(err, err)
+        rows = list(csv.DictReader(merged.splitlines()))
+        self.assertEqual([row["splitK"] for row in rows], ["4", "", "8"])
+
+    def test_merge_compares_keys_as_numbers(self):
+        """Cells kept as text still compare as numbers: a shape written 256 in
+        one table and 256.0 in another is one shape."""
+        err, _, _, _ = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,10.0\n",
+            "gfx,cu_num,M,N,K,us\ngfx950,256.0,1,64,128,20.0\n",
+        )
+        self.assertIsNotNone(err, "256 and 256.0 were not seen as one shape")
+        self.assertIn("duplicate shape", err.lower())
+
+    def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
+        """A written us that is not a number, here nan on an unrelated row, must
+        not turn the lowest-us pick into a text sort, which keeps 10.5 over 9.5
+        and deletes the faster row from its source."""
+        err, _, canonical, model = self._merge_synthetic(
+            "gfx,cu_num,M,N,K,us\n"
+            "gfx950,256,1,64,128,10.5\n"
+            "gfx950,256,3,64,128,nan\n",
+            "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,9.5\n",
+        )
+        self.assertIn("duplicate shape", (err or "").lower())
+        self.assertNotIn("10.5", canonical)
+        self.assertIn("9.5", model)
+
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
+
+    def test_a4w4_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
 
     def test_a6w6_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
@@ -351,7 +433,7 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
 
         # The generic config registry owns file discovery and merging; the
-        # dedicated caller policy still owns public-kid normalization.
+        # dedicated caller policy still owns local-kid lookup.
         from aiter.ops.opus import policy
 
         policy._load_mxscale_bmm_tuned.cache_clear()
@@ -359,14 +441,14 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
         self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
-            8311,
-            "legacy local OPUS kid 311 must become public global kid 8311",
+            rows[("gfx950", 256, 2, 1, 1024, 4096, "128x128")]["kernelId"],
+            63,
+            "saved OPUS row must select local kid 63 for CU=256",
         )
         self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
-            8653,
-            "legacy local OPUS kid 653 must become public global kid 8653",
+            rows[("gfx950", 256, 8, 128, 1024, 4096, "128x128")]["kernelId"],
+            144,
+            "saved OPUS row must select local kid 144 for CU=256",
         )
         policy._load_mxscale_bmm_tuned.cache_clear()
 
@@ -393,10 +475,73 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
         with open(merged, newline="") as f:
             rows = list(csv.DictReader(f))
+        dsv4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "7168",
+                "384",
+                "385",
+                "7",
+                "384",
+                "torch.float4_e2m1fn_x2",
+            )
+        ]
+        hy4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "6144",
+                "256",
+                "257",
+                "9",
+                "256",
+                "torch.float8_e4m3fn",
+            )
+        ]
         self.assertEqual(
-            {int(row["token"]) for row in rows},
+            {int(row["token"]) for row in dsv4_rows},
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
         )
+        self.assertEqual(
+            {int(row["token"]) for row in hy4_rows},
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+            },
+        )
+        self.assertEqual(len(dsv4_rows), 12)
+        self.assertEqual(len(hy4_rows), 16)
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")

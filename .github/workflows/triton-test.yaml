@@ -68,7 +68,7 @@ jobs:
         env:
           # 'true': print the selection, but run what CI ran before test
           # selection existed. 'false': run only the selected tests.
-          DRY_RUN: "true"
+          DRY_RUN: "false"
           FULL_SUITE: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
         run: |
           set -euo pipefail
@@ -109,7 +109,7 @@ jobs:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
-    timeout-minutes: 60
+    timeout-minutes: 120
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
@@ -262,12 +262,14 @@ jobs:
           ${{ env.DOCKER_IMAGE }}
 
       - name: Setup Aiter and Triton
+        timeout-minutes: 20
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
+        timeout-minutes: 60
         run: |
           set -exo pipefail
           echo "Running Triton Tests..."

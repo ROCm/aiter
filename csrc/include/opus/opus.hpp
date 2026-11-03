@@ -2873,6 +2873,16 @@ private:
     }
     // The cache policy rides in as the plain integer the builtin takes; the backend spells the th:/scope:/nv modifiers.
     // Groups 2/3 go in zeroed when the tile needs neither, which makes the backend emit the two-operand short form; the fifth operand reaches no instruction field (measured) and is passed zero.
+#if OPUS_HAS_UNSIGNED_TENSOR_D0
+    // Load/store share the descriptor prototype. Probe with a legal cache value
+    // using C++17 SFINAE so standalone C++17 consumers remain supported.
+    template<typename G0, typename G1, typename G2, typename G3, typename G4>
+    OPUS_D static auto tensor_groups_accepted(int) -> decltype(
+        __builtin_amdgcn_tensor_load_to_lds(std::declval<G0>(), std::declval<G1>(),
+            std::declval<G2>(), std::declval<G3>(), std::declval<G4>(), 0), true_type{});
+    template<typename... Groups>
+    OPUS_D static false_type tensor_groups_accepted(...);
+#endif
     template<bool IsStore>
     OPUS_D static void issue(const descriptor& d) {
         // th=7 has a store spelling (TH_STORE_NT_WB) but no legal load one on gfx1250.
@@ -2885,8 +2895,32 @@ private:
 #if OPUS_HAS_UNSIGNED_TENSOR_D0
         // Same lanes either way, so this cast generates nothing.
         const u32x4_t g0 = __builtin_bit_cast(u32x4_t, d.group0);
-        if constexpr (IsStore) __builtin_amdgcn_tensor_store_from_lds(g0, d.group1, g2, g3, unused, traits::cache_pol);
-        else                   __builtin_amdgcn_tensor_load_to_lds   (g0, d.group1, g2, g3, unused, traits::cache_pol);
+        // Newer LLVM prototypes make every descriptor group unsigned; earlier
+        // clang-24 builds changed only group0. Probe the dependent argument types
+        // rather than another major-version guess. Bit casts preserve every D# bit.
+        auto issue_groups = [&](auto group1, auto group2, auto group3, auto group4)
+            __attribute__((always_inline)) {
+            constexpr bool accepts_original = decltype(tensor_groups_accepted<decltype(g0),
+                decltype(group1), decltype(group2), decltype(group3), decltype(group4)>(0))::value;
+            if constexpr (IsStore) {
+                if constexpr (accepts_original)
+                    __builtin_amdgcn_tensor_store_from_lds(g0, group1, group2, group3, group4, traits::cache_pol);
+                else
+                    __builtin_amdgcn_tensor_store_from_lds(g0,
+                        __builtin_bit_cast(vector_t<u32_t, 8>, group1),
+                        __builtin_bit_cast(u32x4_t, group2), __builtin_bit_cast(u32x4_t, group3),
+                        __builtin_bit_cast(vector_t<u32_t, 8>, group4), traits::cache_pol);
+            } else {
+                if constexpr (accepts_original)
+                    __builtin_amdgcn_tensor_load_to_lds(g0, group1, group2, group3, group4, traits::cache_pol);
+                else
+                    __builtin_amdgcn_tensor_load_to_lds(g0,
+                        __builtin_bit_cast(vector_t<u32_t, 8>, group1),
+                        __builtin_bit_cast(u32x4_t, group2), __builtin_bit_cast(u32x4_t, group3),
+                        __builtin_bit_cast(vector_t<u32_t, 8>, group4), traits::cache_pol);
+            }
+        };
+        issue_groups(d.group1, g2, g3, unused);
 #else
         if constexpr (IsStore) __builtin_amdgcn_tensor_store_from_lds(d.group0, d.group1, g2, g3, unused, traits::cache_pol);
         else                   __builtin_amdgcn_tensor_load_to_lds   (d.group0, d.group1, g2, g3, unused, traits::cache_pol);

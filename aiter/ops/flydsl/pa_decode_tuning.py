@@ -17,8 +17,13 @@ from pathlib import Path
 import torch
 from flydsl.autotune import Config, autotune
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
-from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
+from aiter.ops.flydsl.kernels.pa_decode_plan import (
+    DEFAULT_MAX_BATCH_SIZE,
+    PADecodePlan,
+    plan_pa_decode,
+)
 from aiter.ops.flydsl.pa_decode import pa_decode
 
 _PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
@@ -32,14 +37,24 @@ def _tuning_cache_tag():
     return digest.hexdigest()
 
 
+def _cache_geometry(key_cache):
+    """KV heads and page size of a packed 5D K cache."""
+    if key_cache.ndim != 5:
+        if key_cache.ndim == 4:
+            raise NotImplementedError("Non-transposed key cache is not implemented")
+        raise ValueError("key_cache must be 5D")
+    return key_cache.shape[1], key_cache.shape[3]
+
+
 class _PADecodeAutotuneResources:
     """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
 
-    def __init__(self, query, args, options, max_partitions):
+    def __init__(self, query, args, options, max_partitions, max_batch_size=None):
         self.query = query
         self.args = args
         self.options = options
         self.max_partitions = max_partitions
+        self.max_batch_size = max_batch_size
         self.outputs = {}
         self.graphs = {}
         self.plans = {}
@@ -66,16 +81,18 @@ class _PADecodeAutotuneResources:
                         dtype=torch.float32,
                         device=self.query.device,
                     )
+        num_kv_heads = _cache_geometry(key)[0]
         plan = plan_pa_decode(
             lengths,
-            key.shape[1],
+            num_kv_heads,
             max_partitions=self.max_partitions,
+            max_batch_size=self.max_batch_size,
             workgroup_budget=workgroup_budget,
             sliding_window=self.options["sliding_window"],
             query_length=query_length,
         )
-        rows = query_length * self.query.shape[1] // key.shape[1]
-        scalar_shape = (key.shape[1], plan.capacity, rows)
+        rows = query_length * self.query.shape[1] // num_kv_heads
+        scalar_shape = (num_kv_heads, plan.capacity, rows)
         output = torch.full_like(
             self.query, float("nan"), memory_format=torch.contiguous_format
         )
@@ -138,7 +155,7 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     baseline = 2 * num_cu
     resources.prepare(baseline)
     batch = resources.args[2].numel()
-    kv_heads = resources.args[0].shape[1]
+    kv_heads = _cache_geometry(resources.args[0])[0]
     capacities = {}
     for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
         capacity = min(
@@ -236,12 +253,13 @@ def prepare_pa_decode_plan(
     softmax_scale: float,
     query_length: int,
     *,
-    compute_type: torch.dtype = torch.bfloat16,
+    compute_type: torch.dtype | None = None,
     key_scale: torch.Tensor | float | None = None,
     value_scale: torch.Tensor | float | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = 0,
     max_partitions: int | None = None,
+    max_batch_size: int | None = None,
     max_context_length: int | None = None,
     tune: bool = False,
     config_dir: str | Path | None = None,
@@ -260,10 +278,13 @@ def prepare_pa_decode_plan(
     ``tune=True`` searches even when a result is cached and saves the winner.
     ``config_dir`` selects a root containing per-architecture cache directories
     and takes precedence over the environment's cache-directory override.
+    ``max_batch_size`` sets the planner's batch cap (default 4096); the returned
+    plan retains it for refreshes. Larger batches must fit the device's LDS.
 
-    Cache by attention geometry and execution modes. Tensor strides, total KV
-    cache pages, block-table padding, and max_context_length do not partition
-    the tuning cache; max_context_length still bounds kernel scheduling.
+    A 4D ``key_cache`` is not implemented. Cache by attention geometry and
+    execution modes. Tensor strides, total KV cache pages, block-table padding,
+    and max_context_length do not partition the tuning cache; max_context_length
+    still bounds kernel scheduling.
 
     Retain the returned plan for decode/graph replay. Refresh it with
     plan_pa_decode(..., plan=plan) when context lengths change; decode never
@@ -275,11 +296,13 @@ def prepare_pa_decode_plan(
         properties = torch.cuda.get_device_properties(query.device)
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
+        num_kv_heads, block_size = _cache_geometry(key_cache)
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
+            max_batch_size=max_batch_size,
             sliding_window=sliding_window,
             query_length=query_length,
         )
@@ -303,17 +326,18 @@ def prepare_pa_decode_plan(
             ),
             options,
             limit,
+            default_plan.max_batch_size,
         )
 
-        arch = properties.gcnArchName.split(":", 1)[0]
+        arch = get_gfx_runtime()
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
             "num_seqs": context_lengths.numel(),
-            "num_kv_heads": key_cache.shape[1],
-            "query_group_size": query.shape[1] // key_cache.shape[1],
+            "num_kv_heads": num_kv_heads,
+            "query_group_size": query.shape[1] // num_kv_heads,
             "head_dim": query.shape[-1],
-            "block_size": key_cache.shape[3],
+            "block_size": block_size,
             "query_length": query_length,
             "query_dtype": str(query.dtype),
             "kv_dtype": str(key_cache.dtype),
@@ -353,8 +377,9 @@ def prepare_pa_decode_plan(
             return default_plan
         return plan_pa_decode(
             context_lengths,
-            key_cache.shape[1],
+            num_kv_heads,
             max_partitions=limit,
+            max_batch_size=default_plan.max_batch_size,
             workgroup_budget=budget,
             sliding_window=default_plan.sliding_window,
             query_length=query_length,
@@ -373,6 +398,12 @@ def _parse_args(argv=None):
         description="Tune a FlyDSL PA decode shape and save its native configuration."
     )
     parser.add_argument("-b", "--batch-size", type=_positive_int, default=1)
+    parser.add_argument(
+        "--max-batch-size",
+        type=_positive_int,
+        default=DEFAULT_MAX_BATCH_SIZE,
+        help="Planner batch cap (default: 4096); larger batches must fit device LDS.",
+    )
     parser.add_argument("--num-query-heads", type=_positive_int, default=16)
     parser.add_argument("--num-kv-heads", type=_positive_int, default=1)
     parser.add_argument("--head-dim", type=_positive_int, default=128)
@@ -407,8 +438,8 @@ def _parse_args(argv=None):
         help="Save to DIR/<arch>/_pa_decode_autotuner.json; overrides cache env vars.",
     )
     args = parser.parse_args(argv)
-    if args.batch_size > 4096:
-        parser.error("--batch-size must be at most 4096")
+    if args.batch_size > args.max_batch_size:
+        parser.error(f"--batch-size must be at most {args.max_batch_size}")
     if args.num_query_heads % args.num_kv_heads:
         parser.error("--num-query-heads must be divisible by --num-kv-heads")
     if not 64 <= args.head_dim <= 1024 or args.head_dim % 64:
@@ -417,10 +448,8 @@ def _parse_args(argv=None):
         parser.error("FP8 --head-dim must be 64 or a multiple of 128")
     if args.scale_mode is None:
         args.scale_mode = "per-token" if args.kv_dtype == "fp8" else "none"
-    if args.kv_dtype == "bf16" and (
-        args.query_dtype != "bf16" or not args.trans_v or args.scale_mode != "none"
-    ):
-        parser.error("BF16 KV requires BF16 queries, --trans-v 1 and --scale-mode none")
+    if args.kv_dtype == "bf16" and args.scale_mode != "none":
+        parser.error("BF16 KV requires --scale-mode none")
     if len(args.context_length) == 1:
         args.context_length *= args.batch_size
     elif len(args.context_length) != args.batch_size:
@@ -511,6 +540,7 @@ def _make_tuning_inputs(args, device, kv_dtype):
         "sinks": sinks,
         "sliding_window": args.sliding_window,
         "max_partitions": args.max_partitions,
+        "max_batch_size": args.max_batch_size,
         "max_context_length": max_length,
     }
 
@@ -524,9 +554,19 @@ def main(argv=None):
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
-    arch = properties.gcnArchName.split(":", 1)[0]
-    if arch not in ("gfx942", "gfx950"):
-        raise RuntimeError(f"PA decode tuning only supports gfx942/gfx950, got {arch}")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
+        )
+    if args.kv_dtype == "bf16":
+        if arch == "gfx1250":
+            if args.head_dim != 64 and args.head_dim % 128:
+                raise ValueError(
+                    "gfx1250 BF16 head-dim must be 64 or a multiple of 128"
+                )
+        elif args.query_dtype != "bf16" or not args.trans_v:
+            raise ValueError("BF16 KV requires BF16 queries and --trans-v 1 on gfx9")
     if (
         args.max_partitions is not None
         and args.max_partitions > properties.multi_processor_count
@@ -536,7 +576,7 @@ def main(argv=None):
         )
     kv_dtype = torch.bfloat16
     if args.kv_dtype == "fp8":
-        kv_dtype = torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
+        kv_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
     print(
         f"Tuning {arch}: batch={args.batch_size}, Q heads={args.num_query_heads}, "
         f"KV heads={args.num_kv_heads}, dim={args.head_dim}, "

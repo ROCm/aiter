@@ -25,22 +25,21 @@
 //
 // OFFLINE-ONLY HEADER. Unlike every other pipeline under include/gfx1250/, this
 // one is NOT compiled by the aiter JIT. It needs three things a release ROCm
-// toolchain does not have -- __builtin_amdgcn_pin_vgpr, amdgpu_num_vgpr(1024)
+// toolchain does not have -- amdgpu_pin_vgpr locals, amdgpu_num_vgpr(1024)
 // and -mllvm -amdgpu-expert-scheduling-mode -- so it is compiled ahead of time
 // by gen_co/build_co.py into gen_co/gfx1250/*.co and loaded at runtime by
 // opus_co_launch_gfx1250.cuh. The generated host launcher includes only the
 // TRAITS header, never this one.
 //
-// The body below is a verbatim port of the standalone kernel
-// (gcnasm/opus_gemm_compiler_sample/gemm_a16w16_4wave_compute_kernel_template.hpp)
-// with exactly one change: it is a __device__ function instead of a __global__
-// one, so the offline stub TU can wrap it in an extern "C" entry point whose
-// symbol name is predictable. The register pinning in here is fragile (see the
-// OPUS_PIN comments), so nothing else -- naming included -- was touched.
+// Ported from the standalone 4wave_compute kernel. The body is __device__ so
+// the offline stub can retain the extern "C" entry symbol and 64-byte kernarg.
+// Register banks now use amdgpu-named-reg-pin-std locals; the original tuple
+// bases, layouts, barriers and WMMA scheduling policy remain unchanged.
 #pragma once
 
 #include "../opus_gemm_utils.cuh"   // opus.hpp + hip_minimal split, ceil_div
 #include "opus_gemm_traits_a16w16_gfx1250.cuh"
+#include "opus_named_vgpr_bank_gfx1250.cuh"
 
 #include <cstdint>
 
@@ -52,45 +51,9 @@ namespace gemm_4wave_wl_gfx1250 {
 
 using opus::operator""_I;
 
-// The placement request, and the only thing the nopin build drops. It rides on
-// the written value, so which writes carry one is visible in the source.
-#if OPUS_NO_PIN
-#define OPUS_PIN(v, reg) (v)
-#else
-#define OPUS_PIN(v, reg) __builtin_amdgcn_pin_vgpr(v, reg)
-#endif
-
-// A bank of N pinned values at Base, Base+Stride, ... One NAMED member each:
-// a pin is as wide as the value using it, and an element-wise write goes through
-// a GEP and pins nothing, so every slot must be assigned WHOLE and by name. That
-// rules out an array; recursion gives the same codegen as a hand-written list
-// while letting N follow the tile.
-template <typename V, int Base, int Stride, int N>
-struct pinned_bank {
-    V                                              head = OPUS_PIN(V{}, Base);
-    pinned_bank<V, Base + Stride, Stride, N - 1>   tail;
-
-    template <int I>
-    __device__ V get() const {
-        if constexpr (I == 0) return head;
-        else                  return tail.template get<I - 1>();
-    }
-    template <int I>
-    __device__ void set(V v) {
-        if constexpr (I == 0) head = OPUS_PIN(v, Base);
-        else                  tail.template set<I - 1>(v);
-    }
-    // Deliberately unpinned: the declaration above already placed the slot, and
-    // re-pinning here measured no different.
-    __device__ void zero() { head = V{}; tail.zero(); }
-};
-
-template <typename V, int Base, int Stride>
-struct pinned_bank<V, Base, Stride, 0> {
-    template <int I> __device__ V    get() const { return V{}; }
-    template <int I> __device__ void set(V) {}
-    __device__ void zero() {}
-};
+// Named-register views share the original tuple bases/strides. The accessor
+// locals carry amdgpu_pin_vgpr; there are no hinted member initializers.
+using opus_co_detail::named_vgpr_bank;
 
 // Kernel-internal derived traits: WMMA decomposition, N-subtiles, TDM windows.
 template<typename UT>
@@ -471,7 +434,7 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
     // allocator overlaps the buffers and tile t+1's prefetch lands on registers a
     // tile-t WMMA has not read: a VA_VDST drain. The two buffers are one bank so
     // a single base covers both.
-    pinned_bank<bf16x16, PT::kBPinBase, PT::kBFragVgpr, 2 * PT::kBFrags> b_frag;
+    named_vgpr_bank<bf16x16, PT::kBPinBase, PT::kBFragVgpr, 2 * PT::kBFrags> b_frag;
     auto Bt_set = [&](auto bufN, auto ksubN, bf16x16 v) __attribute__((always_inline)) {
         constexpr int bi = decltype(bufN)::value, ki = decltype(ksubN)::value;
         static_assert(bi < 2 && ki < PT::kBFrags, "B sub-tile out of range");
@@ -516,9 +479,9 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
         Bt_set(bufN, ksubN, sub);
     };
 
-    // Persistent accumulators, one pinned value per WMMA C slice: a pin is as wide
-    // as the value using it, so one f32x256 would pin its initialiser only.
-    pinned_bank<f32x8, PT::kAccBase, PT::kElemC, PT::kNumAcc> acc;
+    // Persistent accumulators, one named eight-VGPR tuple per WMMA C slice.
+    // A whole-tile vector is too wide for the named-register backend lookup.
+    named_vgpr_bank<f32x8, PT::kAccBase, PT::kElemC, PT::kNumAcc> acc;
     auto acc_set = [&](auto aiN, f32x8 v) __attribute__((always_inline)) {
         constexpr int ai = decltype(aiN)::value;
         static_assert(ai < PT::kNumAcc, "accumulator index out of range");
