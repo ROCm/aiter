@@ -58,6 +58,15 @@ ARCH_TRAITS = {
         wave_size=64,
         min_block_k=64,
     ),
+    "gfx950": ArchTraits(
+        mma_mnk=(16, 16, 16),
+        k_perm_shape=(4, 4, 2),
+        k_perm_stride=(1, 8, 4),
+        lds_bytes=get_lds_capacity_bytes("gfx950"),
+        a_swizzle=(3, 3, 3),
+        wave_size=64,
+        min_block_k=64,
+    ),
 }
 
 _DEFAULT_STREAM = fx.Stream(None)

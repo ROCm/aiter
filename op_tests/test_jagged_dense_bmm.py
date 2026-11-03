@@ -21,7 +21,7 @@ from aiter.test_common import (
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 SEED = 1234
 
 try:
