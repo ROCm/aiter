@@ -20,21 +20,11 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
-# MXFP4 V staging per wave and 16-token chunk: 128 dims as bf16,
-# [16 chunks of 8 dims][16 tokens][16 B] (conflict free for row writes and transposed reads).
 MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
-# MXFP4 PV: P (<= 1) enters the MFMA times 2**-MXFP4_P_EXP_SHIFT; the epilogue restores
-# it after normalization. The f32 O accumulator then stays <= |V| / 2 for the 2**19
-# tokens one task can own, so it cannot overflow where the output is finite.
-# shortcut: a fixed shift is not lossless at both ends: terms p * |V| below 2**-129 and
-# weights p below ~2**-113 are rounded or lost. Upgrade to a token-count shift if needed.
-# shortcut: V is widened to bf16 before the MFMA, so |V| above the bf16 max (e8m0 byte
-# 254 with e2m1 >= 2, byte 253 with e2m1 >= 4) becomes inf. A 2**-2 pre-shift of V cannot
-# go through the e8m0 widening scale (bytes 0 and 1 have no 2**-129 / 2**-128) and f32
-# widening costs 17-20% on gfx950, so it is not done; revisit if larger V must be finite.
+# Keeps the f32 O accumulator from overflowing; the epilogue undoes it.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
-MXFP4_LDS_LIMIT_BYTES = 160 * 1024  # gfx950 LDS; MXFP4 stages V wave-privately.
+MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
 
@@ -155,7 +145,6 @@ class PaDecodeSchedule:
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16", "mxfp4"):
             raise ValueError(f"Unsupported PA KV dtype {kv_dtype!r}")
-        # Q and P are bf16 in LDS only for BF16 KV; MXFP4 has its own tile.
         is_bf16_kv = kv_dtype == "bf16"
         if kv_dtype == "mxfp4":
             if arch != "gfx950":
@@ -536,12 +525,8 @@ class PaDecodeTraits:
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         MXFP4 = kv_dtype == "mxfp4"
-        # Q/P bf16 in LDS (BF16 KV only), and bf16 PV operands without an fp8 scale
-        # (BF16 and MXFP4 KV).
         is_bf16_kv = kv_dtype == "bf16"
         PV_BF16 = is_bf16_kv or MXFP4
-        # MXFP4 QK is one scaled MFMA (fp4 K x e4m3 Q): a bf16 query is quantized per
-        # row in-kernel like the fp8 path, an "fp8" query is used as stored (scale 1).
         QFP8 = query_dtype == "fp8"
         IS_BF16 = query_dtype in ("bf16", "fp8")
         TUNED_SHAPE = (
@@ -582,8 +567,6 @@ class PaDecodeTraits:
             "fp8",
         ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
         Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
-        # Load-path constants below follow the PV operands; MXFP4's own loader
-        # (``mxfp4_load``) does not use KV_DTYPE or KV_VECTOR_WIDTH.
         KV_DTYPE = fx.BFloat16 if PV_BF16 else FP8
         KV_VECTOR_WIDTH = 8 if PV_BF16 else 16
         # Q in LDS: bf16 for BF16 KV, e4m3 bytes otherwise (MXFP4 included).
@@ -683,7 +666,7 @@ class PaDecodeTraits:
             NWARP * MFMA_MNK
         )  # 2 for head_dim=128, 1 for head_dim=64
         if MXFP4:
-            VHE_CHUNKS = head_dim // MFMA_MNK  # a wave owns its tokens, all dims
+            VHE_CHUNKS = head_dim // MFMA_MNK
         VHE_SIZE = head_dim // VHE_CHUNKS
         OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
         # BF16 has sixteen K16 packs; FP8 has eight K32 or two K128 instructions.
@@ -735,7 +718,7 @@ class PaDecodeTraits:
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         sPages_off = total_bytes
         total_bytes += stage_page_capacity * 4
-        # MXFP4: wave-private bf16 V staging (it also holds the wave's O at the end).
+        # Wave-private bf16 V staging for MXFP4; also holds the wave's O at the end.
         sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
         if MXFP4:
             total_bytes = sMxfp4VBf16_off + NWARP * NCHUNK * MXFP4_V_BF16_CHUNK_BYTES
