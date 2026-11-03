@@ -796,6 +796,22 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+ci_profile = os.environ.get("AITER_MOE_2STAGE_CI_PROFILE")
+if ci_profile == "standard":
+    args.tokenNum = [1, 16, 32, 64, 128, 256, 1024, 4096]
+    args.no_flydsl_csv = True
+elif ci_profile == "full":
+    args.tokenNum = [
+        1,
+        16,
+        32,
+        64,
+        128,
+        256,
+        1024,
+        4096,
+    ]
+    args.no_flydsl_csv = False
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
