@@ -650,6 +650,41 @@ def test_flydsl_decode_split_reuse():
     print("[flydsl_decode_split_reuse] PASS: eager, graph replay and streams")
 
 
+def test_flydsl_decode_gates():
+    """Each FlyDSL decode gate of this arch routes there and matches torch.topk.
+
+    Walks the gate table itself, at each gate's smallest width and its row
+    limit, so narrowing the sweep shapes cannot leave a gate untested.
+    """
+    arch = get_gfx()
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or T._FLYDSL_TOPK_DECODE_DISABLED:
+        print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    for stable, gates in _FLYDSL_TOPK_DECODE_GATES[arch].items():
+        for min_width, max_width, num_rows in gates:
+            for k in T._FLYDSL_TOPK_DECODE_KS:
+                # At least 2k wide, so each row selects rather than copies.
+                width = max(min_width, 2 * k)
+                if max_width is not None and width > max_width:
+                    continue
+                seq_lens = torch.full((num_rows,), width, dtype=torch.int32)
+                row_starts = torch.zeros(num_rows, dtype=torch.int32)
+                logits = create_random_logits(row_starts, seq_lens, torch.float32, k)
+                indices = torch.empty((num_rows, k), dtype=torch.int32)
+                args = (logits, 1, seq_lens, indices, num_rows, width, 1)
+                what = f"stable={stable} width={width} rows={num_rows} k={k}"
+                assert T._should_use_flydsl_topk_decode(
+                    *args, k, stable
+                ), f"not routed to FlyDSL decode: {what}"
+                aiter.top_k_per_row_decode(*args, k=k, stable=stable)
+                ref = _decode_reference(logits, seq_lens, k)
+                assert compare_topk_results(
+                    logits, indices, ref, row_starts, seq_lens, k, stable=stable
+                ), f"flydsl decode gate mismatch: {what}"
+    print("[flydsl_decode_gates] PASS: every gate routes and matches torch.topk")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -1002,7 +1037,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 4096, 90000],
+    default=[8, 4096, 32768, 90000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
@@ -1089,6 +1124,7 @@ parser.add_argument(
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
+    "flydsl-decode-gates": test_flydsl_decode_gates,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,
