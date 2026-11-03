@@ -1317,13 +1317,19 @@ def test_multi_case_set(case_set_name):
         pytest.param((8, 1), True, 128, 1024, 8, id="ps_sliding_window_block_1024"),
         # One query token per program, but the group alone is 128 rows.
         pytest.param((128, 1), True, 0, 16, 2, id="ps_one_kv_head_group_128"),
+        # Each query token sees sliding_window - query_length keys: none here.
+        pytest.param((8, 1), True, 8, 16, 8, id="ps_one_kv_head_window_8"),
     ],
 )
 def test_unsupported_query_shape_is_rejected(
     num_heads, ps, sliding_window, block_size, query_length
 ):
-    """Kernels that hold every query token in one tile still take at most 4
-    tokens, and no kernel takes a tile over 64 rows; both fail before launch."""
+    """Reject unsupported query shapes before launch.
+
+    Kernels that hold every query token in one tile take at most 4 tokens. No
+    kernel takes a tile over 64 rows. The single-KV-head PS kernel needs a
+    sliding window that is longer than the query.
+    """
     num_query_heads, num_kv_heads = num_heads
     head_size = 128
     dtype = torch.bfloat16

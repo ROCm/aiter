@@ -4840,6 +4840,8 @@ def pa_decode_gluon(
     query_length : int
         Length of query sequences. Must be <= 4, except on the PS kernel with a
         single KV head, which spreads the query tokens over the launch grid.
+        On that kernel, it must be less than sliding_window when
+        sliding_window > 0.
 
     max_context_partition_num : int
         Maximum number of context partitions.
@@ -4901,7 +4903,8 @@ def pa_decode_gluon(
     Notes
     -----
     - query_length * query_group_size must be <= 64; on the PS kernel with a
-      single KV head only query_group_size must be <= 64
+      single KV head only query_group_size must be <= 64, and query_length
+      must be less than sliding_window when sliding_window > 0
     - kv_block_size must be one of [16, 64, 1024]
     - When query_length > 1, automatic transpose operations are performed
       between standard and gluon layouts
@@ -4956,6 +4959,11 @@ def pa_decode_gluon(
         assert (
             query_group_size <= 64
         ), f"query_group_size={query_group_size} exceeds maximum of 64"
+        # Each query token sees sliding_window - query_length keys. A window
+        # that is not longer than the query masks all keys.
+        assert (
+            sliding_window <= 0 or query_length < sliding_window
+        ), f"query_length={query_length} must be less than sliding_window={sliding_window}"
     else:
         assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
         assert (
