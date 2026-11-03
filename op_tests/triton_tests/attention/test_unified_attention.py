@@ -1118,3 +1118,92 @@ def test_unified_attn_spec_verify_gfx1250(
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_seqs", [4, 64])
+@torch.inference_mode()
+def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
+    """All-decode gpt-oss shapes take the 2D register store: head 64, 8 query
+    heads per KV head, page 64, bf16 out, sliding window. The output must match
+    the reference, and CUDA graph replays must match the eager call bitwise."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip(f"gfx1250 Gluon 2D kernel only, not {DEVICE_ARCH}")
+
+    random.seed(0)
+    seq_lens = [(1, random.randint(1, 4096)) for _ in range(num_seqs)]
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_rest,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_seqs * 64 + 64,
+        block_size=64,
+        head_size=64,
+        num_heads=(64, 8),
+        sliding_window=128,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    def run(out):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            backend="gluon",
+        )
+
+    eager = torch.empty_like(query)
+    run(eager)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=128,
+        soft_cap=None,
+        sinks=None,
+    )
+    torch.testing.assert_close(eager, ref_output, atol=1.5e-2, rtol=1e-2)
+
+    graph_out = torch.empty_like(query)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(graph_out)
+    for replay in range(32):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, eager), f"graph replay {replay} differs"
