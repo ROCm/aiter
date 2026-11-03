@@ -67,7 +67,8 @@ BN: gl.constexpr = gl.constexpr(64)  # keys per tile
 D: gl.constexpr = gl.constexpr(512)  # latent width = V width
 
 # Triton 3.8 spells shared_memory_descriptor.reinterpret as _reinterpret and has
-# no gl.amd.hint.sched_barrier; both settled at compile time.
+# no gl.amd.hint.sched_barrier (_sched_barrier falls back to an asm fence); both
+# settled at compile time.
 _HAS_REINTERPRET = gl.constexpr(
     hasattr(_gl_core.shared_memory_descriptor, "reinterpret")
 )
@@ -83,6 +84,15 @@ _FN_ATTRS = "amdgpu-agpr-alloc=0"
 def _sched_barrier():
     if _HAS_SCHED_BARRIER:
         gl.amd.hint.sched_barrier()
+    else:
+        # Triton 3.8 has no sched_barrier op. An empty side-effecting asm statement
+        # is a weaker stand-in: memory operations do not move across it, MFMAs
+        # can (QK's K read-ahead holds partly, Pro prefill -4%).
+        fence_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+        gl.inline_asm_elementwise(
+            "; fence", "=v,v", [gl.full([64], 0, gl.int32, fence_l)], dtype=gl.int32,
+            is_pure=False, pack=1,
+        )  # fmt: skip
 
 
 # The loop's f32 math as unpacked VOP3 ops. Left to itself LLVM pairs them into
