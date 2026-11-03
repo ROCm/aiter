@@ -6,6 +6,12 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import silu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_moe_gemm_a16w16_repr = make_kernel_repr(
+    "moe_gemm_a16w16",
+    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M", "XCD_SWIZZLE"],
+)
 
 
 @triton.jit
@@ -17,7 +23,7 @@ def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
     return group * pids_per_group + tl.minimum(group, extra_pid_groups) + local_pid
 
 
-@triton.jit
+@triton.jit(repr=_moe_gemm_a16w16_repr)
 def _moe_gemm_a16w16(
     Y,
     stride_y_k,

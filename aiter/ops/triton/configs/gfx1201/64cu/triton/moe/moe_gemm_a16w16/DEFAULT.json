@@ -1,0 +1,13 @@
+{
+  "any": {
+    "block_n": 64,
+    "block_k_even": 128,
+    "block_k_default": 64,
+    "group_m": 4,
+    "xcd_swizzle": 8,
+    "w_cache_modifier": ".cg",
+    "w_cache_modifier_block_m_leq": 32,
+    "num_warps": 8,
+    "num_stages": 2
+  }
+}

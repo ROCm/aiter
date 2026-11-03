@@ -4,8 +4,18 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_topk_hist_repr = make_kernel_repr("moe_topk_align_hist", ["BLOCK"])
+_topk_prefix_repr = make_kernel_repr(
+    "moe_topk_align_prefix", ["BLOCK_M", "NUM_EXPERTS"]
+)
+_topk_scatter_repr = make_kernel_repr(
+    "moe_topk_align_scatter", ["BLOCK_M", "BLOCK"]
+)
+
+
+@triton.jit(repr=_topk_hist_repr)
 def _topk_hist_kernel(
     TopkIds,
     Hist,
@@ -19,7 +29,7 @@ def _topk_hist_kernel(
     tl.atomic_add(Hist + expert, 1, mask=mask, sem="relaxed")
 
 
-@triton.jit
+@triton.jit(repr=_topk_prefix_repr)
 def _topk_prefix_kernel(
     Hist,
     RawOffsets,
@@ -72,7 +82,7 @@ def _topk_blockmap_kernel(
     tl.store(BlockPidMap + tile, value, mask=mask)
 
 
-@triton.jit
+@triton.jit(repr=_topk_scatter_repr)
 def _topk_scatter_kernel(
     TopkIds,
     TopkWeights,

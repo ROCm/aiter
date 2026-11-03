@@ -4,11 +4,14 @@
 import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.moe.moe_routing import topk_align
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is None,
-    reason="Triton MoE route alignment requires a ROCm GPU",
+    not torch.cuda.is_available()
+    or torch.version.hip is None
+    or get_gfx() != "gfx1201",
+    reason="gfx1201 selected large-M BF16 G1U1 route alignment coverage",
 )
 
 

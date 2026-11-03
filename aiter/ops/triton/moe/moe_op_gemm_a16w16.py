@@ -8,9 +8,13 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w16 import (
     _moe_gemm_a16w16,
 )
 from aiter.ops.triton.moe.moe_routing.routing import ExptData, RoutingData
-from aiter.ops.triton.moe.moe_routing.topk_align import align_topk_ids
+from aiter.ops.triton.moe.moe_routing.topk_align import (
+    align_topk_ids,
+    get_topk_align_config,
+)
 from aiter.ops.triton.moe.reduce import reduce_grouped, validate_reduce_out
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 
 def build_routing_from_topk(
@@ -26,15 +30,24 @@ def build_routing_from_topk(
 
 
 def _config(block_m: int, n: int, k: int):
+    config = dict(get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton")["any"])
+    block_k = config["block_k_even"] if k % config["block_k_even"] == 0 else config[
+        "block_k_default"
+    ]
+    w_cache_modifier = (
+        config["w_cache_modifier"]
+        if block_m <= config["w_cache_modifier_block_m_leq"]
+        else None
+    )
     return {
         "block_m": block_m,
-        "block_n": 64,
-        "block_k": 128 if k % 128 == 0 else 64,
-        "group_m": 4,
-        "xcd_swizzle": 8 if get_arch() == "gfx1201" else 1,
-        "w_cache_modifier": ".cg" if block_m <= 32 else None,
-        "num_warps": 8,
-        "num_stages": 2,
+        "block_n": config["block_n"],
+        "block_k": block_k,
+        "group_m": config["group_m"],
+        "xcd_swizzle": config["xcd_swizzle"],
+        "w_cache_modifier": w_cache_modifier,
+        "num_warps": config["num_warps"],
+        "num_stages": config["num_stages"],
     }
 
 
@@ -140,8 +153,9 @@ def fused_moe_bf16_g1u1(
     assert w1.is_contiguous()
     assert w2.is_contiguous()
     experts = w1.shape[0]
+    route_cfg = get_topk_align_config()
     routing_data, gather_indx, scatter_indx, sorted_weights = build_routing_from_topk(
-        topk_ids, topk_weight, num_experts=experts, block_m=32
+        topk_ids, topk_weight, num_experts=experts, block_m=route_cfg["block_m"]
     )
     stage1 = moe_gemm_a16w16(
         hidden_states.contiguous(),

@@ -10,6 +10,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk_align import (
     _topk_scatter_kernel,
 )
 from aiter.ops.triton.moe.moe_routing.routing import ExptData, RoutingData
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 from aiter.utility.graph_alloc import persistent_alloc
 
 _TOPK_ALIGN_SCRATCH = {}
@@ -23,6 +25,10 @@ def _max_tiles(route_count: int, num_experts: int, block_m: int) -> int:
         + num_experts
         - 1
     )
+
+
+def get_topk_align_config():
+    return dict(get_moe_dispatch("MOE-TOPK-ALIGN", get_arch(), "triton")["any"])
 
 
 def _scratch(device, route_count: int, num_experts: int, block_m: int):
@@ -69,6 +75,7 @@ def align_topk_ids(
     tokens, topk = topk_ids.shape
     route_count = tokens * topk
     device = topk_ids.device
+    cfg = get_topk_align_config()
 
     scratch = _scratch(device, route_count, num_experts, block_m)
     hist = scratch["hist"]
@@ -83,13 +90,14 @@ def align_topk_ids(
     inverse = scratch["inverse"]
     hist.zero_()
 
-    block = 256
+    block = cfg["route_block"]
+    num_warps = cfg["num_warps"]
     _topk_hist_kernel[(triton.cdiv(route_count, block),)](
         topk_ids,
         hist,
         route_count,
         BLOCK=block,
-        num_warps=8,
+        num_warps=num_warps,
     )
     block_e = triton.next_power_of_2(num_experts)
     _topk_prefix_kernel[(1,)](
@@ -104,7 +112,7 @@ def align_topk_ids(
         MAX_BLOCKS=max_blocks,
         BLOCK_E=block_e,
         BLOCK_B=triton.next_power_of_2(max_blocks),
-        num_warps=8,
+        num_warps=num_warps,
     )
     _topk_scatter_kernel[(triton.cdiv(route_count, block),)](
         topk_ids,
@@ -119,7 +127,7 @@ def align_topk_ids(
         route_count,
         BLOCK_M=block_m,
         BLOCK=block,
-        num_warps=8,
+        num_warps=num_warps,
     )
 
     routing_data = RoutingData(
