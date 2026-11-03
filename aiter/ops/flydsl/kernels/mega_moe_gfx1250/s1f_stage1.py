@@ -208,8 +208,11 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: P48/rb4 67.9 (2), P32/rb4 70.1 (2); 768 P64 101.1, P48 101.5, P80 101.4
 #: (2), P96 102.7 (2); 1536 P64 155.1, P80 155.7 (2), P96 155.5 (2), P48
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
+#: Runs per claim: the tpr <= 1024 bucket uses 2 (was 8), from DSV4.1-Flash
+#: DEP4 on MI455X, MLPerf Endpoints agentic c512 (end to end, with the rest of
+#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
 S1F_PRODUCERS = (64, 64, 64, 64)
-S1F_BLOCK_RUNS = (4, 8, 8, 8)
+S1F_BLOCK_RUNS = (4, 2, 8, 8)
 if "AITER_MEGA_S1F_PRODUCERS" in os.environ:
     producer_override = int(os.environ["AITER_MEGA_S1F_PRODUCERS"])
     if producer_override < N_XCC or producer_override % N_XCC:
@@ -593,9 +596,18 @@ def make_s1f_stage1(
     """
     if WAVE != 32:
         raise ValueError("S1F requires gfx1250 wave32")
-    _ring_geometry = bool(a_preshuffled and
-                          (int(tile_m), int(tile_n), int(tile_k), int(m_warp),
-                           int(n_warp), int(num_buffers)) == (256, 256, 256, 2, 2, 4))
+    _ring_geometry = bool(
+        a_preshuffled
+        and (
+            int(tile_m),
+            int(tile_n),
+            int(tile_k),
+            int(m_warp),
+            int(n_warp),
+            int(num_buffers),
+        )
+        == (256, 256, 256, 2, 2, 4)
+    )
     R, S, D = int(run_rows), (S1F_SLOTS if _ring_geometry else 4), int(depth)
     _st_limit = MB_ST_INFL if _ring_geometry else 0
     if not 1 <= R <= 15:
@@ -666,8 +678,7 @@ def make_s1f_stage1(
     # retires its oldest store; the cap never exceeds its owned slots.
     # At a full ring this frees its own next slot, so forward progress
     # never depends on the other storer. Below cap it only polls FULL.
-    ST_CAP = (min(_st_limit or 3, (S + 1) // 2),
-              min(_st_limit or 3, S // 2))
+    ST_CAP = (min(_st_limit or 3, (S + 1) // 2), min(_st_limit or 3, S // 2))
     # Live pieces never exceed (records W1 may run ahead) + (ring slots) +
     # (pieces one block starts), so a counter slot is always free again by
     # the time W1 reuses it: W1's reuse wait never depends on itself.
@@ -775,9 +786,10 @@ def make_s1f_stage1(
             quant_wmma_rep=quant_wmma_rep,
             cluster_n=1,
             cluster_m=1,
-            next_stage_prefetch=int(a_preshuffled and os.environ.get(
-                "AITER_MEGA_S1F_APRE_PREFETCH", "0"
-            ) == "1"),
+            next_stage_prefetch=int(
+                a_preshuffled
+                and os.environ.get("AITER_MEGA_S1F_APRE_PREFETCH", "0") == "1"
+            ),
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
             tdm_b_th=0,
@@ -795,9 +807,12 @@ def make_s1f_stage1(
             persistent_workers=G,
             rolled_drain=0,
             a_preshuffled=a_preshuffled,
-            wire_preshuffle=(2 if a_preshuffled and os.environ.get(
-                "AITER_MEGA_S1F_APRE_TDM", "0"
-            ) == "1" else a_preshuffled),
+            wire_preshuffle=(
+                2
+                if a_preshuffled
+                and os.environ.get("AITER_MEGA_S1F_APRE_TDM", "0") == "1"
+                else a_preshuffled
+            ),
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,

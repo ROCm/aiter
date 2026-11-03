@@ -16,6 +16,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -59,8 +60,10 @@ __all__ = [
 
 def _require_gfx1250():
     gfx = get_gfx()
-    if gfx != "gfx1250":
-        raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+    # gfx1250-strict (MI450 A0) shares the gfx1250 MegaMoE kernel family. Accept
+    # the family here; exact identity is enforced for build/cache/.co elsewhere.
+    if not is_gfx1250_family(gfx):
+        raise RuntimeError(f"MegaMoEGfx1250 requires the gfx1250 family, got {gfx}")
 
 
 def _alias(owner: str, name: str) -> property:
@@ -382,14 +385,15 @@ class MegaMoEGfx1250:
         )
         target = ep.prepare(batch, quant_bits)
         if hook is not None and target.scatter is not None:
-            target.scatter = dataclasses.replace(
+            # The grouped GEMM reads the hook off dispatch_context (the same
+            # scatter object on the compact path), so swap both: replacing
+            # target.scatter alone leaves the probe / stage-1 hook unreachable.
+            hooked = dataclasses.replace(
                 target.scatter, stage1_gemm1=hook, stage1_a_row_major=s1f
             )
-            # Compact compute reads dispatch_context before the scatter arg.
-            # Both must carry the current hook; otherwise every eager call
-            # remains a probe and capture silently keeps separate dispatch/G1.
-            if target.dispatch_context is not None:
-                target.dispatch_context = target.scatter
+            if target.dispatch_context is target.scatter:
+                target.dispatch_context = hooked
+            target.scatter = hooked
         expert_out = self._compute(
             batch,
             target,
