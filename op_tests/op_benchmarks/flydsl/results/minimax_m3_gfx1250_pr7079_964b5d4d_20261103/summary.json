@@ -1,0 +1,3121 @@
+{
+  "metadata": {
+    "previous_commit": "15214dad75fc26d13402b1571de080cf56c514f3",
+    "head_commit": "964b5d4d8f7085497238f69fface36cb90ef36b2",
+    "main_commit": "6d8c8e9c247f318204303724f34d6d134c24d864",
+    "previous_runs": [
+      "previous.json",
+      "repeat-previous-2.json",
+      "repeat-previous-3.json"
+    ],
+    "head_runs": [
+      "head.json",
+      "repeat-head-2.json",
+      "repeat-head-3.json"
+    ],
+    "main_runs": [
+      "main.json"
+    ],
+    "recheck_runs": [
+      "recheck-previous-1.json",
+      "recheck-previous-2.json",
+      "recheck-previous-3.json",
+      "recheck-head-1.json",
+      "recheck-head-2.json",
+      "recheck-head-3.json"
+    ],
+    "verify_recheck_runs": [
+      "verify-recheck-previous-1.json",
+      "verify-recheck-previous-2.json",
+      "verify-recheck-previous-3.json",
+      "verify-recheck-head-1.json",
+      "verify-recheck-head-2.json",
+      "verify-recheck-head-3.json"
+    ],
+    "aggregate_statistic": "median of 3 process medians; each process median is median of 5 round minima",
+    "regression_screen_pct": 5,
+    "regressions_above_screen": [],
+    "geomean_latency_change_pct": 0.2431872706362137,
+    "geomean_speedup_vs_main": 1.2063614429910674,
+    "checked_measurements": 660,
+    "max_fp8_row_relative_l2": 0.03444158658385277
+  },
+  "results": [
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.537099838256836,
+      "head_us": 5.564339756965637,
+      "latency_change_pct": 0.4919528183435551,
+      "main_us": 6.797379851341248,
+      "speedup_vs_main": 1.2215968377617572,
+      "previous_run_medians_us": [
+        5.5483198165893555,
+        5.518659949302673,
+        5.537099838256836
+      ],
+      "head_run_medians_us": [
+        5.574759840965271,
+        5.564339756965637,
+        5.541899800300598
+      ],
+      "previous_run_spread_pct": 0.5356570795736186,
+      "head_run_spread_pct": 0.5905469849057562,
+      "logical_io_bytes": 4202496,
+      "logical_io_throughput_tb_s": 0.7552551036696074,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.956119894981384,
+      "head_us": 5.968940258026123,
+      "latency_change_pct": 0.21524689346064108,
+      "main_us": 6.849460005760193,
+      "speedup_vs_main": 1.1475169309242257,
+      "previous_run_medians_us": [
+        6.052280068397522,
+        5.956119894981384,
+        5.877599716186523
+      ],
+      "head_run_medians_us": [
+        5.968940258026123,
+        5.950499773025513,
+        5.994579792022705
+      ],
+      "previous_run_spread_pct": 2.9327877089610617,
+      "head_run_spread_pct": 0.738489867408545,
+      "logical_io_bytes": 16809984,
+      "logical_io_throughput_tb_s": 2.8162426282280997,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 6.276599764823914,
+      "head_us": 6.296619772911072,
+      "latency_change_pct": 0.3189626364159315,
+      "main_us": 7.176340222358704,
+      "speedup_vs_main": 1.1397131288175142,
+      "previous_run_medians_us": [
+        6.283800005912781,
+        6.276599764823914,
+        6.260579824447632
+      ],
+      "head_run_medians_us": [
+        6.8855202198028564,
+        6.296619772911072,
+        6.287800073623657
+      ],
+      "previous_run_spread_pct": 0.3699484169005375,
+      "head_run_spread_pct": 9.492714626833177,
+      "logical_io_bytes": 33619968,
+      "logical_io_throughput_tb_s": 5.339367662731955,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 9.341980218887329,
+      "head_us": 9.361220002174377,
+      "latency_change_pct": 0.20594973267176186,
+      "main_us": 10.116740465164185,
+      "speedup_vs_main": 1.0807074785994046,
+      "previous_run_medians_us": [
+        9.341980218887329,
+        9.211400151252747,
+        9.425320029258728
+      ],
+      "head_run_medians_us": [
+        9.361220002174377,
+        9.329959750175476,
+        9.378039836883545
+      ],
+      "previous_run_spread_pct": 2.2898772315261895,
+      "head_run_spread_pct": 0.5136091951359015,
+      "logical_io_bytes": 134479872,
+      "logical_io_throughput_tb_s": 14.365635245060332,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.31253981590271,
+      "head_us": 7.5128597021102905,
+      "latency_change_pct": 2.7394023314846194,
+      "main_us": 8.451859951019287,
+      "speedup_vs_main": 1.1249857292883083,
+      "previous_run_medians_us": [
+        7.350999712944031,
+        7.308560013771057,
+        7.31253981590271
+      ],
+      "head_run_medians_us": [
+        7.610599994659424,
+        7.242839932441711,
+        7.5128597021102905
+      ],
+      "previous_run_spread_pct": 0.5803687944464831,
+      "head_run_spread_pct": 4.895074269980206,
+      "logical_io_bytes": 67141632,
+      "logical_io_throughput_tb_s": 8.936894160440737,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 29.56186056137085,
+      "head_us": 29.5522403717041,
+      "latency_change_pct": -0.032542571692251165,
+      "main_us": 31.46872043609619,
+      "speedup_vs_main": 1.0648505846016025,
+      "previous_run_medians_us": [
+        29.56186056137085,
+        29.44809913635254,
+        29.656400680541992
+      ],
+      "head_run_medians_us": [
+        29.5522403717041,
+        29.452900886535645,
+        29.604339599609375
+      ],
+      "previous_run_spread_pct": 0.704629344140962,
+      "head_run_spread_pct": 0.5124441029477113,
+      "logical_io_bytes": 346054656,
+      "logical_io_throughput_tb_s": 11.70992965837348,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.094619870185852,
+      "head_us": 7.129859924316406,
+      "latency_change_pct": 0.4967151838345174,
+      "main_us": 11.715140342712402,
+      "speedup_vs_main": 1.6431094673764748,
+      "previous_run_medians_us": [
+        7.094619870185852,
+        7.09384024143219,
+        7.094619870185852
+      ],
+      "head_run_medians_us": [
+        7.173140048980713,
+        7.127479910850525,
+        7.129859924316406
+      ],
+      "previous_run_spread_pct": 0.010989013758698901,
+      "head_run_spread_pct": 0.6404072255958909,
+      "logical_io_bytes": 12681216,
+      "logical_io_throughput_tb_s": 1.7786066114357562,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 9.099220037460327,
+      "head_us": 9.172940254211426,
+      "latency_change_pct": 0.810181712801783,
+      "main_us": 14.549800157546997,
+      "speedup_vs_main": 1.5861653683906836,
+      "previous_run_medians_us": [
+        9.063979983329773,
+        9.20337975025177,
+        9.099220037460327
+      ],
+      "head_run_medians_us": [
+        9.191359877586365,
+        9.172940254211426,
+        9.15772020816803
+      ],
+      "previous_run_spread_pct": 1.53199687828304,
+      "head_run_spread_pct": 0.3667272268876985,
+      "logical_io_bytes": 50429952,
+      "logical_io_throughput_tb_s": 5.497686739739409,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 12.726240158081055,
+      "head_us": 12.624499797821045,
+      "latency_change_pct": -0.7994534049037716,
+      "main_us": 22.48568058013916,
+      "speedup_vs_main": 1.781114574061788,
+      "previous_run_medians_us": [
+        12.726240158081055,
+        12.541179656982422,
+        12.73427963256836
+      ],
+      "head_run_medians_us": [
+        12.824020385742188,
+        12.439440488815308,
+        12.624499797821045
+      ],
+      "previous_run_spread_pct": 1.5173371961185305,
+      "head_run_spread_pct": 3.0462980956541132,
+      "logical_io_bytes": 134479872,
+      "logical_io_throughput_tb_s": 10.652293093086417,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 33.571860790252686,
+      "head_us": 33.71288061141968,
+      "latency_change_pct": 0.42005363375012816,
+      "main_us": 52.546658515930176,
+      "speedup_vs_main": 1.5586522884707417,
+      "previous_run_medians_us": [
+        33.571860790252686,
+        33.25779914855957,
+        33.6696195602417
+      ],
+      "head_run_medians_us": [
+        33.7120795249939,
+        33.71288061141968,
+        33.894760608673096
+      ],
+      "previous_run_spread_pct": 1.226683305566719,
+      "head_run_spread_pct": 0.5418732554622432,
+      "logical_io_bytes": 346128384,
+      "logical_io_throughput_tb_s": 10.266947757728978,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 4.699040055274963,
+      "head_us": 4.689440131187439,
+      "latency_change_pct": -0.20429543001549977,
+      "main_us": 5.9176599979400635,
+      "speedup_vs_main": 1.2619118343326883,
+      "previous_run_medians_us": [
+        4.722279906272888,
+        4.699040055274963,
+        4.681420028209686
+      ],
+      "head_run_medians_us": [
+        4.608500003814697,
+        4.7062599658966064,
+        4.689440131187439
+      ],
+      "previous_run_spread_pct": 0.8695367049985914,
+      "head_run_spread_pct": 2.084683018592133,
+      "logical_io_bytes": 4227072,
+      "logical_io_throughput_tb_s": 0.9014022744181276,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.642840266227722,
+      "head_us": 5.561919808387756,
+      "latency_change_pct": -1.4340377189883124,
+      "main_us": 7.322959899902344,
+      "speedup_vs_main": 1.3166245023631622,
+      "previous_run_medians_us": [
+        5.642840266227722,
+        5.5483198165893555,
+        5.6957197189331055
+      ],
+      "head_run_medians_us": [
+        5.666080117225647,
+        5.549100041389465,
+        5.561919808387756
+      ],
+      "previous_run_spread_pct": 2.612157980546344,
+      "head_run_spread_pct": 2.1032319750415613,
+      "logical_io_bytes": 67633152,
+      "logical_io_throughput_tb_s": 12.160037240739172,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 8.017600178718567,
+      "head_us": 8.083299994468689,
+      "latency_change_pct": 0.8194448997907333,
+      "main_us": 9.982140064239502,
+      "speedup_vs_main": 1.2349090187262834,
+      "previous_run_medians_us": [
+        8.002380132675171,
+        8.017600178718567,
+        8.094519972801208
+      ],
+      "head_run_medians_us": [
+        8.083299994468689,
+        8.04643988609314,
+        8.241140246391296
+      ],
+      "previous_run_spread_pct": 1.1492196925784353,
+      "head_run_spread_pct": 2.4086741854364924,
+      "logical_io_bytes": 135266304,
+      "logical_io_throughput_tb_s": 16.734044770398377,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 4,
+      "head_plan_cap": 4
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 14.644320011138916,
+      "head_us": 14.661959409713745,
+      "latency_change_pct": 0.12045215183369429,
+      "main_us": 15.017679929733276,
+      "speedup_vs_main": 1.0242614585185565,
+      "previous_run_medians_us": [
+        14.524140357971191,
+        14.695600271224976,
+        14.644320011138916
+      ],
+      "head_run_medians_us": [
+        14.64993953704834,
+        14.703619480133057,
+        14.661959409713745
+      ],
+      "previous_run_spread_pct": 1.1708287795088235,
+      "head_run_spread_pct": 0.36611711698746835,
+      "logical_io_bytes": 270532608,
+      "logical_io_throughput_tb_s": 18.451327032099716,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 4.775959849357605,
+      "head_us": 4.751119911670685,
+      "latency_change_pct": -0.5201035701810075,
+      "main_us": 6.098719835281372,
+      "speedup_vs_main": 1.2836383734075902,
+      "previous_run_medians_us": [
+        4.7823598980903625,
+        4.755119979381561,
+        4.775959849357605
+      ],
+      "head_run_medians_us": [
+        4.7446998953819275,
+        4.768739938735962,
+        4.751119911670685
+      ],
+      "previous_run_spread_pct": 0.5703548515481176,
+      "head_run_spread_pct": 0.5059868789036936,
+      "logical_io_bytes": 12681216,
+      "logical_io_throughput_tb_s": 2.6691003880684576,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 15.371019840240479,
+      "head_us": 15.260440111160278,
+      "latency_change_pct": -0.7194039837923327,
+      "main_us": 15.526460409164429,
+      "speedup_vs_main": 1.0174320200509555,
+      "previous_run_medians_us": [
+        15.442320108413696,
+        15.371019840240479,
+        15.29088020324707
+      ],
+      "head_run_medians_us": [
+        15.260440111160278,
+        15.508819818496704,
+        15.099420547485352
+      ],
+      "previous_run_spread_pct": 0.9852300416018246,
+      "head_run_spread_pct": 2.6827487806983386,
+      "logical_io_bytes": 277086208,
+      "logical_io_throughput_tb_s": 18.157157066352305,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 109.80283737182617,
+      "head_us": 109.26362037658691,
+      "latency_change_pct": -0.49107746953140907,
+      "main_us": 110.57036399841309,
+      "speedup_vs_main": 1.0119595490001372,
+      "previous_run_medians_us": [
+        108.6001968383789,
+        110.01113891601562,
+        109.80283737182617
+      ],
+      "head_run_medians_us": [
+        108.53130340576172,
+        109.31570053100586,
+        109.26362037658691
+      ],
+      "previous_run_spread_pct": 1.2849777942065697,
+      "head_run_spread_pct": 0.7178941376284671,
+      "logical_io_bytes": 3255304192,
+      "logical_io_throughput_tb_s": 29.793120352229778,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 252.87630081176758,
+      "head_us": 253.04773330688477,
+      "latency_change_pct": 0.06779302550965483,
+      "main_us": 254.5290756225586,
+      "speedup_vs_main": 1.0058540034969503,
+      "previous_run_medians_us": [
+        251.92678451538086,
+        252.87630081176758,
+        253.3962631225586
+      ],
+      "head_run_medians_us": [
+        253.54442596435547,
+        253.04773330688477,
+        252.9868507385254
+      ],
+      "previous_run_spread_pct": 0.5811057036426532,
+      "head_run_spread_pct": 0.2203438926496434,
+      "logical_io_bytes": 7583825920,
+      "logical_io_throughput_tb_s": 29.96994211682063,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 13.519439697265625,
+      "head_us": 13.713339567184448,
+      "latency_change_pct": 1.4342300735883384,
+      "main_us": 14.826200008392334,
+      "speedup_vs_main": 1.0811516724832602,
+      "previous_run_medians_us": [
+        13.519439697265625,
+        13.529059886932373,
+        13.39445948600769
+      ],
+      "head_run_medians_us": [
+        13.713339567184448,
+        13.80228042602539,
+        13.499419689178467
+      ],
+      "previous_run_spread_pct": 0.9956063560230697,
+      "head_run_spread_pct": 2.2085119045083608,
+      "logical_io_bytes": 252567552,
+      "logical_io_throughput_tb_s": 18.417654632018703,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 13.551479578018188,
+      "head_us": 13.77102017402649,
+      "latency_change_pct": 1.620048901261062,
+      "main_us": 14.846220016479492,
+      "speedup_vs_main": 1.078076992762013,
+      "previous_run_medians_us": [
+        13.498619794845581,
+        13.573919534683228,
+        13.551479578018188
+      ],
+      "head_run_medians_us": [
+        13.77102017402649,
+        13.833520412445068,
+        13.475379943847656
+      ],
+      "previous_run_spread_pct": 0.5556569627997665,
+      "head_run_spread_pct": 2.6006821867337075,
+      "logical_io_bytes": 253624320,
+      "logical_io_throughput_tb_s": 18.41724990559237,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 14.694000482559204,
+      "head_us": 14.735660552978516,
+      "latency_change_pct": 0.2835175517297728,
+      "main_us": 15.05776047706604,
+      "speedup_vs_main": 1.0218585331094925,
+      "previous_run_medians_us": [
+        14.694000482559204,
+        14.71642017364502,
+        14.645940065383911
+      ],
+      "head_run_medians_us": [
+        14.63312029838562,
+        14.790940284729004,
+        14.735660552978516
+      ],
+      "previous_run_spread_pct": 0.4796522794780331,
+      "head_run_spread_pct": 1.0710072057915563,
+      "logical_io_bytes": 254681088,
+      "logical_io_throughput_tb_s": 17.283316691800515,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.344799757003784,
+      "head_us": 5.377640128135681,
+      "latency_change_pct": 0.6144359494266061,
+      "main_us": 6.548200249671936,
+      "speedup_vs_main": 1.2176717098289849,
+      "previous_run_medians_us": [
+        5.311160087585449,
+        5.344799757003784,
+        5.359219908714294
+      ],
+      "head_run_medians_us": [
+        5.312759876251221,
+        5.377640128135681,
+        5.3840601444244385
+      ],
+      "previous_run_spread_pct": 0.8991884320056706,
+      "head_run_spread_pct": 1.3258653698334428,
+      "logical_io_bytes": 2170880,
+      "logical_io_throughput_tb_s": 0.4036863658172307,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.680500268936157,
+      "head_us": 5.725380182266235,
+      "latency_change_pct": 0.7900697333913298,
+      "main_us": 6.969640254974365,
+      "speedup_vs_main": 1.2173235720768545,
+      "previous_run_medians_us": [
+        5.658079981803894,
+        5.680500268936157,
+        5.700539946556091
+      ],
+      "head_run_medians_us": [
+        5.654860138893127,
+        5.725380182266235,
+        5.785459876060486
+      ],
+      "previous_run_spread_pct": 0.7474687570105363,
+      "head_run_spread_pct": 2.281066636795184,
+      "logical_io_bytes": 8683520,
+      "logical_io_throughput_tb_s": 1.516671334227951,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.908039808273315,
+      "head_us": 5.945720076560974,
+      "latency_change_pct": 0.6377795260433583,
+      "main_us": 7.124279737472534,
+      "speedup_vs_main": 1.1982198364093257,
+      "previous_run_medians_us": [
+        5.878400206565857,
+        5.908039808273315,
+        6.413599848747253
+      ],
+      "head_run_medians_us": [
+        5.945720076560974,
+        6.203680038452148,
+        5.91126024723053
+      ],
+      "previous_run_spread_pct": 9.058836086918886,
+      "head_run_spread_pct": 4.918156042602586,
+      "logical_io_bytes": 17367040,
+      "logical_io_throughput_tb_s": 2.920931321416187,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.850959897041321,
+      "head_us": 7.850160002708435,
+      "latency_change_pct": -0.01018849087723872,
+      "main_us": 9.177740216255188,
+      "speedup_vs_main": 1.169115051551652,
+      "previous_run_medians_us": [
+        7.850959897041321,
+        7.828519940376282,
+        7.906240224838257
+      ],
+      "head_run_medians_us": [
+        7.813299894332886,
+        7.957519888877869,
+        7.850160002708435
+      ],
+      "previous_run_spread_pct": 0.9899462674782536,
+      "head_run_spread_pct": 1.8371599368066973,
+      "logical_io_bytes": 69468160,
+      "logical_io_throughput_tb_s": 8.8492667634841,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 6.703619956970215,
+      "head_us": 6.725279688835144,
+      "latency_change_pct": 0.32310500899455086,
+      "main_us": 8.104940056800842,
+      "speedup_vs_main": 1.2051454261829613,
+      "previous_run_medians_us": [
+        6.703619956970215,
+        6.694819927215576,
+        6.77012026309967
+      ],
+      "head_run_medians_us": [
+        6.733279824256897,
+        6.678000092506409,
+        6.725279688835144
+      ],
+      "previous_run_spread_pct": 1.1232787116131084,
+      "head_run_spread_pct": 0.8219692608808518,
+      "logical_io_bytes": 34635776,
+      "logical_io_throughput_tb_s": 5.150087074817123,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 15.102620124816895,
+      "head_us": 14.67877984046936,
+      "latency_change_pct": -2.806402338433134,
+      "main_us": 20.803139209747314,
+      "speedup_vs_main": 1.417225371307301,
+      "previous_run_medians_us": [
+        15.172300338745117,
+        15.102620124816895,
+        14.782940149307251
+      ],
+      "head_run_medians_us": [
+        14.67877984046936,
+        14.601060152053833,
+        15.058540105819702
+      ],
+      "previous_run_spread_pct": 2.5780969541706384,
+      "head_run_spread_pct": 3.1166075023797144,
+      "logical_io_bytes": 178446336,
+      "logical_io_throughput_tb_s": 12.15675539379805,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.881420254707336,
+      "head_us": 7.919859886169434,
+      "latency_change_pct": 0.48772467676925224,
+      "main_us": 10.02060055732727,
+      "speedup_vs_main": 1.2652497268072116,
+      "previous_run_medians_us": [
+        7.860559821128845,
+        7.881420254707336,
+        7.893419861793518
+      ],
+      "head_run_medians_us": [
+        7.89821982383728,
+        7.919859886169434,
+        8.011999726295471
+      ],
+      "previous_run_spread_pct": 0.4169304465784137,
+      "head_run_spread_pct": 1.4366403458334713,
+      "logical_io_bytes": 6586368,
+      "logical_io_throughput_tb_s": 0.8316268336390484,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 8.75711977481842,
+      "head_us": 8.804399967193604,
+      "latency_change_pct": 0.5399057405968133,
+      "main_us": 11.603779792785645,
+      "speedup_vs_main": 1.3179523688181947,
+      "previous_run_medians_us": [
+        8.725860118865967,
+        8.75711977481842,
+        8.774740099906921
+      ],
+      "head_run_medians_us": [
+        8.738679885864258,
+        8.804399967193604,
+        8.809199929237366
+      ],
+      "previous_run_spread_pct": 0.5581741748184336,
+      "head_run_spread_pct": 0.8009636504006544,
+      "logical_io_bytes": 26050560,
+      "logical_io_throughput_tb_s": 2.958811514364175,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 11.700719594955444,
+      "head_us": 11.822500228881836,
+      "latency_change_pct": 1.040796106069375,
+      "main_us": 15.869359970092773,
+      "speedup_vs_main": 1.3423015151502928,
+      "previous_run_medians_us": [
+        11.700719594955444,
+        11.631799936294556,
+        11.953099966049194
+      ],
+      "head_run_medians_us": [
+        11.962720155715942,
+        11.822500228881836,
+        11.785639524459839
+      ],
+      "previous_run_spread_pct": 2.7459852118254457,
+      "head_run_spread_pct": 1.49782726012137,
+      "logical_io_bytes": 69468160,
+      "logical_io_throughput_tb_s": 5.875927989435975,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 24.10248041152954,
+      "head_us": 24.084858894348145,
+      "latency_change_pct": -0.07311080386965818,
+      "main_us": 34.538118839263916,
+      "speedup_vs_main": 1.4340179027317772,
+      "previous_run_medians_us": [
+        24.10248041152954,
+        24.162580966949463,
+        23.612160682678223
+      ],
+      "head_run_medians_us": [
+        24.084858894348145,
+        23.88535976409912,
+        24.40131902694702
+      ],
+      "previous_run_spread_pct": 2.283666555778815,
+      "head_run_spread_pct": 2.1422557014397854,
+      "logical_io_bytes": 178520064,
+      "logical_io_throughput_tb_s": 7.412128291185143,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 4.828819930553436,
+      "head_us": 4.931379854679108,
+      "latency_change_pct": 2.123912790301885,
+      "main_us": 6.128360033035278,
+      "speedup_vs_main": 1.242727231247543,
+      "previous_run_medians_us": [
+        4.828819930553436,
+        4.803999960422516,
+        4.830420017242432
+      ],
+      "head_run_medians_us": [
+        4.931379854679108,
+        4.80318009853363,
+        4.947420060634613
+      ],
+      "previous_run_spread_pct": 0.5471327819194065,
+      "head_run_spread_pct": 2.9249412203385936,
+      "logical_io_bytes": 2195456,
+      "logical_io_throughput_tb_s": 0.4452011535710144,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.56194007396698,
+      "head_us": 5.599579811096191,
+      "latency_change_pct": 0.6767375525203345,
+      "main_us": 7.1915602684021,
+      "speedup_vs_main": 1.2843035568760395,
+      "previous_run_medians_us": [
+        5.604379773139954,
+        5.537099838256836,
+        5.56194007396698
+      ],
+      "head_run_medians_us": [
+        5.595579743385315,
+        5.629220008850098,
+        5.599579811096191
+      ],
+      "previous_run_spread_pct": 1.209648683523682,
+      "head_run_spread_pct": 0.6007641037300832,
+      "logical_io_bytes": 35127296,
+      "logical_io_throughput_tb_s": 6.273202130344021,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.753199934959412,
+      "head_us": 7.765219807624817,
+      "latency_change_pct": 0.1550311196182097,
+      "main_us": 9.56391990184784,
+      "speedup_vs_main": 1.231635438375723,
+      "previous_run_medians_us": [
+        7.745180130004883,
+        7.753199934959412,
+        7.759619951248169
+      ],
+      "head_run_medians_us": [
+        7.735580205917358,
+        7.7988797426223755,
+        7.765219807624817
+      ],
+      "previous_run_spread_pct": 0.18624337517953773,
+      "head_run_spread_pct": 0.8151673522861783,
+      "logical_io_bytes": 70254592,
+      "logical_io_throughput_tb_s": 9.047341059298242,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 4,
+      "head_plan_cap": 4
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.127559661865234,
+      "head_us": 14.179619550704956,
+      "latency_change_pct": 0.3684988071948947,
+      "main_us": 14.36229944229126,
+      "speedup_vs_main": 1.012883271721999,
+      "previous_run_medians_us": [
+        14.08187985420227,
+        14.198060035705566,
+        14.127559661865234
+      ],
+      "head_run_medians_us": [
+        14.136359691619873,
+        14.179619550704956,
+        14.247740507125854
+      ],
+      "previous_run_spread_pct": 0.8223655343456313,
+      "head_run_spread_pct": 0.7854993225149262,
+      "logical_io_bytes": 140509184,
+      "logical_io_throughput_tb_s": 9.909235117173113,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 4.9946799874305725,
+      "head_us": 4.952220022678375,
+      "latency_change_pct": -0.8501038076323297,
+      "main_us": 6.257359981536865,
+      "speedup_vs_main": 1.263546440360421,
+      "previous_run_medians_us": [
+        4.991480112075806,
+        4.9946799874305725,
+        5.013920068740845
+      ],
+      "head_run_medians_us": [
+        4.9161601066589355,
+        4.9746400117874146,
+        4.952220022678375
+      ],
+      "previous_run_spread_pct": 0.4492771653341281,
+      "head_run_spread_pct": 1.180882611448482,
+      "logical_io_bytes": 6586368,
+      "logical_io_throughput_tb_s": 1.3299829106619148,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 8,
+      "head_plan_cap": 8
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.391939640045166,
+      "head_us": 14.444019794464111,
+      "latency_change_pct": 0.36187029491170364,
+      "main_us": 14.545760154724121,
+      "speedup_vs_main": 1.007043770481331,
+      "previous_run_medians_us": [
+        14.299019575119019,
+        14.397560358047485,
+        14.391939640045166
+      ],
+      "head_run_medians_us": [
+        14.358299970626831,
+        14.604259729385376,
+        14.444019794464111
+      ],
+      "previous_run_spread_pct": 0.6846942482601848,
+      "head_run_spread_pct": 1.7028483916424202,
+      "logical_io_bytes": 146935808,
+      "logical_io_throughput_tb_s": 10.172778083308593,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 71.17618083953857,
+      "head_us": 71.15776062011719,
+      "latency_change_pct": -0.025879752473534356,
+      "main_us": 71.20821952819824,
+      "speedup_vs_main": 1.00070911321044,
+      "previous_run_medians_us": [
+        70.43503761291504,
+        71.2907600402832,
+        71.17618083953857
+      ],
+      "head_run_medians_us": [
+        70.73391914367676,
+        71.15776062011719,
+        71.30837917327881
+      ],
+      "previous_run_spread_pct": 1.2022595442390016,
+      "head_run_spread_pct": 0.807304817627501,
+      "logical_io_bytes": 1694769152,
+      "logical_io_throughput_tb_s": 23.81706699635609,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 162.36148834228516,
+      "head_us": 162.1956443786621,
+      "latency_change_pct": -0.10214488997133397,
+      "main_us": 162.41676330566406,
+      "speedup_vs_main": 1.0013632852340086,
+      "previous_run_medians_us": [
+        162.36148834228516,
+        162.53538131713867,
+        162.02743530273438
+      ],
+      "head_run_medians_us": [
+        162.1956443786621,
+        162.14040756225586,
+        162.44245529174805
+      ],
+      "previous_run_spread_pct": 0.3128488286172037,
+      "head_run_spread_pct": 0.1862243161024883,
+      "logical_io_bytes": 3942916096,
+      "logical_io_throughput_tb_s": 24.30962996019094,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 1,
+      "head_plan_cap": 1
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 13.35118055343628,
+      "head_us": 13.367220163345337,
+      "latency_change_pct": 0.12013626693805346,
+      "main_us": 14.4199800491333,
+      "speedup_vs_main": 1.078756829985846,
+      "previous_run_medians_us": [
+        13.35118055343628,
+        13.42892050743103,
+        13.343180418014526
+      ],
+      "head_run_medians_us": [
+        13.505020141601562,
+        13.23099970817566,
+        13.367220163345337
+      ],
+      "previous_run_spread_pct": 0.6421910712190648,
+      "head_run_spread_pct": 2.0499432946971514,
+      "logical_io_bytes": 131178496,
+      "logical_io_throughput_tb_s": 9.813446206243283,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 13.318339586257935,
+      "head_us": 13.440920114517212,
+      "latency_change_pct": 0.920388967899255,
+      "main_us": 14.395959377288818,
+      "speedup_vs_main": 1.0710546044939357,
+      "previous_run_medians_us": [
+        13.268660306930542,
+        13.446539640426636,
+        13.318339586257935
+      ],
+      "head_run_medians_us": [
+        13.440920114517212,
+        13.386460542678833,
+        13.456939458847046
+      ],
+      "previous_run_spread_pct": 1.3355969214032684,
+      "head_run_spread_pct": 0.5243607994670716,
+      "logical_io_bytes": 131727360,
+      "logical_io_throughput_tb_s": 9.800471908000143,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.34548020362854,
+      "head_us": 14.553799629211426,
+      "latency_change_pct": 1.4521606988812552,
+      "main_us": 14.51051950454712,
+      "speedup_vs_main": 0.9970261975726643,
+      "previous_run_medians_us": [
+        14.336659908294678,
+        14.478479623794556,
+        14.34548020362854
+      ],
+      "head_run_medians_us": [
+        14.394359588623047,
+        14.553799629211426,
+        14.560199975967407
+      ],
+      "previous_run_spread_pct": 0.9886020787509512,
+      "head_run_spread_pct": 1.1394989045437762,
+      "logical_io_bytes": 132276224,
+      "logical_io_throughput_tb_s": 9.088775946489184,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.433740019798279,
+      "head_us": 5.440160036087036,
+      "latency_change_pct": 0.11815096536391678,
+      "main_us": 6.490520238876343,
+      "speedup_vs_main": 1.1930752396660749,
+      "previous_run_medians_us": [
+        5.417699813842773,
+        5.438560247421265,
+        5.433740019798279
+      ],
+      "head_run_medians_us": [
+        5.38565993309021,
+        5.440160036087036,
+        5.443339943885803
+      ],
+      "previous_run_spread_pct": 0.3839056249007959,
+      "head_run_spread_pct": 1.0602631248524992,
+      "logical_io_bytes": 4202496,
+      "logical_io_throughput_tb_s": 0.7724949214954979,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.670099854469299,
+      "head_us": 5.65887987613678,
+      "latency_change_pct": -0.1978797308776814,
+      "main_us": 6.602680087089539,
+      "speedup_vs_main": 1.166782160358752,
+      "previous_run_medians_us": [
+        5.670099854469299,
+        5.691720247268677,
+        5.670080184936523
+      ],
+      "head_run_medians_us": [
+        5.65887987613678,
+        5.6957197189331055,
+        5.652480125427246
+      ],
+      "previous_run_spread_pct": 0.38165222637298246,
+      "head_run_spread_pct": 0.764101632342447,
+      "logical_io_bytes": 16809984,
+      "logical_io_throughput_tb_s": 2.970549714420849,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 6.081100106239319,
+      "head_us": 6.030640006065369,
+      "latency_change_pct": -0.829785717919318,
+      "main_us": 7.045760154724121,
+      "speedup_vs_main": 1.168327100877815,
+      "previous_run_medians_us": [
+        6.1940598487854,
+        6.081100106239319,
+        5.994579792022705
+      ],
+      "head_run_medians_us": [
+        6.0314202308654785,
+        5.992180109024048,
+        6.030640006065369
+      ],
+      "previous_run_spread_pct": 3.2803284484336177,
+      "head_run_spread_pct": 0.6506792281078719,
+      "logical_io_bytes": 33619968,
+      "logical_io_throughput_tb_s": 5.574859047495195,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.371619820594788,
+      "head_us": 9.27869975566864,
+      "latency_change_pct": -0.9915048487343592,
+      "main_us": 9.997360110282898,
+      "speedup_vs_main": 1.0774527006518566,
+      "previous_run_medians_us": [
+        9.331560134887695,
+        9.392459988594055,
+        9.371619820594788
+      ],
+      "head_run_medians_us": [
+        9.268280267715454,
+        9.323559999465942,
+        9.27869975566864
+      ],
+      "previous_run_spread_pct": 0.6498327383333262,
+      "head_run_spread_pct": 0.5957702394316209,
+      "logical_io_bytes": 134479872,
+      "logical_io_throughput_tb_s": 14.493396223737292,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 7.401480078697205,
+      "head_us": 7.497619986534119,
+      "latency_change_pct": 1.2989281442994383,
+      "main_us": 8.6080801486969,
+      "speedup_vs_main": 1.148108354938926,
+      "previous_run_medians_us": [
+        7.401480078697205,
+        7.709940075874329,
+        7.3541998863220215
+      ],
+      "head_run_medians_us": [
+        7.497619986534119,
+        7.375059723854065,
+        7.500839829444885
+      ],
+      "previous_run_spread_pct": 4.806338539992718,
+      "head_run_spread_pct": 1.6776004360947074,
+      "logical_io_bytes": 67141632,
+      "logical_io_throughput_tb_s": 8.955059354913661,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 29.754960536956787,
+      "head_us": 29.80462074279785,
+      "latency_change_pct": 0.1668972330828078,
+      "main_us": 31.53923988342285,
+      "speedup_vs_main": 1.0581996716413231,
+      "previous_run_medians_us": [
+        29.754960536956787,
+        29.662020206451416,
+        29.78060007095337
+      ],
+      "head_run_medians_us": [
+        29.750120639801025,
+        29.80462074279785,
+        29.960079193115234
+      ],
+      "previous_run_spread_pct": 0.3985213300977914,
+      "head_run_spread_pct": 0.7044496728412305,
+      "logical_io_bytes": 346054656,
+      "logical_io_throughput_tb_s": 11.610772000298729,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 6.495320200920105,
+      "head_us": 6.51453971862793,
+      "latency_change_pct": 0.29589792517237257,
+      "main_us": 11.358619928359985,
+      "speedup_vs_main": 1.7435798105399072,
+      "previous_run_medians_us": [
+        6.472079753875732,
+        6.495320200920105,
+        6.505759954452515
+      ],
+      "head_run_medians_us": [
+        6.496120095252991,
+        6.51453971862793,
+        6.555420160293579
+      ],
+      "previous_run_spread_pct": 0.518530257707868,
+      "head_run_spread_pct": 0.9102725227236462,
+      "logical_io_bytes": 12681216,
+      "logical_io_throughput_tb_s": 1.9466019930370269,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.099239706993103,
+      "head_us": 9.12086009979248,
+      "latency_change_pct": 0.23760658577618443,
+      "main_us": 14.234919548034668,
+      "speedup_vs_main": 1.5606992533915243,
+      "previous_run_medians_us": [
+        9.07118022441864,
+        9.28189992904663,
+        9.099239706993103
+      ],
+      "head_run_medians_us": [
+        9.086400270462036,
+        9.12086009979248,
+        9.263479709625244
+      ],
+      "previous_run_spread_pct": 2.315794631347549,
+      "head_run_spread_pct": 1.941477417982071,
+      "logical_io_bytes": 50429952,
+      "logical_io_throughput_tb_s": 5.529078557092154,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 12.70542025566101,
+      "head_us": 12.622100114822388,
+      "latency_change_pct": -0.6557842177750794,
+      "main_us": 22.090680599212646,
+      "speedup_vs_main": 1.7501588799213463,
+      "previous_run_medians_us": [
+        12.70542025566101,
+        12.8889000415802,
+        12.421000003814697
+      ],
+      "head_run_medians_us": [
+        12.51471996307373,
+        12.622100114822388,
+        12.817579507827759
+      ],
+      "previous_run_spread_pct": 3.6826805280764012,
+      "head_run_spread_pct": 2.399438619555665,
+      "logical_io_bytes": 134479872,
+      "logical_io_throughput_tb_s": 10.654318281161276,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 34.076619148254395,
+      "head_us": 33.686439990997314,
+      "latency_change_pct": -1.1450054817925381,
+      "main_us": 52.48737812042236,
+      "speedup_vs_main": 1.5581159105696414,
+      "previous_run_medians_us": [
+        34.076619148254395,
+        34.445180892944336,
+        33.69525909423828
+      ],
+      "head_run_medians_us": [
+        33.59270095825195,
+        33.90758037567139,
+        33.686439990997314
+      ],
+      "previous_run_spread_pct": 2.2006930776889293,
+      "head_run_spread_pct": 0.9347364028481043,
+      "logical_io_bytes": 346128384,
+      "logical_io_throughput_tb_s": 10.275006325764986,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 4.687820076942444,
+      "head_us": 4.715059995651245,
+      "latency_change_pct": 0.5810785879514446,
+      "main_us": 5.908839702606201,
+      "speedup_vs_main": 1.2531844150564346,
+      "previous_run_medians_us": [
+        4.684599936008453,
+        4.687820076942444,
+        4.734300076961517
+      ],
+      "head_run_medians_us": [
+        4.718259871006012,
+        4.656580090522766,
+        4.715059995651245
+      ],
+      "previous_run_spread_pct": 1.0601972801285515,
+      "head_run_spread_pct": 1.3081441283914486,
+      "logical_io_bytes": 4227072,
+      "logical_io_throughput_tb_s": 0.896504393135756,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.651659965515137,
+      "head_us": 5.672500133514404,
+      "latency_change_pct": 0.36874419420893645,
+      "main_us": 7.151520252227783,
+      "speedup_vs_main": 1.2607351403969118,
+      "previous_run_medians_us": [
+        5.651659965515137,
+        5.562719702720642,
+        5.950520038604736
+      ],
+      "head_run_medians_us": [
+        5.672500133514404,
+        5.7846599817276,
+        5.587559938430786
+      ],
+      "previous_run_spread_pct": 6.861706795000839,
+      "head_run_spread_pct": 3.4746591213335134,
+      "logical_io_bytes": 67633152,
+      "logical_io_throughput_tb_s": 11.92298817243003,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.469379782676697,
+      "head_us": 9.59115982055664,
+      "latency_change_pct": 1.286040275866096,
+      "main_us": 9.883599877357483,
+      "speedup_vs_main": 1.0304905832320779,
+      "previous_run_medians_us": [
+        9.370840191841125,
+        9.469379782676697,
+        9.547100067138672
+      ],
+      "head_run_medians_us": [
+        9.554319977760315,
+        9.59115982055664,
+        9.703320264816284
+      ],
+      "previous_run_spread_pct": 1.8613666295230504,
+      "head_run_spread_pct": 1.5535168826674992,
+      "logical_io_bytes": 135266304,
+      "logical_io_throughput_tb_s": 14.103226985133231,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 14.633920192718506,
+      "head_us": 14.688400030136108,
+      "latency_change_pct": 0.37228464212009094,
+      "main_us": 15.036100149154663,
+      "speedup_vs_main": 1.0236717490199871,
+      "previous_run_medians_us": [
+        14.459259510040283,
+        14.633920192718506,
+        14.68999981880188
+      ],
+      "head_run_medians_us": [
+        14.694000482559204,
+        14.688400030136108,
+        14.683599472045898
+      ],
+      "previous_run_spread_pct": 1.5767498095035917,
+      "head_run_spread_pct": 0.07081105152341963,
+      "logical_io_bytes": 270532608,
+      "logical_io_throughput_tb_s": 18.41811275870413,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 4.7695401310920715,
+      "head_us": 4.7895801067352295,
+      "latency_change_pct": 0.4201657831227834,
+      "main_us": 6.103540062904358,
+      "speedup_vs_main": 1.27433719175537,
+      "previous_run_medians_us": [
+        4.771139919757843,
+        4.7695401310920715,
+        4.7647398710250854
+      ],
+      "head_run_medians_us": [
+        4.7895801067352295,
+        4.758319854736328,
+        4.80320006608963
+      ],
+      "previous_run_spread_pct": 0.1341858660761947,
+      "head_run_spread_pct": 0.9370385368477355,
+      "logical_io_bytes": 12681216,
+      "logical_io_throughput_tb_s": 2.6476675861767824,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 14.978419542312622,
+      "head_us": 14.994460344314575,
+      "latency_change_pct": 0.10709275405618168,
+      "main_us": 19.953080415725708,
+      "speedup_vs_main": 1.3306968011883993,
+      "previous_run_medians_us": [
+        15.020099878311157,
+        14.965620040893555,
+        14.978419542312622
+      ],
+      "head_run_medians_us": [
+        15.22439956665039,
+        14.994460344314575,
+        14.661959409713745
+      ],
+      "previous_run_spread_pct": 0.3637222022236868,
+      "head_run_spread_pct": 3.750986324425507,
+      "logical_io_bytes": 277086208,
+      "logical_io_throughput_tb_s": 18.47923844121955,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 111.57989501953125,
+      "head_us": 111.83385848999023,
+      "latency_change_pct": 0.22760683760683076,
+      "main_us": 129.9281406402588,
+      "speedup_vs_main": 1.1617960999878056,
+      "previous_run_medians_us": [
+        109.2499828338623,
+        111.7585563659668,
+        111.57989501953125
+      ],
+      "head_run_medians_us": [
+        110.64647674560547,
+        111.83385848999023,
+        111.93242073059082
+      ],
+      "previous_run_spread_pct": 2.2482307692307693,
+      "head_run_spread_pct": 1.1498699967509847,
+      "logical_io_bytes": 3255304192,
+      "logical_io_throughput_tb_s": 29.108395578530168,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 258.3540725708008,
+      "head_us": 259.4709587097168,
+      "latency_change_pct": 0.43230831540692627,
+      "main_us": 293.58116149902344,
+      "speedup_vs_main": 1.1314605802473157,
+      "previous_run_medians_us": [
+        258.3660125732422,
+        258.3540725708008,
+        258.31722259521484
+      ],
+      "head_run_medians_us": [
+        258.04555892944336,
+        260.73204040527344,
+        259.4709587097168
+      ],
+      "previous_run_spread_pct": 0.018884927008059094,
+      "head_run_spread_pct": 1.0353688479008474,
+      "logical_io_bytes": 7583825920,
+      "logical_io_throughput_tb_s": 29.228033679423856,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 13.467379808425903,
+      "head_us": 13.583539724349976,
+      "latency_change_pct": 0.8625279570076083,
+      "main_us": 14.891079664230347,
+      "speedup_vs_main": 1.0962591464680198,
+      "previous_run_medians_us": [
+        13.425699472427368,
+        13.837519884109497,
+        13.467379808425903
+      ],
+      "head_run_medians_us": [
+        13.567520380020142,
+        13.594759702682495,
+        13.583539724349976
+      ],
+      "previous_run_spread_pct": 3.0579104290537074,
+      "head_run_spread_pct": 0.20053184379859443,
+      "logical_io_bytes": 252567552,
+      "logical_io_throughput_tb_s": 18.59364768869819,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 13.583539724349976,
+      "head_us": 13.630019426345825,
+      "latency_change_pct": 0.34217665600468905,
+      "main_us": 14.928760528564453,
+      "speedup_vs_main": 1.0952853449136144,
+      "previous_run_medians_us": [
+        13.47216010093689,
+        13.787859678268433,
+        13.583539724349976
+      ],
+      "head_run_medians_us": [
+        13.53626012802124,
+        13.643620014190674,
+        13.630019426345825
+      ],
+      "previous_run_spread_pct": 2.324133353588366,
+      "head_run_spread_pct": 0.7876722901943546,
+      "logical_io_bytes": 253624320,
+      "logical_io_throughput_tb_s": 18.60777391921855,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 14.67877984046936,
+      "head_us": 14.731659889221191,
+      "latency_change_pct": 0.3602482585510325,
+      "main_us": 15.004860162734985,
+      "speedup_vs_main": 1.018545111383795,
+      "previous_run_medians_us": [
+        14.67877984046936,
+        14.62589979171753,
+        14.753299951553345
+      ],
+      "head_run_medians_us": [
+        14.731659889221191,
+        14.728460311889648,
+        14.806180000305176
+      ],
+      "previous_run_spread_pct": 0.8679206393202622,
+      "head_run_spread_pct": 0.5275691198409557,
+      "logical_io_bytes": 254681088,
+      "logical_io_throughput_tb_s": 17.28801030672342,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.213419795036316,
+      "head_us": 5.222219824790955,
+      "latency_change_pct": 0.1687957252745509,
+      "main_us": 6.276580095291138,
+      "speedup_vs_main": 1.2018988678904166,
+      "previous_run_medians_us": [
+        5.213419795036316,
+        5.219820141792297,
+        5.19897997379303
+      ],
+      "head_run_medians_us": [
+        5.250260233879089,
+        5.198180079460144,
+        5.222219824790955
+      ],
+      "previous_run_spread_pct": 0.39974083842451075,
+      "head_run_spread_pct": 0.9972800105370915,
+      "logical_io_bytes": 2170880,
+      "logical_io_throughput_tb_s": 0.4157006163728277,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.423319935798645,
+      "head_us": 5.450559854507446,
+      "latency_change_pct": 0.502273866031655,
+      "main_us": 6.492120027542114,
+      "speedup_vs_main": 1.191092328281347,
+      "previous_run_medians_us": [
+        5.458580255508423,
+        5.423319935798645,
+        5.416119694709778
+      ],
+      "head_run_medians_us": [
+        5.442559719085693,
+        5.507460236549377,
+        5.450559854507446
+      ],
+      "previous_run_spread_pct": 0.7829256120106111,
+      "head_run_spread_pct": 1.1907128661290334,
+      "logical_io_bytes": 8683520,
+      "logical_io_throughput_tb_s": 1.5931427654755492,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.594779849052429,
+      "head_us": 5.663679838180542,
+      "latency_change_pct": 1.2315049204265405,
+      "main_us": 6.758919954299927,
+      "speedup_vs_main": 1.1933795954947959,
+      "previous_run_medians_us": [
+        5.582759976387024,
+        5.594779849052429,
+        5.617219805717468
+      ],
+      "head_run_medians_us": [
+        5.663679838180542,
+        5.728579759597778,
+        5.626040101051331
+      ],
+      "previous_run_spread_pct": 0.6159282449028033,
+      "head_run_spread_pct": 1.8104776660431539,
+      "logical_io_bytes": 17367040,
+      "logical_io_throughput_tb_s": 3.066388019132657,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 7.721160054206848,
+      "head_us": 7.68992006778717,
+      "latency_change_pct": -0.404602238528351,
+      "main_us": 9.11683976650238,
+      "speedup_vs_main": 1.1855571561390517,
+      "previous_run_medians_us": [
+        7.686700224876404,
+        7.75160014629364,
+        7.721160054206848
+      ],
+      "head_run_medians_us": [
+        7.68992006778717,
+        7.609800100326538,
+        7.75160014629364
+      ],
+      "previous_run_spread_pct": 0.8405462516202578,
+      "head_run_spread_pct": 1.843972950526468,
+      "logical_io_bytes": 69468160,
+      "logical_io_throughput_tb_s": 9.033664769936934,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 6.717259883880615,
+      "head_us": 6.708440184593201,
+      "latency_change_pct": -0.13129906300899385,
+      "main_us": 8.047239780426025,
+      "speedup_vs_main": 1.199569431789457,
+      "previous_run_medians_us": [
+        6.6763997077941895,
+        6.717259883880615,
+        6.767740249633789
+      ],
+      "head_run_medians_us": [
+        6.708440184593201,
+        6.982460021972656,
+        6.692420244216919
+      ],
+      "previous_run_spread_pct": 1.3597887147226384,
+      "head_run_spread_pct": 4.323505461401461,
+      "logical_io_bytes": 34635776,
+      "logical_io_throughput_tb_s": 5.163014806265327,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.796559810638428,
+      "head_us": 14.676380157470703,
+      "latency_change_pct": -0.8122134787122426,
+      "main_us": 20.37290096282959,
+      "speedup_vs_main": 1.3881420857348936,
+      "previous_run_medians_us": [
+        14.796559810638428,
+        15.190739631652832,
+        14.742879867553711
+      ],
+      "head_run_medians_us": [
+        14.676380157470703,
+        14.50652003288269,
+        14.822180271148682
+      ],
+      "previous_run_spread_pct": 3.0267830484293987,
+      "head_run_spread_pct": 2.1508044550434393,
+      "logical_io_bytes": 178446336,
+      "logical_io_throughput_tb_s": 12.158743101865321,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 7.300540208816528,
+      "head_us": 7.278900146484375,
+      "latency_change_pct": -0.29641727479317037,
+      "main_us": 9.703320264816284,
+      "speedup_vs_main": 1.3330750621030123,
+      "previous_run_medians_us": [
+        7.256460189819336,
+        7.300540208816528,
+        7.310959696769714
+      ],
+      "head_run_medians_us": [
+        7.278900146484375,
+        7.27649986743927,
+        7.292519807815552
+      ],
+      "previous_run_spread_pct": 0.7465133454721865,
+      "head_run_spread_pct": 0.2200873765800893,
+      "logical_io_bytes": 6586368,
+      "logical_io_throughput_tb_s": 0.9048575839003836,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 8.81160020828247,
+      "head_us": 8.763520121574402,
+      "latency_change_pct": -0.5456453489897983,
+      "main_us": 11.601380109786987,
+      "speedup_vs_main": 1.3238264931036356,
+      "previous_run_medians_us": [
+        8.724259734153748,
+        8.81160020828247,
+        8.814799785614014
+      ],
+      "head_run_medians_us": [
+        8.761919736862183,
+        8.823620080947876,
+        8.763520121574402
+      ],
+      "previous_run_spread_pct": 1.0275097521465275,
+      "head_run_spread_pct": 0.7040589081754587,
+      "logical_io_bytes": 26050560,
+      "logical_io_throughput_tb_s": 2.9726137030104645,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 11.973940134048462,
+      "head_us": 11.650240421295166,
+      "latency_change_pct": -2.7033683911016126,
+      "main_us": 16.011979579925537,
+      "speedup_vs_main": 1.3743904847369213,
+      "previous_run_medians_us": [
+        11.992360353469849,
+        11.973940134048462,
+        11.73516035079956
+      ],
+      "head_run_medians_us": [
+        11.650240421295166,
+        11.676679849624634,
+        11.627800464630127
+      ],
+      "previous_run_spread_pct": 2.1479980673941053,
+      "head_run_spread_pct": 0.4195568780294139,
+      "logical_io_bytes": 69468160,
+      "logical_io_throughput_tb_s": 5.962809134223615,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 23.430280685424805,
+      "head_us": 24.567980766296387,
+      "latency_change_pct": 4.8556826789501795,
+      "main_us": 34.454779624938965,
+      "speedup_vs_main": 1.402426188488628,
+      "previous_run_medians_us": [
+        23.968679904937744,
+        23.430280685424805,
+        23.075358867645264
+      ],
+      "head_run_medians_us": [
+        24.567980766296387,
+        24.28597927093506,
+        24.705801010131836
+      ],
+      "previous_run_spread_pct": 3.8126774889563557,
+      "head_run_spread_pct": 1.7088166227023032,
+      "logical_io_bytes": 178520064,
+      "logical_io_throughput_tb_s": 7.266371041974397,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 4.901739954948425,
+      "head_us": 4.920159876346588,
+      "latency_change_pct": 0.37578332525713964,
+      "main_us": 6.113139986991882,
+      "speedup_vs_main": 1.242467753208688,
+      "previous_run_medians_us": [
+        4.90013986825943,
+        4.920179843902588,
+        4.901739954948425
+      ],
+      "head_run_medians_us": [
+        4.920159876346588,
+        4.904940128326416,
+        4.920960068702698
+      ],
+      "previous_run_spread_pct": 0.4088339207576101,
+      "head_run_spread_pct": 0.32559796386488915,
+      "logical_io_bytes": 2195456,
+      "logical_io_throughput_tb_s": 0.44621639442135613,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.603579878807068,
+      "head_us": 5.656480193138123,
+      "latency_change_pct": 0.9440449761611402,
+      "main_us": 7.149900197982788,
+      "speedup_vs_main": 1.2640193112770612,
+      "previous_run_medians_us": [
+        5.634819865226746,
+        5.59798002243042,
+        5.603579878807068
+      ],
+      "head_run_medians_us": [
+        5.702940225601196,
+        5.656480193138123,
+        5.593180060386658
+      ],
+      "previous_run_spread_pct": 0.6574340616728823,
+      "head_run_spread_pct": 1.9404322381909629,
+      "logical_io_bytes": 35127296,
+      "logical_io_throughput_tb_s": 6.210097940873713,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 9.260280132293701,
+      "head_us": 9.262679815292358,
+      "latency_change_pct": 0.02591371928684083,
+      "main_us": 9.619200229644775,
+      "speedup_vs_main": 1.03848998577753,
+      "previous_run_medians_us": [
+        9.308339953422546,
+        9.260280132293701,
+        9.224219918251038
+      ],
+      "head_run_medians_us": [
+        9.284300208091736,
+        9.245039820671082,
+        9.262679815292358
+      ],
+      "previous_run_spread_pct": 0.90839622527351,
+      "head_run_spread_pct": 0.42385560338420397,
+      "logical_io_bytes": 70254592,
+      "logical_io_throughput_tb_s": 7.584693997952098,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.246139526367188,
+      "head_us": 14.252539873123169,
+      "latency_change_pct": 0.04492688523887178,
+      "main_us": 14.432820081710815,
+      "speedup_vs_main": 1.0126489881938594,
+      "previous_run_medians_us": [
+        14.177219867706299,
+        14.278179407119751,
+        14.246139526367188
+      ],
+      "head_run_medians_us": [
+        14.317439794540405,
+        14.135580062866211,
+        14.252539873123169
+      ],
+      "previous_run_spread_pct": 0.7086799846835219,
+      "head_run_spread_pct": 1.2759812166330975,
+      "logical_io_bytes": 140509184,
+      "logical_io_throughput_tb_s": 9.858536460926956,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 4.984259903430939,
+      "head_us": 4.9722400307655334,
+      "latency_change_pct": -0.2411566190023806,
+      "main_us": 6.323859691619873,
+      "speedup_vs_main": 1.2718331481367044,
+      "previous_run_medians_us": [
+        4.9794599413871765,
+        4.984259903430939,
+        4.98988002538681
+      ],
+      "head_run_medians_us": [
+        4.9722400307655334,
+        4.977039992809296,
+        4.960219860076904
+      ],
+      "previous_run_spread_pct": 0.20905980429433615,
+      "head_run_spread_pct": 0.3382807874985413,
+      "logical_io_bytes": 6586368,
+      "logical_io_throughput_tb_s": 1.324627926095103,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.696520328521729,
+      "head_us": 13.654040098190308,
+      "latency_change_pct": -0.3101534500186909,
+      "main_us": 18.49969983100891,
+      "speedup_vs_main": 1.3548883479154894,
+      "previous_run_medians_us": [
+        13.59794020652771,
+        13.715740442276001,
+        13.696520328521729
+      ],
+      "head_run_medians_us": [
+        13.596359491348267,
+        13.654040098190308,
+        13.763799667358398
+      ],
+      "previous_run_spread_pct": 0.8600741861637878,
+      "head_run_spread_pct": 1.2263049969534232,
+      "logical_io_bytes": 146935808,
+      "logical_io_throughput_tb_s": 10.761342939037855,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 70.92700004577637,
+      "head_us": 71.14334106445312,
+      "latency_change_pct": 0.3050192712748867,
+      "main_us": 89.46353912353516,
+      "speedup_vs_main": 1.2575110725047989,
+      "previous_run_medians_us": [
+        70.56084156036377,
+        71.61764144897461,
+        70.92700004577637
+      ],
+      "head_run_medians_us": [
+        70.98065853118896,
+        71.47984027862549,
+        71.14334106445312
+      ],
+      "previous_run_spread_pct": 1.4899825002168146,
+      "head_run_spread_pct": 0.7016563180302202,
+      "logical_io_bytes": 1694769152,
+      "logical_io_throughput_tb_s": 23.821894314249374,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 163.03207397460938,
+      "head_us": 163.61698150634766,
+      "latency_change_pct": 0.35876838064967664,
+      "main_us": 199.9505615234375,
+      "speedup_vs_main": 1.2220648473195324,
+      "previous_run_medians_us": [
+        163.03207397460938,
+        162.60751724243164,
+        163.82692337036133
+      ],
+      "head_run_medians_us": [
+        163.61698150634766,
+        163.75879287719727,
+        163.31497192382812
+      ],
+      "previous_run_spread_pct": 0.7479547417887832,
+      "head_run_spread_pct": 0.2712560452363083,
+      "logical_io_bytes": 3942916096,
+      "logical_io_throughput_tb_s": 24.098452738214288,
+      "output_mode": "direct",
+      "previous_output_modes": [
+        "direct"
+      ],
+      "head_output_modes": [
+        "direct"
+      ],
+      "previous_plan_cap": 256,
+      "head_plan_cap": 256
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.436119556427002,
+      "head_us": 13.45054030418396,
+      "latency_change_pct": 0.10732821851127117,
+      "main_us": 14.500099420547485,
+      "speedup_vs_main": 1.0780310004377331,
+      "previous_run_medians_us": [
+        13.456939458847046,
+        13.436119556427002,
+        13.371219635009766
+      ],
+      "head_run_medians_us": [
+        13.473780155181885,
+        13.43932032585144,
+        13.45054030418396
+      ],
+      "previous_run_spread_pct": 0.6379805082657013,
+      "head_run_spread_pct": 0.2561966177650512,
+      "logical_io_bytes": 131178496,
+      "logical_io_throughput_tb_s": 9.752656252715385,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.418500423431396,
+      "head_us": 13.357620239257812,
+      "latency_change_pct": -0.4537033368294585,
+      "main_us": 14.382339715957642,
+      "speedup_vs_main": 1.0767142244161274,
+      "previous_run_medians_us": [
+        13.581140041351318,
+        13.277479410171509,
+        13.418500423431396
+      ],
+      "head_run_medians_us": [
+        13.331160545349121,
+        13.42650055885315,
+        13.357620239257812
+      ],
+      "previous_run_spread_pct": 2.2629997510717152,
+      "head_run_spread_pct": 0.7137499928604475,
+      "logical_io_bytes": 131727360,
+      "logical_io_throughput_tb_s": 9.861588938788332,
+      "output_mode": "cluster",
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "head_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.347100257873535,
+      "head_us": 14.570620059967041,
+      "latency_change_pct": 1.5579441007310235,
+      "main_us": 14.682799577713013,
+      "speedup_vs_main": 1.0076990215436463,
+      "previous_run_medians_us": [
+        14.416780471801758,
+        14.34548020362854,
+        14.347100257873535
+      ],
+      "head_run_medians_us": [
+        14.63070034980774,
+        14.307819604873657,
+        14.570620059967041
+      ],
+      "previous_run_spread_pct": 0.4969664036054181,
+      "head_run_spread_pct": 2.2159712051047222,
+      "logical_io_bytes": 132276224,
+      "logical_io_throughput_tb_s": 9.07828379681868,
+      "output_mode": "reducer",
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "head_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_cap": 2,
+      "head_plan_cap": 2
+    }
+  ],
+  "targeted_recheck": [
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 6.264579892158508,
+      "head_us": 6.299840211868286,
+      "latency_change_pct": 0.5628521036807888,
+      "previous_run_medians_us": [
+        6.250159740447998,
+        6.2717801332473755,
+        6.264579892158508
+      ],
+      "head_run_medians_us": [
+        6.266980171203613,
+        6.313459873199463,
+        6.299840211868286
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.304540276527405,
+      "head_us": 7.375059723854065,
+      "latency_change_pct": 0.9654193783182885,
+      "previous_run_medians_us": [
+        7.304540276527405,
+        7.239639759063721,
+        7.391059994697571
+      ],
+      "head_run_medians_us": [
+        7.329379916191101,
+        7.396680116653442,
+        7.375059723854065
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.903239846229553,
+      "head_us": 5.9248799085617065,
+      "latency_change_pct": 0.36657941902826785,
+      "previous_run_medians_us": [
+        5.883200168609619,
+        5.903239846229553,
+        5.914459824562073
+      ],
+      "head_run_medians_us": [
+        5.89601993560791,
+        5.9248799085617065,
+        5.980139970779419
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 6.694819927215576,
+      "head_us": 6.75491988658905,
+      "latency_change_pct": 0.8977083779230233,
+      "previous_run_medians_us": [
+        6.694819927215576,
+        6.728479862213135,
+        6.6908198595047
+      ],
+      "head_run_medians_us": [
+        6.768540143966675,
+        6.6916197538375854,
+        6.75491988658905
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 6.073079705238342,
+      "head_us": 6.075500249862671,
+      "latency_change_pct": 0.03985695465582584,
+      "previous_run_medians_us": [
+        6.073079705238342,
+        5.9400999546051025,
+        6.141999959945679
+      ],
+      "head_run_medians_us": [
+        6.635540127754211,
+        6.075500249862671,
+        6.006600260734558
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 7.450360059738159,
+      "head_us": 7.546499967575073,
+      "latency_change_pct": 1.2904061960234081,
+      "previous_run_medians_us": [
+        7.456759810447693,
+        7.296519875526428,
+        7.450360059738159
+      ],
+      "head_run_medians_us": [
+        7.669079899787903,
+        7.546499967575073,
+        7.496839761734009
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.585160255432129,
+      "head_us": 5.58758020401001,
+      "latency_change_pct": 0.04332818517656101,
+      "previous_run_medians_us": [
+        5.5787599086761475,
+        5.585160255432129,
+        5.629220008850098
+      ],
+      "head_run_medians_us": [
+        5.585160255432129,
+        5.58758020401001,
+        5.588359832763672
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 6.8454402685165405,
+      "head_us": 6.707639694213867,
+      "latency_change_pct": -2.0130271961679935,
+      "previous_run_medians_us": [
+        6.649140119552612,
+        6.863880157470703,
+        6.8454402685165405
+      ],
+      "head_run_medians_us": [
+        6.658759713172913,
+        6.745299696922302,
+        6.707639694213867
+      ]
+    }
+  ],
+  "verify_recheck": [
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 33.51900100708008,
+      "head_us": 33.804218769073486,
+      "latency_change_pct": 0.8509136711239096,
+      "previous_run_medians_us": [
+        33.51900100708008,
+        33.914780616760254,
+        33.378798961639404
+      ],
+      "head_run_medians_us": [
+        33.804218769073486,
+        33.688859939575195,
+        34.56053972244263
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 23.947858810424805,
+      "head_us": 23.984720706939697,
+      "latency_change_pct": 0.15392564657532581,
+      "previous_run_medians_us": [
+        23.947858810424805,
+        24.555978775024414,
+        23.706700801849365
+      ],
+      "head_run_medians_us": [
+        23.984720706939697,
+        24.53674077987671,
+        23.844499588012695
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 33.56945991516113,
+      "head_us": 33.449299335479736,
+      "latency_change_pct": -0.3579461212217083,
+      "previous_run_medians_us": [
+        33.61433982849121,
+        33.56945991516113,
+        33.14402103424072
+      ],
+      "head_run_medians_us": [
+        33.4453010559082,
+        33.449299335479736,
+        34.03898000717163
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 23.794820308685303,
+      "head_us": 23.778018951416016,
+      "latency_change_pct": -0.07060930509802388,
+      "previous_run_medians_us": [
+        23.794820308685303,
+        23.455119132995605,
+        24.2891788482666
+      ],
+      "head_run_medians_us": [
+        23.027279376983643,
+        24.153780937194824,
+        23.778018951416016
+      ]
+    }
+  ]
+}

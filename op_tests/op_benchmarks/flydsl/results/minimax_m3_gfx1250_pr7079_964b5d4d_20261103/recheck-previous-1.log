@@ -1,0 +1,10 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-fly041-base-frozen/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b8-q1-ctx8192                     6.250 us    5.379 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.305 us    9.192 logical IO TB/s  reducer
+atom fp8  dense-decode-b8-q1-ctx8192                     5.883 us    2.952 logical IO TB/s  reducer
+atom fp8  dense-decode-b4-q1-ctx32768                    6.695 us    5.174 logical IO TB/s  reducer
+pr   bf16 dense-decode-b8-q1-ctx8192                     6.073 us    5.536 logical IO TB/s  reducer
+pr   bf16 dense-decode-b4-q1-ctx32768                    7.457 us    9.004 logical IO TB/s  reducer
+pr   fp8  dense-decode-b8-q1-ctx8192                     5.579 us    3.113 logical IO TB/s  reducer
+pr   fp8  dense-decode-b4-q1-ctx32768                    6.649 us    5.209 logical IO TB/s  reducer
+Saved 8 results to /tmp/pr7079-regression-gfx1250-20261103-964b5d4d/recheck-previous-1.json and /tmp/pr7079-regression-gfx1250-20261103-964b5d4d/recheck-previous-1.csv

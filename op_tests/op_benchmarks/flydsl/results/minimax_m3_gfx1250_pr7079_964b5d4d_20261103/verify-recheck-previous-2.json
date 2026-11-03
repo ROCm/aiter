@@ -1,0 +1,385 @@
+{
+  "metadata": {
+    "label": "verify-recheck-previous-2",
+    "source": "/tmp/aiter-pa-fly041-base-frozen",
+    "commit": "15214dad75fc26d13402b1571de080cf56c514f3",
+    "dirty": false,
+    "timestamp_utc": "2026-11-03T04:00:46.385366+00:00",
+    "gpu": {
+      "name": "AMD Radeon Graphics",
+      "arch": "gfx1250",
+      "cus": 256,
+      "uuid": "33656162-3833-3532-6661-356238663661",
+      "total_memory": 463856467968
+    },
+    "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+    "flydsl": "0.4.1",
+    "hip": "7.16.26315",
+    "seed": 37,
+    "workgroup_budget": null,
+    "harness_sha256": "46aa561f489625fb455719ef57f2367ab891c85fc99588c29ce1fd73216a60ed",
+    "timing": {
+      "graph_calls": 10,
+      "replays": 5,
+      "samples": 5,
+      "rounds": 5,
+      "warmup": 5,
+      "statistic": "median of round minima; GPU events; microseconds per complete decode"
+    },
+    "environment": {
+      "AITER_FLYDSL_KERNARG_PRELOAD": null,
+      "FLYDSL_AUTOTUNE": null,
+      "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+    },
+    "checked": true,
+    "expected_results": 4,
+    "logical_io_throughput_definition": "logical K/V payload + FP32 per-token K/V scales for FP8 + BF16 Q read + BF16 output write; KV once per sequence; excludes metadata/scratch; decimal TB/s, not measured HBM traffic",
+    "status": "complete"
+  },
+  "results": [
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "query_heads": 16,
+      "kv_heads": 1,
+      "head_dim": 128,
+      "query_dtype": "bf16",
+      "query_shape": [
+        12,
+        16,
+        128
+      ],
+      "batch": 3,
+      "requests": 3,
+      "query_length": 4,
+      "page": 128,
+      "context_min": 225280,
+      "context_max": 225280,
+      "table_width": 2048,
+      "kv_pool_pages": 5280,
+      "max_context_length": null,
+      "plan_cap": 256,
+      "plan_capacity": 512,
+      "workgroup_budget": null,
+      "output_mode": "reducer",
+      "scratch_bytes": 8650752,
+      "median_us": 33.914780616760254,
+      "logical_io_throughput_tb_s": 10.205827008326505,
+      "logical_kv_tokens": 675840,
+      "kv_payload_bytes": 346030080,
+      "kv_scale_bytes": 0,
+      "query_output_bytes": 98304,
+      "logical_io_bytes": 346128384,
+      "round_min_us": [
+        33.50938081741333,
+        33.83948087692261,
+        33.914780616760254,
+        34.228060245513916,
+        34.01174068450928
+      ],
+      "samples_us": [
+        [
+          33.60152006149292,
+          33.50938081741333,
+          34.28574085235596,
+          33.71449947357178,
+          34.54293966293335
+        ],
+        [
+          34.56615924835205,
+          34.40351963043213,
+          34.146339893341064,
+          33.83948087692261,
+          34.38107967376709
+        ],
+        [
+          33.998119831085205,
+          33.914780616760254,
+          34.43798065185547,
+          34.18720006942749,
+          34.07501935958862
+        ],
+        [
+          34.39471960067749,
+          34.260900020599365,
+          34.228060245513916,
+          34.512479305267334,
+          34.513280391693115
+        ],
+        [
+          34.01174068450928,
+          34.41231966018677,
+          34.34823989868164,
+          34.58858013153076,
+          34.49326038360596
+        ]
+      ],
+      "checked": true,
+      "reference_check": "rtol=atol=0.005",
+      "graph_changed_query_checked": true,
+      "max_abs_error": 1.2610107660293579e-05,
+      "relative_l2_error": 0.002131946384906769,
+      "max_row_relative_l2_error": 0.0022618290968239307
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "query_heads": 16,
+      "kv_heads": 1,
+      "head_dim": 128,
+      "query_dtype": "bf16",
+      "query_shape": [
+        12,
+        16,
+        128
+      ],
+      "batch": 3,
+      "requests": 3,
+      "query_length": 4,
+      "page": 128,
+      "context_min": 225280,
+      "context_max": 225280,
+      "table_width": 2048,
+      "kv_pool_pages": 5280,
+      "max_context_length": null,
+      "plan_cap": 256,
+      "plan_capacity": 512,
+      "workgroup_budget": null,
+      "output_mode": "reducer",
+      "scratch_bytes": 8650752,
+      "median_us": 24.555978775024414,
+      "logical_io_throughput_tb_s": 7.269922556765303,
+      "logical_kv_tokens": 675840,
+      "kv_payload_bytes": 173015040,
+      "kv_scale_bytes": 5406720,
+      "query_output_bytes": 98304,
+      "logical_io_bytes": 178520064,
+      "round_min_us": [
+        24.40053939819336,
+        24.188239574432373,
+        24.623260498046875,
+        24.61848020553589,
+        24.555978775024414
+      ],
+      "samples_us": [
+        [
+          25.60715913772583,
+          24.731440544128418,
+          24.580819606781006,
+          25.10319948196411,
+          24.40053939819336
+        ],
+        [
+          24.843618869781494,
+          25.224180221557617,
+          25.084760189056396,
+          24.188239574432373,
+          24.81395959854126
+        ],
+        [
+          24.623260498046875,
+          24.781100749969482,
+          24.651319980621338,
+          24.68496084213257,
+          25.23859977722168
+        ],
+        [
+          24.764299392700195,
+          24.783520698547363,
+          24.658520221710205,
+          25.851519107818604,
+          24.61848020553589
+        ],
+        [
+          24.68816041946411,
+          25.037500858306885,
+          24.644100666046143,
+          24.555978775024414,
+          24.74665880203247
+        ]
+      ],
+      "checked": true,
+      "reference_check": "max row relative L2 <= 0.05",
+      "graph_changed_query_checked": true,
+      "max_abs_error": 7.266097236424685e-05,
+      "relative_l2_error": 0.014818434603512287,
+      "max_row_relative_l2_error": 0.016584789380431175
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "query_heads": 16,
+      "kv_heads": 1,
+      "head_dim": 128,
+      "query_dtype": "bf16",
+      "query_shape": [
+        12,
+        16,
+        128
+      ],
+      "batch": 3,
+      "requests": 3,
+      "query_length": 4,
+      "page": 128,
+      "context_min": 225280,
+      "context_max": 225280,
+      "table_width": 1760,
+      "kv_pool_pages": 5280,
+      "max_context_length": 225280,
+      "plan_cap": 256,
+      "plan_capacity": 512,
+      "workgroup_budget": null,
+      "output_mode": "reducer",
+      "scratch_bytes": 8650752,
+      "median_us": 33.56945991516113,
+      "logical_io_throughput_tb_s": 10.310811817489993,
+      "logical_kv_tokens": 675840,
+      "kv_payload_bytes": 346030080,
+      "kv_scale_bytes": 0,
+      "query_output_bytes": 98304,
+      "logical_io_bytes": 346128384,
+      "round_min_us": [
+        32.839579582214355,
+        33.52780103683472,
+        33.62473964691162,
+        33.780179023742676,
+        33.56945991516113
+      ],
+      "samples_us": [
+        [
+          32.839579582214355,
+          32.988600730895996,
+          33.629560470581055,
+          33.723320960998535,
+          33.69767904281616
+        ],
+        [
+          33.769779205322266,
+          33.91479969024658,
+          33.62396001815796,
+          33.687260150909424,
+          33.52780103683472
+        ],
+        [
+          33.62473964691162,
+          33.744940757751465,
+          33.917999267578125,
+          33.69126081466675,
+          33.99009943008423
+        ],
+        [
+          33.998920917510986,
+          33.780179023742676,
+          33.88675928115845,
+          33.904380798339844,
+          33.91158103942871
+        ],
+        [
+          33.56945991516113,
+          33.574280738830566,
+          33.724119663238525,
+          33.651180267333984,
+          33.681640625
+        ]
+      ],
+      "checked": true,
+      "reference_check": "rtol=atol=0.005",
+      "graph_changed_query_checked": true,
+      "max_abs_error": 1.2610107660293579e-05,
+      "relative_l2_error": 0.002131946384906769,
+      "max_row_relative_l2_error": 0.0022618290968239307
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "query_heads": 16,
+      "kv_heads": 1,
+      "head_dim": 128,
+      "query_dtype": "bf16",
+      "query_shape": [
+        12,
+        16,
+        128
+      ],
+      "batch": 3,
+      "requests": 3,
+      "query_length": 4,
+      "page": 128,
+      "context_min": 225280,
+      "context_max": 225280,
+      "table_width": 1760,
+      "kv_pool_pages": 5280,
+      "max_context_length": 225280,
+      "plan_cap": 256,
+      "plan_capacity": 512,
+      "workgroup_budget": null,
+      "output_mode": "reducer",
+      "scratch_bytes": 8650752,
+      "median_us": 23.455119132995605,
+      "logical_io_throughput_tb_s": 7.611134396195243,
+      "logical_kv_tokens": 675840,
+      "kv_payload_bytes": 173015040,
+      "kv_scale_bytes": 5406720,
+      "query_output_bytes": 98304,
+      "logical_io_bytes": 178520064,
+      "round_min_us": [
+        23.39344024658203,
+        24.373300075531006,
+        23.395841121673584,
+        24.338839054107666,
+        23.455119132995605
+      ],
+      "samples_us": [
+        [
+          24.621660709381104,
+          23.39344024658203,
+          24.13856029510498,
+          24.569599628448486,
+          25.22413969039917
+        ],
+        [
+          24.59601879119873,
+          24.373300075531006,
+          25.07836103439331,
+          25.440499782562256,
+          24.609661102294922
+        ],
+        [
+          25.688059329986572,
+          24.946959018707275,
+          24.925320148468018,
+          24.474260807037354,
+          23.395841121673584
+        ],
+        [
+          25.200140476226807,
+          24.397339820861816,
+          24.888460636138916,
+          24.65291976928711,
+          24.338839054107666
+        ],
+        [
+          24.535939693450928,
+          23.455119132995605,
+          24.4702410697937,
+          24.91892099380493,
+          24.398939609527588
+        ]
+      ],
+      "checked": true,
+      "reference_check": "max row relative L2 <= 0.05",
+      "graph_changed_query_checked": true,
+      "max_abs_error": 7.266097236424685e-05,
+      "relative_l2_error": 0.014818434603512287,
+      "max_row_relative_l2_error": 0.016584789380431175
+    }
+  ]
+}

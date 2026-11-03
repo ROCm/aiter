@@ -1,0 +1,130 @@
+[
+  {
+    "label": "repeat-head-2",
+    "argv": [
+      "python",
+      "-u",
+      "/tmp/aiter-pa-benchmark/op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py",
+      "--source",
+      "/tmp/aiter-pr7079-regression-head-964b5d4d",
+      "--profile",
+      "both",
+      "--suite",
+      "dense-decode",
+      "dense-verify",
+      "sparse-decode",
+      "sparse-verify",
+      "sparse-prefill",
+      "cluster-boundary",
+      "--rounds",
+      "5",
+      "--label",
+      "repeat-head-2",
+      "--output",
+      "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/repeat-head-2.json"
+    ],
+    "environment": {
+      "HIP_VISIBLE_DEVICES": "3",
+      "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+    },
+    "started_utc": "2026-11-03T03:59:09.593616+00:00",
+    "exit_code": 0,
+    "ended_utc": "2026-11-03T03:59:19.201288+00:00"
+  },
+  {
+    "label": "repeat-previous-2",
+    "argv": [
+      "python",
+      "-u",
+      "/tmp/aiter-pa-benchmark/op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py",
+      "--source",
+      "/tmp/aiter-pa-fly041-base-frozen",
+      "--profile",
+      "both",
+      "--suite",
+      "dense-decode",
+      "dense-verify",
+      "sparse-decode",
+      "sparse-verify",
+      "sparse-prefill",
+      "cluster-boundary",
+      "--rounds",
+      "5",
+      "--label",
+      "repeat-previous-2",
+      "--output",
+      "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/repeat-previous-2.json"
+    ],
+    "environment": {
+      "HIP_VISIBLE_DEVICES": "3",
+      "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+    },
+    "started_utc": "2026-11-03T03:59:19.281836+00:00",
+    "exit_code": 0,
+    "ended_utc": "2026-11-03T03:59:28.717929+00:00"
+  },
+  {
+    "label": "repeat-previous-3",
+    "argv": [
+      "python",
+      "-u",
+      "/tmp/aiter-pa-benchmark/op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py",
+      "--source",
+      "/tmp/aiter-pa-fly041-base-frozen",
+      "--profile",
+      "both",
+      "--suite",
+      "dense-decode",
+      "dense-verify",
+      "sparse-decode",
+      "sparse-verify",
+      "sparse-prefill",
+      "cluster-boundary",
+      "--rounds",
+      "5",
+      "--label",
+      "repeat-previous-3",
+      "--output",
+      "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/repeat-previous-3.json"
+    ],
+    "environment": {
+      "HIP_VISIBLE_DEVICES": "3",
+      "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+    },
+    "started_utc": "2026-11-03T03:59:28.799481+00:00",
+    "exit_code": 0,
+    "ended_utc": "2026-11-03T03:59:38.413307+00:00"
+  },
+  {
+    "label": "repeat-head-3",
+    "argv": [
+      "python",
+      "-u",
+      "/tmp/aiter-pa-benchmark/op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py",
+      "--source",
+      "/tmp/aiter-pr7079-regression-head-964b5d4d",
+      "--profile",
+      "both",
+      "--suite",
+      "dense-decode",
+      "dense-verify",
+      "sparse-decode",
+      "sparse-verify",
+      "sparse-prefill",
+      "cluster-boundary",
+      "--rounds",
+      "5",
+      "--label",
+      "repeat-head-3",
+      "--output",
+      "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/repeat-head-3.json"
+    ],
+    "environment": {
+      "HIP_VISIBLE_DEVICES": "3",
+      "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+    },
+    "started_utc": "2026-11-03T03:59:38.494874+00:00",
+    "exit_code": 0,
+    "ended_utc": "2026-11-03T03:59:48.230075+00:00"
+  }
+]

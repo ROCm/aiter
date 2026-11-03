@@ -1,0 +1,65 @@
+{
+  "pr_url": "https://github.com/ROCm/aiter/pull/7079",
+  "previous_head": "15214dad75fc26d13402b1571de080cf56c514f3",
+  "new_head": "964b5d4d8f7085497238f69fface36cb90ef36b2",
+  "main_baseline": "6d8c8e9c247f318204303724f34d6d134c24d864",
+  "main_baseline_reason": "Latest main merged into PR 7079; isolates the PR from later main changes",
+  "physical_gpu": 3,
+  "flydsl_commit": "f37f7a2b98f295902240f9f96612222003578b40",
+  "harness": "/tmp/aiter-pa-benchmark/op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py",
+  "environment": {
+    "HIP_VISIBLE_DEVICES": "3",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/tmp/pr7079-regression-gfx1250-20261103-964b5d4d/flydsl-cache"
+  },
+  "flydsl_commit_after": "f37f7a2b98f295902240f9f96612222003578b40",
+  "flydsl_dirty_after": false,
+  "source_fingerprints": {
+    "previous": {
+      "aiter/ops/flydsl/pa_decode.py": "1b81ff7e2d3d81a7175a53d4afc683459f6bb87d3539bed08f653edb15f534b5",
+      "aiter/ops/flydsl/pa_decode_tuning.py": "7ffe1644ff09127b24c297d158d376734084d232efaf4cd9660ff579ff7e52e2",
+      "aiter/ops/flydsl/kernels/pa_decode_kernel.py": "10e50337a29c3f64211681540c258ff4c99baed0499c7c23858eb56f0f5a69dd",
+      "aiter/ops/flydsl/kernels/pa_decode_plan.py": "00c3c7f53f7251280f96d3b183427ecc1a556b509dcd635232bcb3a3697133e5",
+      "aiter/ops/flydsl/kernels/pa_decode_reduce.py": "d655259fdbc13a4f0a94595478fd5fa7947eea0a692d527ddc9be4030ca9ad84",
+      "aiter/ops/flydsl/kernels/pa_decode/__init__.py": "589a8d22465c1b5e16a8b584fcee9e68dd9c2a119aa684ebbf9be830901c1341",
+      "aiter/ops/flydsl/kernels/pa_decode/context.py": "032edcffa9cb12b85b5c2702c3d95f866730c39893622220d9f66696764e7969",
+      "aiter/ops/flydsl/kernels/pa_decode/op_epilog.py": "fd62546b278a49d43b5cf87f5631976a47bdda3eef8145d949fe11a5bc670fbf",
+      "aiter/ops/flydsl/kernels/pa_decode/op_gemm.py": "5eeec9853a957e5191a5bca6e0ddfa32846e49ac54ea404ee5004f3880ad4698",
+      "aiter/ops/flydsl/kernels/pa_decode/op_lds.py": "05f39ae51626fbf48c63a06482b9e697f2106fedce87c9f7302bf593d0f87243",
+      "aiter/ops/flydsl/kernels/pa_decode/op_merge.py": "1a64fc087c449704421e9e0427c9f3d440f0d3ca7d2f0edd1280b76faa35f360",
+      "aiter/ops/flydsl/kernels/pa_decode/op_softmax.py": "dc9fed79c24b5cea6ca71d4d6bf63e3bf5844756d3702b0658425d468c77060b",
+      "aiter/ops/flydsl/kernels/pa_decode/pipeline.py": "c1e719d2b81f12617e1f69664196da1c63e29d86b0d56c8c2fccde5fba6aed6d",
+      "aiter/ops/flydsl/kernels/pa_decode/traits.py": "e21db3f4c958e4b7520dd583735367217cafc13715c0b40821432874ba9a7562"
+    },
+    "head": {
+      "aiter/ops/flydsl/pa_decode.py": "caff1f2a42c9b3f7f250ea1bd2fa963a23c7ea27c499a9b577495f34a2e03767",
+      "aiter/ops/flydsl/pa_decode_tuning.py": "2fa0f14c4c3492c48e8b14f3f591395104cb5a97465857ce0853209716673a7c",
+      "aiter/ops/flydsl/kernels/pa_decode_kernel.py": "5e8bd85bacba49939ee189f989034c892af2c3b519ff01d4bf582ecd47d28b2f",
+      "aiter/ops/flydsl/kernels/pa_decode_plan.py": "00c3c7f53f7251280f96d3b183427ecc1a556b509dcd635232bcb3a3697133e5",
+      "aiter/ops/flydsl/kernels/pa_decode_reduce.py": "ff2c5ef623ec163fa61567dd433cd8ea421edeccc81c49072392ddfe03e85e55",
+      "aiter/ops/flydsl/kernels/pa_decode/__init__.py": "589a8d22465c1b5e16a8b584fcee9e68dd9c2a119aa684ebbf9be830901c1341",
+      "aiter/ops/flydsl/kernels/pa_decode/context.py": "032edcffa9cb12b85b5c2702c3d95f866730c39893622220d9f66696764e7969",
+      "aiter/ops/flydsl/kernels/pa_decode/op_epilog.py": "fd62546b278a49d43b5cf87f5631976a47bdda3eef8145d949fe11a5bc670fbf",
+      "aiter/ops/flydsl/kernels/pa_decode/op_gemm.py": "5eeec9853a957e5191a5bca6e0ddfa32846e49ac54ea404ee5004f3880ad4698",
+      "aiter/ops/flydsl/kernels/pa_decode/op_lds.py": "05f39ae51626fbf48c63a06482b9e697f2106fedce87c9f7302bf593d0f87243",
+      "aiter/ops/flydsl/kernels/pa_decode/op_merge.py": "1a64fc087c449704421e9e0427c9f3d440f0d3ca7d2f0edd1280b76faa35f360",
+      "aiter/ops/flydsl/kernels/pa_decode/op_softmax.py": "dc9fed79c24b5cea6ca71d4d6bf63e3bf5844756d3702b0658425d468c77060b",
+      "aiter/ops/flydsl/kernels/pa_decode/pipeline.py": "5fef4f79b30e5c134e3a927fca389620958176c90c606a8f7106c8246ec5c839",
+      "aiter/ops/flydsl/kernels/pa_decode/traits.py": "e21db3f4c958e4b7520dd583735367217cafc13715c0b40821432874ba9a7562"
+    },
+    "main": {
+      "aiter/ops/flydsl/pa_decode.py": "000e2e254571432d4de1100f870c0cf1bba27a3cfcbaa98b5ab45d84424ee9c9",
+      "aiter/ops/flydsl/pa_decode_tuning.py": "2fa0f14c4c3492c48e8b14f3f591395104cb5a97465857ce0853209716673a7c",
+      "aiter/ops/flydsl/kernels/pa_decode_kernel.py": "4909fbe456f20142cd86c62fd35f922aba78085a89b8212cce0c88e75fc027dd",
+      "aiter/ops/flydsl/kernels/pa_decode_plan.py": "f459273bf4aa0aa6bd9af247ed77bed399dbc5d7aaac5676f95bff2161b4a031",
+      "aiter/ops/flydsl/kernels/pa_decode_reduce.py": "126dda5069279153dc658d6127865feaa803aa21abf488eb280bd3306e7b33ef",
+      "aiter/ops/flydsl/kernels/pa_decode/__init__.py": "589a8d22465c1b5e16a8b584fcee9e68dd9c2a119aa684ebbf9be830901c1341",
+      "aiter/ops/flydsl/kernels/pa_decode/context.py": "032edcffa9cb12b85b5c2702c3d95f866730c39893622220d9f66696764e7969",
+      "aiter/ops/flydsl/kernels/pa_decode/op_epilog.py": "fd62546b278a49d43b5cf87f5631976a47bdda3eef8145d949fe11a5bc670fbf",
+      "aiter/ops/flydsl/kernels/pa_decode/op_gemm.py": "5eeec9853a957e5191a5bca6e0ddfa32846e49ac54ea404ee5004f3880ad4698",
+      "aiter/ops/flydsl/kernels/pa_decode/op_lds.py": "05f39ae51626fbf48c63a06482b9e697f2106fedce87c9f7302bf593d0f87243",
+      "aiter/ops/flydsl/kernels/pa_decode/op_softmax.py": "dc9fed79c24b5cea6ca71d4d6bf63e3bf5844756d3702b0658425d468c77060b",
+      "aiter/ops/flydsl/kernels/pa_decode/pipeline.py": "3b17af52e4c7183e2fe212e5127d97a75a3ceec2b60d3406cd0eb2e75fa216bc",
+      "aiter/ops/flydsl/kernels/pa_decode/traits.py": "42c92f24c54915dcb95fe46196b38275c6cb2aa165a87ab144c7bcaec0b051f6"
+    }
+  }
+}

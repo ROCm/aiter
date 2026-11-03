@@ -157,6 +157,16 @@ results retain the original field name `effective_bandwidth_tb_s`; that field
 has the same logical IO meaning and must not be interpreted as measured HBM
 bandwidth.
 
+## Latest PR regression check
+
+The [PR 7079 head `964b5d4d8` regression report](results/minimax_m3_gfx1250_pr7079_964b5d4d_20261103/README.md)
+compares the refreshed PR against the previously measured `15214dad7` on idle
+gfx1250 GPU 3. Both revisions ran the complete 84-point matrix in three
+independent processes, followed by alternating checks for suspicious cases.
+All 660 measurements, including a main comparison, passed correctness checks.
+The report preserves first-run anomalies, full timing samples, latency changes
+and logical IO throughput. Use `--source` to select the revision being tested.
+
 ## Validation
 
 Validated on 2026-11-02 against PR 7079 head `15214dad7`, with a 256-CU gfx1250,
