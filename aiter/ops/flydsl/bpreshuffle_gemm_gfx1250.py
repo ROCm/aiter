@@ -130,9 +130,12 @@ def run_preshuffle_gemm_a8_gfx1250(
             f"{split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
-    if num_k_tiles < nb:
+    # K=128 with two buffers uses only the prologue and drain. Keep all
+    # other configurations at their existing minimum.
+    min_k_tiles = 1 if nb == 2 and K == tile_k == 128 else nb
+    if num_k_tiles < min_k_tiles:
         raise RuntimeError(
-            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {nb} K-tiles per "
+            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {min_k_tiles} K-tiles per "
             f"split-k chunk, got {num_k_tiles} (K={K}, split_k={split_k}, tile_k={tile_k})"
         )
     if split_k > 1:
