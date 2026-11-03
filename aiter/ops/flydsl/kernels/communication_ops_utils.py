@@ -409,6 +409,29 @@ def atomic_add_agent(addr_i64, val):
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
 
 
+def atomic_add_agent_acq_rel_av_none(addr_i64, val):
+    """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
+
+    ``!mmra !{"amdgcn-av", "none"}`` tells the AMDGPU memory legalizer that the
+    payload accesses ordered by this RMW make themselves available/visible at
+    agent scope (e.g. ``sc1`` loads and stores), so it emits only the
+    ``s_waitcnt`` ordering and no ``buffer_wbl2``/``buffer_inv``. Payload
+    accesses that rely on ordinary caching are not synchronized by this RMW.
+    """
+    op = _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_global(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.acq_rel,
+        syncscope=fx.rocdl.SyncScope.Agent,
+        alignment=4,
+    )
+    op.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
+    return op.res
+
+
 def atomic_add_agent_one_as(addr_i64, val):
     """Agent-one-as monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.AgentOneAs)

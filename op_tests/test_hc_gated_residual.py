@@ -434,6 +434,48 @@ def _run_side_stream_pressure():
         _check(inj_ref.to(inj.dtype), inj.contiguous(), f"{label} inj", atol=0.05)
 
 
+def _run_skinny_publication_stress(reps=300):
+    """Repeat skinny decode; the last-arriving wave must never read stale partials.
+
+    Workgroups of one column group land on different XCDs, whose L2s are not
+    coherent. The cross-wave sum is accumulated in a fixed order, so every
+    replay must be bit-identical to the first oracle-checked result.
+    """
+    for tokens in (1, 3, 8):
+        inp = _make_inputs(tokens, seed=26)
+        merged = _merged(inp, True)
+
+        def run(inp=inp, merged=merged):
+            return flydsl_gr_two_stage_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                HC,
+                EPS,
+                w_down_merged=merged,
+                fold_w=True,
+            )
+
+        _, x0, inj0 = run()
+        torch.cuda.synchronize()
+        _, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+        label = f"skinny_stress[M={tokens}]"
+        _check(x_ref.to(x0.dtype), x0, f"{label} x")
+        _check(inj_ref.to(inj0.dtype), inj0.contiguous(), f"{label} inj", atol=0.05)
+        outs = [run() for _ in range(reps)]
+        torch.cuda.synchronize()
+        bad = sum(
+            not (torch.equal(x, x0) and torch.equal(inj, inj0)) for _, x, inj in outs
+        )
+        if bad:
+            print(f"[FAIL] {label}: {bad}/{reps} replays differ from the first")
+            _FAILURES.append(f"{label} replay")
+
+
 def _make_shape_inputs(tokens, hc_count, stream_dim, seed):
     torch.manual_seed(seed)
     hidden = hc_count * stream_dim
@@ -789,6 +831,7 @@ def main():
     _run_zero_tokens()
     _run_k2_override_limits()
     _run_side_stream_pressure()
+    _run_skinny_publication_stress()
     _run_untuned_hidden()
     _run_counter_hc_isolation()
     for m in args.decode_tokens:

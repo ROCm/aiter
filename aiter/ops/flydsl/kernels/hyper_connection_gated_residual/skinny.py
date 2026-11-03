@@ -29,15 +29,13 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
-    atomic_add_agent,
-    fence_acquire,
-    fence_release,
+    atomic_add_agent_acq_rel_av_none,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     GTensor,
@@ -48,8 +46,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 WAVE = 64
-# sc0|sc1: the partials are written and read across XCDs, which do not share L2.
-CPOL_COHERENT = 0x1 | 0x10
+# sc1: agent-visible partials. They are written and read across XCDs, which
+# do not share L2.
+CPOL_AGENT = 0x10
 DOWN_VEC = 8  # bf16 per 16-byte load
 UP_VEC = 4
 PART_M = 4  # partial slots per column; bounds m_rows
@@ -248,25 +247,19 @@ def _build_down_fused(
                     fx.Vector.from_elements(dots, dtype=fx.Float32),
                     elem=fx.Float32,
                     unit_elems=PART_M,
-                    cache_modifier=CPOL_COHERENT,
+                    cache_modifier=CPOL_AGENT,
                 )
-        # Cross-XCD visibility comes from the hardware protocol: sc0|sc1 partial
-        # stores and loads bypass the non-coherent L2, s_waitcnt drains them
-        # before/after the device-scope atomic. The workgroup fences only stop
-        # the compiler from moving the partial accesses across the atomic.
-        # Agent-scope fences would add buffer_wbl2/buffer_inv and cost 2-4x
-        # decode latency on MI300X.
-        rocdl.s_waitcnt(0)
-        fence_release("workgroup")
 
+        # Partials use agent-visible (sc1) stores and loads; the acq_rel arrival
+        # RMW orders them, and its amdgcn-av:none MMRA skips cache-wide L2
+        # maintenance because the partials are visible per access.
+        #
         # One counter per lane of a column, so lanes don't contend on an address.
         # Every lane of the last-arriving wave sees hc-1 (mod hc) on its own slot.
         slot = fx.Int64(fx.ptrtoint(fx.get_iter(counters))) + fx.Int64(
             (mg * n_pad + grp) * WAVE + lane
         ) * fx.Int64(4)
-        arrival = fx.Int32(atomic_add_agent(slot, fx.Int32(1)))
-        rocdl.s_waitcnt(0)
-        fence_acquire("workgroup")
+        arrival = fx.Int32(atomic_add_agent_acq_rel_av_none(slot, fx.Int32(1)))
         is_last = (arrival & fx.Int32(hc_count - 1)) == fx.Int32(hc_count - 1)
         writer = is_last & (lane == fx.Int32(0))
 
@@ -280,7 +273,7 @@ def _build_down_fused(
                         mg * part_group_elems + (n * n_chunks + ch) * PART_M,
                         elem=fx.Float32,
                         unit_elems=PART_M,
-                        cache_modifier=CPOL_COHERENT,
+                        cache_modifier=CPOL_AGENT,
                     )
                 )
                 for ss in range_constexpr(1, hc_count):
@@ -291,7 +284,7 @@ def _build_down_fused(
                             + ((ss * n_pad + n) * n_chunks + ch) * PART_M,
                             elem=fx.Float32,
                             unit_elems=PART_M,
-                            cache_modifier=CPOL_COHERENT,
+                            cache_modifier=CPOL_AGENT,
                         )
                     )
                 for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M)):
