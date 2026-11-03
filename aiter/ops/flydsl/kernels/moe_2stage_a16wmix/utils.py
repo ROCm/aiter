@@ -98,7 +98,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
     ``eff = scale*16``. ``is_gfx942``: pack two f32 high-16s into a bf16
-    pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
+    pair with ``v_perm_b32`` (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
     ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
@@ -113,22 +113,29 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
     raw_odd = raw_even.shrui(fx.Int32(4))
     if is_gfx942:
         # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
+        # Both eff2 lanes are defined: a splat leaves v_pk_mul_f32's high src0 reg
+        # undefined, and the waitcnt pass then waits on the last load into it.
+        eff_hi = llvm.call_intrinsic(
+            T.f32, "llvm.arithmetic.fence", [_raw(eff)], [], []
+        )
+        eff2 = fx.Vector.from_elements([_raw(eff), eff_hi], fx.Float32)
         los = []
         his = []
         for j in range_constexpr(4):
-            f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
-            f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
+            f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j))
+            f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j))
             los.append(f_lo)
             his.append(f_hi)
         f32s = (los + his) if old_pack else [x for pair in zip(los, his) for x in pair]
-        c16 = fx.Int32(16)
-        hi16 = fx.Int32(0xFFFF0000)
+        hi16 = fx.Int32(0x07060302)  # perm_b32(b1, b0): their high halves
         i32s = []
         for i in range_constexpr(4):
-            b0 = f32s[2 * i].bitcast(fx.Int32)
-            b1 = f32s[2 * i + 1].bitcast(fx.Int32)
-            i32s.append(b0.shrui(c16) | (b1 & hi16))
-        v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+            pair = [_raw(f32s[2 * i]), _raw(f32s[2 * i + 1])]
+            p = fx.Vector.from_elements(pair, fx.Float32) * eff2
+            b0 = p[0].bitcast(fx.Int32)
+            b1 = p[1].bitcast(fx.Int32)
+            i32s.append(rocdl.perm_b32(_raw(b1), _raw(b0), _raw(hi16)))
+        v4i32 = fx.Vector.from_elements(i32s, fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
     los = []
@@ -489,7 +496,7 @@ def make_b_loader(
     here rather than inline in the kernel body does not perturb instruction order.
 
     Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
-    On gfx942 the a16wi4 W upconvert is the lshr-16 bf16 pack in
+    On gfx942 the a16wi4 W upconvert is the ``v_perm_b32`` bf16 pack in
     ``_int4_nibble_to_bf16x8``; a16wfp4 uses ``_fp4_nibble_to_bf16x8`` (fp8 LUT
     + ``cvt_pk_f32_fp8``) instead of ``v_cvt_scalef32_pk_bf16_fp4``.
     """
@@ -770,6 +777,14 @@ def make_b_loader(
             pair_idx = adj_ku // fx.Int32(2)
             dword = scale_expert_base() + pair_idx * fx.Int32(N_OUT) + n_full
             packed = _buffer_i32_scalar_read(sw_tiles, dword, sw_read_atom)
+            if const_expr(_is_gfx942):
+                # Selected bf16 -> f32 high half, low half zeroed (0x0C bytes).
+                sel = (adj_ku % fx.Int32(2) == fx.Int32(0)).select(
+                    fx.Int32(0x01000C0C), fx.Int32(0x03020C0C)
+                )
+                f = rocdl.perm_b32(_raw(packed), _raw(packed), _raw(sel))
+                scales.append(fx.Int32(f).bitcast(fx.Float32))
+                continue
             # even adj_ku -> low bf16, odd -> high.
             lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
             hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)

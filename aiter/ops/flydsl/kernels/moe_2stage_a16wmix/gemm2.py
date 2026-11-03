@@ -568,8 +568,11 @@ def compile_gemm2_a16w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(_num_n_blocks) + n_block
 
+        # Bound at kernel scope: FlyDSL's cache key skips globals of nested defs.
+        gemm2_body = _gemm2_body_a16w4
+
         def _run_tile(tile):
-            _gemm2_body_a16w4(
+            gemm2_body(
                 lds_raw_ptr,
                 arg_a,
                 arg_bq,
