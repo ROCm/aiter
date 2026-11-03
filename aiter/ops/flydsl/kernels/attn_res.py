@@ -57,7 +57,9 @@ _ONE_WAVE_GROUP_SIZE = 2
 # Multi-wave rows when T exceeds the CU count.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
-_WIDE_SOURCE_GROUP_SIZE = 1
+# Two sources fill one batched wave-sum register; one source per barrier lost
+# 3 to 7% at T=1024.
+_WIDE_SOURCE_GROUP_SIZE = 2
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
 _DPP_QUAD_XOR2 = 0x4E
