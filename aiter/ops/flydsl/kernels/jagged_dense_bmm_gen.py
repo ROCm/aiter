@@ -30,7 +30,6 @@ from .tensor_shim import _run_compiled
 BLOCK_M = 128
 BLOCK_N = 128
 STAGES_A = 2
-B_STAGES = 3
 
 
 @dataclass(frozen=True)
@@ -43,6 +42,7 @@ class ArchTraits:
     wave_size: int
     min_block_k: int
     a_lds_dma: bool
+    b_stages: int
 
     @property
     def k_tile_gran(self) -> int:
@@ -59,6 +59,7 @@ ARCH_TRAITS = {
         wave_size=64,
         min_block_k=64,
         a_lds_dma=False,
+        b_stages=3,
     ),
     "gfx950": ArchTraits(
         mma_mnk=(16, 16, 32),
@@ -69,6 +70,7 @@ ARCH_TRAITS = {
         wave_size=64,
         min_block_k=64,
         a_lds_dma=True,
+        b_stages=2,
     ),
 }
 
@@ -139,6 +141,7 @@ def _build_launcher(
     MMA_N = TRAITS.mma_mnk[1]
     K_STEP = TRAITS.k_tile_gran
     K_ATOMS = K_STEP // TRAITS.mma_mnk[2]
+    B_STAGES = TRAITS.b_stages
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
     WAVES = THREADS // TRAITS.wave_size
@@ -486,12 +489,12 @@ def _build_launcher(
                 thr_gB_k[None, None, None, 0],
                 b_dst(0),
             )
-            if fx.const_expr(n_tiles > 1):
+            for b_pre in fx.range_constexpr(1, min(B_STAGES - 1, n_tiles)):
                 fx.copy(
                     b_copy,
                     thr_gB_k[None, None, None, 0],
-                    b_dst(1),
-                    soffset=fx.Int32(1) * gB_k_stride,
+                    b_dst(b_pre),
+                    soffset=fx.Int32(b_pre) * gB_k_stride,
                 )
             mma_frag_C.store(bias_frag.load().to(fx.Float32))
             a_commit(0)
