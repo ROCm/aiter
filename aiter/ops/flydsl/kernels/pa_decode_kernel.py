@@ -28,7 +28,7 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
 using the 64-token pipeline.
 
-MXFP4 K/V (``kv_dtype="mxfp4"``, gfx950, head_dim 128, page 128, one query token a
+MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950, head_dim 128, page 128, one query token a
 row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 K x
 e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
 tile and all dims, so the tile loop has no barrier; the waves merge once after it.
@@ -58,6 +58,7 @@ this module keeps the compilation API and launch wrappers.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
@@ -79,19 +80,23 @@ from .pa_decode.pipeline import (
     PaDecodePipeline,
 )
 from .pa_decode.traits import (
+    FP8_KV_DTYPES,
     FP8_PACK_K,
     KV_COMPUTE_BLOCK,
     LOG2E,
     MFMA_ACC_ELEMS,
     MFMA_MNK,
+    MXFP4_KV_DTYPE,
     WAVE,
     Gfx1250Traits,
     PaDecodeSchedule,
     PaDecodeTraits,
+    kv_fx_dtype,
 )
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    torch_to_fx_dtype,
 )
 
 __all__ = [
@@ -110,6 +115,13 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
+
+
+def _dtype_tag(dtype):
+    """Short dtype tag of trace-visible kernel names and the gfx1250 traits."""
+    if dtype in FP8_KV_DTYPES:
+        return "fp8"
+    return {fx.Float16: "f16", fx.BFloat16: "bf16", MXFP4_KV_DTYPE: "mxfp4"}[dtype]
 
 
 def _pa_decode_tile_kernel_name(
@@ -165,8 +177,8 @@ def compile_pa_decode_tile(
     work_capacity: int,
     num_partitions: int = 1,
     softmax_scale: float | None = None,
-    query_dtype: str = "f16",
-    kv_dtype: str = "fp8",
+    query_dtype: torch.dtype = torch.float16,
+    kv_dtype: torch.dtype,
     per_token_kv: bool = False,
     query_length: int = 1,
     trans_v: bool = True,
@@ -233,14 +245,23 @@ def compile_pa_decode_tile(
     """
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
+    kv_dtype, query_dtype = kv_fx_dtype(kv_dtype), torch_to_fx_dtype(query_dtype)
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
+        if query_dtype not in (fx.Float16, fx.BFloat16) or kv_dtype not in (
+            fx.Float8E4M3FN,
+            fx.BFloat16,
+        ):
+            raise ValueError(
+                "gfx1250 PA decode takes an f16/bf16 query and e4m3fn/bf16 KV, "
+                f"got {query_dtype} and {kv_dtype}"
+            )
         if query_splits is None:
             # Split the measured spilling BF16 specialization into one Q tile
             # per CTA. Other shapes retain fused queries and their KV reuse.
             query_splits = (
                 4
-                if kv_dtype == "bf16"
+                if kv_dtype == fx.BFloat16
                 and head_dim == 1024
                 and query_group_size == 16
                 and query_length == 4
@@ -254,12 +275,12 @@ def compile_pa_decode_tile(
             query_group_size=query_group_size,
             block_size=block_size,
             softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
+            query_dtype=_dtype_tag(query_dtype),
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
             sliding_window=sliding_window,
-            compute_dtype=kv_dtype,
+            compute_dtype=_dtype_tag(kv_dtype),
             direct_output=direct_output and num_partitions == 1,
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
@@ -269,7 +290,7 @@ def compile_pa_decode_tile(
         raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
         raise NotImplementedError("cluster_merge requires gfx1250")
-    if direct_output and kv_dtype != "mxfp4":
+    if direct_output and kv_dtype != MXFP4_KV_DTYPE:
         raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -313,7 +334,7 @@ def compile_pa_decode_tile(
         # Packed partials: [KV heads, capacity, query rows].
         pmax_ptr: fx.Pointer,  # Natural-log row max.
         psum_ptr: fx.Pointer,  # Row sum.
-        pout_ptr: fx.Pointer,  # Adds head_dim; Q_DTYPE normalized O_p/l_p.
+        pout_ptr: fx.Pointer,  # Adds head_dim; OUT_DTYPE normalized O_p/l_p.
         query_ptr: fx.Pointer,
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
@@ -358,8 +379,8 @@ def compile_pa_decode_tile(
         PaDecodePipeline(ctx).run()
 
     kernel_name = _pa_decode_tile_kernel_name(
-        kv_dtype=kv_dtype,
-        query_dtype=query_dtype,
+        kv_dtype=_dtype_tag(traits.kv_dtype),
+        query_dtype=_dtype_tag(traits.query_dtype),
         head_dim=traits.head_dim,
         block_size=traits.block_size,
         query_group_size=traits.query_group_size,
@@ -369,7 +390,9 @@ def compile_pa_decode_tile(
         sliding_window=traits.sliding_window,
         query_splits=traits.query_splits,
         direct_output=traits.DIRECT,
-        stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
+        stage_pages=(
+            traits.stage_page_capacity if traits.kv_dtype == MXFP4_KV_DTYPE else 0
+        ),
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
@@ -436,7 +459,7 @@ def compile_pa_decode_tile(
                 tid = fx.Int32(gpu.thread_id("x"))
                 head = tid // (traits.head_dim // 8)
                 if head < traits.query_group_size:
-                    out = fx.recast_iter(traits.Q_DTYPE, pout_ptr)
+                    out = fx.recast_iter(traits.OUT_DTYPE, pout_ptr)
                     offset = (
                         slot * stride_q_row
                         + (fx.Int32(gpu.block_id("y")) * traits.query_group_size + head)
@@ -444,7 +467,7 @@ def compile_pa_decode_tile(
                         + tid % (traits.head_dim // 8) * 8
                     )
                     fx.ptr_store(
-                        fx.full(8, 0.0, traits.Q_DTYPE), fx.add_offset(out, offset)
+                        fx.full(8, 0.0, traits.OUT_DTYPE), fx.add_offset(out, offset)
                     )
         else:
             task = fx.ptr_load(

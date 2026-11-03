@@ -20,7 +20,14 @@ from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
+from .traits import (
+    KV_COMPUTE_BLOCK,
+    LOG2E,
+    MFMA_MNK,
+    MXFP4_KV_DTYPE,
+    MXFP4_P_EXP_SHIFT,
+    WAVE,
+)
 
 
 class PaDecodePipeline:
@@ -53,18 +60,18 @@ class PaDecodePipeline:
             self.kv.stage_page_ids()
             gpu.barrier()
         k_pf0 = self.kv.prefetch_first()
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             v_page_pf0 = self.kv.mxfp4_prefetch("v")
         self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
         self.query.stage(q_units_prefetched)
         gpu.barrier()
-        if const_expr(not self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype != MXFP4_KV_DTYPE):
             v_page_pf0 = self.kv.read_v_pages()
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.epilogue.store_mxfp4(o_final)
         else:
             self.epilogue.store(o_final)
@@ -120,7 +127,7 @@ class PaDecodePipeline:
         v_page_cur = ostate[
             self.traits.V_SLOT
         ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
-        tok0 = tt * self.traits.TILE_TOK
+        tok0 = tt * KV_COMPUTE_BLOCK
         # Interleave MFMA with VALU/LDS or page16 V loads.
         if const_expr(
             (not self.traits.per_token_kv and multi_query) or self.traits.PAGE16_VPIPE
@@ -166,7 +173,7 @@ class PaDecodePipeline:
             ]
 
         q_scale_vec = None
-        if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
+        if const_expr(self.traits.M_TILES > 1 and self.traits.kv_dtype != fx.BFloat16):
             q_scale_vec = self.lds.load(
                 self.traits.sQscale_off
                 + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
@@ -190,7 +197,7 @@ class PaDecodePipeline:
                 q_ops_all,
                 mask_tail,
             )
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
             return self.single_query_tile_mxfp4(
                 ostate, k_cur, tt1, tile_valid, q_ops_all
@@ -248,7 +255,7 @@ class PaDecodePipeline:
 
             scale = (
                 self.ctx.scale_qk
-                if const_expr(self.traits.is_bf16_kv)
+                if const_expr(self.traits.kv_dtype == fx.BFloat16)
                 else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
             )
             masked_chunks = self.softmax.multi_scores(
@@ -565,7 +572,7 @@ class PaDecodePipeline:
         masked_chunks = []
         v_scale_vecs = None
         for m in range_constexpr(self.traits.M_TILES):
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 scale = self.ctx.scale_qk
             elif const_expr(self.traits.M_TILES > 1):
                 scale = self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
@@ -704,7 +711,9 @@ class PaDecodePipeline:
             self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid)
         scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
         scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
-        if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
+        if (
+            tile_valid < KV_COMPUTE_BLOCK
+        ):  # only a sequence's last tile has masked tokens
             thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)
             neg4 = fx.full(4, float("-inf"), fx.Float32)
             scores = [

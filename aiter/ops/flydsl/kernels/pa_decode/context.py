@@ -10,7 +10,7 @@ Loop-carried softmax and output values are passed as SSA values, not stored here
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 
-from .traits import LOG2E, MFMA_MNK, WAVE
+from .traits import FP8_KV_DTYPES, LOG2E, MFMA_MNK, WAVE
 
 
 class PaDecodeContext:
@@ -106,7 +106,9 @@ class PaDecodeContext:
         self.part_end = self.planned_end
 
     def init_scales(self, key_scale, value_scale):
-        if const_expr(self.traits.per_token_kv or self.traits.PV_BF16):
+        if const_expr(
+            self.traits.per_token_kv or self.traits.kv_dtype not in FP8_KV_DTYPES
+        ):
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E)
         else:
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E) * fx.Float32(
