@@ -38,7 +38,7 @@ def asm_mla_sparse_prefill_v41_fwd(
 
 def _check_tensor(name, value, shape, allowed_dtypes, device):
     if not isinstance(value, torch.Tensor):
-        raise ValueError(f"mla_sparse_prefill_v41 asm: {name} must be a tensor")
+        raise TypeError(f"mla_sparse_prefill_v41 asm: {name} must be a tensor")
     if value.device != device:
         raise ValueError(
             f"mla_sparse_prefill_v41 asm: {name} must be on {device}, got {value.device}"
