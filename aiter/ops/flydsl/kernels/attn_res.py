@@ -16,7 +16,6 @@ pre-folded ``score_weight``, and an online softmax mixes the raw values.
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -57,16 +56,12 @@ _SOURCE_GROUP_SIZE = 2
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
 _WIDE_SOURCE_GROUP_SIZE = 1
-# Changing this constant requires _clear_caches().
-_WAVE_REDUCE_MODE: Literal["auto", "swizzle", "dpp"] = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
 _DPP_QUAD_XOR2 = 0x4E
 _DPP_ROW_SHR1 = 0x111
 _DPP_ROW_SHR2 = 0x112
-_DPP_ROW_SHL4 = 0x104
 _DPP_ROW_SHR4 = 0x114
-_DPP_ROW_SHL8 = 0x108
 _DPP_ROW_SHR8 = 0x118
 _DPP_ROW_BCAST15 = 0x142
 _DPP_ROW_BCAST31 = 0x143
@@ -78,44 +73,6 @@ _ROW_LANES = 16
 _DPP_ROW_BCAST15_MASK = 0xA
 # row_bcast:31 moves the row-0/1 total into rows 2 and 3.
 _DPP_ROW_BCAST31_MASK = 0xC
-# Banks 0+2 read n+4; banks 1+3 read n-4.
-_DPP_BANK_XOR4_SHL = 0x5
-_DPP_BANK_XOR4_SHR = 0xA
-# Banks 0+1 read n+8; banks 2+3 read n-8.
-_DPP_BANK_XOR8_SHL = 0x3
-_DPP_BANK_XOR8_SHR = 0xC
-
-
-def _dpp_xor_f32(value, offset: int):
-    """Return the f32 held by ``lane ^ offset`` via VALU DPP. Offsets 1, 2, 4, 8 only."""
-    bits = value.bitcast(fx.Int32)
-    if offset == 1:
-        peer = dpp_utils.update_dpp_i32(
-            bits, bits, _DPP_QUAD_XOR1, _DPP_ROW_MASK, _DPP_ROW_MASK, True
-        )
-    elif offset == 2:
-        peer = dpp_utils.update_dpp_i32(
-            bits, bits, _DPP_QUAD_XOR2, _DPP_ROW_MASK, _DPP_ROW_MASK, True
-        )
-    elif offset == 4:
-        shifted = dpp_utils.update_dpp_i32(
-            bits, bits, _DPP_ROW_SHL4, _DPP_ROW_MASK, _DPP_BANK_XOR4_SHL, True
-        )
-        peer = dpp_utils.update_dpp_i32(
-            shifted, bits, _DPP_ROW_SHR4, _DPP_ROW_MASK, _DPP_BANK_XOR4_SHR, True
-        )
-    elif offset == 8:
-        shifted = dpp_utils.update_dpp_i32(
-            bits, bits, _DPP_ROW_SHL8, _DPP_ROW_MASK, _DPP_BANK_XOR8_SHL, True
-        )
-        peer = dpp_utils.update_dpp_i32(
-            shifted, bits, _DPP_ROW_SHR8, _DPP_ROW_MASK, _DPP_BANK_XOR8_SHR, True
-        )
-    else:
-        raise ValueError(
-            "DPP XOR is row-local; offset must be 1, 2, 4, or 8, " f"got {offset}"
-        )
-    return fx.Int32(peer).bitcast(fx.Float32)
 
 
 def _dpp_row_f32(
@@ -165,42 +122,6 @@ def _wave_reduce_to_one_lane_f32(value, fastmath, op: str = "add"):
         reduced = _combine_f32(reduced, peer, op, fastmath)
     bits = reduced.bitcast(fx.Int32)
     return fx.Int32(fx.rocdl.readlane(T.i32, bits, 63)).bitcast(fx.Float32)
-
-
-def _wave_reduce_f32(value, mode: str, fastmath, op: str = "add"):
-    reduced = value
-    for shift_exp in range_constexpr(int(math.log2(_WARP_SIZE))):
-        offset = _WARP_SIZE // (2 << shift_exp)
-        if mode == "dpp" and offset <= 8:
-            peer = _dpp_xor_f32(reduced, offset)
-        else:
-            peer = reduced.shuffle_xor(offset, _WARP_SIZE)
-        reduced = _combine_f32(reduced, peer, op, fastmath)
-    return reduced
-
-
-def _narrow_dpp_reduce_f32(value, red_slots: int, fastmath, op: str = "add"):
-    """Reduce the first ``red_slots`` lanes (rest already zero) and broadcast lane 0.
-
-    Offsets 32/16/8 of a wave64 butterfly add zeros when ``red_slots <= 8``.
-    The remaining tree (span/2 .. 1) fits DPP; ``v_readfirstlane`` replaces
-    the zero-add copy that used to spread the total across the wave.
-    """
-    if red_slots <= 1:
-        return value
-    if red_slots > 8:
-        raise ValueError(
-            "DPP finish reduce only covers red_slots in 2..8, " f"got {red_slots}"
-        )
-    span = 1 << math.ceil(math.log2(red_slots))
-    reduced = value
-    for shift_exp in range_constexpr(int(math.log2(span))):
-        offset = span // (2 << shift_exp)
-        peer = _dpp_xor_f32(reduced, offset)
-        reduced = _combine_f32(reduced, peer, op, fastmath)
-    bits = reduced.bitcast(fx.Int32)
-    broadcast = fx.Int32(fx.rocdl.readfirstlane(T.i32, bits))
-    return broadcast.bitcast(fx.Float32)
 
 
 def _has_permlane_swap() -> bool:
@@ -426,26 +347,16 @@ def _build_attn_res(spec: _AttnResSpec):
     else:
         group_size = _SOURCE_GROUP_SIZE
     num_groups = (num_sources + group_size - 1) // group_size
-    if _WAVE_REDUCE_MODE == "auto":
-        wave_reduce_mode = "dpp" if red_slots == 1 else "swizzle"
-    elif _WAVE_REDUCE_MODE in ("swizzle", "dpp"):
-        wave_reduce_mode = _WAVE_REDUCE_MODE
-    else:
-        raise ValueError(
-            f"_WAVE_REDUCE_MODE must be 'auto', 'swizzle', or 'dpp', "
-            f"got {_WAVE_REDUCE_MODE!r}"
-        )
-    # Multi-wave finish is 3-step DPP + readfirstlane. DPP XOR only reaches
-    # offsets 1/2/4/8, so more than 8 waves still uses the wave64 butterfly.
-    # Production is 7 (D=7168) or 1 (D=1024, which never enters finish).
-    use_dpp_finish = 1 < red_slots <= 8
+    if red_slots > _ROW_LANES:
+        raise ValueError(f"at most {_ROW_LANES} waves per row, got {red_slots}")
 
     native_swap = _has_permlane_swap()
-    # LDS holds wave totals as (ping-pong buffer, value, wave). Successive groups
-    # use disjoint buffers. A group's values are sumsq then dot for each source,
-    # padded to a multiple of 4, the width of one batched wave reduction.
-    values_per_buf = 4 * ((2 * group_size + 3) // 4)
+    # Alternate buffers per group so the next group's writes need no second
+    # barrier. Waves pad to a power of two so a DPP row reduce over wave_stride
+    # lanes sums one value.
     wave_stride = 1 << max(red_slots - 1, 0).bit_length()
+    values_per_reg = _WARP_SIZE // wave_stride
+    values_per_buf = -(-2 * group_size // values_per_reg) * values_per_reg
 
     def partial_index(buf, value):
         return (buf * values_per_buf + value) * wave_stride
@@ -485,6 +396,7 @@ def _build_attn_res(spec: _AttnResSpec):
         )
         lane = local_tid % _WARP_SIZE
         wave = local_tid // _WARP_SIZE
+        wave_slot = lane % wave_stride
 
         zero = fx.Float32(0.0)
         neg_inf = fx.Float32(float("-inf"))
@@ -505,11 +417,6 @@ def _build_attn_res(spec: _AttnResSpec):
         def store_reduce(value, op="add"):
             return _wave_reduce_to_one_lane_f32(value, fm_fast, op)
 
-        def finish_reduce(value, op="add"):
-            if const_expr(use_dpp_finish):
-                return _narrow_dpp_reduce_f32(value, red_slots, fm_fast, op)
-            return _wave_reduce_f32(value, wave_reduce_mode, fm_fast, op)
-
         def store_group_partials(pairs, buf):
             totals = _wave_sum_batched(
                 [value for pair in pairs for value in pair], lane, fm_fast, native_swap
@@ -523,25 +430,32 @@ def _build_attn_res(spec: _AttnResSpec):
                         partial_index(buf, 4 * register) + row * wave_stride + wave,
                     )
 
-        def finish_pair_reduce(slot, buf):
-            """Every wave reduces the LDS partials in registers."""
-            in_range = lane < red_slots
-            lane_safe = in_range.select(lane, 0)
-            sumsq_base = partial_index(buf, 2 * slot)
-            sumsq_partial = fx.memref_load(s_partials, sumsq_base + lane_safe)
-            dot_partial = fx.memref_load(
-                s_partials, sumsq_base + wave_stride + lane_safe
-            )
-            sumsq_partial = in_range.select(sumsq_partial, zero)
-            dot_partial = in_range.select(dot_partial, zero)
-            return finish_reduce(sumsq_partial), finish_reduce(dot_partial)
+        def finish_group_reduce(n_members, buf):
+            is_wave = wave_slot < red_slots
+            totals = []
+            for register in range_constexpr(-(-2 * n_members // values_per_reg)):
+                partial = fx.memref_load(
+                    s_partials, partial_index(buf, 0) + register * _WARP_SIZE + lane
+                )
+                totals.append(
+                    _row_reduce_f32(is_wave.select(partial, zero), wave_stride, fm_fast)
+                )
 
-        def block_reduce_add2(sumsq_local, dot_local, buf, slot):
+            def total(value):
+                register, row = divmod(value, values_per_reg)
+                bits = totals[register].bitcast(fx.Int32)
+                return fx.Int32(
+                    fx.rocdl.readlane(T.i32, bits, row * wave_stride)
+                ).bitcast(fx.Float32)
+
+            return [(total(2 * slot), total(2 * slot + 1)) for slot in range(n_members)]
+
+        def block_reduce_add2(sumsq_local, dot_local, buf):
             if const_expr(red_slots == 1):
                 return store_reduce(sumsq_local), store_reduce(dot_local)
             store_group_partials([(sumsq_local, dot_local)], buf)
             fx.gpu.barrier()
-            return finish_pair_reduce(slot, buf)
+            return finish_group_reduce(1, buf)[0]
 
         def block_reduce(value, value_index, buf, op):
             if const_expr(red_slots == 1):
@@ -554,11 +468,11 @@ def _build_attn_res(spec: _AttnResSpec):
                 fx.memref_store(wave_total, s_partials, base + wave)
             fx.gpu.barrier()
 
-            in_range = lane < red_slots
-            lane_safe = in_range.select(lane, 0)
-            partial = fx.memref_load(s_partials, base + lane_safe)
-            partial = in_range.select(partial, zero)
-            return finish_reduce(partial, op)
+            partial = fx.memref_load(s_partials, base + wave_slot)
+            partial = (wave_slot < red_slots).select(partial, zero)
+            reduced = _row_reduce_f32(partial, wave_stride, fm_fast, op)
+            bits = reduced.bitcast(fx.Int32)
+            return fx.Int32(fx.rocdl.readfirstlane(T.i32, bits)).bitcast(fx.Float32)
 
         copy_atoms = {
             width: fx.make_copy_atom(copy_op(), fx.BFloat16)
@@ -733,9 +647,6 @@ def _build_attn_res(spec: _AttnResSpec):
                     )
                 return thread_sumsq, thread_dot
 
-            def finish_source_reduce(slot, buf):
-                return finish_pair_reduce(slot, buf)
-
             def update_softmax(
                 values_local, sumsq, dot, old_max, old_denominator, old_mixed
             ):
@@ -763,7 +674,7 @@ def _build_attn_res(spec: _AttnResSpec):
             def consume_source(values_local, old_max, old_denominator, old_mixed, buf):
                 """One-wave path: full reduce in registers, then softmax."""
                 thread_sumsq, thread_dot = local_sumsq_dot(values_local)
-                sumsq, dot = block_reduce_add2(thread_sumsq, thread_dot, buf, 0)
+                sumsq, dot = block_reduce_add2(thread_sumsq, thread_dot, buf)
                 return update_softmax(
                     values_local, sumsq, dot, old_max, old_denominator, old_mixed
                 )
@@ -806,8 +717,9 @@ def _build_attn_res(spec: _AttnResSpec):
                         group_local.append(source_local)
                     store_group_partials(group_partials, buf)
                     fx.gpu.barrier()
+                    group_sums = finish_group_reduce(n_members, buf)
                     for slot in range_constexpr(n_members):
-                        sumsq, dot = finish_source_reduce(slot, buf)
+                        sumsq, dot = group_sums[slot]
                         max_logit, denominator, mixed_local = update_softmax(
                             group_local[slot],
                             sumsq,

@@ -390,6 +390,15 @@ def test_flydsl_attn_res_float64_oracle(hidden_size: int, num_blocks: int, cfg):
 
 
 @_skip_unsupported_gfx
+@pytest.mark.parametrize("hidden_size", (2048, 3072, 5120, 9216, 16384))
+@pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
+def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
+    """Rows of 2, 3, 5, 9, and 16 waves: the cross-wave finish pads waves to a power of two."""
+    _run_and_check(17, _MAX_BLOCKS, cfg, hidden_size=hidden_size)
+    _run_and_check(5, 1, cfg, hidden_size=hidden_size)
+
+
+@_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
 @pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8), ids=str)
 def test_flydsl_attn_res_without_permlane_swap(monkeypatch, hidden_size: int, cfg):
