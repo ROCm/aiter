@@ -19373,5 +19373,5 @@
     }
   ],
   "offload_arch": "gfx1250-strict",
-  "target_profile": "a0-strict"
+  "target_profile": "strict"
 }
