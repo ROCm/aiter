@@ -24,7 +24,7 @@ import torch
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp, Stream, T
+from flydsl.expr.typing import ReductionOp, T
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -49,16 +49,15 @@ _STORE_CACHE_MODIFIER = 2
 _SMALL_D_ROWS_PER_WG = 1
 # Extra block sources kept outstanding during consume_source. Value 3 means
 # sources i+1, i+2, i+3 are already issued when reducing source i. Prefix is
-# already resident and is not prefetched. Changing this constant requires
-# _build_attn_res.cache_clear().
+# already resident and is not prefetched.
 _SOURCE_PREFETCH_IN_FLIGHT = 3
-# Changing this constant requires _build_attn_res.cache_clear().
+# Changing this constant requires _clear_caches().
 _SOURCE_GROUP_SIZE = 2
 # Multi-wave rows when T exceeds the CU count.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
 _WIDE_SOURCE_GROUP_SIZE = 1
-# Changing this constant requires _build_attn_res.cache_clear().
+# Changing this constant requires _clear_caches().
 _WAVE_REDUCE_MODE: Literal["auto", "swizzle", "dpp"] = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
@@ -291,6 +290,18 @@ class _AttnResSpec:
             f"{'_fp8' if self.fp8_dtype is not None else ''}"
             f"{'_wide' if self.wide_grid else ''}"
         )
+
+
+_LAUNCH_PLANS: dict = {}
+# One plan per distinct T. Past about 2000 live keys, cyclic GC makes a miss
+# slower.
+_MAX_LAUNCH_PLANS = 1024
+_ALIGNMENT_MASK = _VEC_WIDTH * 2 - 1
+
+
+def _clear_caches() -> None:
+    _build_attn_res.cache_clear()
+    _LAUNCH_PLANS.clear()
 
 
 @lru_cache(maxsize=256)
@@ -940,56 +951,142 @@ def _block_out_aliases(out: tuple, blocks: tuple, inputs: tuple) -> bool:
     return alias
 
 
-def flydsl_attn_res(
-    prefix: torch.Tensor,
-    block_residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    eps: float = 1e-6,
-    add_hidden: torch.Tensor | None = None,
-    add_hidden2: torch.Tensor | None = None,
-    *,
-    output_rms_weight: torch.Tensor | None = None,
-    output_rms_eps: float = 1e-6,
-    scale: float = 1.0,
-    close_block: bool = False,
-    out_quant_dtype: torch.dtype | None = None,
-    rows_per_wg: int | None = None,
-    stream: torch.cuda.Stream | None = None,
-    block_out: torch.Tensor | None = None,
-):
-    """Drop-in for Triton ``attn_res_gate`` on BF16 inputs over ``B + 1`` candidates.
+@dataclass(frozen=True)
+class _LaunchPlan:
+    launcher: object | None
+    device: torch.device
+    num_tokens: int
+    rows_shape: tuple
+    blocks_shape: tuple
+    weight_shape: tuple
+    block_out_shape: tuple | None
+    block_out_rows_shape: tuple | None
+    out_shape: tuple
+    scale_shape: tuple
+    y_dtype: torch.dtype
+    quantized: bool
 
-    ``prefix`` is ``[.., D]``, ``block_residual`` is ``[.., B, D]`` with ``B`` in
-    0..8 (a strided view such as ``cap[:, :B]`` is fine), and ``score_weight``
-    is the pre-folded ``[D]`` scoring vector. ``logit = scale * rstd *
-    dot(v, score_weight)`` with ``rstd`` from ``eps``, softmaxed over the
-    candidates; the raw values are mixed. ``add_hidden`` [and ``add_hidden2``]
-    fold into the prefix candidate as an unrounded FP32 sum. ``output_rms_weight``
-    applies an output RMSNorm with ``output_rms_eps``.
+    def launch(
+        self,
+        prefix,
+        block_residual,
+        score_weight,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight,
+        block_out,
+        stream,
+    ):
+        device = self.device
+        rows = _view_as(prefix, self.rows_shape)
+        blocks = _view_as(block_residual, self.blocks_shape)
+        score_weight = _view_as(score_weight, self.weight_shape)
+        y = torch.empty(*self.rows_shape, device=device, dtype=self.y_dtype)
+        y_scale = (
+            torch.empty(self.num_tokens, 1, device=device, dtype=torch.float32)
+            if self.quantized
+            else None
+        )
+        prefix_out = (
+            rows
+            if add_hidden is None
+            else torch.empty(*self.rows_shape, device=device, dtype=rows.dtype)
+        )
+        block_out_rows = None
+        if self.block_out_shape is not None:
+            if block_out is None:
+                block_out = torch.empty(
+                    *self.block_out_shape, device=device, dtype=rows.dtype
+                )
+            block_out_rows = _view_as(block_out, self.block_out_rows_shape)
 
-    Returns ``(y, prefix_out)``, or ``(y, prefix_out, block_out)`` with
-    ``close_block`` or a caller-owned ``block_out``. ``prefix_out`` is a new BF16
-    tensor holding the rounded sum when ``add_hidden`` is given, otherwise
-    ``prefix`` itself. ``block_out`` is
-    ``cat([block_residual, prefix_out[..., None, :]], -2)``. Inputs are never
-    mutated.
+        if self.launcher is not None:
+            if stream is None:
+                launch_stream = torch._C._cuda_getCurrentRawStream(device.index)
+            elif stream.device != device:
+                raise ValueError(f"stream must be on {device}, got {stream.device}")
+            else:
+                launch_stream = stream
+            args = (
+                self.launcher,
+                rows,
+                rows if add_hidden is None else _view_as(add_hidden, self.rows_shape),
+                (
+                    rows
+                    if add_hidden2 is None
+                    else _view_as(add_hidden2, self.rows_shape)
+                ),
+                blocks if blocks.shape[1] else rows,
+                score_weight,
+                (
+                    rows
+                    if output_rms_weight is None
+                    else _view_as(output_rms_weight, self.weight_shape)
+                ),
+                y.view(torch.int8) if self.quantized else y,
+                y_scale if self.quantized else rows,
+                prefix_out,
+                rows if block_out_rows is None else block_out_rows,
+                self.num_tokens,
+                launch_stream,
+            )
+            # Entering torch.cuda.device on every call adds host time that shows at
+            # small T.
+            if torch.cuda.current_device() == device.index:
+                _run_compiled(*args)
+            else:
+                with torch.cuda.device(device):
+                    _run_compiled(*args)
+            if stream is not None:
+                for output in (y, y_scale, prefix_out, block_out_rows):
+                    if output is not None and output is not rows:
+                        output.record_stream(stream)
 
-    ``block_out`` is an optional BF16 ``[.., B + 1, D]`` buffer that receives
-    ``cat([block_residual, prefix_out[..., None, :]], -2)`` and implies
-    ``close_block``. When ``block_out[..., :B, :]`` is ``block_residual`` itself
-    (same shape, data pointer, and strides) the ``B`` copies are skipped and only
-    row ``B`` is written. Otherwise the byte extent of ``block_out`` must not
-    meet the extent of any input, so views that interleave in one buffer raise
-    ``ValueError``.
+        y_result = _view_as(y, self.out_shape)
+        if self.quantized:
+            y_result = (y_result, _view_as(y_scale, self.scale_shape))
+        prefix_result = (
+            prefix if add_hidden is None else _view_as(prefix_out, self.out_shape)
+        )
+        if block_out is None:
+            return y_result, prefix_result
+        return y_result, prefix_result, block_out
 
-    Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
-    trailing stride, positive leading strides that are multiples of
-    8, a 16-byte-aligned base pointer, and an extent under 4 GiB.
-    ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64).
-    ``D`` must be a positive multiple of 8 with a wave-aligned row
-    size. ``rows_per_wg`` packs one-wave rows (D=1024) per workgroup; multi-wave
-    rows reject any value other than 1.
+
+def _view_as(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
+    return tensor if tensor.shape == shape else tensor.reshape(shape)
+
+
+def _key_geometry(tensor: torch.Tensor | None, pointer_mask: int):
+    """Must cover every tensor property ``_plan_launch`` validates, or a cached plan
+    skips a check.
     """
+    if tensor is None:
+        return None
+    return (
+        tensor.shape,
+        tensor.stride(),
+        tensor.dtype,
+        tensor.device,
+        tensor.data_ptr() & pointer_mask,
+    )
+
+
+def _plan_launch(
+    prefix,
+    block_residual,
+    score_weight,
+    eps,
+    add_hidden,
+    add_hidden2,
+    output_rms_weight,
+    output_rms_eps,
+    scale,
+    close_block,
+    out_quant_dtype,
+    rows_per_wg,
+    block_out,
+) -> _LaunchPlan:
     if add_hidden2 is not None and add_hidden is None:
         raise ValueError("add_hidden2 requires add_hidden")
     if out_quant_dtype is not None and output_rms_weight is None:
@@ -1086,90 +1183,158 @@ def flydsl_attn_res(
         )
 
     num_tokens = rows.shape[0]
-    y = torch.empty(
-        rows.shape, device=prefix.device, dtype=out_quant_dtype or prefix.dtype
-    )
-    y_scale = (
-        torch.empty((num_tokens, 1), device=prefix.device, dtype=torch.float32)
-        if out_quant_dtype is not None
-        else None
-    )
-    prefix_out = (
-        torch.empty(rows.shape, device=prefix.device, dtype=prefix.dtype)
-        if add_hidden is not None
-        else rows
-    )
-    if block_out is None and close_block:
-        block_out = torch.empty(
-            (*prefix.shape[:-1], num_blocks + 1, hidden_size),
-            device=prefix.device,
-            dtype=prefix.dtype,
-        )
-        block_out_rows = block_out.view(num_tokens, num_blocks + 1, hidden_size)
-        _check_row_layout(block_out_rows, "block_out")
-    close_block = block_out is not None
+    leading = tuple(prefix.shape[:-1])
+    block_out_shape = None
+    block_out_rows_shape = None
+    if block_out is not None or close_block:
+        block_out_shape = (*leading, num_blocks + 1, hidden_size)
+        block_out_rows_shape = (num_tokens, num_blocks + 1, hidden_size)
+        if block_out is None:
+            _check_row_layout(
+                torch.empty(block_out_rows_shape, device="meta"), "block_out"
+            )
 
+    launcher = None
     if num_tokens:
         wide_grid = (
             row_threads > _WARP_SIZE
             and num_tokens > _num_cus(prefix.device)
             and _wide_row_supported(hidden_size)
         )
-        spec = _AttnResSpec(
-            hidden_size=hidden_size,
-            num_blocks=num_blocks,
-            has_add=add_hidden is not None,
-            has_add2=add_hidden2 is not None,
-            close_block=close_block,
-            output_norm=output_rms_weight is not None,
-            eps=float(eps),
-            output_rms_eps=(
-                float(output_rms_eps) if output_rms_weight is not None else 0.0
-            ),
-            scale=float(scale),
-            rows_per_wg=rows_per_wg,
-            wide_grid=wide_grid,
-            fp8_dtype=out_quant_dtype,
-            block_alias=block_alias,
-        )
-        _launch(spec, tensors, y, y_scale, prefix_out, block_out_rows, stream)
-
-    leading = prefix.shape[:-1]
-    y_result = y.view(prefix.shape)
-    if y_scale is not None:
-        y_result = (y_result, y_scale.view(*leading, 1))
-    prefix_result = prefix if add_hidden is None else prefix_out.view(prefix.shape)
-    if not close_block:
-        return y_result, prefix_result
-    return y_result, prefix_result, block_out
-
-
-def _launch(spec, tensors, y, y_scale, prefix_out, block_out, stream) -> None:
-    rows = tensors["prefix"]
-    with torch.cuda.device(rows.device):
-        launch_stream = (
-            torch.cuda.current_stream(rows.device) if stream is None else stream
-        )
-        if launch_stream.device != rows.device:
-            raise ValueError(
-                f"stream must be on {rows.device}, got {launch_stream.device}"
+        launcher = _build_attn_res(
+            _AttnResSpec(
+                hidden_size=hidden_size,
+                num_blocks=num_blocks,
+                has_add=add_hidden is not None,
+                has_add2=add_hidden2 is not None,
+                close_block=block_out_shape is not None,
+                output_norm=output_rms_weight is not None,
+                eps=float(eps),
+                output_rms_eps=(
+                    float(output_rms_eps) if output_rms_weight is not None else 0.0
+                ),
+                scale=float(scale),
+                rows_per_wg=rows_per_wg,
+                wide_grid=wide_grid,
+                fp8_dtype=out_quant_dtype,
+                block_alias=block_alias,
             )
-        _run_compiled(
-            _build_attn_res(spec),
-            rows,
-            tensors.get("add_hidden", rows),
-            tensors.get("add_hidden2", rows),
-            tensors["block_residual"] if spec.num_blocks else rows,
-            tensors["score_weight"],
-            tensors.get("output_rms_weight", rows),
-            y if y_scale is None else y.view(torch.int8),
-            rows if y_scale is None else y_scale,
-            prefix_out,
-            rows if block_out is None else block_out,
-            rows.shape[0],
-            Stream(launch_stream),
         )
-        if stream is not None:
-            for output in (y, y_scale, prefix_out, block_out):
-                if output is not None and output is not rows:
-                    output.record_stream(launch_stream)
+
+    return _LaunchPlan(
+        launcher=launcher,
+        device=prefix.device,
+        num_tokens=num_tokens,
+        rows_shape=tuple(rows.shape),
+        blocks_shape=tuple(blocks.shape),
+        weight_shape=(hidden_size,),
+        block_out_shape=block_out_shape,
+        block_out_rows_shape=block_out_rows_shape,
+        out_shape=tuple(prefix.shape),
+        scale_shape=(*leading, 1),
+        y_dtype=out_quant_dtype or prefix.dtype,
+        quantized=out_quant_dtype is not None,
+    )
+
+
+def flydsl_attn_res(
+    prefix: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float = 1e-6,
+    add_hidden: torch.Tensor | None = None,
+    add_hidden2: torch.Tensor | None = None,
+    *,
+    output_rms_weight: torch.Tensor | None = None,
+    output_rms_eps: float = 1e-6,
+    scale: float = 1.0,
+    close_block: bool = False,
+    out_quant_dtype: torch.dtype | None = None,
+    rows_per_wg: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+    block_out: torch.Tensor | None = None,
+):
+    """Drop-in for Triton ``attn_res_gate`` on BF16 inputs over ``B + 1`` candidates.
+
+    ``prefix`` is ``[.., D]``, ``block_residual`` is ``[.., B, D]`` with ``B`` in
+    0..8 (a strided view such as ``cap[:, :B]`` is fine), and ``score_weight``
+    is the pre-folded ``[D]`` scoring vector. ``logit = scale * rstd *
+    dot(v, score_weight)`` with ``rstd`` from ``eps``, softmaxed over the
+    candidates; the raw values are mixed. ``add_hidden`` [and ``add_hidden2``]
+    fold into the prefix candidate as an unrounded FP32 sum. ``output_rms_weight``
+    applies an output RMSNorm with ``output_rms_eps``.
+
+    Returns ``(y, prefix_out)``, or ``(y, prefix_out, block_out)`` with
+    ``close_block`` or a caller-owned ``block_out``. ``prefix_out`` is a new BF16
+    tensor holding the rounded sum when ``add_hidden`` is given, otherwise
+    ``prefix`` itself. ``block_out`` is
+    ``cat([block_residual, prefix_out[..., None, :]], -2)``. Inputs are never
+    mutated.
+
+    ``block_out`` is an optional caller-owned BF16 ``[.., B + 1, D]`` output and
+    implies ``close_block``. When ``block_out[..., :B, :]`` is ``block_residual``
+    itself (same shape, data pointer, and strides) the ``B`` copies are skipped and
+    only row ``B`` is written. Otherwise the byte extent of ``block_out`` must not
+    meet the extent of any input, so views that interleave in one buffer raise
+    ``ValueError``.
+
+    Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
+    trailing stride, positive leading strides that are multiples of
+    8, a 16-byte-aligned base pointer, and an extent under 4 GiB.
+    ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64).
+    ``D`` must be a positive multiple of 8 with a wave-aligned row
+    size. ``rows_per_wg`` packs one-wave rows (D=1024) per workgroup; multi-wave
+    rows reject any value other than 1.
+
+    With ``block_out``, cached plans key on exact data pointers, so each new
+    buffer address revalidates.
+    """
+    # Without block_out only the base alignment matters. With it, overlap and
+    # the alias flag depend on exact addresses, so the key holds them.
+    pointer_mask = _ALIGNMENT_MASK if block_out is None else -1
+    key = (
+        get_gfx_runtime(),
+        _key_geometry(prefix, pointer_mask),
+        _key_geometry(block_residual, pointer_mask),
+        _key_geometry(score_weight, pointer_mask),
+        _key_geometry(add_hidden, pointer_mask),
+        _key_geometry(add_hidden2, pointer_mask),
+        _key_geometry(output_rms_weight, pointer_mask),
+        _key_geometry(block_out, pointer_mask),
+        eps,
+        output_rms_eps,
+        scale,
+        close_block,
+        out_quant_dtype,
+        rows_per_wg,
+    )
+    plan = _LAUNCH_PLANS.get(key)
+    if plan is None:
+        plan = _plan_launch(
+            prefix,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+            output_rms_weight,
+            output_rms_eps,
+            scale,
+            close_block,
+            out_quant_dtype,
+            rows_per_wg,
+            block_out,
+        )
+        if len(_LAUNCH_PLANS) >= _MAX_LAUNCH_PLANS:
+            _LAUNCH_PLANS.clear()
+        _LAUNCH_PLANS[key] = plan
+    return plan.launch(
+        prefix,
+        block_residual,
+        score_weight,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight,
+        block_out,
+        stream,
+    )

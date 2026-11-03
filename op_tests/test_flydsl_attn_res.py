@@ -478,6 +478,171 @@ def test_flydsl_attn_res_rejects_tensors_over_4gib():
         flydsl_attn_res(prefix, block_residual, inputs.score_weight, _EPS)
 
 
+def _plan_count() -> int:
+    return len(attn_res_kernel._LAUNCH_PLANS)
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize(
+    "layout",
+    ({}, {"pad": 8}, {"leading": (2,), "tokens": 9}, {"hidden_size": _D_SMALL}),
+    ids=str,
+)
+def test_flydsl_attn_res_plan_reuse(cfg: _Config, layout: dict):
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    layout = {"tokens": 17, **layout}
+    _run_and_check(num_blocks=3, cfg=cfg, **layout)
+    assert _plan_count() == 1
+    _run_and_check(num_blocks=3, cfg=cfg, **layout)
+    assert _plan_count() == 1
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_plan_follows_every_option():
+    inputs = _make_inputs(17, num_blocks=3)
+    add_norm = dataclasses.replace(ALL_ON, close=False)
+    for cfg in (MIX, ALL_ON, add_norm, ALL_ON, ALL_ON_FP8, ALL_ON, EVERY_FEATURE, MIX):
+        expected = _call(attn_res_reference, inputs, cfg)
+        out = _call(flydsl_attn_res, inputs, cfg)
+        assert len(out) == len(expected), f"{cfg}"
+        _assert_y_close(out[0], expected[0], cfg, f"{cfg}")
+    args = (inputs.prefix, inputs.block_residual, inputs.score_weight)
+    for eps, output_rms_eps, scale in (
+        (_EPS, _OUT_EPS, 1.0),
+        (1.0, _OUT_EPS, 1.0),
+        (_EPS, 1.0, 1.0),
+        (_EPS, _OUT_EPS, 0.5),
+        (_EPS, _OUT_EPS, 1.0),
+    ):
+        kwargs = {
+            "output_rms_weight": inputs.output_rms_weight,
+            "output_rms_eps": output_rms_eps,
+            "scale": scale,
+        }
+        expected, _ = attn_res_reference(*args, eps, **kwargs)
+        y, _ = flydsl_attn_res(*args, eps, **kwargs)
+        _assert_bf16_close(y, expected, f"{eps=} {output_rms_eps=} {scale=}")
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize(
+    "case",
+    (
+        "add2_without_add",
+        "quant_without_output_norm",
+        "fp16_input",
+        "row_count_mismatch",
+        "non_unit_trailing_stride",
+        "misaligned_base",
+        "misaligned_weight",
+        "pad7",
+    ),
+)
+def test_flydsl_attn_res_failed_validation_is_not_cached(case: str):
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    call, error = _invalid_call(case)
+    for _ in range(2):
+        with pytest.raises(error):
+            call()
+        assert _plan_count() == 0
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_validates_after_the_geometry_is_cached():
+    inputs = _make_inputs(1, _D_SMALL, 2)
+    block_residual = inputs.block_residual
+    row = torch.randn(1, _D_SMALL + 8, dtype=torch.bfloat16)
+    weight = torch.randn(_D_SMALL + 8, dtype=torch.bfloat16)
+    prefix, score_weight = row[:, :_D_SMALL], weight[:_D_SMALL]
+    for _ in range(2):
+        flydsl_attn_res(prefix, block_residual, score_weight, _EPS)
+
+    strided = torch.randn(1, 2 * _D_SMALL, dtype=torch.bfloat16)[:, ::2]
+    for args, error in (
+        ((row[:, 1 : _D_SMALL + 1], block_residual, score_weight), ValueError),
+        ((prefix, block_residual, weight[1 : _D_SMALL + 1]), ValueError),
+        ((strided, block_residual, score_weight), ValueError),
+        ((prefix.half(), block_residual, score_weight), TypeError),
+        ((prefix.cpu(), block_residual, score_weight), ValueError),
+    ):
+        with pytest.raises(error):
+            flydsl_attn_res(*args, _EPS)
+    with pytest.raises(ValueError):
+        flydsl_attn_res(prefix, block_residual, score_weight, _EPS, rows_per_wg=17)
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_launches_on_the_current_stream(monkeypatch):
+    inputs = _make_inputs(17, num_blocks=3)
+    expected = _call(attn_res_reference, inputs, MIX)
+    torch.cuda.synchronize()
+    launched = []
+    run_compiled = attn_res_kernel._run_compiled
+    monkeypatch.setattr(
+        attn_res_kernel,
+        "_run_compiled",
+        lambda *args: (launched.append(args[-1]), run_compiled(*args))[1],
+    )
+    side = torch.cuda.Stream()
+    for _ in range(2):
+        _call(flydsl_attn_res, inputs, MIX)
+        with torch.cuda.stream(side):
+            out = _call(flydsl_attn_res, inputs, MIX)
+        side.synchronize()
+        _assert_y_close(out[0], expected[0], MIX, "side stream")
+        explicit = _call(flydsl_attn_res, inputs, MIX, stream=side)
+        side.synchronize()
+        _assert_y_close(explicit[0], expected[0], MIX, "explicit stream")
+    default_raw = torch.cuda.default_stream().cuda_stream
+    assert launched[0::3] == [default_raw] * 2
+    assert launched[1::3] == [side.cuda_stream] * 2
+    assert launched[2::3] == [side] * 2
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_enters_the_device_only_when_it_differs(monkeypatch):
+    inputs = _make_inputs(17, num_blocks=3)
+    expected = _call(attn_res_reference, inputs, MIX)
+    entered = []
+
+    class SpyDevice(torch.cuda.device):
+        def __init__(self, index):
+            entered.append(index)
+            super().__init__(index)
+
+    monkeypatch.setattr(torch.cuda, "device", SpyDevice)
+
+    _assert_y_close(_call(flydsl_attn_res, inputs, MIX)[0], expected[0], MIX, "same")
+    assert not entered
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: -1)
+    _assert_y_close(_call(flydsl_attn_res, inputs, MIX)[0], expected[0], MIX, "other")
+    assert entered == [inputs.prefix.device]
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_plan_cache_stays_bounded(monkeypatch):
+    monkeypatch.setattr(attn_res_kernel, "_MAX_LAUNCH_PLANS", 3)
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    for tokens in (1, 2, 3, 4, 5, 2):
+        _run_and_check(tokens, 3, MIX, hidden_size=_D_SMALL)
+        assert _plan_count() <= 3
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_plan_cache_cap_holds():
+    """Zero tokens builds a plan without compiling a kernel, so filling the cache past its cap stays cheap."""
+    assert attn_res_kernel._MAX_LAUNCH_PLANS == 1024
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    inputs = _make_inputs(0, _D, 1)
+    for index in range(attn_res_kernel._MAX_LAUNCH_PLANS + 10):
+        args, kwargs = _gate_args(inputs, MIX)
+        flydsl_attn_res(*args[:3], 1e-6 * (index + 1), *args[4:], **kwargs)
+        assert _plan_count() <= attn_res_kernel._MAX_LAUNCH_PLANS
+    assert _plan_count() == 10
+
+
 _BLOCK_OUT_CFGS = tuple(
     dataclasses.replace(cfg, close=False)
     for cfg in (MIX, ALL_ON, EVERY_FEATURE, ALL_ON_FP8)
@@ -497,13 +662,13 @@ def _expected_closed(inputs, cfg: _Config):
 
 def _spy_block_alias(monkeypatch) -> list[bool]:
     seen: list[bool] = []
-    launch = attn_res_kernel._launch
+    build = attn_res_kernel._build_attn_res
 
-    def spy(spec, *args, **kwargs):
+    def spy(spec):
         seen.append(spec.block_alias)
-        return launch(spec, *args, **kwargs)
+        return build(spec)
 
-    monkeypatch.setattr(attn_res_kernel, "_launch", spy)
+    monkeypatch.setattr(attn_res_kernel, "_build_attn_res", spy)
     return seen
 
 
@@ -519,6 +684,7 @@ def test_flydsl_attn_res_block_out_aliased(
     inputs, cap = _cap_inputs(tokens, hidden_size, num_blocks, _MAX_BLOCKS + 1)
     cap_before = cap.clone()
     expected = _expected_closed(inputs, cfg)
+    attn_res_kernel._LAUNCH_PLANS.clear()
     seen = _spy_block_alias(monkeypatch)
 
     out = _call(flydsl_attn_res, inputs, cfg, block_out=cap[:, : num_blocks + 1])
@@ -548,6 +714,7 @@ def test_flydsl_attn_res_block_out_separate_buffer(
     closed = dataclasses.replace(cfg, close=True)
     expected = _call(attn_res_reference, inputs, closed)
     closed_out = _call(flydsl_attn_res, inputs, closed)
+    attn_res_kernel._LAUNCH_PLANS.clear()
     seen = _spy_block_alias(monkeypatch)
 
     cap = torch.randn(tokens, _MAX_BLOCKS + 1, hidden_size, dtype=torch.bfloat16)
@@ -644,6 +811,86 @@ def test_flydsl_attn_res_block_out_rejects_invalid(case: str, error):
         block_out = swapped.transpose(0, 1)
     with pytest.raises(error):
         _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_block_out_plan_follows_alias_and_geometry(monkeypatch):
+    num_blocks = 3
+    inputs, cap = _cap_inputs(17, _D, num_blocks, num_blocks + 1)
+    separate = torch.empty_like(cap)
+    wider = torch.randn(17, num_blocks + 3, _D, dtype=torch.bfloat16)
+    expected = _expected_closed(inputs, ALL_ON)
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    seen = _spy_block_alias(monkeypatch)
+
+    for block_out, builds in (
+        (cap[:, : num_blocks + 1], [True]),
+        (cap[:, : num_blocks + 1], [True]),
+        (separate, [True, False]),
+        (cap[:, : num_blocks + 1], [True, False]),
+        (wider[:, : num_blocks + 1], [True, False, False]),
+        (separate, [True, False, False]),
+    ):
+        out = _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+        torch.cuda.synchronize()
+        assert seen == builds
+        assert out[2] is block_out
+        assert torch.equal(block_out, expected[2])
+        _assert_bf16_close(out[0], expected[0], "block_out plan")
+    assert _plan_count() == 3
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_block_out_plan_is_not_served_to_an_overlap():
+    num_blocks = 3
+    inputs, cap = _cap_inputs(4, _D, num_blocks, num_blocks + 2)
+    block_out = cap[:, : num_blocks + 1]
+    for _ in range(2):
+        _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+    plans = _plan_count()
+
+    inputs.block_residual = cap[:, 1 : num_blocks + 1]
+    for _ in range(2):
+        with pytest.raises(ValueError, match="overlap"):
+            _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+        assert _plan_count() == plans
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_block_out_plan_is_not_served_to_interleaved_views():
+    num_blocks = 3
+    cap = torch.randn(4, 2 * (num_blocks + 1), _D, dtype=torch.bfloat16)
+    inputs = _make_inputs(4, _D, num_blocks)
+    block_out = cap[:, 0::2]
+    disjoint = torch.randn(4, 2 * (num_blocks + 1), _D, dtype=torch.bfloat16)
+    inputs.block_residual = disjoint[:, 1::2][:, :num_blocks]
+    for _ in range(2):
+        _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+    plans = _plan_count()
+
+    inputs.block_residual = cap[:, 1::2][:, :num_blocks]
+    for _ in range(2):
+        with pytest.raises(ValueError, match="overlap"):
+            _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+        assert _plan_count() == plans
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_default_rows_per_wg_keeps_its_own_plan(monkeypatch):
+    rows_per_wg: list[int] = []
+    build = attn_res_kernel._build_attn_res
+
+    def spy(spec):
+        rows_per_wg.append(spec.rows_per_wg)
+        return build(spec)
+
+    attn_res_kernel._LAUNCH_PLANS.clear()
+    monkeypatch.setattr(attn_res_kernel, "_build_attn_res", spy)
+    for tokens, explicit in ((8, None), (32, None), (8, None), (8, 1), (1, None)):
+        extra = {} if explicit is None else {"rows_per_wg": explicit}
+        _run_and_check(tokens, 3, MIX, hidden_size=_D_SMALL, **extra)
+    assert rows_per_wg == [1, 1, 1, 1]
+    assert _plan_count() == 4
 
 
 def _moved_bytes(tokens: int, hidden_size: int, num_blocks: int, cfg: _Config):
