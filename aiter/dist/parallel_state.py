@@ -125,6 +125,24 @@ def all_reduce_(
     )
 
 
+@torch_compile_guard(gen_fake=all_reduce_fake)
+def all_reduce_add_(
+    tensor: torch.Tensor,
+    other: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool,
+    ca_fp8_quant: bool,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_add_out_place(
+        tensor, other, ca_use_new, ca_fp8_quant, prefill_support
+    )
+
+
 def fused_allreduce_rmsnorm_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -793,6 +811,44 @@ class GroupCoordinator:
         return self.device_communicator.all_reduce(
             input_, ca_use_new, ca_fp8_quant, prefill_support
         )
+
+    def all_reduce_add(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other), out of place, with the add folded into
+        the all-reduce where the device communicator can."""
+        if self.world_size == 1:
+            return input_ + other
+        return all_reduce_add_(
+            input_,
+            other,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
+            prefill_support=prefill_support,
+        )
+
+    def _all_reduce_add_out_place(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool,
+        ca_fp8_quant: bool,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        fused = getattr(self.device_communicator, "all_reduce_add", None)
+        if fused is None:
+            return self.device_communicator.all_reduce(
+                input_ + other, ca_use_new, ca_fp8_quant, prefill_support
+            )
+        return fused(input_, other, ca_use_new, ca_fp8_quant, prefill_support)
 
     def fused_allreduce_rmsnorm(
         self,
