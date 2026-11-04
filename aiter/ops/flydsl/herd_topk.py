@@ -3,10 +3,14 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
+import dataclasses
+import os
+
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
-from .kernels.tensor_shim import _run_compiled, wave_size_of
+from .kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK, build_herd_route_psum_module
+from .kernels.tensor_shim import _run_compiled, ptr_arg, wave_size_of
 from .kernels.topk.topk_per_row_small_k import build_topk_per_row_small_k_module
 
 _KIMI_K3_EXPERTS = 896
@@ -173,6 +177,86 @@ def _run_finalize(
         float(routed_scaling_factor),
         stream,
     )
+
+
+def herd_route_psum(
+    candidate_values: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    experts: int,
+    tile_m: int,
+    routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """``herd_finalize_candidates`` fused with the grouped MoE's route + psum.
+
+    Returns ``(topk_weights, topk_ids, masked_m, topids_to_rows, psum)``: the
+    routes exactly as ``herd_finalize_candidates`` returns them, and the layout
+    ``flydsl_moe_topids_to_rows`` + ``contiguous_psum_remap(tile_m)`` build.
+    """
+    rows, width = candidate_ids.shape
+    topk = width - 1
+    device = candidate_ids.device
+    weights = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    ids = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    _run_compiled(
+        build_herd_route_psum_module(topk, experts, num_valid_rows is not None),
+        ptr_arg(candidate_ids.contiguous()),
+        ptr_arg(candidate_values.contiguous()),
+        ptr_arg(weights),
+        ptr_arg(ids),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(psum),
+        # Unread without a count; any tensor stands in for the argument.
+        ptr_arg(num_valid_rows if num_valid_rows is not None else psum),
+        rows,
+        tile_m,
+        float(routed_scaling_factor),
+        torch.cuda.current_stream(device),
+    )
+    return weights, ids, masked_m, topids_to_rows, psum
+
+
+@dataclasses.dataclass
+class HerdCandidates:
+    """fused_moe(herd_topk)'s Top-(K+1) candidates, finalized by the MoE path:
+    in the gfx1250 grouped MoE's route kernel, or up front on any other path."""
+
+    values: torch.Tensor
+    ids: torch.Tensor
+    experts: int
+    routed_scaling_factor: float
+    num_valid_rows: torch.Tensor | None
+
+    def fusable(self) -> bool:
+        """AITER_FLYDSL_HERD_FUSED_ROUTE=0 keeps the separate finalize."""
+        return (
+            os.environ.get("AITER_FLYDSL_HERD_FUSED_ROUTE", "1") != "0"
+            and self.experts <= HERD_ROUTE_BLOCK
+            and 0 < self.ids.shape[0] <= HERD_ROUTE_BLOCK
+        )
+
+    def finalize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return herd_finalize_candidates(
+            self.values,
+            self.ids,
+            self.experts,
+            self.routed_scaling_factor,
+            self.num_valid_rows,
+        )
+
+    def route_psum(self, tile_m: int) -> tuple[torch.Tensor, ...]:
+        return herd_route_psum(
+            self.values,
+            self.ids,
+            self.experts,
+            tile_m,
+            self.routed_scaling_factor,
+            self.num_valid_rows,
+        )
 
 
 def _profile(score_func: str, experts: int, topk: int) -> str | None:

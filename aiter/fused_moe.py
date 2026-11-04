@@ -1568,24 +1568,33 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
+    herd = None
     if herd_topk:
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             _FUSED_ROUTE_PSUM_MAX_EXPERTS,
         )
-        from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
+        from aiter.ops.flydsl.herd_topk import HerdCandidates
 
         # The grouped MoE drops inside its one-workgroup route kernel, which
-        # keeps one LDS slot per expert; wider MoEs finish HERD here instead.
+        # keeps one LDS slot per expert; wider MoEs finish HERD in HERD's own
+        # route kernel when it serves them, else here.
         if E > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
-            # Pad rows past num_local_tokens leave as ids -1, which the grouped
-            # MoE route skips like any other unrouted row.
-            topk_weight, topk_ids = herd_finalize_candidates(
-                topk_weight,
-                topk_ids,
-                E,
-                herd_routed_scaling_factor,
-                num_valid_rows=num_local_tokens,
+            herd = HerdCandidates(
+                topk_weight, topk_ids, E, herd_routed_scaling_factor, num_local_tokens
             )
+            if herd.fusable():
+                # Unfilled: the grouped MoE path fills them before reading them.
+                topk_weight = torch.empty(
+                    (M, herd_topk), dtype=torch.float32, device=topk_ids.device
+                )
+                topk_ids = torch.empty(
+                    (M, herd_topk), dtype=torch.int32, device=topk_ids.device
+                )
+            else:
+                # Pad rows past num_local_tokens leave as ids -1, which the grouped
+                # MoE route skips like any other unrouted row.
+                topk_weight, topk_ids = herd.finalize()
+                herd = None
             herd_topk = 0
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
@@ -1646,6 +1655,7 @@ def _fused_moe_impl(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            herd=herd,
         )
 
     if grouped_a8w4_out is not None:
@@ -1655,6 +1665,8 @@ def _fused_moe_impl(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
             "gate_mode=INTERLEAVE)"
         )
+    if herd is not None:
+        topk_weight, topk_ids = herd.finalize()
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (

@@ -677,6 +677,7 @@ def _grouped_a8w4_tdm_moe(
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
     output=None,
+    herd=None,  # HerdCandidates behind unfilled topk_weight/topk_ids
 ):
     import functools
 
@@ -704,6 +705,9 @@ def _grouped_a8w4_tdm_moe(
         stage2_scatter = _compact_ctx
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
     a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    if herd is not None and (_compact or expert_mask is not None):
+        topk_weight, topk_ids = herd.finalize()
+        herd = None
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -904,6 +908,13 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif herd is not None:
+        # Only set past herd_route_psum_remap's expert limit (fused_moe).
+        _fuse_ep_route_quant = False
+        topk_weight, topk_ids, _masked_m, topids_to_rows, herd_psum = (
+            herd.route_psum(_align_m)
+        )
+        ep_rowmap = None
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
@@ -1581,6 +1592,7 @@ def grouped_gemm_gfx1250_a8w4(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
+    herd=None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1918,6 +1930,7 @@ def grouped_gemm_gfx1250_a8w4(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            herd=herd,
             **_tdm_kw,
         )
 
