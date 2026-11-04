@@ -514,6 +514,13 @@ def build_gemm_a8w4_tdm_task(
             cluster_m == 1
             or (
                 bool(explicit_vgpr_partition)
+                and not enable_ep_scatter
+                and not stage1_act
+                and not stage1_quant_out
+                and K // tile_k >= num_buffers * 4
+            )
+            or (
+                bool(explicit_vgpr_partition)
                 and cluster_n == 2
                 and stage1_act == 1
                 and bool(stage1_quant_out)
@@ -558,7 +565,11 @@ def build_gemm_a8w4_tdm_task(
     )
     fp4_prefill = use_spec_prefill_opt and cluster_m > 1
     quant_gemm1_prefill = fp4_prefill and stage1_act == 1 and bool(stage1_quant_out)
-    native_prefill_compute = quant_gemm1_prefill or plain_gemm_prefill
+    # Keep ring-unrolled paths on their established task and cache schedule.
+    # The compact native schedule accompanies the peeled first K tile.
+    native_prefill_compute = inline_zero_acc and (
+        quant_gemm1_prefill or plain_gemm_prefill
+    )
     reuse_lds_stage_base = fp4_prefill and bool(planar_lds_on)
     skip_initial_cluster_sync = (
         fp4_prefill and bool(next_stage_on) and not tdm_as_in_prologue
@@ -1046,7 +1057,25 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def tiled_store(gt, tile, lds_ptr, lds_row):
+        def tiled_store(
+            gt, tile, lds_ptr, lds_row, outer_bound, inner_bound, global_stride
+        ):
+            if const_expr(
+                a_preshuffled and not native_prefill_compute and not persistent_workers
+            ):
+                # Retain direct-atom output on the established preshuffled
+                # schedule. Non-preshuffled and peeled native paths keep the
+                # tiled descriptor; both forms enforce the same output bounds.
+                direct_gt = tensor_view(fx.get_iter(gt), tile, (global_stride, 1))
+                atom = fx.rocdl.make_tdm_atom(
+                    direct_gt,
+                    [outer_bound, inner_bound],
+                    strides=[global_stride, None],
+                    num_warps=num_waves,
+                )
+                source = tensor_view(lds_ptr, tile, (lds_row, 1))
+                fx.copy(atom, source, direct_gt)
+                return
             atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
                 fx.rocdl.TensorStore(),
                 gt,
@@ -1517,22 +1546,42 @@ def build_gemm_a8w4_tdm_task(
                 ),
             )
 
-        # Materialize each constant-stage base in the prologue. KSL/operand
-        # offsets stay in DS immediates instead of rebuilding scale addresses
-        # inside the unrolled ring. Runtime-stage paths keep their fallback.
+        # Native narrow layouts reuse constant-stage bases. Ordinary inputs
+        # keep their addresses local to DS loads, avoiding a live base vector
+        # for every pipeline stage on the automatic register path.
         payload_bases = (
             []
-            if use_spec_prefill_opt
+            if use_spec_prefill_opt or not a_preshuffled
             else [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
         )
         scale_bases = (
             []
-            if use_spec_prefill_opt
+            if use_spec_prefill_opt or not a_preshuffled
             else [calc_scale_bases(s) for s in range_constexpr(num_buffers)]
         )
 
         def calc_lds_addr(slot, address_slot=0):
             """Get the lane-specific LDS bases for one stage buffer."""
+            if const_expr(not a_preshuffled):
+                slot_idx = fx.Index(slot)
+                return LdsAddr(
+                    a=stC_idx
+                    + A_LDS_OFF
+                    + slot_idx * A_LDS_STAGE
+                    + fx.index_cast(T.index, lds_a_lane_off),
+                    b=stC_idx
+                    + B_LDS_OFF
+                    + slot_idx * B_LDS_STAGE
+                    + fx.index_cast(T.index, lds_b_lane_off),
+                    sa=stC_idx
+                    + SA_LDS_OFF
+                    + slot_idx * SA_LDS_STAGE
+                    + fx.index_cast(T.index, lds_sa_lane_off),
+                    sb=stC_idx
+                    + SB_LDS_OFF
+                    + slot_idx * SB_LDS_STAGE
+                    + fx.index_cast(T.index, lds_sb_lane_off),
+                )
             if const_expr(use_spec_prefill_opt):
                 lane_offsets = (
                     lds_a_lane_off,
@@ -1703,37 +1752,12 @@ def build_gemm_a8w4_tdm_task(
                     + idx * WMMA_VECTOR_DWORDS,
                 )
 
-        if const_expr(use_spec_prefill_opt and not inline_zero_acc):
+        # Preserve ordinary zero constants on unpeeled paths. A side-effecting
+        # inline-asm identity forces separate Lo256 live ranges for every C
+        # vector and can spill wide fallback tiles before their first WMMA.
+        if const_expr(not inline_zero_acc):
             for cf in c_frags:
                 cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
-
-        def init_accumulators():
-            # Cover prologue TDM latency before the first pipeline wait.
-            rocdl.sched_barrier(0)
-            for cf in c_frags:
-                # A tied identity emits no instruction, but its side effect
-                # keeps zero materialization from sinking past the wait.
-                zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
-                if const_expr(
-                    explicit_vgpr_partition
-                    and callable(getattr(rocdl, "sched_vgpr", None))
-                ):
-                    # Generic inline-asm "v" constrains the result to Lo256.
-                    # SSA scheduling cannot widen that class to the pinned C
-                    # range. Keep the scheduling barriers and pin C at reads.
-                    cf.store(zero)
-                else:
-                    cf.store(
-                        llvm_dialect.InlineAsmOp(
-                            res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
-                            operands_=[zero],
-                            asm_string="",
-                            constraints="=v,0",
-                            has_side_effects=True,
-                            is_align_stack=False,
-                        ).res
-                    )
-            rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -2399,8 +2423,6 @@ def build_gemm_a8w4_tdm_task(
                     a_ready_gate()
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
-                    if const_expr(not use_spec_prefill_opt):
-                        init_accumulators()
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
@@ -2483,8 +2505,6 @@ def build_gemm_a8w4_tdm_task(
                     a_ready_gate()
                     for i in range_constexpr(PRE):
                         issue(i, i)
-                    if const_expr(not use_spec_prefill_opt):
-                        init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))
@@ -2826,7 +2846,9 @@ def build_gemm_a8w4_tdm_task(
                                 # Clamp successive slices without extending every pair's live range.
                                 activation_chunk = (
                                     8
-                                    if quant_gemm1_prefill and resident_ring_addresses
+                                    if native_prefill_compute
+                                    and quant_gemm1_prefill
+                                    and resident_ring_addresses
                                     else len(pairs)
                                 )
                                 all_vals = []
@@ -2835,7 +2857,8 @@ def build_gemm_a8w4_tdm_task(
                                 ):
                                     all_vals += (
                                         _batched_silu_swiglu_tanh_fma
-                                        if quant_gemm1_prefill
+                                        if native_prefill_compute
+                                        and quant_gemm1_prefill
                                         and resident_ring_addresses
                                         else batched_silu_swiglu
                                     )(
@@ -3296,6 +3319,9 @@ def build_gemm_a8w4_tdm_task(
                         (tile_m // 16, STORE_N * 16),
                         fx.recast_iter(oc_store, c_q_base_ptr),
                         STORE_N * 16,
+                        (mn_oob + 15) // 16,
+                        None,
+                        out_stride * 16,
                     )
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
@@ -3312,6 +3338,9 @@ def build_gemm_a8w4_tdm_task(
                         (tile_m, STORE_PITCH),
                         fx.recast_iter(oc_store, c_q_base_ptr),
                         STORE_PITCH,
+                        mn_oob,
+                        STORE_N if STORE_PAD else None,
+                        out_stride,
                     )
                 if const_expr(tdm_snop):
                     rocdl.s_nop(0)

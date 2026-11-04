@@ -333,11 +333,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         and not stage1_quant_out
         and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
         == (256, 256, 256, 2, 2, 4)
-        and cluster_m == 1
+        and (cluster_m == 1 or K // tile_k >= num_buffers * 4)
         and callable(getattr(rocdl, "sched_vgpr", None))
     ):
-        # The new allocator's automatic layout is slower for this output tile.
-        # Use its explicit SSA placement under either global register policy.
+        # This output tile benefits from explicit SSA register placement.
+        # Select by tile geometry and K pipeline length.
         explicit_vgpr_partition = 1
         launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
     _run_compiled(
