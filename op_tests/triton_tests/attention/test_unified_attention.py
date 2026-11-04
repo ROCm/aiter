@@ -676,6 +676,8 @@ def _length_aware_seq_lens(batch: str, query_len: int):
         for batch in ["skewed", "uniform"]
     ]
     + [("skewed_300", (8, 2), 1, False, torch.int32)]
+    # the widest verify query that still fits one block of the q >= 4 entry
+    + [("skewed", (8, 2), 8, False, torch.int32)]
     # sglang passes int64 sequence lengths
     + [("skewed", (8, 2), 4, False, torch.int64)],
 )
@@ -974,13 +976,19 @@ def test_length_aware_split_scope() -> None:
         budget = rng.randint(1, 1024)
         assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
     assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
-    # the 3D launch and the reduce read their length-aware keys from these entries
-    assert "SPLIT_RUNS_PER_XCD" in get_unified_attention_config(
-        "attn_3d", params, arch="gfx950"
-    )
-    assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
-        "reduce", params, arch="gfx950"
-    )
+    # the 3D launch and the reduce read their length-aware keys from these entries,
+    # for decode and for verify queries up to one query block (q <= 8 here)
+    for q in (1, 4, 8):
+        verify = SimpleNamespace(**{**vars(params), "max_seqlen_q": q})
+        assert _length_aware_split(config, verify)
+        attn_3d = get_unified_attention_config("attn_3d", verify, arch="gfx950")
+        assert "SPLIT_RUNS_PER_XCD" in attn_3d
+        if attn_3d["BLOCK_M"] > 16:
+            # a wider tuned block is cut down to the query rows of one sequence
+            assert attn_3d["SPLIT_BLOCK_M"] == 16
+        assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
+            "reduce", verify, arch="gfx950"
+        )
 
 
 @pytest.mark.parametrize(

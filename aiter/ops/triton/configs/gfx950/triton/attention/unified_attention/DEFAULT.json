@@ -237,7 +237,8 @@
       "num_warps": 2,
       "num_stages": 2,
       "waves_per_eu": 2,
-      "SPLIT_RUNS_PER_XCD": 16
+      "SPLIT_RUNS_PER_XCD": 16,
+      "SPLIT_BLOCK_M": 16
     },
     "any": {
       "BLOCK_M": 16,

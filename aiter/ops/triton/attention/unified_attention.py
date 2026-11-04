@@ -740,9 +740,17 @@ def _unified_attention_3d_triton(
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
     split_runs_per_xcd = config.pop("SPLIT_RUNS_PER_XCD", None)
+    split_block_m = config.pop("SPLIT_BLOCK_M", None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
+    if split_budget is not None and split_block_m is not None:
+        # the length-aware split runs one query block per sequence, so a block
+        # needs only the query rows; BLOCK_M still bounds them (_attn_3d_block_q)
+        query_rows = triton.next_power_of_2(
+            params.max_seqlen_q * params.num_queries_per_kv
+        )
+        config["BLOCK_M"] = min(config["BLOCK_M"], max(split_block_m, query_rows))
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
