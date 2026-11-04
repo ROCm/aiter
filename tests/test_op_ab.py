@@ -224,3 +224,52 @@ def test_replay_driver_times_rows_through_the_harness(tmp_path, monkeypatch):
     assert abs(report["totals"]["weighted_delta_us"] - 5 * 90 * 0.5) < 1e-6
     md = (out / "report.md").read_text()
     assert "| label | count |" in md and '{"args"' not in md
+
+
+_RANKED_REPLAY = """
+import csv, os
+
+def replay(rows_csv, extra_args):
+    rank, world = os.environ["RANK"], os.environ["WORLD_SIZE"]
+    open(os.path.join(os.path.dirname(rows_csv), f"ran_{rank}_of_{world}"), "w").close()
+    with open(rows_csv) as f:
+        rows = list(csv.DictReader(f))
+    return rows, [{"shape": r["label"], "e2e_us": 5.0, "status": "ok"} for r in rows]
+"""
+
+
+def test_a_collective_runs_one_process_per_rank(tmp_path, monkeypatch):
+    """``--gpus`` with N GPUs: each round runs N ranks under torchrun, every
+    rank replays, rank 0 reports."""
+    base = _fake_aiter(tmp_path / "base")
+    script = tmp_path / "ranked_replay.py"
+    script.write_text(textwrap.dedent(_RANKED_REPLAY))
+    rows = tmp_path / "comm.csv"
+    with open(rows, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["label", "op", "sig", "work", "count"])
+        w.writerow(["ar 64x4096", "all_reduce_", '{"args":[]}', "{}", 120])
+    monkeypatch.setattr(sys, "argv", ["op_ab.py"])
+    out = tmp_path / "ab"
+    op_ab.main(
+        [
+            "--csv",
+            str(rows),
+            "--replay",
+            str(script),
+            "--base",
+            str(base),
+            "--new",
+            str(base),
+            "--gpus",
+            "0,1",
+            "--repeat",
+            "3",
+            "--out",
+            str(out),
+        ]
+    )
+    report = json.loads((out / "report.json").read_text())
+    assert report["ranks"] == 2
+    assert (out / "ran_0_of_2").exists() and (out / "ran_1_of_2").exists()
+    assert [r["verdict"] for r in report["rows"]] == ["same"]

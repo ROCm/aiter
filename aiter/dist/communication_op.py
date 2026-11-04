@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch.distributed
 
+from aiter.jit.utils.call_hook import observe
 from aiter.ops.enum import QuantType
 
 from .parallel_state import (
@@ -308,6 +309,7 @@ def tensor_model_parallel_reduce_scatter(
     return get_tp_group().reduce_scatter_tensor(input_, use_custom, dim)
 
 
+@observe
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor,
     use_custom: bool = False,

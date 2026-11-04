@@ -35,6 +35,7 @@ import json
 import math
 import os
 import runpy
+import socket
 import subprocess
 import sys
 import time
@@ -130,7 +131,9 @@ def worker(
             )
         except Exception:  # noqa: BLE001  reported to the driver, which stops
             code, error = 1, traceback.format_exc()
-        _dump(result, package_file, code, error, captured)
+        # Under torchrun every rank replays; the ranks agree on the times.
+        if int(os.environ.get("RANK", "0")) == 0:
+            _dump(result, package_file, code, error, captured)
         return 0
 
     from aiter.utility import base_tuner
@@ -198,6 +201,12 @@ def _dump(result: str, package_file: str, code: int, error, captured: list) -> N
 # ---------------------------------------------------------------- driver side
 
 
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def run_side(
     side: Side,
     driver: str,
@@ -208,6 +217,7 @@ def run_side(
     gpu: str,
     out_dir: str,
     round_: int,
+    ranks: int = 1,
 ) -> dict:
     result = os.path.join(out_dir, f"{side.name}_r{round_}.json")
     log = os.path.join(out_dir, f"{side.name}_r{round_}.log")
@@ -221,8 +231,18 @@ def run_side(
     # A tuner is the side's own; a replay script is the harness, the same for
     # both sides, and times whichever package the side imports.
     tuner_path = os.path.join(side.root, tuner) if driver == "tuner" else tuner
+    launcher = [sys.executable]
+    if ranks > 1:  # a collective: one process per rank, on the GPUs given
+        launcher += [
+            "-m",
+            "torch.distributed.run",
+            "--nproc-per-node",
+            str(ranks),
+            "--master-port",
+            str(_free_port()),
+        ]
     cmd = [
-        sys.executable,
+        *launcher,
         os.path.abspath(__file__),
         "--_worker",
         "--driver",
@@ -488,6 +508,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base-env", action="append", help="KEY=VALUE, repeatable")
     p.add_argument("--new-env", action="append", help="KEY=VALUE, repeatable")
     p.add_argument("--gpu", default="0", help="HIP_VISIBLE_DEVICES for both sides")
+    p.add_argument(
+        "--gpus",
+        help="comma-separated GPUs, one per rank, for a family that needs the "
+        "recorded TP group (a collective's ``ranks``)",
+    )
     p.add_argument("--repeat", type=int, default=5)
     p.add_argument("--iters", type=int, help="tuner --iters")
     p.add_argument("--warmup", type=int, help="tuner --warmup")
@@ -522,6 +547,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             tuner = tuner or fam["tuner"]
         tuner_args = fam.get("tuner_args", []) + tuner_args
+        ranks = int(fam.get("ranks", 1))
+    else:
+        ranks = len(a.gpus.split(",")) if a.gpus else 1
+    gpu = a.gpu
+    if ranks > 1:
+        if not a.gpus or len(a.gpus.split(",")) != ranks:
+            raise SystemExit(
+                f"this family runs on {ranks} ranks: give --gpus with {ranks}"
+            )
+        gpu = a.gpus
     if not csv_path or not tuner:
         raise SystemExit("give --csv and --tuner, or --summary and --family")
     if a.repeat < 3:
@@ -561,9 +596,10 @@ def main(argv: list[str] | None = None) -> int:
                 tuner,
                 tuner_args,
                 keys_csv,
-                a.gpu,
+                gpu,
                 a.out,
                 i,
+                ranks,
             )
             rounds[name].append(timings(data, columns))
             runs.append(
@@ -587,7 +623,8 @@ def main(argv: list[str] | None = None) -> int:
         "tuner_args": tuner_args,
         "csv": os.path.abspath(csv_path),
         "columns": columns,
-        "gpu": a.gpu,
+        "gpu": gpu,
+        "ranks": ranks,
         "repeat": a.repeat,
         "floor": a.floor,
         "sides": {n: {"root": s.root, "env": s.env} for n, s in sides.items()},

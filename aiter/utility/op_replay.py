@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Replay recorded calls of aiter's attention ops -- whose cost follows
-per-sequence lengths a shape does not carry -- and time them, for
+per-sequence lengths a shape does not carry -- and of its collectives (under
+torchrun, one process per rank), and time them, for
 `aiter/utility/op_ab.py` (``driver: replay``) as a tuner's ``--run_config``
 serves the GEMM families.
 
@@ -82,9 +83,15 @@ class Call:
     """A recorded call bound to ``fn``'s parameter names: ``recorded`` the
     arguments as recorded, ``values`` what the replay passes, by name."""
 
-    def __init__(self, fn: Callable, sig: dict, signature_of: Callable | None = None):
+    def __init__(
+        self,
+        fn: Callable,
+        sig: dict,
+        signature_of: Callable | None = None,
+        names: list[str] | None = None,
+    ):
         self.fn = fn
-        names = list(inspect.signature(signature_of or fn).parameters)
+        names = names or list(inspect.signature(signature_of or fn).parameters)
         self.positional = names[: len(sig["args"])]
         self.keywords = list(sig.get("kwargs", {}))
         self.recorded = dict(zip(names, sig["args"])) | sig.get("kwargs", {})
@@ -289,7 +296,141 @@ def _flash_attn_varlen_forward(sig: dict, work: dict):
     return _varlen(Call(fn, sig), work)
 
 
+# ------------------------------------------------------------------ collectives
+#
+# Run under torchrun, one process per rank of the recorded TP group, on the
+# GPUs it ran on: a collective's time is its rank-slowest, since every rank
+# waits for the last. Each rank calls exactly as often as every other (no
+# input rotation), or the group would hang.
+
+
+def distributed() -> tuple[int, int]:
+    """(rank, world) of a TP group the size of torchrun's world, set up as
+    ATOM sets it up: `aiter.init_dist_env`, custom all-reduce on."""
+    import os
+
+    import torch.distributed as dist
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world < 2:
+        raise RuntimeError("a collective replays across ranks: launch it with torchrun")
+    if not dist.is_initialized():
+        import aiter
+
+        rank = int(os.environ["RANK"])
+        local = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local)
+        aiter.init_dist_env(
+            world,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method="env://",
+            local_rank=local,
+        )
+    return dist.get_rank(), world
+
+
+# The group_name ops' parameters: `torch_compile_guard` hides the signature.
+_ALL_REDUCE = ["tensor", "group_name", "ca_use_new", "ca_fp8_quant", "prefill_support"]
+_AR_RMSNORM = [
+    "inp",
+    "res_inp",
+    "w",
+    "eps",
+    "group_name",
+    "prefill_support",
+    "x_pad_to_multiple",
+    "gemma_norm",
+]
+_AR_RMSNORM_QUANT = [
+    "inp",
+    "res_inp",
+    "w",
+    "eps",
+    "group_name",
+    "group_size",
+    "prefill_support",
+    "transpose_scale",
+    "gemma_norm",
+]
+
+
+def _group_op(name: str, params: list[str]):
+    def build(sig: dict, work: dict):
+        from aiter.dist import parallel_state
+
+        distributed()
+        call = Call(getattr(parallel_state, name), sig, names=params)
+        # The recorded run's TP group, as this process names it.
+        call.values["group_name"] = parallel_state.get_tp_group().unique_name
+        return call.args()
+
+    return build
+
+
+def tensor_model_parallel_all_gather(sig: dict, work: dict):
+    from aiter.dist.communication_op import tensor_model_parallel_all_gather as fn
+
+    distributed()
+    return Call(fn, sig).args()
+
+
+COLLECTIVES = {
+    "all_reduce_": _group_op("all_reduce_", _ALL_REDUCE),
+    "fused_allreduce_rmsnorm_": _group_op("fused_allreduce_rmsnorm_", _AR_RMSNORM),
+    "fused_allreduce_rmsnorm_quant_per_group_": _group_op(
+        "fused_allreduce_rmsnorm_quant_per_group_", _AR_RMSNORM_QUANT
+    ),
+    "fused_allreduce_rmsnorm_quant_per_group_emit_bf16_": _group_op(
+        "fused_allreduce_rmsnorm_quant_per_group_emit_bf16_", _AR_RMSNORM_QUANT
+    ),
+    "tensor_model_parallel_all_gather": tensor_model_parallel_all_gather,
+}
+
+
+# Calls one graph replays back to back: alone, a graph of one few-microsecond
+# collective times each rank's launch skew as much as the collective (A/A
+# rounds of a 64x4096 all-reduce read 8 to 16 us); queued, the ranks run in
+# step and the skew is paid once per replay.
+GRAPH_REPEATS = 8
+
+
+def graphed(fn: Callable, args: tuple, kwargs: dict) -> Callable[[], None]:
+    """``fn(*args, **kwargs)`` recorded `GRAPH_REPEATS` times into a CUDA
+    graph inside aiter's `graph_capture`, as ATOM records a decode step's
+    collectives: custom all-reduce then runs on buffers registered at
+    capture, not the copy-in path an eager call takes. Returns the graph's
+    replay, which keeps the arguments alive; a replay is `GRAPH_REPEATS`
+    calls."""
+    from aiter.dist.parallel_state import graph_capture
+
+    fn(*args, **kwargs)  # lazy setup happens outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with graph_capture() as context, torch.cuda.graph(graph, stream=context.stream):
+        for _ in range(GRAPH_REPEATS):
+            fn(*args, **kwargs)
+    torch.cuda.synchronize()
+
+    def replay_graph(_keep=(args, kwargs)):
+        graph.replay()
+
+    return replay_graph
+
+
+def _across_ranks(value: float, op: str) -> float:
+    """``value`` reduced over the ranks (MIN or MAX); itself off torchrun."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return value
+    t = torch.tensor([value], dtype=torch.float64, device="cuda")
+    dist.all_reduce(t, op=getattr(dist.ReduceOp, op))
+    return float(t.item())
+
+
 REPLAYERS: dict[str, Callable[[dict, dict], tuple[Callable, tuple, dict]]] = {
+    **COLLECTIVES,
     "pa_decode_gluon": pa_decode_gluon,
     "pa_fwd_asm": pa_fwd_asm,
     "pa_persistent_fwd": pa_persistent_fwd,
@@ -322,13 +463,38 @@ def replay(
     results = []
     for row in rows:
         label = row.get("label", row["op"])
+        collective = row["op"] in COLLECTIVES
+        built, error = None, None
         try:
-            fn, args, kwargs = replayers[row["op"]](
+            built = replayers[row["op"]](
                 json.loads(row["sig"]), json.loads(row["work"])
             )
+        except Exception as e:  # noqa: BLE001  one row's failure is that row's result
+            error = f"error:{e}"
+        # A rank that cannot build the call must not leave the others waiting
+        # in it: every rank times the row or none does.
+        if collective and _across_ranks(error is None, "MIN") < 1:
+            error = error or "error:another rank could not build the call"
+        if error is not None:
+            results.append({"shape": label, "e2e_us": -1, "status": error})
+            continue
+        fn, args, kwargs = built
+        try:
+            per_call = 1
+            if collective and json.loads(row["work"]).get("graph"):
+                fn, args, kwargs = graphed(fn, args, kwargs), (), {}
+                per_call = GRAPH_REPEATS
             _, us = run_perftest(
-                fn, *args, num_iters=iters, num_warmup=warmup, **kwargs
+                fn,
+                *args,
+                num_iters=iters,
+                num_warmup=warmup,
+                num_rotate_args=1 if collective else 0,
+                **kwargs,
             )
+            us /= per_call
+            if collective:
+                us = _across_ranks(us, "MAX")
             status = "ok" if math.isfinite(us) and us > 0 else f"error:time {us}"
             results.append({"shape": label, "e2e_us": us, "status": status})
         except Exception as e:  # noqa: BLE001  one row's failure is that row's result
