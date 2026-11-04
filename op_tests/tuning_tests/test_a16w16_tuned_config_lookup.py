@@ -510,6 +510,25 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                     and config["group_m"] == tile[6]
                     for config in configs
                 )
+            configs = policy.get_flydsl_a16w16_configs(
+                322, 7168, 35840, torch.bfloat16, torch.bfloat16, False
+            )
+
+        def accumulator_tiles(config):
+            return (config["block_m"] // config["m_waves"] // 16) * (
+                config["block_n"] // config["n_waves"] // 16
+            )
+
+        # Allowlisted rectangles survive only while their accumulators fit.
+        self.assertTrue(
+            any((c["block_m"], c["block_n"]) == (256, 256) for c in configs)
+        )
+        self.assertFalse(
+            any(
+                not c["use_half_tile_interleaved"] and accumulator_tiles(c) > 64
+                for c in configs
+            )
+        )
 
 
 if __name__ == "__main__":

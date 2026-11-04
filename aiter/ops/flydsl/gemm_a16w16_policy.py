@@ -548,22 +548,25 @@ def get_flydsl_a16w16_configs(
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             if (mma_m_iters > 4 or mma_n_iters > 4) and (
-                config["block_m"],
-                config["block_n"],
-            ) not in (
-                (208, 256),
-                (224, 256),
-                (320, 192),
-                (256, 192),
-                (288, 192),
-                (320, 224),
-                (224, 320),
-                (224, 192),
-                (160, 192),
-                (192, 192),
-                (384, 192),
-                (256, 256),
-                (400, 128),
+                (config["block_m"], config["block_n"])
+                not in (
+                    (208, 256),
+                    (224, 256),
+                    (320, 192),
+                    (256, 192),
+                    (288, 192),
+                    (320, 224),
+                    (224, 320),
+                    (224, 192),
+                    (160, 192),
+                    (192, 192),
+                    (384, 192),
+                    (256, 256),
+                    (400, 128),
+                )
+                # Past 64 accumulator tiles per wave the kernel spills to
+                # scratch, which can exhaust device memory at dispatch.
+                or mma_m_iters * mma_n_iters > 64
             ):
                 continue
 
