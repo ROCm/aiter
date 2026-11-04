@@ -245,11 +245,9 @@ for file in "${sharded_files[@]}"; do
             ;;
         op_tests/test_moe_2stage.py)
             {
-                echo "Running test_moe_2stage.py via the standard CI profile." \
-                     "Use the direct CLI invocation for the full matrix; the CI" \
-                     "profile is selected via AITER_MOE_2STAGE_CI_PROFILE."
+                echo "Running $file with the standard MoE CI profile: representative tokens + no FlyDSL CSV sweep"
             } | tee -a latest_test.log
-            test_cmd=(timeout 60m python3 "$file")
+            test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)
