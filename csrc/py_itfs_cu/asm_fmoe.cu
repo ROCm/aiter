@@ -175,7 +175,10 @@ class FMoeKernel
         // EMSORT also sizes its leader O-zero sweep from XC[0], so handing it
         // the assignment count makes that sweep run token_cnt*topk*dim*2 bytes
         // past the end of out.
-        args.ptr_XC     = this->flat_mode == 0 ? num_valid_ids->ptr : nullptr;
+        args.ptr_XC     = (this->flat_mode == AsmMoeMode::NO_SORT ||
+                       this->flat_mode == AsmMoeMode::EMSORT)
+                              ? nullptr
+                              : num_valid_ids->ptr;
         args.ptr_D      = w2->ptr;
         if constexpr(I_elemSize == 1)
         {
