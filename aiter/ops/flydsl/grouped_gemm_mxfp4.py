@@ -170,14 +170,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
-    tp_reduce_output=None,
-    tp_row_to_token=None,
-    tp_topids_to_rows=None,
-    tp_weights=None,
-    tp_counters=None,
-    tp_topk=0,
-    tp_tokens=0,
-    tp_counter_stride=0,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     row_major_ascale=0,
@@ -269,26 +261,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
-    enable_tp_reduce = tp_reduce_output is not None
-    if enable_tp_reduce:
-        if enable_ep_scatter or stage1_act or stage1_quant_out:
-            raise ValueError(
-                "TP GEMM2 reduce is incompatible with EP scatter and GEMM1 epilogues"
-            )
-        if any(
-            value is None
-            for value in (
-                tp_row_to_token,
-                tp_topids_to_rows,
-                tp_weights,
-                tp_counters,
-            )
-        ):
-            raise ValueError("TP GEMM2 reduce requires all map/weight/counter buffers")
-        if tp_weights.dtype != torch.float32:
-            raise TypeError("TP GEMM2 reduce currently requires float32 route weights")
-        if int(tp_topk) <= 0 or int(tp_tokens) <= 0 or int(tp_counter_stride) <= 0:
-            raise ValueError("TP GEMM2 reduce needs positive topk/tokens/counter stride")
     if enable_ep_scatter and stage2_scatter.combine_quant_bits:
         # N is the payload plane's length and so the scale plane's base, which
         # has to land on a cache line; fp4 packs two elements to the byte and
@@ -302,17 +274,6 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
-    tp_output_tensor = (
-        tp_reduce_output if enable_tp_reduce else out
-    ).view(-1)
-    tp_row_to_token_tensor = (
-        tp_row_to_token if enable_tp_reduce else out
-    ).view(-1)
-    tp_topids_to_rows_tensor = (
-        tp_topids_to_rows if enable_tp_reduce else out
-    ).view(-1)
-    tp_weights_tensor = (tp_weights if enable_tp_reduce else out).view(-1)
-    tp_counters_tensor = (tp_counters if enable_tp_reduce else out).view(-1)
     gemm_spec = (
         K,
         tile_m,
@@ -342,11 +303,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(ep_destination_stride),
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
-    )
-    tp_spec = (
-        int(enable_tp_reduce),
-        int(tp_topk),
-        int(tp_counter_stride),
     )
     layout_spec = (
         int(row_major_ascale),
@@ -378,13 +334,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         *tdm_spec,
         *ep_spec,
         ep_row_map_tensor,
-        *tp_spec,
-        int(tp_tokens),
-        tp_output_tensor,
-        tp_row_to_token_tensor,
-        tp_topids_to_rows_tensor,
-        tp_weights_tensor,
-        tp_counters_tensor,
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
@@ -394,7 +343,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             quant_spec,
             tdm_spec,
             ep_spec,
-            tp_spec,
             layout_spec,
         ),
     )

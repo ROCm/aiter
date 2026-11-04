@@ -60,12 +60,10 @@ def test_fused_scan_integer_reference_and_replay(experts, numel, tile, launcher)
             launcher,
             ptr_arg(ids),
             *(ptr_arg(t) for t in outputs),
-            ptr_arg(None),
             numel,
             experts,
             max(1, numel),
             tile,
-            1,
             torch.cuda.current_stream()
         )
 
@@ -103,39 +101,13 @@ def test_masked_offsets_use_unsigned_high_bit(launcher):
         launcher,
         ptr_arg(ids),
         *(ptr_arg(t) for t in outputs),
-        ptr_arg(None),
         numel,
         experts,
         max_m,
         16,
-        1,
         torch.cuda.current_stream()
     )
     check(ids, outputs, backing, experts, 16)
-
-
-def test_fused_scan_writes_contiguous_row_to_token():
-    tokens, topk, experts, tile = 64, 5, 129, 16
-    ids = (
-        torch.arange(tokens * topk, device="cuda", dtype=torch.int32) % experts
-    ).view(tokens, topk)
-    max_m = ((tokens * topk + tile - 1) // tile) * tile
-    capacity = tokens * topk + experts * tile - topk
-    row_to_token = torch.full(
-        (capacity,), -1, device="cuda", dtype=torch.int32
-    )
-
-    _, route_rows, _ = gm.fused_route_psum_remap(
-        ids,
-        experts,
-        max_m,
-        tile,
-        row_to_token=row_to_token,
-    )
-    expected = torch.arange(tokens, device="cuda", dtype=torch.int32).repeat_interleave(
-        topk
-    )
-    assert torch.equal(row_to_token[route_rows.reshape(-1).long()], expected)
 
 
 @pytest.mark.parametrize("fmt", ["a4w4", "a8w4"])

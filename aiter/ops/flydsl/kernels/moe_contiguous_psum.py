@@ -634,12 +634,10 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Pointer,  # (E,) i32 out (per-expert counts)
         starts: fx.Pointer,  # (E,) i32 out (contiguous row base per expert)
         psum: fx.Pointer,  # (E,) i32 out (= m_tile_map)
-        row_to_token: fx.Pointer,  # (contiguous_m,) i32 inverse map, optional
         numel: Int32,
         experts: Int32,
         max_m: Int32,
         tile_m: Int32,
-        topk: Int32,
     ):
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui rather than their signed forms.
@@ -657,8 +655,6 @@ def build_moe_route_psum_fused_module():
         m_p = ptr_buf_tensor(masked_m)
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
-        r2t_p = ptr_buf_tensor(row_to_token)
-        write_row_to_token = fx.Int64(ptrtoint(row_to_token)) != 0
 
         in_expert = tid < fx.Uint32(experts)
 
@@ -758,10 +754,7 @@ def build_moe_route_psum_fused_module():
                     start = (expert > 0).select(fx.Uint32(src[previous]), fx.Uint32(0))
                 else:
                     start = fx.Uint32(s_p[expert])
-                final_row = start + slot
-                rows_p[route_i32] = final_row
-                if write_row_to_token:
-                    r2t_p[final_row] = route_i32 // fx.Uint32(topk)
+                rows_p[route_i32] = start + slot
 
     @flyc.jit
     def launch_route_psum_fused(
@@ -770,12 +763,10 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
-        row_to_token: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
-        topk: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_fused_kernel(
@@ -784,12 +775,10 @@ def build_moe_route_psum_fused_module():
             masked_m,
             starts,
             psum,
-            row_to_token,
             numel,
             experts,
             max_m,
             tile_m,
-            topk,
         ).launch(
             grid=(1, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

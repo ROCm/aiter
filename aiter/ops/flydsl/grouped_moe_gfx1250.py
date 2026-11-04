@@ -471,14 +471,6 @@ _G2L_MAX_N = 1024
 
 _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _G2L_FUSED_CACHE: dict[tuple[int, str], torch.Tensor] = {}
-# Keep independently-contended (token, N-tile) arrivals on separate cache lines.
-# The GEMM2 epilogue resets every slot to zero, so allocation is the only memset
-# and captured graphs can replay the same stable storage.
-TP_GEMM2_REDUCE_COUNTER_STRIDE = 32
-# Keep the unvalidated medium band on the old epilogue. Above the route-fusion
-# ceiling the scalable multi-block remap feeds the prefill path.
-TP_GEMM2_REDUCE_PREFILL_MIN_ROUTES = 2049
-_TP_GEMM2_REDUCE_COUNTER_CACHE: dict[tuple[int, int, str, int], torch.Tensor] = {}
 
 
 def route_counter_buffer(E: int, device) -> torch.Tensor:
@@ -495,23 +487,6 @@ def route_counter_buffer(E: int, device) -> torch.Tensor:
         buf = torch.zeros(int(E), dtype=torch.int32, device=device)
         _G2L_COUNTER_CACHE[key] = buf
     return buf[: int(E)]
-
-
-def tp_gemm2_reduce_counter_buffer(
-    tokens: int, n_tiles: int, device
-) -> torch.Tensor:
-    """Return stream-private, self-resetting GEMM2-reduce arrival counters."""
-    stream_id = int(torch.cuda.current_stream(device).cuda_stream)
-    key = (int(tokens), int(n_tiles), str(device), stream_id)
-    buf = _TP_GEMM2_REDUCE_COUNTER_CACHE.get(key)
-    if buf is None:
-        buf = torch.zeros(
-            int(tokens) * int(n_tiles) * TP_GEMM2_REDUCE_COUNTER_STRIDE,
-            dtype=torch.int32,
-            device=device,
-        )
-        _TP_GEMM2_REDUCE_COUNTER_CACHE[key] = buf
-    return buf
 
 
 def route_fused_workspace(E: int, device):
@@ -823,6 +798,13 @@ def _grouped_a8w4_tdm_moe(
     # surplus tiles fall past ``psum`` and exit early. The TDM batched GEMMs
     # themselves are EP-agnostic: they operate on the routed contiguous layout.
     _is_ep = expert_mask is not None
+    _g2l_lut = None
+    _g2l_counter = None
+    _gather_w_buf = None
+    _ep_nvr = None
+    _ep_nvt = None
+    _fuse_ep_route_quant = False
+    ep_rowmap = None
     # Small TP batches: one workgroup counts, scans and remaps every route, in
     # place of the counter fill, route and psum-remap launches; it runs where the
     # psum is built below. HERD routes carry K+1 candidates per row and are
@@ -835,63 +817,6 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
-    try:
-        _tp_reduce_max_tokens = int(
-            os.environ.get("AITER_FLYDSL_TP_GEMM2_REDUCE_MAX_TOKENS", "8192")
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "AITER_FLYDSL_TP_GEMM2_REDUCE_MAX_TOKENS must be an integer"
-        ) from exc
-    _gemm2_block = int(m_warp2) * int(n_warp2) * 32
-    _gemm2_reduce_vec = (
-        int(tile_n2) // _gemm2_block
-        if int(tile_n2) % _gemm2_block == 0
-        else 0
-    )
-    _is_m3_tp_shape = (
-        int(E) == 129
-        and int(model_dim) == 6144
-        and int(inter_dim) == 768
-        and int(topk) == 5
-        and activation == ActivationType.Swiglu
-        and data_format == "fp4"
-    )
-    # Ordinary TP only. Each valid route must arrive exactly once, so dynamic
-    # dead-tail/dropped-route calls keep the standalone gather-reduce path.
-    # The default covers M3 decode and its 4536-token prefill; larger batches
-    # retain the standalone path until their synchronization cost is evaluated.
-    # Intermediate one-workgroup-route shapes above decode stay on the old
-    # epilogue until their route-order/graph replay matrix is validated.
-    # A non-positive environment bound means unbounded.
-    _fuse_tp_gemm2_reduce = (
-        os.environ.get("AITER_FLYDSL_TP_GEMM2_REDUCE", "1") in _TRUTHY_ENV
-        and not _compact
-        and not _is_ep
-        and not enable_ep_scatter
-        and not herd_topk
-        and not doweight_stage1
-        and num_local_tokens is None
-        and topk_weight.dtype == torch.float32
-        and dtype in (torch.bfloat16, dtypes.bf16)
-        and model_dim % int(tile_n2) == 0
-        and _gemm2_reduce_vec in (1, 2, 4, 8)
-        and (
-            token_num <= 64
-            or (
-                _is_m3_tp_shape
-                and token_num * topk >= TP_GEMM2_REDUCE_PREFILL_MIN_ROUTES
-            )
-        )
-        and (_tp_reduce_max_tokens <= 0 or token_num <= _tp_reduce_max_tokens)
-    )
-    _g2l_lut = None
-    _g2l_counter = None
-    _gather_w_buf = None
-    _ep_nvr = None
-    _ep_nvt = None
-    _fuse_ep_route_quant = False
-    ep_rowmap = None
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -1006,19 +931,11 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
-    _apre_row_to_token = None
-    if a_preshuffled:
-        # Quant/preshuffle reads padding rows too, so retain its -1 sentinel.
-        _apre_row_to_token = torch.full(
-            (int(contiguous_m),), -1, dtype=torch.int32, device=device
-        )
-    _tp_row_to_token = _apre_row_to_token
-    if _fuse_tp_gemm2_reduce and _tp_row_to_token is None:
-        # GEMM2 only reads live rows (row < mn_oob); every such entry is written
-        # by the route/remap kernel, so no fill launch is needed.
-        _tp_row_to_token = torch.empty(
-            (int(contiguous_m),), dtype=torch.int32, device=device
-        )
+    _apre_row_to_token = (
+        torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
+        if a_preshuffled
+        else None
+    )
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
@@ -1039,11 +956,7 @@ def _grouped_a8w4_tdm_moe(
         psum = herd_psum
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
-            topk_ids,
-            E,
-            max_m,
-            _align_m,
-            row_to_token=_tp_row_to_token,
+            topk_ids, E, max_m, _align_m
         )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
@@ -1077,11 +990,7 @@ def _grouped_a8w4_tdm_moe(
             _align_m,
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
-            row_to_token=(
-                _apre_row_to_token
-                if _apre_row_to_token is not None
-                else _tp_row_to_token
-            ),
+            row_to_token=_apre_row_to_token,
             topk=int(topk),
         )
         psum = psum.to(torch.int32).contiguous()
@@ -1387,28 +1296,6 @@ def _grouped_a8w4_tdm_moe(
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
-    moe_out = None
-    if not enable_ep_scatter:
-        moe_out = (
-            torch.empty((token_num, model_dim), dtype=dtype, device=device)
-            if output is None
-            else output
-        )
-    _tp_gemm2_kwargs = {}
-    if _fuse_tp_gemm2_reduce:
-        _n_tiles2 = model_dim // int(tile_n2)
-        _tp_gemm2_kwargs = {
-            "tp_reduce_output": moe_out,
-            "tp_row_to_token": _tp_row_to_token,
-            "tp_topids_to_rows": topids_to_rows,
-            "tp_weights": topk_weight.contiguous(),
-            "tp_counters": tp_gemm2_reduce_counter_buffer(
-                token_num, _n_tiles2, device
-            ),
-            "tp_topk": int(topk),
-            "tp_tokens": int(token_num),
-            "tp_counter_stride": TP_GEMM2_REDUCE_COUNTER_STRIDE,
-        }
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(
@@ -1443,7 +1330,6 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
         **_ep_gemm2_kwargs,
-        **_tp_gemm2_kwargs,
     )
 
     if kernel_bench_callable is not None:
@@ -1611,8 +1497,6 @@ def _grouped_a8w4_tdm_moe(
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
-                    **_ep_gemm2_kwargs,
-                    **_tp_gemm2_kwargs,
                 ),
             )
         )
@@ -1623,9 +1507,11 @@ def _grouped_a8w4_tdm_moe(
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
-    if _fuse_tp_gemm2_reduce:
-        return moe_out
-
+    moe_out = (
+        torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        if output is None
+        else output
+    )
     if _is_ep:
         # Route kernel already produced gather weights (dropped routes zeroed);
         # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens, and
@@ -2108,7 +1994,6 @@ def fused_route_psum_remap(
     experts: int,
     max_m: int,
     tile_m: int,
-    row_to_token: torch.Tensor | None = None,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
@@ -2142,14 +2027,10 @@ def fused_route_psum_remap(
         ptr_arg(masked_m),
         ptr_arg(starts),
         ptr_arg(psum),
-        ptr_arg(
-            row_to_token.reshape(-1) if row_to_token is not None else None
-        ),
         int(numel),
         experts,
         int(max_m),
         int(tile_m),
-        int(topk),
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
