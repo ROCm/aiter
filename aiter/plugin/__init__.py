@@ -101,6 +101,7 @@ class Decision:
     kernel_id: str | None = None
     artifact_digest: str | None = None
     qualification: str | None = None
+    config_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +129,9 @@ class _Config:
     """
 
     kill_switch: bool
-    disabled_ops: frozenset[str]
+    # op name -> the config layer that disabled it, so an op-disabled route
+    # names the layer that produced it rather than the enable layer.
+    disabled_ops: Mapping[str, str]
     forced_provider: str | None
     enabled: tuple[str, ...]
     source: str
@@ -227,16 +230,26 @@ def _build_config(default: _FrameworkDefault | None, generation: int) -> _Config
 
     # Enable layers replace; disable layers union.
     enabled = (default.enable if default else ()) if env_enable is None else env_enable
-    disabled = (default.disable if default else frozenset()) | frozenset(env_disable)
+
+    if default:
+        framework_source = f"configure:{default.source}"
+        disabled = dict.fromkeys(default.disable, framework_source)
+    else:
+        framework_source = None
+        disabled = {}
+    # Union, and the user's act is the one named when both layers disable an op.
+    disabled.update(dict.fromkeys(env_disable, "env"))
 
     if kill_switch or env_enable is not None or forced:
         source = "env"
-    elif default:
-        source = f"configure:{default.source}"
+    elif framework_source:
+        source = framework_source
     else:
         source = "default-deny"
 
-    return _Config(kill_switch, disabled, forced, enabled, source, generation)
+    return _Config(
+        kill_switch, MappingProxyType(disabled), forced, enabled, source, generation
+    )
 
 
 def _swap_config_locked() -> _Config:
@@ -295,9 +308,13 @@ def _dispatch(
 ) -> _R:
     config = _config()
     if config.kill_switch:
-        return _run_native(op, native, args, kwargs, "plugins-disabled")
-    if op.name in config.disabled_ops:
-        return _run_native(op, native, args, kwargs, "op-disabled")
+        # The feature is off, so there is nothing to observe and no Decision is
+        # recorded. A per-op disable below still records one: that op was routed
+        # and deliberately turned off, which is what an operator is watching.
+        return native(*args, **kwargs)
+    disabled_by = config.disabled_ops.get(op.name)
+    if disabled_by is not None:
+        return _run_native(op, native, args, kwargs, "op-disabled", disabled_by)
 
     eligible = _eligible(op, config)
     if not eligible:
@@ -307,38 +324,26 @@ def _dispatch(
             reason = "provider-not-enabled"
         else:
             reason = "no-provider"
-        return _run_native(op, native, args, kwargs, reason)
+        return _run_native(op, native, args, kwargs, reason, config.source)
 
     provider_args, provider_kwargs = canonicalize(*args, **kwargs)
     readonly_kwargs = MappingProxyType(provider_kwargs)
     declined = False
+    failure: tuple[str, str] | None = None
     for record in eligible:
         provider = record.provider
-        try:
-            candidate = provider.select(op, provider_args, readonly_kwargs)
-        except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
-            logger.warning(
-                "Provider %s selection failed for %s: %s", provider.name, op, error
-            )
-            return _run_native(
-                op, native, args, kwargs, "provider-select-error", provider.name
-            )
-
+        candidate, rejection = _ask_provider(
+            provider, op, provider_args, readonly_kwargs
+        )
+        if rejection is not None:
+            # Isolation: this provider is unusable for this call, but it may not
+            # deny service to a well-behaved one. The first error is the recorded
+            # one; either kind outranks a decline.
+            failure = failure or (rejection, provider.name)
+            continue
         if candidate is None:
             declined = True
             continue
-        if (
-            not isinstance(candidate, KernelCandidate)
-            or candidate.provider != provider.name
-        ):
-            logger.warning(
-                "Provider %s returned an invalid candidate (owned by %s)",
-                provider.name,
-                getattr(candidate, "provider", type(candidate).__name__),
-            )
-            return _run_native(
-                op, native, args, kwargs, "invalid-candidate", provider.name
-            )
 
         _last_decision.set(
             Decision(
@@ -349,14 +354,57 @@ def _dispatch(
                 kernel_id=candidate.kernel_id,
                 artifact_digest=candidate.artifact_digest,
                 qualification=candidate.qualification,
+                config_source=config.source,
             )
         )
         # Once provider execution starts, errors propagate. Falling back here could
         # repeat side effects or hide a broken kernel behind a successful result.
         return cast(_R, candidate.run(*provider_args, **provider_kwargs))
 
+    if failure is not None:
+        reason, provider_name = failure
+        return _run_native(
+            op, native, args, kwargs, reason, config.source, provider_name
+        )
     reason = "provider-declined" if declined else "no-provider"
-    return _run_native(op, native, args, kwargs, reason)
+    return _run_native(op, native, args, kwargs, reason, config.source)
+
+
+def _ask_provider(
+    provider: KernelProvider,
+    op: Op,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> tuple[KernelCandidate | None, str | None]:
+    """Ask one provider whether it serves this call.
+
+    Returns the candidate, ``(None, None)`` for a decline, or ``(None, reason)``
+    when the provider misbehaved before execution. Both kinds of misbehaviour --
+    an exception and a candidate that is not one, or is owned by somebody else --
+    mean the same thing to the caller, and are never silent.
+    """
+
+    try:
+        candidate = provider.select(op, args, kwargs)
+    except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+        logger.warning(
+            "Provider %s selection failed for %s: %s", provider.name, op, error
+        )
+        return None, "provider-select-error"
+
+    if candidate is None:
+        return None, None
+    if (
+        not isinstance(candidate, KernelCandidate)
+        or candidate.provider != provider.name
+    ):
+        logger.warning(
+            "Provider %s returned an invalid candidate (owned by %s)",
+            provider.name,
+            getattr(candidate, "provider", type(candidate).__name__),
+        )
+        return None, "invalid-candidate"
+    return candidate, None
 
 
 def _build_canonicalizer(contract: Signature) -> _Canonicalizer:
@@ -446,10 +494,17 @@ def _run_native(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     reason: str,
+    config_source: str,
     provider: str | None = None,
 ) -> _R:
     _last_decision.set(
-        Decision(op=op, route="native", reason=reason, provider=provider)
+        Decision(
+            op=op,
+            route="native",
+            reason=reason,
+            provider=provider,
+            config_source=config_source,
+        )
     )
     return native(*args, **kwargs)
 
