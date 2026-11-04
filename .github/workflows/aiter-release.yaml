@@ -430,6 +430,8 @@ jobs:
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -e PYBIN="${PYBIN}" \
+            -e PYTHONUNBUFFERED=1 \
+            -e PYTHONFAULTHANDLER=1 \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c '
@@ -442,6 +444,9 @@ jobs:
                 export ROCM_PATH="${ROCM_HOME}"
                 export PATH="$(python -m rocm_sdk path --bin):${PATH}"
                 echo "Using pip ROCm SDK: ROCM_HOME=${ROCM_HOME}"
+                # install_triton.sh has no triton builds for pip ROCm SDKs; keep
+                # the triton that torch pins (e.g. 3.8.0+git...rocm10.0.0).
+                export AITER_USE_SYSTEM_TRITON=1
               fi
               python --version
               which python gcc
