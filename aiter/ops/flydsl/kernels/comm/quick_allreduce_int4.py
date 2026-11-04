@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce, plus its reduce-scatter
+and all-gather phases on their own (``mode``, below).
 
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
@@ -23,6 +24,29 @@ RMSNorm at a row width that needs the 12-atom tile (``tile_atoms_for``).
 A rank never round-trips through its own inbox: its reduce-scatter share is
 added from registers, and its reduced chunk is decoded from the same packet it
 sends. That needs the rank at trace time, which costs one binary per rank.
+
+``mode`` ``"rs"`` / ``"ag"`` run one phase on its own, for sequence
+parallelism (``super_tile=1``, the 8-atom tile, INT4, no fused norm, and
+``divisor == 1``). Rank ``d`` then owns a contiguous block of ``N / world_size``
+bytes (rows ``[d*T/W, (d+1)*T/W)`` of a ``[T, H]`` tensor), not a slice of every
+tile: the tile machinery is unchanged and only the HBM address of atom
+``a = d*rank_atoms + k`` of tile ``v`` moves from ``v*tile_atoms + a`` to
+``d*A_s + v*rank_atoms + k`` with ``A_s = num_tiles * rank_atoms``. ``N`` must be
+a whole number of tiles. Unlike the all-reduce, these modes quantize this
+rank's own partial too, in registers, and accumulate it in rank order with the
+same dequant as a peer's packet, so a row's value does not depend on which rank
+owns it and every rank's all-gather output is bitwise equal.
+
+The all-reduce's second phase is the only guard against inbox reuse (a sender
+writes only after the receiver's previous release flag). A single phase has
+none, so both modes send their payload through the all-gather phase's slots
+and start every round with ``ready``: the reduce-scatter phase's release flag
+with no payload, published once this rank has finished reading the previous
+round (or launch), awaited by every sender before its first payload store. The
+exchange overlaps the round's load and quantize, and nothing is awaited after
+the reads, so a following all-reduce is safe too: it writes the reduce-scatter
+slots at once and waits for this rank's flag before it writes the all-gather
+ones. No other inbox word is used.
 
 ``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded fp16 is divided by it
 before the first pack; the gathered sum is multiplied by it once, through
@@ -64,6 +88,7 @@ from .allreduce_shared import (
     _buffer_load,
     _buffer_ptr,
     _color_io,
+    _global_ptr,
     _i32_to_bytes,
     _load_flag,
     _load_peers,
@@ -103,6 +128,10 @@ __all__ = [
     "DEFAULT_DIVISOR",
     "DEFAULT_GRID_CAP",
     "MESH_CODECS",
+    "MODES",
+    "MODE_AG",
+    "MODE_AR",
+    "MODE_RS",
     "SUPER_TILES",
     "SUPPORTED_BLOCKS",
     "SUPPORTED_WORLDS",
@@ -122,6 +151,12 @@ __all__ = [
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
+
+# The all-reduce, and its reduce-scatter / all-gather phase on its own.
+MODE_AR = "ar"
+MODE_RS = "rs"
+MODE_AG = "ag"
+MODES = (MODE_AR, MODE_RS, MODE_AG)
 
 # (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
 # mesh kernel. Super-tile widens the live atom list, so residency falls as it
@@ -256,6 +291,75 @@ def mesh_lds_bytes(
     return pack_rows * c.rank_tile_bytes + norm_red_bytes
 
 
+def _sp_payload_io(
+    inp_ptr, out_ptr, nbytes, num_tiles, mode, world_size, rank_atoms, block, tid
+):
+    """``(load, store)`` for this thread's 16 B of one atom of a ``mode="rs"`` /
+    ``"ag"`` payload.
+
+    ``"rs"`` reads the full ``[T, H]`` tensor and writes one rank's block,
+    ``"ag"`` reads a block and writes the full tensor. The full tensor is
+    ``(world_size, num_tiles, rank_atoms, block * 4)`` i32, rank ``d``'s block
+    being its ``d``-th slab; a block is ``(num_tiles, rank_atoms, block * 4)``.
+    ``load(*coord)`` and ``store(vec, *coord)`` take the coordinate of the input
+    or output side without its last mode: ``(d, tile, k)`` for the full tensor,
+    ``(tile, k)`` for a block. Thread *tid* owns i32 ``[4 * tid, 4 * tid + 4)``
+    of every row. *nbytes* is the full tensor's size in both modes, and bounds
+    both tensors, so a read past it returns 0 and a write past it is dropped.
+    """
+    row_i32 = block * 4
+    full_layout = fx.make_layout(
+        (world_size, num_tiles, rank_atoms, row_i32),
+        (num_tiles * fx.Int32(rank_atoms * row_i32), rank_atoms * row_i32, row_i32, 1),
+    )
+    shard_layout = fx.make_layout(
+        (num_tiles, rank_atoms, row_i32), (rank_atoms * row_i32, row_i32, 1)
+    )
+    row_layout = fx.make_layout((1, row_i32), (row_i32, 1))
+    copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+    thr_copy = fx.make_tiled_copy_tv(
+        copy_atom,
+        fx.make_layout((1, block), (1, 1)),
+        fx.make_layout((1, 4), (1, 1)),
+    ).get_slice(tid)
+    shard_bytes = nbytes // fx.Int64(world_size)
+
+    def _tensor(addr, layout, live_bytes):
+        view = fx.make_view(_global_ptr(addr, T.i32, 16), layout)
+        return rocdl.make_buffer_tensor(
+            view, max_size=False, num_records_bytes=live_bytes
+        )
+
+    full_in = mode == MODE_RS
+    inp = _tensor(
+        inp_ptr,
+        full_layout if full_in else shard_layout,
+        nbytes if full_in else shard_bytes,
+    )
+    out = _tensor(
+        out_ptr,
+        shard_layout if full_in else full_layout,
+        shard_bytes if full_in else nbytes,
+    )
+
+    def _row(buf, coord):
+        return fx.make_view(fx.get_iter(fx.slice(buf, (*coord, None))), row_layout)
+
+    def load(*coord):
+        src = thr_copy.partition_S(_row(inp, coord))
+        frag = fx.make_fragment_like(src)
+        fx.copy(copy_atom, src, frag)
+        return _atom_bf16_to_f16(fx.Vector(frag.load()))
+
+    def store(vec, *coord):
+        dst = thr_copy.partition_D(_row(out, coord))
+        frag = fx.make_fragment_like(dst)
+        frag.store(_atom_f16_to_bf16(vec))
+        fx.copy(copy_atom, frag, dst)
+
+    return load, store
+
+
 def make_quick_allreduce_int4_kernel(
     *,
     world_size: int = WORLD,
@@ -270,6 +374,7 @@ def make_quick_allreduce_int4_kernel(
     norm_latency: bool = False,
     norm_mxfp4: bool = False,
     tile_atoms: int | None = None,
+    mode: str = MODE_AR,
 ):
     """Build the mesh all-reduce kernel.
 
@@ -294,8 +399,21 @@ def make_quick_allreduce_int4_kernel(
     for latency: two workgroups per CU instead of the persistent-grid
     residency, so the host may only launch it with
     ``num_tiles <= latency_max_tiles(cu)``.
+
+    ``mode`` is ``"ar"`` (default, the two-phase all-reduce), ``"rs"`` (the
+    reduce-scatter phase alone: ``[T, H]`` partials in, this rank's contiguous
+    ``[T/W, H]`` reduced block out) or ``"ag"`` (the all-gather phase alone:
+    ``[T/W, H]`` in, ``[T, H]`` out). ``nbytes`` is the size of the full
+    ``[T, H]`` tensor in both. They share the engine's inbox and colors with
+    the all-reduce, take ``super_tile=1``, the 8-atom tile, the INT4 codec and
+    no fused norm, and need ``nbytes`` to be a whole number of tiles.
     """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    SP_MODE = mode != MODE_AR
     fuse_norm = norm_hidden is not None
+    if SP_MODE and (fuse_norm or norm_latency or norm_mxfp4):
+        raise ValueError(f"mode={mode!r} has no fused-norm epilogue")
     if norm_latency and (not fuse_norm or super_tile != 1 or block != BLOCK):
         raise ValueError("norm_latency needs norm_hidden, super_tile=1 and block=BLOCK")
     if norm_mxfp4 and not fuse_norm:
@@ -348,6 +466,12 @@ def make_quick_allreduce_int4_kernel(
         )
     if super_tile not in SUPER_TILES:
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
+    if SP_MODE and (super_tile != 1 or tile_atoms != DEFAULT_ATOMS or codec != "int4"):
+        raise ValueError(
+            f"mode={mode!r} needs super_tile=1, the {DEFAULT_ATOMS}-atom tile and "
+            f"codec='int4', got super_tile={super_tile!r}, tile_atoms={tile_atoms}, "
+            f"codec={codec!r}"
+        )
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
     # Each rank owns this many atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4 at
@@ -492,6 +616,20 @@ def make_quick_allreduce_int4_kernel(
             encode=_atom_f16_to_bf16,
         )
         _load_color, _store_color = _color_io(colors_ptr, bid)
+        if const_expr(SP_MODE):
+            # ``nbytes`` is the full tensor in both modes; the all-reduce's
+            # ``_payload_io`` above is unused here.
+            _sp_load, _sp_store = _sp_payload_io(
+                inp_ptr,
+                out_ptr,
+                nbytes,
+                num_tiles,
+                mode,
+                world_size,
+                rank_atoms,
+                block,
+                tid,
+            )
         if const_expr(fuse_norm):
             res_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 residual_ptr, num_records_bytes=nbytes
@@ -1023,6 +1161,45 @@ def make_quick_allreduce_int4_kernel(
                         gathered.append(_codec_dequant(c, words, _ag_scale(scale), tid))
             return gathered
 
+        def _own_packets(atoms):
+            """Our own share of *atoms*, quantized as a peer's packet of it is.
+
+            ``mode="rs"`` only. The all-reduce adds its own share exactly; here
+            it goes through the codec like every other partial, so a row's sum
+            does not depend on which rank owns it. The packet stays in
+            registers: our own inbox slots are never written.
+            """
+            own = []
+            for k in range_constexpr(rank_atoms):
+                words, scale, _ = _codec_quant(
+                    c, atoms[self_rank * rank_atoms + k], lane, tid
+                )
+                own.append((words, _scale_from_word(c, scale, pair_in_slot)))
+            return own
+
+        def _reduce_scattered_sp(own):
+            """Dequant-accumulate every rank's packet of this tile, in rank order.
+
+            A peer's packet arrives in the all-gather slots (``mode="rs"`` sends
+            through them, module docstring); ours is *own*, from
+            ``_own_packets``, accumulated by the same dequant so the arithmetic
+            does not depend on where a packet came from.
+            """
+            accs = [None] * rank_atoms
+            for src in range_constexpr(world_size):
+                for k in range_constexpr(rank_atoms):
+                    if const_expr(src == self_rank):
+                        words, scale = own[k]
+                    else:
+                        words, scale = _recv_quantized(
+                            PHASE_ALL_GATHER, fx.Int32(src), fx.Int32(0), k
+                        )
+                    if const_expr(accs[k] is None):
+                        accs[k] = _codec_dequant(c, words, scale, tid)
+                    else:
+                        accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
+            return accs
+
         # Stride by the *launched* grid, not the compile-time cap. The host
         # launches fewer blocks than `grid` whenever it wants each block to own
         # several tiles (see QuickAllReduceInt4._grid_x); striding by the cap instead would
@@ -1030,7 +1207,43 @@ def make_quick_allreduce_int4_kernel(
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
         color = _load_color()
-        if const_expr(super_tile == 1):
+        if const_expr(SP_MODE):
+            # One tile per round, ``ready`` first (module docstring). It is
+            # published after the tile's loads have landed, so the previous
+            # round's HBM stores do not delay it, and awaited only before the
+            # first payload store, so its flight overlaps the quantize.
+            for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+                tile = bid + i * n_blocks
+                if const_expr(mode == MODE_RS):
+                    atoms = [
+                        _sp_load(a // rank_atoms, tile, a % rank_atoms)
+                        for a in range_constexpr(tile_atoms)
+                    ]
+                else:
+                    atoms = [_sp_load(tile, k) for k in range_constexpr(rank_atoms)]
+                _publish(PHASE_REDUCE_SCATTER, rank, color)
+                if const_expr(mode == MODE_RS):
+                    _pack_reduce_scatter(atoms)
+                    own = _own_packets(atoms)
+                else:
+                    own = _pack_all_gather(atoms)
+                gpu.barrier()
+                _wait_release(PHASE_REDUCE_SCATTER, color)
+                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
+                _publish(PHASE_ALL_GATHER, rank, color)
+
+                _wait_release(PHASE_ALL_GATHER, color)
+                if const_expr(mode == MODE_RS):
+                    for k, acc in enumerate(_reduce_scattered_sp(own)):
+                        _sp_store(acc, tile, k)
+                else:
+                    for a, atom in enumerate(_recv_all_gather(fx.Int32(0), own)):
+                        _sp_store(atom, a // rank_atoms, tile, a % rank_atoms)
+
+                color = color + fx.Int32(1)
+                if color == fx.Int32(0):  # 0 is unset sentinel
+                    color = fx.Int32(1)
+        elif const_expr(super_tile == 1):
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
                 res_pref = None
@@ -1122,10 +1335,10 @@ def make_quick_allreduce_int4_kernel(
     value_attrs = {"rocdl.flat_work_group_size": flat_wg}
     if NORM_LATENCY:
         value_attrs["rocdl.waves_per_eu"] = NORM_LATENCY_WGS_PER_CU
-    elif fuse_norm:
+    elif fuse_norm or SP_MODE:
         # The host sizes the persistent grid from the plain kernel's
         # residency. One wave per SIMD per workgroup at BLOCK, so pin the
-        # fused epilogue to the same VGPR budget.
+        # fused epilogue and the single-phase modes to the same VGPR budget.
         value_attrs["rocdl.waves_per_eu"] = _resident_wgs_per_cu(world_size, super_tile)
 
     @flyc.jit
@@ -1172,6 +1385,8 @@ def make_quick_allreduce_int4_kernel(
 
     tag = f"{SCALE_CODEC_TAG}_ws{world_size}_r{self_rank}_st{super_tile}_g{grid}"
     tag += f"_{inbox_memory}_{codec}_b{block}"
+    if SP_MODE:
+        tag += f"_{mode}"
     if tile_atoms != DEFAULT_ATOMS:
         tag += f"_a{tile_atoms}"
     if fuse_norm:
@@ -1194,6 +1409,7 @@ def make_quick_allreduce_int4_kernel(
         "wire_tile_bytes": wire_tile_bytes,
         "super_tile": super_tile,
         "world_size": world_size,
+        "mode": mode,
         "inbox_memory": inbox_memory,
         "codec": codec,
         "payload_policy": payload_policy,

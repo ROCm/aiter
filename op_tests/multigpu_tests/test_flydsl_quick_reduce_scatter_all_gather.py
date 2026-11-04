@@ -57,11 +57,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+    BLOCK,
+    DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
     TILE_BYTES,
+    TwoShotRung,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 
 try:
     ARCH = get_gfx_runtime()
@@ -351,8 +353,10 @@ def _run_rank(
         device=device,
         rank=rank,
         world_size=tp,
-        super_tile=1,
-        grid_cap=grid_cap,
+        # The single-phase kernels are super_tile=1 only.
+        ladder=(
+            TwoShotRung(min_bytes=0, super_tile=1, grid_cap=grid_cap, block=BLOCK),
+        ),
     )
     rows = []
     try:
