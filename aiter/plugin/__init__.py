@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 from importlib import metadata
 from inspect import Parameter, Signature, signature
-from threading import Lock
+from threading import RLock
 from types import MappingProxyType
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
 
@@ -65,16 +65,13 @@ class KernelCandidate:
     provider: str
     kernel_id: str
     artifact_digest: str
-    qualification: str
-    run: Callable[..., Any] = field(repr=False, compare=False)
+    # Optional: the interface says AITER *may* record a provider-supplied
+    # evidence reference, not that a provider must have one to serve.
+    qualification: str | None = None
+    run: Callable[..., Any] = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        identity = (
-            self.provider,
-            self.kernel_id,
-            self.artifact_digest,
-            self.qualification,
-        )
+        identity = (self.provider, self.kernel_id, self.artifact_digest)
         if not all(identity) or not callable(self.run):
             raise ValueError(
                 "candidate identity must be complete and run must be callable"
@@ -130,6 +127,10 @@ class _ProviderRecord:
     provider: KernelProvider
     # the provider API version this provider and this AITER agreed on
     api_version: int
+    # Read once, at discovery. A provider may be a proxy whose attributes start
+    # throwing when its backend goes away; reading the name again inside an
+    # except block would let that exception escape the isolation boundary.
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +178,6 @@ class _RoutedOp:
 
     op: Op
     contract: Signature
-    native: Callable[..., Any]
     canonicalize: _Canonicalizer
     # older op_version -> the release that stops accepting it
     superseded: Mapping[int, str] = MappingProxyType({})
@@ -191,9 +191,14 @@ class _SkippedProvider:
 
 @dataclass(frozen=True, slots=True)
 class Explanation:
-    """What ``explain()`` found without executing anything."""
+    """What ``explain()`` found without executing anything.
 
-    decision: Decision
+    ``decision`` is ``None`` when the call would not produce one at all, which
+    today means the kill switch is on: dispatch goes straight to native and
+    records nothing, so there is no would-be Decision to report.
+    """
+
+    decision: Decision | None
     declines: Mapping[str, str]
 
 
@@ -206,9 +211,11 @@ _callback_errors = 0
 _route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
 _skipped_providers: tuple[_SkippedProvider, ...] = ()
 _provider_records: tuple[_ProviderRecord, ...] | None = None
-_provider_lock = Lock()
+# Reentrant, and discovery runs outside it: both guard against a provider
+# that touches aiter while importing.
+_provider_lock = RLock()
 _config_snapshot: _Config | None = None
-_config_lock = Lock()
+_config_lock = RLock()
 _framework_default: _FrameworkDefault | None = None
 _eligible_cache: dict[tuple[str, int, int], tuple[_ProviderRecord, ...]] = {}
 _FALSY = {"0", "false", "no", "off"}
@@ -281,7 +288,9 @@ def _env_list(name: str) -> tuple[str, ...] | None:
 def _build_config(default: _FrameworkDefault | None, generation: int) -> _Config:
     env_enable = _env_list("AITER_PLUGIN_ENABLE")
     env_disable = _env_list("AITER_PLUGIN_DISABLE") or ()
-    forced = os.getenv("AITER_PLUGIN_FORCE") or None
+    # Stripped like every other control: " aklr" naming nothing is a typo, not
+    # a request to disable forcing.
+    forced = (os.getenv("AITER_PLUGIN_FORCE") or "").strip() or None
     kill_switch = os.getenv("AITER_PLUGINS", "1").strip().lower() in _FALSY
 
     # Enable layers replace; disable layers union.
@@ -365,7 +374,7 @@ def route(
         # list exists to avoid.
         if op in _routed_ops:
             raise ValueError(f"op {op!r} is already routed")
-        _routed_ops[op] = _RoutedOp(operation, contract, native, canonicalize, accepted)
+        _routed_ops[op] = _RoutedOp(operation, contract, canonicalize, accepted)
 
         @wraps(native)
         def routed(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -413,15 +422,12 @@ def _dispatch(
     declined = False
     failure: tuple[str, str] | None = None
     for record in eligible:
-        provider = record.provider
-        candidate, rejection = _ask_provider(
-            provider, op, provider_args, readonly_kwargs
-        )
+        candidate, rejection = _ask_provider(record, op, provider_args, readonly_kwargs)
         if rejection is not None:
             # Isolation: this provider is unusable for this call, but it may not
             # deny service to a well-behaved one. The first error is the recorded
             # one; either kind outranks a decline.
-            failure = failure or (rejection, provider.name)
+            failure = failure or (rejection, record.name)
             continue
         if candidate is None:
             declined = True
@@ -554,14 +560,7 @@ def status() -> Mapping[str, Any]:
             "enabled": config.enabled,
             "forced_provider": config.forced_provider,
             "disabled_ops": dict(config.disabled_ops),
-            "providers": tuple(
-                {
-                    "name": record.provider.name,
-                    "entry_point": record.entry_point,
-                    "op_versions": dict(record.provider.op_versions),
-                }
-                for record in _providers()
-            ),
+            "providers": tuple(_described(record) for record in _providers()),
             "skipped_providers": tuple(
                 {"entry_point": skipped.entry_point, "reason": skipped.reason}
                 for skipped in _skipped_providers
@@ -570,7 +569,7 @@ def status() -> Mapping[str, Any]:
                 name: {
                     "version": routed.op.version,
                     "eligible": tuple(
-                        record.provider.name for record in _eligible(routed.op, config)
+                        record.name for record in _eligible(routed.op, config)
                     ),
                 }
                 for name, routed in _routed_ops.items()
@@ -581,7 +580,7 @@ def status() -> Mapping[str, Any]:
                     [
                         {
                             "kind": "provider-api",
-                            "subject": record.provider.name,
+                            "subject": record.name,
                             "version": record.api_version,
                             "removed_in": SUPERSEDED_API_VERSIONS[record.api_version],
                         }
@@ -620,12 +619,13 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     config = _config()
     operation = routed.op
     if config.kill_switch:
-        return _explained(operation, "plugins-disabled", "env")
+        # Mirrors dispatch exactly: it records nothing, so neither do we.
+        return Explanation(None, MappingProxyType({}))
     disabled_by = config.disabled_ops.get(op)
     if disabled_by is not None:
         return _explained(operation, "op-disabled", disabled_by)
 
-    eligible = _eligible(operation, config)
+    eligible = _eligible(operation, config, warn=False)
     if not eligible:
         if config.forced_provider:
             reason = "forced-provider-unavailable"
@@ -639,15 +639,14 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     readonly = MappingProxyType(canonical_kwargs)
     declines: dict[str, str] = {}
     for record in eligible:
-        provider = record.provider
         candidate, rejection = _ask_provider(
-            provider, operation, canonical_args, readonly
+            record, operation, canonical_args, readonly
         )
         if rejection is not None:
-            declines[provider.name] = rejection
+            declines[record.name] = rejection
             continue
         if candidate is None:
-            declines[provider.name] = "declined"
+            declines[record.name] = "declined"
             continue
         return Explanation(
             Decision(
@@ -663,9 +662,39 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
             MappingProxyType(declines),
         )
 
-    errored = next((r for r in declines.values() if r != "declined"), None)
-    reason = errored or "provider-declined"
-    return _explained(operation, reason, config.source, declines)
+    # Same precedence as dispatch, and the same provider named with it.
+    blamed = next(
+        ((name, why) for name, why in declines.items() if why != "declined"), None
+    )
+    if blamed is not None:
+        return _explained(operation, blamed[1], config.source, declines, blamed[0])
+    return _explained(operation, "provider-declined", config.source, declines)
+
+
+def _described(record: _ProviderRecord) -> Mapping[str, Any]:
+    """One provider as data, without trusting it to answer.
+
+    A provider may be a proxy whose attributes start throwing when its backend
+    goes away. Dispatch already degrades to native in that case; status() is
+    where an operator goes to find out why, so it must not be the one call that
+    fails.
+    """
+
+    try:
+        op_versions: Any = {
+            name: sorted(versions)
+            for name, versions in record.provider.op_versions.items()
+        }
+    except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+        op_versions = f"<unavailable: {error}>"
+    return MappingProxyType(
+        {
+            "name": record.name,
+            "entry_point": record.entry_point,
+            "api_version": record.api_version,
+            "op_versions": op_versions,
+        }
+    )
 
 
 def _explained(
@@ -673,15 +702,22 @@ def _explained(
     reason: str,
     config_source: str,
     declines: Mapping[str, str] | None = None,
+    provider: str | None = None,
 ) -> Explanation:
     return Explanation(
-        Decision(op=op, route="native", reason=reason, config_source=config_source),
+        Decision(
+            op=op,
+            route="native",
+            reason=reason,
+            config_source=config_source,
+            provider=provider,
+        ),
         MappingProxyType(dict(declines or {})),
     )
 
 
 def _ask_provider(
-    provider: KernelProvider,
+    record: _ProviderRecord,
     op: Op,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
@@ -695,22 +731,19 @@ def _ask_provider(
     """
 
     try:
-        candidate = provider.select(op, args, kwargs)
+        candidate = record.provider.select(op, args, kwargs)
     except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
         logger.warning(
-            "Provider %s selection failed for %s: %s", provider.name, op, error
+            "Provider %s selection failed for %s: %s", record.name, op, error
         )
         return None, "provider-select-error"
 
     if candidate is None:
         return None, None
-    if (
-        not isinstance(candidate, KernelCandidate)
-        or candidate.provider != provider.name
-    ):
+    if not isinstance(candidate, KernelCandidate) or candidate.provider != record.name:
         logger.warning(
             "Provider %s returned an invalid candidate (owned by %s)",
-            provider.name,
+            record.name,
             getattr(candidate, "provider", type(candidate).__name__),
         )
         return None, "invalid-candidate"
@@ -828,7 +861,9 @@ def _run_native(
     return native(*args, **kwargs)
 
 
-def _eligible(op: Op, config: _Config) -> tuple[_ProviderRecord, ...]:
+def _eligible(
+    op: Op, config: _Config, *, warn: bool = True
+) -> tuple[_ProviderRecord, ...]:
     """Cached per ``(op, config generation)``.
 
     A build race is benign: both racers compute the same value from the same
@@ -837,20 +872,27 @@ def _eligible(op: Op, config: _Config) -> tuple[_ProviderRecord, ...]:
 
     key = (op.name, op.version, config.generation)
     cached = _eligible_cache.get(key)
-    if cached is None:
-        cached = _eligible_cache[key] = _build_eligible(op, config)
-    return cached
+    if cached is not None:
+        return cached
+    built = _build_eligible(op, config, warn=warn)
+    if warn:
+        _eligible_cache[key] = built
+    # A quiet build is not cached: caching it would swallow the deprecation
+    # warning for every later call, which is worse than spending it here.
+    return built
 
 
-def _build_eligible(op: Op, config: _Config) -> tuple[_ProviderRecord, ...]:
+def _build_eligible(
+    op: Op, config: _Config, *, warn: bool = True
+) -> tuple[_ProviderRecord, ...]:
     """Providers that may serve this op, in preference order."""
 
     if config.forced_provider:
         return tuple(
             record
             for record in _providers()
-            if record.provider.name == config.forced_provider
-            and _supports(record.provider, op)
+            if record.name == config.forced_provider
+            and _supports(record, op, warn=warn)
         )
 
     # Walk the enable list, not the provider names: the enable list order is the
@@ -860,33 +902,37 @@ def _build_eligible(op: Op, config: _Config) -> tuple[_ProviderRecord, ...]:
         record
         for name in config.enabled
         for record in by_name.get(name, ())
-        if _supports(record.provider, op)
+        if _supports(record, op, warn=warn)
     )
 
 
 def _records_by_provider_name() -> dict[str, list[_ProviderRecord]]:
     grouped: dict[str, list[_ProviderRecord]] = {}
     for record in _providers():
-        grouped.setdefault(record.provider.name, []).append(record)
+        grouped.setdefault(record.name, []).append(record)
     return grouped
 
 
-def _supports(provider: KernelProvider, op: Op) -> bool:
-    return _matched_version(provider, op) is not None
+def _supports(record: _ProviderRecord, op: Op, *, warn: bool = True) -> bool:
+    return _matched_version(record, op, warn=warn) is not None
 
 
-def _matched_version(provider: KernelProvider, op: Op) -> int | None:
+def _matched_version(
+    record: _ProviderRecord, op: Op, *, warn: bool = True
+) -> int | None:
     """The op version this provider serves ``op`` on, or ``None``.
 
     The contract version wins. An older version is matched only while this
-    contract still accepts it, and matching one warns once, naming the release
-    that stops accepting it.
+    contract still accepts it; the newest acceptable one is chosen, the same
+    rule discovery uses for API versions. Matching one warns once, naming the
+    release that stops accepting it -- unless ``warn`` is off, which is how a
+    dry run avoids spending the one-shot warning on an interactive query.
     """
 
     try:
-        declared = frozenset(provider.op_versions.get(op.name, ()))
+        declared = frozenset(record.provider.op_versions.get(op.name, ()))
     except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
-        logger.warning("Provider %s has invalid op_versions: %s", provider.name, error)
+        logger.warning("Provider %s has invalid op_versions: %s", record.name, error)
         return None
 
     if op.version in declared:
@@ -894,19 +940,19 @@ def _matched_version(provider: KernelProvider, op: Op) -> int | None:
 
     routed = _routed_ops.get(op.name)
     accepted = routed.superseded if routed is not None else {}
-    for version, removal in accepted.items():
-        if version in declared:
+    for version in sorted(declared & accepted.keys(), reverse=True):
+        if warn:
             _warn_once(
-                ("op", provider.name, op.name, version),
+                ("op", record.name, op.name, version),
                 "Provider %s serves %s on superseded op version %s; %s stops "
                 "accepting it. Re-validate against version %s.",
-                provider.name,
+                record.name,
                 op.name,
                 version,
-                removal,
+                accepted[version],
                 op.version,
             )
-            return version
+        return version
     return None
 
 
@@ -920,19 +966,28 @@ def _warn_once(key: tuple[Any, ...], message: str, *args: Any) -> None:
 
 
 def _providers() -> Sequence[_ProviderRecord]:
-    global _provider_records
-    if _provider_records is None:
-        with _provider_lock:
-            if _provider_records is None:
-                _provider_records = _discover_providers()
-    return _provider_records
+    global _provider_records, _skipped_providers
+    records = _provider_records
+    if records is not None:
+        return records
+
+    # Discovery imports third-party code. It runs outside the lock so that a
+    # provider which touches aiter while importing re-enters cleanly instead of
+    # deadlocking on a lock this thread already holds. Two threads racing only
+    # means the same set is discovered twice; the first to publish wins.
+    discovered, skipped = _discover_providers()
+    with _provider_lock:
+        if _provider_records is None:
+            _provider_records = discovered
+            _skipped_providers = skipped
+        return _provider_records
 
 
 def _accepted_api_versions() -> frozenset[int]:
     return frozenset({API_VERSION, *SUPERSEDED_API_VERSIONS})
 
 
-def _declared_api_versions(provider: KernelProvider) -> frozenset[int]:
+def _declared_api_versions(provider: KernelProvider, name: str) -> frozenset[int]:
     """Every provider API version this provider says it supports.
 
     ``api_versions`` is the spelling the interface asks for. A provider that
@@ -946,28 +1001,39 @@ def _declared_api_versions(provider: KernelProvider) -> frozenset[int]:
     single = provider.api_version
     if SUPERSEDED_API_SPELLING is not None:
         _warn_once(
-            ("spelling", provider.name),
+            ("spelling", name),
             "Provider %s declares api_version=%s; declare api_versions instead, "
             "so one release can support several. %s stops reading the single "
             "spelling.",
-            provider.name,
+            name,
             single,
             SUPERSEDED_API_SPELLING,
         )
     return frozenset({single})
 
 
-def _discover_providers() -> tuple[_ProviderRecord, ...]:
-    global _skipped_providers
+def _discover_providers() -> (
+    tuple[tuple[_ProviderRecord, ...], tuple[_SkippedProvider, ...]]
+):
     records: list[_ProviderRecord] = []
     skipped: list[_SkippedProvider] = []
-    for entry_point in sorted(_entry_points(), key=lambda item: item.name):
+    try:
+        entry_points = sorted(_entry_points(), key=lambda item: item.name)
+    except Exception as error:  # noqa: BLE001 - a broken wheel is not aiter's bug
+        # Enumeration reads every installed distribution's metadata, including
+        # packages with nothing to do with aiter. One malformed entry_points.txt
+        # must not raise into a kernel call -- and must not leave discovery
+        # unfinished, or every later call would raise again.
+        logger.warning("Provider discovery failed, no provider is available: %s", error)
+        return (), (_SkippedProvider("<entry point scan>", str(error)),)
+
+    for entry_point in entry_points:
         try:
             loaded = entry_point.load()
             provider = loaded if hasattr(loaded, "select") else loaded()
             name = provider.name
             _ = provider.op_versions
-            declared = _declared_api_versions(provider)
+            declared = _declared_api_versions(provider, name)
             accepted = _accepted_api_versions()
             usable = declared & accepted
             if not usable:
@@ -994,7 +1060,7 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
                     removal,
                     API_VERSION,
                 )
-            records.append(_ProviderRecord(entry_point.name, provider, matched))
+            records.append(_ProviderRecord(entry_point.name, provider, matched, name))
         except Exception as error:  # noqa: BLE001 - one plugin must not break AITER
             logger.warning(
                 "Skipping provider entry point %s: %s", entry_point.name, error
@@ -1002,11 +1068,11 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             # status() reports what was skipped and why: an installed provider
             # that never serves is the question an operator asks first.
             skipped.append(_SkippedProvider(entry_point.name, str(error)))
-    ordered = sorted(records, key=lambda item: (item.provider.name, item.entry_point))
+    ordered = sorted(records, key=lambda item: (item.name, item.entry_point))
     kept: list[_ProviderRecord] = []
     claimed: dict[str, str] = {}
     for record in ordered:
-        owner = claimed.get(record.provider.name)
+        owner = claimed.get(record.name)
         if owner is not None:
             # A provider name is an identity: AITER_PLUGIN_ENABLE and
             # AITER_PLUGIN_FORCE address it, and a Decision names it. Two
@@ -1014,17 +1080,16 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             # ambiguous and would let install order decide which serves.
             # Skipped rather than raised: a bad install must never break
             # ``import aiter``.
-            reason = f"name {record.provider.name!r} is already used by entry point {owner!r}"
+            reason = f"name {record.name!r} is already used by entry point {owner!r}"
             logger.warning(
                 "Skipping provider entry point %s: %s", record.entry_point, reason
             )
             skipped.append(_SkippedProvider(record.entry_point, reason))
             continue
-        claimed[record.provider.name] = record.entry_point
+        claimed[record.name] = record.entry_point
         kept.append(record)
 
-    _skipped_providers = tuple(skipped)
-    return tuple(kept)
+    return tuple(kept), tuple(skipped)
 
 
 def _entry_points() -> Sequence[metadata.EntryPoint]:
@@ -1056,6 +1121,7 @@ def _reset_for_testing() -> None:
 
 __all__ = [
     "API_VERSION",
+    "ENTRY_POINT_GROUP",
     "SUPERSEDED_API_SPELLING",
     "SUPERSEDED_API_VERSIONS",
     "Decision",
