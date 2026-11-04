@@ -21,12 +21,20 @@
       "machine": "supermicro5",
       "warmup": 10,
       "iters": 30,
-      "required_mean_delta_vs_vllm_pct": 1.0,
-      "required_median_delta_vs_vllm_pct": 0.5,
+      "dispatch_policy": "full_swept_interval_because_original_aiter_fallback_is_not_runnable",
+      "performance_preferred_mean_delta_vs_vllm_pct": 1.0,
+      "performance_preferred_median_delta_vs_vllm_pct": 0.5,
+      "swept_rows": 1537,
+      "mean_latency_winner_or_equal_rows": 1415,
+      "mean_latency_loser_rows": 122,
+      "performance_preferred_rows": 1356,
       "original_aiter_fallback": "not_runnable_in_validation_container",
-      "original_aiter_blocker": "module_moe_sorting_opus build failure on gfx1201; CK sorting path missing moe_sorting_api.hpp in the validation image"
+      "original_aiter_blocker": "default Opus sorting fails to build module_moe_sorting_opus on gfx1201; CK sorting path is unavailable because moe_sorting_api.hpp is absent; FlyDSL sorting avoids Opus but the CK two-stage fallback then faults"
     },
     "m_ranges": [
+      [1024, 2560]
+    ],
+    "performance_preferred_m_ranges": [
       [1024, 1024],
       [1026, 1026],
       [1028, 1028],

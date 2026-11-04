@@ -21,28 +21,28 @@ _RTOL = 1e-2
 _ATOL = 128
 _POLICY_SELECTED_TOKENS = [
     1024,
+    1025,
+    1136,
     1152,
     1543,
     1544,
+    1678,
+    1724,
     1728,
     1799,
     1803,
     1815,
     1837,
+    1944,
     1945,
+    2039,
     2048,
+    2304,
+    2446,
     2560,
 ]
 _POLICY_REJECTED_TOKENS = [
     1023,
-    1025,
-    1136,
-    1678,
-    1724,
-    1944,
-    2039,
-    2304,
-    2446,
     2561,
 ]
 
@@ -118,7 +118,7 @@ def _force_validated_gfx1201_target(monkeypatch):
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
 
-@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1945, 2048, 2560])
+@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1944, 2048, 2560])
 def test_public_fused_moe_bf16_g1u1_selected_large_m(tokens):
     hidden, w1, w2, weights, ids = _make_case(tokens)
 
