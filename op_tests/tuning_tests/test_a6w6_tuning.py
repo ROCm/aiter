@@ -250,7 +250,7 @@ class TestA6W6Manifest(unittest.TestCase):
         self.assertTrue({"exact_M", "exact_N", "exact_K"}.issubset(configs.columns))
         exact_columns = ["exact_M", "exact_N", "exact_K"]
         specialized = configs[(configs[exact_columns] > 0).all(axis=1)]
-        self.assertEqual(len(specialized), 30)
+        self.assertEqual(len(specialized), 35)
         for row in specialized.itertuples():
             match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", row.knl_name)
             self.assertIsNotNone(match)
