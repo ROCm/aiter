@@ -78,8 +78,9 @@ def test_gfx1250_pool_grows_to_largest_set_cutoff():
     # The other ops keep their own defaults.
     assert s.ar == 64 * MiB and s.rs == 64 * MiB, s
 
-    s = resolve(True, AR_MAX=3 * GiB, AG_MAX=2 * GiB, RS_MAX=5 * GiB)
-    assert (s.pool, s.ar, s.ag, s.rs) == (5 * GiB, 3 * GiB, 2 * GiB, 5 * GiB), s
+    rs_max = 3 * GiB + 512 * MiB
+    s = resolve(True, AR_MAX=3 * GiB, AG_MAX=2 * GiB, RS_MAX=rs_max)
+    assert (s.pool, s.ar, s.ag, s.rs) == (rs_max, 3 * GiB, 2 * GiB, rs_max), s
 
     # Rounded up to 2 MiB.
     s = resolve(True, RS_MAX=2 * GiB + 1)
@@ -97,6 +98,40 @@ def test_gfx1250_pool_never_shrinks():
 def test_gfx1250_prefill_not_halved():
     s = resolve(True, AR_MAX=2 * GiB)
     assert s.pool == 2 * GiB and s.ar == 2 * GiB and s.ar_prefill == 2 * GiB, s
+
+
+INT32_MAX = (1 << 31) - 1
+
+
+def test_gfx1250_caps_at_kernel_index_range():
+    # AG: the output in 16-byte packs must fit int32, per rank
+    # 16 * (INT32_MAX // world_size) bytes, whatever the dtype.
+    for ws in (2, 4, 8):
+        s = resolve(True, ws=ws, AG_MAX=64 * GiB)
+        cap = 16 * (INT32_MAX // ws)
+        assert s.ag == cap, (ws, s)
+        assert (cap // 16) * ws <= INT32_MAX < (cap // 16 + 1) * ws, ws
+        assert s.pool == (cap + 2 * MiB - 1) // (2 * MiB) * (2 * MiB), (ws, s)
+    # AR / RS: the element count must fit int32 for 2-byte dtypes.
+    s = resolve(True, AR_MAX=8 * GiB, RS_MAX=8 * GiB)
+    assert s.ar == s.ar_prefill == s.rs == 2 * INT32_MAX, s
+    assert s.pool == 4 * GiB, s
+    # Below the caps nothing changes.
+    s = resolve(True, ws=8, AG_MAX=2 * GiB, AR_MAX=3 * GiB)
+    assert s.ag == 2 * GiB and s.ar == 3 * GiB, s
+    # gfx9 keeps its pool cap and is not affected.
+    s = resolve(False, ws=8, AG_MAX=64 * GiB)
+    assert s.pool == GiB and s.ag == GiB, s
+
+
+def test_gfx1250_ag_gate_takes_large_bf16():
+    # 1.25 GiB of bf16 a rank at world_size 4 is 2.68e9 output elements, past
+    # int32, but only 3.4e8 16-byte packs, which the kernels index. The gate is
+    # in bytes and admits it.
+    ca = _stub(AG_MAX=2 * GiB)
+    inp = torch.empty(5 * GiB // 8, dtype=torch.bfloat16)
+    assert inp.numel() * 4 > INT32_MAX
+    assert ca.should_custom_ag(inp)
 
 
 def test_gfx9_pool_fixed_and_cutoffs_capped():

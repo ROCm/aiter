@@ -259,7 +259,10 @@ def _runtime_gfx() -> str | None:
 #
 #   gfx1250: the pool grows to max(max_size, the cutoffs set in the env),
 #            rounded up to 2 MiB. Its kernels are 1-stage with no tmp region,
-#            so the cost is exactly the pool, once per rank.
+#            so the cost is exactly the pool, once per rank. The cutoffs are
+#            first capped at what the kernels can index with int32 (see
+#            _gfx1250_kernel_caps), so the pool never grows for a size no
+#            kernel takes.
 #   gfx9:    the pool stays at max_size (1 GiB by default) whatever the env
 #            says. The old-arch meta buffer also carries a 2 * max_size tmp
 #            region (see _init_ipc), so a pool of N would cost about 3N per
@@ -275,6 +278,29 @@ _CRS_MAX_SIZE_ENV = "AITER_CUSTOM_RS_MAX_SIZE"
 # allocation granularity (see _init_ipc). VMMBuffer rounds to its own
 # granularity on top.
 _POOL_ALIGN = 2 * 1024 * 1024
+
+_INT32_MAX = (1 << 31) - 1
+
+
+def _gfx1250_kernel_caps(world_size: int) -> tuple[int, int, int]:
+    """Largest AR / AG / RS input (bytes) the gfx1250 kernels can index.
+
+    They index with int32, and these caps are the C++ checks restated in
+    bytes. Keep them in sync with custom_all_reduce_gfx1250.cuh, or the size
+    gates admit inputs the kernels then reject with an exception instead of
+    falling back to RCCL.
+
+    * AG: allgather_packs counts the output in 16-byte packs, so the output
+      can be up to 16 * INT32_MAX bytes whatever the dtype. Per rank that is
+      16 * (INT32_MAX // world_size).
+    * AR / RS: allreduce() and reduce_scatter() take the element count as
+      int, and the kernels' index arithmetic stays within it. 2 bytes is the
+      narrowest dtype they take (fp16 / bf16), so 2 * INT32_MAX bytes keeps
+      the element count in range for every dtype.
+    """
+    ar_rs = 2 * _INT32_MAX
+    return ar_rs, 16 * (_INT32_MAX // world_size), ar_rs
+
 
 # Custom-AR lower size bound (bytes), all-reduce only. Inputs at or below this
 # run on RCCL instead of the custom kernels; only inputs strictly above it are
@@ -330,9 +356,11 @@ def _resolve_custom_sizes(
     that the env can only raise; on gfx9 it is the pool size, period. See the
     comment above _DEFAULT_CAR_MAX_SIZE for the env vars and the reasoning.
 
-    Every cutoff is capped at what the pool can hold. The AR prefill cutoff is
-    capped further on gfx9, whose 2-stage write mode needs the 2x tmp region,
-    to half the pool, as before. gfx1250 has no tmp region and no such cap.
+    Every cutoff is capped at what the pool can hold. On gfx1250 each is
+    first capped at what its kernel can index (_gfx1250_kernel_caps), before
+    the pool is sized from them. The AR prefill cutoff is capped further on
+    gfx9, whose 2-stage write mode needs the 2x tmp region, to half the pool,
+    as before. gfx1250 has no tmp region and no such cap.
     """
     ar, ar_set = _read_size_env(_CAR_MAX_SIZE_ENV, _DEFAULT_CAR_MAX_SIZE)
     ag, ag_set = _read_size_env(_CAG_MAX_SIZE_ENV, max_size // (2 * world_size))
@@ -349,6 +377,25 @@ def _resolve_custom_sizes(
 
     pool = max_size
     if is_gfx1250:
+        ar_cap, ag_cap, rs_cap = _gfx1250_kernel_caps(world_size)
+        caps = {
+            _CAR_MAX_SIZE_ENV: ar_cap,
+            _CAG_MAX_SIZE_ENV: ag_cap,
+            _CRS_MAX_SIZE_ENV: rs_cap,
+        }
+        for name, v in requested:
+            if v > caps[name]:
+                logger.warning(
+                    "%s=%d is more than the gfx1250 kernels can index with "
+                    "int32 at world_size %d; capped at %d bytes. Inputs above "
+                    "it fall back to RCCL.",
+                    name,
+                    v,
+                    world_size,
+                    caps[name],
+                )
+        ar, ag, rs = min(ar, ar_cap), min(ag, ag_cap), min(rs, rs_cap)
+        requested = [(name, min(v, caps[name])) for name, v in requested]
         # Grow only for the cutoffs that were set, so with none set the pool
         # stays exactly max_size.
         want = max((v for _, v in requested), default=0)
