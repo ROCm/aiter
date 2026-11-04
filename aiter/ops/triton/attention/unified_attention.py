@@ -171,9 +171,11 @@ def _length_aware_split(config, params: _UAParams):
     if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
         return None
     budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
-    # the kernels sum the KV lengths and round that up by budget in int32, and
-    # pack the sequences before an item in 15 bits and the items before it in 16
-    if params.num_seqs * params.max_seqlen_k + budget >= 2**31:
+    # the kernels round sum(seq_len) up by budget and seq_len up by its segments'
+    # tiles in int32 (a shuffled tile is the page), and pack the sequences before
+    # an item in 15 bits and the items before it in 16
+    tile = max(config["TILE_SIZE"], params.block_size)
+    if params.num_seqs * params.max_seqlen_k + budget + num_segments * tile >= 2**31:
         return None
     if budget + params.num_seqs >= 2**16 or params.num_seqs >= 2**15:
         return None
@@ -767,9 +769,17 @@ def _unified_attention_3d_triton(
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
     split_runs_per_xcd = config.pop("SPLIT_RUNS_PER_XCD", None)
+    split_block_m = config.pop("SPLIT_BLOCK_M", None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
+    if split_budget is not None and split_block_m is not None:
+        # the length-aware split runs one query block per sequence, so a block
+        # needs only the query rows; BLOCK_M still bounds them (_attn_3d_block_q)
+        query_rows = triton.next_power_of_2(
+            params.max_seqlen_q * params.num_queries_per_kv
+        )
+        config["BLOCK_M"] = min(config["BLOCK_M"], max(split_block_m, query_rows))
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
@@ -781,15 +791,19 @@ def _unified_attention_3d_triton(
     length_aware = {}
     if split_budget is not None:
         # one program per (sequence, segment) work item and KV head: the
-        # per-sequence floor shares sum to at most split_budget + num_seqs, and
-        # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
-        # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
-        # head of an item on one XCD, so they share its L2.
+        # per-sequence floor shares sum to at most split_budget + num_seqs - 1
+        # (a sequence below segment_tokens takes 1 but leaves its tokens out of
+        # the other shares), and no sequence takes more than NUM_SEGMENTS.
+        # Items are dealt out in runs of ITEM_RUN, once per head; a multiple of
+        # the XCD count keeps every head of an item on one XCD, so they share
+        # its L2.
         assert (
             split_runs_per_xcd is not None
         ), "a length-aware split needs SPLIT_RUNS_PER_XCD in the attn_3d config"
         num_xcds = get_num_xcds()
-        num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
+        num_items = min(
+            split_budget + params.num_seqs - 1, params.num_seqs * NUM_SEGMENTS
+        )
         # a batch with fewer items than a full run takes a shorter one, so the
         # padding does not launch idle programs for every KV head
         runs = min(

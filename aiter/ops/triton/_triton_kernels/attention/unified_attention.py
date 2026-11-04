@@ -59,10 +59,10 @@ def find_seq_idx(
 # segments of
 #     segment_tokens = cdiv(sum(seq_len), split_budget)
 # and a sequence takes seq_len // segment_tokens of them, at least one and at
-# most NUM_SEGMENTS_PER_SEQ. The counts sum to at most split_budget + num_seqs,
-# so the attention grid is a flat list of that many (sequence, segment) work
-# items per KV head; the reduce recomputes the same count to merge exactly the
-# segments a sequence used.
+# most NUM_SEGMENTS_PER_SEQ. The counts sum to at most
+# split_budget + num_seqs - 1, so the attention grid is a flat list of that many
+# (sequence, segment) work items per KV head; the reduce recomputes the same
+# count to merge exactly the segments a sequence used.
 # The KV heads of one token share cache lines, so the grid deals each run of
 # ITEM_RUN items out once per KV head: workgroups go round-robin over the XCDs,
 # and a run that is a multiple of the XCD count puts every head of an item on
@@ -458,7 +458,7 @@ def kernel_unified_attention_2d(
                 is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
                 qq_bias = tl.load(
                     qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=is_query_key[None, :],
+                    mask=query_mask_0[:, None] & is_query_key[None, :],
                     other=0.0,
                 )
                 S += qq_bias * RCP_LN2
@@ -599,7 +599,8 @@ def kernel_unified_attention_2d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -1067,7 +1068,8 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2

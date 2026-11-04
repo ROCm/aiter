@@ -316,6 +316,7 @@ def ref_paged_attn(
     v_descale: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     causal: int = 1,
+    qq_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     _, block_size, num_kv_heads, head_size = key_cache.shape
@@ -362,6 +363,8 @@ def ref_paged_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if qq_bias is not None:
+            attn[:, :, kv_len - query_len :] += qq_bias[:query_len, :query_len]
         if causal:
             attn.masked_fill_(mask, float("-inf"))
         if sinks is not None:
@@ -673,6 +676,8 @@ def _length_aware_seq_lens(batch: str, query_len: int):
         for batch in ["skewed", "uniform"]
     ]
     + [("skewed_300", (8, 2), 1, False, torch.int32)]
+    # the widest verify query that still fits one block of the q >= 4 entry
+    + [("skewed", (8, 2), 8, False, torch.int32)]
     # sglang passes int64 sequence lengths
     + [("skewed", (8, 2), 4, False, torch.int64)],
 )
@@ -768,7 +773,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     kv = [k for _, k in seq_lens]
     segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
     used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
-    assert sum(used) <= split_budget + len(kv)
+    assert sum(used) <= split_budget + len(kv) - 1
     if batch != "uniform":
         assert used[0] > max(used[1:]) and min(used) < num_segments, used
     else:
@@ -943,6 +948,9 @@ def test_length_aware_split_scope() -> None:
     edge = {"num_seqs": 1023, "num_kv_heads": 1}
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=2_099_202)) is None
+    # and round one sequence up by its segments' tiles in int32
+    one = {"num_seqs": 1, "num_kv_heads": 1}
+    assert _length_aware_split(*_gfx950_split(**one, max_seqlen_k=2**31 - 2048)) is None
     # find_work_item unpacks the sequences before an item from 15 bits
     wide = {**vars(params), "max_seqlen_k": 1 << 15}
     assert _length_aware_split(
@@ -952,13 +960,35 @@ def test_length_aware_split_scope() -> None:
         _length_aware_split(config, SimpleNamespace(**{**wide, "num_seqs": 2**15}))
         is None
     )
-    # the 3D launch and the reduce read their length-aware keys from these entries
-    assert "SPLIT_RUNS_PER_XCD" in get_unified_attention_config(
-        "attn_3d", params, arch="gfx950"
-    )
-    assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
-        "reduce", params, arch="gfx950"
-    )
+
+    # the grid holds split_budget + num_seqs - 1 work items; the shares reach that
+    # only when empty sequences sit beside one that fills the budget
+    def num_items(kv, budget):
+        segment_tokens = max(triton.cdiv(sum(kv), budget), 1)
+        return sum(max(k // segment_tokens, 1) for k in kv)
+
+    rng = random.Random(0)
+    for _ in range(2000):
+        kv = [
+            rng.choice((0, 1, rng.randint(1, 1 << 17)))
+            for _ in range(rng.randint(1, 40))
+        ]
+        budget = rng.randint(1, 1024)
+        assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
+    assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
+    # the 3D launch and the reduce read their length-aware keys from these entries,
+    # for decode and for verify queries up to one query block (q <= 8 here)
+    for q in (1, 4, 8):
+        verify = SimpleNamespace(**{**vars(params), "max_seqlen_q": q})
+        assert _length_aware_split(config, verify)
+        attn_3d = get_unified_attention_config("attn_3d", verify, arch="gfx950")
+        assert "SPLIT_RUNS_PER_XCD" in attn_3d
+        if attn_3d["BLOCK_M"] > 16:
+            # a wider tuned block is cut down to the query rows of one sequence
+            assert attn_3d["SPLIT_BLOCK_M"] == 16
+        assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
+            "reduce", verify, arch="gfx950"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1150,6 +1180,88 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+# Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+@pytest.mark.parametrize(
+    "num_heads, query_len, kv_len",
+    [
+        ((32, 8), 3, 4096),
+        ((32, 8), 4, 4096),
+        ((16, 1), 3, 4096),
+        ((32, 8), 3, 256),
+        ((32, 8), 5, 256),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_qq_bias_padded_query_rows(
+    num_heads: tuple[int, int], query_len: int, kv_len: int
+) -> None:
+    if DEVICE_ARCH == "gfx1250":
+        pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
+    seq_lens = [(query_len, kv_len)] * 2
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=16,
+        head_size=128,
+        num_heads=num_heads,
+        device="cuda",
+    )
+    qq_bias = torch.randn(query_len, query_len, dtype=torch.float32, device="cuda")
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        qq_bias=qq_bias,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        qq_bias=qq_bias,
+    )
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize(
