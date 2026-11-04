@@ -4,7 +4,9 @@
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
-(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
+(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``) or by dropped routes
+(``valid[t,k] = topk_ids[t,k] >= 0``: the sort leaves dropped routes out, so
+their rows of X are never written). Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
 with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
 ``Constexpr`` so flyc specializes per shape/dtype.
@@ -43,6 +45,7 @@ def _moe_reduction_body(
     dtype_str: fx.Constexpr[str],
     use_mask: fx.Constexpr[bool],
     num_experts: fx.Constexpr[int],
+    skip_dropped: fx.Constexpr[bool],
     out_dtype_str: fx.Constexpr[str],
     use_weight: fx.Constexpr[bool],
     scale_blk: fx.Constexpr[int],
@@ -105,13 +108,14 @@ def _moe_reduction_body(
             fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
         )
         sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
-    if const_expr(use_mask):
+    if const_expr(use_mask or skip_dropped):
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
         tk_ptr = fx.inttoptr(
             i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
         )
+    if const_expr(use_mask):
         em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
     if const_expr(use_weight):
         # Route weights deferred from the stage2 epilogue: scale each expert's
@@ -176,6 +180,9 @@ def _moe_reduction_body(
                 vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
                     vk, fx.full(V, 0.0, fx.Float32)
                 )
+            if const_expr(skip_dropped):
+                # Select, not multiply: a never-written row may hold NaN.
+                vk = (tk_ptr[k] >= fx.Int32(0)).select(vk, fx.full(V, 0.0, fx.Float32))
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)
@@ -207,6 +214,7 @@ def compile_moe_reduction(
     dtype_str: str = "f16",
     use_mask: bool = False,
     num_experts: int = 0,
+    skip_dropped: bool = False,
     out_dtype_str: str | None = None,
     use_weight: bool = False,
     scale_blk: int | None = None,
@@ -236,7 +244,7 @@ def compile_moe_reduction(
 
     kernel_name = (
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
-        f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
+        f"_m{int(use_mask)}e{num_experts if use_mask else 0}d{int(skip_dropped)}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
     )
 
@@ -261,6 +269,7 @@ def compile_moe_reduction(
             dtype_str,
             use_mask,
             num_experts,
+            skip_dropped,
             out_tag,
             use_weight,
             scale_blk,

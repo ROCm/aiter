@@ -1659,23 +1659,6 @@ def _fused_moe_impl(
                 w1.numel() * w1.element_size(), w2.numel() * w2.element_size()
             ),
         )
-        # The sort leaves out dropped routes (topk_ids -1), so the reduction
-        # would add their uninitialized stage-2 partials. Give them zero weight
-        # and an expert the token does not use, which adds exactly zero; a token
-        # routed twice to one expert is not deterministic. The k-th dropped
-        # route takes the k-th expert in 0..topk-1 the token does not use, of
-        # which there are always enough.
-        dropped = topk_ids < 0
-        candidates = torch.arange(
-            topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
-        )
-        used = (topk_ids.unsqueeze(-1) == candidates).any(1)
-        unused = torch.sort(used.to(torch.uint8), dim=1, stable=True).indices
-        rank = (dropped.cumsum(1) - 1).clamp_(min=0)
-        topk_ids = torch.where(
-            dropped, unused.gather(1, rank).to(topk_ids.dtype), topk_ids
-        )
-        topk_weight = topk_weight.masked_fill(dropped, 0)
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -2686,6 +2669,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    skip_dropped_routes: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2743,6 +2727,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        skip_dropped_routes=skip_dropped_routes,
     )
 
 
@@ -3716,7 +3701,7 @@ def _deterministic_metadata(
     the token count, and each changes how a row's sums are split. Deterministic
     mode always runs stage 1 with two K waves and tile_k 256, and stage 2 with
     the non-atomic reduce epilogue instead of atomic adds of the top-k partials,
-    without split-K. Only the tile height grows with the token count, which does
+    without split-K, skipping dropped routes in the reduction. Only the tile height grows with the token count, which does
     not change a row's reduction.
     """
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
@@ -3746,6 +3731,9 @@ def _deterministic_metadata(
             kernelName=kn2,
             inter_dim_pad=intermediate_pad,
             model_dim_pad=hidden_pad,
+            # The sort leaves out dropped routes (topk_ids -1), so their rows of
+            # the per-slot output are never written; the reduction skips them.
+            skip_dropped_routes=True,
         ),
         block_m,
         -1,  # no split-K
@@ -5321,6 +5309,9 @@ def fused_moe_2stages(
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
+    if stage2_keywords.get("skip_dropped_routes"):
+        # The reduction reads topk_ids to leave out dropped routes.
+        extra_stage2_args["topk_ids"] = topk_ids
     uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
         stage2_func is _mxfp4_a4w4_stage2_fw
         and str(stage2_keywords.get("kernelName2", "")).startswith(
