@@ -4,7 +4,7 @@
 
 #include <opus/dtypes.hpp>
 
-#include "mla_decode_kargs.h"
+#include "../mla_decode_kargs.h"
 
 using bf16_t = opus::dtypes::bf16;
 using fp16_t = opus::dtypes::fp16;
