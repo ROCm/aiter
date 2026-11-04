@@ -194,6 +194,41 @@ def test_no_citation_check_means_nothing_is_anchored(report, monkeypatch):
     assert _publish.flagged_citations("9999") is None
 
 
+def test_the_degraded_body_does_not_claim_anchors_it_no_longer_has(
+    report, monkeypatch, capsys
+):
+    """The summary-only retry must drop the inline index, not just append to it.
+
+    build_review writes "N finding(s) posted inline, on the lines they are about".
+    That is true of the attempt GitHub refused and false of the one being sent, where
+    comments[] is empty. Left in place, the degraded review tells the reader that N
+    findings sit on lines that carry nothing, and then lists the same N again below --
+    the inverse of the silence this fallback exists to prevent. The older test for this
+    path asserts only that a retry happened, so it passes on the stale index alone.
+    """
+    sent = []
+
+    def _api(path, method="GET", body=None):
+        if method == "POST" and path.endswith("/reviews"):
+            sent.append(body)
+            if body.get("comments"):
+                return {"message": "line must be part of the diff"}
+            return {"html_url": "https://example/r/1"}
+        return {"state": "open", "merged_at": None, "head": {"sha": "f" * 40}}
+
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    monkeypatch.setattr(_publish, "_api", _api)
+    _publish.main(["9999", "--post"])
+    assert len(sent) == 2 and sent[1]["comments"] == []
+    anchored, degraded = sent[0]["body"], sent[1]["body"]
+    assert "posted inline, on the lines they are about" in anchored
+    assert "posted inline, on the lines they are about" not in degraded, (
+        "the degraded review still claims findings are inline"
+    )
+    # and the findings themselves are still in it, exactly once
+    assert "could not be attached to their lines" in degraded
+
+
 def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):
     """A refusal the caller cannot see is a refusal that happens every run.
 

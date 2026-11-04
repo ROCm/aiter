@@ -84,9 +84,20 @@ def check(card_text: str, trees, changed=()):
                 base = pathlib.Path(path).name
                 hits = [c for c in changed if pathlib.Path(c).name == base]
                 if len(hits) != 1:
+                    # Search the FULL tree, not trees[0]. head/ holds only the files this PR
+                    # touched, so a basename search there can never find untouched context
+                    # code -- and the miss is reported as "no such file in the tree", i.e. an
+                    # invented path, when the file plainly exists and this PR simply did not
+                    # change it. That hard verdict then costs the whole finding its anchor
+                    # and its permalink (_publish._unflagged_cites), including a correct,
+                    # fully-qualified in-diff citation sitting in the same sentence. So a
+                    # bare-basename citation of real code switched anchoring off silently,
+                    # which is the failure this checker exists to prevent.
+                    tree = next((t for t in trees if t.name == "merge-target"), tree)
+                    wide = tree
                     hits = [
-                        str(m.relative_to(tree))
-                        for m in tree.rglob(base)
+                        str(m.relative_to(wide))
+                        for m in wide.rglob(base)
                         if m.is_file()
                     ]
                 if not hits:
@@ -105,7 +116,12 @@ def check(card_text: str, trees, changed=()):
                         f"name and none is in this diff; cite the directory"
                     )
                     continue
-                f = tree / hits[0]
+                # hits[0] came either from `changed` (a path in the diff, present in head/)
+                # or from the basename search (a path in merge-target/). Resolve against
+                # whichever tree actually holds it rather than assuming one of them.
+                f = next(
+                    (t / hits[0] for t in trees if (t / hits[0]).is_file()), tree / hits[0]
+                )
                 if not f.is_file():
                     yield "bad", f"{path}:{lineno} -- {hits[0]} is in the diff but not the tree"
                     continue
