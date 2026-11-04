@@ -12,9 +12,9 @@ AITER_CTYPES_ERROR_DECL;
 
 namespace aiter {
 
-// Direct BF16 G1U1 kernel for the guarded gfx1201 small-M Qwen3.6 shape tier:
+// Direct BF16 G1U1 kernel for gfx1201 small-token-count MoE cases where
 // M in {1,2,3,4,8,16}, model_dim=2048, inter_dim in {128,256},
-// num_experts=256, topk=8.
+// num_experts=256, and topk=8.
 template <int group_size, bool gate_is_shuffled>
 __global__ void fmoe_g1u1_bf16_small_m_stage1_kernel(
     const hip_bfloat16* __restrict__ input,
