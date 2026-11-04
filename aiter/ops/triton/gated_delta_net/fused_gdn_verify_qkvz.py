@@ -142,6 +142,7 @@ def fused_gdn_verify_qkvz(
         _fused_gdn_verify,
         _fused_gdn_verify_chunk,
         _fused_gdn_verify_chunk_compact,
+        _fused_gdn_verify_chunk_mat,
     )
 
     _, v_heads, head_k_dim, head_v_dim = checkpoint.shape
@@ -187,17 +188,20 @@ def fused_gdn_verify_qkvz(
     num_warps, kl, ks = config["num_warps"], config["KL"], config["KS"]
     # The chunk-form kernel where it fits, else the token-loop kernel.
     kernel, tile_args = _fused_gdn_verify, {"KL": kl, "KS": ks}
-    # AITER_GDN_VERIFY_CHUNK_WARPS overrides the chunk kernel's waves and
-    # AITER_GDN_VERIFY_COMPACT=1 selects its compact form (experiments, off by default).
-    chunk_warps = int(os.environ.get("AITER_GDN_VERIFY_CHUNK_WARPS", "0")) or config.get(
-        "chunk_num_warps", 0
-    )
+    # AITER_GDN_VERIFY_CHUNK_WARPS overrides the chunk kernel's waves,
+    # AITER_GDN_VERIFY_COMPACT=1 selects its compact form and
+    # AITER_GDN_VERIFY_MATRIX=1 its matrix form (experiments, off by default).
+    chunk_warps = int(
+        os.environ.get("AITER_GDN_VERIFY_CHUNK_WARPS", "0")
+    ) or config.get("chunk_num_warps", 0)
     if chunk_warps and _chunk_kernel_fits(
         head_k_dim, head_v_dim, ratio, max_query_len, cap, chunk_warps
     ):
         chunk_kernel = _fused_gdn_verify_chunk
         if os.environ.get("AITER_GDN_VERIFY_COMPACT", "0") == "1":
             chunk_kernel = _fused_gdn_verify_chunk_compact
+        if os.environ.get("AITER_GDN_VERIFY_MATRIX", "0") == "1":
+            chunk_kernel = _fused_gdn_verify_chunk_mat
         kernel, num_warps, tile_args = chunk_kernel, chunk_warps, {}
     kernel[(seqs * k_heads,)](
         query_start_loc,

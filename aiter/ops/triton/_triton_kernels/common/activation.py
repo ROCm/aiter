@@ -13,6 +13,13 @@ def _silu(x):
 
 
 @triton.jit
+def _silu_fast(x):
+    """SiLU with an approximate division (about 1 ulp): short code, for outputs
+    that are rounded to bf16."""
+    return tl.fdiv(x, 1.0 + tl.exp2(-(x * 1.44269504089)), approx=True)
+
+
+@triton.jit
 def _sigmoid_exp2(x):
     return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
 
