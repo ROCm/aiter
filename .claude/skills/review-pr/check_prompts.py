@@ -12,7 +12,6 @@ SKILL.md is always at <repo>/.claude/skills/review-pr/SKILL.md.
 
 import pathlib
 import re
-import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
