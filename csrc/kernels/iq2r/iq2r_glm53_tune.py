@@ -180,21 +180,16 @@ def candidates(tokens: int, intermediate_size: int):
 def capture_graph(calls):
     """A CUDA graph that runs ``calls`` in turn.
 
-    Serving captures decode batches, so timing and power both replay this
-    graph and exclude host launch overhead (several launches on the prefill
-    path).
+    Serving captures decode batches, so timing replays this graph and
+    excludes host launch overhead (several launches on the prefill path).
     """
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
+    from aiter.utility.cuda_graph import capture
+
+    def rotation():
         for call in calls:
             call()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for call in calls:
-            call()
-    return graph
+
+    return capture(rotation)
 
 
 def time_us(calls, warmup: int, iters: int) -> float:
@@ -356,13 +351,17 @@ class IQ2RGlm53Tuner(TunerCommon):
                 ]
                 graph = capture_graph(calls)
                 us = time_graph(graph, len(calls), args.warmup, args.iters)
+                del graph
                 tflops, tbps = self.calculate((info, us, 0.0))
                 from aiter.utility.tune_result import TuneResult
 
+                def rotation(calls=calls):
+                    for call in calls:
+                        call()
+
                 watts = self.policy_for(args).measure(
-                    graph.replay, kernel_us=us * len(calls)
+                    rotation, kernel_us=us * len(calls)
                 )
-                del graph
                 watt_text = (
                     f", {watts:.1f} W" if math.isfinite(watts) and watts > 0 else ""
                 )
