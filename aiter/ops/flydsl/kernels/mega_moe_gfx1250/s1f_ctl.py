@@ -57,7 +57,9 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: VGPRs and LDS allow would hang, not just run slow.
 _S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
-_S1F_GROUP_M = 8
+_S1F_GROUP_M = int(os.environ.get("AITER_MEGA_S1F_GROUP_M", "8"))
+if _S1F_GROUP_M < 1:
+    raise ValueError("AITER_MEGA_S1F_GROUP_M must be >= 1")
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
 # Decode steps have too little expert GEMM to hide the compact plan if the plan
@@ -67,8 +69,8 @@ _DECODE_PLAN_OVERLAP_TOKENS = 128
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
-#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
-#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
+#: Automatic steps over this bound keep dispatch + GEMM1. Explicit
+#: AITER_TDM_A_PRESHUFFLE=1 lets M256 prefill steps use the APRE S1F variant.
 _S1F_MAX_RECV = 4096
 
 
@@ -297,12 +299,20 @@ class _Stage1Fusion:
         return (int(step.align_m), int(step.recv_bound))
 
     def _recv_too_big(self) -> bool:
-        # The receive bound is identical on every rank.
+        # The receive bound and selected alignment are identical on all ranks.
         step = getattr(self.d, "_step", None)
-        return step is not None and int(step.recv_bound) > _S1F_MAX_RECV
+        if step is None:
+            return False
+        # The automatic serving path keeps its wide-step fallback. An explicit
+        # APRE request opts into the M256 prefill kernel, still subject to the
+        # shape, tile and epilogue checks before fusion can run.
+        wide_apre = (
+            int(step.align_m) == 256 and os.environ.get("AITER_TDM_A_PRESHUFFLE") == "1"
+        )
+        return int(step.recv_bound) > _S1F_MAX_RECV and not wide_apre
 
     def step_off(self) -> bool:
-        """A step over _S1F_MAX_RECV runs exactly the S1F=0 path.
+        """An automatic wide step runs exactly the S1F=0 path.
 
         Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
         kernel per alignment and slot, instead of one per launch width, block
@@ -401,6 +411,13 @@ class _Stage1Fusion:
         payload = d._quant_payload[:token_count]
         scale_rows = d._quant_scales[:token_count]
         wire = self.wire if run else None
+        if token_count == 0:
+            scales_ptr = (
+                wire.data_ptr() + config.dispatch_token_nbytes
+                if wire is not None
+                else d._quant_scales.data_ptr()
+            )
+            return payload, scales_ptr, None
         if self.wants_fused_quant(run):
             return (
                 payload,
@@ -442,10 +459,18 @@ class _Stage1Fusion:
 
     @staticmethod
     def _mismatches(got: dict, align_m: int) -> tuple:
-        # Fuse whenever the tuned GEMM1's tile_m matches; the stage-1 kernel
-        # then runs its own 256x256 n/k tiles instead of the tuned GEMM1's
-        # (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
+        # The row-major stage-1 kernel runs its own 256x256 n/k tiles.
         want = {"tile_m": int(align_m)}
+        if got.get("a_preshuffled"):
+            if int(align_m) != 256:
+                return (f"APRE GEMM1 needs align_m 256, got {align_m}",)
+            want.update(
+                tile_n=_S1F_TILE_N,
+                tile_k=_S1F_TILE_K,
+                m_warp=2,
+                n_warp=2,
+                num_buffers=4,
+            )
         return tuple(
             f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
         )
@@ -460,9 +485,14 @@ class _Stage1Fusion:
             "tile_m": int(kw.get("tile_m", 64)),
             "tile_n": int(kw.get("tile_n", 256)),
             "tile_k": int(kw.get("tile_k", 256)),
+            "m_warp": int(kw.get("m_warp", 1)),
+            "n_warp": int(kw.get("n_warp", 4)),
+            "num_buffers": int(kw.get("num_buffers", 3)),
+            "a_preshuffled": int(kw.get("a_preshuffled", 0)),
         }
         mismatches = self._mismatches(got, self.d._step.align_m)
         self.g1_seen[self._g1_key()] = mismatches
+        _log.info("S1F GEMM1 configuration: %s; eligible=%s", got, not mismatches)
         if mismatches:
             _fallback_warn(self, list(mismatches))
         return flydsl_grouped_gemm_a8w4_masked(
@@ -475,15 +505,37 @@ class _Stage1Fusion:
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        m_warp=1,
+        n_warp=4,
+        a_preshuffled=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            m_warp,
+            n_warp,
+            a_preshuffled,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
             num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
+            if a_preshuffled:
+                num_buffers = 4
             launch = make_s1f_stage1(
                 rank=config.rank,
                 npes=config.world_size,
@@ -507,6 +559,9 @@ class _Stage1Fusion:
                 group_m=group_m,
                 tile_m=tile_m,
                 num_buffers=num_buffers,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                a_preshuffled=a_preshuffled,
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
@@ -514,7 +569,18 @@ class _Stage1Fusion:
             self.launches[key] = launch
         return launch
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self,
+        launch_args,
+        *,
+        tile_m,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        m_warp=1,
+        n_warp=4,
+        a_preshuffled=0,
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -544,6 +610,9 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                a_preshuffled=a_preshuffled,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -572,6 +641,7 @@ class _Stage1Fusion:
         num_buffers=3,
         out_is_f16=0,
         a_is_fp4=0,
+        a_preshuffled=0,
         stage1_act=0,
         bias=None,
         swiglu_limit=7.0,
@@ -624,8 +694,12 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        # The stage-1 kernel runs its own 256x256 n/k tiles.
-        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        if a_preshuffled:
+            got.update(m_warp=m_warp, n_warp=n_warp, num_buffers=num_buffers)
+            want.update(m_warp=2, n_warp=2, num_buffers=4, variant=256)
+        else:
+            # The row-major stage-1 kernel runs its own 256x256 n/k tiles.
+            got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
@@ -662,7 +736,14 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
-        pkey = (align_m, int(stage1_act), int(quant_wmma_rep))
+        pkey = (
+            align_m,
+            int(stage1_act),
+            int(quant_wmma_rep),
+            int(m_warp),
+            int(n_warp),
+            int(a_preshuffled),
+        )
         if (
             pkey not in self.precompiled
             and not torch.cuda.is_current_stream_capturing()
@@ -674,6 +755,9 @@ class _Stage1Fusion:
                 group_m=group_m,
                 stage1_act=int(stage1_act),
                 quant_wmma_rep=int(quant_wmma_rep),
+                m_warp=int(m_warp) if a_preshuffled else 1,
+                n_warp=int(n_warp) if a_preshuffled else 4,
+                a_preshuffled=int(a_preshuffled),
             )
         launch = self._launcher(
             tile_m=align_m,
@@ -682,6 +766,9 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            m_warp=int(m_warp) if a_preshuffled else 1,
+            n_warp=int(n_warp) if a_preshuffled else 4,
+            a_preshuffled=int(a_preshuffled),
         )
         launch(
             *launch_args(

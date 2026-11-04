@@ -388,7 +388,9 @@ class MegaMoEGfx1250:
             # The grouped GEMM reads the hook off dispatch_context (the same
             # scatter object on the compact path), so swap both: replacing
             # target.scatter alone leaves the probe / stage-1 hook unreachable.
-            hooked = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            hooked = dataclasses.replace(
+                target.scatter, stage1_gemm1=hook, stage1_a_row_major=s1f
+            )
             if target.dispatch_context is target.scatter:
                 target.dispatch_context = hooked
             target.scatter = hooked

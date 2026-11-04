@@ -675,7 +675,7 @@ class _CompactDispatch(_Dispatch):
         return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
 
     def _precompile_s1f_plans(self) -> None:
-        """Compile every stage-1 plan variant before serving.
+        """Compile every automatic stage-1 plan variant before serving.
 
         With S1F on (the default) the plan is keyed by (align_m, slot, waves,
         blocks, tok_map, fused quant), and waves/blocks follow the step's token
@@ -685,6 +685,8 @@ class _CompactDispatch(_Dispatch):
         fused step can have (<= the S1F max recv, 4096), takes the
         alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
+        Explicit wide APRE configurations are warmed eagerly at the token
+        widths used for capture, rather than compiling every prefill width.
         """
         if not self.fusion.enabled:
             return
