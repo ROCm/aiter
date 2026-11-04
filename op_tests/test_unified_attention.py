@@ -769,6 +769,16 @@ def check_routing():
             assert routed(**padded) == ["triton"]
             assert routed(**kv(page=32)) == ["flydsl"]
             assert routed(**kv("vllm", page=32)) == ["flydsl"]
+        # So would a block table with row stride 1, such as a one-column
+        # table allocated on its own: FlyDSL keys a tensor on its first
+        # unit-stride dimension. One column of a wider table is prebuilt.
+        one_page = {"shape": "sliding", "page": 32, "kv_lens": (20, 20)}
+        alone = torch.zeros(2, 1, dtype=torch.int32)
+        column = torch.zeros(2, 4, dtype=torch.int32)[:, :1]
+        assert routed(**one_page, block_table=alone) == ["flydsl"]
+        with run_only_env():
+            assert routed(**one_page, block_table=alone) == ["triton"]
+            assert routed(**one_page, block_table=column) == ["flydsl"]
         # One boundary per cede rule: tiny head-512 decode, page-32 sliding
         # decode past 38 sequences, a short fresh prefill, and a mixed
         # batch's short chunk.

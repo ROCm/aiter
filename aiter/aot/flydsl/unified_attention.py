@@ -10,8 +10,9 @@ Replays ``unified_attention`` on FakeTensors inside ``dry_run`` (see
 ``DEFAULT_SHAPES``, served page size and canonical K/V layout (two contiguous
 caches, or vLLM's views of one): the all-decode batch reaches the decode-only
 build and its combine, the lone chunk over a prefix the unified build and its
-combine. Other K/V strides, such as a padded cache, compile on first use, and
-under ``FLYDSL_RUNTIME_RUN_ONLY=1`` the gate sends them to Triton.
+combine. Other K/V strides, such as a padded cache, and a block table with row
+stride 1 (one column, allocated on its own) compile on first use, and under
+``FLYDSL_RUNTIME_RUN_ONLY=1`` the gate sends them to Triton.
 
 Usage:
     python -m aiter.aot.flydsl.unified_attention

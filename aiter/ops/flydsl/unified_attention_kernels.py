@@ -211,13 +211,15 @@ def _run_only() -> bool:
     return env.runtime.run_only
 
 
-def _prebuilt_ok(k, v, num_kv_heads, block_size) -> bool:
+def _prebuilt_ok(k, v, block_table, num_kv_heads, block_size) -> bool:
     """FLYDSL_RUNTIME_RUN_ONLY=1 loads prebuilt kernels and never compiles,
-    so serve only the K/V strides AOT enumerates; others go to Triton."""
+    so serve only the K/V strides AOT enumerates and, as in its calls, a
+    block table whose row stride is not 1: FlyDSL keys a tensor on its first
+    unit-stride dimension. Others go to Triton."""
     if not _run_only():
         return True
     strides = k.stride()[:3] + v.stride()[:3]
-    return any(
+    return block_table.stride(0) != 1 and any(
         strides == 2 * kv_layout_strides(layout, block_size, num_kv_heads, k.shape[3])
         for layout in KV_LAYOUTS
     )
@@ -311,7 +313,7 @@ def _supported(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale, sinks
         )
         and _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
-        and _prebuilt_ok(k, v, num_kv_heads, block_size)
+        and _prebuilt_ok(k, v, block_table, num_kv_heads, block_size)
     )
 
 

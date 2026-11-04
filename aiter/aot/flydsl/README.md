@@ -234,9 +234,10 @@ strides and decode-only flag. `unified_attention` replays, per layer shape in it
 `DEFAULT_SHAPES` (`num_heads, num_kv_heads, head_dim, window`), every served
 page size for the two canonical K/V layouts (separate caches, or vLLM's views
 of one cache), which reaches the unified and decode-only builds and the decode
-and prefill split combines. It takes no `--csv`. Other strides, such as a
-padded cache, compile on first use; under `FLYDSL_RUNTIME_RUN_ONLY=1` they fall
-back to Triton.
+and prefill split combines. It takes no `--csv`. Other K/V strides, such as a
+padded cache, and a block table with row stride 1 (one column, allocated on its
+own) compile on first use; under `FLYDSL_RUNTIME_RUN_ONLY=1` they fall back to
+Triton.
 
 ```bash
 # Gemma-4-31B at TP1: 16 attention + 4 combine kernels
