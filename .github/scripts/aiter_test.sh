@@ -41,6 +41,7 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/bench_attention_a2a.py"
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
@@ -106,9 +107,14 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_mla_v4_nm.py)
+            # The test cases are pytest functions; the script entry point is an
+            # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
@@ -168,6 +174,17 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
+        op_tests/multigpu_tests/test_attention_a2a.py)
+            {
+                echo "Running fused A2A at world sizes 2/4/8 with heads 8 and 40"
+            } | tee -a latest_test.log
+            # The default would only run ws2 / heads 8. The test spawns its own
+            # per-rank processes, so plain python3 rather than torchrun.
+            test_cmd=(
+                timeout 60m
+                python3 "$file" -w 2 4 8 --heads 8 40
+            )
+            ;;
         op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
             {
                 echo "Running $file at its default group size, then at 6 ranks when available"
@@ -225,6 +242,12 @@ for file in "${sharded_files[@]}"; do
                 echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
             } | tee -a latest_test.log
             test_cmd=(timeout 60m python3 "$file")
+            ;;
+        op_tests/test_moe_2stage.py)
+            {
+                echo "Running $file with the standard MoE CI profile: representative tokens + no FlyDSL CSV sweep"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

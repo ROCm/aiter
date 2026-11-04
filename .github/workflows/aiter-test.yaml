@@ -152,7 +152,7 @@ jobs:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
       needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
-    runs-on: build-only-aiter
+    runs-on: ${{ matrix.build_enabled && 'build-only-aiter' || 'ubuntu-latest' }}
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
       id-token: write
@@ -975,7 +975,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} AITER_MOE_2STAGE_CI_PROFILE=standard ./.github/scripts/aiter_test.sh"
 
       - name: Collect test logs
         if: always()

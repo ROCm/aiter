@@ -21,8 +21,13 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 
+# Mirrors the arch gate in gemm_afp4wfp4_(): archs with software-emulated FP4
+# run only the unshuffled Triton path.
+UNSHUFFLED_TRITON_ONLY = arch_info.is_sw_emulated_fp4_avail()
+
 pytestmark = pytest.mark.skipif(
-    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+    not arch_info.is_any_fp4_avail(),
+    reason="MXFP4 not supported on this architecture",
 )
 
 
@@ -207,6 +212,9 @@ def test_gemm_afp4_wfp4(
     if impl == "gluon" and shuffle_weight_scales:
         pytest.skip("Gluon kernel does not have a preshuffled implementation.")
 
+    if UNSHUFFLED_TRITON_ONLY and (impl != "triton" or shuffle_weight_scales):
+        pytest.skip(f"Only the unshuffled Triton path is supported on {DEVICE_ARCH}.")
+
     if shuffle_weight_scales:
         if N % 32 > 0:
             pytest.skip(
@@ -270,11 +278,20 @@ def test_gemm_afp4_wfp4(
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
 
-    triton.testing.assert_close(torch_out, triton_out)
+    if UNSHUFFLED_TRITON_ONLY:
+        # The emulated dot_scaled result can differ from the reference by one
+        # ULP of the output dtype after rounding.
+        triton.testing.assert_close(
+            torch_out, triton_out, atol=1e-2, rtol=torch.finfo(dtype).eps
+        )
+    else:
+        triton.testing.assert_close(torch_out, triton_out)
 
 
 @pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
 def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
+    if UNSHUFFLED_TRITON_ONLY:
+        pytest.skip(f"Preshuffled MXFP4 GEMM is not supported on {DEVICE_ARCH}.")
     dtype = torch.bfloat16
     (
         x,
