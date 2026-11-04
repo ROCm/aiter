@@ -741,7 +741,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     launch_3d = module._unified_attention_3d_triton
 
     def spy(params, *args):
-        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, split_budget
+        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, split_budget, seq_block
         return launch_3d(params, *args)
 
     monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
@@ -769,7 +769,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     # the split is length-aware, and the per-sequence counts (the kernels'
     # seq_num_segments) differ from the cap the grid was sized for
     assert len(launches) == 1, "expected the 3D split-KV path"
-    num_segments, _, split_budget = launches[0]
+    num_segments, _, split_budget, _ = launches[0]
     assert num_segments > 1 and split_budget is not None
     kv = [k for _, k in seq_lens]
     segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
@@ -923,7 +923,8 @@ def _gfx950_split(**overrides):
 def test_length_aware_split_scope(monkeypatch) -> None:
     """The length-aware entry leaves every call it does not split as before."""
     config, params = _gfx950_split()
-    _, num_segments = _length_aware_split(config, params)
+    _, num_segments, seq_block = _length_aware_split(config, params)
+    assert seq_block == triton.next_power_of_2(params.num_seqs)
     assert num_segments == config["SPLIT_NUM_SEGMENTS"] > config["NUM_SEGMENTS"]
     # calls left out keep the uniform split of the head <= 128 entry
     head_128, _ = _gfx950_split(head_size=128, head_size_v=128)

@@ -66,11 +66,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 _GFX950_LDS_BUDGET = 160 * 1024
 
 
-def _length_aware_seq_block(num_seqs: int) -> int:
-    """Lanes the length-aware split reads the batch's KV lengths in, per step."""
-    return min(256, max(64, triton.next_power_of_2(num_seqs)))
-
-
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
 
@@ -144,7 +139,7 @@ class _UAParams(NamedTuple):
 
 
 def _length_aware_split(config, params: _UAParams):
-    """(split_budget, NUM_SEGMENTS) for the length-aware KV split, or None when off.
+    """(split_budget, NUM_SEGMENTS, SEQ_BLOCK) for the length-aware KV split, or None.
 
     A kv_split entry opts in with SPLIT_PROGRAMS_PER_CU, for batches where every
     sequence fits one query block (decode, short verify queries). Each sequence
@@ -153,6 +148,8 @@ def _length_aware_split(config, params: _UAParams):
     with the 1M max_seqlen_k bound still splits by the real lengths.
     NUM_SEGMENTS is then SPLIT_NUM_SEGMENTS, which only caps one sequence's
     split; calls left out, skip_reduce included, keep the uniform NUM_SEGMENTS.
+    SEQ_BLOCK is the number of KV lengths the kernels read per step, from the
+    entry's SPLIT_SEQ_BLOCK_MIN/MAX.
     """
     per_cu = config.get("SPLIT_PROGRAMS_PER_CU")
     num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])
@@ -175,11 +172,17 @@ def _length_aware_split(config, params: _UAParams):
     # tiles in int32 (a shuffled tile is the page), and pack the sequences before
     # an item in 15 bits and the items before it in 16
     tile = max(config["TILE_SIZE"], params.block_size)
-    if params.num_seqs * params.max_seqlen_k + budget + num_segments * tile >= 2**31:
+    # int(): a numpy max_seqlen_k would wrap the product in its own width
+    max_seqlen_k = int(params.max_seqlen_k)
+    if params.num_seqs * max_seqlen_k + budget + num_segments * tile >= 2**31:
         return None
     if budget + params.num_seqs >= 2**16 or params.num_seqs >= 2**15:
         return None
-    return budget, int(num_segments)
+    seq_block = min(
+        config["SPLIT_SEQ_BLOCK_MAX"],
+        max(config["SPLIT_SEQ_BLOCK_MIN"], triton.next_power_of_2(params.num_seqs)),
+    )
+    return budget, int(num_segments), seq_block
 
 
 def _attn_3d_block_q(params: _UAParams) -> int:
@@ -510,10 +513,10 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
-        split_budget = None
+        split_budget = seq_block = None
         length_aware = None if use_gluon_3d else _length_aware_split(config, params)
         if length_aware is not None:
-            split_budget, NUM_SEGMENTS = length_aware
+            split_budget, NUM_SEGMENTS, seq_block = length_aware
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -580,6 +583,7 @@ def unified_attention(
                 NUM_SEGMENTS,
                 TILE_SIZE,
                 split_budget,
+                seq_block,
             )
 
         if NUM_SEGMENTS == 1:
@@ -590,9 +594,11 @@ def unified_attention(
             return segm_output, segm_max, segm_expsum
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        # The Gluon reduce reads the uniform token-major partials only.
         use_gluon_reduce = (
             is_reduce_gluon_available(params, NUM_SEGMENTS, backend)
             and backend == "gluon"
+            and split_budget is None
         )
         if use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
@@ -615,6 +621,7 @@ def unified_attention(
                 NUM_SEGMENTS,
                 TILE_SIZE,
                 split_budget,
+                seq_block,
             )
     return out
 
@@ -768,6 +775,7 @@ def _unified_attention_3d_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
     split_budget=None,
+    seq_block=None,
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
     split_runs_per_xcd = config.pop("SPLIT_RUNS_PER_XCD", None)
@@ -817,7 +825,7 @@ def _unified_attention_3d_triton(
         length_aware = {
             "split_budget": split_budget,
             "LENGTH_AWARE_SPLIT": True,
-            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "SEQ_BLOCK": seq_block,
             "ITEM_RUN": item_run,
             "num_tokens": params.num_tokens,
         }
@@ -892,6 +900,7 @@ def _reduce_segments_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
     split_budget=None,
+    seq_block=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
@@ -907,7 +916,7 @@ def _reduce_segments_triton(
         length_aware = {
             "split_budget": split_budget,
             "LENGTH_AWARE_SPLIT": True,
-            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "SEQ_BLOCK": seq_block,
             "LENGTH_AWARE_SEGMENT_BLOCK": min(
                 NUM_SEGMENTS,
                 max(split_segment_block_min, triton.next_power_of_2(even_share)),
