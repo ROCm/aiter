@@ -691,7 +691,7 @@ def paged_attn_decode_gqa_tdm(
         HEAD_SZ=head_sz,
         BLOCK_H=16,
         BLOCK_D=triton.next_power_of_2(head_sz),
-        BLOCK_K=kv_blk_sz,
+        KV_BLOCK_SIZE=kv_blk_sz,
         SEQ_PARTITION_SZ=seq_partition_size,
         SPLIT=split,
         num_warps=num_warps,

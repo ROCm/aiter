@@ -21,7 +21,7 @@ _pa_decode_gqa_tdm_repr = make_kernel_repr(
         "HEAD_SZ",
         "BLOCK_H",
         "BLOCK_D",
-        "BLOCK_K",
+        "KV_BLOCK_SIZE",
         "SEQ_PARTITION_SZ",
         "SPLIT",
         "num_warps",
@@ -33,11 +33,11 @@ _pa_decode_gqa_tdm_repr = make_kernel_repr(
 def _pa_decode_gqa_tdm_kernel(
     out_ptr,  # [num_seqs, num_kv_heads * G, HEAD_SZ]
     q_ptr,  # [num_seqs, num_kv_heads * G, HEAD_SZ]
-    k_ptr,  # [num_blks, num_kv_heads, BLOCK_K, HEAD_SZ]
-    v_ptr,  # [num_blks, num_kv_heads, BLOCK_K, HEAD_SZ]
+    k_ptr,  # [num_blks, num_kv_heads, KV_BLOCK_SIZE, HEAD_SZ]
+    v_ptr,  # [num_blks, num_kv_heads, KV_BLOCK_SIZE, HEAD_SZ]
     blk_tables_ptr,  # [num_seqs, max_num_blks_per_seq], int32
     seq_lens_ptr,  # [num_seqs]
-    num_rows,  # num_blks * num_kv_heads * BLOCK_K
+    num_rows,  # num_blks * num_kv_heads * KV_BLOCK_SIZE
     softmax_scale,
     stride_o_s,
     stride_o_h,
@@ -59,15 +59,15 @@ def _pa_decode_gqa_tdm_kernel(
     HEAD_SZ: gl.constexpr,
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,  # HEAD_SZ padded to a power of two
-    BLOCK_K: gl.constexpr,
-    SEQ_PARTITION_SZ: gl.constexpr,  # tokens per program; a multiple of BLOCK_K
+    KV_BLOCK_SIZE: gl.constexpr,
+    SEQ_PARTITION_SZ: gl.constexpr,  # tokens per program; a multiple of KV_BLOCK_SIZE
     SPLIT: gl.constexpr,  # write partials for the v2 reduce kernel
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
     LOG2E: gl.constexpr = 1.4426950408889634
     LN2: gl.constexpr = 0.6931471805599453
-    PAGES_PER_PART: gl.constexpr = SEQ_PARTITION_SZ // BLOCK_K
+    PAGES_PER_PART: gl.constexpr = SEQ_PARTITION_SZ // KV_BLOCK_SIZE
 
     if num_warps == 1:
         pv_warp_bases: gl.constexpr = []
@@ -118,14 +118,14 @@ def _pa_decode_gqa_tdm_kernel(
         order=[1, 0],
     )
     kv_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0]
+        [[BLOCK_D, 8]], [KV_BLOCK_SIZE, BLOCK_D], [1, 0]
     )
 
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     part_idx = gl.program_id(2)
     seq_len = gl.load(seq_lens_ptr + seq_idx).to(gl.int32)
-    num_pages = (seq_len + BLOCK_K - 1) // BLOCK_K
+    num_pages = (seq_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     # Pages of this partition; zero when the partition lies past the sequence.
     page_start = part_idx * PAGES_PER_PART
     num_loc = gl.maximum(gl.minimum(num_pages - page_start, PAGES_PER_PART), 0)
@@ -149,41 +149,44 @@ def _pa_decode_gqa_tdm_kernel(
         [BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT)
     )
     acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=PV_WMMA_LAYOUT)
-    col_offs = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT))
-    row_offs = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, dot_v_layout))
+    col_offs = gl.arange(0, KV_BLOCK_SIZE, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT))
+    row_offs = gl.arange(0, KV_BLOCK_SIZE, layout=gl.SliceLayout(1, dot_v_layout))
 
     k_bufs = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [2, BLOCK_K, BLOCK_D], kv_shared
+        k_ptr.dtype.element_ty, [2, KV_BLOCK_SIZE, BLOCK_D], kv_shared
     )
     v_bufs = gl.allocate_shared_memory(
-        v_ptr.dtype.element_ty, [2, BLOCK_K, BLOCK_D], kv_shared
+        v_ptr.dtype.element_ty, [2, KV_BLOCK_SIZE, BLOCK_D], kv_shared
     )
     # The tile is BLOCK_D wide but rows are HEAD_SZ wide: TDM zero-fills the padding.
     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
         shape=[num_rows, HEAD_SZ],
         strides=[HEAD_SZ, 1],
-        block_shape=[BLOCK_K, BLOCK_D],
+        block_shape=[KV_BLOCK_SIZE, BLOCK_D],
         layout=kv_shared,
     )
     v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr,
         shape=[num_rows, HEAD_SZ],
         strides=[HEAD_SZ, 1],
-        block_shape=[BLOCK_K, BLOCK_D],
+        block_shape=[KV_BLOCK_SIZE, BLOCK_D],
         layout=kv_shared,
     )
 
     blk_tbl = blk_tables_ptr + seq_idx * stride_bt_s
-    head_row = kv_head_idx * BLOCK_K
+    head_row = kv_head_idx * KV_BLOCK_SIZE
 
     # Prologue: pages 0 and 1 are in flight.
     if num_loc > 0:
-        row = gl.load(blk_tbl + page_start) * (NUM_KV_HEADS * BLOCK_K) + head_row
+        row = gl.load(blk_tbl + page_start) * (NUM_KV_HEADS * KV_BLOCK_SIZE) + head_row
         gl.amd.gfx1250.tdm.async_load(k_desc, [row, 0], k_bufs.index(0))
         gl.amd.gfx1250.tdm.async_load(v_desc, [row, 0], v_bufs.index(0))
     if num_loc > 1:
-        row = gl.load(blk_tbl + page_start + 1) * (NUM_KV_HEADS * BLOCK_K) + head_row
+        row = (
+            gl.load(blk_tbl + page_start + 1) * (NUM_KV_HEADS * KV_BLOCK_SIZE)
+            + head_row
+        )
         gl.amd.gfx1250.tdm.async_load(k_desc, [row, 0], k_bufs.index(1))
         gl.amd.gfx1250.tdm.async_load(v_desc, [row, 0], v_bufs.index(1))
 
@@ -199,11 +202,11 @@ def _pa_decode_gqa_tdm_kernel(
         scores = gl.amd.gfx1250.wmma(
             q_dot,
             k_t,
-            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
+            gl.zeros([BLOCK_H, KV_BLOCK_SIZE], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
         )
         scores = scores * (softmax_scale * LOG2E)
         # Select, not add: unused rows of the last page may hold NaN or Inf.
-        valid = ((page_start + i) * BLOCK_K + col_offs) < seq_len
+        valid = ((page_start + i) * KV_BLOCK_SIZE + col_offs) < seq_len
         scores = gl.where(valid[None, :], scores, float("-inf"))
 
         m_new = gl.maximum(m_i, gl.max(scores, axis=1))
@@ -213,7 +216,7 @@ def _pa_decode_gqa_tdm_kernel(
 
         v_t = v_bufs.index(buf).load(dot_v_layout)
         if page_start + i == num_pages - 1:
-            v_valid = ((page_start + i) * BLOCK_K + row_offs) < seq_len
+            v_valid = ((page_start + i) * KV_BLOCK_SIZE + row_offs) < seq_len
             v_t = gl.where(v_valid[:, None], v_t, 0.0)
         p_dot = gl.convert_layout(p.to(q_ptr.dtype.element_ty), dot_p_layout)
         acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
@@ -224,7 +227,7 @@ def _pa_decode_gqa_tdm_kernel(
         gl.barrier()
         if i + 2 < num_loc:
             row = (
-                gl.load(blk_tbl + page_start + i + 2) * (NUM_KV_HEADS * BLOCK_K)
+                gl.load(blk_tbl + page_start + i + 2) * (NUM_KV_HEADS * KV_BLOCK_SIZE)
                 + head_row
             )
             gl.amd.gfx1250.tdm.async_load(k_desc, [row, 0], k_bufs.index(buf))
