@@ -4,9 +4,9 @@
 """Partition-policy safety checks that do not import GPU libraries."""
 
 import importlib.util
+import sys
 from itertools import product
 from pathlib import Path
-import sys
 
 import pytest
 
@@ -18,17 +18,17 @@ _SPEC.loader.exec_module(policy)
 
 
 def select(**changes):
-    arguments = dict(
-        arch="gfx1250",
-        num_compute_units=256,
-        num_seqs=16,
-        num_kv_heads=1,
-        query_group_size=16,
-        head_dim=128,
-        query_length=1,
-        kv_dtype="fp8",
-        max_context_length=8192,
-    )
+    arguments = {
+        "arch": "gfx1250",
+        "num_compute_units": 256,
+        "num_seqs": 16,
+        "num_kv_heads": 1,
+        "query_group_size": 16,
+        "head_dim": 128,
+        "query_length": 1,
+        "kv_dtype": "fp8",
+        "max_context_length": 8192,
+    }
     arguments.update(changes)
     return policy.select_pa_decode_partition_config(**arguments)
 
@@ -72,7 +72,7 @@ def test_existing_short_context_cluster_choice_is_preserved():
     assert (config.max_partitions, config.workgroup_budget) == (16, 1024)
 
 
-@pytest.mark.parametrize("changes", (dict(kv_dtype="bf16"), dict(query_length=4)))
+@pytest.mark.parametrize("changes", ({"kv_dtype": "bf16"}, {"query_length": 4}))
 def test_reducer_budget_fallback_does_not_apply_to_other_pipelines(changes):
     config = select(num_seqs=64, max_context_length=32768, **changes)
     assert (config.max_partitions, config.workgroup_budget) == (256, 512)
@@ -91,13 +91,13 @@ def test_reducer_budget_uses_query_geometry_instead_of_query_length():
 @pytest.mark.parametrize(
     "changes",
     [
-        dict(arch="gfx942"),
-        dict(arch="gfx950"),
-        dict(head_dim=1024),
-        dict(has_sinks=True),
-        dict(output_layout_matches=False),
-        dict(sliding_window=4096),
-        dict(num_seqs=256),
+        {"arch": "gfx942"},
+        {"arch": "gfx950"},
+        {"head_dim": 1024},
+        {"has_sinks": True},
+        {"output_layout_matches": False},
+        {"sliding_window": 4096},
+        {"num_seqs": 256},
     ],
 )
 def test_existing_fallbacks_remain_original(changes):
@@ -152,14 +152,14 @@ def test_low_caps_respect_caller_and_preserve_useful_parallelism():
 @pytest.mark.parametrize(
     "changes",
     [
-        dict(num_seqs=0),
-        dict(num_compute_units=True),
-        dict(max_partitions=0),
-        dict(max_partitions=257),
-        dict(max_context_length=-1),
-        dict(max_context_length=True),
-        dict(query_length=0),
-        dict(kv_dtype="fp16"),
+        {"num_seqs": 0},
+        {"num_compute_units": True},
+        {"max_partitions": 0},
+        {"max_partitions": 257},
+        {"max_context_length": -1},
+        {"max_context_length": True},
+        {"query_length": 0},
+        {"kv_dtype": "fp16"},
     ],
 )
 def test_invalid_geometry_rejected(changes):
@@ -289,15 +289,15 @@ def test_policy_graph_decode(
         max_context_length=context,
     )
     scalar_shape = (heads, plan.capacity, qlen * group)
-    workspace = dict(
-        exp_sums=torch.empty(scalar_shape, device=query.device),
-        max_logits=torch.empty(scalar_shape, device=query.device),
-        temporary_output=torch.empty(
+    workspace = {
+        "exp_sums": torch.empty(scalar_shape, device=query.device),
+        "max_logits": torch.empty(scalar_shape, device=query.device),
+        "temporary_output": torch.empty(
             (*scalar_shape, dim),
             device=query.device,
             dtype=query.dtype,
         ),
-    )
+    }
 
     def launch():
         pa_decode(
