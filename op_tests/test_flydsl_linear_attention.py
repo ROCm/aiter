@@ -792,13 +792,12 @@ _KDA_FLYDSL_TOLS = (_KDA_OUTPUT_TOL, _KDA_STATE_TOL, _TOL_ERR_RATIO)
 
 
 def _kda_err_ratio(batch: int) -> float:
-    """Mismatch ratio the pytest checks allow: none up to batch 16.
+    """Mismatch ratio the pytest checks allow, the same at every batch.
 
-    From batch 64, a few BF16 Q/K/V or projected-g roundings tie differently
-    and move whole state rows or columns (deterministic, under 2e-5 of the state
-    on MI355X), so these batches use the benchmark allowance.
+    A BF16 Q/K/V or projected-g rounding tie can move part of a state row at any
+    batch; MI355X worst over batch 1-256, both layouts and state dtypes is 6.9e-5.
     """
-    return 0.0 if batch <= 16 else _TOL_ERR_RATIO
+    return _TOL_ERR_RATIO
 
 
 # The Triton baseline keeps the convolved Q/K/V in FP32 and computes SiLU as
@@ -983,7 +982,7 @@ def _kda_decode_work(
 
 
 @benchmark()
-def test_flydsl_kda_decode(batch, conv_layout, state_dtype):
+def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True):
     f_a, f_b_weight, seed = _make_kda_fb_inputs(
         batch,
         conv_width_major=conv_layout == "width_major",
@@ -1006,7 +1005,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype):
         ),
     }
     # The Triton kernel takes the conv cache as SGLang's transposed view only.
-    if conv_layout == "width_major":
+    if include_triton and conv_layout == "width_major":
         candidates["triton"] = (
             lambda inputs, out: _run_kda_triton(inputs, cu_seqlens, out),
             False,
@@ -1079,11 +1078,14 @@ def test_flydsl_kda_decode_exports() -> None:
 @_requires_kda
 @pytest.mark.parametrize("state_dtype", [dtypes.fp32, dtypes.bf16])
 @pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
-@pytest.mark.parametrize("batch", [1, 8, 16, 64, 128])
+@pytest.mark.parametrize("batch", [1, 3, 8, 16, 33, 64, 128])
 def test_flydsl_kda_decode_matches_reference(
     batch: int, conv_layout: str, state_dtype: torch.dtype
 ) -> None:
-    result = test_flydsl_kda_decode(batch, conv_layout, state_dtype)
+    # The Triton baseline is a benchmark comparison, not the kernel under test.
+    result = test_flydsl_kda_decode(
+        batch, conv_layout, state_dtype, include_triton=False
+    )
     assert result["flydsl err"] <= _kda_err_ratio(batch)
     assert result["flydsl_f_b err"] <= _kda_err_ratio(batch)
 
