@@ -2433,11 +2433,14 @@ def can_impl_fmha_v3_bwd(
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
-    ret &= not deterministic
-    ret &= hdim_q == hdim_v
+    # hdim_q 192 (hdim_v 192 or 128) runs a16 kernels that write dq / dk / dv once, so it is
+    # deterministic; hdim_q in (128, 192) keeps the a32 psskddv rows.
+    # bwd_hd192[_128]_{fp16,bf16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk
+    ret &= not deterministic or hdim_q == 192
+    ret &= hdim_q == hdim_v or (hdim_q, hdim_v) == (192, 128)
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-    ret &= np() or pssk() or pddv() or psskddv()
+    ret &= np() or pssk() or pddv() or psskddv() or (hdim_q == 192 and (nmask or mask))
     return ret
 
 
@@ -2509,6 +2512,10 @@ def _flash_attn_backward(
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
         how_v3_bf16_cvt = 0
+    # gfx942 hd192 backward uses a16 (atomic32=0); those kernels compute no d_sink
+    gfx942_hd192 = get_gfx() == "gfx942" and q.shape[-1] == 192
+    if gfx942_hd192:
+        is_v3_atomic_fp32 = False
 
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
@@ -2528,6 +2535,7 @@ def _flash_attn_backward(
         deterministic,
         is_v3_atomic_fp32,
     )
+    can_impl_fmha_v3_bwd_ &= not gfx942_hd192 or (sink is None and d_sink is None)
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -3348,17 +3356,6 @@ def _flash_attn_varlen_backward(
 
         return ret
 
-    def g7():
-        # bwd_hd192_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
-        # bwd_hd192_hd128_bf16_{,causal_,causal_br_}{rtne,rtna,rtz}_g7_group
-        # a16 7-GEMM kernels: dq / dk / dv are written once in bf16 (no dq_acc), so they are
-        # also deterministic.  They compute no d_sink, so sink calls keep their previous route.
-        ret = hdim_q == 192 and hdim_v in (192, 128)
-        ret &= q.dtype == dtypes.bf16
-        ret &= sink is None and d_sink is None
-
-        return ret
-
     def can_impl_fmha_v3_bwd():
         # basic
         ret = get_gfx() == "gfx942"
@@ -3366,12 +3363,16 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= deterministic == False or g7()
-        ret &= hdim_q == hdim_v or g7()
+        # hdim_q 192 (hdim_v 192 or 128) runs a16 kernels that write dq / dk / dv once, so it is
+        # deterministic; they compute no d_sink.  hdim_q in (128, 192) keeps the a32 psskddv rows.
+        # bwd_hd192[_128]_{fp16,bf16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk_group
+        ret &= deterministic == False or hdim_q == 192
+        ret &= hdim_q == hdim_v or (hdim_q, hdim_v) == (192, 128)
+        ret &= hdim_q != 192 or (sink is None and d_sink is None)
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= not swa
-        ret &= pssk() or psskddv() or g7()
+        ret &= pssk() or psskddv() or hdim_q == 192
 
         return ret
 
@@ -3395,7 +3396,7 @@ def _flash_attn_varlen_backward(
 
     def can_impl_fmha_bwd_flydsl():
         # d_qk=192 / d_v=128 causal varlen self-attention, taken only when no ASM v3 kernel
-        # covers it (gfx942 has the bf16 7-GEMM kernels, see `g7`).
+        # covers it (gfx942 has asm kernels for hdim_q 192).
         # `deterministic` is absent on purpose: the kernel uses no atomics and
         # writes each of dq/dk/dv exactly once, so it is deterministic either way.
         ret = get_gfx() == "gfx942"
@@ -3424,8 +3425,8 @@ def _flash_attn_varlen_backward(
     # gfx950 hd256 backward uses a16 (atomic32=0)
     if get_gfx() == "gfx950" and hdim_q == 256:
         is_v3_atomic_fp32 = False
-    # and so does gfx942 hd192 bf16 (the 7-GEMM kernels)
-    if get_gfx() == "gfx942" and g7():
+    # and so does gfx942 hd192
+    if get_gfx() == "gfx942" and hdim_q == 192:
         is_v3_atomic_fp32 = False
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]

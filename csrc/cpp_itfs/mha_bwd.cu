@@ -273,7 +273,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
-    // gfx942 serves deterministic requests only with the 7-GEMM kernels (checked after selection)
+    // gfx942 serves deterministic requests only with the hdim_q 192 kernels (checked below)
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) ||
        (a.is_deterministic && arch_id != "gfx1250" && arch_id != "gfx1250-strict" &&
@@ -282,6 +282,15 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
        (!is_gfx1250_asm_supported()))
     {
         return -1;
+    }
+    // gfx942 hdim_q 192 (hdim_v 192 or 128) runs dK/dV workgroups (4 GEMMs, 128 keys each) and
+    // dQ workgroups (3 GEMMs, 128 queries each) in one dispatch, which write dq / dk / dv once:
+    // a16 rows without dq_acc or post kernel, deterministic, no d_sink.  hdim_q in (128, 192)
+    // keeps the a32 kernels.
+    const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192;
+    if(hd192)
+    {
+        a.v3_atomic_fp32 = false;
     }
 
     // ASM mask type
@@ -367,7 +376,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
     // existing a16 causal kernels. Group mode is left out: there a batch's seqlen_q and
-    // seqlen_k can differ, and the a16 group kernels (7-GEMM) have both masks.
+    // seqlen_k can differ, and the a16 hdim_q 192 group kernels have both masks.
     // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
     if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && !a.is_group_mode &&
        a.seqlen_q == a.seqlen_k)
@@ -401,17 +410,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
-    // gfx942 7-GEMM kernels (*_g7_group, hdim_q 192 with hdim_v 192 / 128): dK/dV workgroups
-    // (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in one dispatch
-    // write bf16 dq / dk / dv once, so they are a16 rows (no dq_acc, no post kernel) and
-    // deterministic.
-    const bool is_g7 = dqdkdv_kernel.find("_g7_") != std::string::npos;
-    if(a.is_deterministic && arch_id == "gfx942" && !is_g7)
+    if(a.is_deterministic && arch_id == "gfx942" && !hd192)
     {
         return -1;
     }
-    // The 7-GEMM kernels compute no d_sink: sink calls fall back to CK as before.
-    if(is_g7 && (a.sink_ptr != nullptr || a.d_sink_ptr != nullptr))
+    if(hd192 && (a.sink_ptr != nullptr || a.d_sink_ptr != nullptr))
     {
         return -1;
     }
@@ -504,8 +507,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
     odo_args.seqlen_q        = a.seqlen_q;
-    // D = rowsum(dO * O) runs over the v head dim; the 7-GEMM 192/128 kernels pair with hd128 odo
-    odo_args.head_dim        = is_g7 ? a.hdim_v : a.hdim_q;
+    // D = rowsum(dO * O) runs over the v head dim; gfx942 192/128 pairs with the hd128 odo
+    odo_args.head_dim        = hd192 ? a.hdim_v : a.hdim_q;
     odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
     odo_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
@@ -703,17 +706,20 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
-    if(is_g7)
+    if(hd192)
     {
-        dqdkdv_args.Hs_dq   = a.nhead_stride_dq * 2;
-        dqdkdv_args.Seqs_dq = a.stride_dq * 2;
-        dqdkdv_args.n_kb    = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
-        dqdkdv_args.n_qb    = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+        dqdkdv_args.Hs_dq    = a.nhead_stride_dq * 2;
+        dqdkdv_args.Seqs_dq  = a.stride_dq * 2;
+        dqdkdv_args.BAs_dq   = a.batch_stride_dq * 2;
+        dqdkdv_args.BAs_lsed = a.batch_stride_lsed * 4;
+        dqdkdv_args.n_kb     = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        dqdkdv_args.n_qb     = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
         // Rank-major order hands the longest jobs out first.  Once one batch alone fills the GPU,
         // batch-major order keeps the running workgroups on a few sequences whose Q / K / V / dO
         // stay in L2 / MALL instead of streaming every sequence from HBM at once.
-        const int ranks      = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
-        dqdkdv_args.g7_order = (a.batch > 1 && 4 * a.nhead_q * ranks >= 5 * get_num_cu_func()) ? 2 : 0;
+        const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
+        dqdkdv_args.dispatch_order =
+            (a.batch > 1 && 4 * a.nhead_q * ranks >= 5 * get_num_cu_func()) ? 2 : 0;
     }
 
     auto dqdkdv_kernel_launch = [&]() {
@@ -727,13 +733,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        if(is_g7)
+        if(hd192)
         { // n_kb + n_qb ranks per (head, batch): (nhead_q, batch, ranks), or batch-major
           // (nhead_q, ranks, batch)
             const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
             gdx             = a.nhead_q;
-            gdy             = dqdkdv_args.g7_order == 2 ? ranks : a.batch;
-            gdz             = dqdkdv_args.g7_order == 2 ? a.batch : ranks;
+            gdy             = dqdkdv_args.dispatch_order == 2 ? ranks : a.batch;
+            gdz             = dqdkdv_args.dispatch_order == 2 ? a.batch : ranks;
         }
         else if(a.is_deterministic)
         { // each workgroup walks its own share of the kv blocks

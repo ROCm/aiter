@@ -739,6 +739,7 @@ parser.add_argument(
         (111, 111),
         (128, 128),
         (160, 160),
+        (192, 192),
         (192, 128),
     ],
     help="""Dimension of query and key. Default is None.

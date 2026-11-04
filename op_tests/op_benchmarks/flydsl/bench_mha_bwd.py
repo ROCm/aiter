@@ -11,9 +11,9 @@ pattern and head count, so only the head dims differ between them:
   ``192/128``  the shape this kernel exists for (d_qk=192, d_v=128)
 
       flydsl     the FlyDSL backward, native to the unpadded d_v = 128 shape
-      asm        ASM v3 7-GEMM kernels (`*_g7_group`), native to d_v = 128:
-                 a16 rows (`is_v3_atomic_fp32=False`) that write dq/dk/dv once
-                 in bf16.  What the router reaches for this shape in bf16.
+      asm        ASM v3 gfx942 hdim_q 192 kernels (`bwd_hd192_128_*_a16_*`),
+                 native to d_v = 128: a16 rows (`is_v3_atomic_fp32=False`) that
+                 write dq/dk/dv once.  What the router reaches for this shape.
       asm_vpad   ASM v3 with v zero-padded 128 -> 192 to open its gate.  v/out
                  come pre-padded from the padded forward such a model would
                  already run; padding dout and narrowing dv back to 128 are
