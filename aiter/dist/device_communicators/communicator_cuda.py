@@ -86,6 +86,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.symm_mem_comm = reuse_from.symm_mem_comm
             self.gluon_ar = reuse_from.gluon_ar
             self.gluon_ar_plain = reuse_from.gluon_ar_plain
+            self.rs_rmsnorm_ag = getattr(reuse_from, "rs_rmsnorm_ag", None)
             return
 
         # lazy import to avoid documentation build error
@@ -149,6 +150,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.gluon_ar_plain = all_reduce_init(
                 self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
             )
+        # AITER_PREFILL_RS_AG=1 (experiment): above the Gluon AR's size, the fused
+        # all-reduce + RMSNorm reduce-scatters, normalizes the own rows and
+        # all-gathers them. The residual it returns is row-sharded.
+        self.rs_rmsnorm_ag = None
+        if (
+            os.environ.get("AITER_PREFILL_RS_AG") == "1"
+            and self.world_size == 4
+            and get_gfx() == "gfx1250"
+        ):
+            from aiter.ops.triton.comms.fused.reduce_scatter_rmsnorm_all_gather import (
+                reduce_scatter_rmsnorm_all_gather_init,
+            )
+
+            self.rs_rmsnorm_ag = reduce_scatter_rmsnorm_all_gather_init(self.cpu_group)
 
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
@@ -325,6 +340,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
+        if (
+            self.rs_rmsnorm_ag is not None
+            and total_bytes > _GLUON_AR_MAX_BYTES
+            and input_n == n
+            and x_pad_to_multiple == 0
+        ):
+            from aiter.ops.triton.comms.fused.reduce_scatter_rmsnorm_all_gather import (
+                reduce_scatter_rmsnorm_all_gather,
+                reduce_scatter_rmsnorm_all_gather_supports,
+            )
+
+            if reduce_scatter_rmsnorm_all_gather_supports(
+                input_, res_inp_, weight_, self.rs_rmsnorm_ag
+            ):
+                # The residual rows of the other ranks are not written: every
+                # call of a forward pass has the same row count, so it takes this
+                # path at every boundary.
+                return reduce_scatter_rmsnorm_all_gather(
+                    input_, res_inp_, weight_, eps, gemma_norm, self.rs_rmsnorm_ag
+                )
         if (
             self.gluon_ar is not None
             and total_bytes <= _GLUON_AR_MAX_BYTES
