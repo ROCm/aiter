@@ -172,35 +172,61 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("output_layout", ["same", "padded", "heads_first"])
 @pytest.mark.parametrize(
-    "mode,dim,scratch_offset",
+    "mode,dim,scratch_offset,query_length,page,group,kv_dtype",
     [
-        ("last", 128, 0),
-        ("last", 128, 1),
-        ("last", 128, 2),
-        ("last", 128, 3),
-        ("cluster", 128, 1),
-        ("cluster", 384, 1),
-        ("reducer", 128, 1),
+        ("single", 128, 1, 3, 16, 16, "bf16"),
+        # D1024/MTP4 splits Q across CTAs; independent output strides must
+        # also retain each split's MTP row offset in stores and empty clears.
+        ("single", 1024, 1, 4, 128, 16, "bf16"),
+        ("last", 128, 0, 3, 16, 16, "bf16"),
+        ("last", 128, 1, 1, 16, 16, "bf16"),
+        ("last", 128, 2, 1, 16, 16, "bf16"),
+        ("last", 128, 3, 1, 16, 16, "bf16"),
+        ("cluster", 128, 1, 3, 16, 16, "bf16"),
+        ("cluster", 384, 1, 1, 16, 16, "bf16"),
+        ("reducer", 128, 1, 1, 16, 16, "bf16"),
+        # The FP8 wave-query pipeline keeps its reducer for independent output.
+        # Cover two different query/group combinations selecting that pipeline.
+        ("single", 128, 1, 4, 128, 16, "fp8"),
+        ("cluster", 128, 1, 4, 128, 16, "fp8"),
+        ("single", 128, 1, 5, 128, 12, "fp8"),
+        ("cluster", 128, 1, 5, 128, 12, "fp8"),
     ],
 )
 def test_pa_decode_merge_alignment(
-    device, monkeypatch, mode, dim, scratch_offset, dtype
+    device,
+    monkeypatch,
+    mode,
+    dim,
+    scratch_offset,
+    query_length,
+    page,
+    group,
+    kv_dtype,
+    dtype,
+    output_layout,
 ):
     """Offset scratch and odd query/output strides retain element alignment.
 
     Last-arriver atomics require eight-byte scratch alignment; unaligned
     scratch falls back to the cluster merge. Cluster loads and final stores
-    support the otherwise valid offset views directly, as does the reducer,
-    which a -inf sink selects without adding attention mass.
+    support the otherwise valid offset views directly, as does the reducer.
+    Independent outputs retain the reducer for aligned last-arriver plans.
+    Sinks still use that fallback, including +/-inf and finite values.
     """
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 tile-kernel partition merges")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    lengths = (1024,) if mode == "cluster" else (1024, 0, 0, 0)
-    page, group = 16, 16
+    # FP8 Q/P rounding on very short rows needs a different numerical oracle;
+    # use the existing canonical 65-token range for these layout-policy cases.
+    short_length = 65 if kv_dtype == "fp8" else 17
+    lengths = (
+        (1024, short_length, 0) if mode == "cluster" else (1024, short_length, 0, 0)
+    )
     query, key, value, table, context = _make_inputs(
-        1, 1, group, dim, page, dtype, "random", device, lengths
+        query_length, 1, group, dim, page, dtype, "random", device, lengths
     )
     # Both the base address and each head's stride may be only two-byte aligned.
     query_storage = torch.empty(
@@ -211,32 +237,57 @@ def test_pa_decode_merge_alignment(
     )
     query_view.copy_(query)
     query = query_view
-    output_storage = torch.full_like(query_storage, float("nan"))
-    output = output_storage[1:].as_strided(query.shape, query.stride())
+    if output_layout != "same":
+        # Row and head strides differ from Q and keep only element alignment.
+        if output_layout == "heads_first":
+            output_strides = (dim + 3, query.shape[0] * (dim + 3) + 1, 1)
+            storage_size = group * output_strides[1] + 1
+        else:
+            output_strides = (group * (dim + 3) + 1, dim + 3, 1)
+            storage_size = query.shape[0] * output_strides[0] + 1
+        output_storage = torch.full(
+            (storage_size,),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+    else:
+        output_strides = query.stride()
+        output_storage = torch.full_like(query_storage, float("nan"))
+    output = output_storage[1:].as_strided(query.shape, output_strides)
+    if kv_dtype == "fp8":
+        key, key_scale = per_tensor_quant(key, quant_dtype=torch.float8_e4m3fn)
+        value, value_scale = per_tensor_quant(value, quant_dtype=torch.float8_e4m3fn)
+        vec = 16
+    else:
+        key, value = key.to(torch.bfloat16), value.to(torch.bfloat16)
+        key_scale = value_scale = None
+        vec = 8
+    key_reference = key.float() * (1 if key_scale is None else key_scale)
+    value_reference = value.float() * (1 if value_scale is None else value_scale)
     key_cache = (
-        key.to(torch.bfloat16)
-        .reshape(-1, 1, page, dim // 8, 8)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
+        key.reshape(-1, 1, page, dim // vec, vec).permute(0, 1, 3, 2, 4).contiguous()
     )
     value_cache = (
-        value.to(torch.bfloat16)
-        .reshape(-1, 1, page // 8, 8, dim)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
+        value.reshape(-1, 1, page // vec, vec, dim).permute(0, 1, 2, 4, 3).contiguous()
     )
     plan = pa.plan_pa_decode(
-        context, 1, max_partitions=4, workgroup_budget=None if mode == "cluster" else 1
+        context,
+        1,
+        max_partitions=1 if mode == "single" else 4,
+        workgroup_budget=None if mode == "cluster" else 1,
+        query_length=query_length,
     )
-    sinks = (
-        torch.full((group,), float("-inf"), dtype=dtype, device=device)
-        if mode == "reducer"
-        else None
-    )
-    scalar_shape = (1, plan.capacity, group)
+    sinks = None
+    if mode == "reducer":
+        sinks = torch.linspace(-3, 3, group, dtype=dtype, device=device)
+        sinks[0], sinks[-1] = float("-inf"), float("inf")
+    scalar_shape = (1, plan.capacity, query_length * group)
     partial_shape = (*scalar_shape, dim)
     partials = torch.empty(
-        plan.capacity * group * dim + scratch_offset, dtype=dtype, device=device
+        plan.capacity * query_length * group * dim + scratch_offset,
+        dtype=dtype,
+        device=device,
     )[scratch_offset:].reshape(partial_shape)
     workspace = {
         "exp_sums": torch.empty(scalar_shape, device=device),
@@ -253,18 +304,16 @@ def test_pa_decode_merge_alignment(
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
     reference = _reference(
         query,
-        key.to(torch.bfloat16).float(),
-        value.to(torch.bfloat16).float(),
+        key_reference,
+        value_reference,
         table,
         context,
-        1,
+        query_length,
         0,
         sinks,
     )
-    for _ in range(3):
-        output.fill_(float("nan"))
-        for tensor in workspace.values():
-            tensor.fill_(float("nan"))
+
+    def launch():
         pa.pa_decode(
             output,
             query,
@@ -273,18 +322,80 @@ def test_pa_decode_merge_alignment(
             context,
             table,
             dim**-0.5,
-            1,
+            query_length,
+            key_scale=key_scale,
+            value_scale=value_scale,
             sinks=sinks,
             work_plan=plan,
+            max_context_length=1024,
             **workspace,
         )
-        _check_output(output, reference)
+
+    def check(reference):
+        assert torch.isfinite(output).all()
+        assert (
+            checkAllclose(
+                reference.float(),
+                output.float(),
+                atol=5e-3,
+                rtol=5e-3,
+                tol_err_ratio=0,
+                msg="pa_decode merge alignment",
+            )
+            == 0
+        )
         assert torch.count_nonzero(plan.arrival_counters) == 0
-    last_arriver = mode == "last" and scratch_offset == 0
-    assert compile_kwargs[-1]["direct_output"] == last_arriver
-    assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+
+    for _ in range(3):
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        launch()
+        check(reference)
+    last_arriver_eligible = mode == "last" and scratch_offset == 0
+    last_arriver = last_arriver_eligible and output_layout == "same"
+    wave_fallback = kv_dtype == "fp8" and output_layout != "same"
+    assert compile_kwargs[-1]["direct_output"] == (
+        (last_arriver or mode == "single") and not wave_fallback
     )
+    assert compile_kwargs[-1]["cluster_merge"] == (
+        0
+        if wave_fallback or last_arriver_eligible or mode in ("single", "reducer")
+        else 4
+    )
+    assert compile_kwargs[-1]["output_strides_match"] == (output_layout == "same")
+
+    # Replays must observe updated page tables as well as independent output
+    # strides when task counts change from multi-partition to single and empty.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        launch()
+    for length in (257, 0):
+        table.copy_(table.flip(1))
+        context[0] = length
+        pa.plan_pa_decode(context, 1, plan=plan, query_length=query_length)
+        query.neg_()
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check(
+            _reference(
+                query,
+                key_reference,
+                value_reference,
+                table,
+                context,
+                query_length,
+                0,
+                sinks,
+            )
+        )
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -880,6 +991,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("output_strides_match", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1115,7 +1227,8 @@ def test_pa_decode(case, device, monkeypatch):
     check()
     _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["capture"]:
-        # Compile/allocate before capture; replay must observe changed query data.
+        # Compile/allocate before capture; replay must observe changed Q and
+        # page-table entries, including the single-partition direct path.
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
@@ -1126,6 +1239,7 @@ def test_pa_decode(case, device, monkeypatch):
             launch()
         for _ in range(2):
             query.neg_()
+            table.copy_(table.flip(1))
             output.fill_(float("nan"))
             graph.replay()
             check()
