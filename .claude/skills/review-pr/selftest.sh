@@ -299,13 +299,15 @@ _drift_outside_a_repo() {
   # The whole skill tree, at the same depth it sits in the repo, with no .git anywhere --
   # what `git archive HEAD | tar -x` produces. Checks whose inputs are absent skip and
   # still exit 0; what must not happen is the crash that an empty repo-root produced.
-  # Exactly what `git archive HEAD | tar -x` produces: the tracked tree, no .git. That is
-  # what the description tells a reviewer to verify from, so it is what this asserts --
-  # not a bare skill directory, which promises nothing and would test the wrong thing.
+  # Reconstruct what the check actually needs -- the skill tree at its repo depth, plus
+  # the workflow it reads -- in a directory with no .git. Deliberately NOT `git archive`:
+  # this suite is itself meant to run from an export, where there is no repo to archive
+  # from, and a guard that only works inside a checkout cannot test leaving one.
   local t; t=$(mktemp -d)
-  ( cd "$S/../../.." && git archive HEAD | tar -x -C "$t" ) 2>/dev/null
+  mkdir -p "$t/.claude/skills" "$t/.github/workflows"
+  cp -r "$S" "$t/.claude/skills/review-pr"
   rm -rf "$t/.claude/skills/review-pr/reports"
-  cp "$S/check_prompts.py" "$t/.claude/skills/review-pr/check_prompts.py" 2>/dev/null
+  cp "$S"/../../../.github/workflows/*review-bot.yml "$t/.github/workflows/" 2>/dev/null
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
