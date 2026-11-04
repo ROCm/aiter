@@ -209,7 +209,6 @@ def shuffle_weight(
     x_.is_shuffled = True
     x_.aiter_shuffle_layout = tuple(layout)
     x_.aiter_shuffle_is_guinterleave = False
-    x_.gate_up_interleave = False
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]

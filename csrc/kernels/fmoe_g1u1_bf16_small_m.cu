@@ -12,8 +12,9 @@ AITER_CTYPES_ERROR_DECL;
 
 namespace aiter {
 
-// Direct BF16 G1U1 kernel for gfx1201 small-token-count MoE cases where
-// M <= 4 and M * topk < num_experts.
+// Direct BF16 G1U1 kernel for the guarded gfx1201 small-M Qwen3.6 shape tier:
+// M in {1,2,3,4,8,16}, model_dim=2048, inter_dim in {128,256},
+// num_experts=256, topk=8.
 template <int group_size, bool gate_is_shuffled>
 __global__ void fmoe_g1u1_bf16_small_m_stage1_kernel(
     const hip_bfloat16* __restrict__ input,
@@ -357,9 +358,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int model_dim = input->size(1);
     int expert_cnt = gate->size(0);
     int inter_dim = down->size(2);
+    AITER_CHECK(token_cnt == 1 || token_cnt == 2 || token_cnt == 3 || token_cnt == 4 ||
+                    token_cnt == 8 || token_cnt == 16,
+                __func__,
+                " only supports M in {1,2,3,4,8,16}");
+    AITER_CHECK(model_dim == 2048, __func__, " only supports model_dim=2048");
+    AITER_CHECK(inter_dim == 128 || inter_dim == 256,
+                __func__,
+                " only supports inter_dim in {128,256}");
+    AITER_CHECK(expert_cnt == 256, __func__, " only supports 256 experts");
+    AITER_CHECK(topk == 8, __func__, " only supports topk=8");
+    AITER_CHECK(out->size(0) == token_cnt && out->size(1) == model_dim,
+                __func__,
+                " output shape mismatch");
     AITER_CHECK(gate->size(1) == inter_dim * 2,
                 __func__,
                 " expects G1U1 gate shape [E, 2*inter_dim, model_dim]");
+    AITER_CHECK(down->size(0) == expert_cnt,
+                __func__,
+                " gate/down expert count mismatch");
     AITER_CHECK(gate->size(2) == model_dim && down->size(1) == model_dim,
                 __func__,
                 " model_dim mismatch");

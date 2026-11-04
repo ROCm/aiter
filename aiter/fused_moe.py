@@ -1304,6 +1304,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        splitk=splitk,
         swiglu_limit=swiglu_limit,
         beta=beta,
         linear_beta=linear_beta,
@@ -1356,6 +1357,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -1429,6 +1431,11 @@ def fused_moe_g1u1_bf16_small_m_direct(
 
 
 _BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT = (16, 16)
+_BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M = (1, 2, 3, 4, 8, 16)
+_BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM = 2048
+_BF16_G1U1_SMALL_M_DIRECT_INTER_DIMS = (128, 256)
+_BF16_G1U1_SMALL_M_DIRECT_EXPERTS = 256
+_BF16_G1U1_SMALL_M_DIRECT_TOPK = 8
 
 
 def _supports_bf16_g1u1_small_m_direct_shuffle(weight: torch.Tensor) -> bool:
@@ -1472,12 +1479,28 @@ def _can_use_bf16_g1u1_small_m_direct(
     stage2_scatter: Stage2ScatterContext | None = None,
 ) -> bool:
     M = topk_ids.shape[0]
+    topk = topk_ids.shape[1]
+    inter_dim = w2.shape[2]
     return (
         get_gfx_runtime() == "gfx1201"
         and quant_type == QuantType.No
         and activation == ActivationType.Silu
         and dtype == dtypes.bf16
-        and M in (1, 2, 3, 4, 8, 16)
+        and M in _BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M
+        and topk == _BF16_G1U1_SMALL_M_DIRECT_TOPK
+        and inter_dim in _BF16_G1U1_SMALL_M_DIRECT_INTER_DIMS
+        and hidden_states.shape == (M, _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM)
+        and w1.shape == (
+            _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
+            2 * inter_dim,
+            _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
+        )
+        and w2.shape == (
+            _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
+            _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
+            inter_dim,
+        )
+        and topk_weight.shape == topk_ids.shape
         and hidden_states.is_cuda
         and w1.is_cuda
         and w2.is_cuda
@@ -1492,7 +1515,6 @@ def _can_use_bf16_g1u1_small_m_direct(
         and w2.dtype == dtypes.bf16
         and topk_ids.dtype == dtypes.i32
         and topk_weight.dtype == dtypes.fp32
-        and w1.shape[1] == 2 * w2.shape[2]
         and expert_mask is None
         and stage2_scatter is None
         and not doweight_stage1
@@ -1541,6 +1563,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -1592,6 +1615,7 @@ def fused_moe_(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        splitk=splitk,
         swiglu_limit=swiglu_limit,
         beta=beta,
         linear_beta=linear_beta,
@@ -1628,6 +1652,7 @@ def _fused_moe_impl(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -1835,6 +1860,7 @@ def _fused_moe_impl(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
+        splitk=splitk,
     ):
         return fused_moe_g1u1_bf16_small_m_direct(
             hidden_states,
