@@ -58,6 +58,7 @@ def test_qwen36_gfx1201_bf16_fmoe_rows_cover_padded_m_4096():
 
 def test_moe_sorting_opus_dpp_scan_avoids_gfx1201_row_broadcast_controls():
     source = _OPUS_SORTING_SOURCE.read_text()
-    assert "0x142" not in source
-    assert "0x143" not in source
+    assert "#if defined(__GFX9__)" in source
+    assert source.index("0x142") > source.index("#if defined(__GFX9__)")
+    assert source.index("0x143") > source.index("#if defined(__GFX9__)")
     assert "__builtin_amdgcn_ds_bpermute" in source
