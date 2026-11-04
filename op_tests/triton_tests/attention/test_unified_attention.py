@@ -1666,7 +1666,7 @@ def test_unified_attn_non_causal_rejects_unsupported(
         if unsupported == "qq_bias"
         else None
     )
-    with pytest.raises(AssertionError, match=match):
+    with pytest.raises(ValueError, match=match):
         unified_attention(
             q=q,
             k=kv,

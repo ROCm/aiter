@@ -326,17 +326,19 @@ def unified_attention(
     The result goes into out. With skip_reduce and a split launch, the
     function returns the unmerged segments instead.
     """
-    # Checked before the decode case below, so a decode batch rejects them too.
+    # Checked before the decode case below turns causal on, so a decode batch
+    # rejects them too; raised rather than asserted, so python -O keeps them.
     if not causal:
-        assert (
-            window_size[0] < 0 and window_size[1] < 0
-        ), "Non-causal attention does not support a sliding window"
-        assert (
-            alibi_slopes is None and qq_bias is None
-        ), "Non-causal attention does not support ALiBi or a query-query bias"
-        assert (
-            q.dtype != torch.uint8 and k.dtype != torch.uint8
-        ), "Non-causal attention does not support an fp4 Q or KV cache"
+        if window_size[0] >= 0 or window_size[1] >= 0:
+            raise ValueError("Non-causal attention does not support a sliding window")
+        if alibi_slopes is not None or qq_bias is not None:
+            raise ValueError(
+                "Non-causal attention does not support ALiBi or a query-query bias"
+            )
+        if q.dtype == torch.uint8 or k.dtype == torch.uint8:
+            raise ValueError(
+                "Non-causal attention does not support an fp4 Q or KV cache"
+            )
     # A decode query sees all keys either way, so it keeps the causal kernels.
     causal = causal or int(max_seqlen_q) == 1
 
