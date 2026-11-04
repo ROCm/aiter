@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -149,6 +150,37 @@ class _Config:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _RoutedOp:
+    """What ``route()`` registered, so routed ops are enumerable by name."""
+
+    op: Op
+    contract: Signature
+    native: Callable[..., Any]
+    canonicalize: _Canonicalizer
+
+
+@dataclass(frozen=True, slots=True)
+class _SkippedProvider:
+    entry_point: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class Explanation:
+    """What ``explain()`` found without executing anything."""
+
+    decision: Decision
+    declines: Mapping[str, str]
+
+
+_routed_ops: dict[str, _RoutedOp] = {}
+_decision_counts: Counter[tuple[str, str, str, str | None]] = Counter()
+_decision_callbacks: list[Callable[[Decision], None]] = []
+_silenced_callbacks: set[int] = set()
+_callback_errors = 0
+_route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
+_skipped_providers: tuple[_SkippedProvider, ...] = ()
 _provider_records: tuple[_ProviderRecord, ...] | None = None
 _provider_lock = Lock()
 _config_snapshot: _Config | None = None
@@ -287,7 +319,14 @@ def route(*, op: str, version: int) -> Callable[[Callable[_P, _R]], Callable[_P,
     operation = Op(op, version)
 
     def decorate(native: Callable[_P, _R]) -> Callable[_P, _R]:
-        canonicalize = _build_canonicalizer(signature(native))
+        contract = signature(native)
+        canonicalize = _build_canonicalizer(contract)
+        # Two routes claiming one op name make the contract ambiguous and would
+        # make routing depend on import order, which is exactly what the enable
+        # list exists to avoid.
+        if op in _routed_ops:
+            raise ValueError(f"op {op!r} is already routed")
+        _routed_ops[op] = _RoutedOp(operation, contract, native, canonicalize)
 
         @wraps(native)
         def routed(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -314,7 +353,9 @@ def _dispatch(
         return native(*args, **kwargs)
     disabled_by = config.disabled_ops.get(op.name)
     if disabled_by is not None:
-        return _run_native(op, native, args, kwargs, "op-disabled", disabled_by)
+        return _run_native(
+            op, native, args, kwargs, "op-disabled", disabled_by, config.generation
+        )
 
     eligible = _eligible(op, config)
     if not eligible:
@@ -324,7 +365,9 @@ def _dispatch(
             reason = "provider-not-enabled"
         else:
             reason = "no-provider"
-        return _run_native(op, native, args, kwargs, reason, config.source)
+        return _run_native(
+            op, native, args, kwargs, reason, config.source, config.generation
+        )
 
     provider_args, provider_kwargs = canonicalize(*args, **kwargs)
     readonly_kwargs = MappingProxyType(provider_kwargs)
@@ -345,7 +388,7 @@ def _dispatch(
             declined = True
             continue
 
-        _last_decision.set(
+        _record(
             Decision(
                 op=op,
                 route="provider",
@@ -355,7 +398,9 @@ def _dispatch(
                 artifact_digest=candidate.artifact_digest,
                 qualification=candidate.qualification,
                 config_source=config.source,
-            )
+            ),
+            config.generation,
+            candidate.kernel_id,
         )
         # Once provider execution starts, errors propagate. Falling back here could
         # repeat side effects or hide a broken kernel behind a successful result.
@@ -364,10 +409,205 @@ def _dispatch(
     if failure is not None:
         reason, provider_name = failure
         return _run_native(
-            op, native, args, kwargs, reason, config.source, provider_name
+            op,
+            native,
+            args,
+            kwargs,
+            reason,
+            config.source,
+            config.generation,
+            provider_name,
         )
     reason = "provider-declined" if declined else "no-provider"
-    return _run_native(op, native, args, kwargs, reason, config.source)
+    return _run_native(
+        op, native, args, kwargs, reason, config.source, config.generation
+    )
+
+
+def _record(
+    decision: Decision,
+    generation: int,
+    kernel_id: str | None = None,
+) -> None:
+    """The one place a Decision is published. Four readers, one record."""
+
+    _last_decision.set(decision)
+    _decision_counts[
+        (decision.op.name, decision.route, decision.reason, decision.provider)
+    ] += 1
+    _log_route_change(decision, generation, kernel_id)
+    for callback in _decision_callbacks:
+        try:
+            callback(decision)
+        except Exception as error:  # noqa: BLE001 - telemetry must never break a launch
+            _note_callback_error(callback, error)
+
+
+def _log_route_change(
+    decision: Decision, generation: int, kernel_id: str | None
+) -> None:
+    """Log a route change once per generation, not once per call.
+
+    Within one generation the route is a deterministic function of the call
+    arguments; call-to-call variation is provider behaviour, visible in
+    ``decision_counts()``, and is not an audit event.
+    """
+
+    previous = _route_log.get(decision.op.name)
+    if previous is not None and previous[0] == generation:
+        return
+    current = (decision.route, decision.provider, kernel_id)
+    if previous is not None and previous[1] != current:
+        logger.info(
+            "Route for %s changed at config generation %s: %s -> %s",
+            decision.op.name,
+            generation,
+            previous[1],
+            current,
+        )
+    _route_log[decision.op.name] = (generation, current)
+
+
+def _note_callback_error(callback: Callable[[Decision], None], error: object) -> None:
+    global _callback_errors
+    _callback_errors += 1
+    if id(callback) not in _silenced_callbacks:
+        _silenced_callbacks.add(id(callback))
+        logger.warning(
+            "Decision callback %r failed and will not be reported again: %s",
+            getattr(callback, "__name__", callback),
+            error,
+        )
+
+
+def on_decision(callback: Callable[[Decision], None]) -> None:
+    """Call ``callback`` inline for every decision, native routes included.
+
+    Callback exceptions are swallowed, logged once per callback, and counted in
+    ``status()``: a telemetry bug must never break a kernel launch. The callback
+    budget is microseconds; do your own queueing for I/O.
+    """
+
+    _decision_callbacks.append(callback)
+
+
+def decision_counts() -> Counter[tuple[str, str, str, str | None]]:
+    """Decisions so far, keyed ``(op, route, reason, provider)``."""
+
+    return Counter(_decision_counts)
+
+
+def status() -> Mapping[str, Any]:
+    """The configuration snapshot as data: what is installed, enabled, routable."""
+
+    config = _config()
+    return MappingProxyType(
+        {
+            "api_version": API_VERSION,
+            "generation": config.generation,
+            "config_source": config.source,
+            "kill_switch": config.kill_switch,
+            "enabled": config.enabled,
+            "forced_provider": config.forced_provider,
+            "disabled_ops": dict(config.disabled_ops),
+            "providers": tuple(
+                {
+                    "name": record.provider.name,
+                    "entry_point": record.entry_point,
+                    "op_versions": dict(record.provider.op_versions),
+                }
+                for record in _providers()
+            ),
+            "skipped_providers": tuple(
+                {"entry_point": skipped.entry_point, "reason": skipped.reason}
+                for skipped in _skipped_providers
+            ),
+            "routed_ops": {
+                name: {
+                    "version": routed.op.version,
+                    "eligible": tuple(
+                        record.provider.name for record in _eligible(routed.op, config)
+                    ),
+                }
+                for name, routed in _routed_ops.items()
+            },
+            "decision_callback_errors": _callback_errors,
+        }
+    )
+
+
+def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
+    """Dry-run dispatch: gates, eligibility, selection -- but never ``run()``.
+
+    Returns the Decision this call would produce and why each provider declined.
+    Relies on ``select()`` being pure, which is already a provider obligation.
+    """
+
+    routed = _routed_ops.get(op)
+    if routed is None:
+        raise KeyError(f"op {op!r} is not routed")
+
+    config = _config()
+    operation = routed.op
+    if config.kill_switch:
+        return _explained(operation, "plugins-disabled", "env")
+    disabled_by = config.disabled_ops.get(op)
+    if disabled_by is not None:
+        return _explained(operation, "op-disabled", disabled_by)
+
+    eligible = _eligible(operation, config)
+    if not eligible:
+        if config.forced_provider:
+            reason = "forced-provider-unavailable"
+        elif _providers() and not config.enabled:
+            reason = "provider-not-enabled"
+        else:
+            reason = "no-provider"
+        return _explained(operation, reason, config.source)
+
+    canonical_args, canonical_kwargs = routed.canonicalize(*args, **kwargs)
+    readonly = MappingProxyType(canonical_kwargs)
+    declines: dict[str, str] = {}
+    for record in eligible:
+        provider = record.provider
+        candidate, rejection = _ask_provider(
+            provider, operation, canonical_args, readonly
+        )
+        if rejection is not None:
+            declines[provider.name] = rejection
+            continue
+        if candidate is None:
+            declines[provider.name] = "declined"
+            continue
+        return Explanation(
+            Decision(
+                op=operation,
+                route="provider",
+                reason="selected",
+                provider=candidate.provider,
+                kernel_id=candidate.kernel_id,
+                artifact_digest=candidate.artifact_digest,
+                qualification=candidate.qualification,
+                config_source=config.source,
+            ),
+            MappingProxyType(declines),
+        )
+
+    errored = next((r for r in declines.values() if r != "declined"), None)
+    reason = errored or "provider-declined"
+    return _explained(operation, reason, config.source, declines)
+
+
+def _explained(
+    op: Op,
+    reason: str,
+    config_source: str,
+    declines: Mapping[str, str] | None = None,
+) -> Explanation:
+    return Explanation(
+        Decision(op=op, route="native", reason=reason, config_source=config_source),
+        MappingProxyType(dict(declines or {})),
+    )
 
 
 def _ask_provider(
@@ -495,16 +735,18 @@ def _run_native(
     kwargs: dict[str, Any],
     reason: str,
     config_source: str,
+    generation: int,
     provider: str | None = None,
 ) -> _R:
-    _last_decision.set(
+    _record(
         Decision(
             op=op,
             route="native",
             reason=reason,
             provider=provider,
             config_source=config_source,
-        )
+        ),
+        generation,
     )
     return native(*args, **kwargs)
 
@@ -570,7 +812,9 @@ def _providers() -> Sequence[_ProviderRecord]:
 
 
 def _discover_providers() -> tuple[_ProviderRecord, ...]:
-    records = []
+    global _skipped_providers
+    records: list[_ProviderRecord] = []
+    skipped: list[_SkippedProvider] = []
     for entry_point in sorted(_entry_points(), key=lambda item: item.name):
         try:
             loaded = entry_point.load()
@@ -579,18 +823,19 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             api_version = provider.api_version
             _ = provider.op_versions
             if api_version != API_VERSION:
-                logger.warning(
-                    "Skipping provider %s: API version %s is incompatible with %s",
-                    name,
-                    api_version,
-                    API_VERSION,
-                )
+                reason = f"API version {api_version} is incompatible with {API_VERSION}"
+                logger.warning("Skipping provider %s: %s", name, reason)
+                skipped.append(_SkippedProvider(entry_point.name, reason))
                 continue
             records.append(_ProviderRecord(entry_point.name, provider))
         except Exception as error:  # noqa: BLE001 - one plugin must not break AITER
             logger.warning(
                 "Skipping provider entry point %s: %s", entry_point.name, error
             )
+            # status() reports what was skipped and why: an installed provider
+            # that never serves is the question an operator asks first.
+            skipped.append(_SkippedProvider(entry_point.name, str(error)))
+    _skipped_providers = tuple(skipped)
     return tuple(
         sorted(records, key=lambda item: (item.provider.name, item.entry_point))
     )
@@ -605,8 +850,16 @@ def _entry_points() -> Sequence[metadata.EntryPoint]:
 
 def _reset_for_testing() -> None:
     global _provider_records, _config_snapshot, _eligible_cache, _framework_default
+    global _skipped_providers, _callback_errors
+    _routed_ops.clear()
+    _decision_counts.clear()
+    _decision_callbacks.clear()
+    _silenced_callbacks.clear()
+    _route_log.clear()
+    _callback_errors = 0
     with _provider_lock:
         _provider_records = None
+        _skipped_providers = ()
     with _config_lock:
         _config_snapshot = None
         _eligible_cache = {}
@@ -617,11 +870,16 @@ def _reset_for_testing() -> None:
 __all__ = [
     "API_VERSION",
     "Decision",
+    "Explanation",
     "KernelCandidate",
     "KernelProvider",
     "Op",
     "configure",
+    "decision_counts",
+    "explain",
     "last_decision",
+    "on_decision",
     "reload_config",
     "route",
+    "status",
 ]
