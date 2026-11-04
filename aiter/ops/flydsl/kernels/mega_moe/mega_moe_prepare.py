@@ -1353,8 +1353,11 @@ def _emit_plan(
     # _fast_prepare_supported): the expert tile metadata goes to a helper
     # warp and PLAN_READY is published after the CTA barrier.
     assert fz_epr <= 64 and fz_npes == 8
-    tag_shift = max(1, (int(fz_mtpr) * int(fz_k)).bit_length())
-    assert tag_shift <= 24
+    # Tagged words carry a segment count (<= mtpr * topk) or the sender's
+    # tile_m (<= 128) below the launch tag.  Ranks may pick different tile_m
+    # in one step, so the shift must not depend on this rank's tile_m.
+    tag_shift = max(8, (int(fz_mtpr) * int(fz_k)).bit_length())
+    assert int(fz_tile_m) < (1 << tag_shift) and tag_shift <= 24
     tag_mask = (1 << (31 - tag_shift)) - 1
     # Launch sequence: EXPECTED[parity] advances by npes per use and the two
     # parities alternate, so (expected / npes) * 2 - parity is 1, 2, 3, ...
