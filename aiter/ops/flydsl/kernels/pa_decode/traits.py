@@ -1010,25 +1010,23 @@ class Gfx1250Traits:
 
     @property
     def wave_query_tiles(self):
-        # One D128 query tile per wave keeps scores, P and output in registers:
+        # One query tile per wave keeps scores, P and output in registers:
         # softmax needs no cross-wave exchange, only the page buffers are shared.
+        # fp8_multi_tile bounds four query tiles to D128.
         return (
             self.fp8_multi_tile
             and self.m_tiles == self.NWARP
-            and self.head_dim == 128
             and self.async_page
             and self.causal_rows
         )
 
     @property
     def bf16_wave_query_tiles(self):
-        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # Four query tiles over BF16 page128 caches: wave pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
+        # Packed page128 limits D256 to 32 rows, so this selects D64 and D128.
         return (
-            self.bf16_page128_packed
-            and self.m_tiles == self.NWARP
-            and self.head_dim == 128
-            and self.causal_rows
+            self.bf16_page128_packed and self.m_tiles == self.NWARP and self.causal_rows
         )
 
     @property
