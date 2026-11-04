@@ -12,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
+    _GFX950_PACKED_FMTS,
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
     _launch_splits,
@@ -249,7 +250,8 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
     return True
 
 
-_DSV4_ROW = 448 + 2 * 64 + 8  # 584 B: fp8 nope | bf16 rope | 8 B UE8M0 trailer
+_DSV4_FMTS = tuple(_GFX950_PACKED_FMTS.values())
+DSV4_RECORD_BYTES = tuple(_GFX950_PACKED_FMTS)
 
 
 def _dsv32_row(kv_lora_rank, qk_rope_head_dim):
@@ -320,15 +322,16 @@ def _classify_cache(q, kv, kv_lora_rank, qk_rope_head_dim, kv_scale, what="kv_bu
                 f"{what}: packed caches carry their own scales; kv_scale must be None"
             )
         one_byte = kv.element_size() == 1
-        if one_byte and width == _DSV4_ROW:
-            return "fp8_dsv4_mla"
+        if one_byte and width in _GFX950_PACKED_FMTS:
+            return _GFX950_PACKED_FMTS[width]
         dsv32 = _dsv32_row(kv_lora_rank, qk_rope_head_dim)
         if one_byte and qk_rope_head_dim > 0 and width == dsv32:
             return "fp8_dsv32_mla"
         raise ValueError(
             f"{what}: unrecognized 3-D cache, {width}-wide {kv.dtype} records for q "
             f"width {d_qk}. Expected {d_qk} (bf16 or fp8_scalar block pool), "
-            f"{_DSV4_ROW} uint8 (fp8_dsv4_mla) or {dsv32} uint8 (fp8_dsv32_mla with "
+            f"{DSV4_RECORD_BYTES} uint8 ({', '.join(_DSV4_FMTS)}) "
+            f"or {dsv32} uint8 (fp8_dsv32_mla with "
             f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim})"
         )
     raise ValueError(f"{what} must be 2-D, 3-D or 4-D, got {kv.ndim}-D")
@@ -340,10 +343,10 @@ def _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim):
             f"kv_lora_rank must be > 0 and qk_rope_head_dim >= 0, got "
             f"{kv_lora_rank} / {qk_rope_head_dim}"
         )
-    if fmt == "fp8_dsv4_mla":
+    if fmt in _DSV4_FMTS:
         if d_qk != 512:
             raise ValueError(
-                f"fp8_dsv4_mla needs q width 512 (448 nope + 64 rope), got {d_qk}"
+                f"{fmt} needs q width 512 (rope inside the row), got {d_qk}"
             )
         return
     if fmt == "fp8_g64":
@@ -507,6 +510,13 @@ def sparse_mla_fwd(
                        (DeepSeek-V4; vLLM fp8_ds_mla:
                        448 fp8 | 64 bf16 rope + 8 B
                        UE8M0 trailer per block)
+        fp8_dsv41_mla  [nb, block, 528] uint8        None            ignored
+                       (DeepSeek-V4.1; vLLM fp8_ds_mla:
+                       512 fp8 | 16 UE8M0 per-32)
+        nvfp4_dsv41_mla [nb, block, 288] uint8       None            ignored
+                       (DeepSeek-V4.1 compressed cache,
+                       extra_kv only; vLLM nvfp4_ds_mla:
+                       256 B e2m1 | 32 e4m3 per-16)
 
     Geometry, set by qk_rope_head_dim: separated rope (DeepSeek-V3.2,
     GLM-5.1/5.2), where the query is the latent plus an appended rope and V is
@@ -604,9 +614,15 @@ def sparse_mla_fwd(
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
         # dsv4 decoder reads. A flat main pool would silently drop the extra one.
-        if kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16", "fp8_scalar"):
+        if kv_buffer.ndim != 3 or fmt not in (
+            "fp8_dsv4_mla",
+            "fp8_dsv41_mla",
+            "bf16",
+            "fp8_scalar",
+        ):
             raise ValueError(
-                "the two-loop needs a 3-D block cache (fp8_dsv4_mla, bf16 or "
+                "the two-loop needs a 3-D block cache (fp8_dsv4_mla, fp8_dsv41_mla, "
+                "bf16 or "
                 f"fp8_scalar) as kv_buffer, got {fmt}"
             )
         if fmt == "fp8_scalar":
@@ -629,15 +645,16 @@ def sparse_mla_fwd(
             extra_fmt = _classify_cache(
                 q, extra_kv, kv_lora_rank, qk_rope_head_dim, None, what="extra_kv"
             )
-            if extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16"):
+            if extra_kv.ndim != 3 or extra_fmt not in (*_DSV4_FMTS, "bf16"):
                 raise ValueError(
-                    f"extra_kv must be a 3-D fp8_dsv4_mla or bf16 block cache, got "
+                    "extra_kv must be a 3-D fp8_dsv4_mla, fp8_dsv41_mla or bf16 "
+                    f"block cache, got "
                     f"{extra_fmt}"
                 )
         _check_index_stream(
             extra_indptr, extra_indices, num_queries, q.device, what="extra_"
         )
-    if fmt in ("fp8_dsv4_mla", "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
+    if fmt in (*_DSV4_FMTS, "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
         return _forward_paged(
             q,
             kv_buffer,
