@@ -19,17 +19,18 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def _skill_md():
-    root = subprocess.run(
-        ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    p = pathlib.Path(root, ".claude", "skills", "review-pr", "SKILL.md")
-    return p.read_text(encoding="utf-8")
+    """SKILL.md sits next to this file; do not ask git where the repo root is.
+
+    `git rev-parse --show-toplevel` returns an empty string outside a checkout, and
+    Path("", ".claude", ...) is then a RELATIVE path resolved against the caller's cwd.
+    So the drift check died with FileNotFoundError on a clean `git archive HEAD` export
+    -- which is what this PR's own description tells a reviewer to verify from, and the
+    one place the check absolutely has to work. It passed everywhere it was tried
+    because every trial was inside a git checkout.
+    """
+    return (HERE / "SKILL.md").read_text(encoding="utf-8")
 
 
-# (prompt file relative to HERE, start anchor, end anchor) — anchors are unique lines in SKILL.md.
 CHECKS = [
     (
         "prompts/refuter.md",
