@@ -112,7 +112,7 @@ def issue_wmma(
 
 
 @gluon.jit
-def issue_wmma_khalf(
+def issue_wmma_ktail(
     consumer,
     a_buffer,
     a_layout: gl.constexpr,
@@ -122,27 +122,27 @@ def issue_wmma_khalf(
     wait_producers_cnt,
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    BLOCK_K: gl.constexpr,
+    KTAIL: gl.constexpr,
 ):
-    """Half-K form of issue_wmma for the last K step when K leaves exactly BLOCK_K / 2.
+    """Narrow form of issue_wmma for the last K step, when K does not fill BLOCK_K.
 
-    The TDM descriptor clamps out-of-range K, so the tail slot is zero-filled and a full-width wmma
-    throws away half its work. Only the wmma is halved; the load already happened.
+    The TDM descriptor clamps out-of-range K, so the tail slot is zero-filled and a full-width
+    wmma throws away the fill. KTAIL is the real tail width, rounded up to the wmma K step, so
+    only the useful part is multiplied. Only the wmma narrows; the load already happened.
     """
     _cluster_gate(wait_producers_cnt)
 
-    HALF: gl.constexpr = BLOCK_K // 2
     slot = consumer % NUM_BUFFERS
     a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        a_buffer.index(slot).slice(0, HALF, dim=1), a_layout
+        a_buffer.index(slot).slice(0, KTAIL, dim=1), a_layout
     )
     if TRANSPOSE_B:
         b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index(slot).slice(0, HALF, dim=1).permute([1, 0]), b_layout
+            b_buffer.index(slot).slice(0, KTAIL, dim=1).permute([1, 0]), b_layout
         )
     else:
         b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index(slot).slice(0, HALF, dim=0), b_layout
+            b_buffer.index(slot).slice(0, KTAIL, dim=0), b_layout
         )
 
     return consumer + 1, gl.amd.cdna5.wmma(a, b, accumulator)
@@ -241,7 +241,7 @@ def compute_tile(
                 TRANSPOSE_B,
                 NUM_BUFFERS,
             )
-        consumer, acc = issue_wmma_khalf(
+        consumer, acc = issue_wmma_ktail(
             consumer,
             a_buffer,
             OPERAND_A,
@@ -251,7 +251,7 @@ def compute_tile(
             0,
             TRANSPOSE_B,
             NUM_BUFFERS,
-            BLOCK_K,
+            KTAIL,
         )
     else:
         for i in gl.static_range(NUM_BUFFERS - 1):

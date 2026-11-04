@@ -8,6 +8,7 @@ import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.layouts import (
+    WMMA_INSTR_SHAPE,
     operand_bundle_cga,
     wmma_layout,
 )
@@ -24,6 +25,8 @@ _SUPPORTED_ARCHS = ("gfx1250",)
 # wmma takes 16-bit operands and accumulates in fp32.
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _OPERAND_BYTES = 2
+#: wmma K step; a drain narrower than this cannot be sliced.
+_WMMA_K = WMMA_INSTR_SHAPE[2]
 
 # Floors for a remainder sub-tile. These are hardware widths, not tuned values, so they stay
 # here and not in the config, like TDM_PAD_INTERVAL_MAX in _gluon_kernels/gfx1250/layouts.py.
@@ -247,8 +250,14 @@ def gemm_a16w16_streamk_(
     )
     wmma_r, dot_r_a, dot_r_b, shared_r_a, shared_r_b = rem
 
-    # KTAIL is decided here, from the real K, so only one drain path is compiled.
-    KTAIL = 1 if (K % BLOCK_K) == (BLOCK_K // 2) else 0
+    # KTAIL is the width of the last K step when K does not fill BLOCK_K, rounded up to the
+    # wmma K step. The TDM load zero-fills the rest, so a full-width drain wmma multiplies the
+    # fill: at K=2880 with BLOCK_K=256 the tail is 64, and a full 256-wide drain throws away 75
+    # percent of one step of 12. It is decided here, from the real K, so the compiler builds
+    # only one drain path; testing K inside the kernel compiles both and costs even the shapes
+    # that do not take the tail.
+    _k_rem = K % BLOCK_K
+    KTAIL = triton.cdiv(_k_rem, _WMMA_K) * _WMMA_K if _k_rem else 0
 
     # The masked C store indexes C by an absolute element offset, which overflows int32 past
     # 2**31 elements. Switch that store to a 64-bit base only when C can reach it: the 64-bit
