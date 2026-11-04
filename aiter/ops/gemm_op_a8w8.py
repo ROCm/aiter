@@ -20,6 +20,7 @@ from ..jit.core import (
     compile_ops,
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
@@ -605,6 +606,13 @@ def get_CKGEMM_config(
     gfx = get_gfx() if gfx is None else gfx
     cu_num = get_cu_num() if cu_num is None else cu_num
     has_gfx = _CKGEMM_HAS_GFX[tuned_file]
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if (
+        has_gfx
+        and base_gfx_arch(gfx) != gfx
+        and gfx not in {key[0] for key in _CKGEMM_CONFIG_CACHE[tuned_file]}
+    ):
+        gfx = base_gfx_arch(gfx)
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -1179,6 +1187,11 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
     padded M; None when untuned. Cached per shape; a miss is reported once per
     (N, K, w_scale_block)."""
     gfx, cu_num = get_gfx(), get_cu_num()
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        key[0] for key in _mxscale_bpreshuffle_tuned_nk()
+    }:
+        gfx = base_gfx_arch(gfx)
     if (gfx, cu_num, n, k, w_scale_block) not in _mxscale_bpreshuffle_tuned_nk():
         # No row for this N/K at any M: same answer as the walk below.
         row, padded_m = None, m
@@ -1504,7 +1517,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
-        get_gfx() == "gfx1250"
+        is_gfx1250_family(get_gfx())
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
@@ -1830,7 +1843,7 @@ def gemm_a8w8_blockscale_abpreshuffle(
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if not (
-        get_gfx() == "gfx1250"
+        is_gfx1250_family(get_gfx())
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
