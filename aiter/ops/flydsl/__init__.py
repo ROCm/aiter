@@ -98,6 +98,10 @@ _LAZY_IMPORTS = {
         ".linear_attention_kernels",
         "flydsl_kda_decode_with_f_b",
     ),
+    "flydsl_kda_verify_with_f_b": (
+        ".linear_attention_kernels",
+        "flydsl_kda_verify_with_f_b",
+    ),
     "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
@@ -227,6 +231,7 @@ __all__ = [
     "flydsl_hstu_attention_fwd",
     "flydsl_kda_decode",
     "flydsl_kda_decode_with_f_b",
+    "flydsl_kda_verify_with_f_b",
     "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
