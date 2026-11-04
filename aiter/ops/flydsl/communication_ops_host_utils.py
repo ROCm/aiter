@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from .allreduce_host_shared import _resolve_inbox_flags
+from .comm_collectives_host_shared import _resolve_inbox_flags
 from .ipc_heap import UncachedIpcHeap
 
 

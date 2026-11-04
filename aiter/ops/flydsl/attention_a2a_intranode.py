@@ -21,7 +21,7 @@ from aiter.ops.mha_v4_quant import (
     mxfp6_v_tiles,
 )
 
-from .allreduce_host_shared import _resolve_inbox_flags
+from .comm_collectives_host_shared import _resolve_inbox_flags
 from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,

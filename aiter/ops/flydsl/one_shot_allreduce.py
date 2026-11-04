@@ -10,7 +10,7 @@ import logging
 import torch
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from .allreduce_host_shared import (
+from .comm_collectives_host_shared import (
     _cuda_index,
     _resolve_inbox_flags,
     _StEngine,

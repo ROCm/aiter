@@ -30,7 +30,7 @@ from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .allreduce_host_shared import (
+from .comm_collectives_host_shared import (
     _cuda_index,
     _resolve_inbox_flags,
     _StEngine,
