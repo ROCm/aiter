@@ -315,6 +315,32 @@ class TestTunerCommonRunConfig(_StubFamily):
             [os.pathsep.join([candidate, str(merged)]), str(merged), candidate],
         )
 
+    def test_only_a_table_the_tuner_times_itself_is_merged(self):
+        tuner = self.make_tuner()
+        candidate = self.config("triton")
+        args = argparse.Namespace(warmup=1, iters=1, timeout=60)
+        seen = []
+
+        def record_run_config(_args):
+            seen.append(tuner._substituted_config)
+
+        with (
+            mock.patch.dict(os.environ),
+            mock.patch.object(tuner, "run_config", record_run_config),
+        ):
+            # --compare times a table the tuner wrote.
+            tuner._run_config_for_shapes(args, tuner.untunedf, config_file=candidate)
+            # --run_config <file> times the user's table.
+            old_val, old_rebuild = tuner._set_config_env_for_run_config(
+                args, config_file=candidate
+            )
+            try:
+                tuner.run_config(args)
+            finally:
+                tuner._restore_config_env("STUB_CONFIG", old_val, old_rebuild)
+        self.assertEqual(seen, [candidate, None])
+        self.assertIsNone(tuner._substituted_config)
+
     def test_a_row_keyed_on_another_gpu_fails_without_spawning(self):
         tuner = self.make_tuner()
         args = argparse.Namespace(warmup=1, iters=1, timeout=60)

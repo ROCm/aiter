@@ -972,8 +972,9 @@ class TunerCommon:
     def _with_model_configs(self, config_file):
         """``config_file`` plus the model_configs CSVs serving merges with the
         family's default table, so a duplicate shape fails here as it would
-        there. Only a file the tuner put in the config variable stands in for
-        the default table; serving merges nothing into one the user set."""
+        there. Only a table the tuner wrote and times itself stands in for the
+        default table; a file the user names, in the config variable or with
+        ``--run_config``, is read as given, as serving reads it."""
         default = self.ARG_DEFAULTS.get("tune_file", "")
         name = os.path.splitext(os.path.basename(default))[0]
         if not config_file or not name or config_file != self._substituted_config:
@@ -1088,7 +1089,6 @@ class TunerCommon:
         output_file = config_file if config_file else self.get_out_file(args.tune_file)
         old_val = os.environ.get(env_name)
         os.environ[env_name] = output_file
-        self._substituted_config = output_file
         logger.info(f"Setting {env_name}={output_file} for benchmark")
         # Clear operator-specific config caches
         self._clear_op_caches()
@@ -1693,6 +1693,7 @@ class TunerCommon:
             old_val, old_rebuild = self._set_config_env_for_run_config(
                 args, config_file=config_file
             )
+            self._substituted_config = config_file
             try:
                 return self.run_config(args)
             finally:
