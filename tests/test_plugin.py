@@ -248,8 +248,17 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     assert len(warnings) == 2
     assert {args[0] for args in warnings} == {
         "Skipping provider entry point %s: %s",
-        "Skipping provider %s: API version %s is incompatible with %s",
+        "Skipping provider %s: %s",
     }
+    # An installed provider that never serves is the first thing an operator
+    # asks about, so status() has to say what was skipped and why.
+    skipped = {
+        entry["entry_point"]: entry["reason"]
+        for entry in plugin.status()["skipped_providers"]
+    }
+    assert set(skipped) == {"broken", "old"}
+    assert "missing dependency" in skipped["broken"]
+    assert "incompatible" in skipped["old"]
 
 
 def test_force_and_per_op_disable_are_explicit(monkeypatch):
@@ -614,3 +623,130 @@ def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
     plugin.reload_config()
     assert add(2, 3) == 100
     assert plugin.last_decision().config_source == "env"
+
+
+def test_routing_one_op_name_twice_is_an_error():
+    _route_add([])
+    with pytest.raises(ValueError, match="already routed"):
+        _route_add([])
+
+
+def test_status_reports_the_stack_and_what_is_routable(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    _route_add([])
+    plugin.configure(enable=["aklr"], disable=["other.op"], source="vllm 2026.11")
+
+    status = plugin.status()
+
+    assert status["config_source"] == "configure:vllm 2026.11"
+    assert status["enabled"] == ("aklr",)
+    assert status["disabled_ops"] == {"other.op": "configure:vllm 2026.11"}
+    assert status["routed_ops"]["test.add"] == {"version": 1, "eligible": ("aklr",)}
+    assert status["providers"][0]["name"] == "aklr"
+
+
+def test_explain_answers_without_executing(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    native_calls = []
+    _route_add(native_calls)
+
+    explanation = plugin.explain("test.add", 2, 3)
+
+    assert explanation.decision.route == "provider"
+    assert explanation.decision.provider == "aklr"
+    assert native_calls == [], "explain() must not run anything"
+    assert plugin.last_decision() is None, "a dry run is not a decision"
+    assert plugin.decision_counts() == {}
+
+
+def test_explain_names_why_each_provider_declined(monkeypatch):
+    broken = _Broken("broken", RuntimeError("boom"))
+    quiet = _Provider("quiet")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, quiet")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("broken", broken), _EntryPoint("quiet", quiet)),
+    )
+    _route_add([])
+
+    explanation = plugin.explain("test.add", 2, 3)
+
+    assert explanation.decision.route == "native"
+    assert explanation.decision.reason == "provider-select-error"
+    assert dict(explanation.declines) == {
+        "broken": "provider-select-error",
+        "quiet": "declined",
+    }
+
+
+def test_explain_rejects_an_unrouted_op():
+    with pytest.raises(KeyError):
+        plugin.explain("nobody.routes.this")
+
+
+def test_decision_counts_include_native_routes(monkeypatch):
+    add = _route_add([])
+
+    add(2, 3)
+    add(4, 5)
+
+    assert plugin.decision_counts() == {("test.add", "native", "no-provider", None): 2}
+
+
+def test_on_decision_is_called_inline_for_every_route():
+    seen = []
+    plugin.on_decision(seen.append)
+    add = _route_add([])
+
+    add(2, 3)
+
+    assert [decision.reason for decision in seen] == ["no-provider"]
+
+
+def test_a_broken_callback_is_swallowed_logged_once_and_counted(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(plugin.logger, "warning", lambda *args: warnings.append(args))
+
+    def broken(decision):
+        raise RuntimeError("telemetry is broken")
+
+    plugin.on_decision(broken)
+    add = _route_add([])
+
+    assert add(2, 3) == 5, "a telemetry bug must never break a kernel launch"
+    assert add(4, 5) == 9
+
+    assert len(warnings) == 1, "logged once per callback, not once per call"
+    assert plugin.status()["decision_callback_errors"] == 2
+
+
+def test_route_changes_are_logged_once_per_generation(monkeypatch):
+    infos = []
+    monkeypatch.setattr(
+        plugin.logger, "info", lambda fmt, *rest: infos.append(fmt % rest)
+    )
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+
+    add(2, 3)
+    add(2, 3)
+    assert infos == [], "the first generation has nothing to compare against"
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.reload_config()
+    add(2, 3)
+    add(2, 3)
+
+    assert len(infos) == 1, "one line per generation, not per call"
+    assert "test.add" in infos[0]
