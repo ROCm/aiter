@@ -273,20 +273,18 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
-    // gfx942 serves deterministic requests only with the hdim_q 192 kernels (checked below)
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
-       (a.bias_type != 0) || (a.has_dropout) ||
-       (a.is_deterministic && arch_id != "gfx1250" && arch_id != "gfx1250-strict" &&
-        arch_id != "gfx942") ||
+       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && (arch_id != "gfx1250" && arch_id != "gfx1250-strict")) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")) ||
        (!is_gfx1250_asm_supported()))
     {
         return -1;
     }
-    // gfx942 hdim_q 192 (hdim_v 192 or 128) runs dK/dV workgroups (4 GEMMs, 128 keys each) and
-    // dQ workgroups (3 GEMMs, 128 queries each) in one dispatch, which write dq / dk / dv once:
-    // a16 rows without dq_acc or post kernel, deterministic, no d_sink.  hdim_q in (128, 192)
-    // keeps the a32 kernels.
+    // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
+    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  They run dK/dV workgroups
+    // (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in one dispatch and
+    // write dq / dk / dv once, so they are a16 rows without dq_acc or post kernel; they compute
+    // no d_sink.
     const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192;
     if(hd192)
     {
@@ -400,17 +398,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          a.v3_atomic_fp32,
                                                                          a.v3_bf16_cvt,
                                                                          a.is_group_mode,
-                                                                         // gfx942 rows carry no det column
-                                                                         a.is_deterministic && arch_id != "gfx942",
+                                                                         a.is_deterministic,
                                                                          pre_cfgs,
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
     if((pre_kernel == "") || (dqdkdv_kernel == ""))
-    {
-        return -1;
-    }
-    if(a.is_deterministic && arch_id == "gfx942" && !hd192)
     {
         return -1;
     }
@@ -733,6 +726,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
+        if(a.is_deterministic)
+        { // each workgroup walks its own share of the kv blocks
+            gdx = nsplit;
+        }
+        else if((mt == 1) || (mt == 2))
+        { // mask kb
+            gdx = (gdx + 1) / 2;
+        }
         if(hd192)
         { // n_kb + n_qb ranks per (head, batch): (nhead_q, batch, ranks), or batch-major
           // (nhead_q, ranks, batch)
@@ -740,14 +741,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             gdx             = a.nhead_q;
             gdy             = dqdkdv_args.dispatch_order == 2 ? ranks : a.batch;
             gdz             = dqdkdv_args.dispatch_order == 2 ? a.batch : ranks;
-        }
-        else if(a.is_deterministic)
-        { // each workgroup walks its own share of the kv blocks
-            gdx = nsplit;
-        }
-        else if((mt == 1) || (mt == 2))
-        { // mask kb
-            gdx = (gdx + 1) / 2;
         }
 
         impl_ptr_dqdkdv->launch_kernel(
