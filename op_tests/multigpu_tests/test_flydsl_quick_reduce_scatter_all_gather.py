@@ -29,8 +29,9 @@ the rounding order of the sum shows) and all zeros:
   one rank delayed (``torch.cuda._sleep``, a private torch API), each
   reproduce the isolated output of their own input bit for bit;
 * tensors the engine must refuse are refused: wrong size ratio, a partial
-  tile, overlapping and misaligned buffers; so are engines the modes cannot run
-  on (the ring, a fine-grained inbox);
+  tile, a payload past the 4 GiB buffer window, overlapping and misaligned
+  buffers; so are engines the modes cannot run on (the ring, a fine-grained
+  inbox);
 * after ``compile_sp`` (which launches nothing and leaves its tensors alone)
   both modes capture into one CUDA graph, and every replay with new inputs
   equals an eager run of the same inputs bit for bit; capturing on an engine
@@ -74,6 +75,7 @@ set_start_method("spawn", force=True)
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
+    MAX_PAYLOAD_BYTES,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     TwoShotRung,
@@ -84,10 +86,10 @@ try:
 except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# Expected NMSE of one INT4 group-16 E4M3 codec application on N(0, sigma) data is
-# about 6e-3 for the RS sum of two partials (and for an AG round trip), and about
-# 1e-2 on Student-t(3) data; 2e-2 is a bound a correct kernel stays under with
-# margin and a wrong block / offset (NMSE ~ 1-2) exceeds.
+# Expected NMSE of one INT4 group-16 E5M2-scale codec application on N(0, sigma)
+# data is about 6.5e-3 for the RS sum of two partials (and for an AG round trip),
+# and about 1.1e-2 on Student-t(3) data; 2e-2 is a bound a correct kernel stays
+# under with margin and a wrong block / offset (NMSE ~ 1-2) exceeds.
 NMSE_MAX = 2e-2
 # checkAllclose tolerances as in test_flydsl_quick_allreduce_int4.py: calibrated
 # to the INT4 group-16 codec, not bit identity. NMSE stays the accuracy gate.
@@ -157,9 +159,9 @@ def _make_inp(
         z = z / torch.sqrt(chi / 3.0)
     if fill == "ranged":
         # Rank r's partial is 4**(r % 4) times as large, up to 64x (the values stay
-        # far below the fp16 maximum). A dequantized product is exact in fp16, and
-        # so is a sum of terms of similar magnitude, which makes the result
-        # independent of the accumulation order for the other fills; terms of
+        # far below the fp16 maximum). A dequantized product is exact in fp16 and
+        # a sum of terms of similar magnitude rarely rounds, so for the other
+        # fills the result barely depends on the accumulation order; terms of
         # very different magnitude round, so with this one the order (rank order
         # for every owner) shows in the bits.
         z = z * 4.0 ** (rank % 4)
@@ -233,14 +235,24 @@ def _check_refusals(fly, tp: int, device) -> None:
     # a full tensor that starts one element (2 bytes) into its allocation
     raw = torch.zeros(full.numel() + 8, dtype=torch.bfloat16, device=device)
     skewed = raw[1 : 1 + full.numel()].view_as(full)
+    # whole tiles, tp times the shard, and one step past the 4 GiB buffer window;
+    # never read, because it is refused before any launch
+    step_rows = 32 * tp
+    huge_rows = step_rows * (MAX_PAYLOAD_BYTES // (step_rows * _REFUSE_HIDDEN * 2) + 1)
+    huge = torch.empty((huge_rows, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+    huge_shard = torch.empty(
+        (huge_rows // tp, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device
+    )
 
-    ratio, tile = "times the shard", "whole number of"
+    ratio, tile, window = "times the shard", "whole number of", "4 GiB"
     overlap, align = "non-overlapping", "16-byte-aligned"
     cases = (
         ("rs size ratio", lambda: fly.reduce_scatter(full, big_shard), ratio),
         ("ag size ratio", lambda: fly.all_gather(big_shard, full), ratio),
         ("rs partial tile", lambda: fly.reduce_scatter(part, part_shard), tile),
         ("ag partial tile", lambda: fly.all_gather(part_shard, part), tile),
+        ("rs payload window", lambda: fly.reduce_scatter(huge, huge_shard), window),
+        ("ag payload window", lambda: fly.all_gather(huge_shard, huge), window),
         (
             "rs overlap",
             lambda: fly.reduce_scatter(overlap_full, overlap_shard),

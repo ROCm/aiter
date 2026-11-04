@@ -378,7 +378,7 @@ class QuickAllReduceInt4:
         self._norm_by_atoms = {}
         self._norm_build_kw = {}
         self._norm_launch = {}
-        # The single-phase builds ``sp_launch`` adds on first use, by mode.
+        # The single-phase builds ``_sp_launcher`` adds on first use, by mode.
         self._sp_launch = {}
         # Row widths whose fused builds are all compiled and loaded.
         self._rmsnorm_hidden = set()
