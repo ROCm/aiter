@@ -13,7 +13,8 @@ layout is a new dtype case, not a new entry.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
-  (q, kv fp8), the prefix source fp8 or NVFP4 with ``[*, 32]`` e4m3 scales: opus on gfx950.
+  (q, kv fp8), the prefix source fp8 or NVFP4 with ``[*, 32]`` e4m3 scales: opus on gfx950,
+  and with an fp8 prefix on gfx1250.
 
 ``backend`` forces one backend. A configuration no backend serves raises RuntimeError;
 a bad argument raises ValueError.
@@ -38,6 +39,7 @@ from .opus.mla import (
     opus_mla_v4_prefill_a16w16_gfx1250_fwd,
     opus_mla_v41_prefill_a8w4_gfx950_fwd,
     opus_mla_v41_prefill_a8w8_gfx950_fwd,
+    opus_mla_v41_prefill_a8w8_gfx1250_fwd,
 )
 
 MD_NAME = "module_mla_sparse_prefill_asm"
@@ -279,13 +281,17 @@ _KV_SPLIT_FIT = {
     ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 200, 0.12),
     ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.06),
+    ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 270, 0.10),
+    ("gfx1250", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 290, 0.045),
 }
 
 
 def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     """The split-K fit of the ``kernel`` (v4_a16w16, v4_a8w8, v41_a8w8, v41_a8w4) variant that
     serves ``h`` heads, as the launcher picks it."""
-    if gfx == "gfx1250":
+    if gfx == "gfx1250" and kernel == "v41_a8w8":
+        tile = "16mx1_16nx4" if h <= 32 else "16mx4_64nx1"
+    elif gfx == "gfx1250":
         tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
@@ -469,11 +475,16 @@ def _opus_sparse_prefill_v4(
 
 _E8M0 = (torch.uint8, dtypes.fp8_e8m0)
 
-# unified_kv dtype -> (kernel, split-fit variant, unified_kv_scale dtypes); q and kv are fp8.
+# unified_kv dtype -> ((gfx950, gfx1250) kernel, split-fit variant, unified_kv_scale dtypes);
+# q and kv are fp8.
 _OPUS_V41_KERNELS = {
-    dtypes.fp8: (opus_mla_v41_prefill_a8w8_gfx950_fwd, "v41_a8w8", _E8M0),
+    dtypes.fp8: (
+        (opus_mla_v41_prefill_a8w8_gfx950_fwd, opus_mla_v41_prefill_a8w8_gfx1250_fwd),
+        "v41_a8w8",
+        _E8M0,
+    ),
     dtypes.fp4x2: (
-        opus_mla_v41_prefill_a8w4_gfx950_fwd,
+        (opus_mla_v41_prefill_a8w4_gfx950_fwd, None),
         "v41_a8w4",
         (torch.uint8, dtypes.fp8),
     ),
@@ -496,10 +507,6 @@ def _opus_sparse_prefill_v41(
     out,
     num_kv_splits=None,
 ):
-    gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"mla_sparse_prefill_v41 requires gfx950, got {gfx}")
-
     if q.dtype != dtypes.fp8 or kv.dtype != dtypes.fp8:
         raise RuntimeError(f"q and kv must be fp8, got q={q.dtype}, kv={kv.dtype}")
     prefix_dtype = dtypes.fp4x2 if unified_kv.dtype == torch.uint8 else unified_kv.dtype
@@ -508,7 +515,13 @@ def _opus_sparse_prefill_v41(
             f"mla_sparse_prefill_v41 supports unified_kv dtypes "
             f"{list(_OPUS_V41_KERNELS)}, got {unified_kv.dtype}"
         )
-    fwd, variant, prefix_scale_dtypes = _OPUS_V41_KERNELS[prefix_dtype]
+    kernels, variant, prefix_scale_dtypes = _OPUS_V41_KERNELS[prefix_dtype]
+    gfx = get_gfx_runtime()
+    fwd = _opus_fwd(gfx, *kernels)
+    if fwd is None:
+        raise RuntimeError(
+            f"mla_sparse_prefill_v41: the NVFP4 prefix requires gfx950, got {gfx}"
+        )
     for name, scale, scale_dtypes in (
         ("q_scale", q_scale, _E8M0),
         ("unified_kv_scale", unified_kv_scale, prefix_scale_dtypes),
@@ -772,9 +785,9 @@ def mla_sparse_prefill_v41(
     """MLA v4.1 sparse prefill: rows of 512 values with separate E8M0 scales (uint8
     or fp8_e8m0, one per 32 values). Same argument order as
     :func:`mla_sparse_prefill_v4`, with the RoPE tensors replaced by the scales.
-    Supported (q, unified_kv, kv) dtypes, on gfx950: (fp8, fp8, fp8), and (fp8, fp4x2,
-    fp8) with an NVFP4 prefix source: e2m1 pairs (fp4x2 or uint8, the even value in
-    the low nibble) with an e4m3 scale (fp8 or uint8) per 16 values.
+    Supported (q, unified_kv, kv) dtypes: (fp8, fp8, fp8) on gfx950 and gfx1250, and
+    (fp8, fp4x2, fp8) on gfx950 with an NVFP4 prefix source: e2m1 pairs (fp4x2 or uint8,
+    the even value in the low nibble) with an e4m3 scale (fp8 or uint8) per 16 values.
 
     Args:
       q:                 ``[T, H, 512]`` query.
