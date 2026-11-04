@@ -2643,9 +2643,13 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), N, K)
     _, kernel_name, _ = _get_mxfp8_bpreshuffle_config(M, N, K, w_scale_block)
     if gfx == "gfx950":
-        if kernel_name is not None and kernel_name.startswith(
+        is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"
-        ):
+        )
+        if is_bmm and Y.dtype != dtypes.bf16:
+            # The gfx950 BMM writes bf16 only; let the mxpsh heuristic pick.
+            kernel_name = None
+        elif is_bmm:
             # A kernelId "bmm" row: the batched GEMM at B = 1 (tuned against
             # these kernels by the mxfp8 tuner), on the same row-major scales.
             from .flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
