@@ -188,19 +188,35 @@ def test_run_error_propagates_without_native_fallback(monkeypatch):
     assert plugin.last_decision().route == "provider"
 
 
-def test_provider_arbitration_is_deterministic(monkeypatch):
+def test_enable_list_order_is_the_preference_order(monkeypatch):
+    """The enable order must beat alphabetical order, or it is not covered."""
+
     zebra = _Provider("zebra", _candidate("zebra", 200))
     alpha = _Provider("alpha", _candidate("alpha", 100))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "alpha, zebra")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra, alpha")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
         lambda: (_EntryPoint("z-entry", zebra), _EntryPoint("a-entry", alpha)),
     )
 
-    assert _route_add([])(2, 3) == 100
-    assert alpha.select_calls == 1
-    assert zebra.select_calls == 0
+    assert _route_add([])(2, 3) == 200
+    assert zebra.select_calls == 1
+    assert alpha.select_calls == 0
+
+
+def test_enable_list_order_is_honoured_through_configure(monkeypatch):
+    zebra = _Provider("zebra", _candidate("zebra", 200))
+    alpha = _Provider("alpha", _candidate("alpha", 100))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("z-entry", zebra), _EntryPoint("a-entry", alpha)),
+    )
+    plugin.configure(enable=["zebra", "alpha"], source="test")
+
+    assert _route_add([])(2, 3) == 200
+    assert zebra.select_calls == 1
 
 
 def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
@@ -243,6 +259,7 @@ def test_force_and_per_op_disable_are_explicit(monkeypatch):
     assert add(2, 3) == 200
 
     monkeypatch.setenv("AITER_PLUGIN_DISABLE", "other.op, test.add")
+    plugin.reload_config()
     assert add(2, 3) == 5
     assert plugin.last_decision().reason == "op-disabled"
 
@@ -261,6 +278,7 @@ def test_installed_provider_is_not_enabled_by_default(monkeypatch):
     assert plugin.last_decision().reason == "provider-not-enabled"
 
     monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.reload_config()  # env is snapshotted; a mid-process change needs a reload
     assert add(2, 3) == 100
     assert provider.select_calls == 1
     assert plugin.last_decision().route == "provider"
@@ -283,3 +301,102 @@ def test_non_candidate_return_falls_back_to_native(monkeypatch):
     assert native_calls == [(2, 3)]
     assert plugin.last_decision().reason == "invalid-candidate"
     assert plugin.last_decision().provider == "aklr"
+
+
+def _enabled_pair(monkeypatch):
+    alpha = _Provider("alpha", _candidate("alpha", 100))
+    zebra = _Provider("zebra", _candidate("zebra", 200))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("alpha", alpha), _EntryPoint("zebra", zebra)),
+    )
+    return alpha, zebra
+
+
+def test_env_change_is_not_observed_without_reload(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    add = _route_add([])
+    assert add(2, 3) == 100
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "")
+    assert add(2, 3) == 100, "the snapshot is taken at first dispatch"
+    plugin.reload_config()
+    assert add(2, 3) == 5
+
+
+def test_empty_enable_env_falls_through_to_the_framework_default(monkeypatch):
+    """Empty env is unset, so it must not wipe out configure()'s enable list."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=["aklr"], source="framework")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "")
+    plugin.reload_config()
+
+    assert _route_add([])(2, 3) == 100
+    assert plugin._config().source == "configure:framework"
+
+
+def test_env_enable_replaces_the_framework_default(monkeypatch):
+    alpha, _ = _enabled_pair(monkeypatch)
+    plugin.configure(enable=["alpha"], source="framework")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
+    plugin.reload_config()
+
+    assert _route_add([])(2, 3) == 200
+    assert alpha.select_calls == 0
+    assert plugin._config().source == "env"
+
+
+def test_disable_layers_union(monkeypatch):
+    _enabled_pair(monkeypatch)
+    plugin.configure(enable=["alpha"], disable=["framework.op"], source="framework")
+    monkeypatch.setenv("AITER_PLUGIN_DISABLE", "test.add")
+    plugin.reload_config()
+
+    assert _route_add([])(2, 3) == 5
+    assert plugin.last_decision().reason == "op-disabled"
+    assert plugin._config().disabled_ops == frozenset({"framework.op", "test.add"})
+
+
+def test_generation_bumps_on_change_but_not_on_an_identical_reload(monkeypatch):
+    plugin.configure(enable=["alpha"], source="framework")
+    first = plugin._config().generation
+
+    plugin.reload_config()
+    assert plugin._config().generation == first, "identical snapshot must not bump"
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
+    plugin.reload_config()
+    assert plugin._config().generation == first + 1
+
+
+def test_eligible_list_is_cached_per_generation(monkeypatch):
+    _enabled_pair(monkeypatch)
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "alpha")
+    add = _route_add([])
+    assert add(2, 3) == 100
+    cached = dict(plugin._eligible_cache)
+    assert cached, "the eligible list must be cached"
+
+    assert add(2, 3) == 100
+    assert dict(plugin._eligible_cache) == cached, "a second call must reuse it"
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
+    plugin.reload_config()
+    assert add(2, 3) == 200
+    assert dict(plugin._eligible_cache) != cached, "a bump must invalidate it"
+
+
+def test_configure_requires_a_source():
+    with pytest.raises(ValueError):
+        plugin.configure(enable=["alpha"], source="   ")
+    with pytest.raises(TypeError):
+        plugin.configure(["alpha"], source="positional-is-rejected")  # type: ignore[misc]
