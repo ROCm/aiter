@@ -3156,6 +3156,25 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 # Every destination costs a buffer descriptor held live across the store pass,
 # so the saving stops being free once they crowd the register budget.
 _TOKEN_MULTIDEST_MAX_TOPK = 8
+# Tokens from which the quantizing multidest path writes compact scales and
+# rebuilds the interleaved layout in a second pass (see the dispatch below).
+_TOKEN_MULTIDEST_TWO_PASS_MIN_TOKENS = int(
+    os.environ.get("AITER_FLYDSL_MULTIDEST_TWO_PASS_MIN_TOKENS", "2048")
+)
+# Workgroups per CU of the grid-stride two-pass quant; 0 launches one warp per
+# token instead.
+_TOKEN_MULTIDEST_STREAM_BLOCKS_PER_CU = int(
+    os.environ.get("AITER_FLYDSL_MULTIDEST_STREAM_BLOCKS_PER_CU", "0")
+)
+
+
+def _null_i32(device):
+    """A null int32 pointer argument (0-element tensor -> data_ptr() == 0)."""
+    t = torch.empty(0, dtype=torch.int32, device=device)
+    assert t.data_ptr() == 0, "expected a null data_ptr"
+    return t
+
+
 # Received tokens from which the prequantized multidest path writes row-major
 # scales and preshuffles them in a second pass (see the dispatch below).
 _TOKEN_MULTIDEST_PREQUANT_TWO_PASS_MIN_TOKENS = int(
@@ -3208,6 +3227,8 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    compact_scale: bool = False,
+    persistent: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3220,6 +3241,20 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        compact_scale=compact_scale,
+        persistent=persistent,
+    )
+
+
+@functools.cache
+@fast_jit_result
+def _get_compiled_route_scale_preshuffle(feat_dim: int, wmma_rep: int, topk: int):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_route_scale_preshuffle_module,
+    )
+
+    return build_moe_route_scale_preshuffle_module(
+        feat_dim=feat_dim, wmma_rep=wmma_rep, topk=topk
     )
 
 
@@ -3454,13 +3489,24 @@ def flydsl_moe_fused_quant_preshuffle(
             not prequantized
             and not remap_rows
             and not fuse_ep_psum
-            and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
         )
+        # Dead-tail skip (EP dynamic token count / TP graph-bucket padding):
+        # routes >= num_valid_routes are not gathered/quantized. When not
+        # provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
+        if num_valid_routes is None:
+            num_valid_routes_i32 = _null_i32(device)
+        else:
+            num_valid_routes_i32 = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            ).contiguous()
+        # The caller-sized compact-scale pair has no dead-tail bound; the caller
+        # only asks for it without one.
         if use_token_multidest and row_to_token is not None:
+            assert num_valid_routes is None, "compact scale has no dead-tail skip"
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
             )
@@ -3490,6 +3536,66 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_multidest_tdm_chunks,
             )
 
+            token_grid = (token_num + warps_per_block - 1) // warps_per_block
+            stream = torch.cuda.current_stream()
+            if (
+                token_num >= _TOKEN_MULTIDEST_TWO_PASS_MIN_TOKENS
+                and feat_dim % 512 == 0
+            ):
+                # Large steps: the interleaved scale layout gives every route 4 B
+                # in each of feat_dim/128 lines that 15 other tokens' routes also
+                # write, and those partial lines -- not the payload -- bound the
+                # one-pass kernel. Write one compact e8m0 row per token plus the
+                # row -> route map, then rebuild the interleaved layout with
+                # whole-line stores.
+                compact = torch.empty(
+                    (token_num, Ws), dtype=torch.uint8, device=device
+                )
+                # Never initialised: the rebuild validates every entry against
+                # topids_to_rows, so padding rows keep their bytes untouched.
+                row_to_route = torch.empty(n_rows, dtype=torch.int32, device=device)
+                persistent = _TOKEN_MULTIDEST_STREAM_BLOCKS_PER_CU > 0
+                if persistent:
+                    from aiter.jit.utils.chip_info import get_cu_num
+
+                    token_grid = min(
+                        token_grid,
+                        (get_cu_num() or 256) * _TOKEN_MULTIDEST_STREAM_BLOCKS_PER_CU,
+                    )
+                _get_compiled_token_multidest_quant(
+                    feat_dim=feat_dim,
+                    wmma_rep=wmma_rep,
+                    topk=int(source_topk),
+                    quant_mode=quant_mode,
+                    tdm_hidden_chunks=0,
+                    compact_scale=True,
+                    persistent=persistent,
+                )(
+                    ptr_arg(grouped_in.contiguous().view(-1)),
+                    ptr_arg(out_payload.view(-1)),
+                    ptr_arg(compact.view(-1)),
+                    ptr_arg(topids_to_rows_i32),
+                    ptr_arg(num_valid_routes_i32),
+                    ptr_arg(row_to_route),
+                    token_num,
+                    token_grid,
+                    stream=stream,
+                )
+                rows_per_tile = wmma_rep * 16
+                _get_compiled_route_scale_preshuffle(
+                    feat_dim, wmma_rep, int(source_topk)
+                )(
+                    ptr_arg(compact.view(-1)),
+                    ptr_arg(out_scale.view(-1)),
+                    ptr_arg(row_to_route),
+                    ptr_arg(topids_to_rows_i32),
+                    ptr_arg(num_valid_routes_i32),
+                    numel,
+                    n_rows,
+                    (n_rows + rows_per_tile - 1) // rows_per_tile,
+                    stream=stream,
+                )
+                return out_payload, out_scale
             md_ksplit = token_multidest_ksplit(
                 feat_dim, wmma_rep, quant_mode, token_num
             )
@@ -3503,27 +3609,18 @@ def flydsl_moe_fused_quant_preshuffle(
                 ),
                 ksplit=md_ksplit,
             )
-            token_grid = (token_num + warps_per_block - 1) // warps_per_block
             launch(
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
                 ptr_arg(out_scale.view(-1)),
                 ptr_arg(topids_to_rows_i32),
+                ptr_arg(num_valid_routes_i32),
+                ptr_arg(_null_i32(device)),
                 token_num,
                 token_grid,
-                stream=torch.cuda.current_stream(),
+                stream=stream,
             )
             return out_payload, out_scale
-        # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
-        # padding rows of the dispatch buffer and are not gathered/quantized. When
-        # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
-        if num_valid_routes is None:
-            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
-            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
-        else:
-            num_valid_routes_i32 = (
-                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
-            ).contiguous()
         # A prequantized row needs no quant, so one warp per token copies it once
         # to each local route instead of one warp per route re-reading it.
         use_token_multidest_prequant = (
