@@ -267,6 +267,11 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
+)
+
 
 def _runtime_power_selection() -> bool:
     """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
@@ -468,6 +473,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
@@ -1295,54 +1308,21 @@ def clone_3rdparty(third_party: str) -> None:
                     ]
                 )
             else:
-                # Save current git config value for advice.detachedHead, set to false
-                prev_detached_head = None
-                try:
-                    try:
-                        prev_detached_head = subprocess.check_output(
-                            ["git", "config", "--get", "advice.detachedHead"], text=True
-                        ).strip()
-                    except subprocess.CalledProcessError:
-                        prev_detached_head = None  # not set before
-                    # Set to false before clone
-                    subprocess.call(
-                        ["git", "config", "--global", "advice.detachedHead", "false"]
-                    )
-
-                    subprocess.call(
-                        [
-                            "git",
-                            "clone",
-                            "-q",
-                            f"--revision={third_party_info['commit']}",
-                            "--depth=1",
-                            "--recurse-submodules",
-                            third_party_info["url"],
-                            dir_path,
-                        ]
-                    )
-                finally:
-                    # Restore config after clone
-                    if prev_detached_head is not None:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "advice.detachedHead",
-                                prev_detached_head,
-                            ]
-                        )
-                    else:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "--unset",
-                                "advice.detachedHead",
-                            ]
-                        )
+                # Keep the detached-HEAD advice setting local to this clone.
+                subprocess.call(
+                    [
+                        "git",
+                        "-c",
+                        "advice.detachedHead=false",
+                        "clone",
+                        "-q",
+                        f"--revision={third_party_info['commit']}",
+                        "--depth=1",
+                        "--recurse-submodules",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
 
     if third_party == "HipKittens":
         dir_path = HIP_KITTENS_DIR
@@ -1975,17 +1955,6 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
-    # Avoid constructing a Python Stream object on every ctypes invocation.
-    # Keep the public API fallback for torch versions without the private raw
-    # stream getter, and preserve the first tensor's device selection.
-    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw_stream is None:
-
-        def raw_stream(device_index):
-            return torch.cuda.current_stream(device_index).cuda_stream
-
-    current_device = torch.cuda.current_device
-
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -2220,6 +2189,12 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
+        # The same stream/device getters as the develop pybind path (no Python
+        # Stream object per call), read per call so an AOT dry run can swap
+        # them; the first tensor's device still selects the stream.
+        _, _, raw_stream, current_device = (
+            _pybind_develop_hooks_cache or _pybind_develop_hooks()
+        )
         if tensor_device is None:
             tensor_device = current_device()
         c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
@@ -2271,8 +2246,8 @@ def _pybind_develop_hooks():
         raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
         if raw_stream is None:
 
-            def raw_stream(_device_index):
-                return torch.cuda.current_stream().cuda_stream
+            def raw_stream(device_index):
+                return torch.cuda.current_stream(device_index).cuda_stream
 
         _pybind_develop_hooks_cache = (
             torch_to_aiter_pybind,

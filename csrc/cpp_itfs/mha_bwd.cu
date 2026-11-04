@@ -556,6 +556,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                 // Planes are the only parallelism left along kv, so aim at one workgroup per CU.
                 const uint32_t wg_per_plane = a.batch * a.nhead_q;
                 want = (get_num_cu_func() + wg_per_plane - 1) / wg_per_plane;
+                // A causal dqdkdv saturates at half the planes while dq_convert still folds
+                // every one of them, so a split capped by the kv blocks is halved. Below 16
+                // planes the fold is at its launch floor and the cap is kept.
+                if(mt != 0 && want >= kv_blocks && kv_blocks >= 16)
+                    want = (kv_blocks + 1) / 2;
             }
             nsplit = std::clamp(want, 1u, std::max(kv_blocks, 1u));
         }
