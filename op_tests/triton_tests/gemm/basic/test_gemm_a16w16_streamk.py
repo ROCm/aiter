@@ -214,6 +214,12 @@ def test_gemm_a16w16_streamk_rejects_bad_inputs():
         torch.empty((M, 1), dtype=torch.bfloat16, device="cuda"),
         torch.empty((M, N), dtype=torch.float32, device="cuda"),
         torch.empty((N, M), dtype=torch.bfloat16, device="cuda").T,
+        # rows alias: an expanded view, and an as_strided overlap. Both pass the unit-stride
+        # check and both give a wrong result if they reach the kernel.
+        torch.empty((1, N), dtype=torch.bfloat16, device="cuda").expand(M, N),
+        torch.empty((M + N,), dtype=torch.bfloat16, device="cuda").as_strided(
+            (M, N), (1, 1)
+        ),
     ):
         with pytest.raises(AssertionError):
             gemm_a16w16_streamk(x, w, y=bad_y)

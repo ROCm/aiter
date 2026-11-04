@@ -228,6 +228,12 @@ def gemm_a16w16_streamk_(
         assert y.dtype == dtype, f"y must be {dtype}, got {y.dtype}"
         assert y.device == x.device, f"y must be on {x.device}, got {y.device}"
         assert y.stride(1) == 1, f"y must be row major (M, N), got strides {y.stride()}"
+        # Rows must not alias. The TDM store takes the innermost stride as 1 and addresses C
+        # by row, so a view whose row stride is below N (an expand, or an as_strided overlap)
+        # writes several rows onto the same memory and gives a wrong result instead of failing.
+        assert (
+            M == 1 or y.stride(0) >= N
+        ), f"y rows must not overlap, got shape ({M}, {N}) strides {y.stride()}"
 
     wmma, dot_a, dot_b, shared_a, shared_b = _build_layouts(
         BLOCK_M, BLOCK_N, BLOCK_K, (CTAS_M, CTAS_N), num_warps, TRANSPOSE_B
