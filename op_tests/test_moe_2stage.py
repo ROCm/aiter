@@ -16,6 +16,7 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
+    AsmMoeMode,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -878,6 +879,7 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        post_reduce = row.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
         # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
         # include them so the test harness exercises the emsort path. Only
         # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
@@ -888,7 +890,7 @@ def _iter_csv_cases():
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
             and not (
-                kernel_name1.startswith("_ZN5aiter")
+                (kernel_name1.startswith("_ZN5aiter") or post_reduce)
                 and str(row.get("q_type", "")) == "QuantType.per_1x32"
             )
         ):
@@ -952,9 +954,11 @@ def _iter_csv_cases():
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
         # AOT cache entry, so let those cases compile on demand.
         kwargs["check_aot_cache"] = (
-            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+            args.csv_filter is None
+            and not post_reduce
+            and kwargs["actType"] != aiter.ActivationType.Situv2
         )
-        kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        kwargs["disable_stage2_bias"] = post_reduce or kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
