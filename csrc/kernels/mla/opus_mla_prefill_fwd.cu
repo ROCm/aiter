@@ -15,12 +15,12 @@
 #include "aiter_hip_common.h"
 
 #include "../../cpp_itfs/pa/pa_ps.cuh"
-#include "opus/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
-#include "opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
 
 #include <cstddef>
 
