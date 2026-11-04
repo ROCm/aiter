@@ -262,60 +262,125 @@ _DEFAULT_CAR_MIN_SIZE = 0
 _CAR_MIN_SIZE_ENV = "AITER_CUSTOM_AR_MIN_SIZE"
 
 
-def _resolve_car_max_size(pool_size: int) -> int:
-    """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
+# Registered custom all-reduce / all-gather input pool. Default 1 GiB, the
+# historical CustomAllreduce.max_size. Honored only on gfx1250: on gfx942/950
+# the IPC meta buffer also holds a 2 * max_size uncached tmp region, so a pool
+# of N costs about 3N per rank.
+_CAR_POOL_BYTES_ENV = "AITER_CAR_POOL_BYTES"
+_DEFAULT_CAR_POOL_BYTES = 1 << 30
+
+
+def _resolve_car_pool_bytes(is_gfx1250: bool) -> int:
+    """Resolve the registered input-pool size from ``AITER_CAR_POOL_BYTES``.
 
     Semantics:
-      * unset / empty / unparyable  -> default (64 MiB), i.e. unchanged behavior.
-      * 0                           -> 0: custom AR disabled, everything uses RCCL.
-      * 0 < v <= pool_size          -> v: custom AR used up to v bytes.
-      * v > pool_size               -> too large: the registered pool cannot hold
-                                       it. Raise (then catch), warn, and fall back
-                                       to the 64 MiB default.
+      * unset / empty                         -> 1 GiB.
+      * non-integer or <= 0                   -> warn, 1 GiB.
+      * set on an arch other than gfx1250     -> warn, 1 GiB. gfx9 keeps the
+        1 GiB pool; a larger one would also allocate ``2 * pool`` of uncached
+        meta (about 3x the pool per rank).
+      * positive integer on gfx1250           -> that many bytes.
 
-    ``pool_size`` is the registered input-buffer size (``CustomAllreduce.max_size``).
+    The effective size is logged. ``should_custom_ar`` must stay at or below
+    this pool; see ``_resolve_car_max_size``.
     """
-    raw = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+    raw = os.environ.get(_CAR_POOL_BYTES_ENV, "").strip()
     if raw == "":
-        return _DEFAULT_CAR_MAX_SIZE
+        logger.info(
+            "Custom allreduce input pool: %d bytes (default).",
+            _DEFAULT_CAR_POOL_BYTES,
+        )
+        return _DEFAULT_CAR_POOL_BYTES
+    if not is_gfx1250:
+        logger.warning(
+            "%s=%r is ignored off gfx1250: the IPC meta buffer also holds a "
+            "2 * pool uncached tmp region, so a pool of N costs about 3N per "
+            "rank. Using the %d-byte pool.",
+            _CAR_POOL_BYTES_ENV,
+            raw,
+            _DEFAULT_CAR_POOL_BYTES,
+        )
+        return _DEFAULT_CAR_POOL_BYTES
     try:
         v = int(raw)
     except ValueError:
         logger.warning(
-            "%s=%r is not an integer; using default %d bytes.",
+            "%s=%r is not an integer; using the default %d-byte pool.",
+            _CAR_POOL_BYTES_ENV,
+            raw,
+            _DEFAULT_CAR_POOL_BYTES,
+        )
+        return _DEFAULT_CAR_POOL_BYTES
+    if v <= 0:
+        logger.warning(
+            "%s=%d is not positive; using the default %d-byte pool.",
+            _CAR_POOL_BYTES_ENV,
+            v,
+            _DEFAULT_CAR_POOL_BYTES,
+        )
+        return _DEFAULT_CAR_POOL_BYTES
+    logger.info(
+        "Custom allreduce input pool: %d bytes via %s.",
+        v,
+        _CAR_POOL_BYTES_ENV,
+    )
+    return v
+
+
+def _resolve_car_max_size(pool_size: int) -> int:
+    """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
+
+    Semantics:
+      * unset / empty / unparsable -> min(64 MiB, pool_size). The cutoff must
+        not exceed the registered pool, or ``should_custom_ar`` accepts an
+        input the copy-in path cannot stage.
+      * 0                          -> 0: custom AR disabled, everything uses RCCL.
+      * 0 < v <= pool_size         -> v: custom AR used up to v bytes.
+      * v > pool_size              -> too large: the registered pool cannot hold
+                                      it. Warn, and fall back to
+                                      min(64 MiB, pool_size).
+
+    ``pool_size`` is the registered input-buffer size (``CustomAllreduce.max_size``).
+    """
+    # Never advertise a cutoff the registered pool cannot hold.
+    fallback = min(_DEFAULT_CAR_MAX_SIZE, pool_size)
+    raw = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+    if raw == "":
+        return fallback
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using %d bytes.",
             _CAR_MAX_SIZE_ENV,
             raw,
-            _DEFAULT_CAR_MAX_SIZE,
+            fallback,
         )
-        return _DEFAULT_CAR_MAX_SIZE
+        return fallback
     if v < 0:
         logger.warning(
-            "%s=%d is negative; using default %d bytes.",
+            "%s=%d is negative; using %d bytes.",
             _CAR_MAX_SIZE_ENV,
             v,
-            _DEFAULT_CAR_MAX_SIZE,
+            fallback,
         )
-        return _DEFAULT_CAR_MAX_SIZE
+        return fallback
     if v == 0:
         logger.info(
             "%s=0: custom allreduce disabled; all sizes fall back to RCCL.",
             _CAR_MAX_SIZE_ENV,
         )
         return 0
-    try:
-        if v > pool_size:
-            raise ValueError(
-                f"{_CAR_MAX_SIZE_ENV}={v} exceeds the custom-AR pool size "
-                f"({pool_size} bytes); the registered buffer cannot hold inputs "
-                f"that large."
-            )
-    except ValueError as e:
+    if v > pool_size:
         logger.warning(
-            "%s Falling back to the default %d bytes (64 MiB).",
-            e,
-            _DEFAULT_CAR_MAX_SIZE,
+            "%s=%d exceeds the custom-AR pool size (%d bytes); the registered "
+            "buffer cannot hold inputs that large. Using %d bytes.",
+            _CAR_MAX_SIZE_ENV,
+            v,
+            pool_size,
+            fallback,
         )
-        return _DEFAULT_CAR_MAX_SIZE
+        return fallback
     logger.info(
         "Custom allreduce size cutoff overridden to %d bytes via %s.",
         v,

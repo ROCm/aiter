@@ -91,6 +91,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
             CustomAllreduce,
+            _resolve_car_pool_bytes,
         )
 
         # from aiter.dist.device_communicators.symm_mem import SymmMemCommunicator
@@ -129,8 +130,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # gfx1250's copy-in path stages the whole input into it and fails
             # if it does not fit, and a DP-attention allgather LM head gathers
             # [dp * rows, vocab] logits, which passes 1 GiB at large decode
-            # batches. AITER_CAR_POOL_BYTES raises it; the default is unchanged.
-            pool_bytes = int(os.environ.get("AITER_CAR_POOL_BYTES", str(1 << 30)))
+            # batches. AITER_CAR_POOL_BYTES raises the pool on gfx1250 only;
+            # gfx9 stays at 1 GiB because its meta buffer also holds 2 * pool
+            # of uncached tmp. The default is unchanged.
+            pool_bytes = _resolve_car_pool_bytes(get_gfx() == "gfx1250")
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
