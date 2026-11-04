@@ -2,3 +2,7 @@
 # issue. GitHub emails each mentioned user, as their notification settings allow.
 # One username per line, without "@". Text after "#" is a comment.
 Boss2002n
+azaidy
+brunomazzottiamd
+rahulbatra85
+vgokhale
