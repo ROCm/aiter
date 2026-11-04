@@ -36,8 +36,7 @@ tensor-parallel deployments, whose rank passes no mask but the split
 intermediate dim and the shared-expert handling its framework uses (FHMoE
 among them). Each deployment is replayed at every bucket's smallest and largest
 M up to that M, bisected as above, and reads the tuned tables serving reads; it
-needs no tuned row. Its calls pass the model's activation clamp, and its
-SiTUv2 betas join the generic ones.
+needs no tuned row. Its calls pass the model's activation clamp.
 
 A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
 naming targets, as the wheel build sets it, only rows of those archs are
@@ -352,26 +351,16 @@ def parse_deployments(paths: Sequence[str], edges: bool = True) -> list[dict]:
     caller-side variant) of the deployment files ``paths``."""
     jobs = []
     for call in load_deployments(paths).fused_moe:
-        model = call.model
         shape = deployment_row(call)
         variants = _variants(shape)
         if not call.is_ep:
             # num_local_tokens is the count an EP dispatch received.
             variants = [v for v in variants if not v["local_tokens"]]
-        betas = (model.situ_beta, model.situ_linear_beta)
-        if model.activation == "Situv2" and betas not in {
-            (v["beta"], v["linear_beta"]) for v in variants
-        }:
-            variants += [
-                {**v, "beta": betas[0], "linear_beta": betas[1]}
-                for v in variants
-                if v["beta"] is None
-            ]
         for bucket, low, high in _buckets(call.max_tokens):
             row = {
                 **shape,
                 "token": str(bucket),
-                "swiglu_limit": model.swiglu_limit or None,
+                "swiglu_limit": call.model.swiglu_limit or None,
             }
             points = [low, high] if edges and low < high else [high]
             for index, variant in enumerate(variants):

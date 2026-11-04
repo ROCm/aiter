@@ -102,7 +102,7 @@ lists those deployments too.
 Each deployment replays at the smallest and largest M of every
 `get_padded_M` bucket up to `max_tokens`, bisected as for rows, with the
 caller's default gate/up layout, the model's `swiglu_limit`, and the SiTUv2
-betas a row would get plus the model's own. An EP
+betas a row would get. An EP
 deployment replays with its mask, with and without `num_local_tokens` (MORI
 dispatch passes it, the all-gather path does not). A deployment reads the
 tuned tables serving reads (`AITER_CONFIG_FMOE`, `AITER_CONFIG_GROUPED_FMOE`,
