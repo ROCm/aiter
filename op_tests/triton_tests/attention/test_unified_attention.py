@@ -1457,6 +1457,9 @@ def test_unified_attn_non_causal(
     """With causal=False every query token attends to all keys of its sequence."""
     if backend == "gluon" and not _is_gluon_available():
         pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    # Non-causal gluon calls run the Triton kernels; one shape checks that gate.
+    if backend == "gluon" and (head_size, block_size, num_heads) != (64, 128, (8, 2)):
+        pytest.skip("non-causal gluon calls run the Triton kernels")
     query_lens = [x[0] for x in seq_lens]
     kv_lens_list = [x[1] for x in seq_lens]
     (
@@ -1568,6 +1571,7 @@ def test_unified_attn_non_causal_features(
     soft_cap: float | None,
     use_sinks: bool,
     shuffled_kv_cache: bool,
+    monkeypatch,
 ) -> None:
     """Non-causal attention also takes sinks, a softcap and a shuffled KV cache;
     those run on the Triton kernels, which the gfx950 Gluon gate keeps causal."""
@@ -1607,6 +1611,18 @@ def test_unified_attn_non_causal_features(
     )
     sinks = sinks if use_sinks else None
 
+    # record which kernel ran, so a heuristic change cannot drop a path silently
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    for name in ("_unified_attention_2d_triton", "_unified_attention_3d_triton"):
+        launch = getattr(module, name)
+
+        def spy(params, *args, _name=name, _launch=launch):
+            launches.append((_name, args[5:6]))  # split_budget for 3D
+            return _launch(params, *args)
+
+        monkeypatch.setattr(module, name, spy)
+
     unified_attention(
         q=query,
         k=key_cache,
@@ -1644,6 +1660,14 @@ def test_unified_attn_non_causal_features(
         v_descale=v_descale,
         causal=0,
     )
+
+    if DEVICE_ARCH == "gfx950":
+        kernel = f"_unified_attention_{3 if max_kv_len > 512 else 2}d_triton"
+        assert [name for name, _ in launches] == [kernel], launches
+        # the bf16-Q / fp8-KV head-64 verify batch takes the length-aware split
+        if kernel.endswith("3d_triton") and max_query_len <= 8:
+            split_budget = launches[0][1][0]
+            assert (split_budget is not None) == (kv_dtype == e4m3_dtype), launches
 
     atol, rtol = (1.5e-1, 1.5e-1) if kv_dtype.itemsize == 1 else (1.5e-2, 1e-2)
     torch.testing.assert_close(

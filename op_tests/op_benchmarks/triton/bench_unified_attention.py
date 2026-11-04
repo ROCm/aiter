@@ -365,12 +365,8 @@ def run_benchmark(custom, args):
 
         cu_query_lens = inputs["cu_query_lens"]
         num_contexts = len(cu_query_lens) - 1
-        # Kernel disables windowing for non-positive values (SLIDING_WINDOW > 0).
-        window = (
-            args.sliding_window
-            if args.sliding_window is not None and args.sliding_window > 0
-            else None
-        )
+        # main() turns a window of 0 or less into None
+        window = args.sliding_window
         total_flops = 0.0
         total_k = 0
         for i in range(num_contexts):

@@ -134,6 +134,41 @@ def find_work_item(
 
 
 @triton.jit
+def key_prefix_len(
+    context_len,
+    q_block_local_idx,
+    seq_len,
+    BLOCK_Q,
+    BLOCK_M: tl.constexpr,
+    num_queries_per_kv,
+    CAUSAL: tl.constexpr,
+):
+    """Keys the query block can see: the causal prefix of its last query token
+    (capped by seq_len for a padded block), or all keys when not causal."""
+    if CAUSAL:
+        prefix_len = tl.minimum(
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1,
+            seq_len,
+        )
+    else:
+        prefix_len = seq_len
+    return prefix_len
+
+
+@triton.jit
+def key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL: tl.constexpr):
+    """[query, key] mask of the keys each query token sees."""
+    if CAUSAL:
+        mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+    else:
+        mask = seq_offset[None, :] < seq_len
+    return mask
+
+
+@triton.jit
 def split_window_tiles(seq_len, query_len, TILE_SIZE, SLIDING_WINDOW: tl.constexpr):
     """First tile and tile count a sliding-window split carves for one sequence.
 
@@ -239,7 +274,7 @@ def kernel_unified_attention_2d(
     )
     # the launcher rejects a window for non-causal calls; keep -O from skipping it
     tl.static_assert(
-        CAUSAL or SLIDING_WINDOW == 0,
+        CAUSAL or SLIDING_WINDOW <= 0,
         "non-causal attention does not support a sliding window",
     )
 
@@ -349,26 +384,17 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    if CAUSAL:
-        # compute the length of the longest sequence prefix spanned by any
-        # query token in the current q_block (q_block_local_idx)
-        max_seq_prefix_len = (
-            context_len
-            + q_block_local_idx * BLOCK_Q
-            + (BLOCK_M - 1) // num_queries_per_kv
-            + 1
-        )
+    max_seq_prefix_len = key_prefix_len(
+        context_len,
+        q_block_local_idx,
+        seq_len,
+        BLOCK_Q,
+        BLOCK_M,
+        num_queries_per_kv,
+        CAUSAL,
+    )
 
-        # adjust for potential padding in the last q_block by considering the
-        # actual sequence length
-        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-    else:
-        # every query token attends to all keys of its sequence
-        max_seq_prefix_len = seq_len
-
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # the tiles that cover that prefix; causal masking skips the tiles past it
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     # ---- Sliding-window tile pruning --------------------
@@ -577,10 +603,7 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        if CAUSAL:
-            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-        else:
-            seq_mask = seq_offset[None, :] < seq_len
+        seq_mask = key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
@@ -756,7 +779,7 @@ def kernel_unified_attention_3d(
 ):
     # the launcher rejects a window for non-causal calls; keep -O from skipping it
     tl.static_assert(
-        CAUSAL or SLIDING_WINDOW == 0,
+        CAUSAL or SLIDING_WINDOW <= 0,
         "non-causal attention does not support a sliding window",
     )
 
@@ -909,26 +932,17 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    if CAUSAL:
-        # compute the length of the longest sequence prefix spanned by any
-        # query token in the current q_block (q_block_local_idx)
-        max_seq_prefix_len = (
-            context_len
-            + q_block_local_idx * BLOCK_Q
-            + (BLOCK_M - 1) // num_queries_per_kv
-            + 1
-        )
+    max_seq_prefix_len = key_prefix_len(
+        context_len,
+        q_block_local_idx,
+        seq_len,
+        BLOCK_Q,
+        BLOCK_M,
+        num_queries_per_kv,
+        CAUSAL,
+    )
 
-        # adjust for potential padding in the last q_block by considering the
-        # actual sequence length
-        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-    else:
-        # every query token attends to all keys of its sequence
-        max_seq_prefix_len = seq_len
-
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # the tiles that cover that prefix; causal masking skips the tiles past it
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
@@ -1043,10 +1057,7 @@ def kernel_unified_attention_3d(
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
-        if CAUSAL:
-            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-        else:
-            seq_mask = seq_offset[None, :] < seq_len
+        seq_mask = key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later

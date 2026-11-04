@@ -339,8 +339,9 @@ def unified_attention(
             raise ValueError(
                 "Non-causal attention does not support an fp4 Q or KV cache"
             )
+    ALL_DECODE = int(max_seqlen_q) == 1
     # A decode query sees all keys either way, so it keeps the causal kernels.
-    causal = causal or int(max_seqlen_q) == 1
+    causal = causal or ALL_DECODE
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -432,7 +433,6 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
-    ALL_DECODE = int(max_seqlen_q) == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
