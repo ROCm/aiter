@@ -1357,7 +1357,6 @@ _KDA_F32_VECTOR = _KDA_VECTOR_BYTES // (fx.Float32.width // 8)
 _KDA_L2NORM_EPS = 1e-6
 _KDA_PROJECTION_VECTOR = 4
 _KDA_PROJECTION_ITERS = _KDA_DIM // _KDA_PROJECTION_VECTOR
-_KDA_SPECIALIZATION_CACHE_SIZE = 16
 # Recurrent-state storage dtypes. The recurrence always computes in FP32.
 _KDA_STATE_DTYPES = {"f32": fx.Float32, "bf16": fx.BFloat16}
 
@@ -1381,9 +1380,10 @@ def _kda_vector_sum(vec):
     return fx.Vector(vec).reduce(fx.ReductionOp.ADD)
 
 
-# Each entry holds a JIT launcher and compiled module; keep only a few
-# (norm_eps, lower_bound, fuse_f_b, state_dtype) specializations alive.
-@functools.lru_cache(maxsize=_KDA_SPECIALIZATION_CACHE_SIZE)
+# Each entry holds a JIT launcher and its compiled module, which CUDA graphs
+# captured earlier may still launch, so specializations are not evicted under
+# normal use (sized like the GDR decode caches above).
+@functools.lru_cache(maxsize=1024)
 def create_kda_decode_kernel(
     norm_eps: float, lower_bound: float, fuse_f_b: bool, state_dtype: str
 ):
@@ -1474,7 +1474,6 @@ def create_kda_decode_kernel(
         lane = tid % _KDA_WARP_SIZE
         warp = tid // _KDA_WARP_SIZE
         lane_k = lane % _KDA_WARP_THREADS_K
-        subgroup_leader = lane // _KDA_WARP_THREADS_K * _KDA_WARP_THREADS_K
         out_base = batch * stride_out_token + head * stride_out_head
 
         state_idx = state_indices[batch]
@@ -1615,10 +1614,10 @@ def create_kda_decode_kernel(
                 gate = _kda_sigmoid((gate_bf16.to(fx.Float32) + dt) * a, lower_bound)
                 decay_vecs.append(fx.math.exp2(gate * fx.Float32(_LOG2E)))
 
-            sum_q_partial = _kda_k_group_sum(sum_q_partial)
-            sum_k_partial = _kda_k_group_sum(sum_k_partial)
-            norm_q = fx.shuffle_idx(sum_q_partial, subgroup_leader, _KDA_WARP_SIZE)
-            norm_k = fx.shuffle_idx(sum_k_partial, subgroup_leader, _KDA_WARP_SIZE)
+            # The xor butterfly leaves the same sum in all eight lanes of a K
+            # group, so no broadcast from the subgroup leader is needed.
+            norm_q = _kda_k_group_sum(sum_q_partial)
+            norm_k = _kda_k_group_sum(sum_k_partial)
             inv_q = fx.math.rsqrt(norm_q + fx.Float32(_KDA_L2NORM_EPS))
             inv_k = fx.math.rsqrt(norm_k + fx.Float32(_KDA_L2NORM_EPS))
 
@@ -1658,8 +1657,8 @@ def create_kda_decode_kernel(
                 sum_hq = _kda_k_group_sum(_kda_vector_sum(sum_hq_vec))
 
                 conv_v = fx.Float32(fx.ptr_load(v_lds + global_v))
+                # Every lane of the K group holds the same conv_v, sum_hk and beta.
                 v_new = (conv_v - sum_hk) * beta
-                v_new = fx.shuffle_idx(v_new, subgroup_leader, _KDA_WARP_SIZE)
                 recurrent_value = sum_hq + v_new * dot_kq
                 v_new_vec = fx.Vector.filled(values_per_thread_k, v_new, fx.Float32)
 

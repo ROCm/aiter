@@ -1092,7 +1092,8 @@ _KDA_STATE_DTYPE_TAGS = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _INT32_MAX = 2**31 - 1
 # Debug check that live KDA ``state_indices`` are unique. It copies the
 # duplicates to the host, a sync, so it is off by default and skipped while a
-# CUDA graph is being captured.
+# CUDA graph is being captured. Slot 0 is live, so it also flags SGLang's eager
+# DP-attention padding rows, which share the reserved scratch slot 0.
 _KDA_SLOT_CHECK = os.environ.get("AITER_KDA_DECODE_SLOT_CHECK", "0") == "1"
 
 
@@ -1375,6 +1376,10 @@ def _validate_kda_inputs(
         ("norm_weight", norm_weight, 0),
     ):
         _check_i32_addressing(name, tensor, first_dim=first_dim)
+    # Any strides work, but FlyDSL's layout-dynamic tensor argument needs one
+    # unit-stride axis.
+    if 1 not in conv_weight.stride():
+        raise ValueError("`conv_weight` must have an axis with stride 1.")
 
     if out is None:
         out = torch.empty(
@@ -1396,8 +1401,13 @@ def _validate_kda_inputs(
     head_span = (_KDA_HEADS - 1) * out.stride(2) + _KDA_DIM
     if out.stride(2) < _KDA_DIM or (batch > 1 and out.stride(1) < head_span):
         raise ValueError("`out` must have non-overlapping batch and head rows.")
-    if _KDA_SLOT_CHECK and not torch.cuda.is_current_stream_capturing():
-        _check_unique_live_slots(state_indices, _num_cache_slots(state, conv_state))
+    if _KDA_SLOT_CHECK:
+        # Capture is per stream, so ask about the stream the kernel launches on.
+        with torch.cuda.device(device):
+            if not torch.cuda.is_current_stream_capturing():
+                _check_unique_live_slots(
+                    state_indices, _num_cache_slots(state, conv_state)
+                )
     return out
 
 
@@ -1445,8 +1455,9 @@ def flydsl_kda_decode(
     CUDA-graph padding rows are PAD_SLOT_ID (-1). Its eager DP-attention padding
     rows instead share the reserved scratch slot 0, which is only safe because no
     request owns that slot. Set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
-    ``ValueError`` on any duplicate live slot; the check syncs with the host and
-    is skipped during graph capture.
+    ``ValueError`` on any duplicate live slot, including those shared slot-0
+    padding rows; the check syncs with the host and is skipped during graph
+    capture.
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")

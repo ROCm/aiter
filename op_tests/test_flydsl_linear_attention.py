@@ -1447,6 +1447,28 @@ def test_flydsl_kda_decode_rejects_invalid_projection_inputs() -> None:
 
 
 @_requires_kda
+def test_flydsl_kda_decode_rejects_conv_weight_without_unit_stride(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("A conv_weight FlyDSL cannot pass must be rejected first.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_decode_kernel", unexpected_compile
+    )
+    inputs = _make_kda_inputs(batch=1)
+    inputs.conv_weight = torch.empty(
+        (_KDA_CHANNELS, 8), dtype=torch.float32, device=_KDA_DEVICE
+    )[:, ::2]
+    with pytest.raises(
+        ValueError, match="`conv_weight` must have an axis with stride 1"
+    ):
+        _run_kda(inputs)
+
+
+@_requires_kda
 def test_flydsl_kda_decode_rejects_invalid_input_rank() -> None:
     inputs = _make_kda_inputs(batch=1)
     inputs.x = inputs.x.unsqueeze(0)
