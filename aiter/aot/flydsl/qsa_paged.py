@@ -91,9 +91,13 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
     ``GPU_ARCHS`` is the wheel list. CI sets ``gfx942;gfx950`` and the
     container has no device, so that list is the whole answer. Without
     it, a visible GPU compiles its own arch and CU count. With neither,
-    both supported archs use the full-chip counts.
+    both supported archs use the full-chip count, the first entry of
+    ``GFX_CU_NUMS_MAP``.
     """
-    from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+    from aiter.jit.utils.build_targets import GFX_CU_NUMS_MAP
+
+    def full_chip(arch: str) -> int:
+        return GFX_CU_NUMS_MAP[arch][0]
 
     raw = os.environ.get("GPU_ARCHS", "").strip()
     if raw and raw.lower() != "native":
@@ -104,13 +108,13 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
             )
         if len(archs) == 1 and os.environ.get("CU_NUM"):
             return [(archs[0], int(os.environ["CU_NUM"]))]
-        return [(arch, GFX_CU_NUM_MAP[arch]) for arch in archs]
+        return [(arch, full_chip(arch)) for arch in archs]
     if torch.cuda.is_available():
         from aiter.jit.utils.chip_info import get_cu_num
         from aiter.ops.flydsl.qsa_paged import _qsa_arch
 
         return [(_qsa_arch(), int(get_cu_num()))]
-    return [(arch, GFX_CU_NUM_MAP[arch]) for arch in _QSA_ARCHS]
+    return [(arch, full_chip(arch)) for arch in _QSA_ARCHS]
 
 
 @contextmanager
