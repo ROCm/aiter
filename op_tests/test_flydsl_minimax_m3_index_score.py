@@ -37,7 +37,9 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     score_prefill_flydsl,
 )
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
+from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.utility import fp4_utils
 
 LOG2E = 1.4426950409
 P = 128  # Public operator contract, independent of the kernel implementation.
@@ -2045,6 +2047,445 @@ def test_every_lazy_export_resolves():
         assert name in _LAZY_IMPORTS, f"{name} is not reachable from the package"
 
 
+# ==========================================================================
+# MXFP4 INDEX CACHE (score_flydsl_fp4)
+#
+# The judge is `score_oracle` above: it lifts K to the query dtype and
+# accumulates in fp32. The MXFP4 cache is dequantized to bf16 first, which is
+# exact (e2m1 x 2^e fits bf16), so the tolerance is the fp8 one and a mismatch is
+# a bug, not a rounding difference.
+#
+# The quantizer is aiter's own `per_1x32_f4_quant` (RoundUp), the dequantizer
+# `fp4_utils.mxfp4_to_f32` x `e8m0_to_f32`; neither is reimplemented here beyond
+# chunking. e8m0 bytes 0 and 255 are outside the kernel's contract and are not
+# generated (`quantize_mxfp4` asserts its scales stay within 1..254).
+# ==========================================================================
+QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
+
+
+def quantize_mxfp4(k):
+    """bf16 [pages,128,128] -> (data u8 [pages,128,64], scale u8 [pages,128,4],
+    dequantized bf16 [pages,128,128]).
+
+    Low nibble is the even element; one e8m0 byte per 32 elements; the
+    dequantized tensor is what the kernel is contractually scoring.
+    """
+    pages = k.shape[0]
+    data = torch.empty((pages, P, D // 2), dtype=torch.uint8, device=k.device)
+    scale = torch.empty((pages, P, D // 32), dtype=torch.uint8, device=k.device)
+    deq = torch.empty_like(k)
+    for i in range(0, pages, QCHUNK):
+        x = k[i : i + QCHUNK].reshape(-1, D)
+        n = x.shape[0] // P
+        q, s = per_1x32_f4_quant(x)
+        d = q.view(torch.uint8).reshape(n, P, D // 2)
+        sc = s.view(torch.uint8).reshape(n, P, D // 32)
+        f = fp4_utils.mxfp4_to_f32(d.reshape(-1, D // 2).clone())
+        e = fp4_utils.e8m0_to_f32(sc.reshape(-1, D // 32)).repeat_interleave(32, dim=-1)
+        data[i : i + n] = d
+        scale[i : i + n] = sc
+        deq[i : i + n] = (f * e).to(torch.bfloat16).reshape(n, P, D)
+    assert int(scale.min()) >= 1 and int(scale.max()) <= 254
+    return data, scale, deq
+
+
+def fp4_cache_of(cache8, transform=None):
+    """An MXFP4 version of an fp8 test cache: the same values, re-quantized."""
+    pages = cache8.shape[0]
+    k = torch.empty((pages, P, D), dtype=torch.bfloat16, device=cache8.device)
+    for i in range(0, pages, 2048):
+        blk = cache8[i : i + 2048].to(torch.bfloat16)
+        k[i : i + 2048] = transform(blk) if transform else blk
+    return quantize_mxfp4(k)
+
+
+def single_region_views(data, scale):
+    """Both views of ONE `[pages, 8704]` allocation: 8192 B of data followed by
+    512 B of scale per page, the physical layout the cache is meant to have."""
+    pages = data.shape[0]
+    buf = torch.empty((pages, P * 64 + P * 4), dtype=torch.uint8, device=data.device)
+    buf[:, : P * 64] = data.reshape(pages, -1)
+    buf[:, P * 64 :] = scale.reshape(pages, -1)
+    kd = torch.as_strided(buf, (pages, P, 64), (buf.stride(0), 64, 1))
+    ks = torch.as_strided(buf, (pages, P, 4), (buf.stride(0), 4, 1), P * 64)
+    return buf, kd, ks
+
+
+QDTS = ["bf16", "e4m3"]  # the dtype the query reaches the scorer in
+
+
+def expect_value_error(what, fn, *args, match=None):
+    """`fn(*args)` must raise ValueError (whose message contains `match`)."""
+    try:
+        fn(*args)
+    except ValueError as e:
+        assert match is None or match in str(e), f"{what}: wrong message: {e}"
+        return
+    raise AssertionError(f"{what}: no ValueError")
+
+
+def q_for(q, qdt):
+    """(the Q the kernel is given, the bf16 Q the oracle scores). For e4m3 that is
+    the index-Q writer's rule: the value is already rounded to bf16, then RNE and
+    saturating to e4m3 (torch's own cast would turn an overflow into NaN). e4m3 is a
+    subset of bf16, so the oracle's bf16 view of it is exact. Both keep q's strides."""
+    if qdt == "bf16":
+        return q, q
+    # Same strides as `q` (the `qslice` case is a view into a wider tensor), so the
+    # e4m3 kernel's strided Q loads are exercised; `.to` would repack it.
+    clamped = q.float().clamp(-448, 448)
+    q8 = torch.empty_strided(q.shape, q.stride(), dtype=dtypes.fp8, device=q.device)
+    q8.copy_(clamped)
+    q_ref = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
+    q_ref.copy_(q8)
+    return q8, q_ref
+
+
+def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
+    return kernel.score_flydsl_fp4(q, kd, ks, bt, seq, S, H, D**-0.5, mb, **kw)
+
+
+# --- Correctness ----------------------------------------------------------
+def check_mxfp4_matches_oracle(case, qdt):
+    _, B, S, H, lens, kw = case
+    q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kw)
+    q, q_ref = q_for(q, qdt)
+    kd, ks, deq = fp4_cache_of(cache8)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
+    got = run_fp4(q, kd, ks, bt, seq, S, H, mb)
+    check_scores(got, ref)
+
+
+def check_mxfp4_every_geometry_matches_oracle(point, qdt):
+    """Every launch geometry the selector can reach (work-chunk depth, token
+    split, spread, CP shard) against the oracle. Negative scores expose accidental
+    zero-initialised maxima, as in the fp8 test."""
+    S, H, batch, max_block, world, rank = point
+    # As in the fp8 test: `max_block` is this rank's LOCAL width, the table and
+    # lengths are global, and the score is the compacted shard.
+    glob = max_block * world
+    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [glob * P]
+    lens = [min(x, glob * P) for x in lens]
+    q, cache8, bt, seq, mb = make_case(batch, S, H, lens)
+    assert mb == glob
+    q.copy_(q.abs() + 0.25)
+    q, q_ref = q_for(q, qdt)
+    kd, ks, deq = fp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
+    del cache8
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, max_block, world, rank)
+    out = kernel.alloc_score(batch, S, H, max_block, q.device)
+    out.fill_(float("nan"))
+    got = score_flydsl(
+        q,
+        kd,
+        bt,
+        seq,
+        S,
+        H,
+        D**-0.5,
+        max_block,
+        out=out,
+        cp_world=world,
+        cp_rank=rank,
+        k_scale=ks,
+    )
+    assert got.data_ptr() == out.data_ptr()
+    check_scores(got, ref)
+    assert bool((got[torch.isfinite(ref)] < 0).all())
+
+
+def check_mxfp4_graph_buffers(S, H, layout, map_in_graph):
+    """Captured once, replayed with different lengths and block tables."""
+    B, mb = 3, 9
+    q, cache8, _, seq, _ = make_case(B, S, H, [0, 513, 1])
+    kd, ks, deq = fp4_cache_of(cache8)
+    bt = torch.zeros((B, mb), dtype=torch.int32, device="cuda")
+    bt[:, :5] = torch.arange(5, device="cuda", dtype=torch.int32)
+    buf = torch.empty(
+        (kernel.work_map_capacity(B, mb, S, H), 2), device="cuda", dtype=torch.int32
+    )
+    wm = kernel.build_work_map(seq, mb, S, H, out=buf)
+    out = (
+        torch.empty((H, B * S, mb), device="cuda", dtype=torch.float32)
+        if layout == "contiguous"
+        else torch.empty((mb, B * S, H), device="cuda", dtype=torch.float32).permute(
+            2, 1, 0
+        )
+    )
+
+    def run():
+        current = kernel.build_work_map(seq, mb, S, H, out=buf) if map_in_graph else wm
+        return run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out, work_map=current)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lengths, shift in [([0, 513, 1], 0), ([130, 0, 257], 3), ([1, 129, 0], 1)]:
+        seq.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+        bt.copy_(
+            (torch.arange(mb, device="cuda", dtype=torch.int32)[None, :] + shift)
+            .remainder(kd.shape[0])
+            .expand(B, -1)
+        )
+        if not map_in_graph:
+            kernel.build_work_map(seq, mb, S, H, out=buf)
+        graph.replay()
+        check_scores(out, score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb))
+
+
+def check_mxfp4_split_and_single_region_views_agree_bitwise():
+    """Two separate tensors and two views of one `[pages, 8704]` page are the
+    same input to the kernel, down to the bit."""
+    q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
+    kd, ks, _ = fp4_cache_of(cache8)
+    _buf, kd1, ks1 = single_region_views(kd, ks)
+    assert kd1.stride(0) == ks1.stride(0) == 8704
+    a = run_fp4(q, kd, ks, bt, seq, 4, 4, mb)
+    b = run_fp4(q, kd1, ks1, bt, seq, 4, 4, mb)
+    assert torch.equal(a, b)
+
+
+def check_mxfp4_wide_scale_range(qdt):
+    """Per-token magnitudes over 2^+-20 give e8m0 bytes spread over the range a
+    real cache uses; every lane group must pick its own byte."""
+    B, S, H = 2, 4, 4
+    q, cache8, bt, seq, mb = make_case(B, S, H, [2048, 700])
+    pages = cache8.shape[0]
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    mag = torch.exp2(
+        torch.randint(
+            -20, 21, (pages, P, D // 32), device="cuda", generator=gen
+        ).float()
+    )
+    mag = mag.repeat_interleave(32, dim=-1)
+    k = torch.randn((pages, P, D), device="cuda", generator=gen) * mag
+    kd, ks, deq = quantize_mxfp4(k.to(torch.bfloat16))
+    assert int(ks.min()) < 110 and int(ks.max()) > 140
+    q2 = (q.float() * 2**-8).to(torch.bfloat16)  # keep scores inside fp32 comfortably
+    q2, q2_ref = q_for(q2, qdt)
+    ref = score_oracle(q2_ref, deq, bt, seq, S, H, D**-0.5, mb)
+    got = run_fp4(q2, kd, ks, bt, seq, S, H, mb)
+    check_scores(got, ref)
+
+
+def check_mxfp4_default_score_buffer_reads_as_minus_inf():
+    lens = [512, 256, 128, 512]
+    q, cache8, bt, seq, mb = make_case(len(lens), 1, 1, lens)
+    kd, ks, _ = fp4_cache_of(cache8)
+    out = run_fp4(q, kd, ks, bt, seq, 1, 1, mb)
+    assert (out == float("-inf")).any()
+    assert torch.isfinite(out[out != float("-inf")]).all()
+
+
+def check_mxfp4_e4m3_q_rows_must_be_16_byte_aligned():
+    _, cache8, bt, seq, mb = make_case(2, 4, 2, [513, 513])
+    kd, ks, _ = fp4_cache_of(cache8)
+    flat = torch.empty(8 * 2 * D + 64, dtype=dtypes.fp8, device="cuda")
+    bad = torch.as_strided(flat, (8, 2, D), (2 * D + 8, D, 1), 0)  # row stride 264 B
+    assert not kernel.index_score_supported_fp4(bad, kd, ks, 4, 2, mb, bt, seq_lens=seq)
+    expect_value_error(
+        "misaligned q rows",
+        run_fp4,
+        bad,
+        kd,
+        ks,
+        bt,
+        seq,
+        4,
+        2,
+        mb,
+        match="16-byte aligned",
+    )
+
+
+# --- Rejections -----------------------------------------------------------
+def _valid_inputs():
+    q, cache8, bt, seq, mb = make_case(2, 4, 4, [130, 513])
+    kd, ks, _ = fp4_cache_of(cache8)
+    return q, kd, ks, bt, seq, mb
+
+
+def _bad(name):
+    q, kd, ks, bt, seq, mb = _valid_inputs()
+    pages = kd.shape[0]
+    if name == "data_dtype":
+        kd = kd.view(torch.int8)
+    elif name == "scale_dtype":
+        ks = ks.view(torch.int8)
+    elif name == "data_shape":
+        kd = kd[:, :, :32]
+    elif name == "scale_shape":
+        ks = ks[:, :, :2]
+    elif name == "pages_differ":
+        ks = ks[:-1]
+    elif name == "data_token_stride":
+        kd = torch.empty((pages, P, 128), dtype=torch.uint8, device="cuda")[:, :, :64]
+    elif name == "scale_token_stride":
+        ks = torch.empty((pages, P, 8), dtype=torch.uint8, device="cuda")[:, :, :4]
+    elif name == "data_page_stride_unaligned":
+        buf = torch.empty(pages * (P * 64 + 8) + 16, dtype=torch.uint8, device="cuda")
+        kd = torch.as_strided(buf, (pages, P, 64), (P * 64 + 8, 64, 1))
+    elif name == "data_pages_overlap":
+        kd = torch.as_strided(kd, (pages, P, 64), (P * 64 - 16, 64, 1))
+    elif name == "scale_misaligned":
+        buf = torch.empty(pages * P * 4 + 8, dtype=torch.uint8, device="cuda")
+        ks = torch.as_strided(buf, (pages, P, 4), (P * 4, 4, 1), 2)
+    elif name == "cpu":
+        kd = kd.cpu()
+    elif name == "q_dtype":
+        q = q.float()
+    return q, kd, ks, bt, seq, mb
+
+
+BAD = [
+    "data_dtype",
+    "scale_dtype",
+    "data_shape",
+    "scale_shape",
+    "pages_differ",
+    "data_token_stride",
+    "scale_token_stride",
+    "data_page_stride_unaligned",
+    "data_pages_overlap",
+    "scale_misaligned",
+    "q_dtype",
+]
+
+
+def check_mxfp4_invalid_cache_rejected(name):
+    q, kd, ks, bt, seq, mb = _bad(name)
+    assert not kernel.index_score_supported_fp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
+    expect_value_error(name, run_fp4, q, kd, ks, bt, seq, 4, 4, mb)
+
+
+def check_mxfp4_metadata_rejects_cpu():
+    q = torch.empty(1, 1, D, dtype=torch.bfloat16)
+    kd = torch.empty(1, P, 64, dtype=torch.uint8)
+    ks = torch.empty(1, P, 4, dtype=torch.uint8)
+    bt = torch.zeros(1, 1, dtype=torch.int32)
+    seq = torch.zeros(1, dtype=torch.int32)
+    assert not kernel.index_score_supported_fp4(q, kd, ks, 1, 1, 1, bt, seq_lens=seq)
+
+
+def check_mxfp4_sm_scale_must_be_positive_finite():
+    """The epilogue takes the page max before multiplying by the scale, so a
+    non-positive one would pick the wrong block silently; NaN likewise."""
+    q, kd, ks, bt, seq, mb = _valid_inputs()
+    for scale in (-1.0, 0.0, float("nan")):
+        expect_value_error(
+            f"sm_scale={scale}",
+            kernel.score_flydsl_fp4,
+            q,
+            kd,
+            ks,
+            bt,
+            seq,
+            4,
+            4,
+            scale,
+            mb,
+            match="sm_scale",
+        )
+
+
+def check_mxfp4_supported_accepts_valid_inputs():
+    q, kd, ks, bt, seq, mb = _valid_inputs()
+    assert kernel.index_score_supported_fp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
+
+
+@benchmark()
+def bench_score_mxfp4(case, B, S, H, lens, kwargs):
+    q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kwargs)
+    kd, ks, deq = fp4_cache_of(cache8)
+    ref = score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb)
+    ret = {"gfx": get_gfx(), "timing": "repeated-buffer (warm effective TB/s)"}
+    capacity = kernel.work_map_capacity(B, mb, S, H)
+    buf = torch.empty((capacity, 2), device=q.device, dtype=torch.int32)
+    wm = kernel.build_work_map(seq, mb, S, H, out=buf)
+    pages = sum((L + P - 1) // P for L in lens)
+    flops = 2 * pages * P * D * S * H
+    cache8 = deq.to(dtypes.fp8)  # prepared here so only the scorers are timed
+    out = kernel.alloc_score(B, S, H, mb, q.device)  # outside the timed region
+    cands = {
+        "fp4": (
+            lambda: run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out, work_map=wm),
+            pages * P * 68,
+        ),
+        "fp8": (
+            lambda: kernel.score_flydsl(
+                q, cache8, bt, seq, S, H, D**-0.5, mb, out=out, work_map=wm
+            ),
+            pages * P * D,
+        ),
+    }
+    for name, (run, kbytes) in cands.items():
+        got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
+        err = check_scores(got, ref)
+        nbytes = kbytes + q.numel() * 2 + pages * S * H * 4
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": flops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": err,
+            }
+        )
+    return ret
+
+
+def build_mxfp4_checks():
+    """(name, check, args): one row per MXFP4 correctness case."""
+    checks = []
+    for case, qdt in itertools.product(build_matrix(), QDTS):
+        name = f"matches_oracle_{case[0].replace('fp8', 'mxfp4')}_{qdt}"
+        checks.append((name, check_mxfp4_matches_oracle, (case, qdt)))
+    for point, qdt in itertools.product(GEOM_POINTS, QDTS):
+        name = f"every_geometry_{geom_id(point)}_{qdt}"
+        checks.append((name, check_mxfp4_every_geometry_matches_oracle, (point, qdt)))
+    for (S, H), layout, in_graph in itertools.product(
+        [(1, 4), (4, 2), (8, 4)], ["contiguous", "feature"], [False, True]
+    ):
+        name = f"graph_buffers_S{S}_H{H}_{layout}_{'map_in_graph' if in_graph else 'map_outside'}"
+        checks.append((name, check_mxfp4_graph_buffers, (S, H, layout, in_graph)))
+    for qdt in QDTS:
+        checks.append((f"wide_scale_range_{qdt}", check_mxfp4_wide_scale_range, (qdt,)))
+    for fn in (
+        check_mxfp4_split_and_single_region_views_agree_bitwise,
+        check_mxfp4_default_score_buffer_reads_as_minus_inf,
+        check_mxfp4_e4m3_q_rows_must_be_16_byte_aligned,
+        check_mxfp4_metadata_rejects_cpu,
+        check_mxfp4_sm_scale_must_be_positive_finite,
+        check_mxfp4_supported_accepts_valid_inputs,
+    ):
+        checks.append((fn.__name__.removeprefix("check_mxfp4_"), fn, ()))
+    for name in BAD + ["cpu"]:
+        checks.append(
+            (
+                f"invalid_cache_rejected_{name}",
+                check_mxfp4_invalid_cache_rejected,
+                (name,),
+            )
+        )
+    return checks
+
+
+def run_checks(checks, what):
+    """Run every check, tabulate PASS/FAIL, return the failed names."""
+    rows = []
+    for name, check, cargs in checks:
+        try:
+            check(*cargs)
+            rows.append({"case": name, "status": "PASS", "detail": ""})
+        except (AssertionError, RuntimeError, ValueError) as e:  # list every failure
+            rows.append({"case": name, "status": "FAIL", "detail": repr(e)[:200]})
+    aiter.logger.info(
+        "%s checks (markdown):\n%s", what, pd.DataFrame(rows).to_markdown(index=False)
+    )
+    return [r["case"] for r in rows if r["status"] != "PASS"]
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="MiniMax-M3 index-score correctness and performance sweep",
@@ -2135,6 +2576,15 @@ def main(argv=None):
     if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
+    # A custom --case/--mnk selection is a perf sweep: the correctness checks
+    # run with the default matrix only.
+    if args.case is None and args.mnk is None:
+        failed = run_checks(build_mxfp4_checks(), "mxfp4 decode index score")
+        if failed:
+            aiter.logger.error(
+                "mxfp4 decode index score: %d checks failed: %s", len(failed), failed
+            )
+            return 1
     rows = []
     for (name, B, S, H, lens, kw), layout in itertools.product(
         select_cases(args), args.layout
@@ -2148,8 +2598,17 @@ def main(argv=None):
     else:
         aiter.logger.warning("Empty selection; no decode score tests executed")
 
-    # A second table, not a merged one: the two @benchmark signatures have
-    # different call args, so one frame would scatter NaN columns.
+    # More tables, not a merged one: the @benchmark signatures have different
+    # call args, so one frame would scatter NaN columns.
+    mx = [
+        bench_score_mxfp4(name, B, S, H, lens, kw)
+        for name, B, S, H, lens, kw in select_cases(args)
+    ]
+    if mx:
+        aiter.logger.info(
+            "mxfp4 decode index score summary (markdown):\n%s",
+            pd.DataFrame(mx).to_markdown(index=False),
+        )
     pre = []
     for batch, q_len, ctx_len, heads in itertools.product(
         args.batch or [1], args.q_len, args.ctx_len, args.heads

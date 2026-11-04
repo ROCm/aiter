@@ -69,7 +69,7 @@ def _co_test_profile_dirs(root: Path) -> list[tuple[Path, str]]:
         return [(root, "")]
     return [
         (root / name, name)
-        for name in (GFX1250, f"{GFX1250}-a0")
+        for name in (GFX1250, f"{GFX1250}-strict")
         if (root / name / "build_info.json").is_file()
     ]
 
@@ -158,7 +158,7 @@ def _run_gfx1250_co_override_case(available_kid: int, missing_kid: int) -> None:
     missing_instance = gfx1250_4wave_co_kernels_list[missing_kid]
     missing_images = [
         override_root / directory / f"{missing_instance.name}.co"
-        for directory in (GFX1250, f"{GFX1250}-a0", "")
+        for directory in (GFX1250, f"{GFX1250}-strict", "")
     ]
     try:
         _run_gfx1250_co_case(missing_kid)
@@ -368,7 +368,7 @@ def test_gfx1250_co_kernel_matches_torch(kid, _gfx1250_device, monkeypatch):
     _run_gfx1250_co_case(kid, _gfx1250_device)
 
 
-@pytest.mark.parametrize("kid", (21063, 21105, 21177, 21208, 21316, 21317))
+@pytest.mark.parametrize("kid", (543, 544, 596, 612, 715, 716))
 @pytest.mark.parametrize("case", ("tiny", "one_step", "ring_tail", "steady_tail"))
 @pytest.mark.parametrize("split_k", (0, 1))
 @pytest.mark.parametrize("pad", (0, 8))

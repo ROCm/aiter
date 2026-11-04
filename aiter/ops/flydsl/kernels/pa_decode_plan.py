@@ -13,6 +13,8 @@ import torch
 from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 
 DEFAULT_MAX_BATCH_SIZE = 4096
+# int32 slots per arrival counter: one 128-byte line per (sequence, KV head).
+ARRIVAL_COUNTER_STRIDE = 32
 # Two warp scans and one reduction use at most 512 bytes at 1024 wave32 threads.
 _PLAN_SCAN_LDS_BYTES = 512
 
@@ -152,6 +154,11 @@ class PADecodePlan:
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
     original context length. Tile ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
+    ``arrival_counters`` is [batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE]
+    int32 and zero between decodes: gfx1250 decodes that merge partitions in
+    the tile kernel count finished tasks in slot 0 and the last one resets it,
+    so decodes running concurrently must not share a plan. ``None`` keeps the
+    shared reducer.
     """
 
     work_info: torch.Tensor
@@ -161,6 +168,7 @@ class PADecodePlan:
     sliding_window: int = 0
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
+    arrival_counters: torch.Tensor | None = None
 
     @property
     def capacity(self) -> int:
@@ -186,7 +194,16 @@ class PADecodePlan:
             raise ValueError("work_info must have shape [capacity, 4]")
         if not batch_size <= self.capacity <= batch_size * self.max_partitions:
             raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
-        for tensor in (self.work_info, self.reduce_info):
+        metadata = [self.work_info, self.reduce_info]
+        if self.arrival_counters is not None:
+            counter_shape = (batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE)
+            if self.arrival_counters.shape != counter_shape:
+                raise ValueError(
+                    "arrival_counters must have shape "
+                    "[batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE]"
+                )
+            metadata.append(self.arrival_counters)
+        for tensor in metadata:
             if tensor.device != device or tensor.dtype != torch.int32:
                 raise ValueError("plan metadata must be int32 on the query device")
             if not tensor.is_contiguous():
@@ -216,13 +233,12 @@ def plan_pa_decode(
     must fit the device's per-block shared-memory capacity.
 
     Lengths include MTP tokens. Positive windows include each query's position;
-    0 and -1 disable them. Plans cover the MTP window union: match the window
-    and query length when decoding or refreshing. Dense plans ignore query length.
+    nonpositive windows disable them. Plans cover the MTP window union: match
+    the window and query length when decoding or refreshing. Dense plans ignore
+    query length.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
@@ -274,6 +290,12 @@ def plan_pa_decode(
             sliding_window,
             query_length,
             max_batch_size,
+            # Zeroed once here: every decode that counts arrivals resets them.
+            torch.zeros(
+                (batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE),
+                dtype=torch.int32,
+                device=dev,
+            ),
         )
     else:
         if workgroup_budget is not None:
