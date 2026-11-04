@@ -312,14 +312,31 @@ UNTUNED_HEADER = (
 class TestOnlineTuneFmoe(unittest.TestCase):
     """Tests for the real _online_tune_fmoe shared by both online-tune paths."""
 
+    @staticmethod
+    def _shape_args():
+        import torch
+
+        return (
+            16,
+            7168,
+            256,
+            256,
+            8,
+            "ActivationType.Silu",
+            torch.bfloat16,
+            torch.float8_e4m3fnuz,
+            torch.uint32,
+            "QuantType.per_Token",
+            True,
+            False,
+        )
+
     def _run(self, tmp, returncode, untuned_content=""):
         """Call _online_tune_fmoe with the tuner subprocess faked to exit returncode.
 
         Returns (raised exception or None, untuned lines, tuner commands, aiter log lines).
         """
         import subprocess
-
-        import torch
 
         fused_moe = importlib.import_module("aiter.fused_moe")
         untune_file = os.path.join(tmp, "untuned_fmoe.csv")
@@ -342,21 +359,7 @@ class TestOnlineTuneFmoe(unittest.TestCase):
         ):
             try:
                 fused_moe._online_tune_fmoe(
-                    untune_file,
-                    tune_file,
-                    profile_file,
-                    16,
-                    7168,
-                    256,
-                    256,
-                    8,
-                    "ActivationType.Silu",
-                    torch.bfloat16,
-                    torch.float8_e4m3fnuz,
-                    torch.uint32,
-                    "QuantType.per_Token",
-                    True,
-                    False,
+                    untune_file, tune_file, profile_file, *self._shape_args()
                 )
             except RuntimeError as e:
                 raised = e
@@ -411,6 +414,30 @@ class TestOnlineTuneFmoe(unittest.TestCase):
         self.assertIsInstance(raised.__cause__, subprocess.CalledProcessError)
         self.assertFalse(any("[Hint]" in m for m in logs))
         self.assertTrue(any(m.endswith("\033[0m") for m in logs))
+
+    def test_unwritable_untuned_file_raises_without_running_tuner(self):
+        fused_moe = importlib.import_module("aiter.fused_moe")
+        commands = []
+        with tempfile.TemporaryDirectory() as tmp:
+            untune_file = os.path.join(tmp, "untuned_fmoe.csv")
+            os.mkdir(untune_file)
+            with (
+                patch.object(
+                    fused_moe.subprocess,
+                    "run",
+                    lambda cmd, **kwargs: commands.append(cmd),
+                ),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                fused_moe._online_tune_fmoe(
+                    untune_file,
+                    os.path.join(tmp, "tuned_fmoe.csv"),
+                    os.path.join(tmp, "profile_fmoe.csv"),
+                    *self._shape_args(),
+                )
+        self.assertIn("online tune could not write", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertEqual(commands, [])
 
     def test_shared_expert_path_uses_same_helper(self):
         fused_moe = importlib.import_module("aiter.fused_moe")

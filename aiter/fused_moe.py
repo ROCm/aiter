@@ -3619,16 +3619,23 @@ def _online_tune_fmoe(
     """Append one shape to untune_file and tune it into tune_file.
 
     Shared by the AITER_ONLINE_TUNE paths of fused_moe and
-    fused_moe_dp_shared_expert. Raises RuntimeError if gemm_moe_tune.py exits
-    non-zero; callers catch it so inference falls back to the default configs.
+    fused_moe_dp_shared_expert. Raises RuntimeError if untune_file cannot be
+    written or gemm_moe_tune.py exits non-zero; callers catch it so inference
+    falls back to the default configs.
     """
-    with open(untune_file, "a") as f:
-        if os.path.getsize(untune_file) == 0:
-            f.write(_UNTUNED_FMOE_HEADER)
-        q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-        f.write(
-            f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-        )
+    try:
+        with open(untune_file, "a") as f:
+            if os.path.getsize(untune_file) == 0:
+                f.write(_UNTUNED_FMOE_HEADER)
+            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+            f.write(
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+            )
+    except OSError as e:
+        raise RuntimeError(
+            f"[fused_moe] online tune could not write {untune_file}: {e}; "
+            "falling back to default configs"
+        ) from e
     logger.info("\033[34m Start tuning fmoe")
     cmd = [
         PY,
