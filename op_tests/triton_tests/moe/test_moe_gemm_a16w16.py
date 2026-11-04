@@ -19,31 +19,32 @@ pytestmark = pytest.mark.skipif(
 
 _RTOL = 1e-2
 _ATOL = 128
-_RANGE_TOKENS = [
+_POLICY_SELECTED_TOKENS = [
     1024,
-    1088,
-    1151,
     1152,
-    1153,
-    1542,
     1543,
     1544,
-    1727,
     1728,
-    1729,
     1799,
     1803,
     1815,
     1837,
-    1944,
     1945,
-    2047,
     2048,
-    2049,
-    2304,
     2560,
 ]
-_OUT_OF_RANGE_TOKENS = [1023, 2561]
+_POLICY_REJECTED_TOKENS = [
+    1023,
+    1025,
+    1136,
+    1678,
+    1724,
+    1944,
+    2039,
+    2304,
+    2446,
+    2561,
+]
 
 
 def _make_case(tokens: int):
@@ -60,7 +61,13 @@ def _make_case(tokens: int):
     ids = torch.randint(0, expert, (tokens, topk), dtype=torch.int32, device="cuda")
     weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
     weights = weights / weights.sum(dim=-1, keepdim=True)
-    return hidden, w1.contiguous(), w2.contiguous(), weights.contiguous(), ids.contiguous()
+    return (
+        hidden,
+        w1.contiguous(),
+        w2.contiguous(),
+        weights.contiguous(),
+        ids.contiguous(),
+    )
 
 
 def _large_m_gate_inputs(tokens: int):
@@ -106,11 +113,12 @@ def _large_m_gate(**kwargs):
 @pytest.fixture(autouse=True)
 def _force_validated_gfx1201_target(monkeypatch):
     fused_moe_mod = importlib.import_module("aiter.fused_moe")
+    monkeypatch.delenv("AITER_DISABLE_GFX1201_BF16_G1U1_TRITON", raising=False)
     monkeypatch.setattr(fused_moe_mod, "get_gfx_runtime", lambda: "gfx1201")
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
 
-@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1944, 2048, 2560])
+@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1945, 2048, 2560])
 def test_public_fused_moe_bf16_g1u1_selected_large_m(tokens):
     hidden, w1, w2, weights, ids = _make_case(tokens)
 
@@ -161,14 +169,19 @@ def test_public_fused_moe_bf16_g1u1_selected_large_m_output_buffer():
     assert checkAllclose(output, expected, rtol=_RTOL, atol=_ATOL) == 0
 
 
-@pytest.mark.parametrize("tokens", _RANGE_TOKENS)
-def test_large_m_gate_accepts_validated_range_rows(tokens):
+@pytest.mark.parametrize("tokens", _POLICY_SELECTED_TOKENS)
+def test_large_m_gate_accepts_validated_policy_rows(tokens):
     assert _large_m_gate(**_large_m_gate_inputs(tokens))
 
 
-@pytest.mark.parametrize("tokens", _OUT_OF_RANGE_TOKENS)
-def test_large_m_gate_rejects_out_of_range_rows(tokens):
+@pytest.mark.parametrize("tokens", _POLICY_REJECTED_TOKENS)
+def test_large_m_gate_rejects_unvalidated_policy_rows(tokens):
     assert not _large_m_gate(**_large_m_gate_inputs(tokens))
+
+
+def test_large_m_gate_rejects_when_disabled(monkeypatch):
+    monkeypatch.setenv("AITER_DISABLE_GFX1201_BF16_G1U1_TRITON", "1")
+    assert not _large_m_gate(**_large_m_gate_inputs(1152))
 
 
 def test_large_m_gate_rejects_unsupported_modes(monkeypatch):

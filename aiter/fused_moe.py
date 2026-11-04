@@ -1371,9 +1371,30 @@ def fused_moe_fake(
     return torch.empty((M, model_dim), dtype=dtype, device=device)
 
 
-_BF16_G1U1_GFX1201_TRITON_M_MIN = 1024
-_BF16_G1U1_GFX1201_TRITON_M_MAX = 2560
 _BF16_G1U1_GFX1201_TRITON_CU_NUM = 64
+_BF16_G1U1_GFX1201_TRITON_POLICY_KEY = "qwen3_6_35b_a3b_bf16_g1u1_large_m"
+_BF16_G1U1_GFX1201_TRITON_DISABLE_ENV = "AITER_DISABLE_GFX1201_BF16_G1U1_TRITON"
+
+
+@functools.lru_cache(maxsize=1)
+def _get_bf16_g1u1_gfx1201_triton_policy() -> dict:
+    from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+    dispatch = get_moe_dispatch("MOE-BF16-G1U1-POLICY", get_gfx_runtime(), "triton")
+    policy = dispatch.get(_BF16_G1U1_GFX1201_TRITON_POLICY_KEY, {})
+    return dict(policy)
+
+
+def _bf16_g1u1_gfx1201_triton_disabled() -> bool:
+    return os.environ.get(_BF16_G1U1_GFX1201_TRITON_DISABLE_ENV, "0") == "1"
+
+
+def _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens: int) -> bool:
+    policy = _get_bf16_g1u1_gfx1201_triton_policy()
+    for start, end in policy.get("m_ranges", ()):
+        if int(start) <= tokens <= int(end):
+            return True
+    return False
 
 
 def _can_use_bf16_g1u1_gfx1201_triton_large_m(
@@ -1409,11 +1430,10 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
 ) -> bool:
     tokens = topk_ids.shape[0]
     return (
-        get_gfx_runtime() == "gfx1201"
+        not _bf16_g1u1_gfx1201_triton_disabled()
+        and get_gfx_runtime() == "gfx1201"
         and get_cu_num() == _BF16_G1U1_GFX1201_TRITON_CU_NUM
-        and _BF16_G1U1_GFX1201_TRITON_M_MIN
-        <= tokens
-        <= _BF16_G1U1_GFX1201_TRITON_M_MAX
+        and _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens)
         and hidden_states.is_cuda
         and w1.is_cuda
         and w2.is_cuda
