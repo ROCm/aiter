@@ -2563,11 +2563,32 @@ def _flash_attn_backward(
         ret &= not swa
         return ret
 
-    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_bwd has no CK fallback, so this must match the gfx1250 kernel
+        # set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        wl = -1 if window_size_left >= seqlen_k else window_size_left
+        wr = -1 if window_size_right >= seqlen_k else window_size_right
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= bias is None
+        ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in ((64, 64), (128, 128), (192, 128))
+        ret &= nhead_q % nhead_k == 0
+        ret &= wl == -1 and (causal or wr == -1)
+        ret &= sink is None and d_sink is None
+        return ret
 
-    if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
-    ):  # ck fmha bwd has optimization for seqlen_q <= 16
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    # ck fmha bwd has optimization for seqlen_q <= 16; gfx1250 builds no such ck tiles
+    can_impl_fmha_v3_bwd_ &= seqlen_q > 16
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx1250()
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
+
+    if can_impl_fmha_v3_bwd_:
         if dq is not None:
             dq.zero_()
         (
@@ -3386,6 +3407,20 @@ def _flash_attn_varlen_backward(
 
         return ret
 
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_varlen_bwd has no CK fallback, so this must match the gfx1250
+        # kernel set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in ((64, 64), (128, 128), (192, 128))
+        ret &= nhead_q % nhead_k == 0
+        ret &= window_size_left == -1 and (causal or window_size_right == -1)
+        ret &= sink is None and d_sink is None
+
+        return ret
+
     def can_impl_fmha_bwd_flydsl():
         # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
         # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
@@ -3413,10 +3448,17 @@ def _flash_attn_varlen_backward(
 
         return ret
 
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+    can_impl_fmha_v3_bwd_ = (
+        can_impl_fmha_v3_bwd()
+        or can_impl_fmha_v3_bwd_gfx950()
+        or can_impl_fmha_v3_bwd_gfx1250()
+    )
     # gfx950 hd256 backward uses a16 (atomic32=0)
     if get_gfx() == "gfx950" and hdim_q == 256:
         is_v3_atomic_fp32 = False
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
