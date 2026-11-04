@@ -203,6 +203,25 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     )
 
 
+@pytest.mark.parametrize("num_kv_blocks", [1, 128, 129, 2048, 2049, 5000])
+def test_block_attn_mask_to_ragged_lut_default_width_matches_reference(num_kv_blocks):
+    """The default BLOCK_KB follows the row length, clamped to [128, 2048], so a row is one chunk
+    up to 2048 KV blocks and several past it. Every chunk's indices must land in order.
+    """
+    torch.manual_seed(0)
+    block_attn_mask = torch.rand((2, 3, 4, num_kv_blocks), device="cuda") < 0.3
+
+    kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
+        block_attn_mask
+    )
+
+    rows = block_attn_mask.reshape(-1, num_kv_blocks)
+    torch.testing.assert_close(lut_count, rows.sum(dim=-1, dtype=torch.int32))
+    for row, (start, count) in enumerate(zip(lut_start.tolist(), lut_count.tolist())):
+        expected = rows[row].nonzero().flatten().to(torch.int32)
+        torch.testing.assert_close(kv_block_indices[start : start + count], expected)
+
+
 def test_tiebreak_keeps_its_own_reference_bound():
     """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
 

@@ -14,7 +14,7 @@ def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
     num_heads: int | None = None,
     return_none_if_dense: bool = False,
-    BLOCK_KB: int = 128,
+    BLOCK_KB: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
