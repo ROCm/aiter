@@ -77,8 +77,6 @@ def _build_inputs(B, D, Kout, Mi, regime, dtype, seq_offsets=None):
         "dense": dense,
         "bias": bias,
         "seq_offsets": seq_offsets,
-        "dense_tall": dense.transpose(1, 2).reshape(B * N, K).contiguous(),
-        "bias_flat": bias.reshape(B * N).contiguous(),
         "L": L,
         "N": N,
         "K": K,
@@ -94,8 +92,8 @@ def _launch(d, out, B, Mi, uniform, **kwargs):
     jagged_dense_bmm_dispatched(
         out,
         d["jagged"],
-        d["dense_tall"],
-        d["bias_flat"],
+        d["dense"],
+        d["bias"],
         d["seq_offsets"],
         B,
         Mi,
@@ -130,21 +128,8 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     uniform = regime == "uniform"
     out = _nan_out(L, N, dtype)
 
-    def _flydsl_with_transpose():
-        # Callers that build dense per call in (B, K, N) pay this transpose.
-        dense_tall = d["dense"].transpose(1, 2).reshape(B * N, d["K"]).contiguous()
-        return _launch({**d, "dense_tall": dense_tall}, out, B, Mi, uniform)
-
     candidates = {
         "flydsl": lambda: _launch(d, out, B, Mi, uniform),
-        "flydsl+transpose": _flydsl_with_transpose,
-        "flydsl bkn": lambda: _launch(
-            {**d, "dense_tall": d["dense"], "bias_flat": d["bias"]},
-            out,
-            B,
-            Mi,
-            uniform,
-        ),
     }
     if _HAS_TRITON:
         so64 = d["seq_offsets"].to(torch.int64)

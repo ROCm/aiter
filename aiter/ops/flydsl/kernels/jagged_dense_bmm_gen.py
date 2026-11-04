@@ -7,8 +7,7 @@ For each group ``b`` over ``[seq_offsets[b], seq_offsets[b+1])``::
 
     Out[s:e, :] = Jagged[s:e, :] @ Dense[b] + Bias[b]
 
-Dense is ``(B * N, K)`` (host-pre-transposed) or ``(B, K, N)`` (DENSE_KN:
-N-contiguous, transposed in registers). Supports a uniform
+Dense is ``(B, K, N)``, N-contiguous, transposed in registers. Supports a uniform
 grid launch with optional XCD remap, and a compact launch for skewed
 sequence lengths that maps each workgroup to its group on device.
 """
@@ -135,7 +134,6 @@ def _build_launcher(
     XCD_W,
     COMPACT,
     NXCD,
-    DENSE_KN,
     TRAITS,
 ):
     MMA_N = TRAITS.mma_mnk[1]
@@ -143,9 +141,9 @@ def _build_launcher(
     K_ATOMS = K_STEP // TRAITS.mma_mnk[2]
     B_STAGES = TRAITS.b_stages
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
-    # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
+    # >= 2 adjacent n per lane, so each B load is at least 32-bit.
     WAVES = THREADS // TRAITS.wave_size
-    N_WARPS = min(WAVES, BLOCK_N // (MMA_N * (2 if DENSE_KN else 1)))
+    N_WARPS = min(WAVES, BLOCK_N // (MMA_N * 2))
     M_WARPS = WAVES // N_WARPS
     B_REPS = BLOCK_N // (MMA_N * N_WARPS)
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
@@ -154,7 +152,7 @@ def _build_launcher(
     def jdbba_kernel(
         C: fx.Tensor,  # out    (L, N)   bf16
         A: fx.Tensor,  # jagged (L, K)   bf16
-        B: fx.Tensor,  # dense  (n_groups * N, K) bf16 (pre-transposed, tall)
+        B: fx.Tensor,  # dense  (n_groups * K, N) bf16, view of (n_groups, K, N)
         BIAS: fx.Tensor,  # bias   (n_groups * N,)   bf16
         SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
         n_groups: fx.Int32,
@@ -239,7 +237,7 @@ def _build_launcher(
             b_row_off = fx.Int64(off_b) * fx.Int64(N) * fx.Int64(K)
             B_g = fx.make_view(
                 fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)),
-                fx.make_layout((N, K), (1, N)) if DENSE_KN else fx.get_layout(B),
+                fx.make_layout((N, K), (1, N)),
             )
 
             # Rows >= M_b fall outside num_records: loads read 0, stores drop.
@@ -282,25 +280,15 @@ def _build_launcher(
 
             tiled_copy_s2r_A = fx.make_tiled_copy_A(uni_copy_128b, tiled_mma)
             thr_copy_s2r_A = tiled_copy_s2r_A.get_slice(tid)
-            if fx.const_expr(DENSE_KN):
-                b_copy = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy(B_REPS * MMA_N), fx.BFloat16
-                )
-                tv_mma_B = tiled_mma.tv_layout_B_tiled
-                k_in_atom, n_rep, k_rep = 0, 1, 2
-                ring_modes = [n_rep, k_in_atom] + ([k_rep] if K_ATOMS > 1 else [])
-                vals_g2r_B = fx.coalesce(
-                    fx.select(fx.coalesce(tv_mma_B[1]), ring_modes)
-                )
-                tv_g2r_B = fx.group(
-                    fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank
-                )
-                thr_copy_g2r_B = fx.make_tiled_copy(
-                    b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_STEP)
-                ).get_slice(tid)
-            else:
-                b_copy = buffer_copy_128b
-                thr_copy_g2r_B = fx.make_tiled_copy_B(b_copy, tiled_mma).get_slice(tid)
+            b_copy = fx.make_copy_atom(fx.rocdl.BufferCopy(B_REPS * MMA_N), fx.BFloat16)
+            tv_mma_B = tiled_mma.tv_layout_B_tiled
+            k_in_atom, n_rep, k_rep = 0, 1, 2
+            ring_modes = [n_rep, k_in_atom] + ([k_rep] if K_ATOMS > 1 else [])
+            vals_g2r_B = fx.coalesce(fx.select(fx.coalesce(tv_mma_B[1]), ring_modes))
+            tv_g2r_B = fx.group(fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank)
+            thr_copy_g2r_B = fx.make_tiled_copy(
+                b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_STEP)
+            ).get_slice(tid)
 
             a_swizzle = fx.static(fx.SwizzleType.get(*TRAITS.a_swizzle))
             a_smem = fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2))
@@ -322,40 +310,27 @@ def _build_launcher(
             def k_coord(kc):
                 return (None, kc) if K_ATOMS > 1 else kc
 
-            if fx.const_expr(DENSE_KN):
-                # Ring slots hold (n-rep, k) as loaded; each K32 step shuffles
-                # them into the MFMA's K-packed (k, n-rep) operand.
-                b_ring = [
-                    fx.make_fragment_like(thr_gB_k[None, None, None, 0])
-                    for _ in range(B_STAGES)
-                ]
-                mma_frag_B = thr_mma.make_fragment_B(gB_k[None, None, 0])
-                mma_to_ring_B = fx.composition(fx.left_inverse(vals_g2r_B), tv_mma_B[1])
-                b_shuffle = [
-                    fx.get_scalar(fx.crd2idx(i, mma_to_ring_B))
-                    for i in range(fx.get_scalar(fx.size(mma_to_ring_B)))
-                ]
+            # Ring slots hold (n-rep, k) as loaded; each K32 step shuffles
+            # them into the MFMA's K-packed (k, n-rep) operand.
+            b_ring = [
+                fx.make_fragment_like(thr_gB_k[None, None, None, 0])
+                for _ in range(B_STAGES)
+            ]
+            mma_frag_B = thr_mma.make_fragment_B(gB_k[None, None, 0])
+            mma_to_ring_B = fx.composition(fx.left_inverse(vals_g2r_B), tv_mma_B[1])
+            b_shuffle = [
+                fx.get_scalar(fx.crd2idx(i, mma_to_ring_B))
+                for i in range(fx.get_scalar(fx.size(mma_to_ring_B)))
+            ]
 
-                def b_dst(slot):
-                    return b_ring[slot]
+            def b_dst(slot):
+                return b_ring[slot]
 
-                def b_operand(slot, kc):
-                    raw = b_ring[slot][None, None, kc].load()
-                    dst = mma_frag_B[None, None, k_coord(kc)]
-                    dst.store(
-                        raw.shuffle(raw, b_shuffle).reshape(dst.shape.to_py_value())
-                    )
-                    return dst
-
-            else:
-                mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=B_STAGES)
-                mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
-
-                def b_dst(slot):
-                    return mma_frag_B_retile[None, None, None, slot]
-
-                def b_operand(slot, kc):
-                    return mma_frag_B[None, None, k_coord(kc), slot]
+            def b_operand(slot, kc):
+                raw = b_ring[slot][None, None, kc].load()
+                dst = mma_frag_B[None, None, k_coord(kc)]
+                dst.store(raw.shuffle(raw, b_shuffle).reshape(dst.shape.to_py_value()))
+                return dst
 
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
@@ -554,11 +529,7 @@ def _build_launcher(
         search_steps: int,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
-        n_perm = (
-            fx.make_layout((MMA_N, N_WARPS, B_REPS), (B_REPS, MMA_N * B_REPS, 1))
-            if DENSE_KN
-            else None
-        )
+        n_perm = fx.make_layout((MMA_N, N_WARPS, B_REPS), (B_REPS, MMA_N * B_REPS, 1))
         tiled_mma = fx.make_tiled_mma(
             fx.make_mma_atom(fx.rocdl.MFMA(*TRAITS.mma_mnk, fx.BFloat16)),
             fx.make_layout((M_WARPS, N_WARPS, 1), (1, M_WARPS, 0)),
@@ -627,13 +598,10 @@ def jagged_dense_bmm(
     block_n: int | None = None,
     traits: ArchTraits,
 ):
-    dense_kn = B.dim() == 3
-    if dense_kn:
-        K, N = B.shape[1], B.shape[2]
-        B = B.view(n_groups * K, N)
-    else:
-        N = B.shape[0] // n_groups
-        K = B.shape[1]
+    if B.dim() != 3:
+        raise ValueError(f"B must be 3-D (n_groups, K, N), got {B.dim()}-D")
+    K, N = B.shape[1], B.shape[2]
+    B = B.view(n_groups * K, N)
     bmn = BLOCK_M if block_m is None else int(block_m)
     bnn = BLOCK_N if block_n is None else int(block_n)
     if bmn <= 0 or bmn & (bmn - 1):
@@ -642,8 +610,8 @@ def jagged_dense_bmm(
     # would silently drop the trailing N % block_n output columns.
     if bnn <= 0 or N % bnn != 0:
         raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
-    if dense_kn and bnn % 32:
-        raise ValueError(f"3-D dense needs block_n % 32 == 0, got {bnn}")
+    if bnn % 32:
+        raise ValueError(f"block_n must be a multiple of 32, got {bnn}")
     block_k = int(block_k)
     if block_k <= 0 or block_k % traits.k_tile_gran != 0:
         raise ValueError(
@@ -689,7 +657,6 @@ def jagged_dense_bmm(
         xcd_w,
         compact,
         get_num_xcds(),
-        dense_kn,
         traits,
     )
     launch_args = (
