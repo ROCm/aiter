@@ -44,7 +44,7 @@ SKEW_COMPACT_KN_XCD_W_SMALL = 16
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
 _KEY_COLS = ["gfx", "cu_num", "K", "N", "tiles_log2"]
-_CFG_KEYS = ("xcd_c", "xcd_w", "block_k", "threads")
+_CFG_KEYS = ("xcd_c", "xcd_w", "block_k")
 _ROW_KEYS = _CFG_KEYS + ("skew_xcd_c", "skew_xcd_w")
 
 
@@ -72,14 +72,10 @@ def tiles_log2(*, n_groups: int, output_n: int, max_seq_len: int) -> int:
     return max(tiles, 1).bit_length() - 1
 
 
-def _skew_compact_xcd(
-    n_groups: int, reduction_k: int, dense_kn: bool = False
-) -> tuple[int | None, int | None]:
-    if dense_kn and n_groups <= _SKEW_XCD_REMAP_SMALL_B_THRESHOLD and reduction_k < 512:
+def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int, int]:
+    if n_groups <= _SKEW_XCD_REMAP_SMALL_B_THRESHOLD and reduction_k < 512:
         return SKEW_COMPACT_KN_XCD_C_SMALL, SKEW_COMPACT_KN_XCD_W_SMALL
-    if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
-        return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
-    return None, None
+    return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
 
 
 def _config_valid(cfg: dict, *, reduction_k: int) -> bool:
@@ -94,7 +90,6 @@ def resolve_config(
     output_n: int,
     max_seq_len: int,
     uniform_seqlen: bool,
-    dense_kn: bool,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     block_k: int | None = None,
@@ -116,12 +111,7 @@ def resolve_config(
         if row["skew_xcd_c"] is not None:
             cfg["xcd_c"], cfg["xcd_w"] = row["skew_xcd_c"], row["skew_xcd_w"]
         else:
-            cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(
-                n_groups, reduction_k, dense_kn
-            )
-    # Thread counts were tuned on the uniform 2-D layout; 3-D is faster at the default.
-    if not uniform_seqlen or dense_kn:
-        cfg["threads"] = None
+            cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(n_groups, reduction_k)
     if xcd_c is not None:
         cfg["xcd_c"] = int(xcd_c)
     if xcd_w is not None:
@@ -137,8 +127,6 @@ def resolve_config(
         cfg["xcd_w"] = 1 if cfg["xcd_c"] == 1 else DEFAULT_XCD_W
     if cfg["block_k"] is None:
         cfg["block_k"] = DEFAULT_BLOCK_K
-    if cfg["threads"] is None:
-        cfg["threads"] = DEFAULT_THREADS
     return cfg
 
 
@@ -164,14 +152,8 @@ def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int) -> tuple[int, int]:
         if B.shape[0] != n_groups:
             raise ValueError(f"B has {B.shape[0]} groups, n_groups={n_groups}")
         K, N = B.shape[1], B.shape[2]
-    elif B.dim() == 2:
-        if B.shape[0] % n_groups:
-            raise ValueError(
-                f"B rows {B.shape[0]} are not a multiple of n_groups={n_groups}"
-            )
-        N, K = B.shape[0] // n_groups, B.shape[1]
     else:
-        raise ValueError(f"B must be 2-D or 3-D, got {B.dim()}-D")
+        raise ValueError(f"B must be 3-D (n_groups, K, N), got {B.dim()}-D")
     if A.shape[1] != K:
         raise ValueError(f"A has K={A.shape[1]}, B has K={K}")
     if tuple(C.shape) != (A.shape[0], N):
@@ -211,9 +193,7 @@ def jagged_dense_bmm_dispatched(
             ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
             read. One group's rows of ``A`` and of ``C`` must each stay under
             4 GiB, the 32-bit buffer bound.
-        B: bf16 dense weights, either ``(n_groups, K, N)`` or
-            ``(n_groups * N, K)``, the latter being
-            ``dense.transpose(1, 2).reshape(-1, K)`` of the former.
+        B: bf16 dense weights ``(n_groups, K, N)``.
         BIAS: ``(n_groups, N)`` or ``(n_groups * N,)`` bf16.
         SEQ_OFFSETS: ``(n_groups + 1,)`` int32 prefix sum of group lengths,
             read on the device only.
@@ -243,7 +223,6 @@ def jagged_dense_bmm_dispatched(
         output_n=output_n,
         max_seq_len=max_seq_len,
         uniform_seqlen=uniform_seqlen,
-        dense_kn=B.dim() == 3,
         xcd_c=xcd_c,
         xcd_w=xcd_w,
         block_k=block_k,
@@ -260,6 +239,7 @@ def jagged_dense_bmm_dispatched(
         max_seq_len,
         stream=stream,
         uniform_seqlen=uniform_seqlen,
+        threads=DEFAULT_THREADS,
         traits=ARCH_TRAITS[arch],
         **cfg,
     )
