@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import functools
 import random
 import sys
 from types import SimpleNamespace
@@ -919,7 +920,7 @@ def _gfx950_split(**overrides):
     return config, params
 
 
-def test_length_aware_split_scope() -> None:
+def test_length_aware_split_scope(monkeypatch) -> None:
     """The length-aware entry leaves every call it does not split as before."""
     config, params = _gfx950_split()
     _, num_segments = _length_aware_split(config, params)
@@ -976,18 +977,34 @@ def test_length_aware_split_scope() -> None:
         budget = rng.randint(1, 1024)
         assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
     assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
+    # the query-block guard reads the attn_3d table; pin it to gfx950 like the rest
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(
+        module,
+        "get_unified_attention_config",
+        functools.partial(get_unified_attention_config, arch="gfx950"),
+    )
+
+    def verify(q):
+        return SimpleNamespace(
+            **{**vars(params), "max_seqlen_q": q, "all_decode": q == 1}
+        )
+
+    # a verify query longer than one query block (BLOCK_Q 8 at q >= 4) keeps the
+    # uniform split
+    assert _length_aware_split(config, verify(9)) is None
     # the 3D launch and the reduce read their length-aware keys from these entries,
     # for decode and for verify queries up to one query block (q <= 8 here)
     for q in (1, 4, 8):
-        verify = SimpleNamespace(**{**vars(params), "max_seqlen_q": q})
-        assert _length_aware_split(config, verify)
-        attn_3d = get_unified_attention_config("attn_3d", verify, arch="gfx950")
+        verify_q = verify(q)
+        assert _length_aware_split(config, verify_q)
+        attn_3d = get_unified_attention_config("attn_3d", verify_q, arch="gfx950")
         assert "SPLIT_RUNS_PER_XCD" in attn_3d
         if attn_3d["BLOCK_M"] > 16:
             # a wider tuned block is cut down to the query rows of one sequence
             assert attn_3d["SPLIT_BLOCK_M"] == 16
         assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
-            "reduce", verify, arch="gfx950"
+            "reduce", verify_q, arch="gfx950"
         )
 
 
