@@ -21,15 +21,20 @@
       "machine": "supermicro5",
       "warmup": 10,
       "iters": 30,
-      "dispatch_policy": "full_swept_interval_because_original_aiter_fallback_is_not_runnable",
+      "three_path_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/three_path_all_m_w1_i3/three_path_all_m.csv",
+      "dispatch_policy": "full_swept_interval_new_path_passes_reference_and_beats_original_aiter",
       "performance_preferred_mean_delta_vs_vllm_pct": 1.0,
       "performance_preferred_median_delta_vs_vllm_pct": 0.5,
       "swept_rows": 1537,
       "mean_latency_winner_or_equal_rows": 1415,
       "mean_latency_loser_rows": 122,
       "performance_preferred_rows": 1356,
-      "original_aiter_fallback": "not_runnable_in_validation_container",
-      "original_aiter_blocker": "default Opus sorting fails to build module_moe_sorting_opus on gfx1201; CK sorting path is unavailable because moe_sorting_api.hpp is absent; FlyDSL sorting avoids Opus but the CK two-stage fallback then faults"
+      "original_aiter_fallback": "runnable_with_opus_dpp_fix_cu64_metadata_and_preshuffled_weights",
+      "original_aiter_rows": 1537,
+      "original_aiter_reference_pass_rows": 1534,
+      "original_aiter_reference_fail_rows": [1037, 1120, 1282],
+      "new_beats_original_mean_rows": 1537,
+      "original_aiter_notes": "Default Opus sorting needed a gfx1201-compatible DPP scan. Qwen3.6 BF16 rows are keyed to AITER runtime cu_num=64. Original AITER comparison uses preshuffled weights because the CK rows are preshuffle_on."
     },
     "m_ranges": [
       [1024, 2560]
