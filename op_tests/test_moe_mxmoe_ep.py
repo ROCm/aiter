@@ -9,6 +9,10 @@ Opus aux sort emits local expert ids, so no NE-specialized aux kernel is used.
 
 import contextlib
 import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -250,6 +254,78 @@ def _reference(x, w1, w2, ids, weights):
         a2_scale=a2_scale,
         doweight=True,
     )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="MXMOE a4w4 requires gfx950")
+@pytest.mark.parametrize("ep_mode", ["real", "fake"])
+@pytest.mark.parametrize("betas", [(), ("--beta", "2.0", "--linear-beta", "12.0")])
+def test_ep_cli_a4w4_situv2_reference(tuned_rows, ep_mode, betas):
+    root = Path(__file__).resolve().parents[1]
+    kn1, kn2 = CASES["bm16_atomic"]
+    kn1 += "_situv2"
+    tuned_rows(
+        [
+            _row(
+                get_gfx(),
+                fused_moe.get_cu_num(),
+                32,
+                LOCAL_ROUTED,
+                TOPK if ep_mode == "real" else ROUTED_TOPK,
+                kn1,
+                kn2,
+                act="Situv2",
+            )
+        ]
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(root),
+        "AITER_META_DIR": str(root),
+        "AITER_LOG_LEVEL": "INFO",
+        "AITER_BYPASS_TUNE_CONFIG": "0",
+        "AITER_ONLINE_TUNE": "0",
+        "AITER_SMI_MONITOR": "0",
+        # The CLI must select A4W4 even if it inherits an A8W4 request.
+        "AITER_SITUV2_A8W4": "1",
+        "AITER_SITUV2_A4W4": "0",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "op_tests/test_moe_ep.py",
+            "-t",
+            "g1u1_a4w4_mxfp4",
+            "-a",
+            "situv2",
+            "-hd",
+            str(MODEL_DIM),
+            "-id",
+            str(INTER_DIM),
+            "-e",
+            str(ROUTED_EXPERTS),
+            "-k",
+            str(ROUTED_TOPK),
+            "-ep",
+            str(EP),
+            "-m",
+            "32",
+            "--ep-mode",
+            ep_mode,
+            *betas,
+        ],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout
+    assert any(
+        "[fused_moe] using 2stage (" in line and kn1 in line and kn2 in line
+        for line in result.stdout.splitlines()
+    ), result.stdout
+    assert "logits_diff=" in result.stdout and "PASSED" in result.stdout, result.stdout
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="MXMOE a4w4 requires gfx950")
