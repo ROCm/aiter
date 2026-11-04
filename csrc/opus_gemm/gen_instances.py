@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -270,12 +271,28 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # A16W16 uses separate direct-output and workspace launcher tables.
 A16W16_KID_DISPATCH_TAGS = set(_A16W16_TAGS)
-A8W8_BPRESHUFFLE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
+A8W8_BPRESHUFFLE_TAGS = {
+    "a8w8_blockscale_bpreshuffle_singlebuf",
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+}
+
+
+def _is_bpreshuffle_workspace_instance(k):
+    return (
+        k.arch_prefix == "gfx950"
+        and k.kernel_tag in A8W8_BPRESHUFFLE_TAGS
+        and k.bpreshuffle_entry is not None
+        and k.splitk_workspace_dtype is not None
+        and not k.direct_only
+    )
+
+
 # Three-tensor launchers: A16W16 and A8W8 no-scale.
 NOSCALE_TAGS = A16W16_KID_DISPATCH_TAGS | {"a8w8"}
 
@@ -461,8 +478,12 @@ def _make_host_decl(kid_name, dtype, host_extra_params):
     )
 
 
-def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, _host_extra_params):
-    """Emit the ``XQ,WQ,x_scale,w_scale,Y`` host declaration."""
+def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, host_extra_params):
+    """Emit the bpreshuffle host declaration with an optional workspace tail."""
+    # The gfx942 emitter passes the legacy scale marker, whose tensors are
+    # already present below. Keep its original five-tensor declaration.
+    if host_extra_params == A8W8_BLOCKSCALE_HOST_EXTRA:
+        host_extra_params = ""
     return (
         f"template void\n"
         f"{kid_name}<{dtype}>(\n"
@@ -470,7 +491,7 @@ def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, _host_extra_params):
         f"    aiter_tensor_t &WQ,\n"
         f"    aiter_tensor_t &x_scale,\n"
         f"    aiter_tensor_t &w_scale,\n"
-        f"    aiter_tensor_t &Y);\n"
+        f"    aiter_tensor_t &Y{host_extra_params});\n"
     )
 
 
@@ -779,12 +800,17 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<{ctype}> }},  \\
 """
 
-        def _rows(arch, tags, ctype):
+        def _rows(arch, tags, ctype, workspace=None):
             rows = []
             for kid, k in kernels_dict.items():
                 if not isinstance(kid, KernelKey) or k.kernel_tag not in tags:
                     continue
                 if kid.gfx != arch or ctype not in k.output_dtypes:
+                    continue
+                if workspace is not None and (
+                    kid.family != "a8w8_blockscale_bpreshuffle"
+                    or _is_bpreshuffle_workspace_instance(k) != workspace
+                ):
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
@@ -833,9 +859,20 @@ class opus_gemm_codegen:
                     _emit_map(
                         f,
                         macro_name,
-                        _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
+                        _rows(
+                            arch,
+                            A8W8_BPRESHUFFLE_TAGS,
+                            ctype,
+                            workspace=False if arch == "gfx950" else None,
+                        ),
                         ctype,
                     )
+            _emit_map(
+                f,
+                "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_WORKSPACE_KID_DISPATCH_GFX950_BF16",
+                _rows("gfx950", A8W8_BPRESHUFFLE_TAGS, "bf16_t", workspace=True),
+                "bf16_t",
+            )
 
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
@@ -923,7 +960,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y);
+    aiter_tensor_t &Y{workspace_param});
 """
         # a8w8 noscale (3 args, no splitK) has its own exact-kid table.
         MANIFEST_NOSCALE_3ARG = """
@@ -984,7 +1021,16 @@ void
             elif k.kernel_tag == "a8w8_scale":
                 parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
+                workspace_param = (
+                    ",\n    aiter_tensor_t &workspace"
+                    if _is_bpreshuffle_workspace_instance(k)
+                    else ""
+                )
+                parts.append(
+                    MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(
+                        kernel_name=k.name, workspace_param=workspace_param
+                    )
+                )
             else:
                 raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
         # Every TU includes this header, so rewriting it unconditionally would
@@ -1137,7 +1183,11 @@ void
         is the preferred fast path when its constraints hold.
         """
         # Bucket present archs from splitk kids.
-        present_archs = set()
+        present_archs = {
+            row["splitk_reduce_arch"]
+            for row in self._device_instantiations
+            if row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+        }
         for row in self._device_instantiations:
             name = row["kid_name"]
             for arch_prefix in SPLITK_REDUCE_ARCHES:
@@ -1241,7 +1291,9 @@ void
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
         needs_reduce_tu = any(
-            ("flatmm_splitk" in row["kid_name"]) or ("_splitk_" in row["kid_name"])
+            row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+            or ("flatmm_splitk" in row["kid_name"])
+            or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
         )
         if needs_reduce_tu:
@@ -1346,6 +1398,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
 
     TAG_TO_LIST = {
+        "a8w8_blockscale_mxscale_gemm_bpreshuffle": a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
@@ -1447,7 +1500,14 @@ if __name__ == "__main__":
     defaults = {
         key for gfx, cu in targets for key in default_compiled_keys(gfx, cu)
     } & available.keys()
-    mandatory = {key for key in available if key.family != "a16w16"}
+    # Keep the gfx950 bpreshuffle sweep on demand through namespace defaults,
+    # tuned rows, sidecars, and explicit keys.
+    mandatory = {
+        key
+        for key in available
+        if key.family != "a16w16"
+        and not (key.gfx == "gfx950" and key.family == "a8w8_blockscale_bpreshuffle")
+    }
     selected = (
         csv_keys | sidecar_keys | requested_keys | defaults | mandatory
     ) & available.keys()

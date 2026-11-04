@@ -39,6 +39,10 @@ using OpusA8W8BlockscaleBpreshuffleKernel = void (*)(
     aiter_tensor_t&, aiter_tensor_t&);
 #endif
 
+using OpusA8W8BlockscaleBpreshuffleWorkspaceKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&);
+
 namespace opus_gfx950_detail
 {
 struct OpusA16W16KidEntry
@@ -101,6 +105,47 @@ inline const OpusA16W16KidEntry* non_workspace_entry<fp32_t>(int kid)
         kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX950_FP32(fp32_t)}};
     return find_kid(kKids, kid);
 }
+
+using OpusA8W8BlockscaleBpreshuffleKidEntry =
+    OpusA8W8KidEntry<OpusA8W8BlockscaleBpreshuffleKernel>;
+using OpusA8W8BlockscaleBpreshuffleWorkspaceKidEntry =
+    OpusA8W8KidEntry<OpusA8W8BlockscaleBpreshuffleWorkspaceKernel>;
+
+template <typename CDataType>
+inline const OpusA8W8BlockscaleBpreshuffleKidEntry*
+bpreshuffle_non_workspace_entry(int kid);
+
+template <>
+inline const OpusA8W8BlockscaleBpreshuffleKidEntry*
+bpreshuffle_non_workspace_entry<bf16_t>(int kid)
+{
+    static constexpr std::array<
+        OpusA8W8BlockscaleBpreshuffleKidEntry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16}};
+    return find_kid(kKids, kid);
+}
+
+template <>
+inline const OpusA8W8BlockscaleBpreshuffleKidEntry*
+bpreshuffle_non_workspace_entry<fp32_t>(int kid)
+{
+    static constexpr std::array<
+        OpusA8W8BlockscaleBpreshuffleKidEntry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32}};
+    return find_kid(kKids, kid);
+}
+
+inline const OpusA8W8BlockscaleBpreshuffleWorkspaceKidEntry*
+bpreshuffle_workspace_entry(int kid)
+{
+    static constexpr std::array<
+        OpusA8W8BlockscaleBpreshuffleWorkspaceKidEntry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_WORKSPACE_KID_DISPATCH_GFX950_BF16_SIZE>
+        kWorkspace = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_WORKSPACE_KID_DISPATCH_GFX950_BF16}};
+    return find_kid(kWorkspace, kid);
+}
 } // namespace opus_gfx950_detail
 
 inline OpusA8W8Kernel opus_a8w8_kid_dispatch_gfx950(int id)
@@ -142,16 +187,10 @@ template <>
 inline OpusA8W8BlockscaleBpreshuffleKernel
 opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx950<bf16_t>(int id)
 {
-    using Entry = opus_gfx950_detail::OpusA8W8KidEntry<
-        OpusA8W8BlockscaleBpreshuffleKernel>;
-    static constexpr std::array<
-        Entry,
-        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16_SIZE>
-        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16}};
-    AITER_CHECK(!kKids.empty(),
+    AITER_CHECK(GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16_SIZE > 0,
                 "no registered kernel for OPUS "
                 "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
-    const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
+    const auto* entry = opus_gfx950_detail::bpreshuffle_non_workspace_entry<bf16_t>(id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "
                 "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
@@ -162,19 +201,37 @@ template <>
 inline OpusA8W8BlockscaleBpreshuffleKernel
 opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx950<fp32_t>(int id)
 {
-    using Entry = opus_gfx950_detail::OpusA8W8KidEntry<
-        OpusA8W8BlockscaleBpreshuffleKernel>;
-    static constexpr std::array<
-        Entry,
-        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32_SIZE>
-        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32}};
-    AITER_CHECK(!kKids.empty(),
+    AITER_CHECK(GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32_SIZE > 0,
                 "no registered kernel for OPUS "
                 "a8w8_blockscale_bpreshuffle on gfx950 with fp32 Y");
-    const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
+    const auto* entry = opus_gfx950_detail::bpreshuffle_non_workspace_entry<fp32_t>(id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "
                 "a8w8_blockscale_bpreshuffle on gfx950 with fp32 Y");
+    return entry->func;
+}
+
+inline bool opus_a8w8_blockscale_bpreshuffle_has_non_workspace_kernel_gfx950(int id)
+{
+    return opus_gfx950_detail::bpreshuffle_non_workspace_entry<bf16_t>(id) != nullptr
+           || opus_gfx950_detail::bpreshuffle_non_workspace_entry<fp32_t>(id) != nullptr;
+}
+
+inline bool opus_a8w8_blockscale_bpreshuffle_has_workspace_kernel_gfx950(int id)
+{
+    return opus_gfx950_detail::bpreshuffle_workspace_entry(id) != nullptr;
+}
+
+inline OpusA8W8BlockscaleBpreshuffleWorkspaceKernel
+opus_a8w8_blockscale_bpreshuffle_workspace_kid_dispatch_gfx950(int id)
+{
+    AITER_CHECK(GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_WORKSPACE_KID_DISPATCH_GFX950_BF16_SIZE > 0,
+                "no registered workspace kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
+    const auto* entry = opus_gfx950_detail::bpreshuffle_workspace_entry(id);
+    AITER_CHECK(entry != nullptr,
+                "unknown workspace kid ", id, " for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
     return entry->func;
 }
 

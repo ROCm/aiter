@@ -27,10 +27,12 @@ void opus_gemm_a8w8_blockscale_launch(aiter_tensor_t& XQ,
                                       aiter_tensor_t& w_scale,
                                       int kid);
 
+// Split-K kids take a caller-owned FP32 workspace; the kid fixes the split count.
 void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& XQ,
     aiter_tensor_t& WQ,
     aiter_tensor_t& x_scale,
     aiter_tensor_t& w_scale,
     aiter_tensor_t& Y,
-    int kid);
+    int kid,
+    std::optional<aiter_tensor_t> workspace = std::nullopt);

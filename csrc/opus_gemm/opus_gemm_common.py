@@ -2,10 +2,12 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """OPUS kernel registrations shared by selection and code generation."""
 
+import json
 import os
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
+from itertools import product
 
 
 def base_gfx_arch(gfx: str) -> str:
@@ -218,8 +220,23 @@ class OpusGemmInstance:
     # Optional logical-M limit imposed by this exact kernel's launch geometry.
     max_m: int | None = None
 
+    max_tensor_bytes: int | None = None
+    pad_m: bool = False
+    max_k: int | None = None
+    bpreshuffle_split_k: int = 1
+    bpreshuffle_pad_n: bool = False
+    bpreshuffle_fixed_k: int = 0
+    bpreshuffle_co: dict | None = None
+    bpreshuffle_entry: dict | None = None
+
     @property
     def name(self) -> str:
+        if self.bpreshuffle_entry is not None:
+            return _bpreshuffle_name(
+                "opus_gemm_gfx950_" + self.bpreshuffle_entry["config_name"]
+            )
+        if self.bpreshuffle_co is not None:
+            return self.bpreshuffle_co["name"]
         parts = [
             self.name_root,
             "x".join(map(str, [self.BLOCK_SIZE, self.B_M, self.B_N, self.B_K])),
@@ -466,6 +483,9 @@ class OpusGemmInstance:
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
+        if self.kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle":
+            entry = self.bpreshuffle_co or self.bpreshuffle_entry or {}
+            return entry.get("m_align", 64 if self.pad_m else self.B_M)
         mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
         if mult is not None:
             return self.B_M * mult if mult else 1
@@ -765,7 +785,6 @@ _bmm_flatmm_local.update({
     kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
-
 
 
 # Preshuffled-weight MXFP8 BMM kernel registrations.
@@ -1268,9 +1287,6 @@ _bmm_bpre_wave8n4_local.update({
 })
 
 # B_K=256 variants with matched plain and shuffled-scale configurations.
-
-
-
 
 
 def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
@@ -2661,7 +2677,9 @@ _FUSE_MAX_NCLUSTER = 5
 # this host-launcher registry. The device kernels need compiler facilities not
 # available in the release JIT toolchain, so gen_instances emits host launchers
 # only and loads the matching image at runtime.
-CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
+CO_KERNELS_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx1250.json"
+)
 
 _CO_DTYPE_BYTES = {
     "bf16_t": 2,
@@ -2865,6 +2883,1239 @@ a8w8_mxscale_bmm_kernels_list = {
     for kid, instance in family.items()
 }
 
+
+def _gfx950_co_image_path(path, entry):
+    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
+    return os.path.join(root, "gfx950", entry["image"])
+
+
+def _bpreshuffle_name(config_name):
+    # Omit only these default tail fields; keep geometry and nondefault policies.
+    defaults = {"sn0", "sl0", "sched0", "compact0", "aheadauto", "out0"}
+    return "_".join(part for part in config_name.split("_") if part not in defaults)
+
+
+def _load_gfx950_co_kernels(path, require_image=True):
+    with open(path) as stream:
+        document = json.load(stream)
+    entries = {}
+    for record in document["gfx950"]:
+        entry = {**document.get("defaults", {}), **record}
+        if entry["pipeline"] == "pingpong_lds":
+            # Read existing CO manifests while exposing the current family name.
+            entry["pipeline"] = "m_repeat"
+            entry["traits"] = {**entry["traits"], "name": entry["traits"]["name"].replace("pingpong_lds", "m_repeat")}
+            entry["body_func"] = entry["body_func"].replace("pingpong_lds", "m_repeat")
+        kid = entry["kid"]
+        if kid in entries:
+            raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
+        entry.setdefault("block_size", 64 * entry["wave_layout"][0] * entry["wave_layout"][1])
+        entry.setdefault("launch_bounds", [entry["block_size"], 1])
+        entry["device_flags"] = list(entry["device_flags"])
+        if "launches" in entry:
+            entry["supported_shapes"] = sorted(
+                list(map(int, shape.split(","))) for shape in entry["launches"]
+            )
+        entries[kid] = entry
+    image_configs = {}
+    for kid, entry in sorted(entries.items()):
+        fields = (
+            (entry["block_size"], *entry["tile"]),
+            entry["wave_layout"],
+            (16, 16, 128),
+            (1, 128, 128),
+        )
+        family = {
+            "pin_agpr": "4wave_pin_agpr_co",
+            "b_vgpr": "b_vgpr_overlap_co" if entry.get("b_vgpr_schedule") == "overlap" else "b_vgpr_co",
+            "wave_interleave": "interleave_co",
+            "m_repeat": "m_repeat_co",
+        }[entry["pipeline"]]
+        name = "_".join(
+            ("opus_gemm", "gfx950", family)
+            + tuple("x".join(map(str, values)) for values in fields)
+        )
+        suffix = entry["variant"]
+        symbol = name + (f"_{suffix}" if suffix else "")
+        entry["symbol"] = symbol
+        entry["image"] = _bpreshuffle_name(symbol) + ".co"
+        public_name = symbol
+        if entry["pipeline"] == "b_vgpr":
+            public_name = public_name.replace("b_vgpr_overlap_co", "b_vgpr_co", 1)
+            if entry.get("b_vgpr_schedule") != "overlap":
+                public_name = public_name.replace("_pub0_", "_pubnone_", 1)
+        entry["name"] = _bpreshuffle_name(public_name)
+        config = {key: value for key, value in entry.items()
+                  if key not in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask")}
+        if image_configs.setdefault(entry["image"], config) != config:
+            raise ValueError(f"Different CO configurations share image name {entry['image']}")
+    return {
+        kid: entry
+        for kid, entry in entries.items()
+        if not require_image or os.path.isfile(_gfx950_co_image_path(path, entry))
+    }
+
+
+GFX950_CO_KERNELS_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+)
+gfx950_co_kernels_declared = _load_gfx950_co_kernels(
+    GFX950_CO_KERNELS_JSON, require_image=False
+)
+
+_TAG = "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+_INT32_MAX = 2**31 - 1
+_BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
+a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
+
+
+# JIT IDs are independent of CO availability; CO IDs occupy the range below 200.
+_bpreshuffle_jit_kid_base = 200
+_BPRESHUFFLE_JIT_FIXED_K = (768, 1024, 1536, 2048, 3072, 4096, 7168, 16384, 21504)
+_BPRESHUFFLE_JIT_CACHES = ((0, 0), (1, 17), (17, 1))
+
+
+def _bpreshuffle_jit_configs(*, fixed_ks=_BPRESHUFFLE_JIT_FIXED_K,
+                            bms=(32, 48, 64, 96, 128), bns=(64, 128),
+                            wave_ns=(2, 4, 8), block_k=256, wgs=(1, 2)):
+    configs = product(
+        fixed_ks, bms, bns, wave_ns,
+        ((2, 1), (3, 1), (3, 2), (4, 2)), wgs,
+        _BPRESHUFFLE_JIT_CACHES, (0, 2),
+    )
+    for fixed_k, bm, bn, wn, schedule, wg, caches, output in configs:
+        stages, ahead = schedule
+        ca, cb = caches
+        threads = wn * 64
+        mr, nr = bm // 16, bn // (wn * 16)
+        scale_cols = fixed_k // 128
+        scale_bytes = ((bm * scale_cols + threads * 16 - 1)
+                       // (threads * 16)) * threads * 16
+        lds_bytes = stages * bm * block_k + scale_bytes + threads * 4
+        # Match the B-VGPR traits' tile, packed-scale, and per-CU LDS limits.
+        if (block_k not in (128, 256) or fixed_k % block_k
+                or bm <= 0 or bm % 16 or bn <= 0 or bn > 256
+                or wn not in (1, 2, 4, 8) or wg not in (1, 2)
+                or bn % (wn * 16) or (bm * block_k) % (threads * 16)
+                or mr * nr * 4 > 256 or fixed_k // block_k < stages - 1
+                or ((mr + 3) // 4) * 64 * scale_cols > scale_bytes
+                or ((bn + 127) // 128)
+                   * (scale_cols if scale_cols % 4 else scale_cols // 4) > threads
+                or ((lds_bytes + 1279) // 1280 * 1280) * wg > 160 * 1024):
+            continue
+        yield fixed_k, bm, bn, wn, stages, ahead, wg, ca, cb, output
+
+
+def _bpreshuffle_cpp_traits(name, args):
+    return name + "<" + ", ".join(
+        str(value).lower() if isinstance(value, bool) else str(value) for value in args
+    ) + ">"
+
+
+def _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, suffix):
+    # Same geometry fields and parameter ordering as the CO family names.
+    return (f"{family}_jit_{64 * wm * wn}x{bm}x{bn}x{bk}_{wm}x{wn}"
+            f"_16x16x128_1x128x128_{suffix}")
+
+
+def _bpreshuffle_b_jit_suffix(bk, fixed_k, stages, bd, wg, ca, cb, output, pub="none"):
+    # Match CO labels: stages, prefetch distance, BK loops, pin/address/cache,
+    # residency, publication, stream/static/compact flags, queue override, output.
+    return (f"p{stages}_bd{bd}_loops{fixed_k // bk}_pinA0C0_xcd1_contig0"
+            f"_ca{ca}cb{cb}_wg{wg}_pub{pub}_sa0_sb0_compact0_aheadauto_out{output}")
+
+
+def _register_bpreshuffle_jit(entry, bm, bn, bk, wm, wn, max_k, *,
+                             fixed_k=0, wg=1, ca=0, cb=0):
+    global _next_bpreshuffle_jit_kid
+    kid = _next_bpreshuffle_jit_kid
+    _next_bpreshuffle_jit_kid += 1
+    if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
+        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
+    entry["kid"] = kid
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
+        BLOCK_SIZE=64 * wm * wn, B_M=bm, B_N=bn, B_K=bk,
+        T_M=wm, T_N=wn, W_M=16, W_N=16, W_K=128,
+        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
+        WG_PER_CU=wg, cachectl_a=ca, cachectl_b=cb,
+        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
+        direct_only=True, pad_m=True, has_oob=True, max_k=max_k,
+        max_tensor_bytes=2**63 - 1, bpreshuffle_fixed_k=fixed_k,
+        bpreshuffle_entry=entry,
+    )
+
+
+def _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
+    threads = wm * 2 * 64
+    if bm % (wm * 16) or bn % 32:
+        return False
+    em = bm // (wm * 16)
+    packs = (em + 3) // 4
+    lds = 264 * (bm + bn) + panel * (packs * wm * 64 + 4)
+    return not (
+        em < 2 or bn < wm * 2 * 16 or 64 % (packs * wm * 4)
+        or threads % panel or lds > 160 * 1024
+        or 2 * bm * (bn + 8) > lds or bm * bn % (threads * 8)
+    )
+
+
+def _bpreshuffle_b_vgpr_jit_configs():
+    """The supported BK=256 sweep and BK=128 layout share one registration loop."""
+    for config in _bpreshuffle_jit_configs():
+        yield 256, config
+    for config in _bpreshuffle_jit_configs(
+        fixed_ks=(7168,), bms=(128,), bns=(256,), wave_ns=(4,), block_k=128, wgs=(1,)
+    ):
+        yield 128, config
+
+
+def _bpreshuffle_m_repeat_jit_configs():
+    """Generate guarded and unguarded layouts with their existing parameter ranges."""
+    for bm, bn, wm, panel in product(
+        (64, 96, 128, 192, 256), (64, 128, 256), (2, 4), (16, 32, 64, 128)
+    ):
+        if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
+            continue
+        for fixed_k, gm, caches, fragments in product(
+            (0, 384, *_BPRESHUFFLE_JIT_FIXED_K), (0, 4, 8),
+            _BPRESHUFFLE_JIT_CACHES, (False, True)
+        ):
+            if fixed_k <= panel * 128:
+                yield bm, bn, wm, panel, fixed_k, gm, *caches, fragments, True, 8
+
+    for bm, bn, wm in ((128, 128, 2), (256, 256, 4)):
+        for panel, caches, fragments in product(
+            (64, 128, 256), _BPRESHUFFLE_JIT_CACHES, (False, True)
+        ):
+            if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
+                continue
+            schedules = ((4, 8), (8, 8), (0, 16), (0, 32))
+            if panel == 256:
+                schedules = ((0, 8), *schedules)
+            for gm, gn in schedules:
+                yield bm, bn, wm, panel, 0, gm, *caches, fragments, False, gn
+
+    for bm, bn, wm, panel, policies in (
+        (128, 128, 2, 64, (
+            ((0, 0), (False,)), ((1, 17), (True,)), ((17, 1), (True,)),
+        )),
+        (192, 256, 4, 64, (
+            ((0, 0), (False, True)), ((1, 17), (False,)), ((17, 1), (False, True)),
+        )),
+        (192, 256, 4, 128, (
+            ((1, 17), (False, True)), ((17, 1), (True,)),
+        )),
+        (256, 256, 4, 64, tuple((cache, (True,)) for cache in _BPRESHUFFLE_JIT_CACHES)),
+    ):
+        if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
+            raise ValueError(f"Illegal m-repeat geometry {(bm, bn, wm, panel)}")
+        for caches, fragment_values in policies:
+            for fragments in fragment_values:
+                yield bm, bn, wm, panel, 0, 0, *caches, fragments, False, 8
+
+
+_next_bpreshuffle_jit_kid = _bpreshuffle_jit_kid_base
+for _bk, (_fixed_k, _bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _bpreshuffle_b_vgpr_jit_configs():
+    _args = (_bm, _bn, _stages, _ahead, _cb, True, _fixed_k, _wn, _wg, _ca)
+    if _bk == 128:
+        _args += (2, _output, 128, False, False, False, 0)
+    elif _output:
+        _args += (2, _output)
+    _register_bpreshuffle_jit(
+        {
+            "pipeline": "b_vgpr", "b_vgpr_schedule": "fragment",
+            "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
+            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_b_vgpr_traits", _args),
+            "config_name": _bpreshuffle_jit_name(
+                "b_vgpr", _bm, _bn, _bk, 1, _wn,
+                _bpreshuffle_b_jit_suffix(_bk, _fixed_k, _stages, _ahead,
+                                         _wg, _ca, _cb, _output)),
+            "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+            "m_align": 16,
+        },
+        _bm, _bn, _bk, 1, _wn, _fixed_k, fixed_k=_fixed_k, wg=_wg, ca=_ca, cb=_cb,
+    )
+
+
+for (_bm, _bn, _wm, _panel, _fixed_k, _gm, _ca, _cb,
+     _fragments, _bounded, _gn) in _bpreshuffle_m_repeat_jit_configs():
+    _args = (_bm, _bn, _panel, _fixed_k, _wm, _gm, _ca, _cb,
+             _fragments, False, _bounded, 0, _gn)
+    _register_bpreshuffle_jit(
+        {
+            "pipeline": "m_repeat",
+            "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
+            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_m_repeat_traits", _args),
+            # sp=scale panel, loops=FixedK/BK (auto means runtime K),
+            # gm/gn=tile grouping, ca/cb=cache, frag=fragment mode, bound=guard.
+            "config_name": _bpreshuffle_jit_name(
+                "m_repeat", _bm, _bn, 128, _wm, 2,
+                f"sp{_panel}_loops{_fixed_k // 128 if _fixed_k else 'auto'}"
+                f"_gm{_gm}_gn{_gn}_ca{_ca}cb{_cb}_frag{int(_fragments)}"
+                f"_bound{int(_bounded)}"),
+            "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+            "grid_layout": "n_m", "m_align": 16,
+        },
+        _bm, _bn, 128, _wm, 2, _panel * 128, fixed_k=_fixed_k, ca=_ca, cb=_cb,
+    )
+
+
+# Reuse the legal B-VGPR geometry/schedule sweep, with every publication point
+# before the final M repeat. Both pin switches remain disabled.
+for (_fixed_k, _bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _bpreshuffle_jit_configs():
+    for _publish in range(_bm // 16 - 1):
+        _args = (_bm, _bn, _stages, _ahead, _cb, True, _fixed_k, _wn, _wg, _ca,
+                 2, _output, 256, False, False, False, 0, _publish)
+        _register_bpreshuffle_jit(
+            {
+                "pipeline": "b_vgpr", "b_vgpr_schedule": "overlap",
+                "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
+                "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_b_vgpr_overlap_traits", _args),
+                "config_name": _bpreshuffle_jit_name(
+                    "b_vgpr", _bm, _bn, 256, 1, _wn,
+                    _bpreshuffle_b_jit_suffix(256, _fixed_k, _stages, _ahead,
+                                             _wg, _ca, _cb, _output, _publish)),
+                "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+                "m_align": 16,
+            },
+            _bm, _bn, 256, 1, _wn, _fixed_k, fixed_k=_fixed_k, wg=_wg, ca=_ca, cb=_cb,
+        )
+
+
+for _bm, _wn, _fixed_k, _gm, _xcd, (_ca, _cb) in product(
+    (128, 192, 256), (2, 4), (0, *_BPRESHUFFLE_JIT_FIXED_K),
+    (0, 4, 8), (False, True), _BPRESHUFFLE_JIT_CACHES
+):
+    if _fixed_k > 16384 or _fixed_k % 256 or (_xcd and not _gm):
+        continue
+    _threads = 2 * _wn * 64
+    _half_m = _bm // 2
+    _rows = _threads // 8
+    _a_slot = ((_half_m + _rows - 1) // _rows) * _rows * 128
+    _lds = 2 * (2 * _a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
+    if _lds > 160 * 1024 or 2 * _bm * 264 > _lds:
+        continue
+    _args = (_bm, _fixed_k, _gm, _xcd, _ca, _cb, _wn)
+    _register_bpreshuffle_jit(
+        {
+            "pipeline": "wave_interleave",
+            "kernel": "opus_gemm_bpreshuffle_wave_interleave_kernel",
+            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_wave_interleave_traits", _args),
+            # loops=FixedK/BK, gm=GroupM, xcd=tile order, ca/cb=cache,
+            # skipA/bfirst are the same load-order switches as the CO route.
+            "config_name": _bpreshuffle_jit_name(
+                "interleave", _bm, 256, 256, 2, _wn,
+                f"loops{_fixed_k // 256 if _fixed_k else 'auto'}_gm{_gm}"
+                f"_xcd{int(_xcd)}_ca{_ca}cb{_cb}_skipA0_bfirst0"),
+            "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_interleave_gfx950.cuh",),
+            "grid_layout": "n_m", "m_align": 16,
+        },
+        _bm, 256, 256, 2, _wn, 16384, fixed_k=_fixed_k, ca=_ca, cb=_cb,
+    )
+
+
+# Preserve route annotations for the builder; verified runtime image aliases
+# share canonical instance metadata for the complete name/config equality check.
+_bpreshuffle_co_entries_by_image = {}
+for _kid, _entry in gfx950_co_kernels_declared.items():
+    if _kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
+        raise ValueError(f"gfx950 CO ID {_kid} collides with a JIT ID")
+    _bm, _bn, _bk = _entry["tile"]
+    _wm, _wn = _entry["wave_layout"]
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = OpusGemmInstance(
+        BLOCK_SIZE=_entry["block_size"], B_M=_bm, B_N=_bn, B_K=_bk,
+        T_M=_wm, T_N=_wn, W_M=16, W_N=16, W_K=128,
+        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
+        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
+        direct_only=True, pad_m=_entry.get("pad_m", True),
+        has_oob=_entry.get("pad_m", True),
+        max_k=_entry.get("max_k", 16384),
+        bpreshuffle_fixed_k=_entry.get("fixed_k", 0),
+        max_tensor_bytes=2**63 - 1 if _entry.get("wide_output") else _INT32_MAX,
+        bpreshuffle_co=_bpreshuffle_co_entries_by_image.setdefault(_entry["image"], _entry))
+
+
+# Operand-ring and LDS-panel candidates for small M share the existing registry.
+def _bpreshuffle_traits(name, *args):
+    return _bpreshuffle_cpp_traits(name, args)
+
+
+# Additional Wk=1 operand-ring configurations. M remains a runtime dimension;
+# these geometry/policy tuples are not restricted to the tuning shapes.
+def _register_bpreshuffle_small(kid, geometry, traits, entry, *, fixed_k=0,
+                              max_k=16384, split_k=1, wg=1, ca=0, cb=0):
+    bm, bn, bk, wm, wn = geometry
+    variant = entry["pipeline"]
+    if variant in ("m_repeat_scale", "m_repeat_stage"):
+        entry = {**entry, "pipeline": "m_repeat",
+                 "m_repeat_schedule": "staged" if variant == "m_repeat_stage" else "double_buffer",
+                 "scale_on_read": variant == "m_repeat_scale"}
+        entry["config_name"] = entry["config_name"].replace(variant + "_", "m_repeat_", 1)
+    if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
+        raise ValueError(f"duplicate bpreshuffle ID {kid}")
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
+        BLOCK_SIZE=64 * wm * wn, B_M=bm, B_N=bn, B_K=bk,
+        T_M=wm, T_N=wn, W_M=16, W_N=16, W_K=128,
+        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
+        WG_PER_CU=wg, cachectl_a=ca, cachectl_b=cb,
+        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
+        direct_only=split_k == 1, pad_m=True, has_oob=True, max_k=max_k,
+        splitk_workspace_dtype="fp32_t" if split_k > 1 else None,
+        max_tensor_bytes=_INT32_MAX if split_k > 1 else 2**63 - 1,
+        bpreshuffle_split_k=split_k, bpreshuffle_fixed_k=fixed_k,
+        bpreshuffle_entry={"kid": kid, "traits": traits, **entry})
+
+# Local IDs append after the existing large-shape JIT bank.
+# M remains a runtime dimension for every configuration below.
+_BPRESHUFFLE_B_VGPR_PANEL_CONFIGS = (
+    (47632, (48, 64, 4, 2, 1, True, 1536, 4, 2, 17),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
+    (47633, (64, 64, 4, 2, 1, True, 1536, 4, 1, 17),
+     'b_vgpr_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
+    (47634, (96, 64, 3, 1, 1, True, 1536, 4, 2, 17),
+     'b_vgpr_96x64x256_w1x4x1_p3_o0_ba1_sk1_wg2_cA17cB1_k1536_nt0_pfpanel', 16, '', 'xcd'),
+    (47635, (32, 64, 4, 2, 0, True, 7168, 4, 1, 0),
+     'b_vgpr_32x64x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47636, (48, 64, 4, 2, 17, True, 7168, 4, 2, 1),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47637, (64, 64, 4, 2, 0, True, 7168, 2, 1, 0),
+     'b_vgpr_64x64x256_w1x2x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47638, (64, 128, 3, 1, 17, True, 7168, 8, 1, 1),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47639, (64, 128, 3, 1, 1, True, 7168, 8, 1, 17),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg1_cA17cB1_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47640, (64, 128, 3, 1, 0, True, 7168, 8, 2, 0),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47641, (64, 128, 3, 1, 17, True, 7168, 8, 2, 1),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA1cB17_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47642, (64, 128, 4, 2, 0, True, 7168, 8, 1, 0),
+     'b_vgpr_64x128x256_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_pfpanel', 16, '', 'xcd'),
+    (47643, (64, 64, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47644, (64, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, False),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
+    (47645, (64, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47646, (96, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, False),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
+    (47647, (96, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47648, (128, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, False),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
+    (47649, (64, 128, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_64x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47650, (128, 64, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x64x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47651, (128, 128, 4, 1, 0, False, 384, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba1_sk1_wg2_cA0cB0_k384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47652, (64, 32, 4, 2, 0, False, 3072, 2, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47653, (64, 64, 5, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47654, (96, 64, 5, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47655, (96, 128, 4, 2, 0, False, 3072, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47656, (128, 128, 4, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47657, (160, 128, 3, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47658, (192, 128, 3, 2, 0, False, 3072, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47659, (128, 256, 3, 2, 0, False, 3072, 8, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k3072_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47660, (48, 128, 3, 2, 0, False, 7168, 4, 1, 0, 2, 0, 256, True, False, False, False),
+     'b_vgpr_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d0_pfpanel', 16, '', 'xcd'),
+    (47661, (48, 128, 3, 2, 0, False, 7168, 4, 1, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_48x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47662, (96, 128, 4, 2, 0, False, 7168, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47663, (96, 128, 5, 2, 0, False, 7168, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x128x128_w1x4x1_p5_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47664, (128, 256, 4, 2, 0, False, 7168, 8, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47665, (16, 32, 4, 2, 0, False, 7168, 2, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_16x32x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47666, (48, 64, 4, 2, 0, False, 7168, 4, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47667, (96, 64, 5, 2, 0, False, 7168, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47668, (96, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47669, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47670, (160, 128, 3, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_160x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47671, (192, 128, 3, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_192x128x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47672, (128, 256, 3, 2, 0, False, 16384, 8, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_128x256x128_w1x8x1_p3_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47673, (128, 256, 4, 2, 0, False, 16384, 8, 1, 0, 2, 0, 128, True, False, False, True, 1),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47674, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 2),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk2_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', None),
+    (47675, (128, 128, 4, 2, 0, False, 16384, 4, 1, 0, 2, 0, 128, True, False, False, True, 4),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk4_wg1_cA0cB0_k16384_nt0_ctg1_grid2d1_pfpanel', 16, '', None),
+    (47676, (32, 64, 4, 2, 0, False, 1536, 2, 2, 0, 2, 0, 256, False, False, False, True),
+     'b_vgpr_32x64x256_w1x2x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg0_grid2d1_pfpanel', 16, '', 'nm'),
+    (47677, (64, 128, 3, 2, 0, False, 1536, 4, 1, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47678, (96, 128, 4, 2, 0, False, 1536, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_96x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47679, (64, 128, 4, 2, 0, False, 1536, 4, 1, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x128x256_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47680, (128, 128, 4, 2, 0, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47681, (128, 256, 4, 2, 0, False, 1536, 8, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x256x128_w1x8x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1536_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47682, (16, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_16x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47683, (32, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47684, (64, 64, 5, 2, 0, False, 7168, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_64x64x128_w1x4x1_p5_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47685, (64, 128, 3, 2, 0, False, 1024, 4, 1, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_64x128x256_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47686, (128, 128, 4, 2, 0, False, 1024, 4, 1, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB0_k1024_nt0_ctg1_grid2d1_pfpanel', 16, '', 'nm'),
+    (47687, (128, 256, 4, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
+     'b_vgpr_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
+    (47688, (192, 256, 3, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
+     'b_vgpr_192x256x128_w1x4x1_p3_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
+    (47689, (224, 256, 2, 1, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
+     'b_vgpr_224x256x128_w1x4x1_p2_o0_ba1_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_pfpanel', 16, '', 'nm'),
+    (47690, (128, 256, 4, 2, 2, False, 1536, 4, 1, 0, 2, 0, 128, True, False, False, True, 1, False),
+     'b_vgpr_128x256x128_w1x4x1_p4_o0_ba2_sk1_wg1_cA0cB2_k1536_nt0_ctg1_grid2d1_bs0_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
+    (47691, (128, 128, 4, 2, 0, False, 768, 4, 2, 0, 2, 0, 128, True, False, False, True),
+     'b_vgpr_128x128x128_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k768_nt0_ctg1_grid2d1_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'nm'),
+    (47692, (64, 128, 3, 1, 0, True, 7168, 8, 2, 0),
+     'b_vgpr_64x128x256_w1x8x1_p3_o0_ba1_sk1_wg2_cA0cB0_k7168_nt0_bounded_threads_pfpanel', 16, 'opus_gemm_bpreshuffle_bounded_thread_traits', 'xcd'),
+    (47693, (48, 64, 4, 2, 0, False, 7168, 4, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_48x64x256_w1x4x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail_pfpanel', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
+    (47694, (32, 32, 4, 2, 0, False, 7168, 1, 2, 0, 2, 0, 256, True, False, False, True),
+     'b_vgpr_32x32x256_w1x1x1_p4_o0_ba2_sk1_wg2_cA0cB0_k7168_nt0_ctg1_grid2d1_simple_tail_pfpanel', 16, 'opus_gemm_bpreshuffle_simple_tail_traits', 'nm'),
+)
+
+for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_VGPR_PANEL_CONFIGS:
+    _values = list(_args)
+    _defaults = (0, False, 7168, 4, 1, 0, 2, 0, 256, False, False, False, False, 1, False)
+    _values.extend(_defaults[len(_values) - 4:])
+    _bm, _bn, _stages, _ahead, _bc, _xcd, _k, _wn, _wg, _ca = _values[:10]
+    _bk, _sk = _values[12], _values[17]
+    _traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_b_vgpr_panel_traits", *_args)
+    if _wrapper:
+        _traits = _bpreshuffle_traits(_wrapper, _traits)
+    _entry = {
+        "pipeline": "b_vgpr", "b_vgpr_schedule": "panel",
+        "kernel": "opus_gemm_bpreshuffle_b_vgpr_kernel",
+        "config_name": _name,
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+        "host_kind": "reduce" if _sk > 1 else "tile",
+        "m_align": _m_align,
+        "workspace_rule": ["mn", 4 * _sk, 0] if _sk > 1 else ["none"],
+        "workspace_zero_init": False,
+    }
+    if _grid is not None:
+        _entry["grid_kind"] = _grid
+    if _sk > 1:
+        _entry["headers"] = ("gfx950/splitk_reduce_gfx950.cuh", *_entry["headers"])
+        _entry["reduce_kernel"] = "splitk_reduce_kernel"
+    _register_bpreshuffle_small(
+        _kid, (_bm, _bn, _bk, 1, _wn), _traits, _entry,
+        fixed_k=_k, max_k=_k, split_k=_sk, wg=_wg, ca=_ca, cb=_bc,
+    )
+
+_BPRESHUFFLE_OPERAND_CONFIGS = (
+    (47695, (16, 16, 1, 1, 256, 6, 7168, 4), (False, True, False, 1, 2, True, True, False, True, 0, 1, False),
+     'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'xcd_split'),
+    (47696, (16, 16, 1, 1, 256, 6, 7168, 4), (True, False, False, 1, 2, True, True, False, True, 0, 1, False),
+     'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47697, (32, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, True, True, 0, 1, False),
+     'm_repeat_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
+    (47698, (48, 32, 1, 2, 256, 4, 7168, 4), (True, True, False, 1, 0, True, True, True, True, 3, 1, False),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
+    (47699, (64, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47700, (64, 32, 2, 2, 256, 4, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47701, (48, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47702, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, True, True, 3, 1, True),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd1_operand', 4, False, 'xcd_split'),
+    (47703, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47704, (48, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47705, (96, 64, 2, 2, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, True, True, 3, 1, True),
+     'm_repeat_96x64x128_w2x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal1_xcd1_operand', 4, False, 'xcd_split'),
+    (47706, (96, 64, 1, 4, 128, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_96x64x128_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47707, (64, 64, 4, 1, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x64x128_w4x1x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47708, (64, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47709, (64, 64, 1, 4, 256, 5, 7168, 4), (True, False, True, 2, 0, True, True, True, True, 3, 1, False),
+     'b_vgpr_64x64x256_w1x4x1_p5_o3_ba2_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'xcd_split'),
+    (47710, (128, 64, 4, 2, 128, 5, 7168, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47711, (48, 64, 1, 4, 256, 5, 7168, 2), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47712, (48, 64, 1, 4, 256, 5, 7168, 2), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47713, (64, 64, 4, 2, 256, 4, 7168, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47714, (64, 64, 4, 2, 128, 5, 7168, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x64x128_w4x2x1_p5_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47715, (48, 64, 1, 4, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47716, (48, 64, 1, 2, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_48x64x256_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd1_operand', 4, False, 'xcd'),
+    (47717, (16, 32, 1, 1, 128, 4, 384, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
+    (47718, (16, 32, 1, 2, 256, 4, 768, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
+    (47719, (16, 32, 1, 2, 128, 9, 1024, 1), (False, False, False, 1, 2, True, True, True, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp0_ps0_bd0_normal1_xcd0_operand', 1, False, 'nm'),
+    (47720, (16, 32, 1, 1, 128, 5, 1536, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
+    (47721, (16, 32, 1, 2, 128, 6, 1536, 1), (False, False, True, 3, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_operand', 1, False, 'nm'),
+    (47722, (16, 32, 1, 2, 128, 11, 1536, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
+    (47723, (16, 32, 1, 2, 128, 5, 1536, 1), (False, False, True, 2, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_16x32x128_w1x2x1_p5_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_operand', 1, False, 'nm'),
+    (47724, (16, 32, 1, 2, 128, 4, 384, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47725, (16, 32, 1, 2, 256, 4, 768, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
+    (47726, (16, 32, 1, 2, 128, 9, 1024, 1), (True, False, False, 1, 2, True, True, True, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p9_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'nm'),
+    (47727, (16, 32, 1, 2, 128, 10, 7168, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p10_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47728, (32, 64, 2, 2, 128, 6, 1536, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_32x64x128_w2x2x1_p6_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47729, (16, 32, 1, 2, 128, 8, 1024, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p8_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47730, (16, 32, 1, 2, 128, 6, 1536, 1), (True, False, True, 3, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_16x32x128_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47731, (16, 32, 1, 2, 512, 6, 3072, 1), (True, True, True, 3, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_16x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB2_k3072_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47732, (16, 32, 1, 1, 128, 5, 1536, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x1x1_p5_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
+    (47733, (16, 32, 1, 2, 128, 5, 1536, 1), (True, False, True, 3, 2, True, True, True, True, 3, 1, False),
+     'b_vgpr_16x32x128_w1x2x1_p5_o3_ba3_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
+    (47734, (32, 32, 1, 1, 128, 4, 384, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_32x32x128_w1x1x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47735, (32, 32, 1, 2, 256, 4, 1024, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_32x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47736, (48, 32, 1, 2, 128, 4, 384, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_48x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47737, (48, 32, 1, 2, 256, 4, 768, 1), (True, True, False, 1, 2, True, True, True, True, 3, 1, False),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd0_normal1_xcd0_operand', 4, False, 'nm'),
+    (47738, (64, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 4, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47739, (64, 128, 1, 4, 128, 4, 1536, 1), (True, False, True, 2, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47740, (64, 32, 1, 2, 128, 4, 384, 1), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_64x32x128_w1x2x1_p4_o3_ba0_sk1_wg1_cA0cB2_k384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47741, (64, 32, 1, 2, 256, 4, 768, 1), (True, True, True, 2, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k768_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47742, (64, 32, 1, 2, 256, 4, 1024, 1), (True, True, True, 2, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x32x256_w1x2x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1024_nt0_cp1_ps1_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47743, (64, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 3, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47744, (96, 64, 2, 2, 128, 5, 16384, 2), (True, False, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_96x64x128_w2x2x1_p5_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47745, (96, 128, 1, 4, 128, 4, 1536, 1), (True, False, True, 1, 2, True, True, False, True, 3, 1, False),
+     'b_vgpr_96x128x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47746, (48, 64, 1, 4, 256, 5, 3072, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47747, (96, 64, 1, 4, 128, 8, 16384, 2), (True, False, True, 3, 2, True, True, True, True, 3, 1, False),
+     'b_vgpr_96x64x128_w1x4x1_p8_o3_ba3_sk2_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'xcd_split'),
+    (47748, (128, 64, 1, 4, 128, 6, 7168, 2), (True, False, True, 3, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47749, (128, 128, 4, 2, 128, 4, 16384, 4), (True, False, False, 1, 2, True, True, False, True, 3, 1, True),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47750, (64, 64, 1, 4, 256, 4, 1024, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_64x64x256_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB0_k1024_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47751, (96, 64, 1, 4, 128, 6, 768, 1), (True, False, True, 2, 0, True, True, True, True, 3, 1, False),
+     'b_vgpr_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
+    (47752, (96, 64, 1, 4, 128, 4, 384, 1), (True, False, True, 1, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_96x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47753, (128, 64, 4, 2, 128, 5, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47754, (128, 64, 4, 2, 128, 5, 768, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_128x64x128_w4x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47755, (128, 128, 4, 2, 128, 4, 16384, 2), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd_split'),
+    (47756, (128, 64, 2, 2, 128, 4, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_128x64x128_w2x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47757, (192, 128, 4, 2, 128, 3, 16384, 2), (True, False, False, 1, 0, True, True, True, True, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd0_operand', 4, False, 'xcd_split'),
+    (47758, (192, 128, 4, 2, 128, 3, 1536, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k1536_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47759, (192, 128, 4, 2, 128, 3, 16384, 2), (True, False, False, 1, 0, True, True, True, True, 3, 1, True),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk2_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal1_xcd1_operand', 4, False, 'xcd_split'),
+    (47760, (128, 128, 4, 2, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd1_operand', 4, False, 'xcd'),
+    (47761, (128, 128, 2, 4, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_128x128x128_w2x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47762, (128, 128, 4, 2, 128, 4, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47763, (128, 128, 1, 4, 128, 4, 7168, 1), (True, False, True, 3, 0, True, True, True, True, 3, 1, False),
+     'b_vgpr_128x128x128_w1x4x1_p4_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal1_xcd0_operand', 4, False, 'nm'),
+    (47764, (192, 128, 4, 2, 128, 3, 3072, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k3072_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47765, (192, 128, 4, 2, 128, 3, 7168, 1), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47766, (64, 64, 1, 4, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
+    (47767, (64, 64, 4, 1, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x64x128_w4x1x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
+    (47768, (64, 64, 2, 2, 128, 5, 768, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_64x64x128_w2x2x1_p5_o3_ba0_sk1_wg1_cA0cB0_k768_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
+    (47769, (96, 64, 1, 4, 128, 4, 384, 1), (True, True, False, 1, 0, True, True, False, True, 3, 1, True),
+     'm_repeat_96x64x128_w1x4x1_p4_o3_ba0_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd0_normal0_mfirst_operand', 4, True, 'mn'),
+    (47770, (96, 64, 1, 4, 128, 6, 768, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_96x64x128_w1x4x1_p6_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
+    (47771, (128, 64, 1, 4, 128, 4, 384, 1), (True, True, True, 1, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_128x64x128_w1x4x1_p4_o3_ba1_sk1_wg1_cA0cB0_k384_nt0_cp1_ps1_bd1_normal0_mfirst_operand', 4, True, 'mn'),
+    (47772, (128, 64, 2, 2, 128, 5, 768, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, True),
+     'b_vgpr_128x64x128_w2x2x1_p5_o3_ba2_sk1_wg1_cA0cB0_k768_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
+    (47773, (48, 64, 1, 4, 256, 5, 7168, 1), (True, False, True, 2, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_48x64x256_w1x4x1_p5_o3_ba2_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_mfirst_operand', 4, True, 'mn'),
+    (47774, (16, 32, 1, 2, 128, 8, 7168, 4), (False, True, False, 1, 2, True, True, False, True, 0, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'xcd_split'),
+    (47775, (16, 32, 1, 2, 128, 8, 7168, 4), (True, True, False, 1, 0, True, True, False, True, 0, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47776, (16, 32, 1, 2, 256, 7, 7168, 1), (False, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p7_o3_ba0_sk1_wg1_cA0cB2_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_operand', 1, False, 'nm'),
+    (47777, (16, 32, 1, 2, 128, 11, 1536, 1), (True, True, False, 1, 2, True, True, False, True, 3, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p11_o3_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp1_ps1_bd0_normal0_xcd0_operand', 4, False, 'nm'),
+    (47778, (32, 32, 1, 2, 512, 6, 7168, 1), (True, False, True, 3, 0, True, True, False, True, 3, 1, False),
+     'b_vgpr_32x32x512_w1x2x1_p6_o3_ba3_sk1_wg1_cA0cB0_k7168_nt0_cp1_ps0_bd1_normal0_xcd0_operand', 4, False, 'nm'),
+    (47779, (192, 128, 4, 2, 128, 3, 16384, 4), (True, False, False, 1, 0, True, True, False, True, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp1_ps0_bd0_normal0_xcd0_operand', 4, False, 'xcd_split'),
+    (47780, (128, 64, 1, 4, 128, 6, 7168, 2), (False, False, True, 3, 2, True, True, False, False, 3, 1, False),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47781, (128, 128, 4, 2, 128, 4, 16384, 4), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk4_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47782, (64, 32, 2, 2, 256, 4, 7168, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_64x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47783, (128, 64, 4, 1, 128, 4, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
+     'm_repeat_128x64x128_w4x1x1_p4_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47784, (16, 32, 1, 1, 128, 5, 1536, 1), (False, True, False, 1, 2, True, True, False, False, 0, 1, False),
+     'm_repeat_16x32x128_w1x1x1_p5_o0_ba0_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47785, (192, 128, 4, 2, 128, 3, 16384, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_192x128x128_w4x2x1_p3_o3_ba0_sk4_wg1_cA0cB0_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47786, (16, 32, 1, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47787, (128, 64, 4, 1, 128, 4, 7168, 4), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_128x64x128_w4x1x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47788, (128, 128, 1, 4, 128, 4, 7168, 2), (False, False, True, 3, 0, True, True, False, False, 3, 1, False),
+     'b_vgpr_128x128x128_w1x4x1_p4_o3_ba3_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47789, (128, 128, 4, 2, 128, 4, 7168, 2), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47790, (64, 64, 4, 2, 256, 4, 7168, 2), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_64x64x256_w4x2x1_p4_o3_ba0_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47791, (128, 64, 1, 4, 128, 6, 768, 1), (False, False, True, 3, 0, True, True, False, False, 3, 1, False),
+     'b_vgpr_128x64x128_w1x4x1_p6_o3_ba3_sk1_wg1_cA0cB0_k768_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47792, (16, 32, 1, 2, 256, 6, 3072, 1), (False, True, False, 1, 2, True, True, False, False, 0, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47793, (32, 64, 2, 2, 128, 6, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
+     'm_repeat_32x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47794, (32, 64, 2, 2, 128, 4, 16384, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
+     'm_repeat_32x64x128_w2x2x1_p4_o3_ba0_sk2_wg1_cA0cB2_k16384_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47795, (32, 32, 1, 2, 512, 6, 3072, 1), (False, False, True, 3, 0, True, True, False, False, 0, 1, False),
+     'b_vgpr_32x32x512_w1x2x1_p6_o0_ba3_sk1_wg1_cA0cB0_k3072_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47796, (16, 32, 1, 2, 256, 5, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
+     'm_repeat_16x32x256_w1x2x1_p5_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47797, (64, 64, 1, 4, 128, 8, 1536, 1), (False, False, True, 4, 2, True, True, False, False, 3, 1, False),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47798, (48, 32, 1, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_48x32x256_w1x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47799, (64, 64, 2, 2, 128, 6, 7168, 2), (False, False, False, 1, 2, True, True, False, False, 3, 1, False),
+     'm_repeat_64x64x128_w2x2x1_p6_o3_ba0_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47800, (16, 32, 1, 2, 128, 8, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 0, 1, False),
+     'm_repeat_16x32x128_w1x2x1_p8_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47801, (16, 32, 1, 2, 128, 6, 1536, 1), (False, False, True, 4, 2, True, True, False, False, 0, 1, False),
+     'b_vgpr_16x32x128_w1x2x1_p6_o0_ba4_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47802, (128, 128, 4, 2, 128, 4, 7168, 1), (False, False, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_128x128x128_w4x2x1_p4_o3_ba0_sk1_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd0_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47803, (64, 128, 1, 4, 128, 4, 1536, 1), (False, False, True, 2, 2, True, True, False, False, 3, 1, False),
+     'b_vgpr_64x128x128_w1x4x1_p4_o3_ba2_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+    (47804, (64, 64, 1, 4, 128, 8, 7168, 2), (False, False, True, 4, 2, True, True, False, False, 3, 1, False),
+     'b_vgpr_64x64x128_w1x4x1_p8_o3_ba4_sk2_wg1_cA0cB2_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47805, (96, 32, 2, 2, 256, 4, 7168, 4), (False, True, False, 1, 0, True, True, False, False, 3, 1, False),
+     'm_repeat_96x32x256_w2x2x1_p4_o3_ba0_sk4_wg1_cA0cB0_k7168_nt0_cp0_ps1_bd0_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47806, (96, 64, 1, 4, 256, 4, 7168, 2), (False, False, True, 2, 0, True, True, False, False, 3, 1, False),
+     'b_vgpr_96x64x256_w1x4x1_p4_o3_ba2_sk2_wg1_cA0cB0_k7168_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'xcd_split'),
+    (47807, (96, 128, 1, 4, 128, 3, 1536, 1), (False, False, True, 1, 2, True, True, False, False, 3, 1, False),
+     'b_vgpr_96x128x128_w1x4x1_p3_o3_ba1_sk1_wg1_cA0cB2_k1536_nt0_cp0_ps0_bd1_normal0_xcd0_derived_operand', 1, False, 'nm'),
+)
+
+for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_OPERAND_CONFIGS:
+    _bm, _bn, _wm, _wn, _bk, _stages, _k, _sk = _geometry[:8]
+    _family = "b_vgpr" if _policy[2] else "m_repeat"
+    _traits = _bpreshuffle_traits(
+        f"opus_gemm_bpreshuffle_{_family}_operand_traits",
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_geometry", *_geometry),
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_policy", *_policy),
+    )
+    if _m_first:
+        _traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_mfirst_traits", _traits)
+    _entry = {
+        "pipeline": _family, f"{_family}_schedule": "operand",
+        "kernel": f"opus_gemm_bpreshuffle_{_family}_kernel",
+        "config_name": _name,
+        "headers": (f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{_family}_gfx950.cuh",),
+        "host_traits_headers": (f"gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_{_family}_gfx950.cuh",),
+        "host_kind": "xcd_ring" if _sk > 1 else "tile",
+        "m_align": _m_align,
+        "workspace_rule": ["tiles", 4 * _sk, _bm, _bn, 4] if _sk > 1 else ["none"],
+        "workspace_zero_init": _sk > 1,
+    }
+    if _grid is not None:
+        _entry["grid_kind"] = _grid
+    _register_bpreshuffle_small(
+        _kid, (_bm, _bn, _bk, _wm, _wn), _traits, _entry,
+        fixed_k=_k, max_k=_k, split_k=_sk, cb=_policy[4],
+    )
+
+_BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS = (
+    (47808, 'unrolled',
+     (16, 32, 2, 256, 6, 7168, 4), 'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_loop_unrolled', 1),
+    (47809, 'unrolled',
+     (32, 32, 2, 256, 6, 7168, 4), 'm_repeat_32x32x256_w1x2x1_p6_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_loop_unrolled', 1),
+    (47810, 'unrolled',
+     (32, 32, 2, 256, 4, 7168, 4, 2, False, 0), 'm_repeat_32x32x256_w2x2x1_p4_o0_ba0_sk4_wg1_cA0cB0_k7168_nt0_compact0_loop_unrolled', 1),
+    (47811, 'unrolled',
+     (16, 16, 1, 256, 6, 7168, 4, 1, False, 2), 'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact0_loop_unrolled', 1),
+    (47812, 'unrolled',
+     (16, 16, 1, 256, 6, 7168, 4, 1, True, 2), 'm_repeat_16x16x256_w1x1x1_p6_o0_ba0_sk4_wg1_cA0cB2_k7168_nt0_compact1_loop_unrolled', 4),
+    (47813, 'rolled',
+     (16, 32, 2, 128, 12, 3072, 1, 1, False, 2), 'm_repeat_16x32x128_w1x2x1_p12_o0_ba0_sk1_wg1_cA0cB2_k3072_nt0_loop_rolled', 1),
+    (47814, 'rolled',
+     (16, 32, 2, 128, 10, 7168, 1, 1, False, 2), 'm_repeat_16x32x128_w1x2x1_p10_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47815, 'rolled',
+     (16, 32, 2, 256, 7, 7168, 1, 1, False, 2), 'm_repeat_16x32x256_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47816, 'rolled',
+     (16, 32, 2, 256, 6, 16384, 1, 1, False, 2), 'm_repeat_16x32x256_w1x2x1_p6_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0_loop_rolled', 1),
+    (47817, 'rolled',
+     (32, 32, 2, 256, 5, 7168, 1, 2, False, 2), 'm_repeat_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47818, 'rolled',
+     (64, 32, 2, 256, 4, 7168, 1, 2, False, 2), 'm_repeat_64x32x256_w2x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k7168_nt0_loop_rolled', 1),
+    (47819, 'rolled',
+     (32, 32, 2, 256, 5, 16384, 1, 2, False, 2), 'm_repeat_32x32x256_w2x2x1_p5_o0_ba0_sk1_wg1_cA0cB2_k16384_nt0_loop_rolled', 1),
+    (47820, 'unrolled',
+     (32, 32, 2, 128, 7, 768, 1, 1, False, 2), 'm_repeat_32x32x128_w1x2x1_p7_o0_ba0_sk1_wg1_cA0cB2_k768_nt0_loop_unrolled', 1),
+    (47821, 'unrolled',
+     (48, 32, 2, 128, 4, 384, 1, 1, False, 2), 'm_repeat_48x32x128_w1x2x1_p4_o0_ba0_sk1_wg1_cA0cB2_k384_nt0_loop_unrolled', 1),
+)
+
+for _kid, _loop, _args, _name, _m_align in _BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS:
+    _bm, _bn, _wn, _bk, _stages, _k, _sk = _args[:7]
+    _wm = _args[7] if len(_args) > 7 else 1
+    _bc = _args[9] if len(_args) > 9 else 0
+    _entry = {
+        "pipeline": "m_repeat_stage", "loop": _loop,
+        "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
+        "config_name": _name,
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+        "host_kind": "xcd_ring" if _sk > 1 else "tile",
+        "grid_kind": "xcd_split" if _sk > 1 else "nm",
+        "m_align": _m_align,
+        "workspace_rule": ["tiles", 4 * _sk, _bm, _bn, 4] if _sk > 1 else ["none"],
+        "workspace_zero_init": _sk > 1,
+    }
+    _register_bpreshuffle_small(
+        _kid, (_bm, _bn, _bk, _wm, _wn),
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_stage_traits",
+                            *_args, *(1, False, 0)[len(_args) - 7:], _loop == "rolled"), _entry,
+        fixed_k=_k, max_k=_k, split_k=_sk, cb=_bc,
+    )
+
+
+# These panel configurations use JIT instantiation; no new CO images are needed.
+_BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS = (
+    (47822, ('192', '256', '16', '0', '4', '0', '0', '0'), (192, 256, 128, 4, 2), 0, 2048),
+    (47823, ('128', '128', '64', '0', '2', '0', '0', '0'), (128, 128, 128, 2, 2), 0, 8192),
+    (47824, ('192', '256', '16', '1536', '4', '0', '0', '0', 'false', 'false', 'false', 'false', 'true'), (192, 256, 128, 4, 2), 1536, 2048),
+    (47825, ('256', '256', '16', '1536', '4', '0', '0', '0', 'true', 'false', 'false', 'false', 'false'), (256, 256, 128, 4, 2), 1536, 2048),
+    (47826, ('192', '256', '16', '1536', '4', '0', '0', '2', 'false', 'false', 'false', 'false', 'true'), (192, 256, 128, 4, 2), 1536, 1536),
+    (47827, ('256', '256', '16', '1536', '4', '0', '0', '2', 'true', 'false', 'false', 'false', 'false'), (256, 256, 128, 4, 2), 1536, 1536),
+)
+
+for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS:
+    _bm, _bn, _bk, _wm, _wn = _geometry
+    _panel, _gm, _ca, _cb = map(int, (_args[2], *_args[5:8]))
+    _flags = (*_args[8:], *("false",) * (13 - len(_args)))
+    _fragment, _pin_a, _pin_b, _pin_c, _xcd = (
+        int(flag == "true") for flag in _flags
+    )
+    _suffix = (f"sp{_panel}_k{_fixed_k}_gm{_gm}_ca{_ca}cb{_cb}"
+               f"_frag{_fragment}_pinA{_pin_a}B{_pin_b}C{_pin_c}_xcd{_xcd}")
+    _entry = {
+        "pipeline": "m_repeat_scale",
+        "kernel": "opus_gemm_bpreshuffle_m_repeat_kernel",
+        "config_name": _bpreshuffle_jit_name(
+            "m_repeat_scale", _bm, _bn, _bk, _wm, _wn, _suffix),
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+        "host_traits_headers": ("gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
+        "host_kind": "tile", "grid_kind": "nm", "m_align": 16,
+        "workspace_rule": ["none"], "workspace_zero_init": False,
+    }
+    _register_bpreshuffle_small(
+        _kid, _geometry,
+        _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_scale_traits", *_args), _entry,
+        fixed_k=_fixed_k, max_k=_max_k, ca=_ca, cb=_cb,
+    )
+
+
+# The retained configurations above keep their IDs. Expand a parameter search
+# independently of tuning tables, using the same generator/guard/registration
+# flow as the large-shape JIT families. K is specialized; M/N remain runtime.
+_BPRESHUFFLE_SMALL_FIXED_K = (384, *_BPRESHUFFLE_JIT_FIXED_K)
+_BPRESHUFFLE_SMALL_SCHEDULES = ((2, 1), (3, 1), (3, 2), (4, 2))
+
+
+def _bpreshuffle_b_vgpr_panel_legal(args):
+    (bm, bn, stages, ahead, cb, xcd, fixed_k, wn, wg, ca,
+     _store, output, bk, _contiguous, pin_a, pin_c, grid2d, split, byte_scale) = args
+    threads = wn * 64
+    if (split not in (1, 2, 4) or fixed_k <= 0 or fixed_k % (split * bk)
+            or bm <= 0 or bm % 16 or bn <= 0 or bn > 256
+            or wn not in (1, 2, 4, 8) or bn % (wn * 16)
+            or bk not in (128, 256) or wg not in (1, 2)
+            or stages < 2 or ahead < 1 or ahead >= stages
+            or (split > 1 and not grid2d) or (grid2d and xcd)
+            or pin_a or pin_c or output not in (0, 2)
+            or cb not in (0, 1, 2, 17) or ca not in (0, 1, 17)
+            or bm * bk % (threads * 16)
+            or (bm // 16) * (bn // (wn * 16)) * 4 > 256):
+        return False
+    k = fixed_k // split
+    sc = k // 128
+    if (k // bk < stages - 1
+            or ((bn + 127) // 128) * (sc if sc % 4 else sc // 4) > threads):
+        return False
+    scale_copy = threads if byte_scale else threads * 16
+    scale_bytes = ((bm * sc + scale_copy - 1) // scale_copy
+                   * threads * (4 if byte_scale else 16))
+    lds = stages * bm * bk + scale_bytes + threads * 4
+    return (((lds + 1279) // 1280 * 1280) * wg <= 160 * 1024
+            and (split > 1 or output != 0 or 16 * (bn + 8) * 2 <= lds))
+
+
+def _bpreshuffle_small_b_vgpr_panel_configs():
+    for bm, bn, wn, bk, fixed_k, split, schedule, wg, caches, output in product(
+        (16, 32, 48, 64, 96, 128), (32, 64, 128), (1, 2, 4, 8),
+        (128, 256), _BPRESHUFFLE_SMALL_FIXED_K, (1, 2, 4),
+        _BPRESHUFFLE_SMALL_SCHEDULES, (1, 2), _BPRESHUFFLE_JIT_CACHES, (0, 2)
+    ):
+        stages, ahead = schedule
+        ca, cb = caches
+        if split > 1 and output != 0:
+            # Split-K publishes FP32 partials before the direct-output branch.
+            continue
+        # Linear XCD traversal and contiguous 2D traversal are independent
+        # address policies. Split-K uses the 2D grid's z partition only.
+        modes = ((False, True, False, False),) if split == 1 else ()
+        modes += ((True, False, True, False), (True, False, True, True))
+        for contiguous, xcd, grid2d, byte_scale in modes:
+            args = (bm, bn, stages, ahead, cb, xcd, fixed_k, wn, wg, ca,
+                    2, output, bk, contiguous, False, False, grid2d, split, byte_scale)
+            if _bpreshuffle_b_vgpr_panel_legal(args):
+                yield args
+
+
+def _bpreshuffle_operand_legal(geometry, policy):
+    bm, bn, wm, wn, bk, stages, total_k, split, fixed_n = geometry
+    compact, perstage, direct, ahead, cb, async_groups, _contiguous, _normal, _simple, output, address, _xcd = policy
+    if (min(bm, bn, wm, wn, total_k, split) <= 0 or wm * wn > 8
+            or bm % (16 * wm) or bn % (16 * wn)
+            or bk not in (128, 256, 512) or total_k % (split * bk)
+            or stages < 2 or total_k // (split * bk) < stages - 1
+            or (bn >= 128 and bn % 128) or (bn < 128 and 128 % bn)
+            or fixed_n < 0 or (fixed_n and fixed_n % bn)
+            or (direct and (not async_groups or ahead < 1 or ahead >= stages))
+            or (not async_groups and not perstage)
+            or cb not in (0, 1, 2, 17) or output not in (0, 1, 2, 3)
+            or address not in (0, 1, 2)):
+        return False
+    threads = wm * wn * 64
+    dma = threads * 16
+    a = (bm * bk + dma - 1) // dma * dma
+    b = 0 if direct else (bn * bk + dma - 1) // dma * dma
+    sc = bk // 128 if perstage else total_k // (split * 128)
+    scale_copy = 4 if compact else 1
+    sa = (bm * sc + threads * scale_copy - 1) // (threads * scale_copy) * threads * 4
+    sb = (((bn + 127) // 128) * sc + threads - 1) // threads * threads * 4
+    main = stages * (a + b + (sa + sb if perstage else 0))
+    main += 0 if perstage else sa + sb
+    return max(main, bm * (bn + 8) * 2) + 16 <= 160 * 1024
+
+
+def _bpreshuffle_small_operand_configs():
+    # Explore shared/direct operands and resident/per-stage scales as policies,
+    # rather than retaining only the configurations that previously won.
+    load_policies = ((False, True, False), (True, True, False),
+                     (True, False, False), (False, False, False),
+                     (True, False, True), (False, False, True))
+    for bm, bn, waves, bk, stages, total_k, split in product(
+        (16, 32, 48, 64, 96, 128), (16, 32, 64, 128),
+        ((1, 1), (1, 2), (1, 4), (2, 2), (2, 4), (4, 2)),
+        (128, 256, 512), (3, 4, 6), _BPRESHUFFLE_SMALL_FIXED_K, (1, 2, 4)
+    ):
+        wm, wn = waves
+        geometry = (bm, bn, wm, wn, bk, stages, total_k, split, 0)
+        for (compact, perstage, direct), normal, cb in product(
+            load_policies, (False, True), (0, 2)
+        ):
+            policy = (compact, perstage, direct, 2 if direct else 1, cb,
+                      True, True, normal, False, 3, 1, False)
+            if _bpreshuffle_operand_legal(geometry, policy):
+                yield geometry, policy
+
+
+def _bpreshuffle_small_m_repeat_stage_configs():
+    for bm, bn, waves, bk, stages, total_k, split, compact, cb in product(
+        (16, 32, 48, 64, 96, 128), (16, 32, 64, 128),
+        ((1, 1), (1, 2), (1, 4), (2, 2)), (128, 256),
+        (2, 3, 4, 6, 8, 12), _BPRESHUFFLE_SMALL_FIXED_K,
+        (1, 2, 4, 8), (False, True), (0, 2)
+    ):
+        wm, wn = waves
+        threads = wm * wn * 64
+        if (bm % (16 * wm) or bn % (16 * wn)
+                or bm * bk % (threads * 16) or bn * bk % (threads * 16)
+                or total_k % (split * bk) or total_k // (split * bk) < stages - 1):
+            continue
+        sc = total_k // (split * 128)
+        scale_copy = 4 if compact else 1
+        sa = (bm * sc + threads * scale_copy - 1) // (threads * scale_copy) * threads * 4
+        lds = stages * (bm + bn) * bk + sa + threads * 4
+        if sc > threads or lds + 4 > 160 * 1024:
+            continue
+        args = (bm, bn, wn, bk, stages, total_k, split, wm, compact, cb)
+        yield "unrolled", args
+        if split == 1 and not compact:
+            yield "rolled", args
+
+
+def _bpreshuffle_small_m_repeat_scale_configs():
+    for bm, bn, wm, panel, fixed_k, gm, caches, fragments, xcd in product(
+        (64, 96, 128, 192, 256), (64, 128, 256), (2, 4), (16, 32, 64, 128),
+        (0, *_BPRESHUFFLE_SMALL_FIXED_K), (0, 4, 8),
+        _BPRESHUFFLE_JIT_CACHES, (False, True), (False, True)
+    ):
+        threads = wm * 2 * 64
+        em = bm // (wm * 16)
+        lds = 264 * (bm + bn) + panel * (bm + 4)
+        if (bm % (wm * 16) or em < 2 or bn < threads // 4
+                or threads % panel or threads // min(panel, 32) > 64
+                or fixed_k > panel * 128 or lds > 160 * 1024
+                or bm * (bn + 8) * 2 > lds or bm * bn % (threads * 8)):
+            continue
+        ca, cb = caches
+        yield (bm, bn, panel, fixed_k, wm, gm, ca, cb,
+               fragments, False, False, False, xcd)
+
+
+_small_config_signatures = set()
+for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_VGPR_PANEL_CONFIGS:
+    _values = list(_args)
+    _defaults = (0, False, 7168, 4, 1, 0, 2, 0, 256, False, False, False, False, 1, False)
+    _values.extend(_defaults[len(_values) - 4:])
+    _small_config_signatures.add(("b_vgpr_panel", tuple(_values), _wrapper))
+for _kid, _geometry, _policy, _name, _m_align, _m_first, _grid in _BPRESHUFFLE_OPERAND_CONFIGS:
+    _small_config_signatures.add(("operand", (*_geometry, *((0,) if len(_geometry) == 8 else ())), _policy, _m_first))
+for _kid, _loop, _args, _name, _m_align in _BPRESHUFFLE_M_REPEAT_STAGE_CONFIGS:
+    _defaults = (1, False, 0)
+    _small_config_signatures.add(("m_repeat_stage", (*_args, *_defaults[len(_args) - 7:]), f"loop_{_loop}"))
+for _kid, _args, _geometry, _fixed_k, _max_k in _BPRESHUFFLE_M_REPEAT_SCALE_CONFIGS:
+    _values = tuple(int(v) if v not in ("true", "false") else v == "true" for v in _args)
+    _small_config_signatures.add(("m_repeat_scale", (*_values, *((False,) * (13 - len(_values))))))
+
+_next_small_kid = max(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list) + 1
+
+
+def _register_generated_small(signature, traits, geometry, entry, *, fixed_k,
+                              max_k=None, split_k=1, wg=1, ca=0, cb=0):
+    global _next_small_kid
+    if signature in _small_config_signatures:
+        return
+    _small_config_signatures.add(signature)
+    # The complete parameter tuple makes names independent of enumeration IDs.
+    bm, bn, bk, wm, wn = geometry
+    params = signature[1:]
+    token = "_".join(str(v).lower() for group in params
+                     for v in (group if isinstance(group, tuple) else (group,)))
+    family = signature[0]
+    if family in ("b_vgpr_panel", "b_vgpr_panel_native_c"):
+        token += "_pfpanel" + ("_native_c" if family.endswith("_native_c") else "")
+        family = "b_vgpr"
+    elif family == "operand":
+        family = entry["pipeline"]
+        token += "_operand"
+    entry["config_name"] = _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, token)
+    _register_bpreshuffle_small(
+        _next_small_kid, geometry, traits, entry,
+        fixed_k=fixed_k, max_k=fixed_k if max_k is None else max_k,
+        split_k=split_k, wg=wg, ca=ca, cb=cb,
+    )
+    _next_small_kid += 1
+
+
+def _small_pipeline_entry(pipeline, header, kernel, *, split=1, bm=0, bn=0, m_align=1):
+    header = {"m_repeat_scale": "m_repeat", "m_repeat_stage": "m_repeat"}.get(header, header)
+    host_kind = "xcd_ring" if split > 1 else "tile"
+    return {
+        "pipeline": pipeline, "kernel": kernel,
+        "headers": (f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{header}_gfx950.cuh",),
+        "host_traits_headers": (f"gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_{header}_gfx950.cuh",),
+        "host_kind": host_kind, "grid_kind": "xcd_split" if split > 1 else "nm",
+        "m_align": m_align,
+        "workspace_rule": ["tiles", 4 * split, bm, bn, 4] if split > 1 else ["none"],
+        "workspace_zero_init": split > 1,
+    }
+
+
+def _register_b_vgpr_panel_config(args, *, native_c=False):
+    bm, bn, _stages, _ahead, cb, _xcd, fixed_k, wn, wg, ca = args[:10]
+    bk, split = args[12], args[17]
+    traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_b_vgpr_panel_traits", *args)
+    if native_c:
+        traits = _bpreshuffle_traits("opus_gemm_bpreshuffle_native_c_traits", traits)
+    entry = _small_pipeline_entry(
+        "b_vgpr", "b_vgpr", "opus_gemm_bpreshuffle_b_vgpr_kernel", m_align=16)
+    entry["b_vgpr_schedule"] = "panel"
+    entry["grid_kind"] = "nm" if args[16] else "xcd"
+    if split > 1:
+        entry.update(host_kind="reduce",
+                     headers=("gfx950/splitk_reduce_gfx950.cuh", *entry["headers"]),
+                     reduce_kernel="splitk_reduce_kernel",
+                     workspace_rule=["mn", 4 * split, 0])
+    _register_generated_small(
+        ("b_vgpr_panel_native_c" if native_c else "b_vgpr_panel", args, ""), traits,
+        (bm, bn, bk, 1, wn), entry, fixed_k=fixed_k, split_k=split,
+        wg=wg, ca=ca, cb=cb)
+
+
+for _args in _bpreshuffle_small_b_vgpr_panel_configs():
+    _register_b_vgpr_panel_config(_args)
+
+for _geometry, _policy in _bpreshuffle_small_operand_configs():
+    _bm, _bn, _wm, _wn, _bk, _st, _k, _sk, _fn = _geometry
+    _family = "b_vgpr" if _policy[2] else "m_repeat"
+    _traits = _bpreshuffle_traits(f"opus_gemm_bpreshuffle_{_family}_operand_traits",
+                                _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_geometry", *_geometry),
+                                _bpreshuffle_traits("opus_gemm_bpreshuffle_stage_policy", *_policy))
+    _entry = _small_pipeline_entry(_family, _family, f"opus_gemm_bpreshuffle_{_family}_kernel",
+                                   split=_sk, bm=_bm, bn=_bn, m_align=4 if _policy[0] else 1)
+    _entry[f"{_family}_schedule"] = "operand"
+    _register_generated_small(("operand", _geometry, _policy, False), _traits,
+                              (_bm, _bn, _bk, _wm, _wn), _entry, fixed_k=_k, split_k=_sk, cb=_policy[4])
+
+for _loop, _args in _bpreshuffle_small_m_repeat_stage_configs():
+    _bm, _bn, _wn, _bk, _st, _k, _sk, _wm, _compact, _cb = _args
+    _entry = _small_pipeline_entry("m_repeat_stage", "m_repeat_stage", "opus_gemm_bpreshuffle_m_repeat_kernel",
+                                   split=_sk, bm=_bm, bn=_bn, m_align=4 if _compact else 1)
+    _entry["loop"] = _loop
+    _register_generated_small(("m_repeat_stage", _args, f"loop_{_loop}"),
+                              _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_stage_traits", *_args, _loop == "rolled"),
+                              (_bm, _bn, _bk, _wm, _wn), _entry, fixed_k=_k, split_k=_sk, cb=_cb)
+
+for _args in _bpreshuffle_small_m_repeat_scale_configs():
+    _bm, _bn, _panel, _k, _wm, _gm, _ca, _cb = _args[:8]
+    _entry = _small_pipeline_entry("m_repeat_scale", "m_repeat_scale", "opus_gemm_bpreshuffle_m_repeat_kernel", m_align=16)
+    _register_generated_small(("m_repeat_scale", _args), _bpreshuffle_traits("opus_gemm_bpreshuffle_m_repeat_scale_traits", *_args),
+                              (_bm, _bn, 128, _wm, 2), _entry, fixed_k=_k, max_k=_panel * 128, ca=_ca, cb=_cb)
+
+
+# Append experimental candidates after the complete existing bank. Keep the
+# original enumeration order so saved exact-kid measurements remain replayable.
+def _bpreshuffle_wide_b_vgpr_panel_configs():
+    for bm, wn, bk, fixed_k, split, wg, caches, output in product(
+        (96, 128), (4, 8), (128, 256), (16384, 21504), (1, 2),
+        (1, 2), _BPRESHUFFLE_JIT_CACHES, (0, 2)
+    ):
+        if split > 1 and output != 0:
+            continue
+        ca, cb = caches
+        args = (bm, 256, 3, 1, cb, False, fixed_k, wn, wg, ca,
+                2, output, bk, True, False, False, True, split, False)
+        if _bpreshuffle_b_vgpr_panel_legal(args):
+            yield args
+
+
+for _bpreshuffle_wide_args in _bpreshuffle_wide_b_vgpr_panel_configs():
+    _register_b_vgpr_panel_config(_bpreshuffle_wide_args)
+
+
+def _bpreshuffle_native_c_configs():
+    for geometry, fixed_k, caches, output in product(
+        ((128, 128, 2), (128, 256, 4), (96, 256, 4)),
+        (16384, 21504), _BPRESHUFFLE_JIT_CACHES, (0, 2)
+    ):
+        bm, bn, wn = geometry
+        ca, cb = caches
+        args = (bm, bn, 3, 1, cb, False, fixed_k, wn, 1, ca,
+                2, output, 128, True, False, False, True, 1, False)
+        if _bpreshuffle_b_vgpr_panel_legal(args):
+            yield args
+
+
+for _bpreshuffle_native_args in _bpreshuffle_native_c_configs():
+    _register_b_vgpr_panel_config(_bpreshuffle_native_args, native_c=True)
+
+
+
+def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
+    """Return all shape-legal kids; the tuner prunes resources and variants."""
+    if str(gfx).lower().split(":", 1)[0] != "gfx950" or canonical_output_dtype(outdtype) != "bf16_t":
+        return []
+    return [kid for kid, instance in sorted(get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items())
+            if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)]
+
+
+def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
+    if instance.bpreshuffle_co is not None:
+        shapes = instance.bpreshuffle_co.get("supported_shapes")
+        if shapes is not None:
+            return [m, n, k] in shapes
+    if (min(m, n, k) <= 0 or m % instance.m_align or n % 128 or k % instance.B_K
+            or (not instance.bpreshuffle_pad_n and n % instance.B_N)
+            or (instance.max_k is not None and k > instance.max_k)
+            or (instance.bpreshuffle_fixed_k and k != instance.bpreshuffle_fixed_k)
+            or k // instance.B_K < instance.bpreshuffle_split_k):
+        return False
+    if max(m * k, n * k) > _INT32_MAX:
+        return False
+    if instance.bpreshuffle_entry is not None and 2 * min(m, instance.B_M) * n > _INT32_MAX:
+        return False
+    if (instance.bpreshuffle_co is not None and instance.bpreshuffle_co.get("wide_output")
+            and 2 * ((min(m, instance.B_M) - 1) * n + instance.B_N) > _INT32_MAX):
+        return False
+    if instance.bpreshuffle_split_k > 1:
+        return bpreshuffle_workspace_bytes(instance, m, n, k) <= instance.max_tensor_bytes
+    return 2 * m * n <= instance.max_tensor_bytes
+
+
+def bpreshuffle_workspace_bytes(instance, m, n, k):
+    rule = (instance.bpreshuffle_entry or {}).get("workspace_rule", ("none",))
+    if rule[0] == "none":
+        return 0
+    if rule[0] == "tiles":
+        _, factor, bm, bn, counter = rule
+        tiles = ((m + bm - 1) // bm) * (n // bn)
+        return tiles * (factor * bm * bn + counter)
+    _, factor, extra = rule
+    return factor * m * n + extra
+
+
 # combined list (used by production gen_instances / dispatch)
 gfx950_a16w16_kernels_list = {
     **a16w16_kernels_list,
@@ -2902,8 +4153,12 @@ KERNEL_REGISTRY = {
     "a8w8": {"gfx950": {cu: dict(a8w8_kernels_list) for cu in (128, 256)}},
     "a8w8_blockscale": {"gfx950": {cu: dict(a8w8_scale_kernels_list) for cu in (128, 256)}},
     "a8w8_mxscale_bmm": {"gfx950": {cu: dict(sorted(a8w8_mxscale_bmm_kernels_list.items())) for cu in (128, 256)}},
-    "a8w8_blockscale_bpreshuffle": {"gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)}},
+    "a8w8_blockscale_bpreshuffle": {
+        "gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)},
+        "gfx950": {cu: dict(sorted(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list.items())) for cu in (128, 256)},
+    },
 }
+
 
 # fmt: on
 
@@ -2917,6 +4172,7 @@ for _cat in (
     gfx950_a16w16_kernels_list,
     gfx942_kernels_list,
     gfx1250_a16w16_kernels_list,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
 ):
     for _kid, _inst in _cat.items():
         _sig = repr(asdict(_inst))
@@ -2980,6 +4236,15 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             if instance.kernel_tag not in _A16W16_CO_TAGS
             or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
         }
+    if family == "a8w8_blockscale_bpreshuffle" and gfx == "gfx950":
+        return {
+            kid: instance
+            for kid, instance in records.items()
+            if instance.bpreshuffle_co is None
+            or os.path.isfile(
+                _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
+            )
+        }
     return records
 
 
@@ -3016,11 +4281,18 @@ def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the default compile set from the current CU table."""
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    return {
+    keys = {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
+    if gfx == "gfx950":
+        keys.update(
+            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
+            for kid in get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num)
+            if kid == 0
+        )
+    return keys
 
 
 def _in_group(name, family, instance):
@@ -3213,7 +4485,9 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline_bpreshuffle",
             }
         ),
-        "a8w8_blockscale_bpreshuffle": frozenset(),
+        "a8w8_blockscale_bpreshuffle": frozenset(
+            {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
+        ),
     },
     "gfx942": {
         "a16w16": frozenset(
@@ -3327,6 +4601,15 @@ def get_kernel_instance(
         and arch == "gfx1250"
         and instance.kernel_tag in _A16W16_CO_TAGS
         and not os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
+    ):
+        return None
+    if (
+        family == "a8w8_blockscale_bpreshuffle"
+        and arch == "gfx950"
+        and instance.bpreshuffle_co is not None
+        and not os.path.isfile(
+            _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
+        )
     ):
         return None
     return instance
