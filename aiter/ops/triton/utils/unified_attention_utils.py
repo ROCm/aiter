@@ -38,8 +38,9 @@ and the SPLIT_MIN_* floors; see compute_segment_params.
 A kv_split entry may add SPLIT_PROGRAMS_PER_CU to make the Triton 3D split
 length-aware: each sequence takes its share of num_sms * SPLIT_PROGRAMS_PER_CU
 programs by its KV length on the GPU, capped by the segment count that
-SPLIT_SEGMENTS_PER_CU gives; calls the split does not cover keep the uniform
-NUM_SEGMENTS. See _length_aware_split in attention/unified_attention.py.
+SPLIT_SEGMENTS_PER_CU gives. The launcher uses it only for bf16 Q with head
+size 64 (Q/K and V); other calls keep the uniform NUM_SEGMENTS. See
+_length_aware_split in attention/unified_attention.py.
 """
 
 import copy

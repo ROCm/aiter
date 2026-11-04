@@ -123,7 +123,8 @@ def find_work_item(
         segs = seq_num_segments(lens, segment_tokens, NUM_SEGMENTS_PER_SEQ)
         segs = tl.where(valid, segs, 0)
         end = items + tl.cumsum(segs, 0)
-        before = end <= item
+        # an empty lane past num_seqs is not a sequence before the item
+        before = (end <= item) & valid
         owner = (end > item) & (end - segs <= item) & valid
         word = tl.where(before, (segs + 65536).to(tl.int64) << 32, 0)
         found += tl.sum(word + tl.where(owner, lens, 0).to(tl.int64))
