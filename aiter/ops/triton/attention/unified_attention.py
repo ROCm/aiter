@@ -101,6 +101,23 @@ _GFX12_TOKEN_SPLIT_MAX_KV = int(
 # from the live seqused_k on every CUDA-graph replay. 13 calls a Qwen3.5 MTP-3 decode
 # step (10 layers + 3 draft passes): 117 kernels become 13.
 _GFX12_TOKEN_SPLIT_FUSED = os.environ.get("AITER_GFX12_TOKEN_SPLIT_FUSED", "0") == "1"
+
+
+def gfx12_token_split_constants():
+    """None when the gfx1250 token split is off, else the (PROGRAMS, MIN_TILES,
+    MAX_TILES) of its tiles per segment: clamp(cdiv(sum_i cdiv(seqused_k[i],
+    tile_size) * num_kv_heads, PROGRAMS), MIN_TILES, MAX_TILES), int32. For a
+    caller that computes it itself and passes it as `unified_attention`'s
+    ``gfx12_token_split_tiles``."""
+    if not (_GFX12_TOKEN_SPLIT and DEVICE_ARCH == "gfx1250"):
+        return None
+    return (
+        _GFX12_TOKEN_SPLIT_PROGRAMS,
+        _GFX12_TOKEN_SPLIT_MIN_TILES,
+        _GFX12_TOKEN_SPLIT_MAX_TILES,
+    )
+
+
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU sets the short-query bound above, and
 # PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
@@ -302,14 +319,26 @@ def _gfx12_token_split_tiles_fused(
     return segm_tiles
 
 
-def _gfx12_token_split(params: _UAParams, tile_size: int):
+def _gfx12_token_split(params: _UAParams, tile_size: int, precomputed=None):
     """The token split's grid width (NUM_SEGMENTS) and its tiles per segment.
 
     Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
     over _GFX12_TOKEN_SPLIT_PROGRAMS, clamped to [MIN_TILES, MAX_TILES]. Device ops
     only (nine torch ops, or one Triton program under AITER_GFX12_TOKEN_SPLIT_FUSED=1),
     so a CUDA graph recomputes it from the live context lengths on replay.
+
+    ``precomputed``: the caller's ``(segm_tiles, tile_size, num_kv_heads)``
+    (`unified_attention`'s ``gfx12_token_split_tiles``), used when it was computed
+    for this launch's tile size and KV heads; otherwise it is computed here.
     """
+    if precomputed is not None:
+        tiles, at_tile, at_heads = precomputed
+        if at_tile == tile_size and at_heads == params.num_kv_heads:
+            kv_cover = max(int(params.max_seqlen_k), _GFX12_TOKEN_SPLIT_MAX_KV)
+            num_segments = triton.next_power_of_2(
+                triton.cdiv(kv_cover, _GFX12_TOKEN_SPLIT_MIN_TILES * tile_size)
+            )
+            return num_segments, tiles
     if _GFX12_TOKEN_SPLIT_FUSED:
         segm_tiles = _gfx12_token_split_tiles_fused(
             params.seqused_k, params.num_kv_heads, tile_size
@@ -456,6 +485,11 @@ def unified_attention(
     # NVFP4 (uint8 e2m1) KV cache only: run PV as an FP8 WMMA, with P and the upcast,
     # scaled V in e4m3, instead of a BF16 WMMA. Same for A8W4 and A4W4; ignored otherwise.
     force_fp8_pv_on_fp4_kv_cache: bool = False,
+    # gfx1250 token split only (AITER_GFX12_TOKEN_SPLIT=1): (segm_tiles, tile_size,
+    # num_kv_heads), the [1] int32 tiles per segment the caller computed from this
+    # call's seqused_k (see gfx12_token_split_constants), so that it is not
+    # computed here. Ignored unless tile_size and num_kv_heads are this launch's.
+    gfx12_token_split_tiles=None,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
     # Epilogue of the Qwen3-Next / Qwen3.5 attention: out * sigmoid(output_gate),
@@ -685,7 +719,9 @@ def unified_attention(
             )
         segm_tiles = None
         if _GFX12_TOKEN_SPLIT and use_gluon_3d and DEVICE_ARCH == "gfx1250":
-            NUM_SEGMENTS, segm_tiles = _gfx12_token_split(params, CONFIG_TILE_SIZE)
+            NUM_SEGMENTS, segm_tiles = _gfx12_token_split(
+                params, CONFIG_TILE_SIZE, gfx12_token_split_tiles
+            )
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.

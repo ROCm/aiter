@@ -1490,3 +1490,82 @@ def test_unified_attn_output_gate_rows_k4v8(
     fused = run(out, output_gate=gate, output_rows=rows)
     assert fused.data_ptr() == out.data_ptr()
     assert torch.equal(out.reshape(ref.shape), ref)
+
+@pytest.mark.parametrize("batch, seed", [(1, 0), (13, 1), (64, 2)])
+@pytest.mark.parametrize("block_size", [64, 128])
+@torch.inference_mode()
+def test_gfx12_token_split_tiles_precomputed(batch, seed, block_size, monkeypatch):
+    """gfx12_token_split_tiles: a caller's tiles per segment at this launch's tile
+    size and KV heads replace the split's own (bitwise the same output, nothing
+    computed); at another tile size the split computes its own."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    ua = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(ua, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(ua, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(seed)
+    seq_lens = [(1, int(n)) for n in torch.randint(1, 20000, (batch,))]
+    (
+        query,
+        _key_cache,
+        _value_cache,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (20000 // block_size + 1) + 8,
+        block_size=block_size,
+        head_size=256,
+        num_heads=(4, 1),
+        sliding_window=None,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+
+    def run(**kwargs):
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            shuffled_kv_cache=True,
+            **kwargs,
+        )
+        return out
+
+    ref = run()
+    tiles = ua._gfx12_token_split_tiles_torch(kv_lens, 1, block_size)
+    wrong_tile = (tiles, block_size * 2, 1)
+    assert torch.equal(run(gfx12_token_split_tiles=wrong_tile), ref)
+
+    def computed(*args):
+        raise AssertionError("the split computed its own tiles")
+
+    monkeypatch.setattr(ua, "_gfx12_token_split_tiles_torch", computed)
+    monkeypatch.setattr(ua, "_gfx12_token_split_tiles_fused", computed)
+    out = run(gfx12_token_split_tiles=(tiles, block_size, 1))
+    assert torch.equal(out, ref)
