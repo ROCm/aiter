@@ -659,17 +659,20 @@ def build_moe_route_psum_fused_module():
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
         # The allocator's typed pointer keeps the counter in shared memory.
-        # A route to expert -1 (a pad row the router left unrouted) claims no
-        # slot and gets DROPPED_ROUTE_ROW, as in the split-kernel route.
+        # A route to expert -1, or to an id at or past E, claims no slot and
+        # gets DROPPED_ROUTE_ROW, as in the split-kernel route. The store is in
+        # the else so a valid route is written once.
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            rows_p[route_i32] = fx.Int32(DROPPED_ROUTE_ROW)
             e = fx.Int32(topk_p[route_i32])
-            if (e >= fx.Int32(0)) & (e < experts):
+            routed = (e >= fx.Int32(0)) & (e < experts)
+            if routed:
                 ptr = lds_cnt + e
                 slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
                 row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
                 rows_p[route_i32] = row
+            else:
+                rows_p[route_i32] = fx.Int32(DROPPED_ROUTE_ROW)
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.

@@ -54,3 +54,38 @@ def test_route_psum_fused_pad_routes(experts, topk, token_num, pad_frac):
         assert ((kept_rows >= base) & (kept_rows < base + counts[ids[kept]])).all()
         assert kept_rows.unique().numel() == kept_rows.numel()
         assert int(kept_rows.max()) < contiguous_m
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() != "gfx1250",
+    reason="Requires gfx1250",
+)
+@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
+@pytest.mark.parametrize("token_num", [1, 8])
+def test_route_psum_fused_mixed_pad_and_out_of_range(experts, topk, token_num):
+    """One row can mix a valid id, expert -1, and an id >= E."""
+    align = 64
+    pattern = torch.tensor([0, -1, experts, 1, experts + 5, 2], dtype=torch.int32)
+    ids = pattern[:topk].repeat(token_num).reshape(token_num, topk)
+    ids = ids.to("cuda")
+    numel = token_num * topk
+    max_m = max(align, _tdm_align_up(numel, align))
+
+    masked_m, rows, psum = fused_route_psum_remap(ids, experts, max_m, align)
+    torch.cuda.synchronize()
+
+    ids = ids.reshape(-1).cpu().long()
+    rows = rows.reshape(-1).cpu().long()
+    kept = (ids >= 0) & (ids < experts)
+    counts = torch.bincount(ids[kept], minlength=experts)
+    starts = torch.cumsum((counts + align - 1) // align * align, 0) - (
+        (counts + align - 1) // align * align
+    )
+
+    assert (rows[~kept] == DROPPED_ROUTE_ROW).all()
+    assert torch.equal(masked_m.cpu().long(), counts)
+    assert torch.equal(psum.cpu().long(), starts + counts)
+    kept_rows = rows[kept]
+    base = starts[ids[kept]]
+    assert ((kept_rows >= base) & (kept_rows < base + counts[ids[kept]])).all()
+    assert kept_rows.unique().numel() == kept_rows.numel()
