@@ -263,6 +263,7 @@ class _ArchTuning:
     # registers.
     narrow_prefetch_in_flight: int
     wide_grid_cu_divisor: int
+    alias_wide_grid_cu_divisor: int
 
 
 _ARCH_TUNING = {
@@ -270,11 +271,13 @@ _ARCH_TUNING = {
         nontemporal_block_loads=True,
         narrow_prefetch_in_flight=8,
         wide_grid_cu_divisor=2,
+        alias_wide_grid_cu_divisor=1,
     ),
     "gfx950": _ArchTuning(
         nontemporal_block_loads=False,
         narrow_prefetch_in_flight=3,
         wide_grid_cu_divisor=1,
+        alias_wide_grid_cu_divisor=1,
     ),
 }
 
@@ -1218,9 +1221,14 @@ def _plan_launch(
 
     launcher = None
     if num_tokens:
+        cu_divisor = (
+            tuning.alias_wide_grid_cu_divisor
+            if block_alias
+            else tuning.wide_grid_cu_divisor
+        )
         wide_grid = (
             row_threads > _WARP_SIZE
-            and num_tokens > _num_cus(prefix.device) // tuning.wide_grid_cu_divisor
+            and num_tokens > _num_cus(prefix.device) // cu_divisor
             and _wide_row_supported(hidden_size)
         )
         gfx950_ops = _has_gfx950_ops()
