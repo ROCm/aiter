@@ -30,6 +30,10 @@ from types import MappingProxyType
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
 
 API_VERSION = 1
+# Provider API versions still accepted after a bump, each naming the release that
+# removes it. The window exists so adapting is never an emergency; the runtime
+# warning always names the removal point, so nobody learns it from a crash.
+SUPERSEDED_API_VERSIONS: Mapping[int, str] = MappingProxyType({})
 ENTRY_POINT_GROUP = "aiter.kernel_providers"
 
 _Canonicalizer = Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]
@@ -158,6 +162,8 @@ class _RoutedOp:
     contract: Signature
     native: Callable[..., Any]
     canonicalize: _Canonicalizer
+    # older op_version -> the release that stops accepting it
+    superseded: Mapping[int, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +184,7 @@ _routed_ops: dict[str, _RoutedOp] = {}
 _decision_counts: Counter[tuple[str, str, str, str | None]] = Counter()
 _decision_callbacks: list[Callable[[Decision], None]] = []
 _silenced_callbacks: set[int] = set()
+_warned: set[tuple[Any, ...]] = set()
 _callback_errors = 0
 _route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
 _skipped_providers: tuple[_SkippedProvider, ...] = ()
@@ -313,10 +320,25 @@ def _config() -> _Config:
     return snapshot
 
 
-def route(*, op: str, version: int) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
-    """Route an AITER op through a compatible provider before its native path."""
+def route(
+    *,
+    op: str,
+    version: int,
+    supersedes: Mapping[int, str] = MappingProxyType({}),
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Route an AITER op through a compatible provider before its native path.
+
+    ``supersedes`` maps an older ``op_version`` still accepted for this contract
+    to the release that stops accepting it. AITER owns the contract, so only
+    AITER can say that a provider written against the older version is still
+    acceptable for calls on this one; declaring it here makes that assertion
+    explicit and dated rather than implied.
+    """
 
     operation = Op(op, version)
+    accepted = MappingProxyType(dict(supersedes))
+    if version in accepted:
+        raise ValueError(f"op {op!r} cannot supersede its own version {version}")
 
     def decorate(native: Callable[_P, _R]) -> Callable[_P, _R]:
         contract = signature(native)
@@ -326,7 +348,7 @@ def route(*, op: str, version: int) -> Callable[[Callable[_P, _R]], Callable[_P,
         # list exists to avoid.
         if op in _routed_ops:
             raise ValueError(f"op {op!r} is already routed")
-        _routed_ops[op] = _RoutedOp(operation, contract, native, canonicalize)
+        _routed_ops[op] = _RoutedOp(operation, contract, native, canonicalize, accepted)
 
         @wraps(native)
         def routed(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -536,6 +558,34 @@ def status() -> Mapping[str, Any]:
                 }
                 for name, routed in _routed_ops.items()
             },
+            "api_versions_accepted": (API_VERSION, *sorted(SUPERSEDED_API_VERSIONS)),
+            "deprecations": tuple(
+                sorted(
+                    [
+                        {
+                            "kind": "provider-api",
+                            "subject": record.provider.name,
+                            "version": record.provider.api_version,
+                            "removed_in": SUPERSEDED_API_VERSIONS[
+                                record.provider.api_version
+                            ],
+                        }
+                        for record in _providers()
+                        if record.provider.api_version in SUPERSEDED_API_VERSIONS
+                    ]
+                    + [
+                        {
+                            "kind": "op-version",
+                            "subject": name,
+                            "version": version,
+                            "removed_in": removal,
+                        }
+                        for name, routed in _routed_ops.items()
+                        for version, removal in routed.superseded.items()
+                    ],
+                    key=lambda item: (item["kind"], item["subject"], item["version"]),
+                )
+            ),
             "decision_callback_errors": _callback_errors,
         }
     )
@@ -800,11 +850,51 @@ def _records_by_provider_name() -> dict[str, list[_ProviderRecord]]:
 
 
 def _supports(provider: KernelProvider, op: Op) -> bool:
+    return _matched_version(provider, op) is not None
+
+
+def _matched_version(provider: KernelProvider, op: Op) -> int | None:
+    """The op version this provider serves ``op`` on, or ``None``.
+
+    The contract version wins. An older version is matched only while this
+    contract still accepts it, and matching one warns once, naming the release
+    that stops accepting it.
+    """
+
     try:
-        return op.version in provider.op_versions.get(op.name, ())
+        declared = frozenset(provider.op_versions.get(op.name, ()))
     except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
         logger.warning("Provider %s has invalid op_versions: %s", provider.name, error)
-        return False
+        return None
+
+    if op.version in declared:
+        return op.version
+
+    routed = _routed_ops.get(op.name)
+    accepted = routed.superseded if routed is not None else {}
+    for version, removal in accepted.items():
+        if version in declared:
+            _warn_once(
+                ("op", provider.name, op.name, version),
+                "Provider %s serves %s on superseded op version %s; %s stops "
+                "accepting it. Re-validate against version %s.",
+                provider.name,
+                op.name,
+                version,
+                removal,
+                op.version,
+            )
+            return version
+    return None
+
+
+def _warn_once(key: tuple[Any, ...], message: str, *args: Any) -> None:
+    """Warn about a deprecation once per subject, not once per call."""
+
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(message, *args)
 
 
 def _providers() -> Sequence[_ProviderRecord]:
@@ -827,11 +917,28 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             name = provider.name
             api_version = provider.api_version
             _ = provider.op_versions
-            if api_version != API_VERSION:
-                reason = f"API version {api_version} is incompatible with {API_VERSION}"
+            removal = SUPERSEDED_API_VERSIONS.get(api_version)
+            if api_version != API_VERSION and removal is None:
+                accepted = sorted({API_VERSION, *SUPERSEDED_API_VERSIONS})
+                reason = (
+                    f"API version {api_version} is not accepted; "
+                    f"this aiter accepts {accepted}"
+                )
                 logger.warning("Skipping provider %s: %s", name, reason)
                 skipped.append(_SkippedProvider(entry_point.name, reason))
                 continue
+            if removal is not None:
+                # Inside the window: it loads, but nobody should learn the
+                # removal release from a future crash.
+                _warn_once(
+                    ("api", name, api_version),
+                    "Provider %s uses superseded provider API version %s; %s "
+                    "removes it. Adapt to version %s.",
+                    name,
+                    api_version,
+                    removal,
+                    API_VERSION,
+                )
             records.append(_ProviderRecord(entry_point.name, provider))
         except Exception as error:  # noqa: BLE001 - one plugin must not break AITER
             logger.warning(
@@ -860,6 +967,7 @@ def _reset_for_testing() -> None:
     _decision_counts.clear()
     _decision_callbacks.clear()
     _silenced_callbacks.clear()
+    _warned.clear()
     _route_log.clear()
     _callback_errors = 0
     with _provider_lock:
@@ -874,6 +982,7 @@ def _reset_for_testing() -> None:
 
 __all__ = [
     "API_VERSION",
+    "SUPERSEDED_API_VERSIONS",
     "Decision",
     "Explanation",
     "KernelCandidate",

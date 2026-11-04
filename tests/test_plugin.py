@@ -258,7 +258,7 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     }
     assert set(skipped) == {"broken", "old"}
     assert "missing dependency" in skipped["broken"]
-    assert "incompatible" in skipped["old"]
+    assert "not accepted" in skipped["old"]
 
 
 def test_force_and_per_op_disable_are_explicit(monkeypatch):
@@ -750,3 +750,122 @@ def test_route_changes_are_logged_once_per_generation(monkeypatch):
 
     assert len(infos) == 1, "one line per generation, not per call"
     assert "test.add" in infos[0]
+
+
+def _provider_at(api_version: int, name: str = "aklr"):
+    provider = _Provider(name, _candidate(name))
+    provider.api_version = api_version
+    return provider
+
+
+def test_a_superseded_api_version_still_loads_and_names_its_removal(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    monkeypatch.setattr(
+        plugin, "SUPERSEDED_API_VERSIONS", {plugin.API_VERSION - 1: "aiter 0.5"}
+    )
+    provider = _provider_at(plugin.API_VERSION - 1)
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+
+    assert add(2, 3) == 100, "inside the window it serves"
+    assert len(warnings) == 1
+    assert "aiter 0.5" in warnings[0], "the warning must name the removal release"
+
+    add(4, 5)
+    assert len(warnings) == 1, "warned once per provider, not once per call"
+
+
+def test_an_api_version_outside_the_window_is_skipped(monkeypatch):
+    monkeypatch.setattr(plugin, "SUPERSEDED_API_VERSIONS", {})
+    provider = _provider_at(plugin.API_VERSION - 1)
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 5
+    assert plugin.status()["skipped_providers"][0]["entry_point"] == "aklr"
+
+
+def test_a_superseded_op_version_is_routable_while_the_contract_accepts_it(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add": {1}}  # still on the old contract
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add", version=2, supersedes={1: "aiter 0.6"})
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 100
+    assert len(warnings) == 1
+    assert "aiter 0.6" in warnings[0]
+    # The Decision names the contract that was routed, which is the new one.
+    assert plugin.last_decision().op == plugin.Op("test.add", 2)
+
+
+def test_an_op_version_the_contract_does_not_accept_stays_native(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add": {1}}
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add", version=2)
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 5
+    # "no-provider" means no *eligible* provider, which is literally true here.
+    # It does not distinguish "nothing installed" from "installed and enabled but
+    # on an op version this contract no longer accepts" -- a distinction the
+    # window makes newly common. Not invented here: the design enumerates no
+    # reason for it.
+    assert plugin.last_decision().reason == "no-provider"
+
+
+def test_a_contract_cannot_supersede_its_own_version():
+    with pytest.raises(ValueError, match="own version"):
+        plugin.route(op="test.add", version=2, supersedes={2: "aiter 0.6"})
+
+
+def test_status_lists_what_is_deprecated_and_when_it_goes(monkeypatch):
+    monkeypatch.setattr(
+        plugin, "SUPERSEDED_API_VERSIONS", {plugin.API_VERSION - 1: "aiter 0.5"}
+    )
+    provider = _provider_at(plugin.API_VERSION - 1)
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add", version=2, supersedes={1: "aiter 0.6"})
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert plugin.status()["deprecations"] == (
+        {
+            "kind": "op-version",
+            "subject": "test.add",
+            "version": 1,
+            "removed_in": "aiter 0.6",
+        },
+        {
+            "kind": "provider-api",
+            "subject": "aklr",
+            "version": plugin.API_VERSION - 1,
+            "removed_in": "aiter 0.5",
+        },
+    )
