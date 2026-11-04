@@ -487,11 +487,20 @@ def test_pa_decode_bf16_wave_large_logits(
             output.fill_(float("nan"))
             graph.replay() if captured else run()
             torch.cuda.synchronize()
-            torch.testing.assert_close(
-                output.cpu().float(),
-                reference.float(),
-                atol=5e-3,
-                rtol=5e-3,
+            assert (
+                checkAllclose(
+                    output.cpu().float(),
+                    reference.float(),
+                    atol=5e-3,
+                    rtol=5e-3,
+                    tol_err_ratio=0,
+                    msg=(
+                        f"BF16 wave large logits: query_length={query_length} "
+                        f"mode={mode} pattern={pattern} magnitude={magnitude} "
+                        f"{'replay' if captured else 'eager'}: "
+                    ),
+                )
+                == 0
             )
 
 
