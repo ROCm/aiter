@@ -30,7 +30,7 @@ The host classes are in `aiter/ops/flydsl/`:
 | Kernel | Hops | Wire bytes for each rank | Accuracy | Use |
 |---|---|---|---|---|
 | One-shot | 1 | `(N-1)*S` | Exact: fp32 accumulate, one bf16 rounding | Small payloads (decode) |
-| Mesh | 2 | `2(N-1)/N*S` | INT4 on the wire | Medium and large payloads |
+| Mesh | 2 | `2(N-1)/N*S` | INT4, or opt-in INT6 | Medium and large payloads |
 | Ring | `2(N-1)` | `2(N-1)/N*S` | INT4 or INT6 on the wire | Large payloads, mostly on PCIe |
 
 ### One-shot
@@ -43,9 +43,10 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 ### Mesh
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
-lap. In each lap, each rank pushes to all `N-1` peers. The wire format is INT4
-with one E5M2 scale for each group of 16 values. FP16 is also available for
-tests.
+lap. In each lap, each rank pushes to all `N-1` peers. The default wire format
+is INT4; INT6 is opt-in. Both use one signed scale byte for each group of 16
+values. Each wave slice selects E4M3 when its extrema fit, and E5M2 for large
+or tiny slices. FP16 is also available for tests.
 
 ### Ring
 
@@ -60,7 +61,7 @@ This is better on PCIe, where each GPU has one shared x16 uplink.
 | Quantizations in the reduce-scatter lap | 1 | `N-1`, one at each hop |
 | Default reduce-scatter codec | INT4 | INT4 at TP2, INT6 from TP4 |
 | Writers for each inbox slot | `N-1` peers | 1, the ring predecessor |
-| LDS staging (TP8, block 256) | Packets for all destinations, 9216 B with INT4 | Packet for one destination, 1664 B with INT6 |
+| LDS staging (TP8, block 256) | Packets for 7 destinations plus format bits | Packet for one destination plus format bits |
 
 The ring quantizes the running partial sum again at each hop. The maximum
 absolute value of the partial sum increases with each hop. For this reason,
@@ -73,16 +74,28 @@ its own chunk from the packet that it sent.
 
 ### Accuracy limits
 
-The kernels convert the bf16 payload to fp16 and do all arithmetic in packed
-fp16, for every wire format.
+The kernels do reduction and quantization in packed fp16.
 
-* A magnitude above 65504 saturates to 65504. The `fp16` wire format is not
+* The opt-in shared `divisor` is applied in fp32 before narrowing to fp16 and
+  restored in fp32 before the bf16 store (before the fused residual add).
+  Both mesh and ring accept it with INT4 or INT6, including mixed ring laps.
+  At divisor 1, magnitudes above 65504 saturate; a larger divisor extends the
+  usable range to `65504 * divisor`. Every rank must use the same divisor.
+  The all-FP16 wire format does not accept a non-default divisor and is not
   lossless for bf16 values outside the fp16 range.
-* The group scale is an E5M2 byte (bias 12) spanning `[2**-12, 1.75 * 2**19]`,
-  so every fp16 extremum fits and no group clips below the fp16 limit above,
-  including the ring's requantized partial sums. NaN and Inf become finite
-  values. `SCALE_CODEC_TAG` is part of every kernel's launch name: bump it when
-  the codec changes, or a warm FlyDSL cache keeps loading old binaries.
+* E4M3 (bias 7) spans `[2**-7, 480]` and preserves in-range precision. A wave
+  slice selects E5M2 (bias 12, `[2**-12, 1.75 * 2**19]`) if any group exceeds
+  480 or all group extrema are below `2**-6`. INT6 rounds scales upward and
+  retains its E5M2 floor of `2**-10`; INT4 rounds to nearest.
+* Format bits occupy the high halves of the release-tail words; their low
+  halves hold a nonzero 16-bit epoch. The INT4 and INT6 payload layouts stay
+  unchanged. A tail holds at least one 64 B sector and grows by whole sectors
+  for large super-tiles. Extra metadata sectors complete before the first
+  sector signals readiness. Ring all-gather forwards payload and format bits
+  without requantization.
+* NaN and Inf become finite values. `SCALE_CODEC_TAG` is part of every kernel's
+  launch name: bump it when the codec changes, or a warm FlyDSL cache keeps
+  loading old binaries.
 
 ## Inbox memory
 

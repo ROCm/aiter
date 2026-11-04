@@ -397,7 +397,7 @@ def _flag_word(color):
     return fx.Vector.from_elements([color, color], fx.Int32).bitcast(fx.Int64)[0]
 
 
-def _store_flag_peer(addr_i64, color, policy):
+def _store_flag_peer(addr_i64, color, policy, second=None):
     """Write one lane's share of a peer's 64 B handshake sector.
 
     *policy* is the inbox's ``flag`` entry in ``_INBOX_POLICY``. On a cacheable
@@ -406,7 +406,12 @@ def _store_flag_peer(addr_i64, color, policy):
     add after every flag. Atomic stores stop at 64 bits, which is why a sector
     takes ``FLAG_LANES`` lanes of 8 B rather than four of 16 B.
     """
-    fx.generic_store(_global_ptr(addr_i64, T.i64, 8), _flag_word(color), **dict(policy))
+    value = (
+        _flag_word(color)
+        if second is None
+        else fx.Vector.from_elements([color, second], fx.Int32).bitcast(fx.Int64)[0]
+    )
+    fx.generic_store(_global_ptr(addr_i64, T.i64, 8), value, **dict(policy))
 
 
 def _release_inbox(scope):
@@ -564,8 +569,17 @@ def _acquire_inbox(scope):
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 
-def make_pack_storage(n_i32: int):
+def make_pack_storage(n_i32: int, n_format_i32: int = 0):
     """LDS staging for *n_i32* packed words, 16 B aligned."""
+
+    if n_format_i32:
+
+        @fx.struct
+        class PackFormatStorage:
+            pack: fx.Array[fx.Int32, n_i32, 16]
+            formats: fx.Array[fx.Int32, n_format_i32, 16]
+
+        return PackFormatStorage
 
     @fx.struct
     class PackStorage:
@@ -574,8 +588,18 @@ def make_pack_storage(n_i32: int):
     return PackStorage
 
 
-def make_pack_norm_storage(n_i32: int, n_red_f32: int):
+def make_pack_norm_storage(n_i32: int, n_red_f32: int, n_format_i32: int = 0):
     """``make_pack_storage`` plus *n_red_f32* fp32 words of norm partial sums."""
+
+    if n_format_i32:
+
+        @fx.struct
+        class PackNormFormatStorage:
+            pack: fx.Array[fx.Int32, n_i32, 16]
+            red: fx.Array[fx.Float32, n_red_f32, 16]
+            formats: fx.Array[fx.Int32, n_format_i32, 16]
+
+        return PackNormFormatStorage
 
     @fx.struct
     class PackNormStorage:
