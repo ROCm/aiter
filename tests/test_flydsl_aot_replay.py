@@ -183,11 +183,11 @@ config = get_GEMM_A16W16_config(
 )
 # a missed row falls back to another kernel and would never read the cache
 assert config and config["libtype"] == "flydsl", config
-# small integers: every product and partial sum is exact, and a wrong K-slice,
-# row or stride changes the result
-ks = torch.arange(k, device="cuda")
-a = torch.stack([(ks + 3 * i) % 7 - 3 for i in range(m)]).to(torch.bfloat16)
-w = torch.stack([(5 * ks + j) % 5 - 2 for j in range(n)]).to(torch.bfloat16)
+# seeded values in {-1, 0, 1}: sums stay exact and within bf16's exact integer range
+# (|out| <= 161 for this seed), and a dropped K-slice or swapped row/column changes the result
+g = torch.Generator().manual_seed(0)
+a = torch.randint(-1, 2, (m, k), generator=g).to("cuda", torch.bfloat16)
+w = torch.randint(-1, 2, (n, k), generator=g).to("cuda", torch.bfloat16)
 ref = (a.float() @ w.float().t()).to(torch.bfloat16)
 torch.testing.assert_close(gemm_a16w16(a, w, otype=torch.bfloat16), ref, rtol=0, atol=0)
 """
