@@ -13,11 +13,9 @@ from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import _online_tune_fmoe, moe_sorting
 from aiter.jit.core import (
-    AITER_CSRC_DIR,
     AITER_ROOT_DIR,
-    PY,
     bd_dir,
     mp_lock,
 )
@@ -441,27 +439,41 @@ def get_2stage_cfgs(
     )
 
     def MainFunc():
-        with open(untune_file, "a") as f:
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
-        logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+        _online_tune_fmoe(
+            untune_file,
+            tune_file,
+            profile_file,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
         )
-
-    def FinalFunc():
-        logger.info("\033[0m")
 
     cfg = cfg_2stages.get(keys, None)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
-        mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-        cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = cfg_2stages.get(keys, None)
-        if cfg is None:
-            logger.warning(f"Fmoe tuning not support for {keys}")
+        try:
+            mp_lock(lock_path, MainFunc=MainFunc)
+        except RuntimeError as e:
+            logger.error(str(e))
+        else:
+            # Processes that waited on the lock never see the tuner's exit
+            # status, so a missing row here can also mean the tuner failed.
+            cfg_2stages = get_cfg_2stages(tune_file)
+            cfg = cfg_2stages.get(keys, None)
+            if cfg is None:
+                logger.warning(
+                    f"[fused_moe] no tuned row for {keys} after online tune "
+                    "(tuner failed or found no kernel); using default configs"
+                )
 
     if cfg is None:
         ksplit = 0

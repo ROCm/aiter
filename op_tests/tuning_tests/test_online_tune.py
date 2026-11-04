@@ -8,7 +8,8 @@ Tests the online tuning decision path in fused_moe.py / fused_moe_dp_shared_expe
   - Config missing + AITER_ONLINE_TUNE=0 -> skip online tune
   - Config missing + AITER_ONLINE_TUNE=1 -> trigger mp_lock, reload cfg
   - Tune succeeds -> new config used
-  - Tune fails -> cfg stays None, warning logged
+  - Tuner raises -> error logged, cfg stays None, table not reloaded
+  - Reload finds no row (e.g. a waiter after a failed tune) -> warning logged
   - mp_lock synchronization: first acquirer runs MainFunc, waiters get None
   - MainFunc writes correct shape row to untuned CSV
 """
@@ -58,17 +59,21 @@ def simulate_online_tune_path(
     reload_fn,
     logger_obj,
 ):
-    """Simulate the AITER_ONLINE_TUNE decision logic from fused_moe.py:837-844.
+    """Simulate the AITER_ONLINE_TUNE decision logic of get_2stage_cfgs.
 
     This mirrors the production code pattern:
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
             lock_path = ...
-            mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-            cfg_2stages = get_cfg_2stages(tune_file)
-            cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
-            if cfg is None:
-                logger.warning(f"Fmoe tuning not support for {keys}")
+            try:
+                mp_lock(lock_path, MainFunc=MainFunc)
+            except RuntimeError as e:
+                logger.error(str(e))
+            else:
+                cfg_2stages = get_cfg_2stages(tune_file)
+                cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+                if cfg is None:
+                    logger.warning(f"[fused_moe] no tuned row for {keys} ...")
 
     Returns (cfg, cfg_2stages, mp_lock_called).
     """
@@ -76,11 +81,18 @@ def simulate_online_tune_path(
     cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and env_online_tune == "1":
         mp_lock_called = True
-        mp_lock_fn()
-        cfg_2stages = reload_fn()
-        cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
-        if cfg is None:
-            logger_obj.warning(f"Fmoe tuning not support for {keys}")
+        try:
+            mp_lock_fn()
+        except RuntimeError as e:
+            logger_obj.error(str(e))
+        else:
+            cfg_2stages = reload_fn()
+            cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+            if cfg is None:
+                logger_obj.warning(
+                    f"[fused_moe] no tuned row for {keys} after online tune "
+                    "(tuner failed or found no kernel); using default configs"
+                )
     return cfg, cfg_2stages, mp_lock_called
 
 
@@ -160,14 +172,35 @@ class TestOnlineTuneDecision(unittest.TestCase):
         self.assertEqual(cfg, SAMPLE_CFG)
         self.assertIs(updated_cfgs, new_cfg_2stages)
 
-    def test_config_missing_env_on_tune_fails(self):
-        """AITER_ONLINE_TUNE=1 + tune fails -> cfg stays None, warning logged."""
-        cfg_2stages = {}
+    def test_config_missing_env_on_tune_raises(self):
+        """AITER_ONLINE_TUNE=1 + tuner raises -> error logged, no reload, cfg None."""
+        logger_obj = logging.getLogger("test_online_tune")
+
+        def failed_tune():
+            raise RuntimeError("[fused_moe] online tune exited 1")
+
+        with self.assertLogs(logger_obj, level="WARNING") as cm:
+            cfg, _, mp_lock_called = simulate_online_tune_path(
+                {},
+                SAMPLE_KEYS,
+                "1",
+                mp_lock_fn=failed_tune,
+                reload_fn=lambda: self.fail("reload should not be called"),
+                logger_obj=logger_obj,
+            )
+        self.assertTrue(mp_lock_called)
+        self.assertIsNone(cfg)
+        self.assertEqual(len(cm.records), 1)
+        self.assertEqual(cm.records[0].levelno, logging.ERROR)
+        self.assertIn("online tune exited 1", cm.records[0].getMessage())
+
+    def test_config_missing_env_on_reload_has_no_row(self):
+        """A waiter (mp_lock returns None) that reloads no row -> warning, cfg None."""
         logger_obj = logging.getLogger("test_online_tune")
 
         with self.assertLogs(logger_obj, level="WARNING") as cm:
             cfg, _, mp_lock_called = simulate_online_tune_path(
-                cfg_2stages,
+                {},
                 SAMPLE_KEYS,
                 "1",
                 mp_lock_fn=lambda: None,
@@ -176,7 +209,10 @@ class TestOnlineTuneDecision(unittest.TestCase):
             )
         self.assertTrue(mp_lock_called)
         self.assertIsNone(cfg)
-        self.assertTrue(any("Fmoe tuning not support" in msg for msg in cm.output))
+        self.assertTrue(
+            any("tuner failed or found no kernel" in msg for msg in cm.output)
+        )
+        self.assertFalse(any("Fmoe tuning not support" in msg for msg in cm.output))
 
     def test_cfg_2stages_none_env_on(self):
         """When cfg_2stages is None (no CSV loaded at all), should still trigger tune."""
@@ -267,81 +303,146 @@ class TestMpLock(unittest.TestCase):
             )
 
 
-class TestMainFuncCSVWrite(unittest.TestCase):
-    """Tests that the MainFunc closure writes the correct row to the untuned CSV."""
+UNTUNED_HEADER = (
+    "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+    "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+)
+
+
+class TestOnlineTuneFmoe(unittest.TestCase):
+    """Tests for the real _online_tune_fmoe shared by both online-tune paths."""
+
+    @staticmethod
+    def _shape_args():
+        import torch
+
+        return (
+            16,
+            7168,
+            256,
+            256,
+            8,
+            "ActivationType.Silu",
+            torch.bfloat16,
+            torch.float8_e4m3fnuz,
+            torch.uint32,
+            "QuantType.per_Token",
+            True,
+            False,
+        )
+
+    def _run(self, tmp, returncode, untuned_content=""):
+        """Call _online_tune_fmoe with the tuner subprocess faked to exit returncode.
+
+        Returns (raised exception or None, untuned lines, tuner commands, aiter log lines).
+        """
+        import subprocess
+
+        fused_moe = importlib.import_module("aiter.fused_moe")
+        untune_file = os.path.join(tmp, "untuned_fmoe.csv")
+        tune_file = os.path.join(tmp, "tuned_fmoe.csv")
+        profile_file = os.path.join(tmp, "profile_fmoe.csv")
+        with open(untune_file, "w") as f:
+            f.write(untuned_content)
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            if kwargs.get("check") and returncode != 0:
+                raise subprocess.CalledProcessError(returncode, cmd)
+            return subprocess.CompletedProcess(cmd, returncode)
+
+        raised = None
+        with (
+            patch.object(fused_moe.subprocess, "run", fake_run),
+            self.assertLogs("aiter", level="INFO") as logs,
+        ):
+            try:
+                fused_moe._online_tune_fmoe(
+                    untune_file, tune_file, profile_file, *self._shape_args()
+                )
+            except RuntimeError as e:
+                raised = e
+        with open(untune_file) as f:
+            lines = f.read().split("\n")
+        return raised, lines, commands, logs.output
 
     def test_writes_header_when_empty(self):
-        """MainFunc should write CSV header when file is empty."""
         with tempfile.TemporaryDirectory() as tmp:
-            untune_file = os.path.join(tmp, "untuned_fmoe.csv")
-            with open(untune_file, "w"):
-                pass
-
-            token, model_dim, inter_dim, expert, topk = 16, 7168, 256, 256, 8
-            activation = "ActivationType.Silu"
-            dtype = "torch.bfloat16"
-            q_dtype_a = "torch.float8_e4m3fnuz"
-            q_dtype_w = "torch.float8_e4m3fnuz"
-            q_type = "QuantType.per_Token"
-            use_g1u1 = 1
-            doweight_stage1 = 0
-
-            with open(untune_file, "a") as f:
-                if os.path.getsize(untune_file) == 0:
-                    f.write(
-                        "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
-                        "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
-                    )
-                f.write(
-                    f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},"
-                    f"{dtype},{q_dtype_a},{q_dtype_w},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-                )
-
-            with open(untune_file) as f:
-                lines = f.read().strip().split("\n")
-            self.assertEqual(len(lines), 2, "Should have header + 1 data row")
-            self.assertIn("token,model_dim", lines[0])
-            parts = lines[1].split(",")
-            self.assertEqual(parts[0], "16")
-            self.assertEqual(parts[1], "7168")
-            self.assertEqual(parts[3], "256")
+            _, lines, _, _ = self._run(tmp, returncode=0)
+        self.assertEqual(lines[0], UNTUNED_HEADER)
+        self.assertEqual(
+            lines[1],
+            "16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
+            "torch.float8_e4m3fnuz,torch.int4,QuantType.per_Token,1,0",
+        )
+        self.assertEqual(len(lines), 2)
 
     def test_appends_without_header_when_nonempty(self):
-        """MainFunc should NOT re-write header when file already has content."""
+        existing = UNTUNED_HEADER + "\n512,6144,4096,8,2,ActivationType.Silu,..."
+        with tempfile.TemporaryDirectory() as tmp:
+            _, lines, _, _ = self._run(tmp, returncode=0, untuned_content=existing)
+        self.assertEqual(sum(line == UNTUNED_HEADER for line in lines), 1)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[2].startswith("16,7168,256,"))
+
+    def test_runs_tuner_on_last_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, commands, _ = self._run(tmp, returncode=0)
+        self.assertEqual(len(commands), 1)
+        cmd = commands[0]
+        self.assertTrue(cmd[1].endswith("gemm_moe_tune.py"))
+        self.assertEqual(
+            cmd[cmd.index("-i") + 1], os.path.join(tmp, "untuned_fmoe.csv")
+        )
+        self.assertEqual(cmd[cmd.index("-o") + 1], os.path.join(tmp, "tuned_fmoe.csv"))
+        self.assertIn("--last", cmd)
+
+    def test_success_does_not_raise_and_prints_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raised, _, _, logs = self._run(tmp, returncode=0)
+        self.assertIsNone(raised)
+        self.assertTrue(any("[Hint] tuned configs are saved" in m for m in logs))
+
+    def test_failure_raises_without_hint(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raised, _, _, logs = self._run(tmp, returncode=1)
+        self.assertIsInstance(raised, RuntimeError)
+        self.assertIn("online tune exited 1", str(raised))
+        self.assertIsInstance(raised.__cause__, subprocess.CalledProcessError)
+        self.assertFalse(any("[Hint]" in m for m in logs))
+        self.assertTrue(any(m.endswith("\033[0m") for m in logs))
+
+    def test_unwritable_untuned_file_raises_without_running_tuner(self):
+        fused_moe = importlib.import_module("aiter.fused_moe")
+        commands = []
         with tempfile.TemporaryDirectory() as tmp:
             untune_file = os.path.join(tmp, "untuned_fmoe.csv")
-            header = (
-                "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
-                "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
-            )
-            existing_row = "512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0"
-            with open(untune_file, "w") as f:
-                f.write(header + "\n" + existing_row)
-
-            token, model_dim, inter_dim, expert, topk = 16, 7168, 256, 256, 8
-            activation = "ActivationType.Silu"
-            dtype = "torch.bfloat16"
-            q_dtype_a = "torch.float8_e4m3fnuz"
-            q_dtype_w = "torch.float8_e4m3fnuz"
-            q_type = "QuantType.per_Token"
-            use_g1u1 = 1
-            doweight_stage1 = 0
-
-            with open(untune_file, "a") as f:
-                if os.path.getsize(untune_file) == 0:
-                    f.write(header)
-                f.write(
-                    f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},"
-                    f"{dtype},{q_dtype_a},{q_dtype_w},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+            os.mkdir(untune_file)
+            with (
+                patch.object(
+                    fused_moe.subprocess,
+                    "run",
+                    lambda cmd, **kwargs: commands.append(cmd),
+                ),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                fused_moe._online_tune_fmoe(
+                    untune_file,
+                    os.path.join(tmp, "tuned_fmoe.csv"),
+                    os.path.join(tmp, "profile_fmoe.csv"),
+                    *self._shape_args(),
                 )
+        self.assertIn("online tune could not write", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertEqual(commands, [])
 
-            with open(untune_file) as f:
-                lines = f.read().strip().split("\n")
-            self.assertEqual(len(lines), 3, "Should have header + 2 data rows")
-            header_count = sum(
-                1 for line in lines if line.startswith("token,model_dim")
-            )
-            self.assertEqual(header_count, 1, "Header should appear only once")
+    def test_shared_expert_path_uses_same_helper(self):
+        fused_moe = importlib.import_module("aiter.fused_moe")
+        shared = importlib.import_module("aiter.fused_moe_dp_shared_expert")
+        self.assertIs(shared._online_tune_fmoe, fused_moe._online_tune_fmoe)
 
 
 class TestGetCfg2stages(unittest.TestCase):
