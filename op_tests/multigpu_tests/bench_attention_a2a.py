@@ -564,15 +564,13 @@ def main():
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
-    from aiter.ops.flydsl.communication_ops_host_utils import (
-        detect_link,
-        resolve_inbox_memory,
-    )
+    from aiter.ops.flydsl.allreduce_host_shared import _resolve_inbox_flags
+    from aiter.ops.flydsl.allreduce_policy import detect_link
 
     args.link = detect_link()
-    args.resolved_inbox = resolve_inbox_memory(
+    args.resolved_inbox = _resolve_inbox_flags(
         args.inbox_memory, args.world_size, args.link
-    )
+    )[1]
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 

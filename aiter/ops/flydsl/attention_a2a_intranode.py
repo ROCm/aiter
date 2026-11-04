@@ -21,7 +21,8 @@ from aiter.ops.mha_v4_quant import (
     mxfp6_v_tiles,
 )
 
-from .communication_ops_host_utils import make_symmetric_heap, resolve_inbox_memory
+from .allreduce_host_shared import _resolve_inbox_flags
+from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,
     make_attention_a2a_dequant_jit,
@@ -416,7 +417,7 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
-        self.inbox_memory = resolve_inbox_memory(inbox_memory, world_size)
+        self.inbox_memory = _resolve_inbox_flags(inbox_memory, world_size)[1]
         # The MoRI heap checks rank against MoRI's PE here; the IPC heap is
         # local until publish().
         heap = make_symmetric_heap(

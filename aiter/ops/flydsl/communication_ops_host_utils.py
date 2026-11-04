@@ -5,17 +5,11 @@
 
 from __future__ import annotations
 
-import functools
-import logging
-import os
-from pathlib import Path
-
 import torch
 import torch.distributed as dist
 
+from .allreduce_host_shared import _resolve_inbox_flags
 from .ipc_heap import UncachedIpcHeap
-
-logger = logging.getLogger("aiter")
 
 
 def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
@@ -32,90 +26,6 @@ def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
             )
         table[peer] = ptr
     return table
-
-
-# Interconnect
-# ============
-
-LINKS = ("pcie", "xgmi")
-# Read only when the KFD topology cannot be; the same variable as the FlyDSL
-# all-reduce, so one setting covers every FlyDSL collective on a host.
-LINK_ENV = "AITER_FLY_AR_LINK"
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
-
-# KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
-_HSA_IOLINK_TYPE_XGMI = 11
-_KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
-
-
-def probe_xgmi_peer_links() -> bool | None:
-    """Whether any GPU-to-GPU link on this host is xGMI rather than PCIe, from
-    the KFD topology. None when the topology cannot be read.
-
-    The arch cannot tell: an MI350X (xGMI) and an MI350P (PCIe-only) both
-    report ``gfx950``, and the right inbox memory type is opposite on the two.
-
-    Both ``io_links`` and ``p2p_links`` are scanned. KFD fills ``p2p_links``
-    only for peers reached through a host bridge, so on a directly connected
-    xGMI mesh the peers appear solely under ``io_links``.
-
-    The answer is per host: one xGMI link classifies the whole node as xGMI,
-    which holds for the uniform single-node systems this targets.
-    """
-    try:
-        found = False
-        for subdir in ("io_links", "p2p_links"):
-            for props in _KFD_NODES.glob(f"*/{subdir}/*/properties"):
-                found = True
-                for line in props.read_text().splitlines():
-                    field, _, value = line.partition(" ")
-                    if field == "type" and int(value) == _HSA_IOLINK_TYPE_XGMI:
-                        return True
-        return False if found else None
-    except (OSError, ValueError):
-        logger.debug("FlyDSL comm: cannot read KFD topology", exc_info=True)
-        return None
-
-
-@functools.lru_cache(maxsize=1)
-def _probe_link() -> str | None:
-    xgmi = probe_xgmi_peer_links()
-    return None if xgmi is None else "xgmi" if xgmi else "pcie"
-
-
-def detect_link() -> str:
-    """``"xgmi"`` or ``"pcie"`` for this host: the KFD topology, or
-    ``AITER_FLY_AR_LINK`` when the topology cannot be read."""
-    link = _probe_link()
-    if link is not None:
-        return link
-    raw = os.environ.get(LINK_ENV, "").strip().lower()
-    if raw not in LINKS:
-        raise ValueError(
-            "cannot tell if this host has xGMI or PCIe links: the KFD topology "
-            f"is not readable. Set {LINK_ENV} to one of {LINKS}, got {raw!r}."
-        )
-    return raw
-
-
-def resolve_inbox_memory(mode: str, world_size: int, link: str | None = None) -> str:
-    """The memory type an ``inbox_memory`` mode allocates peer-written buffers in.
-
-    ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
-    TP2, where it is ``uncached`` on PCIe too. Over PCIe, uncached peer writes
-    serialize per destination as soon as a GPU writes to more than one peer;
-    fine-grained memory is cacheable, so its L2 combines the writes into full
-    PCIe packets, and a release fence publishes them.
-    """
-    if mode not in INBOX_MEMORY_MODES:
-        raise ValueError(
-            f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
-        )
-    if mode != "auto":
-        return mode
-    if int(world_size) == 2 or (link or detect_link()) == "xgmi":
-        return "uncached"
-    return "finegrained"
 
 
 # Symmetric heaps
@@ -184,13 +94,6 @@ class _DeviceBuffer:
         }
 
 
-# hipExtMallocWithFlags mode of each IPC heap memory type.
-_IPC_FLAGS = {
-    "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
-    "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
-}
-
-
 class IpcSymmetricHeap:
     """HIP IPC buffers in a chosen memory type, exchanged over *group*.
 
@@ -200,14 +103,9 @@ class IpcSymmetricHeap:
     """
 
     def __init__(self, *, rank, world_size, device, group, memory):
-        if memory not in _IPC_FLAGS:
-            raise ValueError(
-                f"memory must be one of {tuple(_IPC_FLAGS)}, got {memory!r}"
-            )
-        self.memory = memory
+        self._flags, self.memory = _resolve_inbox_flags(memory, world_size)
         self.rank, self.world_size, self.device = rank, world_size, device
         self.group = group
-        self._flags = _IPC_FLAGS[memory]
         self._local = []
         # Per allocation, the base address on every rank; ``None`` for the
         # allocations not yet published.
