@@ -445,6 +445,7 @@ def verify_auto_variant(s_q, s_k, num_heads):
 # variant's epilogue and window handling is reached.
 _PRODUCTION_CASE = {"s_q": 67, "s_k": 1500}
 _PRODUCTION_WINDOWS = ("causal", "past_end")
+_PRODUCTION_EXTRA_HEAD_DIMS = (512,)
 
 
 @contextlib.contextmanager
@@ -475,7 +476,7 @@ def verify_production_variants(num_heads, head_dims, clean_logits):
     for tag, nh, hd, cl, window in itertools.product(
         _auto_variants(),
         num_heads,
-        head_dims,
+        sorted({*head_dims, *_PRODUCTION_EXTRA_HEAD_DIMS}),
         clean_logits,
         _PRODUCTION_WINDOWS,
     ):
@@ -509,6 +510,45 @@ def verify_production_variants(num_heads, head_dims, clean_logits):
                 "status": status,
             }
         )
+    return rows, failures
+
+
+# (s_q, s_k) on every side of the gfx950 route bounds (256/2048 rows, 4096 KV).
+_ROUTE_SHAPES = ((1, 113), (128, 1024), (256, 8192), (1024, 1560), (4096, 4096))
+
+
+def verify_auto_routed_head_dims(num_heads):
+    """Auto-routed calls at the extra head dims: every route `_auto_variant`
+    picks must tile the problem and fit LDS (the routes are tuned at D <= 128),
+    and the routed op, unforced, must match the reference. gfx950 only.
+    Returns (rows, failures) in the shape main() reports them.
+    """
+    rows, failures = [], []
+    for nh, hd, (s_q, s_k) in itertools.product(
+        num_heads, _PRODUCTION_EXTRA_HEAD_DIMS, _ROUTE_SHAPES
+    ):
+        label = f"auto-routed nh={nh} hd={hd} s_q={s_q} s_k={s_k}"
+        try:
+            tag = _auto_variant(s_q, s_k, nh, hd)
+            if not _variant_supports(tag, nh, hd):
+                raise AssertionError(f"routed to {tag}, which cannot run at hd={hd}")
+            if (s_q, s_k) == tuple(_PRODUCTION_CASE.values()):
+                verify_fp8_mqa_logits(
+                    s_q,
+                    s_k,
+                    nh,
+                    hd,
+                    _DEFAULT_Q_DTYPES[0],
+                    _DEFAULT_KV_DTYPES[0],
+                    True,
+                    "causal",
+                )
+            status = "ok"
+        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+            aiter.logger.error("FAILED auto_routed_head_dim case: %s: %s", label, exc)
+            failures.append(("auto_routed_head_dim", label, exc))
+            status = "FAIL"
+        rows.append({"case": label, "status": status})
     return rows, failures
 
 
@@ -1040,6 +1080,14 @@ def main():
         )
         failures.extend(variant_failures)
         total += len(rows)
+        if get_gfx() == "gfx950":
+            auto_rows, auto_failures = verify_auto_routed_head_dims(args.num_heads)
+            failures.extend(auto_failures)
+            total += len(auto_rows)
+            aiter.logger.info(
+                "fp8_mqa_logits auto_routed_head_dim summary (markdown):\n%s",
+                pd.DataFrame(auto_rows).to_markdown(index=False),
+            )
         aiter.logger.info(
             "fp8_mqa_logits production_variant summary (markdown):\n%s",
             pd.DataFrame(rows).to_markdown(index=False),

@@ -24,6 +24,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
 from ..kernels_common import (
     ceildiv,
     warp_reduce_scatter_strided,
@@ -1077,6 +1079,11 @@ def _build_kernel_mfma_lds_pipe(
     TILE_COLS = max(BKV, 64 * ceildiv(BKV, 64))
     SLOT_BYTES = KV_BYTES + SCALE_BYTES
     SLOT_I32 = SLOT_BYTES // 4
+    _LDS_CAPACITY = get_lds_capacity_bytes()
+    assert NUM_BUFFERS * SLOT_BYTES <= _LDS_CAPACITY, (
+        f"{NUM_BUFFERS} LDS slots of {SLOT_BYTES} bytes exceed the "
+        f"{_LDS_CAPACITY} bytes of LDS per workgroup; lower num_buffers or block_kv"
+    )
     SCALE_DW = KV_BYTES // 4  # slot-relative dword offset of the scales
     # gfx950 global->LDS DMA supports size=16 (dwordx4).
     DMA_BYTES = 16
@@ -1108,17 +1115,31 @@ def _build_kernel_mfma_lds_pipe(
     # 16 consecutive KV columns n at the same head-dim chunk, so with rows of
     # D bytes they cover only the 256/D distinct row positions within a bank
     # line. XOR-ing the 32-byte chunk index with the row bits above the bank
-    # line (n >> log2(256/D)) spreads them over the NC chunk positions too.
+    # line (n >> log2(256/D)) spreads them over the chunk positions of the line
+    # too. Once a row spans several bank lines (D > 256) the row bits start at
+    # log2(D) instead, and the chunk index is XORed with them.
     #
     # Chunks stay whole (base = log2 frag_bytes), so every 16-byte DMA write
     # and both ds_read_b128 of a fragment stay contiguous.
-    NC = D // mfma.frag_bytes  # B-fragment chunks per column
+    #
+    # The swizzle is applied on both the DMA source and the read view, so it
+    # must be its own inverse: Swizzle<B, M, S> XORs offset bits [M+S, M+S+B)
+    # into [M, M+B), which round-trips only if S >= B (the source bits do not
+    # overlap the bits they modify). B is capped at the 8 chunks of a bank
+    # line, and the source bits start at the first row bit, log2(D) once rows
+    # outgrow a bank line (D > 256).
     _BANK_LINE_BYTES = 256  # 64 banks x 4 B
     _FRAG_LOG2 = mfma.frag_bytes.bit_length() - 1
+    _BANK_LINE_LOG2 = _BANK_LINE_BYTES.bit_length() - 1
+    _CHUNKS_PER_LINE = _BANK_LINE_BYTES // mfma.frag_bytes
     LDS_SWZ = (
-        NC.bit_length() - 1,
+        min(D // mfma.frag_bytes, _CHUNKS_PER_LINE).bit_length() - 1,
         _FRAG_LOG2,
-        _BANK_LINE_BYTES.bit_length() - 1 - _FRAG_LOG2,
+        max(_BANK_LINE_LOG2, D.bit_length() - 1) - _FRAG_LOG2,
+    )
+    assert LDS_SWZ[2] >= LDS_SWZ[0], (
+        f"LDS swizzle Swizzle{LDS_SWZ} is not an involution (S < B); it is "
+        "applied on both the DMA source and the read view"
     )
 
     # The B-fragment reads view one n-tile (MFMA_N KV columns) at a time, with
@@ -1572,7 +1593,9 @@ def _build_kernel_mfma_lds_pipe(
                 _compute(read)
             elif const_expr(not _need_barrier_b):
                 # The DMA targets another slot (NB > PD), so the reads can
-                # follow it and a skipped tile reads nothing.
+                # follow it and a skipped tile reads nothing. Without
+                # lds_scales, the column-scale loads come after the DMAs
+                # and wait on them. Issuing them first was not faster.
                 _dma_next()
 
                 def _read_and_compute():

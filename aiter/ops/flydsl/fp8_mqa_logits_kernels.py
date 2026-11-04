@@ -26,7 +26,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 from .kernels.mqa_logits.fp8_mqa_logits import (
     _MFMA16,
@@ -86,7 +86,8 @@ class _SplitPolicy:
         column-equivalent scales with the variant's ``block_kv``.
     cu_oversub : int
         Target total blocks as a multiple of the device CU count. Used only by
-        the fixed-oversubscription path (``block_overhead_tiles=None``).
+        the fixed-oversubscription path (``block_overhead_tiles`` is None, or
+        ``blocks_per_cu`` is unknown).
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
     block_overhead_tiles : int | None
@@ -94,18 +95,11 @@ class _SplitPolicy:
         (``_splits_by_wave_cost``). None keeps the ``cu_oversub`` target.
     streaming_lowh_cu_oversub : int
         Oversub target for the streaming, ``num_heads<=32`` regime specifically,
-        used only on the fixed-oversubscription path
-        (``block_overhead_tiles=None``). That regime is MFMA-latency / occupancy-
-        bound, not bandwidth-bound, so it wants an *aggressive* oversub to keep
-        every CU pinned through ramp/tail and hide the dependent ReLU/head-
-        reduce behind resident waves.
-    streaming_lowh_residency : int
-        Occupancy-derived replacement for ``streaming_lowh_cu_oversub`` on the
-        streaming ``num_heads<=32`` regime: the streaming block target is
-        ``streaming_lowh_residency * blocks_per_cu * cu_count`` instead of a
-        fixed blocks/CU constant. It expresses "how many full
-        waves-per-SIMD residencies of grid depth to queue". Falls back to
-        ``streaming_lowh_cu_oversub`` when ``blocks_per_cu`` is unknown.
+        used only on the fixed-oversubscription path (``block_overhead_tiles``
+        is None, or ``blocks_per_cu`` is unknown). That regime is
+        MFMA-latency / occupancy-bound, not bandwidth-bound, so it wants an
+        *aggressive* oversub to keep every CU pinned through ramp/tail and
+        hide the dependent ReLU/head-reduce behind resident waves.
     """
 
     min_seq_len_kv: int
@@ -114,7 +108,6 @@ class _SplitPolicy:
     fallback_cu: int
     block_overhead_tiles: int | None = None
     streaming_lowh_cu_oversub: int = 0
-    streaming_lowh_residency: int = 0
 
 
 _SPLIT_POLICIES = {
@@ -127,10 +120,6 @@ _SPLIT_POLICIES = {
         fallback_cu=304,
         block_overhead_tiles=8,  # fitted on MI325X
     ),
-    # MI355X (256 CU). gfx942's occupancy-aware wave-cost model and overhead;
-    # the gfx950 routes (_GFX950_ROUTES) were selected under it. The streaming
-    # fields serve only a launch that cannot query occupancy (the first one
-    # during graph capture).
     "gfx950": _SplitPolicy(
         min_seq_len_kv=0,
         min_tiles_per_split=2,
@@ -138,7 +127,6 @@ _SPLIT_POLICIES = {
         fallback_cu=256,
         block_overhead_tiles=8,
         streaming_lowh_cu_oversub=12,
-        streaming_lowh_residency=4,
     ),
 }
 
@@ -236,13 +224,8 @@ def _auto_num_splits(
         )
     target_blocks = pol.cu_oversub * cu_count
     if aggressive:
-        streaming_target = 0
-        if pol.streaming_lowh_residency and blocks_per_cu is not None:
-            streaming_target = pol.streaming_lowh_residency * blocks_per_cu * cu_count
-        elif pol.streaming_lowh_cu_oversub:
-            streaming_target = pol.streaming_lowh_cu_oversub * cu_count
         # never below the conservative non-streaming target
-        target_blocks = max(target_blocks, streaming_target)
+        target_blocks = max(target_blocks, pol.streaming_lowh_cu_oversub * cu_count)
     if grid_x >= target_blocks:
         return 1
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
@@ -341,12 +324,26 @@ def _register_variants(entries):
         _VARIANT_MFMA_K[tag] = mfma.MFMA_K
 
 
+def _variant_lds_bytes(tag, head_size):
+    """LDS bytes ``tag``'s kernel allocates at ``head_size`` (0: direct load)."""
+    m = _TAG_RE.match(tag)
+    if m is None or not m.group("lds"):
+        return 0
+    bkv = int(m.group("bkv")) if m.group("bkv") else _BLOCK_KV
+    # lds_scales appends the tile's f32 kv_scales, padded to whole 64-lane DMAs.
+    scale_bytes = -(-bkv // 64) * 64 * 4 if m.group("ls") else 0
+    return int(m.group("lds")) * (bkv * head_size + scale_bytes)
+
+
 def _variant_supports(tag, num_heads, head_size):
-    """Whether ``tag``'s MFMA atom tiles ``num_heads`` x ``head_size``."""
+    """Whether ``tag``'s MFMA atom tiles ``num_heads`` x ``head_size`` and its
+    LDS slots fit."""
     if _variant_builder(tag) is None:
         return False
-    return num_heads % _VARIANT_MFMA_M[tag] == 0 and (
-        head_size % _VARIANT_MFMA_K[tag] == 0
+    return (
+        num_heads % _VARIANT_MFMA_M[tag] == 0
+        and head_size % _VARIANT_MFMA_K[tag] == 0
+        and _variant_lds_bytes(tag, head_size) <= get_lds_capacity_bytes()
     )
 
 
@@ -440,20 +437,9 @@ class _Route:
 
 # Tuned gfx950 routes, (num_heads, head_size) class -> routes by seq_len,
 # shortest first, then by seq_len_kv within one seq_len bound, the last of each
-# unbounded. Each tag is the best geomean time, under the split policy
-# (_auto_num_splits), over the tuned problems of its (seq_len, seq_len_kv)
-# window, out of the winners of searches over the whole builder knob space.
-# The problems: every (num_heads, head_size) at 128x1024,
-# 256x8192, 1024x1024, 1024x1560 and 4096x4096 under causal, misaligned and
-# past-the-end windows, plus causal 256x32768, 1024x{2k,4k,8k,16k,32k,64k},
-# 4096x{8k,16k,32k} and (D128) 8192x8192, clean-logits causal at the first
-# five shapes and 1024x32768 and 4096x16384, and (D128, H32 and H64) the
-# DSv4/GLM block-diagonal batch_causal model shapes. Causal and batch_causal
-# are weighted 2x as the production windows. See
-# op_tests/tune_flydsl_fp8_mqa_logits.py (--auto-split).
-# A route is tuned at the class's own (num_heads, head_size): other sizes that
-# map to the class run untuned and may spill. Re-tune after a kernel or split
-# policy change. The tags carry no _ns: the split policy sizes grid.y per shape.
+# unbounded. A route is tuned at the class's own (num_heads, head_size): other sizes that
+# map to the class run untuned and may spill.
+_GFX950_LARGE_HEAD_FALLBACK = "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"
 _GFX950_ROUTES = {
     (32, 64): (
         _Route(256, "mfma32x32x64_bkv64_r1_w1_lds4_pd1_swp_rs_hfma_wpe3", 4096),
@@ -548,11 +534,18 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
     if _ARCH == "gfx950":
         h = 32 if num_heads <= 32 else (128 if num_heads >= 128 else 64)
         routes = _GFX950_ROUTES[(h, 128 if head_size >= 128 else 64)]
+        # Routes are tuned at D=64/128; a larger head size may overflow a
+        # route's LDS slots (causgin build-time error), so the first
+        # admitted route that fits is selected.
         return next(
-            r.tag
-            for r in routes
-            if (r.max_seq_len is None or seq_len <= r.max_seq_len)
-            and (r.max_seq_len_kv is None or seq_len_kv <= r.max_seq_len_kv)
+            (
+                r.tag
+                for r in routes
+                if (r.max_seq_len is None or seq_len <= r.max_seq_len)
+                and (r.max_seq_len_kv is None or seq_len_kv <= r.max_seq_len_kv)
+                and _variant_lds_bytes(r.tag, head_size) <= get_lds_capacity_bytes()
+            ),
+            _GFX950_LARGE_HEAD_FALLBACK,
         )
     raise NotImplementedError(
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
@@ -626,9 +619,7 @@ def _policy_num_splits(
     pol = _split_policy()
     aggressive = _is_streaming_lowh(seq_len, seq_len_kv, num_heads)
     blocks_per_cu = None
-    if pol.block_overhead_tiles is not None or (
-        aggressive and pol.streaming_lowh_residency
-    ):
+    if pol.block_overhead_tiles is not None:
         blocks_per_cu = _max_blocks_per_cu(launcher, args)
     return _auto_num_splits(
         seq_len,
