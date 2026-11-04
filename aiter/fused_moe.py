@@ -1092,8 +1092,13 @@ def _herd_finalize_routes(
     doweight_stage1: bool,
     stage2_scatter: Stage2ScatterContext | None,
     num_local_tokens: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Drop each row's Top-(K+1) HERD candidates to K renormalized routes."""
+):
+    """Drop each row's Top-(K+1) HERD candidates to K renormalized routes.
+
+    Returns ``(topk_weight, topk_ids, candidates)``. When the gfx1250 grouped
+    MoE can finalize inside its route kernel, the two are unfilled and
+    ``candidates`` is set: the MoE path fills them before reading them.
+    """
     if get_gfx() != "gfx1250":
         raise ValueError("herd_topk is supported only on gfx1250")
     if topk_ids.shape[1] != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
@@ -1102,14 +1107,19 @@ def _herd_finalize_routes(
         raise ValueError(
             "HERD routing requires unmasked routes and doweight_stage1=False"
         )
-    from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
+    from aiter.ops.flydsl.herd_topk import HerdCandidates
 
-    return herd_finalize_candidates(
-        topk_weight,
-        topk_ids,
-        experts,
-        routed_scaling_factor,
-        num_valid_rows=num_local_tokens,
+    candidates = HerdCandidates(
+        topk_weight, topk_ids, experts, routed_scaling_factor, num_local_tokens
+    )
+    if not candidates.fusable():
+        return (*candidates.finalize(), None)
+    rows = topk_ids.shape[0]
+    device = topk_ids.device
+    return (
+        torch.empty((rows, herd_topk), dtype=torch.float32, device=device),
+        torch.empty((rows, herd_topk), dtype=torch.int32, device=device),
+        candidates,
     )
 
 
@@ -1184,20 +1194,8 @@ def fused_moe(
         )
         or shared_expert_id != -1
     )
-    if herd_topk:
-        if has_shared_expert:
-            raise ValueError("herd_topk does not support fused shared experts")
-        topk_weight, topk_ids = _herd_finalize_routes(
-            topk_weight,
-            topk_ids,
-            get_inter_dim(w1.shape, w2.shape)[0],
-            herd_topk,
-            herd_routed_scaling_factor,
-            expert_mask=expert_mask,
-            doweight_stage1=doweight_stage1,
-            stage2_scatter=stage2_scatter,
-            num_local_tokens=num_local_tokens,
-        )
+    if herd_topk and has_shared_expert:
+        raise ValueError("herd_topk does not support fused shared experts")
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
     if has_shared_expert:
@@ -1318,6 +1316,8 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1360,6 +1360,8 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1421,6 +1423,8 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1464,6 +1468,8 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1498,6 +1504,8 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1519,6 +1527,19 @@ def _fused_moe_impl(
     if block_size_M == -1:
         block_size_M = None
     """user API"""
+    herd = None
+    if herd_topk:
+        topk_weight, topk_ids, herd = _herd_finalize_routes(
+            topk_weight,
+            topk_ids,
+            get_inter_dim(w1.shape, w2.shape)[0],
+            herd_topk,
+            herd_routed_scaling_factor,
+            expert_mask=expert_mask,
+            doweight_stage1=doweight_stage1,
+            stage2_scatter=stage2_scatter,
+            num_local_tokens=num_local_tokens,
+        )
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
@@ -1609,10 +1630,13 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            herd=herd,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if herd is not None:
+        topk_weight, topk_ids = herd.finalize()
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (

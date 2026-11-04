@@ -602,6 +602,7 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    herd=None,  # HerdCandidates behind unfilled topk_weight/topk_ids
 ):
     import functools
 
@@ -623,6 +624,9 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    if herd is not None and (_compact or expert_mask is not None):
+        topk_weight, topk_ids = herd.finalize()
+        herd = None
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -787,6 +791,12 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif herd is not None:
+        _fuse_ep_route_quant = False
+        topk_weight, topk_ids, _masked_m, topids_to_rows, psum = herd.route_psum(
+            _align_m
+        )
+        ep_rowmap = None
     else:
         _fuse_ep_route_quant = False
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
@@ -841,7 +851,7 @@ def _grouped_a8w4_tdm_moe(
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             "route_max_m": int(max_m),
         }
-    else:
+    elif herd is None:  # the HERD route kernel returned psum with the routes
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
         # boundary (see the divisibility check above).
@@ -1405,6 +1415,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    herd=None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1713,6 +1724,7 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            herd=herd,
             **_tdm_kw,
         )
 
