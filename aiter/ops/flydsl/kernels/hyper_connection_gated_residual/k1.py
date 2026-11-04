@@ -1827,7 +1827,11 @@ def _k1_combine_norm_down(
     # select a tile height that does not divide a direct caller's token count.
     if gemm_tokens % sk_block_m:
         sk_block_m = 64 if gemm_tokens % 64 == 0 else block_m
-    assert gemm_tokens % sk_block_m == 0
+    if gemm_tokens % sk_block_m:
+        raise ValueError(
+            f"tokens={gemm_tokens} must be a multiple of the {sk_block_m}-row K1 "
+            f"tile; pass gemm_pad rounded up to a multiple of {sk_block_m}"
+        )
     if split_k == "auto":
         split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles, stages)
     use_splitk = isinstance(split_k, int) and split_k > 1

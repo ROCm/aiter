@@ -662,8 +662,40 @@ def _run_direct_k1(inp, hc_count, label, **kwargs):
 
 
 def _run_direct_k1_untiled_tokens():
-    """A nearest tuned split-K tile must not overrun a direct M=224 call."""
+    """A nearest tuned split-K tile must not overrun a direct M=224 call.
+
+    Row counts no tile divides are rejected; ``gemm_pad`` makes them valid.
+    """
     _run_direct_k1(_make_inputs(224, seed=18), HC, "direct_k1[M=224]")
+    tokens = 100
+    inp = _make_inputs(tokens, seed=19)
+    for split_k in ("auto", 1, 4):
+        _expect_value_error(
+            f"direct_k1[M={tokens}][sk={split_k}]",
+            lambda split_k=split_k: _run_direct_k1(inp, HC, "unused", split_k=split_k),
+        )
+        merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+        r2, packed = flydsl_k1_combine_norm_down(
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            merged,
+            LOWRANK,
+            HC,
+            EPS,
+            split_k=split_k,
+            gemm_pad=128,
+        )
+        torch.cuda.synchronize()
+        _check_direct_k1(
+            inp,
+            merged,
+            HC,
+            r2[:tokens],
+            packed[:tokens],
+            f"direct_k1[M={tokens}][gemm_pad=128][sk={split_k}]",
+        )
 
 
 def _run_wide_stream_lds():
