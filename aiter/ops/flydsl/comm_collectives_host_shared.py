@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from .allreduce_policy import resolve_link
+from .ipc_heap import UncachedIpcHeap
 from .kernels.comm.allreduce_shared import (
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
@@ -18,7 +19,6 @@ from .kernels.comm.allreduce_shared import (
     SUPPORTED_WORLDS,
 )
 from .kernels.tensor_shim import _preload_compiled
-from .ipc_heap import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 

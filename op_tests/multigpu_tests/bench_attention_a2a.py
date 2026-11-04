@@ -564,8 +564,8 @@ def main():
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
-    from aiter.ops.flydsl.comm_collectives_host_shared import _resolve_inbox_flags
     from aiter.ops.flydsl.allreduce_policy import detect_link
+    from aiter.ops.flydsl.comm_collectives_host_shared import _resolve_inbox_flags
 
     args.link = detect_link()
     args.resolved_inbox = _resolve_inbox_flags(
