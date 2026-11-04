@@ -105,11 +105,6 @@ COMPACT_CAP_MULT = 16
 COUNTER_STRIDE = 32
 # s_sleep units between barrier polls, about 64 clocks each.
 SPIN_SLEEP = 1
-# Bound on the certificate's re-read loop, so a bug cannot hang the GPU. It is a
-# liveness guard, not a schedule: the loop exits when the bins sum to the row's
-# live length, which every part's atomics make inevitable. Sized far past any
-# real wait -- the loop is a scan of 2048 bins, so this is minutes.
-CERTIFICATE_MAX_SPINS = 4194304
 # buffer_load cache policy: sc0 (bit 0) and sc1 (bit 4) together, so the load is
 # system-scope coherent and reads past both L1 and L2. The certificate's re-read is
 # the only thing that needs it -- every other read of the histogram follows a
@@ -866,21 +861,18 @@ def create_topk_per_row_decode_adaptive_kernel(
             Re-reads the bins and re-runs the bucket scan until the scan's total
             equals the row's live cardinality.
 
-            The attempt cap is a liveness guard, not a recovery: a row that reaches
-            it settles its digit from an incomplete histogram and returns a wrong
-            answer that nothing catches, because no caller inspects the result.
-            Reaching the cap means a bug elsewhere.
+            Waits without a cap, as `row_barrier` does: the total gets there once
+            every part of the row has flushed, which needs every part resident. A
+            cap would settle the digit from a partial histogram on a long stall.
             """
             load_global_histogram(s_hist, pass_id, coherent=True)
             choose_bucket_prefix(s_hist, s_meta, target_k)
-            spins = c_zero
-            while (s_meta[SMEM_META_TOTAL] != expected_total) & (
-                spins < fx.Int32(CERTIFICATE_MAX_SPINS)
-            ):
+            total = s_meta[SMEM_META_TOTAL]
+            while total != expected_total:
                 rocdl.s_sleep(SPIN_SLEEP)
                 load_global_histogram(s_hist, pass_id, coherent=True)
                 choose_bucket_prefix(s_hist, s_meta, target_k)
-                spins = spins + c_one
+                total = s_meta[SMEM_META_TOTAL]
 
         def flush_local_histogram(pass_id: int):
             for hist_i32 in range(tid, c_bins_i32, c_block_i32):
