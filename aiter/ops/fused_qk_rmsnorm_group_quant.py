@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import torch
 from torch import Tensor
 
 from aiter.ops.enum import QuantType
@@ -32,6 +33,7 @@ def _fused_qk_rmsnorm_group_quant_kernel(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    amax_floor: float = 0.0,
 ) -> None: ...
 
 
@@ -57,6 +59,107 @@ def _fused_qk_rmsnorm_per_token_quant_kernel(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_fused_qk_rmsnorm_group_quant",
+    fc_name="fused_qk_rmsnorm_mxfp8_kv_rope_quant",
+    develop=True,
+)
+def _fused_qk_rmsnorm_mxfp8_kv_rope_quant_kernel(
+    q_out: Tensor,
+    q_out_scale: Tensor,
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    kv: Tensor,
+    kv_weight: Tensor,
+    kv_epsilon: float,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    amax_floor: float = 0.0,
+    kv_out: Tensor | None = None,
+    qat: Tensor | None = None,
+    values: Tensor | None = None,
+    scales: Tensor | None = None,
+    pool: Tensor | None = None,
+    batch_ids: Tensor | None = None,
+    cu_seqlens_q: Tensor | None = None,
+    slots: Tensor | None = None,
+    ring_start: int = 0,
+    ring_slots: int = 1,
+    slot_rows: int = 0,
+    ring_stride: int = 1,
+    run_rows: int = 0,
+) -> None: ...
+
+
+def fused_qk_rmsnorm_mxfp8_kv_rope_quant(
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    kv: Tensor,
+    kv_weight: Tensor,
+    kv_epsilon: float,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    *,
+    rope_dim: int,
+    amax_floor: float = 0.0,
+    q_out: Tensor | None = None,
+    q_out_scale: Tensor | None = None,
+    kv_out: Tensor | None = None,
+    qat: Tensor | None = None,
+    values: Tensor | None = None,
+    scales: Tensor | None = None,
+    ring=None,
+) -> tuple[Tensor, Tensor]:
+    """Q: RMSNorm -> MXFP8 (fp8 e4m3 + uint8 e8m0 per 32), as triton
+    `fused_dual_rmsnorm_mxfp8_quant`. KV: RMSNorm -> bf16, then the KV half of ATOM's
+    `rope_quant_window` on that row (GPT-J RoPE on the last `rope_dim` columns, MXFP8 with
+    step 2^ceil(log2(amax / 448))), into whichever of `qat` (dequantized bf16 row),
+    `values` / `scales` (fp8 + e8m0 rows of any stride) and `ring` (`(pool, step, window)`,
+    as rope_quant_window takes it) are given. `kv_out` keeps the normed bf16 kv row.
+    Returns `(q_out, q_out_scale)`.
+    """
+    m, kq = q.shape
+    if q_out is None:
+        q_out = q.new_empty((m, kq), dtype=dtypes.fp8)
+    if q_out_scale is None:
+        q_out_scale = q.new_empty((m, kq // 32), dtype=torch.uint8)
+    pool, step, window = ring or (None, None, None)
+    _fused_qk_rmsnorm_mxfp8_kv_rope_quant_kernel(
+        q_out,
+        q_out_scale,
+        q,
+        q_weight,
+        q_epsilon,
+        kv,
+        kv_weight,
+        kv_epsilon,
+        cos,
+        sin,
+        positions,
+        rope_dim,
+        amax_floor,
+        kv_out,
+        qat,
+        values,
+        scales,
+        pool,
+        None if step is None else step.batch_ids,
+        None if step is None else step.cu_seqlens_q,
+        None if step is None else step.slots,
+        0 if window is None else int(window.ring_start),
+        1 if window is None else int(window.ring_slots),
+        0 if window is None else int(window.slot_rows),
+        1 if window is None else int(window.ring_stride),
+        0 if window is None else int(window.run_rows),
+    )
+    return q_out, q_out_scale
+
+
 def fused_qk_rmsnorm_group_quant(
     q_out_quantized: Tensor | None = None,
     q_out_scale: Tensor | None = None,
@@ -73,7 +176,11 @@ def fused_qk_rmsnorm_group_quant(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    amax_floor: float = 0.0,
 ) -> None:
+    """A uint8 / float8_e8m0fnu q_out_scale with fp8 q_out_quantized selects MXFP8
+    (group_size=32, OCP e8m0 rounding as aiter triton `_mxfp8_quant_op`, each group's
+    amax floored at `amax_floor`)."""
     # No-quant mode: when q_out_scale is None we only do RMSNorm and write to q_out_unquantized.
     no_quant = q_out_scale is None
     if no_quant:
@@ -131,6 +238,7 @@ def fused_qk_rmsnorm_group_quant(
         group_size,
         transpose_scale,
         gemma_norm,
+        amax_floor,
     )
 
 
