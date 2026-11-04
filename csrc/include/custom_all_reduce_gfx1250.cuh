@@ -373,6 +373,15 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 // ---------------------------------------------------------------------------
 // Synchronisation primitives (ROCm path only)
 // ---------------------------------------------------------------------------
+// Serial-number comparison of barrier epochs. A peer may already have stored
+// the next epoch (it can leave a barrier first), so the wait is "at or after
+// the target"; comparing the signed difference keeps that test right when a
+// slot's uint32 epoch wraps. Ranks are at most one barrier apart.
+DINLINE bool epoch_before(uint32_t observed, uint32_t target)
+{
+    return static_cast<int32_t>(observed - target) < 0;
+}
+
 template <int ngpus>
 DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
 {
@@ -383,9 +392,10 @@ DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
                                 flag,
                                 __ATOMIC_RELAXED,
                                 __MEMORY_SCOPE_SYSTEM);
-        while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                     __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+        while(epoch_before(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                                  __ATOMIC_RELAXED,
+                                                  __MEMORY_SCOPE_DEVICE),
+                           flag))
             ;
     }
     __syncthreads();
@@ -404,9 +414,11 @@ DINLINE void end_sync(const RankSignals& sg, Signal* self_sg, int rank)
                                 flag,
                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+        while(epoch_before(
+            __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                   final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                   __MEMORY_SCOPE_DEVICE),
+            flag))
             ;
     }
     __syncthreads();
@@ -505,6 +517,26 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 // Stage 1 of the large-message path. Each rank owns one contiguous hidden
 // shard, reduces that shard in fixed rank order, and writes it to its
 // peer-visible staging region. Stage 2 reads the reduced shards below.
+//
+// A two-stage call is four launches per rank, with no barrier in either stage:
+//  1. start_sync_kernel: every peer has written this call's input (its
+//     producer precedes the barrier on the peer's stream) and has finished the
+//     previous call's stage 2, so stage 1 may overwrite this rank's shard.
+//  2. Stage 1.
+//  3. start_sync_kernel again: every peer has finished stage 1, so its shard
+//     is complete and it no longer reads this rank's input, which may be
+//     rewritten once this call returns.
+//  4. Stage 2.
+// There is no end barrier. Peers may still read this rank's shard after this
+// call returns; its only writer is the next two-stage call's stage 1, which
+// waits behind barrier 1 of that call, and no peer reaches that barrier before
+// its stage 2 has completed. The shard, like the input, is published by the
+// completion of the kernel that wrote it, before the next launch on the
+// writer's stream signals the barrier, so both barriers stay relaxed.
+// Barriers inside the stages cost more than these one-block launches: an
+// agent-scope release in every block is a cache writeback (global_wb) per
+// block, and a start_sync at the top of every stage-2 block costs as much as
+// the launches it would save.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
     RankData* _input_dp,
@@ -1874,7 +1906,8 @@ public:
         const int blocks     = std::min(tokens, kMaxBlocks);
         const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
         // At TP4+, two-stage halves or better the peer traffic of direct-read.
-        // Its three single-block barriers do not amortize at TP2 or narrow rows.
+        // Its extra launches and staging traffic do not amortize at TP2 or
+        // narrow rows.
         // Each rank's reduced shard must fit its staging region.
         const bool two_stage =
             !use_1stage && world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
@@ -1886,7 +1919,7 @@ public:
             start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
             ar_rmsnorm_reduce_scatter_gfx1250<T, NG><<<blocks, 512, 0, stream>>>(           \
                 input_ptrs, self_sg_, rank_, tokens, hidden / pack_size);                   \
-            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
+            start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
             if(gemma_norm)                                                                  \
                 ar_rmsnorm_gfx1250<T, OutT, NG, true, true>                                 \
                     <<<blocks, threads, 0, stream>>>(                                       \
@@ -1897,7 +1930,6 @@ public:
                     <<<blocks, threads, 0, stream>>>(                                       \
                         nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
                         weight, scale_out, bf16_output, tokens, hidden, eps);                \
-            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
         }                                                                                   \
         else if(gemma_norm)                                                                 \
             ar_rmsnorm_gfx1250<T, OutT, NG, true><<<blocks, threads, 0, stream>>>(          \
