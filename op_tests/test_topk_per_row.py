@@ -973,7 +973,7 @@ def test_adaptive_control_stays_zero(card):
             logits.shape[1],
         )
 
-    def check(logits, seq_lens, out, stable, stream, what):
+    def check(logits, seq_lens, out, stable, control, what):
         torch.cuda.synchronize()
         rows, width = logits.shape
         live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
@@ -990,8 +990,11 @@ def test_adaptive_control_stays_zero(card):
                 top_k,
             )
         assert ok, f"{what}: wrong indices"
-        control = flydsl_decode_host._adaptive_control[(device, stream.cuda_stream)]
         assert not control.any(), f"{what}: control left dirty"
+
+    def eager_control():
+        key = (device, torch.cuda.current_stream().cuda_stream)
+        return flydsl_decode_host._adaptive_control[key]
 
     seen = []
     for stable in (False, True):
@@ -1008,9 +1011,9 @@ def test_adaptive_control_stays_zero(card):
                 out = torch.full((cell[0], top_k), -7, dtype=torch.int32, device="cuda")
                 decode(logits, seq_lens, out, stable)
                 what = f"{name} stable={stable} cell={cell} seed={seed}"
-                check(logits, seq_lens, out, stable, torch.cuda.current_stream(), what)
+                check(logits, seq_lens, out, stable, eager_control(), what)
 
-    # Replay over the cached buffer: warmed up on the stream the graph captures on.
+    # Replay: the graph owns its buffer, even on a stream warmed up eagerly.
     rows, width = next(
         (m, n) for m, n in candidates if picks["compact"](cfg(m, n, True))
     )
@@ -1024,22 +1027,28 @@ def test_adaptive_control_stays_zero(card):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         decode(logits, seq_lens, out, True)
+        decode(logits, seq_lens, out, True)
+    (graph_control,) = [
+        buf
+        for key, buf in flydsl_decode_host._captured_adaptive_control.items()
+        if key[:2] == (device, stream.cuda_stream)
+    ]
     for seed in (4, 5):
         fresh_logits, fresh_lens = case(rows, width, seed)
         logits.copy_(fresh_logits)
         seq_lens.copy_(fresh_lens)
         out.fill_(-7)
         graph.replay()
-        check(logits, seq_lens, out, True, stream, f"replay seed={seed}")
+        check(logits, seq_lens, out, True, graph_control, f"replay seed={seed}")
     print(
         f"[adaptive_control_stays_zero] PASS: {seen}, replay rows={rows} width={width}"
     )
 
 
-def test_adaptive_control_unwarmed_capture(card):
-    """A capture on a stream the op never ran on records one zeroing per graph, not
-    per call, and its buffer is zero for every replay order and for an eager launch
-    before any replay, whatever the pool left in it."""
+def test_adaptive_control_per_capture(card):
+    """Each capture owns its control buffer, zeroed once per replay rather than per
+    call, whether or not its stream ran eagerly. It is zero for every replay order
+    and whatever the pool left in it, and eager launches on the stream use another."""
     top_k, width, calls = 2048, 262144, 3
     device = torch.device("cuda", torch.cuda.current_device())
     multi = [
@@ -1112,15 +1121,18 @@ def test_adaptive_control_unwarmed_capture(card):
         for case in cases:
             check(case, what)
 
-    def control(stream):
-        return flydsl_decode_host._adaptive_control[(device, stream.cuda_stream)]
+    def captured(stream):
+        (buf,) = [
+            buf
+            for key, buf in flydsl_decode_host._captured_adaptive_control.items()
+            if key[:2] == (device, stream.cuda_stream)
+        ]
+        return buf
 
-    def poison(stream):
-        # Until a graph that zeroes it replays, the buffer holds whatever the pool
-        # left there; make that garbage rather than trust it to be zero.
-        key = (device, stream.cuda_stream)
-        assert key in flydsl_decode_host._unzeroed_adaptive_control, "not unzeroed"
-        control(stream).fill_(0x01010101)
+    def poison(buf):
+        # The graph's zeroing node must run on every replay; make the pool's leftovers
+        # garbage rather than trust them to be zero.
+        buf.fill_(0x01010101)
         torch.cuda.synchronize()
 
     flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
@@ -1131,42 +1143,135 @@ def test_adaptive_control_unwarmed_capture(card):
     with torch.cuda.stream(warm):
         decode(*warm_cases[0])
     check(warm_cases[0], "eager warm-up")
-    baseline = nodes(capture(warm, warm_cases))
+    graph_w = capture(warm, warm_cases)
+    eager_w = flydsl_decode_host._adaptive_control[(device, warm.cuda_stream)]
+    assert captured(warm).data_ptr() != eager_w.data_ptr(), "capture took eager buffer"
+    baseline = nodes(graph_w)
 
-    # Two graphs on one cold stream, the later one replayed first.
+    # Two graphs on one stream, the later one replayed first.
     cold = torch.cuda.Stream()
     a_cases = [inputs(rows, 20 + i) for i in range(calls)]
     b_cases = [inputs(rows, 30 + i) for i in range(calls)]
-    graph_a, graph_b = capture(cold, a_cases), capture(cold, b_cases)
-    poison(cold)
-    assert nodes(graph_a) == baseline + 1, (nodes(graph_a), baseline)
-    assert nodes(graph_b) == baseline + 1, (nodes(graph_b), baseline)
+    graph_a = capture(cold, a_cases)
+    buf_a = captured(cold)
+    graph_b = capture(cold, b_cases)
+    buf_b = captured(cold)
+    assert buf_a.data_ptr() != buf_b.data_ptr(), "two captures share a buffer"
+    assert nodes(graph_a) == baseline, (nodes(graph_a), baseline)
+    assert nodes(graph_b) == baseline, (nodes(graph_b), baseline)
+    poison(buf_a)
+    poison(buf_b)
     replay(graph_b, cold, b_cases, 40, "graph B replayed before graph A")
     replay(graph_a, cold, a_cases, 50, "graph A after graph B")
-    assert not control(cold).any(), "control left dirty after replay"
+    assert not buf_a.any() and not buf_b.any(), "control left dirty after replay"
 
-    # An eager launch on a cold stream before its graph ever replays.
-    early = torch.cuda.Stream()
-    c_cases = [inputs(rows, 60 + i) for i in range(calls)]
-    graph_c = capture(early, c_cases)
-    poison(early)
+    # An eager launch on the capture stream between replays.
     eager = inputs(rows, 70)
-    early.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(early):
+    cold.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(cold):
         decode(*eager)
-    check(eager, "eager launch before the first replay")
-    replay(graph_c, early, c_cases, 80, "graph C after the eager launch")
+    check(eager, "eager launch on the capture stream")
+    replay(graph_a, cold, a_cases, 80, "graph A after the eager launch")
 
     # Growing inside a capture zeroes the new buffer once more.
     grow = torch.cuda.Stream()
     g_cases = [inputs(rows, 90), inputs(grown, 91), inputs(grown, 92)]
     graph_g = capture(grow, g_cases)
-    assert nodes(graph_g) == baseline + 2, (nodes(graph_g), baseline)
+    assert nodes(graph_g) == baseline + 1, (nodes(graph_g), baseline)
     replay(graph_g, grow, g_cases, 100, "graph grown inside the capture")
-    assert not control(grow).any(), "grown control left dirty after replay"
+    assert not captured(grow).any(), "grown control left dirty after replay"
     print(
-        f"[adaptive_control_unwarmed_capture] PASS: rows {rows} and {grown}, "
-        f"width {width}, {calls} calls per graph, {baseline} nodes warm"
+        f"[adaptive_control_per_capture] PASS: rows {rows} and {grown}, "
+        f"width {width}, {calls} calls per graph, {baseline} nodes per graph"
+    )
+
+
+def test_adaptive_control_concurrent_replays(card):
+    """Graphs replayed at once, and a replay beside eager launches on its capture
+    stream, never share control slots: every row stays exact. With one buffer per
+    stream these returned wrong rows, and the uncapped waits never finished."""
+    top_k, width, calls, rounds = 2048, 1 << 20, 4, 50
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def inputs(m, seed):
+        torch.manual_seed(seed)
+        logits = torch.randn(m, width, device="cuda")
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out):
+        m = logits.shape[0]
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            m,
+            width,
+            1,
+            top_k,
+            False,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(cases, what):
+        torch.cuda.synchronize()
+        for logits, _, out in cases:
+            want = logits.topk(top_k, dim=-1)[1].sort(dim=-1)[0]
+            assert torch.equal(out.long().sort(dim=-1)[0], want), what
+
+    def capture(stream, cases):
+        graph = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            for case in cases:
+                decode(*case)
+        return graph
+
+    for m in (8, 4):
+        warm = inputs(m, m)
+        decode(*warm)
+        check([warm], f"eager warm-up, {m} rows")
+
+    home, s1, s2 = torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    a_cases = [inputs(8, 10 + i) for i in range(calls)]
+    b_cases = [inputs(4, 20 + i) for i in range(calls)]
+    c_cases = [inputs(8, 30 + i) for i in range(calls)]
+
+    # Two graphs captured on one stream, replayed at once on two others.
+    for what, first, second in (
+        ("8 and 4 rows", a_cases, b_cases),
+        ("same shape", a_cases, c_cases),
+    ):
+        graph_1, graph_2 = capture(home, first), capture(home, second)
+        for stream in (s1, s2):
+            stream.wait_stream(torch.cuda.current_stream())
+        for _ in range(rounds):
+            with torch.cuda.stream(s1):
+                graph_1.replay()
+            with torch.cuda.stream(s2):
+                graph_2.replay()
+        check(first + second, f"concurrent replays, {what}")
+
+    # A replay beside eager launches on the stream it was captured on.
+    graph_a = capture(home, a_cases)
+    eager = inputs(8, 40)
+    s1.wait_stream(torch.cuda.current_stream())
+    home.wait_stream(torch.cuda.current_stream())
+    for _ in range(rounds):
+        with torch.cuda.stream(s1):
+            graph_a.replay()
+        with torch.cuda.stream(home):
+            decode(*eager)
+    check(a_cases + [eager], "replay beside eager launches on its capture stream")
+    control = flydsl_decode_host._adaptive_control[(device, home.cuda_stream)]
+    assert not control.any(), "eager control left dirty"
+    print(
+        f"[adaptive_control_concurrent_replays] PASS: width {width}, k {top_k}, "
+        f"{calls} calls per graph, {rounds} rounds per case"
     )
 
 
@@ -2317,7 +2422,8 @@ def run_adaptive():
     ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
     test_adaptive_control_stays_zero(card)
-    test_adaptive_control_unwarmed_capture(card)
+    test_adaptive_control_per_capture(card)
+    test_adaptive_control_concurrent_replays(card)
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)
