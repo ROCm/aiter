@@ -83,9 +83,9 @@ _STANDARD_MOE_2STAGE_TOKENS = [1, 16, 32, 64, 128, 256, 1024, 4096]
 # The default script behavior must keep the historical full sweep. CI can opt
 # into the reduced representative-token standard profile, while the explicit
 # "full" profile preserves the parsed CLI arguments unchanged.
-AITER_MOE_2STAGE_CI_PROFILE = (
-    os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
-)
+AITER_MOE_2STAGE_CI_PROFILE = os.environ.get(
+    "AITER_MOE_2STAGE_CI_PROFILE", "default"
+).lower()
 
 if AITER_MOE_2STAGE_CI_PROFILE == "standard":
     logger.info("moe_2stage active CI profile: standard")
@@ -819,11 +819,12 @@ args = parser.parse_args()
 
 ci_profile = os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
 if ci_profile == "standard":
-    args.no_flydsl_csv = True
+    # Standard CI keeps the representative-token sweep but must not disable the
+    # FlyDSL/Opus CSV validation path; that would silently weaken the check.
     args.tokenNum = _STANDARD_MOE_2STAGE_TOKENS
 elif ci_profile == "full":
     # Preserve the caller's parsed arguments exactly; only the "standard"
-    # profile applies the representative-token / no-CSV restriction.
+    # profile reduces the token sweep.
     pass
 else:
     args.tokenNum = _DEFAULT_MOE_2STAGE_TOKENS
