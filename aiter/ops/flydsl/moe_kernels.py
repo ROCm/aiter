@@ -1058,6 +1058,8 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    *,
+    streaming_loads=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1133,6 +1135,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        streaming_loads=streaming_loads,
     )
     _run_compiled(
         reduce_exe,
@@ -2043,6 +2046,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2118,6 +2122,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            use_valid_token_count=use_valid_token_count,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2369,6 +2374,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2390,6 +2396,9 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    use_valid_token_count: atomic a16w-mix only; bound scatter rows by
+        num_valid_ids[1] (the sort's real token count) when out is padded.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2422,6 +2431,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
