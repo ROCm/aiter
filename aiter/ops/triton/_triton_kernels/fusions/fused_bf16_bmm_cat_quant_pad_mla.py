@@ -279,6 +279,8 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         if ROPE_AND_CACHE:
             pos = tl.load(pos_ptr + offs_om, mask=row_mask, other=0)
             slot = tl.load(slot_ptr + offs_om, mask=row_mask, other=-1)
+            # A padding token's position can be out of the cos/sin cache range.
+            pos = tl.where(slot >= 0, pos, 0)
             roped = _rope_vllm(
                 pe,
                 pos,
@@ -321,9 +323,12 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             other=0.0,
         )
         k_pe = tl.load(k_pe_ptr + tok * stride_kpe_m + offs_d * stride_kpe_d)
+        valid = tok_slot >= 0
+        # A padding token's position can be out of the cos/sin cache range.
+        tok_pos = tl.where(valid, tl.load(pos_ptr + tok + tl.arange(0, 1)), 0)
         k_pe = _rope_vllm(
             k_pe[None, :],
-            tl.load(pos_ptr + tok + tl.arange(0, 1)),
+            tok_pos,
             cos_sin_ptr,
             stride_cs_pos,
             stride_cs_d,
@@ -331,7 +336,6 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             1,
             BLOCK_D_PE,
         )
-        valid = tok_slot >= 0
         cache_dtype = kv_cache_ptr.dtype.element_ty
         entry_ptr = (
             kv_cache_ptr

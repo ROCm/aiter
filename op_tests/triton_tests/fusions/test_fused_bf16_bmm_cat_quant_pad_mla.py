@@ -155,6 +155,8 @@ def ref_rope_cache(
     and k_pe and writes fp8([kv_c | k_pe] / k_scale) to the slot. Tokens with
     slot < 0 keep q_pe unroped and do not write the cache."""
     valid = slot_mapping >= 0
+    # A padding token's RoPE is discarded, so its position does not matter.
+    positions = torch.where(valid, positions, 0)
     q_pe = torch.where(
         valid[:, None, None], rope_vllm(q_pe, positions, cos_sin_cache, is_neox), q_pe
     )
@@ -212,6 +214,9 @@ def test_fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     kv_c, k_pe, cos_sin_cache, positions, slot_mapping, kv_cache = (
         generate_rope_cache_inputs(M)
     )
+    # A padding token's position can be any value. This one is far out of the
+    # cos/sin cache range, so a read of its row faults.
+    positions[slot_mapping < 0] = 2**40
     q_scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
     k_scale = torch.tensor(k_scale, dtype=torch.float32, device="cuda")
     fp8_max = vllm_fp8_max()
