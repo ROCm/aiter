@@ -829,6 +829,9 @@ parser.add_argument(
 )
 if __name__ == "__main__":
     args = parser.parse_args()
+    # packed layouts share one head dim between q / k and v (generate_qkv asserts d == d_v)
+    packed = args.input_layout in ("KVPACKED", "QKVPACKED")
+    d_qk_v = [d for d in args.d_qk_v if not packed or d[0] == d[1]]
 
     collected = []
     for (
@@ -840,7 +843,7 @@ if __name__ == "__main__":
         deterministic,
     ) in itertools.product(
         args.dtype,
-        args.d_qk_v,
+        d_qk_v,
         args.gqa_ratio,
         args.causal,
         args.local,
