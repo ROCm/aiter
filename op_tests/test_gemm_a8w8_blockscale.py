@@ -20,6 +20,7 @@ from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_bpreshuffle_flydsl,
     gemm_a8w8_blockscale_ck,
     gemm_a8w8_blockscale_cktile,
     gemm_a8w8_blockscale_flydsl,
@@ -100,6 +101,39 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
         dtype=dtype,
         backend=backend,
     )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_flydsl_blockscale(
+    x, weightshuffle, x_scale, w_scale, config, dtype=dtypes.bf16
+):
+    """Call the FlyDSL backend directly with the shape's tuned row, so the FlyDSL
+    column times FlyDSL even where dispatch would pick another backend.
+    """
+    m = x.shape[0]
+    n = weightshuffle.shape[0]
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+        x, weightshuffle, x_scale, w_scale, out, config
+    )
+
+
+def _flydsl_blockscale_row(m, n, k):
+    """The shape's tuned row if it names a gfx942 FlyDSL block-scale kernel, else None.
+
+    The FlyDSL kernel has no untuned tile choice, so the sweep skips other shapes.
+    """
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
+    if config is None or config["libtype"] != "flydsl":
+        return None
+    if not str(config["kernelName"]).startswith("flydsl_blockscale_bpreshuffle_"):
+        return None
+    return config
 
 
 @benchmark()
@@ -217,6 +251,21 @@ def test_gemm(
             ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
+
+            # The gfx942 FlyDSL kernel takes the same preshuffled weight and K-major
+            # x_scale as the CK bpreshuffle path.
+            flydsl_row = (
+                _flydsl_blockscale_row(m, n, k) if get_gfx() == "gfx942" else None
+            )
+            if flydsl_row is not None:
+                e, avg_e = run_gemm_flydsl_blockscale(
+                    x, gemm_weight, gemm_x_scale, w_scale, flydsl_row, dtype
+                )
+                err_flydsl = checkAllclose(a, e, msg="flydsl", catastrophic_check=True)
+                ret["flydsl us"] = avg_e
+                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_e / 1e6
+                ret["flydsl err"] = err_flydsl
 
         # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
         if get_gfx() == "gfx950":
