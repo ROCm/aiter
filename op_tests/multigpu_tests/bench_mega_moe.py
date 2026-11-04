@@ -59,6 +59,8 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # Setting DEBUG_HIP_GRAPH_CLASSIC_PATH yourself keeps it to one pass on that
     # path; =0 drops the stage1_fused kernel tables, which that path would
     # mislabel.
+    # --stage1_fused true returns gemm2's rows with one per-rank TDM store;
+    # AITER_MEGA_PER_RANK_SCATTER=0 keeps the 8-row gather scatter instead.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --stage2_fused --dispatch_wire --combine --combine_quant
@@ -115,10 +117,6 @@ os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
-
-# 0 withholds next_topk_ids, the way a model does: its next-layer routing depends
-# on this layer's output, so the compact plan lands on the critical path.
-_PLAN_PREFETCH = os.environ.get("AITER_MEGA_PLAN_PREFETCH", "1") != "0"
 
 QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
 # add_data_init_args' --scale-init default. Kept here so main() can tell whether
@@ -755,11 +753,6 @@ class DeviceMoEPipeline:
     def _layer_step(self, x, layer_idx):
         ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
-        next_ids = (
-            self.routings[layer_idx + 1][0]
-            if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
-            else None
-        )
         y = self.mega(
             xn,
             wts,
@@ -768,7 +761,6 @@ class DeviceMoEPipeline:
             w2=self.w2_a,
             w1_scale=self.w1_s,
             w2_scale=self.w2_s,
-            next_topk_ids=next_ids,
             # Named per step, not inherited from construction: building the
             # reduce and running it are separate decisions now.
             combine_quant=self.combine_quant,
@@ -777,8 +769,6 @@ class DeviceMoEPipeline:
 
     def _pipeline(self, x0):
         x = x0
-        if _PLAN_PREFETCH:
-            self.mega.prefetch_compact_plan(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
         return x

@@ -131,6 +131,73 @@ def tdm_group1_rows_4b(rows):
     ).ir_value()
 
 
+def tdm_group1_rows(rows, row_elems, tile_row_elems, elem_bytes, stride):
+    """GROUP1 for ``rows`` runtime rows of a padded LDS tile, ``stride`` apart.
+
+    The LDS side is dense at ``tile_row_elems`` per row; ``row_elems`` is the
+    tensor's row width, so on a store the pad columns past it fall out of
+    bounds and never land. ``rows`` is both the tile and the tensor height,
+    must be wave-uniform and in ``[1, TDM_MAX_DIM]``, and goes through
+    ``readfirstlane`` like :func:`tdm_group1_rows_4b`.
+    """
+    if elem_bytes not in (1, 2, 4, 8):
+        raise ValueError(
+            f"TDM data_size encodes 1/2/4/8-byte elements, got {elem_bytes}"
+        )
+    if not (1 <= row_elems <= tile_row_elems <= TDM_MAX_DIM):
+        raise ValueError(
+            f"TDM row needs 1 <= row_elems ({row_elems}) <= tile_row_elems "
+            f"({tile_row_elems}) <= {TDM_MAX_DIM}"
+        )
+    ds = int(math.log2(elem_bytes))
+    r = fx.Int32(readfirstlane(T.i32, fx.Int32(rows).ir_value()))
+    r_hi = r << 16
+    return fx.Vector.from_elements(
+        [
+            _i32(ds << 16),
+            _i32((row_elems & 0xFFFF) << 16),
+            r_hi | _i32((row_elems >> 16) & 0xFFFF),
+            _i32((tile_row_elems & 0xFFFF) << 16),
+            r,
+            _i32(stride & 0xFFFFFFFF),
+            r_hi | _i32((stride >> 32) & 0xFFFF),
+            _i32(0),
+        ],
+        fx.Int32,
+    ).ir_value()
+
+
+def tdm_group1_run(n_elems, elem_bytes):
+    """GROUP1 for one row of ``n_elems`` runtime elements at any alignment.
+
+    The tile is one element wider than the tensor, which keeps OOB checking on:
+    only the run's own bytes land, so it may share its end 128B blocks with
+    runs other workgroups write. The LDS side reads that one extra element.
+    ``n_elems`` must be wave-uniform and in ``[1, TDM_MAX_DIM - 1]``. The dim1
+    stride is 1, not 0: a ``dim1 == 1`` descriptor with a zero one hangs.
+    """
+    if elem_bytes not in (1, 2, 4, 8):
+        raise ValueError(
+            f"TDM data_size encodes 1/2/4/8-byte elements, got {elem_bytes}"
+        )
+    ds = int(math.log2(elem_bytes))
+    n = fx.Int32(readfirstlane(T.i32, fx.Int32(n_elems).ir_value()))
+    tile = n + 1
+    return fx.Vector.from_elements(
+        [
+            _i32(ds << 16),
+            n << 16,
+            _i32(1 << 16),
+            tile << 16,
+            _i32(1),
+            tile,
+            _i32(1 << 16),
+            _i32(0),
+        ],
+        fx.Int32,
+    ).ir_value()
+
+
 def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
     """Split a dword run into a scalar head/tail and a row-aligned TDM body.
 

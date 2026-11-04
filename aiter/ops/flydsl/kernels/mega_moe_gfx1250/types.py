@@ -16,6 +16,13 @@ import torch
 # Both plane bases stay cache-line aligned -- the payload plane is a multiple of
 # 128 bytes and the slot stride is a power of two -- and that must not slip.
 COMBINE_SCALE_BLOCK = 32
+# The per-rank scatter's dense comb_inp starts every (src, dest, expert) run of
+# slots on a fresh block of this many slots, at the residue of its first compact
+# row, so ``slot - row`` is a multiple of it. gemm2's planar scale stores (8 B a
+# slot) then cover whole 128 B lines and never share one with another run: TDM
+# commits whole lines, so a shared one can land a run's stale bytes over its
+# neighbour's, and a partial line over the fabric costs several times a whole.
+COMBINE_SLOT_ALIGN = 16
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
@@ -97,6 +104,16 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
+    # Compact only: gemm2 returns each peer's run with one plain TDM store into
+    # the plan's dense comb_inp layout, reading the run table the plan appended
+    # to compact_psum (see compact_plan.compact_comb_tab_dwords).
+    per_rank_scatter: bool = False
+    # Per-rank scatter on a quantized wire only, 0 when off: arena offset of a
+    # [N/256][slot] x 8 B e8m0 region that replaces the slots' scale plane, so a
+    # peer's run of slots takes its 8-byte scale slices as one contiguous store.
+    combine_scale_offset: int = 0
+    # Slots per N/256 column block of that region (compact_dense_comb_slots).
+    combine_scale_slots: int = 0
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

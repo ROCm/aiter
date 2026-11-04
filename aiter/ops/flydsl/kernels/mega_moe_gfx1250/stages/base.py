@@ -33,6 +33,9 @@ from ..types import Stage2ScatterContext, _from_gpu_ptr
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    # The per-rank scatter's dense comb_inp: route tok*topk + k's slot, -1 for a
+    # dropped route. None on the tok*topk + k layout.
+    comb_slot: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -194,12 +197,8 @@ class DispatchStage(Protocol):
         topk_ids: torch.Tensor,
         *,
         recv_token_bound: int | None = None,
-        next_topk_ids: torch.Tensor | None = None,
-        next_recv_token_bound: int | None = None,
         begin_step: bool = True,
     ) -> _DispatchBatch: ...
-
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None: ...
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None: ...
 
@@ -341,7 +340,9 @@ class _Dispatch:
         # it stages them, so there is no repack here.
         return payload, scale_rows.data_ptr()
 
-    def _routing(self, token_count: int) -> Routing:
+    def _routing(self, token_count: int, comb_slot=None) -> Routing:
         return Routing(
-            token_count=token_count, reverse_source_view=self._reverse_source
+            token_count=token_count,
+            reverse_source_view=self._reverse_source,
+            comb_slot=comb_slot,
         )

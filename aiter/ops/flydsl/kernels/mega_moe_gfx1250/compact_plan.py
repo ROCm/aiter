@@ -46,6 +46,7 @@ from . import tdm_prims as TDM
 from .config import _LANE_MASK as LANE_MASK
 from .config import _LOG2_WAVE_SIZE as LOG2_WAVE
 from .config import _WAVE_SIZE as WAVE
+from .types import COMBINE_SLOT_ALIGN
 
 PLAN_BLOCKS = 1
 PLAN_MAX_BLOCKS = 16
@@ -253,6 +254,30 @@ def compact_tile_capacity(*, compact_cap: int, tile_m: int) -> int:
     return (int(compact_cap) + int(tile_m) - 1) // int(tile_m)
 
 
+def compact_comb_tab_dwords(*, npes: int, experts_per_rank: int) -> int:
+    """Dwords of the ``dense_comb`` run table the plan appends after psum.
+
+    Entry ``e*npes + src`` is ``(row_start, delta)``: the first compact row this
+    rank's local expert ``e`` holds from ``src``, and ``comb_slot - row`` for
+    every row of that run on ``src``'s side, a multiple of COMBINE_SLOT_ALIGN.
+    """
+    return 2 * int(npes) * int(experts_per_rank)
+
+
+def compact_dense_comb_slots(
+    *, max_routes: int, npes: int, experts_per_rank: int
+) -> int:
+    """Slots a ``dense_comb`` comb_inp needs for ``max_routes`` routes a rank.
+
+    Each nonempty segment pads its run by at most ``COMBINE_SLOT_ALIGN - 1``
+    slots in front, to match its first row's residue, and as many behind, to
+    end on a block. Rounded to a whole block so planar planes stay aligned.
+    """
+    a = COMBINE_SLOT_ALIGN
+    n = int(max_routes) + 2 * (a - 1) * int(npes) * int(experts_per_rank)
+    return (n + a - 1) // a * a
+
+
 @functools.cache
 def compile_tdm_compact_plan(
     *,
@@ -278,6 +303,7 @@ def compile_tdm_compact_plan(
     s1f: bool = False,
     write_tok_map: bool = True,
     align_m: int | None = None,
+    dense_comb: bool = False,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -337,6 +363,22 @@ def compile_tdm_compact_plan(
     ``align_m`` keeps its producers' ``tile_m``-row pieces and reads ``align_m
     // tile_m`` tile_info words (and flags) per GEMM1 m-tile.
 
+    ``dense_comb`` lays this rank's comb_inp out segment-major instead of
+    ``tok*topk + k``: the route of segment ``seg`` with intra index ``i`` owns
+    slot ``local_base[seg] + i``. A ``(src, dest, e)`` run then sits contiguous
+    on both ends, in the same order, so gemm2 can return it in one plain TDM.
+    Each nonempty segment takes whole COMBINE_SLOT_ALIGN blocks and starts at
+    its first compact row's residue in them, so ``local_base`` is the exclusive
+    prefix of those padded sizes plus that residue, and slot and row agree
+    modulo the block (:func:`compact_dense_comb_slots` bounds the total). The
+    plan writes ``comb_slot[route]`` for the reduce, and the run table of
+    :func:`compact_comb_tab_dwords` into ``psum[experts_per_rank:]`` for gemm2.
+    The hist matrix lives in block 0's LDS, row pitch ``hist_dwords``; block 0
+    pads it, prefixes each source's row and writes the run table in one pass.
+    It also keeps each segment's slot of intra 0 (the exclusive padded prefix
+    of this rank's row plus the first compact row's residue); with
+    ``plan_blocks > 1`` it publishes that in ``block_hist[seg]`` and the other
+    blocks add their exclusive route offset and the route's own intra.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -356,6 +398,7 @@ def compile_tdm_compact_plan(
     plan_blocks = int(plan_blocks)
     if not 1 <= plan_blocks <= PLAN_MAX_BLOCKS:
         raise ValueError(f"plan_blocks={plan_blocks} not in [1, {PLAN_MAX_BLOCKS}]")
+    dense_comb = bool(dense_comb)
     default_waves = compact_plan_waves(npes=npes, max_routes=max_routes)
     if plan_waves is None:
         plan_waves = default_waves
@@ -443,6 +486,8 @@ def compile_tdm_compact_plan(
         )
     if not write_tok_map:
         kernel_name += "_nm"
+    if dense_comb:
+        kernel_name += "_dcomb"
     # The send list is staged in LDS (one slot per route of this block) and
     # copied out coalesced: a per-route scattered store costs a cache line per
     # lane (~2.4 us at 7K routes on one CU). It needs only this rank's own
@@ -451,7 +496,15 @@ def compile_tdm_compact_plan(
     stage_send = emit_runs and merge_routes
     # S1F without tok_map: the other blocks need only the send offsets, which
     # block 0 has before X1, so they are released then (barrier[3]).
-    early_release = emit_runs and stage_send and not write_tok_map and plan_blocks > 1
+    # local_base is published only after the scan, so a dense combine cannot
+    # release the other blocks before the exchange.
+    early_release = (
+        emit_runs
+        and stage_send
+        and not write_tok_map
+        and plan_blocks > 1
+        and not dense_comb
+    )
     # Per-wave ranges of run-order positions (le outer, destination rotated
     # inner) or segments for the send offsets / copies: each wave owns
     # pos_per_wave consecutive ones and sums the prefix before them itself
@@ -527,6 +580,7 @@ def compile_tdm_compact_plan(
         addr_masked_m,
         addr_psum,
         addr_barrier,
+        addr_comb_slot,
         my_lsa_rank,
         inp_cur_tok,
         addr_send_list,
@@ -555,6 +609,8 @@ def compile_tdm_compact_plan(
         rsrc_mm = create_buffer_resource_from_addr(addr_masked_m)
         rsrc_psum = create_buffer_resource_from_addr(addr_psum)
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
+        if const_expr(dense_comb):
+            rsrc_cslot = create_buffer_resource_from_addr(addr_comb_slot)
 
         smem = fx.SharedAllocator(static=False)
         hist_ptr = smem.allocate(hist_dwords * 4, 128)._ptr
@@ -568,6 +624,17 @@ def compile_tdm_compact_plan(
         if const_expr(merge_routes):
             routes_ptr = smem.allocate(chunk_cap * 4, 16)._ptr
             lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
+        if const_expr(dense_comb):
+            # Per segment, the dest's first compact row of its expert.
+            segstart_ptr = smem.allocate(segs * 4, 16)._ptr
+            lds_segstart = fx.Int64(fx.ptrtoint(segstart_ptr))
+            if const_expr(n_chunks > 1):
+                # Per (src, seg), the padded prefix within its 32-segment
+                # chunk; per (src, chunk), the chunk's padded sum.
+                cexcl_ptr = smem.allocate(npes * segs * 4, 16)._ptr
+                lds_cexcl = fx.Int64(fx.ptrtoint(cexcl_ptr))
+                csum_ptr = smem.allocate(npes * n_chunks * 4, 16)._ptr
+                lds_csum = fx.Int64(fx.ptrtoint(csum_ptr))
         if const_expr(use_sparse):
             pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
@@ -1133,6 +1200,11 @@ def compile_tdm_compact_plan(
                     send = expert_start + my_prefix
                     if dest == fx.Int32(rank):
                         buffer_store(expert_start + total, rsrc_psum, e)
+                    if const_expr(dense_comb):
+                        comm_ops.store_i32_lds(
+                            lds_segstart + fx.Int64(idx) * fx.Int64(4),
+                            expert_start,
+                        )
                     if const_expr(plan_blocks > 1):
                         # Only the other blocks read it (after the release).
                         buffer_store(send, rsrc_base, idx)
@@ -1209,6 +1281,111 @@ def compile_tdm_compact_plan(
                         carry = _scan_chunk(dest, chunk, carry)
             _lds_barrier()
 
+            if const_expr(dense_comb):
+                # Padded size of one source's run, then the exclusive prefix
+                # of those sizes along the source's row. One warp owns one
+                # (src, 32-segment) chunk, and the chunk carries cross one LDS
+                # barrier; segs <= 32 is a single chunk with no carry.
+                _a = COMBINE_SLOT_ALIGN
+
+                def _row0_and_padded(src_i, seg_i, live_i):
+                    expert_start = live_i.select(_ld(lds_segstart, seg_i), fx.Int32(0))
+                    row = expert_start
+                    row0_v = expert_start
+                    cnt_v = fx.Int32(0)
+                    for s in range_constexpr(npes):
+                        c = live_i.select(
+                            _ld(lds_matrix, fx.Int32(s * hist_dwords) + seg_i),
+                            fx.Int32(0),
+                        )
+                        take = src_i == fx.Int32(s)
+                        row0_v = take.select(row, row0_v)
+                        cnt_v = take.select(c, cnt_v)
+                        row = row + c
+                    residue = row0_v & fx.Int32(_a - 1)
+                    padded = (residue + cnt_v + fx.Int32(_a - 1)) & fx.Int32(-_a)
+                    padded = (cnt_v > fx.Int32(0)).select(padded, fx.Int32(0))
+                    # select() is a raw arith value; the wave scan wants Int32.
+                    return fx.Int32(row0_v), fx.Int32(padded)
+
+                def _publish(src_i, seg_i, row0_v, excl):
+                    """Run-table entry (this rank's experts) and intra-0 slot."""
+                    in_mine = (seg_i >= fx.Int32(rank * epr)) & (
+                        seg_i < fx.Int32((rank + 1) * epr)
+                    )
+                    if in_mine:
+                        e = seg_i - fx.Int32(rank * epr)
+                        item = e * fx.Int32(npes) + src_i
+                        base_e = excl + (row0_v & fx.Int32(_a - 1))
+                        tab = fx.Int32(epr) + item * fx.Int32(2)
+                        buffer_store(row0_v, rsrc_psum, tab)
+                        buffer_store(base_e - row0_v, rsrc_psum, tab + fx.Int32(1))
+                    if src_i == fx.Int32(rank):
+                        send = _ld(lds_hist, seg_i)
+                        slot0 = excl + (send & fx.Int32(_a - 1))
+                        if const_expr(plan_blocks == 1):
+                            _st(lds_pref, seg_i, slot0)
+                        else:
+                            # Keep lds_segstart as expert_start until every
+                            # warp has recomputed row0 from it.
+                            _st(lds_total, seg_i, slot0)
+                            buffer_store(slot0, rsrc_bhist, seg_i)
+
+                if const_expr(n_chunks == 1):
+                    if warp < npes:
+                        src = warp_u
+                        seg = lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        row0_v, padded = _row0_and_padded(src, seg_s, live)
+                        incl = _wave32_inclusive_scan_i32(padded, lane)
+                        if live:
+                            _publish(src, seg, row0_v, incl - padded)
+                else:
+                    n_jobs = npes * n_chunks
+                    for job in range(warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)):
+                        src = job // fx.Int32(n_chunks)
+                        ch = job - src * fx.Int32(n_chunks)
+                        seg = ch * fx.Int32(WAVE) + lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        _row0, padded = _row0_and_padded(src, seg_s, live)
+                        incl = _wave32_inclusive_scan_i32(padded, lane)
+                        # Uniform readlane: a later partial exec must not be
+                        # the only producer of lane 31's sum.
+                        chunk_total = fx.Int32(
+                            readlane(T.i32, arith.unwrap(incl), WAVE - 1)
+                        )
+                        if live:
+                            _st(lds_cexcl, src * fx.Int32(segs) + seg, incl - padded)
+                        if lane_i == fx.Int32(0):
+                            _st(lds_csum, src * fx.Int32(n_chunks) + ch, chunk_total)
+                    _lds_barrier()
+                    for job in range(warp_u, fx.Int32(n_jobs), fx.Int32(plan_waves)):
+                        src = job // fx.Int32(n_chunks)
+                        ch = job - src * fx.Int32(n_chunks)
+                        seg = ch * fx.Int32(WAVE) + lane_i
+                        live = seg < fx.Int32(segs)
+                        seg_s = live.select(seg, fx.Int32(0))
+                        carry = fx.Int32(0)
+                        for prev in range_constexpr(n_chunks):
+                            prev_i = fx.Int32(prev)
+                            add = _ld(lds_csum, src * fx.Int32(n_chunks) + prev_i)
+                            carry = carry + (prev_i < ch).select(add, fx.Int32(0))
+                        if live:
+                            row0_v, _padded = _row0_and_padded(src, seg_s, live)
+                            excl = carry + _ld(lds_cexcl, src * fx.Int32(segs) + seg)
+                            _publish(src, seg, row0_v, excl)
+                _lds_barrier()
+                if const_expr(plan_blocks > 1):
+                    # Row 0 of block_hist carries slot0 out on the same release
+                    # as send_base. lds_pref is this block's exclusive offset.
+                    for seg in range(tid, segs, plan_threads):
+                        slot0 = _ld(lds_total, seg)
+                        _st(lds_segstart, seg, slot0)
+                        _st(lds_pref, seg, fx.Int32(0))
+                    _lds_barrier()
+
         if const_expr(plan_blocks > 1):
             if const_expr(early_release):
                 # S1F without tok_map: released before X1 (barrier[3]).
@@ -1241,10 +1418,18 @@ def compile_tdm_compact_plan(
                         vec_width=1,
                         dtype=T.i32,
                     )
-                    if const_expr(write_tok_map):
+                    if const_expr(write_tok_map or dense_comb):
                         base = buffer_load(rsrc_base, s, vec_width=1, dtype=T.i32)
                         comm_ops.store_i32_lds(
                             lds_hist + fx.Int64(s) * fx.Int64(4), base + off
+                        )
+                    if const_expr(dense_comb):
+                        comm_ops.store_i32_lds(
+                            lds_segstart + fx.Int64(s) * fx.Int64(4),
+                            buffer_load(rsrc_bhist, s, vec_width=1, dtype=T.i32),
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_pref + fx.Int64(s) * fx.Int64(4), off
                         )
                     if const_expr(emit_runs):
                         comm_ops.store_i32_lds(
@@ -1405,7 +1590,7 @@ def compile_tdm_compact_plan(
                             fx.Int32(run_hdr + 2 * run_cap) + r,
                         )
 
-        if const_expr(write_tok_map or not stage_send):
+        if const_expr(write_tok_map or dense_comb or not stage_send):
             for local in range(tid, r_n, plan_threads):
                 route = r0 + local
                 if const_expr(merge_routes):
@@ -1432,6 +1617,28 @@ def compile_tdm_compact_plan(
                         rsrc_map,
                         route,
                     )
+                if const_expr(dense_comb):
+                    own_seg = valid.select(segment, fx.Int32(0))
+                    if const_expr(plan_blocks == 1):
+                        # Intra-0 slot, published by the dcomb pass.
+                        local_base = _ld(lds_pref, own_seg)
+                    else:
+                        # intra counts only this block's routes. slot0 is the
+                        # segment's intra-0 slot; lds_pref is the block offset.
+                        # The residue stays on the segment's first compact row,
+                        # which is not lds_hist once the offset has been added.
+                        local_base = comm_ops.load_i32_lds(
+                            lds_segstart + fx.Int64(own_seg) * fx.Int64(4)
+                        ) + comm_ops.load_i32_lds(
+                            lds_pref + fx.Int64(own_seg) * fx.Int64(4)
+                        )
+                    buffer_store(
+                        arith.select(
+                            valid & in_cap, local_base + intra, arith.constant(dropped)
+                        ),
+                        rsrc_cslot,
+                        route,
+                    )
                 if const_expr(emit_runs and not stage_send):  # noqa: SIM102
                     # Slot = this block's first slot of the segment + intra.
                     if valid & in_cap:
@@ -1454,6 +1661,7 @@ def compile_tdm_compact_plan(
             addr_masked_m: Int64,
             addr_psum: Int64,
             addr_barrier: Int64,
+            addr_comb_slot: Int64,
             my_lsa_rank: Int32,
             inp_cur_tok: Int32,
             addr_send_list: Int64,
@@ -1540,6 +1748,7 @@ def compile_tdm_compact_plan(
                     addr_masked_m,
                     addr_psum,
                     addr_barrier,
+                    addr_comb_slot,
                     my_lsa_rank,
                     inp_cur_tok,
                     addr_send_list,
@@ -1570,6 +1779,7 @@ def compile_tdm_compact_plan(
             addr_masked_m: Int64,
             addr_psum: Int64,
             addr_barrier: Int64,
+            addr_comb_slot: Int64,
             my_lsa_rank: Int32,
             inp_cur_tok: Int32,
             addr_send_list: Int64,
@@ -1588,6 +1798,7 @@ def compile_tdm_compact_plan(
                 addr_masked_m,
                 addr_psum,
                 addr_barrier,
+                addr_comb_slot,
                 my_lsa_rank,
                 inp_cur_tok,
                 addr_send_list,
@@ -1615,6 +1826,7 @@ def compile_tdm_compact_plan(
             addr_masked_m: Int64,
             addr_psum: Int64,
             addr_barrier: Int64,
+            addr_comb_slot: Int64,
             my_lsa_rank: Int32,
             inp_cur_tok: Int32,
             addr_send_list: Int64,
@@ -1629,6 +1841,7 @@ def compile_tdm_compact_plan(
                 addr_masked_m,
                 addr_psum,
                 addr_barrier,
+                addr_comb_slot,
                 my_lsa_rank,
                 inp_cur_tok,
                 addr_send_list,
@@ -1646,6 +1859,7 @@ def compile_tdm_compact_plan(
             addr_masked_m: Int64,
             addr_psum: Int64,
             addr_barrier: Int64,
+            addr_comb_slot: Int64,
             my_lsa_rank: Int32,
             inp_cur_tok: Int32,
             addr_send_list: Int64,
@@ -1661,6 +1875,7 @@ def compile_tdm_compact_plan(
                 addr_masked_m,
                 addr_psum,
                 addr_barrier,
+                addr_comb_slot,
                 my_lsa_rank,
                 inp_cur_tok,
                 addr_send_list,
@@ -1683,6 +1898,7 @@ def compile_tdm_compact_plan(
         addr_masked_m: Int64,
         addr_psum: Int64,
         addr_barrier: Int64,
+        addr_comb_slot: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
     ):
@@ -1695,6 +1911,7 @@ def compile_tdm_compact_plan(
             addr_masked_m,
             addr_psum,
             addr_barrier,
+            addr_comb_slot,
             my_lsa_rank,
             inp_cur_tok,
             None,
@@ -1712,6 +1929,7 @@ def compile_tdm_compact_plan(
         addr_masked_m: Int64,
         addr_psum: Int64,
         addr_barrier: Int64,
+        addr_comb_slot: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
         stream=fx.Stream(None),  # noqa: B008
@@ -1725,6 +1943,7 @@ def compile_tdm_compact_plan(
             addr_masked_m,
             addr_psum,
             addr_barrier,
+            addr_comb_slot,
             my_lsa_rank,
             inp_cur_tok,
         ).launch(
