@@ -114,7 +114,10 @@ def runTorch(xs, dtype):
 def makeInputs(tp, rank, case_idx, m, n, dtype):
     """Every rank's input from one seed, so each rank has the reference."""
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
-    xs = [torch.randn((m, n), dtype=dtype, device="cuda", generator=gen) for _ in range(tp)]
+    xs = [
+        torch.randn((m, n), dtype=dtype, device="cuda", generator=gen)
+        for _ in range(tp)
+    ]
     # one rank sends the sentinel bit pattern; it must not hang and the output
     # there must be NaN
     xs[case_idx % tp].view(torch.int16).view(-1)[[0, -1]] = SENTINEL
@@ -153,7 +156,9 @@ def timeGraph(fn, graphs):
         graph.replay()
         e.record()
     torch.cuda.synchronize()
-    ms = sorted(s.elapsed_time(e) for s, e in zip(start_events, end_events))[GRAPH_REPLAYS // 2]
+    ms = sorted(s.elapsed_time(e) for s, e in zip(start_events, end_events))[
+        GRAPH_REPLAYS // 2
+    ]
     return out, ms * 1000 / CALLS_PER_GRAPH
 
 
@@ -164,8 +169,9 @@ def forceKernel(ca, x, kernel):
 
 
 @benchmark()
-def testLamportAllReduce(tp, m, n, dtype, path, lamport, case_idx=0, rank=0, ca=None,
-                         graphs=None):
+def testLamportAllReduce(
+    tp, m, n, dtype, path, lamport, case_idx=0, rank=0, ca=None, graphs=None
+):
     x, xs = makeInputs(tp, rank, case_idx, m, n, dtype)
     ref = runTorch(xs, dtype)
     nbytes = x.numel() * x.element_size()
@@ -177,8 +183,11 @@ def testLamportAllReduce(tp, m, n, dtype, path, lamport, case_idx=0, rank=0, ca=
         ret["orig us"] = us
         ret["orig TB/s"] = nbytes / us / 1e6
         ret["orig err"] = checkAllclose(
-            ref.to(dtypes.fp32), out.to(dtypes.fp32), mask=~torch.isnan(ref),
-            printLog=rank == 0, msg=f"orig: tp{tp} {path} {m=} {n=}",
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            mask=~torch.isnan(ref),
+            printLog=rank == 0,
+            msg=f"orig: tp{tp} {path} {m=} {n=}",
         )
         return ret
 
@@ -198,8 +207,11 @@ def testLamportAllReduce(tp, m, n, dtype, path, lamport, case_idx=0, rank=0, ca=
         # is not bitwise rank-order on every path
         if name == "lamport" and kernel == 0:
             ret[f"{name} err"] = checkAllclose(
-                ref.to(dtypes.fp32), out.to(dtypes.fp32), mask=~torch.isnan(ref),
-                printLog=rank == 0, msg=f"{name}: tp{tp} {path} {m=} {n=}",
+                ref.to(dtypes.fp32),
+                out.to(dtypes.fp32),
+                mask=~torch.isnan(ref),
+                printLog=rank == 0,
+                msg=f"{name}: tp{tp} {path} {m=} {n=}",
             )
         else:
             ret[f"{name} err"] = bitErr(out, ref)
@@ -220,7 +232,17 @@ def checkSizeChanges(ca, tp, rank, dtype):
             positions = [top, 1, 5120, 192, 65, 64, top]
         else:
             top = twoShotMaxPositions(tp)
-            positions = [top, 1, MAX_POSITIONS, MAX_POSITIONS + 1, 5120, 192, 65, 64, top]
+            positions = [
+                top,
+                1,
+                MAX_POSITIONS,
+                MAX_POSITIONS + 1,
+                5120,
+                192,
+                65,
+                64,
+                top,
+            ]
         # a two-shot position stands for one pack of each of the tp chunks
         chunks = 1 if kernel == 1 else tp
         for i, pos in enumerate(positions * 3):
@@ -237,7 +259,9 @@ def checkUnalignedInput(ca, tp, rank, dtype):
     errs = []
     for i, (m, n) in enumerate([(1, 4096), (64, 8192)]):
         x, xs = makeInputs(tp, rank, 2000 + i, m, n, dtype)
-        assert aiter.lamportKernel(ca._ptr, x.numel()) != 0, f"{m}x{n} is not a lamport size"
+        assert (
+            aiter.lamportKernel(ca._ptr, x.numel()) != 0
+        ), f"{m}x{n} is not a lamport size"
         if rank % 2 == 1:
             buf = torch.empty(x.numel() + PACK_BYTES, dtype=dtype, device=x.device)
             x = buf[1 : 1 + x.numel()].view(m, n).copy_(x)
@@ -253,10 +277,14 @@ def worker(tp, rank, shapes, dtype, lamport, init_method):
         os.environ[DISABLE_LAMPORT_ENV] = "1"
     torch.cuda.set_device(rank)
     set_custom_all_reduce(True)
-    init_distributed_environment(world_size=tp, rank=rank, distributed_init_method=init_method)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
     ensure_model_parallel_initialized(tp, 1)
     ca = get_tp_group().device_communicator.ca_comm
-    assert ca.lamport_enabled == lamport, f"lamport_enabled={ca.lamport_enabled}, want {lamport}"
+    assert (
+        ca.lamport_enabled == lamport
+    ), f"lamport_enabled={ca.lamport_enabled}, want {lamport}"
 
     resize_err = checkSizeChanges(ca, tp, rank, dtype) if lamport else None
     unaligned_err = checkUnalignedInput(ca, tp, rank, dtype) if lamport else None
@@ -267,7 +295,16 @@ def worker(tp, rank, shapes, dtype, lamport, init_method):
         ca.enable_register_for_capturing = path == "registered"
         for i, (m, n) in enumerate(shapes):
             row = testLamportAllReduce(
-                tp, m, n, dtype, path, lamport, case_idx=i, rank=rank, ca=ca, graphs=graphs
+                tp,
+                m,
+                n,
+                dtype,
+                path,
+                lamport,
+                case_idx=i,
+                rank=rank,
+                ca=ca,
+                graphs=graphs,
             )
             for k in ("case_idx", "rank", "ca", "graphs", "lamport"):
                 row.pop(k, None)
@@ -298,7 +335,7 @@ def runTp(tp, shapes, dtype, lamport, timeout):
     for case in zip(*per_rank):
         row = dict(case[0])
         for k in row:
-            if k.endswith(" us") or k.endswith(" err"):
+            if k.endswith((" us", " err")):
                 row[k] = max(r[k] for r in case)
             elif k.endswith(" TB/s"):
                 row[k] = min(r[k] for r in case)
@@ -308,7 +345,9 @@ def runTp(tp, shapes, dtype, lamport, timeout):
 
 def main():
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("lamport all-reduce unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning(
+            "lamport all-reduce unsupported on %s; skipping", get_gfx()
+        )
         return
 
     parser = argparse.ArgumentParser(
@@ -316,27 +355,47 @@ def main():
         description="lamport path of custom all-reduce: correctness and tuning numbers",
     )
     parser.add_argument(
-        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,",
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default="bf16,",
         help="data type, e.g. -d bf16",
     )
     parser.add_argument(
-        "-t", "--tp", type=int, nargs="*", default=[2, 4, 8],
+        "-t",
+        "--tp",
+        type=int,
+        nargs="*",
+        default=[2, 4, 8],
         help="tensor parallel sizes (2/4/8), e.g. -t 8",
     )
     parser.add_argument(
-        "-n", type=int, nargs="*", default=[7168, 8192],
+        "-n",
+        type=int,
+        nargs="*",
+        default=[7168, 8192],
         help="hidden sizes, e.g. -n 7168",
     )
     parser.add_argument(
-        "-m", type=int, nargs="*", default=None,
+        "-m",
+        type=int,
+        nargs="*",
+        default=None,
         help="token counts, default 1, 2, 4, ... up to the two-shot cap of each tp and n",
     )
     parser.add_argument(
-        "-s", "--mn", type=dtypes.str2tuple, nargs="*", default=None,
+        "-s",
+        "--mn",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=None,
         help="explicit (tokens, hidden) shapes, overrides -m/-n, e.g. -s 16,4096",
     )
     parser.add_argument(
-        "--timeout", type=int, default=1800,
+        "--timeout",
+        type=int,
+        default=1800,
         help="seconds per process group before declaring a hang",
     )
     args = parser.parse_args()

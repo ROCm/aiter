@@ -241,7 +241,9 @@ def lamportKernel(_fa: int, numel: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
-def lamportAllReduce(_fa: int, inp: torch.Tensor, out: torch.Tensor, kernel: int) -> None: ...
+def lamportAllReduce(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, kernel: int
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
