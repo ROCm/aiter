@@ -1059,7 +1059,7 @@ _BLOCKSCALE_TRITON_FALLBACK_MIN_M = {"gfx942": 2048, "gfx950": 384}
 def _warn_blockscale_split_k_row_not_bf16(n: int, k: int, dtype: torch.dtype):
     logger.warning(
         f"gemm_a8w8_blockscale N:{n}, K:{k} has split-K rows, which accumulate in "
-        f"the output dtype; {dtype} output uses the untuned dispatch instead."
+        f"the output dtype; {dtype} output runs them without split-K."
     )
 
 
@@ -1281,8 +1281,7 @@ def gemm_a8w8_blockscale(
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
     FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
     queried through get_CKGEMM_config before choosing a fallback. A split-K CK
-    or CK-Tile row applies to BF16 output only; other output dtypes take the
-    fallback. Group32
+    or CK-Tile row runs without split-K for output other than BF16. Group32
     currently supports libtype="triton", also its default on a config miss.
     Triton tile and split-K parameters come from its own tuning tables.
     For native group32 operands, split_k optionally overrides the positive
@@ -1331,15 +1330,6 @@ def gemm_a8w8_blockscale(
         else AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     config = get_CKGEMM_config(m, n, k, tuned_file)
-    if (
-        config is not None
-        and not is_group32
-        and config["libtype"] in ("ck", "cktile")
-        and int(config.get("splitK", 0)) > 0
-        and dtype != dtypes.bf16
-    ):
-        _warn_blockscale_split_k_row_not_bf16(n, k, dtype)
-        config = None
     if config is not None:
         libtype = config["libtype"]
         if libtype == "triton":
@@ -1350,6 +1340,9 @@ def gemm_a8w8_blockscale(
         # group32 row must fail instead of reinterpreting its E8M0 bytes.
         assert not is_group32, f"Unsupported libtype {libtype} for group32 GEMM"
         splitK = int(config.get("splitK", 0))
+        if splitK > 0 and dtype != dtypes.bf16 and libtype in ("ck", "cktile"):
+            _warn_blockscale_split_k_row_not_bf16(n, k, dtype)
+            splitK = 0
         kernelName = str(config.get("kernelName", ""))
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
         if libtype == "ck":

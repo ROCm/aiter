@@ -29,13 +29,17 @@ needs_threshold = pytest.mark.skipif(MIN_M is None, reason="no threshold for thi
 def dispatch(monkeypatch, m, config=None, gfx=None, dtype=dtypes.bf16):
     reached = []
 
+    def label(name, kwargs):
+        split_k = kwargs.get("splitK", 0)
+        return f"{name}/sk{split_k}" if split_k else name
+
     def fake_ck(XQ, WQ, x_scale, w_scale, Y, **kwargs):
-        reached.append("ck_tuned" if kwargs.get("kernelName") else "ck")
+        reached.append(label("ck_tuned" if kwargs.get("kernelName") else "ck", kwargs))
         return Y
 
     def fake_backend(name):
         def run(XQ, WQ, x_scale, w_scale, Y, *args, **kwargs):
-            reached.append(name)
+            reached.append(label(name, kwargs))
             return Y
 
         return run
@@ -84,16 +88,14 @@ def test_gemm_a8w8_blockscale_uses_ck_for_tuned_above_threshold(monkeypatch, del
 
 @needs_threshold
 @pytest.mark.parametrize("libtype, tuned", [("ck", "ck_tuned"), ("cktile", "cktile")])
-@pytest.mark.parametrize("delta, untuned", [(-1, "ck"), (0, "triton")])
-def test_gemm_a8w8_blockscale_skips_split_k_row_for_fp16(
-    monkeypatch, libtype, tuned, delta, untuned
+@pytest.mark.parametrize("delta", [-1, 0])
+def test_gemm_a8w8_blockscale_drops_split_k_for_fp16(
+    monkeypatch, libtype, tuned, delta
 ):
     m = MIN_M + delta
     split_k = {**SPLIT_K_CONFIG, "libtype": libtype}
-    no_split = {**CK_CONFIG, "libtype": libtype}
-    assert dispatch(monkeypatch, m, config=split_k, dtype=dtypes.fp16) == untuned
-    assert dispatch(monkeypatch, m, config=split_k) == tuned
-    assert dispatch(monkeypatch, m, config=no_split, dtype=dtypes.fp16) == tuned
+    assert dispatch(monkeypatch, m, config=split_k, dtype=dtypes.fp16) == tuned
+    assert dispatch(monkeypatch, m, config=split_k) == f"{tuned}/sk2"
 
 
 @pytest.mark.parametrize("gfx", NO_THRESHOLD_GFX)
