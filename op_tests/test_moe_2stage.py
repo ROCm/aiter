@@ -83,9 +83,9 @@ _STANDARD_MOE_2STAGE_TOKENS = [1, 16, 32, 64, 128, 256, 1024, 4096]
 # The default script behavior must keep the historical full sweep. CI can opt
 # into the reduced representative-token standard profile, while the explicit
 # "full" profile preserves the parsed CLI arguments unchanged.
-AITER_MOE_2STAGE_CI_PROFILE = (
-    os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
-)
+AITER_MOE_2STAGE_CI_PROFILE = os.environ.get(
+    "AITER_MOE_2STAGE_CI_PROFILE", "default"
+).lower()
 
 if AITER_MOE_2STAGE_CI_PROFILE == "standard":
     logger.info("moe_2stage active CI profile: standard")
