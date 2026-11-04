@@ -28,16 +28,45 @@ _REPO = Path(__file__).resolve().parent.parent
 _BASELINE = Path(__file__).with_name("plugin_contracts.json")
 
 
-def _is_route(decorator: ast.expr) -> bool:
-    """A ``route(op=..., version=...)`` decorator under any local spelling."""
+def _route_spellings(tree: ast.Module) -> set[str]:
+    """The names this file can call ``route()`` by.
 
+    Resolved from the imports rather than guessed from the name, so an alias
+    (``from ..plugin import route as _route``, which is what the routed ops
+    use) is found, and an unrelated function whose name happens to end in
+    "route" is not.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.endswith("plugin"):
+                names |= {a.asname or a.name for a in node.names if a.name == "route"}
+            if module.endswith("aiter") or module == "":
+                names |= {
+                    f"{a.asname or a.name}.route"
+                    for a in node.names
+                    if a.name == "plugin"
+                }
+        elif isinstance(node, ast.Import):
+            names |= {
+                f"{a.asname or a.name}.route"
+                for a in node.names
+                if a.name in {"aiter.plugin", "aiter"}
+            }
+    return names
+
+
+def _is_route(decorator: ast.expr, spellings: set[str]) -> bool:
     if not isinstance(decorator, ast.Call):
         return False
     target = decorator.func
-    name = (
-        target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
-    )
-    if not name.endswith("route"):
+    if isinstance(target, ast.Attribute):
+        name = f"{ast.unparse(target.value)}.{target.attr}"
+    else:
+        name = getattr(target, "id", "")
+    if name not in spellings:
         return False
     return {keyword.arg for keyword in decorator.keywords} >= {"op", "version"}
 
@@ -65,22 +94,26 @@ def _signature(function: ast.FunctionDef) -> str:
         if default is not None:
             defaults[arg.arg] = _literal(default) or ""
 
-    parts = [f"{a.arg}:positional-only" for a in args.posonlyargs]
-    parts += [f"{a.arg}:positional" for a in args.args]
+    def render(arg: ast.arg, kind: str) -> str:
+        part = f"{arg.arg}:{kind}"
+        if arg.annotation is not None:
+            # A provider implements against the declared types too, so a change
+            # from Tensor to list[Tensor] has to move the fingerprint.
+            part += f":{ast.unparse(arg.annotation)}"
+        if arg.arg in defaults:
+            part += f"={defaults[arg.arg]}"
+        return part
+
+    parts = [render(a, "positional-only") for a in args.posonlyargs]
+    parts += [render(a, "positional") for a in args.args]
     if args.vararg:
         parts.append(f"*{args.vararg.arg}")
-    parts += [f"{a.arg}:keyword-only" for a in args.kwonlyargs]
+    parts += [render(a, "keyword-only") for a in args.kwonlyargs]
     if args.kwarg:
         parts.append(f"**{args.kwarg.arg}")
-    return ", ".join(
-        part
-        + (
-            f"={defaults[part.split(':')[0].lstrip('*')]}"
-            if part.split(":")[0].lstrip("*") in defaults
-            else ""
-        )
-        for part in parts
-    )
+    if function.returns is not None:
+        parts.append(f"-> {ast.unparse(function.returns)}")
+    return ", ".join(parts)
 
 
 def routed_contracts(root: Path) -> dict[str, dict[str, object]]:
@@ -89,11 +122,14 @@ def routed_contracts(root: Path) -> dict[str, dict[str, object]]:
     found: dict[str, dict[str, object]] = {}
     for path in sorted(root.glob("aiter/**/*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
             for decorator in node.decorator_list:
-                if not _is_route(decorator):
+                if not _is_route(decorator, spellings):
                     continue
                 keywords = {k.arg: k.value for k in decorator.keywords}
                 op = ast.literal_eval(keywords["op"])
@@ -119,14 +155,28 @@ def test_routed_contracts_match_the_committed_baseline():
             f"the baseline is where it is recorded."
         )
         if recorded["fingerprint"] == entry["fingerprint"]:
+            assert recorded["version"] == entry["version"], (
+                f"The op_version of {op} moved but its signature did not. Either "
+                f"the bump is spurious, or {_BASELINE.name} was not rewritten "
+                f"with the change it describes."
+            )
             continue
-        assert recorded["version"] != entry["version"], (
+        # A bump must move forward, and the baseline must be rewritten in the
+        # same change. Accepting any difference would let one bump license every
+        # later signature change for that op -- the hole this guards.
+        assert recorded["version"] < entry["version"], (
             f"The public signature of {op} changed without an op_version bump.\n"
-            f"  was: {recorded['signature']}\n"
-            f"  now: {entry['signature']}\n"
+            f"  was: v{recorded['version']}  {recorded['signature']}\n"
+            f"  now: v{entry['version']}  {entry['signature']}\n"
             f"Providers implement against this signature. Bump version= on the "
-            f"route and record the new contract in {_BASELINE.name}, or revert "
-            f"the signature change."
+            f"route, record the new contract in {_BASELINE.name}, and declare "
+            f"the old version in supersedes= -- or revert the signature change."
+        )
+        pytest.fail(
+            f"{op} was bumped to v{entry['version']} but {_BASELINE.name} still "
+            f"records v{recorded['version']}. Rewrite the baseline in the same "
+            f"change, so the next signature edit is checked against the new "
+            f"contract rather than the old one."
         )
 
     for op in sorted(set(baseline) - set(current)):

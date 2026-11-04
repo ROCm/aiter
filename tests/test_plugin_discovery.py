@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import threading
 
 import pytest
 
@@ -127,3 +128,81 @@ def test_discovery_reads_only_this_group(tmp_path, monkeypatch):
     )
 
     assert [record.provider.name for record in plugin._providers()] == ["aklr"]
+
+
+_REENTRANT_MODULE = """
+from aiter import plugin
+
+
+class Provider:
+    name = "reentrant"
+    api_versions = {plugin.API_VERSION}
+    op_versions = {"demo.add": {1}}
+
+    def select(self, op, args, kwargs):
+        return None
+
+
+# A provider that touches aiter while importing. Discovery must not be holding
+# a lock this call would need: that deadlocks with no traceback and no log, in
+# the middle of a kernel call.
+plugin.status()
+instance = Provider()
+"""
+
+
+def test_a_provider_that_touches_aiter_while_importing_does_not_deadlock(
+    tmp_path, monkeypatch
+):
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "reentrant_pkg.py").write_text(_REENTRANT_MODULE)
+    dist = site / "reentrant-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: reentrant\nVersion: 1.0\n"
+    )
+    (dist / "entry_points.txt").write_text(
+        f"[{plugin.ENTRY_POINT_GROUP}]\nreentrant = reentrant_pkg:instance\n"
+    )
+    monkeypatch.syspath_prepend(str(site))
+
+    done = threading.Event()
+
+    def discover():
+        plugin._providers()
+        done.set()
+
+    worker = threading.Thread(target=discover, daemon=True)
+    worker.start()
+    # Fails rather than hanging the suite: a deadlock would never set this.
+    assert done.wait(timeout=20), "discovery deadlocked on a re-entrant provider"
+
+    # It does not serve, and that is the right answer rather than a hang: the
+    # re-entrant call asks for an attribute of a module that is still executing
+    # its own top level. The point is that the failure is isolated, reported,
+    # and survivable -- a deadlock here is invisible and unrecoverable.
+    skipped = {
+        e["entry_point"]: e["reason"] for e in plugin.status()["skipped_providers"]
+    }
+    assert "reentrant" in skipped
+    assert "circular import" in skipped["reentrant"]
+
+
+def test_a_broken_entry_point_scan_does_not_raise_into_the_call(monkeypatch):
+    """A malformed wheel belonging to somebody else must not break dispatch."""
+
+    def exploding():
+        raise UnicodeDecodeError("utf-8", b"", 0, 1, "some other package is broken")
+
+    monkeypatch.setattr(plugin, "_entry_points", exploding)
+
+    @plugin.route(op="demo.add", version=1)
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 5, "it must fall back to native, not raise"
+    assert add(4, 5) == 9, "and must not re-raise on the next call either"
+    assert (
+        plugin.status()["skipped_providers"][0]["entry_point"] == "<entry point scan>"
+    )

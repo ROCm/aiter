@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -552,10 +552,13 @@ def test_a_misbehaving_provider_does_not_deny_service_to_the_next(
         lambda: (_EntryPoint("broken", broken), _EntryPoint("good", good)),
     )
 
-    assert _route_add([])(2, 3) == 100, reason
+    assert _route_add([])(2, 3) == 100
     assert broken.select_calls == 1
     assert good.select_calls == 1
     assert plugin.last_decision().provider == "good"
+    # The two parameter sets must not collapse into the same assertion: a
+    # misbehaving provider is not a declining one, and the record says which.
+    assert plugin.explain("test.add", 2, 3).declines["broken"] == reason
 
 
 @pytest.mark.parametrize(
@@ -877,7 +880,7 @@ def test_a_provider_supporting_several_api_versions_is_served_on_the_newest():
     provider = _Provider("aklr", _candidate("aklr"))
     provider.api_versions = {plugin.API_VERSION - 1, plugin.API_VERSION}
 
-    assert plugin._declared_api_versions(provider) == frozenset(
+    assert plugin._declared_api_versions(provider, "aklr") == frozenset(
         {plugin.API_VERSION - 1, plugin.API_VERSION}
     )
 
@@ -931,3 +934,145 @@ def test_a_var_signature_warns_that_it_pays_the_generic_binder(monkeypatch):
 
     assert len(messages) == 1
     assert "Signature.bind on every call" in messages[0]
+
+
+def test_a_candidate_without_evidence_can_still_serve(monkeypatch):
+    """The interface says AITER *may* record a qualification, not that one exists."""
+
+    bare = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="k1",
+        artifact_digest="sha256:abc",
+        run=lambda left, right: 100,
+    )
+    provider = _Provider("aklr", bare)
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100
+    assert plugin.last_decision().qualification is None
+
+
+def test_the_newest_acceptable_op_version_is_matched(monkeypatch):
+    """Same rule as the API version handshake, which takes max(usable)."""
+
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add": {1, 2}}
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    # Written oldest-first on purpose: the answer must not depend on this order.
+    @plugin.route(op="test.add", version=3, supersedes={1: "aiter 0.5", 2: "aiter 0.6"})
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 100
+    assert "op version 2" in warnings[0], "the newest acceptable version serves"
+    assert "aiter 0.6" in warnings[0], "and its own removal release is named"
+
+
+def test_explain_names_the_provider_it_blames(monkeypatch):
+    """explain() claims to return the Decision the call would produce."""
+
+    broken = _Broken("broken", RuntimeError("boom"))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("broken", broken),)
+    )
+    add = _route_add([])
+
+    predicted = plugin.explain("test.add", 2, 3).decision
+    add(2, 3)
+    actual = plugin.last_decision()
+
+    assert (predicted.reason, predicted.provider) == (actual.reason, actual.provider)
+
+
+def test_explain_reports_no_decision_under_the_kill_switch(monkeypatch):
+    monkeypatch.setenv("AITER_PLUGINS", "0")
+    _route_add([])
+
+    # Dispatch records nothing there, so there is no would-be Decision either.
+    assert plugin.explain("test.add", 2, 3).decision is None
+
+
+def test_explain_does_not_spend_the_one_shot_deprecation_warning(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add": {1}}
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add", version=2, supersedes={1: "aiter 0.6"})
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    plugin.explain("test.add", 2, 3)
+    assert warnings == [], "a dry run must not consume the warning"
+
+    add(2, 3)
+    assert len(warnings) == 1, "real traffic still gets told"
+
+
+def test_a_forced_provider_name_is_stripped(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setenv("AITER_PLUGIN_FORCE", "  aklr ")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100, "whitespace is a typo, not a different name"
+
+
+def test_status_survives_a_provider_that_stops_answering(monkeypatch):
+    """status() is where an operator goes to find out why routing stopped."""
+
+    class Rotting:
+        broken = False
+        name = "aklr"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+
+        @property
+        def op_versions(self):
+            if Rotting.broken:
+                raise RuntimeError("backend went away")
+            return {"test.add": {1}}
+
+        def select(self, op, args, kwargs):
+            return _candidate("aklr")
+
+    provider = Rotting()
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+    assert add(2, 3) == 100
+
+    Rotting.broken = True
+    try:
+        # Eligibility is cached per (op, generation), so a provider that rots
+        # mid-generation keeps serving until the config changes -- the hot path
+        # does not re-interrogate it.
+        assert add(2, 3) == 100
+
+        # status() does interrogate it, and must survive the answer.
+        entry = plugin.status()["providers"][0]
+        assert entry["name"] == "aklr"
+        assert "unavailable" in entry["op_versions"]
+        assert "backend went away" in entry["op_versions"]
+    finally:
+        Rotting.broken = False
