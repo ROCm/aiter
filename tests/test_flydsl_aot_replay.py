@@ -3,11 +3,15 @@ size inside a row's range it may report as the runtime refusing that size, and
 the command line its per-arch processes get.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
+The last test needs a gfx950 GPU: it serves a real run-only process from an
+AOT-built cache.
 """
 
 import csv
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -156,3 +160,79 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+# One split-K A16W16 row (dsv3_bf16_tuned_gemm.csv, M=2 N=256 K=7168, ks7); the
+# CU count is filled in from the live device.
+_HGEMM_CSV = (
+    "gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,"
+    "splitK,us,kernelName,err_ratio,tflops,bw\n"
+    "gfx950,{cu_num},2,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,"
+    "flydsl,312,7,5.1366,"
+    "flydsl_hgemm_abf16_wbf16_bf16_t16x32x128x7_ks7_w1x2x1_bias0_ktail0_gm0_pft_gfx950,"
+    "0.0137,1.43,720.26\n"
+)
+_HGEMM_RUN_ONLY = """
+import torch
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.tuned_gemm import get_GEMM_A16W16_config, gemm_a16w16
+m, n, k = 2, 256, 7168
+config = get_GEMM_A16W16_config(
+    M=m, N=n, K=k, bias=False, dtype=str(torch.bfloat16), otype=str(torch.bfloat16),
+    gfx=get_gfx_runtime(), cu_num=get_cu_num(),
+)
+# a missed row falls back to another kernel and would never read the cache
+assert config and config["libtype"] == "flydsl", config
+# small integers: every product and partial sum is exact, and a wrong K-slice,
+# row or stride changes the result
+ks = torch.arange(k, device="cuda")
+a = torch.stack([(ks + 3 * i) % 7 - 3 for i in range(m)]).to(torch.bfloat16)
+w = torch.stack([(5 * ks + j) % 5 - 2 for j in range(n)]).to(torch.bfloat16)
+ref = (a.float() @ w.float().t()).to(torch.bfloat16)
+torch.testing.assert_close(gemm_a16w16(a, w, otype=torch.bfloat16), ref, rtol=0, atol=0)
+"""
+
+
+def _run(cmd, env, timeout=240):
+    """Run cmd in its own process group; kill the group (replay workers too) on timeout."""
+    proc = subprocess.Popen(
+        [sys.executable, *cmd],
+        cwd=_REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        pytest.fail(f"{cmd[:2]} timed out after {timeout}s:\n{out[-4000:]}")
+    return proc.returncode, out
+
+
+def test_a16w16_aot_cache_serves_a_run_only_process(tmp_path):
+    """A fresh FLYDSL_RUNTIME_RUN_ONLY process must load the kernel the AOT
+    replay built for a tuned A16W16 row; a cache miss raises there."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        pytest.skip("needs a gfx950 GPU")
+    cu_num = torch.cuda.get_device_properties(0).multi_processor_count
+    csv_path = tmp_path / "bf16_tuned_gemm.csv"
+    csv_path.write_text(_HGEMM_CSV.format(cu_num=cu_num))
+    env = dict(
+        os.environ,
+        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
+        AITER_CONFIG_GEMM_BF16=str(csv_path),
+        GPU_ARCHS="gfx950",
+    )
+    env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+    for name, cmd, extra_env in (
+        ("AOT", ["-m", "aiter.aot.flydsl.gemm", "--csv", str(csv_path)], {}),
+        ("RUN_ONLY", ["-c", _HGEMM_RUN_ONLY], {"FLYDSL_RUNTIME_RUN_ONLY": "1"}),
+    ):
+        returncode, out = _run(cmd, {**env, **extra_env})
+        assert returncode == 0, f"{name}:\n{out[-4000:]}"
