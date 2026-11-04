@@ -61,6 +61,8 @@ def test_large_row_dispatch_matches_small_generic(rows, cols):
         (4537, 4096),
         (5611, 6144),
         (8193, 8192),
+        (8192, 4096),
+        (8193, 4096),
         (16384, 1024),
         (16385, 1024),
     ],
