@@ -18,6 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
+    _check_epilogue,
     _launch_splits,
     _staged_block_m,
 )
@@ -491,38 +492,6 @@ def _fp8_plan(num_queries, num_heads, avg_topk, two_loops):
     return g, _mla_num_splits(num_queries, num_heads // g, avg_topk)
 
 
-def _check_fp8_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8):
-    """The output epilogue's arguments, as pa_decode_sparse takes them."""
-    C, H, D = q.shape
-    if (inv_rope_positions is None) != (inv_rope_cos_sin_cache is None):
-        raise ValueError("inv_rope_positions and inv_rope_cos_sin_cache go together")
-    if out_mxfp8 is not None and inv_rope_positions is None:
-        raise ValueError("out_mxfp8 needs the inverse-RoPE inputs")
-    if inv_rope_positions is not None:
-        cs = inv_rope_cos_sin_cache
-        if inv_rope_positions.shape != (C,) or inv_rope_positions.stride(0) != 1:
-            raise ValueError(f"inv_rope_positions must be a contiguous [{C}]")
-        if cs.dtype != torch.float32 or cs.ndim != 2 or cs.shape[1] != 64:
-            raise ValueError("inv_rope_cos_sin_cache must be [P, 64] f32 (cos | sin)")
-        if cs.stride(1) != 1 or cs.device != q.device:
-            raise ValueError(
-                "inv_rope_cos_sin_cache rows must be contiguous, on q's device"
-            )
-    if out_mxfp8 is not None:
-        if out is not None:
-            raise ValueError("out and out_mxfp8 are mutually exclusive")
-        data, scale = out_mxfp8
-        if data.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
-            raise ValueError("out_mxfp8 is (e4m3 data, uint8 E8M0 scales)")
-        if data.shape != (C, H * D) or scale.shape != (C, H * D // 32):
-            raise ValueError(
-                f"out_mxfp8 must be ([{C}, {H * D}], [{C}, {H * D // 32}]), got "
-                f"{tuple(data.shape)}, {tuple(scale.shape)}"
-            )
-        if data.stride(-1) != 1 or scale.stride(-1) != 1:
-            raise ValueError("out_mxfp8 rows must be contiguous")
-
-
 def _sparse_mla_fwd_gfx950_fp8(
     q,
     q_scale,
@@ -558,6 +527,8 @@ def _sparse_mla_fwd_gfx950_fp8(
     own cache. Host metadata only (storage pointers, strides, scale identity):
     safe under graph capture."""
     C, H, row = q.shape
+    if cache.numel() == 0 or (extra_kv is not None and extra_kv.numel() == 0):
+        return None  # an empty key list still gathers row 0
     kv, x_kv, x_ks = cache, None, None
     main = extra = (None, None, 0)
     if extra_kv is not None:
@@ -592,7 +563,7 @@ def _sparse_mla_fwd_gfx950_fp8(
     if main is None or extra is None:
         return None
 
-    _check_fp8_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8)
+    _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8)
     inv_rope = inv_rope_positions is not None
     mxfp8 = out_mxfp8 is not None
     # the output epilogue's arguments, shared with the merge

@@ -16,6 +16,7 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _epilogue_store,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 LOG2E: gl.constexpr = gl.constexpr(1.4426950408889634)
@@ -829,7 +830,12 @@ class Program:
             self.store_rows(x, base, out_stride1)
 
 
-@gluon.jit(do_not_specialize=["num_queries", "num_splits"])
+_sparse_mla_fp8_repr = make_kernel_repr(
+    "_sparse_mla_fp8", ["BLOCK_H", "ROPE_TAIL", "LAZY_LOG2", "ADDR64", "HEAD_BLOCKS"]
+)
+
+
+@gluon.jit(repr=_sparse_mla_fp8_repr, do_not_specialize=["num_queries", "num_splits"])
 def _sparse_mla_fp8(
     q_ptr,  # [C, H, 512 + ROPE_TAIL] fp8 (u8 view) or bf16
     kv_ptr,  # u8 base of the cache(s): rows of 512 + ROPE_TAIL bytes
