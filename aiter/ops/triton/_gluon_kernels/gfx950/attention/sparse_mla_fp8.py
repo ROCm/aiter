@@ -554,18 +554,18 @@ class Program:
     h0: gl.tensor
     split: gl.tensor
     num_splits: gl.tensor
-    num_heads: gl.tensor
+    num_heads: gl.constexpr
     q_ptr: gl.tensor  # head h0 of the row's q
-    q_stride: gl.tensor  # between heads
+    q_stride: gl.constexpr  # between heads
 
     @gluon.jit
     def initialize(
         cfg,
         HEAD_BLOCKS: gl.constexpr,
         q_ptr,
-        q_stride0,
-        q_stride1,
-        num_heads,
+        q_stride0: gl.constexpr,
+        q_stride1: gl.constexpr,
+        num_heads: gl.constexpr,
         num_splits,
     ):
         # A row's head blocks run at program ids L, L + 8, ..: on one XCD, so the
@@ -881,26 +881,26 @@ def _sparse_mla_fp8(
     x_indptr_ptr,
     x_idx_ptr,
     main_row0,
-    main_stride,
+    main_stride: gl.constexpr,
     extra_row0,
-    extra_stride,
+    extra_stride: gl.constexpr,
     x_kv_ptr,
     x_ks_ptr,
     # output epilogue: positions and cos_sin (+ stride) for the inverse RoPE,
     # E8M0 scales (+ stride) for MXFP8; None when off
     pos_ptr,
     cs_ptr,
-    cs_stride,
+    cs_stride: gl.constexpr,
     osc_ptr,
-    osc_stride,
+    osc_stride: gl.constexpr,
     num_queries,
-    num_heads,
+    num_heads: gl.constexpr,
     sm_scale_log2,
     num_splits,
-    q_stride0,
-    q_stride1,
-    out_stride0,
-    out_stride1,
+    q_stride0: gl.constexpr,
+    q_stride1: gl.constexpr,
+    out_stride0: gl.constexpr,
+    out_stride1: gl.constexpr,
     BLOCK_H: gl.constexpr,
     ROPE_TAIL: gl.constexpr,
     LAZY_LOG2: gl.constexpr,
