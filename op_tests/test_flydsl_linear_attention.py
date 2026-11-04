@@ -1172,6 +1172,74 @@ def test_flydsl_kda_decode_bf16_state_recurrent_sequence(fused_f_b: bool) -> Non
 
 @_requires_kda
 @pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_flydsl_kda_decode_graph_replay(
+    fused_f_b: bool, state_dtype: torch.dtype
+) -> None:
+    """A captured decode must match eager bit for bit across replays: it reads the
+    inputs written before each replay and carries the recurrent and conv state."""
+    batch = 8
+    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=batch, state_dtype=state_dtype)
+    # Compile outside the capture on a throwaway copy, so capture records launches only.
+    _run_kda_api(fused_f_b, f_a.clone(), f_b_weight, _copy_kda_inputs(seed))
+    torch.cuda.synchronize()
+
+    graph_inputs, eager_inputs, reference_inputs = (
+        _copy_kda_inputs(seed) for _ in range(3)
+    )
+    graph_f_a, eager_f_a = f_a.clone(), f_a.clone()
+    out = torch.empty(
+        (1, batch, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=_KDA_DEVICE
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        if fused_f_b:
+            _run_kda_with_f_b(graph_f_a, f_b_weight, graph_inputs, out=out)
+        else:
+            _run_kda(graph_inputs, out=out)
+
+    generator = torch.Generator(device=_KDA_DEVICE).manual_seed(7)
+    for step in range(3):
+        x = torch.randn(
+            graph_inputs.x.shape,
+            dtype=torch.bfloat16,
+            device=_KDA_DEVICE,
+            generator=generator,
+        )
+        new_f_a = torch.randn(
+            f_a.shape, dtype=torch.bfloat16, device=_KDA_DEVICE, generator=generator
+        )
+        raw_g = F.linear(
+            new_f_a.float(), f_b_weight.view(_KDA_HEADS * _KDA_DIM, _KDA_DIM).float()
+        ).to(torch.bfloat16)
+        for inputs in (graph_inputs, eager_inputs, reference_inputs):
+            inputs.x.copy_(x)
+            inputs.raw_g.copy_(raw_g.view(1, batch, _KDA_HEADS, _KDA_DIM))
+        graph_f_a.copy_(new_f_a)
+        eager_f_a.copy_(new_f_a)
+
+        graph.replay()
+        eager = _run_kda_api(fused_f_b, eager_f_a, f_b_weight, eager_inputs)
+        reference = _kda_reference(reference_inputs)
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), f"replay {step} output differs from eager"
+        assert torch.equal(
+            graph_inputs.state.view(torch.uint8), eager_inputs.state.view(torch.uint8)
+        ), f"replay {step} state differs from eager"
+        assert torch.equal(graph_inputs.conv_state, eager_inputs.conv_state)
+        _assert_kda_close(
+            reference, out, _KDA_OUTPUT_TOL, f"replay {step} output", _TOL_ERR_RATIO
+        )
+        _assert_kda_state_close(
+            reference_inputs.state,
+            graph_inputs.state,
+            f"replay {step} state",
+            _TOL_ERR_RATIO,
+        )
+
+
+@_requires_kda
+@pytest.mark.parametrize("fused_f_b", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.float64])
 def test_flydsl_kda_decode_rejects_unsupported_state_dtype(
     monkeypatch: pytest.MonkeyPatch,
