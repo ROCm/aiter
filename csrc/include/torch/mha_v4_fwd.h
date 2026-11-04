@@ -45,7 +45,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         double softmax_scale,
                         const at::Tensor& kv_block_indices,
                         const at::Tensor& lut_start,
-                        const at::Tensor& lut_count);
+                        const at::Tensor& lut_count,
+                        std::optional<at::Tensor> lse = std::nullopt);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each
