@@ -11,6 +11,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
     _lines,
+    _pack_lines,
     _post,
     _receive,
 )
@@ -27,8 +28,51 @@ def _columns(v):
     return gl.convert_layout(gl.reshape(v, [N, 4]), ROW, assert_trivial=True)
 
 
+@gluon.jit
+def _gated_row(routed, shared, gate, value, mask):
+    """routed + sigmoid(gate) * shared of one row in bf16, rounded as the unfused
+    sigmoid_mul does: the sigmoid to bf16, the product to bf16, then the fp32 add."""
+    g = gl.load(gate).to(gl.float32)
+    g = (1.0 / (1.0 + gl.exp(-g))).to(gl.bfloat16).to(gl.float32)
+    s = gl.amd.cdna5.buffer_load(shared, value, mask=mask, other=0).to(gl.float32)
+    r = gl.amd.cdna5.buffer_load(routed, value, mask=mask, other=0).to(gl.float32)
+    return ((s * g).to(gl.bfloat16).to(gl.float32) + r).to(gl.bfloat16)
+
+
+@gluon.jit
+def _gated_lines(
+    routed, shared, gate, gate_stride, row, tokens, value, HIDDEN: gl.constexpr, counter
+):
+    """_lines of the 3 rows from row on of routed + sigmoid(gate) * shared, the MoE
+    output of Qwen3-Next / Qwen3.5 left unsummed: x is never stored."""
+    call = gl.load(counter) % (1 << 30) + 1  # 1 to 2^30
+    last = tokens - 1  # a row out of range reads the gate of the last one, unused
+    v0 = _gated_row(
+        routed + row * HIDDEN,
+        shared + row * HIDDEN,
+        gate + gl.minimum(row, last) * gate_stride,
+        value,
+        row < tokens,
+    )
+    v1 = _gated_row(
+        routed + (row + 1) * HIDDEN,
+        shared + (row + 1) * HIDDEN,
+        gate + gl.minimum(row + 1, last) * gate_stride,
+        value,
+        row + 1 < tokens,
+    )
+    v2 = _gated_row(
+        routed + (row + 2) * HIDDEN,
+        shared + (row + 2) * HIDDEN,
+        gate + gl.minimum(row + 2, last) * gate_stride,
+        value,
+        row + 2 < tokens,
+    )
+    return call, _pack_lines(v0, v1, v2, call, counter)
+
+
 _all_reduce_rmsnorm_repr = make_kernel_repr(
-    "_all_reduce_rmsnorm_kernel", ["RANK", "HIDDEN", "GEMMA", "QUANT"]
+    "_all_reduce_rmsnorm_kernel", ["RANK", "HIDDEN", "GEMMA", "QUANT", "GATED"]
 )
 
 
@@ -47,15 +91,20 @@ def _all_reduce_rmsnorm_kernel(
     tokens,
     programs,
     eps,
+    shared,
+    gate,
+    gate_stride,
     RANK: gl.constexpr,
     HIDDEN: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
     GEMMA: gl.constexpr,
     QUANT: gl.constexpr,
+    GATED: gl.constexpr,
 ):
     """Program t sends rows 3t to 3t + 2 of x. Programs T to T + P - 1 receive triples
-    p, p + P, ... (T triples, P = programs). Rows from tokens on are 0, not stored."""
+    p, p + P, ... (T triples, P = programs). Rows from tokens on are 0, not stored.
+    With GATED, x is x + sigmoid(gate) * shared, gate one value a row."""
     # A lane has 4 columns of a row and a wave has 128: one fp8 group.
     ROW: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     N: gl.constexpr = HIDDEN // 4
@@ -72,15 +121,20 @@ def _all_reduce_rmsnorm_kernel(
     pos = 4 * pos + gl.arange(0, 4, layout=gl.SliceLayout(0, ROW))[None, :]
     if pid < triples:
         row = 3 * pid
-        call, lines = _lines(
-            x + row * HIDDEN,
-            col,
-            row < tokens,
-            row + 1 < tokens,
-            row + 2 < tokens,
-            HIDDEN,
-            calls + 2 * pid,
-        )
+        if GATED:
+            call, lines = _gated_lines(
+                x, shared, gate, gate_stride, row, tokens, col, HIDDEN, calls + 2 * pid
+            )
+        else:
+            call, lines = _lines(
+                x + row * HIDDEN,
+                col,
+                row < tokens,
+                row + 1 < tokens,
+                row + 2 < tokens,
+                HIDDEN,
+                calls + 2 * pid,
+            )
         # All lines of the triple on each call: no old tag can stay.
         _post(lines, inboxes, 2 * HIDDEN * pid + pos, line < 2 * N, call, RANK, SLOT)
     else:
@@ -89,15 +143,28 @@ def _all_reduce_rmsnorm_kernel(
             w += 1.0
         for t in range(pid - triples, triples, programs):
             row = 3 * t
-            call, lines = _lines(
-                x + row * HIDDEN,
-                col,
-                row < tokens,
-                row + 1 < tokens,
-                row + 2 < tokens,
-                HIDDEN,
-                calls + 2 * t + 1,
-            )
+            if GATED:
+                call, lines = _gated_lines(
+                    x,
+                    shared,
+                    gate,
+                    gate_stride,
+                    row,
+                    tokens,
+                    col,
+                    HIDDEN,
+                    calls + 2 * t + 1,
+                )
+            else:
+                call, lines = _lines(
+                    x + row * HIDDEN,
+                    col,
+                    row < tokens,
+                    row + 1 < tokens,
+                    row + 2 < tokens,
+                    HIDDEN,
+                    calls + 2 * t + 1,
+                )
             # The residual is local: load it before the wait.
             res = residual + row * HIDDEN
             r0 = gl.amd.cdna5.buffer_load(res, col, mask=row < tokens, other=0)

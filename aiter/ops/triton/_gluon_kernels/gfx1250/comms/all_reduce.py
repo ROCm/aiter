@@ -13,12 +13,19 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     """Advances the call counter. Returns the call and the lines of 2 units [x[value],
     x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask."""
-    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     call = gl.load(counter) % (1 << 30) + 1  # 1 to 2^30
     # Buffer loads: a mask does not make a branch.
     v0 = gl.amd.cdna5.buffer_load(x, value, mask=mask0, other=0)
     v1 = gl.amd.cdna5.buffer_load(x, value + PLANE, mask=mask1, other=0)
     v2 = gl.amd.cdna5.buffer_load(x, value + 2 * PLANE, mask=mask2, other=0)
+    return call, _pack_lines(v0, v1, v2, call, counter)
+
+
+@gluon.jit
+def _pack_lines(v0, v1, v2, call, counter):
+    """Stores the call in its counter once all waves have read the old one. Returns
+    the lines of 2 units [v0, v1, v2, tag] of the bf16 values v0, v1 and v2."""
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     gl.barrier()  # all waves have read the old call number
     gl.store(counter, call)
     b0 = v0.to(gl.int16, bitcast=True).to(gl.int32) & 65535
@@ -27,12 +34,12 @@ def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     # Never 0 (an empty inbox). Before the data comes, a unit holds the call of 2 uses
     # of the chunk ago: 15 bits tell the 2 calls apart.
     tag = call % 32768 + 1
-    N: gl.constexpr = value.shape[0]
-    H: gl.constexpr = value.shape[1] // 2  # lines of a row
+    N: gl.constexpr = v0.shape[0]
+    H: gl.constexpr = v0.shape[1] // 2  # lines of a row
     # Line h * N + i has the units of columns 2h and 2h + 1 of row i.
     lines = gl.reshape(gl.join(b1 | b0, tag << 16 | b2), [N, H, 4])
     lines = gl.reshape(gl.permute(lines, (1, 0, 2)), [H * N, 4])
-    return call, gl.convert_layout(lines, LINE, assert_trivial=True)
+    return gl.convert_layout(lines, LINE, assert_trivial=True)
 
 
 @gluon.jit
