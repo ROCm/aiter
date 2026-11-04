@@ -40,7 +40,10 @@ from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     StoreC,
     _xcd_swizzle_any,
 )
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    set_slp_vectorize_once_used,
+)
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 BLOCK_M = 256
@@ -1159,4 +1162,4 @@ def compile_int8_gemm_4w(
             },
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
-    return launch_gemm
+    return set_slp_vectorize_once_used(launch_gemm, False)
