@@ -775,8 +775,6 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
-    # Emit OCP FP8 plus one FP32 descale per logical query token.
-    quant_output: bool = False
 
     WAVE = 32
     NWARP = 4
