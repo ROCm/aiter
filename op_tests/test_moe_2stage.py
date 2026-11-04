@@ -1561,7 +1561,8 @@ def test_adaptive_sort_output_in_place():
     checks it against the torch reference; here we also check that the buffer
     reached the adaptive sort as its atomic moe_buf and was never copied into.
     A buffer starting 2 bytes into its allocation is too underaligned for the
-    sort's 16-byte zeroing, so it must take a fresh moe_buf and be copied into.
+    4-byte atomics of GEMM2, so it must take a fresh moe_buf and be copied into;
+    one starting 4 bytes in is aligned enough and stays in place.
     """
     global AITER_MOE_NUM_EXPERT_ACTIVATED
     fm = aiter.fused_moe
@@ -1596,7 +1597,8 @@ def test_adaptive_sort_output_in_place():
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
-            for token, output_offset in ((1, 0), (4, 0), (1, 1)):
+            # output_offset is in bf16 elements: 1 is 2 bytes, 2 is 4 bytes.
+            for token, output_offset in ((1, 0), (4, 0), (1, 1), (1, 2)):
                 adaptive_calls.clear()
                 copies.clear()
                 rows.append(
@@ -1620,7 +1622,7 @@ def test_adaptive_sort_output_in_place():
                 assert (
                     True in adaptive_calls
                 ), f"token={token}: output never reached the adaptive sort"
-                if output_offset:
+                if output_offset % 2:
                     assert copies, f"token={token}: underaligned output used in place"
                 else:
                     assert not copies, f"token={token}: output was copied into"
@@ -1760,7 +1762,7 @@ def test_output_buffer_contract():
     row = scale_pool[14].view(dtype)[:model_dim].view(1, model_dim)
     assert row.data_ptr() >= strided_scale.data_ptr() + strided_scale.nbytes
     try:
-        check_overlap(row, {"w1_scale": strided_scale})
+        check_overlap(row, (("w1_scale", strided_scale),))
     except RuntimeError:
         pass
     else:
@@ -1768,7 +1770,7 @@ def test_output_buffer_contract():
     # Memory past the view's last element stays legal.
     check_overlap(
         scale_pool[15].view(dtype)[:model_dim].view(1, model_dim),
-        {"w1_scale": strided_scale},
+        (("w1_scale", strided_scale),),
     )
 
     # The check clears most inputs from data_ptr/nbytes alone before the exact
@@ -1783,14 +1785,14 @@ def test_output_buffer_contract():
         ("an empty input inside output", flat[model_dim + 1 : model_dim + 1], False),
     ):
         try:
-            check_overlap(out_row, {"x": tensor})
+            check_overlap(out_row, (("x", tensor),))
         except RuntimeError:
             assert overlaps, f"{described} was rejected"
         else:
             assert not overlaps, f"{described} was accepted"
     # Tensors in the stage extra-arg dicts (FHMoE shared weights) count as inputs.
     try:
-        check_overlap(out_row, {}, ({"shared_expert_id": 0, "shared_w1": flat}, None))
+        check_overlap(out_row, (), ({"shared_expert_id": 0, "shared_w1": flat}, None))
     except RuntimeError as e:
         assert "shared_w1" in str(e), e
     else:
@@ -1984,7 +1986,11 @@ test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
-    if get_gfx() == "gfx950":
+    # Kimi-K3 weights at three batch sizes; skip it for an explicit CLI quant
+    # sweep, like the tuned-CSV validation below.
+    if args.quant is not None:
+        aiter.logger.info("skipping adaptive-sort in-place output test for --quant")
+    elif get_gfx() == "gfx950":
         test_adaptive_sort_output_in_place()
     else:
         aiter.logger.warning(
