@@ -7,6 +7,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+    attention_output_gate_rows,
     gfx12_token_split_tiles,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
@@ -457,6 +458,13 @@ def unified_attention(
     force_fp8_pv_on_fp4_kv_cache: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # Epilogue of the Qwen3-Next / Qwen3.5 attention: out * sigmoid(output_gate),
+    # output_gate [num_tokens, num_query_heads * head_size_v] (row-strided, e.g. a
+    # slice of the QKV-gate projection), bitwise the unfused sigmoid-mul. With
+    # output_rows ([R] int32/int64), out has R rows: out[r] is query token
+    # output_rows[r] (every token still attends and its KV is read as usual).
+    output_gate: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -482,6 +490,24 @@ def unified_attention(
 
     if sinks is not None:
         assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    epilogue = output_gate is not None or output_rows is not None
+    final_out = out
+    if epilogue:
+        assert not skip_reduce, "the output epilogue needs the reduce"
+        assert out.dtype in (torch.bfloat16, torch.float16) and output_scale is None
+        assert out.stride(-1) == 1 and out.stride(-2) == out.shape[-1]
+        if output_gate is not None:
+            assert output_gate.dim() == 2 and output_gate.stride(1) == 1
+            assert output_gate.shape == (num_tokens, num_query_heads * out.shape[-1])
+            assert output_gate.dtype == out.dtype
+        if output_rows is not None:
+            assert output_rows.dim() == 1 and output_rows.is_contiguous()
+            assert out.shape[0] == output_rows.shape[0]
+            # The kernels write every token; the epilogue picks the rows.
+            out = torch.empty(
+                (num_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
+            )
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
@@ -632,6 +658,8 @@ def unified_attention(
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
+        if epilogue:
+            _output_epilogue(out, final_out, output_gate, output_rows)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
         split_params = params
@@ -727,14 +755,19 @@ def unified_attention(
             )
 
         if NUM_SEGMENTS == 1:
+            if epilogue:
+                _output_epilogue(segm_output, final_out, output_gate, output_rows)
+                return final_out
             return segm_output
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        # The output epilogue is the Triton reduce's.
         use_gluon_reduce = (
             is_reduce_gluon_available(params, NUM_SEGMENTS, backend)
             and backend == "gluon"
+            and not epilogue
         )
         if use_gluon_reduce:
             if DEVICE_ARCH == "gfx1250":
@@ -751,15 +784,39 @@ def unified_attention(
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _reduce_segments_triton(
-                params,
+                params._replace(out=final_out),
                 segm_output,
                 segm_max,
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
                 segm_tiles=segm_tiles,
+                output_gate=output_gate,
+                output_rows=output_rows,
             )
-    return out
+    return final_out
+
+
+def _output_epilogue(out, final_out, output_gate, output_rows):
+    """The output epilogue of reduce_segments for an attention that ends without it:
+    final_out[r] = out[rows[r]] * sigmoid(gate[rows[r]]), in one launch."""
+    width = out.shape[-2] * out.shape[-1]
+    num_rows = final_out.shape[0]
+    if num_rows == 0:
+        return
+    block = min(1024, triton.next_power_of_2(width))
+    attention_output_gate_rows[(num_rows, triton.cdiv(width, block))](
+        final_out,
+        out,
+        output_gate,
+        output_rows,
+        out.stride(0),
+        output_gate.stride(0) if output_gate is not None else 0,
+        final_out.stride(0),
+        WIDTH=width,
+        BLOCK=block,
+        num_warps=4,
+    )
 
 
 def is_2d_gluon_available(params: _UAParams, backend: str):
@@ -1005,15 +1062,20 @@ def _reduce_segments_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
     segm_tiles=None,
+    output_gate=None,
+    output_rows=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
+    if num_rows == 0:
+        return
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
     num_d_blocks = triton.cdiv(
         v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
     )
 
-    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
+    reduce_segments[(num_rows, params.num_query_heads, num_d_blocks)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -1034,6 +1096,9 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else 0,
+        rows_ptr=output_rows,
         **config,
         enable_fp_fusion=True,
     )

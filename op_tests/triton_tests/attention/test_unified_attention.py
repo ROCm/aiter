@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
@@ -1361,3 +1363,130 @@ def test_triton_unified_attn_k4v8_loop_variant(
     rel = ((out - ref).norm() / ref.norm()).item()
     assert rel < 0.04, f"relative L2 error {rel:.4f}"
     assert (out - ref).abs().max().item() < 0.15
+
+
+@triton.jit
+def _sigmoid_mul_ref_kernel(x_ptr, g_ptr, out_ptr, stride_g, WIDTH: tl.constexpr):
+    """x * sigmoid(gate) rounded as the unfused Qwen3.5 output gate (ATOM's
+    sigmoid_mul): the sigmoid to the gate dtype, then the product to bf16."""
+    row = tl.program_id(0)
+    cols = tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + row * WIDTH + cols).to(tl.float32)
+    g = tl.load(g_ptr + row * stride_g + cols)
+    g = tl.sigmoid(g.to(tl.float32)).to(g.dtype).to(tl.float32)
+    tl.store(out_ptr + row * WIDTH + cols, (x * g).to(tl.bfloat16))
+
+
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("token_split", [False, True])
+@pytest.mark.parametrize("select", [False, True])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)] * 3,  # decode
+        [(5, 3000), (5, 129), (5, 7000)] * 5,  # MTP-4 verify rows
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_output_gate_rows_k4v8(
+    path: str,
+    token_split: bool,
+    select: bool,
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """The output epilogue (Qwen3.5: out * sigmoid(gate), and only some rows) is
+    bitwise the unfused attention followed by the sigmoid-mul and the row gather,
+    on every path the attention can end on (2D, 3D + reduce_segments, 3D with one
+    segment)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    if path != "auto":
+        monkeypatch.setattr(
+            module,
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", token_split)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (4, 1)
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = bench.make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    # The gate is a column slice of the QKV-gate projection's output.
+    qkvg = 3 * torch.randn(tokens, 2 * width + 512, dtype=torch.bfloat16, device="cuda")
+    gate = qkvg[:, :width]
+    rows = None
+    if select:
+        # One row a sequence (its last), as the MTP drafter keeps.
+        rows = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
+
+    def run(out, **kw):
+        return unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+            **kw,
+        )
+
+    plain = run(
+        torch.empty(
+            tokens, num_heads[0], head_size, dtype=torch.bfloat16, device="cuda"
+        )
+    )
+    ref = torch.empty(tokens, width, dtype=torch.bfloat16, device="cuda")
+    _sigmoid_mul_ref_kernel[(tokens,)](
+        plain.reshape(tokens, width),
+        gate,
+        ref,
+        gate.stride(0),
+        WIDTH=width,
+        enable_fp_fusion=False,
+    )
+    if rows is not None:
+        ref = ref[rows]
+    out = torch.full(
+        (ref.shape[0], num_heads[0], head_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    fused = run(out, output_gate=gate, output_rows=rows)
+    assert fused.data_ptr() == out.data_ptr()
+    assert torch.equal(out.reshape(ref.shape), ref)
