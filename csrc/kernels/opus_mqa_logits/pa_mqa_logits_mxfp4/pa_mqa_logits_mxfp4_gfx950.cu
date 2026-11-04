@@ -279,6 +279,8 @@ using h32g_r1w1s2L = kv_traits<32, true>;
 // A table entry is one 64-row group (V4: a page; pages_per_block 1), or (V4.1 full layers) a
 // power-of-two run of up to 2^MAX_TPB_SHIFT of them: the MFMA-permuted kv_cache / kv_scale are laid
 // out a group at a time. V4.1 candidate layers: an 8-row page.
+// A V# a page (GATHER: 64-bit addresses), so no buffer resource bounds the kv_cache. GATHER clamps
+// its page ids into the plane by kv_last_row, a 32-bit key index: 2^32 keys.
 template<class T, class K>
 constexpr mqa_logits_instance entry() {
     constexpr int run_max = T::ENTRY_RUNS ? T::PAGE_SIZE << MAX_TPB_SHIFT : T::PAGE_SIZE;
@@ -296,8 +298,7 @@ constexpr mqa_logits_instance entry() {
             .flat_out       = T::FLAT_OUT,
             .kv_nt          = T::KV_NT,
             .slot_waves     = T::SLOT_WAVES,
-            // a page's byte offset from kv_cache is 32 bits (a 0xffffffff-byte buffer resource)
-            .max_kv_bytes   = 0xffffffff,
+            .max_kv_bytes   = T::GATHER ? (1LL << 32) * T::KV_PAGE_BYTES / T::PAGE_SIZE : 0,
             .launch         = K::launch,
             .occupancy      = K::occupancy};
 }

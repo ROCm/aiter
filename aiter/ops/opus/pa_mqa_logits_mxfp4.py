@@ -49,10 +49,10 @@ rows (p % 8) * 8 .. + 7 of group p / 8): the plane is laid out a group at a time
 
 Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
 padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
-decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
-page's offset fits 32 bits -- on gfx950 its 64-row group's byte offset (group id x 4 KiB: a
-``kv_cache`` under 4 GiB, which the launch checks), on gfx1250 its row (page id x
-``page_size``). ``max_seq_len`` is under 2^29 (a row's logits are addressed in 32 bits, with
+decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and on
+gfx1250 a page's offset fits 32 bits (its row, page id x ``page_size``); gfx950 reads ``kv_cache``
+through 64-bit addresses (a candidate layer's within its first 2^32 keys, 256 GiB, which the
+launch checks). ``max_seq_len`` is under 2^29 (a row's logits are addressed in 32 bits, with
 headroom for the stores the gfx950 kernels mask out); the config checks it.
 
 NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold

@@ -490,13 +490,14 @@ __device__ inline void permlane_head_reduce2(float& o0, float& o1, float v0, flo
     o1 = std::bit_cast<float>(r1[0]) + std::bit_cast<float>(r1[1]);
 }
 
-// A page's byte offset from kv_cache: the product in unsigned 32 bits, handed to the buffer ops
-// as the int they take. A buffer offset is unsigned, so this reaches the whole 4 GiB the launcher
-// allows; a signed product would overflow from 2 GiB on.
-template<class T>
-__device__ inline int kv_page_offset(int page_id) {
-    return static_cast<int>(static_cast<unsigned>(page_id) *
-                            static_cast<unsigned>(T::KV_PAGE_BYTES));
+// A load through a 64-bit global address, for KV whose page differs across the lanes (GATHER),
+// which leaves no wave-uniform base for a per-page buffer resource. The pointer is in the global
+// address space: a generic one would make a flat load, counted on lgkmcnt too.
+using gbyte_ptr = const uint8_t __attribute__((address_space(1)))*;
+
+template<class V>
+__device__ inline V global_load_as(gbyte_ptr p) {
+    return *reinterpret_cast<const V __attribute__((address_space(1)))*>(p);
 }
 
 // A wave-uniform int through the constant address space, so it is an s_load: a plain dereference

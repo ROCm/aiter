@@ -30,13 +30,15 @@ config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget)
   bands    a forward scored in slices of rows (``query_start_loc`` clamped) equals it whole
   padding  rows past ``query_start_loc[-1]`` and empty sequences untouched, the rest right
   graph    schedule + launch captured in a CUDA graph and replayed on new data
+  pool     (gfx950) a kv_cache past 4 GiB: the case's groups copied across byte 4 GiB of a larger
+           pool, the table moved with them, and every way bit for bit as on the original pool
   errors   the interface refuses what it cannot run (layouts, bounds, a foreign schedule, ...)
 """
 
 import argparse
 import bisect
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 import torch
@@ -868,6 +870,66 @@ def check_padding(model, pad_rows=7):
     return results
 
 
+def check_pool(model, straddle=1 << 20):
+    """A kv_cache past 4 GiB (gfx950): each case's 64-row groups copied into a larger pool so that
+    half sit below group ``straddle`` (byte 4 GiB) and half above it, the table moved with them;
+    every way must give the original pool's logits bit for bit."""
+    if not _permuted():
+        return []
+    if model == "v4":
+        real = full_layer("v4 pool", [9000, 1500, 777], [4, 3, 1], 4)
+        shapes = [(real, True), (real, False)]
+    elif model == "v41":
+        shapes = [
+            (full_layer("v41 pool r2", [2048, 1500, 777], [6, 4, 1], 2), False),
+            (full_layer("v41 pool r1", [3000, 2048], [6, 6], 1), False),
+        ]
+    else:
+        shapes = [(candidate_layer("cand pool", [20000, 17000], [6, 6]), False)]
+    results = []
+    for rows, page64 in shapes:
+        case = make_case(rows, MODEL_HEADS[model], page64=page64)
+        q_scale, kv, kv_scale = case.arch_inputs()
+        groups = kv.shape[0]
+        entry_rows = case.page_size * case.pages_per_block
+        if entry_rows >= TILE:  # an entry: a run of groups
+            run = entry_rows // TILE
+            shift_entries = (straddle - groups // 2) // run
+            shift_groups = shift_entries * run
+        else:  # an entry: an 8-row page of a group
+            shift_groups = straddle - groups // 2
+            shift_entries = shift_groups * (TILE // entry_rows)
+        kv_big = torch.zeros((shift_groups + groups, *kv.shape[1:]), dtype=kv.dtype)
+        kv_scale_big = torch.zeros(
+            (shift_groups + groups, *kv_scale.shape[1:]), dtype=kv_scale.dtype
+        )
+        kv_big[shift_groups:] = kv
+        kv_scale_big[shift_groups:] = kv_scale
+        big = replace(
+            case,
+            block_tables=(case.block_tables + shift_entries).contiguous(),
+            _arch=(q_scale, kv_big, kv_scale_big),
+        )
+        tag = f"{rows.label} page{case.page_size}x{case.pages_per_block}"
+        for name, (cfg, build) in ways(case).items():
+            schedule = schedule_for(cfg, case, build)
+            ref = torch.full((rows.rows, rows.width), float("-inf"))
+            got = torch.full_like(ref, float("-inf"))
+            launch(case, cfg, ref, schedule=schedule)
+            try:
+                launch(big, cfg, got, schedule=schedule)
+            except RuntimeError as e:
+                results.append(
+                    (f"{tag} {name}", [f"refused: {str(e).splitlines()[0]}"])
+                )
+                continue
+            same = torch.equal(ref.view(torch.int32), got.view(torch.int32))
+            bad = [] if same else [f"{int((ref != got).sum())} cells differ"]
+            results.append((f"{tag} {name}", bad))
+        del big, kv_big, kv_scale_big
+    return results
+
+
 def check_graph(model):
     """Schedule + launch captured once, replayed on new contents of the same tensors (new q, new
     and shorter windows) == the same call made eagerly."""
@@ -1018,6 +1080,7 @@ SEMANTIC_CHECKS = {
     "bands": check_bands,
     "padding": check_padding,
     "graph": check_graph,
+    "pool": check_pool,
     "errors": check_errors,
 }
 

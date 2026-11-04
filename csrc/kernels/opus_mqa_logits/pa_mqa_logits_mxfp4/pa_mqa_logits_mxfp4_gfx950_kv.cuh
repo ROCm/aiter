@@ -9,27 +9,6 @@
 
 namespace opus_logits::gfx950 {
 
-// KV partition, byte strides. kv_cache is [pages][kt][g][nt][m][16 B]; lane L reads
-// K[(kt * K_CHUNKS + g) * 32 : +32] of key nt * MMA_N + m, g = L / 32, m = L % 32.
-template<class T>
-__device__ inline auto make_layout_kv(int lane_m0, int lane_g) {
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::MMA_N>{},          // key m in tile (p: lane % 32)
-        opus::number<T::K_CHUNKS>{},       // 32-K block g  (p: lane / 32)
-        opus::number<T::KV_GRP_BYTES>{});  // 16 B = 32 fp4 (y, contiguous)
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-    return opus::make_layout(
-        shape,
-        opus::unfold_x_stride(dim, shape, opus::make_tuple(
-            opus::number<T::STRIDE_KV_M>{},   // key: consecutive keys are 16 B apart
-            opus::number<T::STRIDE_KV_G>{},   // block g: one 32-K block across the page
-            opus::number<1>{})),              // bytes
-        opus::unfold_p_coord(dim, opus::make_tuple(lane_m0, lane_g)));
-}
-
 // block_tables: entry wave + i, one int a wave. The wave index is the layout's p coordinate, so
 // the page-id address is computed per lane (VALU), off the SALU chain the prologue waits on.
 template<class T>
@@ -132,8 +111,6 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
 
     auto g_q   = opus::make_gmem(q_base);
     auto g_qs  = opus::make_gmem(qs_base);
-    auto g_kv  = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv));
-    auto g_kvs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(p_kv_scale));
     auto g_bt  = opus::make_gmem(bt_base);
     auto g_w   = opus::make_gmem(w_base);
     auto g_out = opus::make_gmem(out_base, out_bytes);
@@ -146,9 +123,10 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     int q_scale;   // the row's scale bytes, zero-extended
     auto u_w = make_layout_w<T>(lane_g);
     opus::vector_t<float, EC> w_pl[MT];
-    auto u_kv  = make_layout_kv<T>(lane_m0, lane_g);
-    auto u_kvs = make_layout_scale<T>(lane);
     auto u_bt  = make_layout_bt<T>(wave);
+    // A page is [kt][g][nt][m][16 B]; lane L reads K[(kt * K_CHUNKS + g) * 32 : +32] of key
+    // nt * MMA_N + m (g = L / 32, m = L % 32), and scale dword L.
+    const int lane_kv = lane_g * T::STRIDE_KV_G + lane_m0 * T::STRIDE_KV_M;
     const int key_lane = wave * (NT * T::MMA_N) + lane_m0;   // this lane's key in a tile
 
     // Lanes L and L^32 hold the same logit; lane group 1 is biased out of bounds and masked. A
@@ -170,10 +148,6 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
             return opus::load<1>(g_bt, u_bt + (chunk_start + tile_idx))[0];
         }
     };
-    auto load_kv_scale = [&](int page_id) {
-        return opus::load<1>(
-            g_kvs, u_kvs + page_id * (T::KVS_PAGE_BYTES / (int)sizeof(D_SCALE)))[0];
-    };
 
     using kv_nt_t = typename Mma::vtype_b;
     using sfrag   = opus::vector_t<float, MT * EC>;
@@ -187,22 +161,29 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     [[maybe_unused]] const int lane_kv_g =
         lane_g * T::STRIDE_KV_G + (lane_m0 % T::GATHER_NT_KEYS) * T::STRIDE_KV_M;
     [[maybe_unused]] const int lane_kvs_g = lane_g * T::MMA_N + lane_m0 % T::GATHER_NT_KEYS;
+    // Each lane its own page, so no wave-uniform base for a per-page V#: 64-bit addresses
+    // (global_load_as).
+    using kv_grp_t = opus::vector_t<D_BYTE, T::KV_GRP_BYTES>;
     auto issue_gather = [&](kv_nt_t (&kv)[NT][KT], gather_scales& kvs, int page_id) {
+        const auto kv_base  = reinterpret_cast<gbyte_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(p_kv));
+        const auto kvs_base =
+            reinterpret_cast<gbyte_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(p_kv_scale));
         const int grp = page_id / T::TILE_PAGES, sub = page_id % T::TILE_PAGES;
-        const int kv_off = kv_page_offset<T>(grp) + sub * T::PAGE_ROWS * T::STRIDE_KV_M + lane_kv_g;
-        const int kvs_off = grp * (T::KVS_PAGE_BYTES / (int)sizeof(D_SCALE)) +
-                            (sub % (T::TILE_PAGES / 2)) * T::PAGE_ROWS + lane_kvs_g;
-        kvs.lo  = opus::load<1>(g_kvs, kvs_off)[0];
-        kvs.hi  = opus::load<1>(g_kvs, kvs_off + T::GATHER_NT_KEYS)[0];
+        const gbyte_ptr kv_addr = kv_base + (size_t)(unsigned)grp * T::KV_PAGE_BYTES +
+                                  (unsigned)(sub * T::PAGE_ROWS * T::STRIDE_KV_M + lane_kv_g);
+        const gbyte_ptr kvs_addr =
+            kvs_base + (size_t)(unsigned)grp * T::KVS_PAGE_BYTES +
+            (unsigned)((sub % (T::TILE_PAGES / 2)) * T::PAGE_ROWS + lane_kvs_g) * sizeof(D_SCALE);
+        kvs.lo  = global_load_as<D_SCALE>(kvs_addr);
+        kvs.hi  = global_load_as<D_SCALE>(kvs_addr + T::GATHER_NT_KEYS * sizeof(D_SCALE));
         // byte kt * 2 + nt <- byte kt * 2 + half of lo (nt 0: selector 4..7) or hi (nt 1: 0..3)
         kvs.sel = 0x02060004 + (sub / (T::TILE_PAGES / 2)) * 0x01010101;
         opus::static_for<NT>([&](auto ntc) {
             constexpr int nt = ntc.value;
             opus::static_for<KT>([&](auto ktc) {
                 constexpr int kt = ktc.value;
-                auto v = opus::load<T::KV_GRP_BYTES>(
-                    g_kv,
-                    kv_off + kt * T::STRIDE_KV_KTILE + nt * T::GATHER_NT_KEYS * T::STRIDE_KV_M);
+                auto v = global_load_as<kv_grp_t>(
+                    kv_addr + (kt * T::STRIDE_KV_KTILE + nt * T::GATHER_NT_KEYS * T::STRIDE_KV_M));
                 opus::set_slice(kv[nt][kt], v, opus::number<0>{}, opus::number<T::KV_GRP_BYTES>{});
             });
         });
@@ -212,14 +193,20 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
         if constexpr (T::GATHER) {
             issue_gather(kv, kvs, page_id);
         } else {
-            kvs = load_kv_scale(page_id);
+            // A V# a page, off the page id made scalar (one entry a wave: wave-uniform), its base
+            // 64-bit scalar arithmetic: the offsets stay inside the page.
+            const unsigned pg = __builtin_amdgcn_readfirstlane(page_id);
+            auto g_kvs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(p_kv_scale) +
+                                         (size_t)pg * (T::KVS_PAGE_BYTES / sizeof(D_SCALE)));
+            auto g_kv  = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv) +
+                                         (size_t)pg * T::KV_PAGE_BYTES);
+            kvs = opus::load<1>(g_kvs, lane)[0];
             opus::static_for<NT>([&](auto ntc) {
                 constexpr int nt = ntc.value;
                 opus::static_for<KT>([&](auto ktc) {
                     constexpr int kt = ktc.value;
                     auto v = opus::load<T::KV_GRP_BYTES>(
-                        g_kv, u_kv + kv_page_offset<T>(page_id) + kt * T::STRIDE_KV_KTILE +
-                                  nt * T::STRIDE_KV_NTILE);
+                        g_kv, lane_kv + kt * T::STRIDE_KV_KTILE + nt * T::STRIDE_KV_NTILE);
                     opus::set_slice(kv[nt][kt], v, opus::number<0>{},
                                     opus::number<T::KV_GRP_BYTES>{});
                 });
@@ -228,13 +215,15 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     };
 
     // One phase: refill the buffer tile t freed with tile t + 2, then tile t + 1's GEMMs, tile t's
-    // relu and head reduction.
+    // relu and head reduction. The next page id is read ahead of the refill: vmcnt retires in
+    // order, so a wait for an id read behind the tile's loads would wait for them all.
     auto compute_phase = [&](kv_nt_t (&kv_c)[NT][KT], kvs_t& kvs_c, sfrag (&acc_c)[NT],
                              kv_nt_t (&kv_p)[NT][KT], kvs_t& kvs_p, sfrag (&acc_p)[NT],
                              int& pg_c, int pf_tile, opus::vector_t<float, NT>& out) {
         __builtin_amdgcn_sched_barrier(0);
+        const int pg_n = load_page_id(clamp_tile(pf_tile + 2));
         issue_kv(kv_c, kvs_c, pg_c);
-        pg_c = load_page_id(clamp_tile(pf_tile + 2));
+        pg_c = pg_n;
         __builtin_amdgcn_sched_barrier(0);
         compute_tile<T>(mma_op, q_a, q_scale, w_pl, acc_c, acc_p, kv_p, kv_scale_word(kvs_p), out);
     };

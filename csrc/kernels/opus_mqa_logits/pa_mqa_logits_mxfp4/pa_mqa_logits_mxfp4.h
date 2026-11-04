@@ -21,9 +21,9 @@
 //   2. row_ends[r] <= the logits width and <= what block_tables[b] covers (the width, a row's
 //      logits addressed in 32 bits, is under 2^29: the config checks that);
 //   3. query_start_loc[-1] <= rows; rows past it are neither read nor written;
-//   4. a page's offset in the cache fits 32 bits: on gfx950 its 64-row group's byte offset
-//      (group id x 4 KiB, so the kv_cache a call reads is under 4 GiB: the launch checks that), on
-//      gfx1250 its plane row (page id x page rows).
+//   4. on gfx1250 a page's offset in the cache fits 32 bits (its plane row, page id x page rows);
+//      gfx950 reads the cache through 64-bit addresses, a candidate layer's within its first 2^32
+//      keys (256 GiB: the launch checks that).
 #pragma once
 #include "aiter_tensor.h"
 #include <hip/hip_runtime.h>

@@ -135,8 +135,6 @@ void rows_kernel(mqa_logits_mxfp4_kargs k) {
     auto page_at = [&](int entry, int t) {
         return (int)(((unsigned)entry << tpb_shift) | (tile_at(t) & tpb_mask));
     };
-    auto g_kv  = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv));
-    auto g_kvs = opus::make_gmem(reinterpret_cast<const int*>(p_kv_scale));
     const int lane_kv = lg * T::STRIDE_KV_G + li * T::STRIDE_KV_M;   // block g, key i
 
     struct kv_tile {
@@ -149,23 +147,27 @@ void rows_kernel(mqa_logits_mxfp4_kargs k) {
             opus::static_for<KT>([&](auto kc) { kv[bc.value].b[jc.value][kc.value] = vb_t{}; });
         });
     });
-    // KV_AUX: the loads' cache policy (2: nontemporal, for walks no other CTA reads again).
+    // KV_AUX: the loads' cache policy (2: nontemporal, for walks no other CTA reads again). A V# a
+    // page, its base 64-bit scalar arithmetic off the (wave-uniform) page: the offsets stay inside
+    // the page, so no 32-bit offset bounds the kv_cache.
     constexpr auto KV_AUX = opus::number<T::KV_AUX>{};
     auto issue = [&](kv_tile& x, int page) {
-        const int kv_off  = kv_page_offset<T>(page);
-        const int kvs_off = page * (T::KVS_PAGE_BYTES / 4);
+        auto g_kv  = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv) +
+                                     (size_t)(unsigned)page * T::KV_PAGE_BYTES);
+        auto g_kvs = opus::make_gmem(reinterpret_cast<const int*>(p_kv_scale) +
+                                     (size_t)(unsigned)page * (T::KVS_PAGE_BYTES / 4));
         opus::static_for<KT>([&](auto kc) {
             constexpr int kt = kc.value;
             opus::static_for<NT>([&](auto jc) {
                 constexpr int j = jc.value;
                 auto v = opus::load<T::KV_GRP_BYTES>(
-                    g_kv, lane_kv + kt * 2 * T::STRIDE_KV_G + j * T::MMA_N * T::STRIDE_KV_M,
-                    kv_off, KV_AUX);
+                    g_kv, lane_kv + kt * 2 * T::STRIDE_KV_G + j * T::MMA_N * T::STRIDE_KV_M, 0,
+                    KV_AUX);
                 opus::set_slice(x.b[j][kt], v, opus::number<0>{},
                                 opus::number<T::KV_GRP_BYTES>{});
             });
         });
-        x.d = opus::load<1>(g_kvs, lane, kvs_off, KV_AUX)[0];
+        x.d = opus::load<1>(g_kvs, lane, 0, KV_AUX)[0];
     };
 
     // ---- an item: two MFMAs; its epilogue: relu x weight over the lane's 16 heads ----

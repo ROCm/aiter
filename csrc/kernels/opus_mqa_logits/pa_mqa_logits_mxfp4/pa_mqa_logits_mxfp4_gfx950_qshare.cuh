@@ -110,8 +110,6 @@ void qshare_kernel(mqa_logits_mxfp4_kargs k) {
 
     auto g_q   = opus::make_gmem(q_base);
     auto g_qs  = opus::make_gmem(qs_base);
-    auto g_kv  = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv));
-    auto g_kvs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(p_kv_scale));
     auto g_w   = opus::make_gmem(w_base);
     auto g_out = opus::make_gmem(out_base, out_bytes);
     auto s_kv  = opus::make_smem(reinterpret_cast<D_BYTE*>(smem_buf));
@@ -130,11 +128,11 @@ void qshare_kernel(mqa_logits_mxfp4_kargs k) {
     // multiple of the window, which could land back inside it.
     const int lane_bias = (lane_g != 0) ? -(chunk_start + tile_count) * TK : 0;
 
-    // block_tables through the constant address space, so the page id is an s_load: it is the
-    // copy's soffset (buffer_load_lds takes no divergent scalar operand), and on lgkmcnt it is
-    // covered by the wait the phase already makes for its ds_reads. A plain dereference lands on
-    // flat_load: the loop's stores to `out` defeat the no-clobber proof. chunk_start is folded
-    // into the base and the index is unsigned, which keeps the address arithmetic off the SALU.
+    // block_tables through the constant address space, so the page id is an s_load: the copy's V#
+    // (buffer_load_lds takes no divergent scalar operand), and on lgkmcnt it is covered by the
+    // wait the phase already makes for its ds_reads. A plain dereference lands on flat_load: the
+    // loop's stores to `out` defeat the no-clobber proof. chunk_start is folded into the base and
+    // the index is unsigned, which keeps the address arithmetic off the SALU.
     using bt_scalar_ptr = const int __attribute__((address_space(4)))*;
     auto bt_c = reinterpret_cast<bt_scalar_ptr>(
         reinterpret_cast<__UINTPTR_TYPE__>(bt_base + chunk_start));
@@ -155,20 +153,25 @@ void qshare_kernel(mqa_logits_mxfp4_kargs k) {
     const int async_lane_off = lane * T::ASYNC_VEC_BYTES;
     const int async_wave_off = wave * T::ASYNC_WAVE_BYTES;
     // Fill one stage from one page: the page copy (issuing waves), then this wave's scale copy,
-    // adjacent in the vmem queue so one wait retires both.
+    // adjacent in the vmem queue so one wait retires both. A V# a page, its base 64-bit scalar
+    // arithmetic off the page id: the offsets stay inside the page, so no 32-bit offset bounds the
+    // kv_cache.
     auto issue_async = [&](int tile, int page_id) {
         if (T::ISSUE_WAVES == T::NUM_WAVES || wave < T::ISSUE_WAVES) {
+            auto g_kv = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv) +
+                                        (size_t)(unsigned)page_id * T::KV_PAGE_BYTES);
             D_BYTE* dst = reinterpret_cast<D_BYTE*>(smem_buf) + stage_byte(tile) + async_wave_off;
             opus::static_for<T::ASYNC_ISSUES>([&](auto ic) {
                 constexpr int chunk = ic.value * T::ISSUE_WAVES * T::ASYNC_WAVE_BYTES;
-                opus::async_load<T::ASYNC_VEC_BYTES>(
-                    g_kv, reinterpret_cast<void*>(dst + chunk), async_lane_off,
-                    kv_page_offset<T>(page_id) + async_wave_off + chunk);
+                opus::async_load<T::ASYNC_VEC_BYTES>(g_kv, reinterpret_cast<void*>(dst + chunk),
+                                                     async_lane_off, async_wave_off + chunk);
             });
         }
+        const D_SCALE* kvs_page = reinterpret_cast<const D_SCALE*>(p_kv_scale) +
+                                  (size_t)(unsigned)page_id * (T::KVS_PAGE_BYTES / sizeof(D_SCALE));
+        auto g_kvs = opus::make_gmem(kvs_page);
         D_BYTE* sdst = reinterpret_cast<D_BYTE*>(smem_buf) + scale_stage_byte(tile);
-        opus::async_load<1>(g_kvs, reinterpret_cast<void*>(sdst), lane,
-                            page_id * (T::KVS_PAGE_BYTES / (int)sizeof(D_SCALE)));
+        opus::async_load<1>(g_kvs, reinterpret_cast<void*>(sdst), lane);
     };
 
     // Drain one stage into the four MFMA B operands: one address VGPR, four immediates.
