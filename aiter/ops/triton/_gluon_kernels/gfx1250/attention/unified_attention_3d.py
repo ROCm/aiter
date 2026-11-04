@@ -2418,7 +2418,74 @@ def _unified_attention_gluon_kernel_3d(
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
 
-    for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
+    # With q_len > 1 (not ALL_DECODE), tiles below safe_tile_end hold only keys that every row of the query block
+    # may see: run them without the causal mask, then the remaining tiles (at most the sequence's last one or two,
+    # so only the last segment has any) with it.
+    j_masked = pgm.tile_start
+    if not cfg.ALL_DECODE:
+        j_masked = gl.maximum(
+            pgm.tile_start, gl.minimum(pgm.safe_tile_end, pgm.tile_end - (cfg.NUM_STAGES - 1))
+        )
+        for j in range(pgm.tile_start, j_masked):
+            # physical_block_idx = physical_block_idx + 1 # no-paging expt
+            physical_block_idx = next_physical_block_idx
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+            )
+            if KV_CACHE_DTYPE == "nvfp4":
+                k = pgm.tdm_shared_load_k(wait_count=K_OPS - 1 + V_OPS, buffer_id=buffer_id)
+                k_scales = pgm.tdm_shared_load_k_scales(
+                    wait_count=V_OPS, buffer_id=buffer_id
+                ).to(e4m3_dtype, bitcast=True)
+            else:
+                k = pgm.tdm_shared_load_k(wait_count=V_OPS, buffer_id=buffer_id)
+                k_scales = None
+            next_buffer_id = pgm.get_next_buffer_id(buffer_id)
+            pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=next_buffer_id)
+            pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
+
+            S = pgm.compute_qk(k, q_scales, k_scales)
+            S = S * qk_factor
+
+            S = pgm.apply_softcap(S)
+            if need_addtional_mask:
+                seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
+                S = pgm.apply_addtional_mask_qk(
+                    S, seq_offset, alibi_slope, qq_bias_row_ptrs
+                )
+
+            p, alpha, M = pgm.softmax_part0(S, M)
+            if V_NVFP4 and cfg.HEAD_SIZE_SPLIT == 2:
+                p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
+            else:
+                p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+
+            if V_NVFP4:
+                if cfg.HEAD_SIZE_SPLIT == 2:
+                    acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_split_head(
+                        p,
+                        acc0,
+                        acc1,
+                        wait_count=K_OPS + V_OPS,
+                        buffer_id=buffer_id,
+                        scales_dtype=e4m3_dtype,
+                    )
+                else:
+                    v = pgm.tdm_shared_load_v(wait_count=K_OPS + V_OPS + 1, buffer_id=buffer_id)
+                    v_scales = pgm.tdm_shared_load_v_scales(
+                        wait_count=K_OPS + V_OPS, buffer_id=buffer_id
+                    ).to(e4m3_dtype, bitcast=True)
+                    acc = pgm.compute_pv(p, v, v_scales, acc)
+            else:
+                v = pgm.tdm_shared_load_v(wait_count=K_OPS + V_OPS, buffer_id=buffer_id)
+                v_scales = None
+                acc = pgm.compute_pv(p, v, v_scales, acc)
+
+            buffer_id = next_buffer_id
+            if need_addtional_mask:
+                seq_offset += cfg.TILE_SIZE
+
+    for j in range(j_masked, pgm.tile_end - (cfg.NUM_STAGES - 1)):
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
