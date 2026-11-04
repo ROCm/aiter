@@ -39,8 +39,8 @@ HEAD_DIM = 512
 NUM_HEADS = 16
 VEC = 8
 NEG_INF = float("-inf")
-# Padded KV row pitch (elements): the gfx942 gluon reference, one 16-B chunk past HEAD_DIM.
-LD_KV = 520
+# Padded KV row pitch (elements), used only by Q-block.
+LD_KV = 528
 # MFMA batches between LDS-read issue and sched_barrier: QK pairs (2 MFMAs each)
 # and, one-query only, PV groups (4 MFMAs each).
 QK_BATCH_PAIRS_ONE_Q = 4
