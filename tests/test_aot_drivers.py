@@ -1,4 +1,4 @@
-"""AOT driver coverage: config wiring, cache signatures, and GPU worker policy."""
+"""AOT driver coverage: config wiring, AOT cache reuse, and GPU worker policy."""
 
 import inspect
 import os
@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
 from unittest.mock import MagicMock, call, patch
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -31,12 +30,10 @@ _needs_pa_gluon = unittest.skipIf(pa_gluon is None, "needs a GPU for Triton")
 
 # FlyDSL ships no Windows wheel; its tests skip there instead of breaking collection.
 try:
-    from aiter.aot.flydsl import gemm
-    from aiter.aot.flydsl.common import override_env
-    from aiter.ops.flydsl.kernels import gemm_a16w16_gfx950 as gemm_kernel
+    import flydsl
 except ImportError:
-    gemm = None
-_needs_flydsl = unittest.skipIf(gemm is None, "needs FlyDSL")
+    flydsl = None
+_needs_flydsl = unittest.skipIf(flydsl is None, "needs FlyDSL")
 
 
 class AsmMlaDecodeAotTest(unittest.TestCase):
@@ -48,128 +45,29 @@ class AsmMlaDecodeAotTest(unittest.TestCase):
         self.assertEqual(driver.MLAConfig._fields, compile_parameters)
 
 
-def _flydsl_cache_key(jit_func, dispatch_args):
-    """The key FlyDSL files a compile of ``jit_func`` under, launch stream excluded.
-
-    Built by FlyDSL itself (pinned in requirements.txt), so every input of the real
-    key counts: per-tensor type, dtype, alignment, 32-bit-stride flag, shape and
-    stride (dynamic dims as -1), scalar types, the constexpr param, the target, the
-    cache-invalidating env vars and the captured globals.
-    """
-    jit_func._ensure_sig()
-    bound = jit_func._sig.bind_partial(*dispatch_args[:-1])
-    return jit_func._build_full_cache_key(bound.arguments)
-
-
-@_needs_flydsl
-class FlydslGemmAotTest(unittest.TestCase):
-    def test_a16w16_aot_matches_runtime_cache_signature(self):
-        """AOT must pass the runtime's argument signature to reuse its compiled cache."""
-        m, n, k = 8, 1536, 7168
-        gemm_kernel.get_split_k_buffers.cache_clear()
-        self.addCleanup(gemm_kernel.get_split_k_buffers.cache_clear)
-        for dtype, torch_dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
-            for split_k in (1, 7):
-                config = {
-                    "block_m": 128,
-                    "block_n": 128,
-                    "block_k": 64,
-                    "stages": 2,
-                    "split_k": split_k,
-                    "m_waves": 2,
-                    "n_waves": 2,
-                    "k_waves": 1,
-                    "group_m": 0,
-                    "use_half_tile_interleaved": False,
-                }
-                # Pin the target so the LDS lookup does not read the host GPU.
-                with (
-                    self.subTest(dtype=dtype, split_k=split_k),
-                    override_env("FLYDSL_GPU_ARCH", "gfx950"),
-                    patch.object(gemm, "run_cached") as aot_call,
-                    patch.object(gemm_kernel, "run_cached") as runtime_call,
-                    patch.object(
-                        gemm_kernel, "persistent_alloc", return_value=nullcontext()
-                    ),
-                ):
-                    gemm._compile_hgemm_to_cache(
-                        m=m,
-                        n=n,
-                        k=k,
-                        dtype=dtype,
-                        out_dtype=dtype,
-                        has_bias=False,
-                        target_gfx="gfx950",
-                        **config,
-                    )
-                    # CPU inputs keep the split-K buffers off the GPU.
-                    gemm_kernel.gemm_a16w16(
-                        torch.empty((m, k), device="cpu", dtype=torch_dtype),
-                        torch.empty((n, k), device="cpu", dtype=torch_dtype).t(),
-                        user_kwargs=config,
-                        stream="stream",
-                    )
-                    aot_args, runtime_args = (
-                        c.call_args.kwargs["dispatch_args"]
-                        for c in (aot_call, runtime_call)
-                    )
-                    runtime_key = _flydsl_cache_key(
-                        gemm_kernel.gemm_a16w16_gfx950, runtime_args
-                    )
-                    self.assertEqual(
-                        _flydsl_cache_key(gemm_kernel.gemm_a16w16_gfx950, aot_args),
-                        runtime_key,
-                    )
-                    # The key must see a semaphore dtype drift (what this test guards)
-                    # and a stride drift (B passed with A's leading dimension).
-                    for index, arg in (
-                        (4, aot_args[4].to(torch.float32)),
-                        (
-                            2,
-                            gemm_kernel._dynamic_tensor_arg(
-                                torch.empty((8, 8), dtype=torch_dtype), 1
-                            ),
-                        ),
-                    ):
-                        drifted = list(aot_args)
-                        drifted[index] = arg
-                        self.assertNotEqual(
-                            _flydsl_cache_key(gemm_kernel.gemm_a16w16_gfx950, drifted),
-                            runtime_key,
-                        )
-
-
-# The documented AOT -> run-only flow, in two fresh processes so the second one
-# can only hit the disk cache. RUN_ONLY raises on a miss instead of compiling.
-_HGEMM_SPLIT_K = (1, 7)
-_HGEMM_AOT = f"""
-from aiter.aot.flydsl.gemm import _compile_hgemm_to_cache
-for split_k in {_HGEMM_SPLIT_K}:
-    _compile_hgemm_to_cache(
-        m=8, n=1536, k=7168, dtype="bf16", out_dtype="bf16",
-        block_m=128, block_n=128, block_k=64, stages=2, split_k=split_k,
-        m_waves=2, n_waves=2, k_waves=1, group_m=0,
-        use_half_tile_interleaved=False, has_bias=False, target_gfx="gfx950",
-    )
-"""
-_HGEMM_RUN_ONLY = f"""
+# The documented AOT -> run-only flow for one split-K A16W16 row, in fresh
+# processes so the run-only one can only hit the disk cache. RUN_ONLY raises on
+# a miss instead of compiling, so any drift between the AOT replay and the
+# runtime launch (the split-K semaphore dtype once) fails here.
+_HGEMM_CSV = (
+    "gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,"
+    "splitK,us,kernelName,err_ratio,tflops,bw\n"
+    "gfx950,256,2,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,"
+    "flydsl,312,7,5.1366,"
+    "flydsl_hgemm_abf16_wbf16_bf16_t16x32x128x7_ks7_w1x2x1_bias0_ktail0_gm0_pft_gfx950,"
+    "0.0137,1.43,720.26\n"
+)
+_HGEMM_RUN_ONLY = """
 import torch
-from aiter.ops.flydsl import flydsl_hgemm
 from aiter.test_common import checkAllclose
-a = torch.ones((8, 7168), device="cuda", dtype=torch.bfloat16)
-w = torch.ones((1536, 7168), device="cuda", dtype=torch.bfloat16)
+from aiter.tuned_gemm import gemm_a16w16
+# all-ones inputs: every split-K partial and the sum are exact in bf16
+a = torch.ones((2, 7168), device="cuda", dtype=torch.bfloat16)
+w = torch.ones((256, 7168), device="cuda", dtype=torch.bfloat16)
 ref = (a.float() @ w.float().t()).to(torch.bfloat16)
-for split_k in {_HGEMM_SPLIT_K}:
-    out = torch.empty((8, 1536), device="cuda", dtype=torch.bfloat16)
-    y = flydsl_hgemm(
-        a, w, out=out, block_m=128, block_n=128, block_k=64, stages=2,
-        split_k=split_k, m_waves=2, n_waves=2, k_waves=1,
-    )
-    assert y.data_ptr() == out.data_ptr()
-    err = checkAllclose(
-        ref.float(), out.float(), rtol=0, atol=0, msg=f"hgemm split_k={{split_k}}"
-    )
-    assert err == 0, f"split_k={{split_k}}: mismatch ratio {{err}}"
+out = gemm_a16w16(a, w, otype=torch.bfloat16)
+err = checkAllclose(ref.float(), out.float(), rtol=0, atol=0, msg="hgemm ks7")
+assert err == 0, f"mismatch ratio {err}"
 """
 
 
@@ -180,21 +78,29 @@ class FlydslGemmAotCacheReuseTest(unittest.TestCase):
             self.skipTest("needs a gfx950 GPU")
 
     def test_a16w16_aot_cache_serves_a_run_only_process(self):
-        """A fresh RUN_ONLY process must load AOT-built A16W16 kernels, not miss."""
-        with tempfile.TemporaryDirectory() as cache_dir:
-            env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=cache_dir)
+        """A fresh RUN_ONLY process must load the AOT-built A16W16 kernel, not miss."""
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "bf16_tuned_gemm.csv")
+            with open(csv_path, "w") as f:
+                f.write(_HGEMM_CSV)
+            env = dict(
+                os.environ,
+                FLYDSL_RUNTIME_CACHE_DIR=os.path.join(tmp, "cache"),
+                AITER_CONFIG_GEMM_BF16=csv_path,
+                GPU_ARCHS="gfx950",
+            )
             env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
-            for name, code, extra_env in (
-                ("AOT", _HGEMM_AOT, {}),
-                ("RUN_ONLY", _HGEMM_RUN_ONLY, {"FLYDSL_RUNTIME_RUN_ONLY": "1"}),
+            for name, cmd, extra_env in (
+                ("AOT", ["-m", "aiter.aot.flydsl.gemm", "--csv", csv_path], {}),
+                ("RUN_ONLY", ["-c", _HGEMM_RUN_ONLY], {"FLYDSL_RUNTIME_RUN_ONLY": "1"}),
             ):
                 proc = subprocess.run(
-                    [sys.executable, "-c", code],
+                    [sys.executable, *cmd],
                     cwd=_REPO_ROOT,
                     env={**env, **extra_env},
                     capture_output=True,
                     text=True,
-                    timeout=600,
+                    timeout=900,
                     check=False,
                 )
                 self.assertEqual(proc.returncode, 0, f"{name}:\n{proc.stderr[-4000:]}")

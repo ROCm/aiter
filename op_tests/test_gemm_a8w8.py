@@ -19,7 +19,7 @@ from aiter.jit.core import AITER_CONFIGS, get_module
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
-from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import e8m0_to_f32
 
 try:
@@ -29,14 +29,32 @@ except ModuleNotFoundError as e:
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import argparse
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
-TEST_NUM_ITERS = 100
+# Direct performance runs keep the original repetition count. Standard CI
+# overrides this for correctness sweeps in .github/scripts/aiter_test.sh.
+TEST_NUM_ITERS = int(os.environ.get("AITER_GEMM_TEST_ITERS", "100"))
+if TEST_NUM_ITERS < 1:
+    raise ValueError("AITER_GEMM_TEST_ITERS must be at least 1")
+aiter.logger.info("gemm_a8w8 benchmark iterations: %d", TEST_NUM_ITERS)
+
+
+def gemm_perftest(func):
+    """One iteration checks correctness; larger budgets retain profiler timing."""
+
+    @wraps(func)
+    def wrapper(*args, benchmark_iters=None, **kwargs):
+        num_iters = TEST_NUM_ITERS if benchmark_iters is None else benchmark_iters
+        if num_iters == 1:
+            return func(*args, **kwargs), None
+        return run_perftest(func, *args, num_iters=num_iters, **kwargs)
+
+    return wrapper
 
 
 _TUNED_SHAPES_CACHE = None
@@ -72,8 +90,7 @@ def is_shape_tuned(
     return (m, n, k, str(q_dtype_w)) in _TUNED_SHAPES_CACHE[tuned_file]
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(
+def reference_gemm(
     x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
 ):
     # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
@@ -88,7 +105,15 @@ def run_torch(
     return out.to(dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@gemm_perftest
+def run_torch(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
+):
+    # Skinny tests report a torch baseline latency.
+    return reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode)
+
+
+@gemm_perftest
 def run_aiter_hip(
     inp,
     weights,
@@ -135,22 +160,22 @@ def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
     )
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@gemm_perftest
 def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
 
 
-@perftest()
+@gemm_perftest
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
-@perftest()
+@gemm_perftest
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@gemm_perftest
 def run_gemm_skinny(
     x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, cu_count=1
 ):
@@ -177,6 +202,8 @@ def test_gemm(
     pad_a=128,
     skip_ck=False,
     quant_mode="per-token",
+    test_hipb=True,
+    bpreshuffle_iters=None,
 ):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
@@ -226,9 +253,8 @@ def test_gemm(
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, _avg_a = run_torch(
-        x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode
-    )
+    # Correctness sweeps need one reference output, not a reference benchmark.
+    a = reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only.
     # run_gemm_ck_bpreshuffle is gated by quantDtype/quant_mode below.
     if skip_ck or quant_mode != "per-token":
@@ -253,7 +279,14 @@ def test_gemm(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
             )
     if quantDtype != dtypes.i8 and quant_mode == "per-token":
-        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        c, avg_c = run_gemm_ck_bpreshuffle(
+            x,
+            weightshuffle,
+            x_scale,
+            w_scale,
+            dtype,
+            benchmark_iters=bpreshuffle_iters,
+        )
         # c = c + bias
         err_c = checkAllclose(
             a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
@@ -281,7 +314,11 @@ def test_gemm(
             avg_d = None
 
     avg_hipb = err_hipb = None
-    if quantDtype == dtypes.fp8 and (dtype == dtypes.bf16 or quant_mode != "per-token"):
+    if (
+        test_hipb
+        and quantDtype == dtypes.fp8
+        and (dtype == dtypes.bf16 or quant_mode != "per-token")
+    ):
         init_hipblas()
         hipb_x_scale, hipb_w_scale = x_scale, w_scale
         if quant_mode == "mxfp8-swizzled":
@@ -309,7 +346,12 @@ def test_gemm(
     err_gelu = None
     avg_gelu_sol = None
     err_gelu_sol = None
-    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
+    if (
+        test_hipb
+        and quantDtype == dtypes.fp8
+        and get_gfx() == "gfx942"
+        and dtype == dtypes.bf16
+    ):
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
         e, avg_e = run_aiter_hip(
@@ -476,7 +518,9 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}"
+    if avg_a is not None and avg_b is not None:
+        msg = f"[perf] {msg}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )
@@ -703,7 +747,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
-def _iter_flydsl_csv_cases():
+def _iter_flydsl_csv_cases(compare_hipblaslt=False):
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
@@ -716,8 +760,16 @@ def _iter_flydsl_csv_cases():
         cu,
         os.path.basename(merged_csv),
     )
+    profiled_kernels = set()
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
+        kernel = (str(row["kernelName"]), str(row["q_dtype_w"]))
+        bpreshuffle_iters = TEST_NUM_ITERS
+        if TEST_NUM_ITERS == 1 and kernel not in profiled_kernels:
+            # Preserve a latency sample for every configuration while checking
+            # all remaining shapes once, without profiler/rotating-buffer work.
+            bpreshuffle_iters = 10
+            profiled_kernels.add(kernel)
         yield (
             {
                 "dtype": dtypes.bf16,
@@ -728,6 +780,10 @@ def _iter_flydsl_csv_cases():
                 "quant_mode": "per-token",
                 "pad_a": 128,
                 "skip_ck": True,
+                # This sweep validates FlyDSL dispatch for every tuned shape.
+                # The legacy sweep and test_hipb_mm.py cover ordinary hipb_mm.
+                "test_hipb": compare_hipblaslt,
+                "bpreshuffle_iters": bpreshuffle_iters,
             },
             {
                 "source": "flydsl_csv",
@@ -768,8 +824,9 @@ parser.add_argument(
     "--quant-mode",
     choices=["per-token", "per-tensor", "mxfp8-unswizzled", "mxfp8-swizzled"],
     nargs="+",
-    default=["per-token", "per-tensor", "mxfp8-unswizzled", "mxfp8-swizzled"],
+    default=["per-token"],
     help="""Quantization mode.
+    Default: per-token. Other modes have focused coverage in test_hipb_mm.py.
     per-token/per-tensor use FP32 scales; MXFP8 uses one E8M0 scale per 32 elements.
     e.g.: --quant-mode mxfp8-unswizzled mxfp8-swizzled""",
 )
@@ -865,6 +922,11 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned bpreshuffle CSVs.",
 )
 parser.add_argument(
+    "--compare-hipblaslt",
+    action="store_true",
+    help="Also run hipBLASLt comparisons for every FlyDSL CSV shape (legacy comparisons always run).",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -875,20 +937,21 @@ args = parser.parse_args()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
-    for kwargs, extras in _iter_flydsl_csv_cases():
+    bench_rows = []
+    for kwargs, extras in _iter_flydsl_csv_cases(args.compare_hipblaslt):
         ret = test_gemm(**kwargs)
+        # Execution controls must not change the historical benchmark join key.
+        ret.pop("test_hipb", None)
+        ret.pop("bpreshuffle_iters", None)
         ret.update(extras)
-        written = append_tuned_op_bench_rows(
+        bench_rows.append(ret)
+    written = append_tuned_op_bench_rows(bench_csv, bench_rows, op_name="gemm_a8w8")
+    if written:
+        aiter.logger.info(
+            "gemm_a8w8: appended %d tuned op bench row(s) to %s",
+            written,
             bench_csv,
-            [ret],
-            op_name="gemm_a8w8",
         )
-        if written:
-            aiter.logger.info(
-                "gemm_a8w8: appended %d tuned op bench row(s) to %s",
-                written,
-                bench_csv,
-            )
 
 if not args.no_legacy:
     if args.csv is not None:
