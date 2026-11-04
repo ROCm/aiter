@@ -81,6 +81,14 @@ def is_mxfp4_moe_shape_supported(
     )
 
 
+def is_mxfp4_moe_scatter_supported(model_dim: int, topk: int) -> bool:
+    """Return whether a generated scatter_reduce kernel covers (model_dim, topk)."""
+    return any(
+        (h, t) == (int(model_dim), int(topk))
+        for _, h, _, t in MXFP4_MOE_SUPPORTED_SHAPES
+    )
+
+
 @compile_ops("module_moe_mxfp4_aux", develop=True)
 def _mxfp4_moe_sort_internal_is_supported(
     NE: int,
