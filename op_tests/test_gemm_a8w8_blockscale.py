@@ -18,7 +18,12 @@ import aiter
 from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_ck,
+    gemm_a8w8_blockscale_cktile,
+    gemm_a8w8_blockscale_flydsl,
+)
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
@@ -150,13 +155,13 @@ def test_gemm(
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
+    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    if ck_preshuffle:
+    if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
             x, gemm_weight, x_scale_strided, w_scale, dtype
@@ -167,6 +172,7 @@ def test_gemm(
             msg="ck strided x_scale",
             catastrophic_check=True,
         )
+    ret["gfx"] = get_gfx()
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
@@ -212,6 +218,31 @@ def test_gemm(
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
 
+        # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
+        if get_gfx() == "gfx950":
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+                kernel_fits_shape,
+                kernelInstance,
+            )
+
+            flydsl_kernel = kernelInstance(ck_preshuffle)
+            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
+                f, avg_f = run_flydsl(
+                    x,
+                    gemm_weight,
+                    gemm_x_scale,
+                    w_scale,
+                    flydsl_kernel.name,
+                    ck_preshuffle,
+                    dtype,
+                )
+                ret["flydsl us"] = avg_f
+                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_f / 1e6
+                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_f / 1e6
+                ret["flydsl err"] = checkAllclose(
+                    a, f, msg="flydsl", catastrophic_check=True
+                )
+
     return ret
 
 
@@ -241,6 +272,18 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_flydsl(
+    x, weight, x_scale, w_scale, kernel_name, preshuffle_b, dtype=dtypes.bf16
+):
+    m, _k = x.shape
+    n, _ = weight.shape
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return gemm_a8w8_blockscale_flydsl(
+        x, weight, x_scale, w_scale, out, {"kernelName": kernel_name}, preshuffle_b
+    )
 
 
 def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
@@ -293,6 +336,10 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
 
     print(
         f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
+    )
+    assert ck_err < 0.05 and cktile_err < 0.05, (
+        f"split-K mismatch (m={m}, n={n}, k={k}, splitK={splitK}): "
         f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
     )
 
@@ -520,6 +567,9 @@ if args.table and not df.empty:
 print("\nRunning split-K correctness checks ...")
 for splitK in [1, 2]:
     test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+# Two K loops per split for the default CK-Tile tile, the shortest split it runs.
+for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
+    test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
 
 # Save results from benchmarks
 if args.output:

@@ -14,6 +14,13 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+    default_varctx_parallel_unit_num,
+)
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+    pack_kv_cache,
+    pack_q_scales,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -131,23 +138,22 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .contiguous()
         .view(batch * t_blocks, k_tiles, 4, kv_block_size, 16)
     )
-    # KVS_NTPW: nt-bytes packed together for the kernel's packed dword load
-    # (4 ubyte → 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
-    # 0..KVS_NTPW-1 are adjacent so one thread dword-loads all 4 nts.
+    # Interleave four equally sized token groups so a warp's four scale bytes
+    # can be reconstructed from one dword per half-page.
     assert kv_block_size % KVS_NTPW == 0
-    kv_e8m0_perm = (
-        kv_e8m0.view(batch, t_blocks, kv_block_size, k_tiles, 4)
-        .permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
-        # Interleave 4 nts per token group: split [kv_block_size] into
-        # (NTPW=4, T_per_nt), transpose to (T, NTPW) so 4 consecutive bytes
-        # per T cover nts 0..3 → 1 dword load.
-        .view(batch * t_blocks, k_tiles, 4, KVS_NTPW, kv_block_size // KVS_NTPW)
-        .transpose(-1, -2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
+    scale_group_size = kv_block_size // KVS_NTPW
+    kv_e8m0_perm = torch.empty(
+        batch * t_blocks,
+        k_tiles,
+        4,
+        kv_block_size,
+        dtype=torch.uint8,
+        device=dev,
     )
+    token = torch.arange(kv_block_size, device=dev)
+    sflat = (token % scale_group_size) * KVS_NTPW + token // scale_group_size
+    source = kv_e8m0.view(batch * t_blocks, kv_block_size, k_tiles, 4)
+    kv_e8m0_perm[:, :, :, sflat] = source.permute(0, 2, 3, 1)
 
     phys_flat = block_tables.reshape(-1).long()
     kv_cache = torch.zeros(
@@ -468,9 +474,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped
     # (their out stays -inf -> NaN cosine). For an explicit value grow the grid
-    # so every (batch, next_n) gets at least one slot; when None, let the
-    # scheduler auto-derive a cudagraph-safe grid (= batch*next_n*ceil(t_max/
-    # block_k)), which already satisfies both constraints.
+    # so every (batch, next_n) gets at least one slot; when None, use the tuned
+    # cudagraph-safe gfx950 grid, which already satisfies both constraints.
     if parallel_unit_num is not None:
         parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
     safe, cta_info, total_ctas = compute_varctx_schedule(
@@ -620,6 +625,116 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )
 
 
+def test_pa_mqa_logits_fp4_page8(
+    batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20
+):
+    """kv_block_size=8: the row-group kernel (pa_mqa_logits_fp4_rowgroup) in
+    its 8-row-page cache layout, pages in a random order, a sequence's next_n
+    rows as its ragged rows (row n seeing context - next_n + n + 1 keys)."""
+
+    setup_seed(SEED)
+    page = 8
+    ctx_list = _make_varctx(batch, max_ctx, page)
+    context_lens = torch.tensor(ctx_list, dtype=torch.int32, device=dev)
+    max_blocks = -(-max_ctx // page)
+    t_max = max_blocks * page
+    num_blocks = batch * max_blocks
+    kv_bf16 = torch.randn(batch, t_max, head_dim, dtype=torch.bfloat16, device=dev)
+    kv_fp4, kv_e8m0 = fp4_quant_e2m1_with_e8m0(kv_bf16.reshape(-1, head_dim))
+    block_tables = (
+        torch.randperm(num_blocks, device=dev).to(torch.int32).view(batch, max_blocks)
+    )
+    pages_kv, pages_ks = pack_kv_cache(kv_fp4, kv_e8m0, page)
+    kv_cache = torch.empty_like(pages_kv)
+    kv_scale = torch.empty_like(pages_ks)
+    kv_cache[block_tables.reshape(-1).long()] = pages_kv
+    kv_scale[block_tables.reshape(-1).long()] = pages_ks
+
+    q_bf16 = torch.randn(
+        batch, next_n, heads, head_dim, dtype=torch.bfloat16, device=dev
+    )
+    q_packed, q_e8m0 = fp4_quant_e2m1_with_e8m0(q_bf16.reshape(-1, head_dim))
+    q_packed = q_packed.view(batch, next_n, heads, head_dim // 2)
+    q_e8m0 = q_e8m0.view(batch, next_n, heads, head_dim // 32)
+    weights = (
+        torch.randn(batch * next_n, heads, dtype=torch.float32, device=dev) * 0.1
+    ).to(torch.bfloat16)
+    weight_scale = 1.5
+
+    ref = ref_mqa_logits_mixed(
+        q_packed,
+        q_e8m0,
+        kv_fp4.view(batch, t_max, head_dim // 2),
+        kv_e8m0.view(batch, t_max, head_dim // 32),
+        weights,
+        context_lens,
+        next_n=next_n,
+        weight_scale=weight_scale,
+    )
+    out = torch.full((batch * next_n, t_max), float("-inf"), device=dev)
+    query_start_loc = torch.arange(
+        0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
+    )
+    lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
+    row_ends = (context_lens[:, None] - lag).reshape(-1)
+
+    def launch(out=out, out_offsets=None):
+        flydsl_pa_mqa_logits_fp4(
+            q_packed,
+            pack_q_scales(q_e8m0),
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            None,
+            t_max,
+            weight_scale=weight_scale,
+            kv_block_size=page,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            max_query_len=next_n,
+            out=out,
+            out_offsets=out_offsets,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    mask = ~torch.isneginf(ref)
+    got, want = out[mask].double(), ref[mask].double()
+    cos = ((got * want).sum() / (got.norm() * want.norm() + 1e-12)).item()
+    max_err = (got - want).abs().max().item()
+    tail_ok = bool(torch.isneginf(out[~mask]).all())
+    _, us = run_perftest(launch, num_iters=num_iters, num_warmup=3)
+    print(
+        f"page8 batch={batch} ctx<= {max_ctx} next_n={next_n} heads={heads} "
+        f"head_dim={head_dim}: cos={cos:.6f} max_abs_err={max_err:.2e} "
+        f"past_ctx_neginf={tail_ok} {us:.1f} us"
+    )
+    # same fp4 operands, fp32 accumulation: only the summation order differs
+    assert max_err < 1e-3 * want.abs().max().item(), max_err
+    assert tail_ok, "columns past a row's context were written"
+    _check_page8_packed(launch, out, row_ends)
+
+
+def _check_page8_packed(launch, plane, row_ends):
+    """The same launch into a flat buffer, each row at its own 64-element
+    aligned start (out_offsets): bit for bit the plane's row, nothing written
+    between rows."""
+    lens = row_ends.clamp(min=0)
+    spans = (lens + 63) // 64 * 64
+    starts = (torch.cumsum(spans, 0) - spans).to(torch.int32)
+    sentinel = 7.0
+    flat = torch.full((int(spans.sum()) + 64,), sentinel, device=dev)
+    launch(out=flat, out_offsets=starts)
+    torch.cuda.synchronize()
+    written = torch.zeros_like(flat, dtype=torch.bool)
+    for row, (start, length) in enumerate(zip(starts.tolist(), lens.tolist())):
+        span = flat[start : start + length]
+        assert torch.equal(span, plane[row, :length]), f"packed row {row} differs"
+        written[start : start + length] = True
+    assert bool((flat[~written] == sentinel).all()), "packed rows wrote past their span"
+
+
 def _print_perf_summary():
     print("\n" + "=" * 96)
     print("Perf summary (flydsl-qfp4/kvfp4 across shapes)")
@@ -641,6 +756,27 @@ def _print_perf_summary():
             f"{fp8_us_str} | {ratio_str}"
         )
     print()
+
+
+def test_default_varctx_parallel_unit_num():
+    expected = {
+        8192: (64, 96, 256, 256, 512, 512),
+        32768: (128, 256, 256, 512, 1024, 2048),
+        65536: (256, 512, 1024, 1280, 1536, 2048),
+        131072: (256, 512, 1280, 1280, 2048, 4096),
+    }
+    batches = (1, 2, 4, 8, 16, 64)
+    for context, targets in expected.items():
+        actual = tuple(
+            default_varctx_parallel_unit_num(batch, context) for batch in batches
+        )
+        assert actual == targets, f"{context=}: {actual=} != {targets=}"
+
+    # MTP rows share the same tuning buckets; the launch grid remains a
+    # multiple of next_n and can never drop a row.
+    for next_n in (2, 3, 5):
+        ctas = default_varctx_parallel_unit_num(3, 131072, next_n=next_n)
+        assert ctas >= 3 * next_n and ctas % next_n == 0
 
 
 def main():
@@ -673,8 +809,7 @@ def main():
         "--parallel_unit_num",
         type=int,
         default=None,
-        help="target CTA count for host schedule "
-        "(default: auto = batch*next_n*ceil(max_seq_len/block_k))",
+        help="target CTA count for host schedule (default: tuned gfx950 auto grid)",
     )
     parser.add_argument(
         "--next_n",
@@ -695,6 +830,7 @@ def main():
         help=f"Per-head dim (multiple of 128). Default {DEFAULT_HEAD_DIM}.",
     )
     args = parser.parse_args()
+    test_default_varctx_parallel_unit_num()
 
     if get_arch() != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
@@ -719,6 +855,15 @@ def main():
             (4, 2048, 1, 64),
         ]
 
+    if args.kv_block_size == 8:
+        for b, c, nn, h in configs:
+            test_pa_mqa_logits_fp4_page8(
+                b, c, next_n=nn, heads=h, head_dim=args.head_dim,
+                num_iters=args.num_iters,
+            )  # fmt: skip
+        print("  PASS")
+        return
+
     for b, c, nn, h in configs:
         try:
             test_pa_mqa_logits_fp4_qfp4_kvfp4(
@@ -742,6 +887,21 @@ def main():
 
             traceback.print_exc()
             raise
+
+    if args.batch == 0 and args.ctx == 0:
+        test_pa_mqa_logits_fp4_qfp4_kvfp4(
+            batch=2,
+            max_ctx=512,
+            heads=64,
+            kv_block_size=128,
+            block_k=256,
+            num_iters=args.num_iters,
+            num_warmup=args.num_warmup,
+            num_warps=args.num_warps,
+            parallel_unit_num=args.parallel_unit_num,
+            head_dim=args.head_dim,
+            bench=False,
+        )
 
     if _PERF_SUMMARY:
         _print_perf_summary()

@@ -17,6 +17,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 logger = AiterTritonLogger()
 
 from aiter.ops.triton.utils.config_utils import (
+    DEVICE_CU_NUM,
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,
@@ -35,6 +36,7 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu_num=DEVICE_CU_NUM,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -42,8 +44,10 @@ def _get_gemm_config_cached(
     callers can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
-    default named ``DEFAULT.json``). ``backend`` is declared by the caller and
-    defaults to ``"triton"``; there is no cross-backend fallback.
+    default named ``DEFAULT.json``), or from the ``<arch>/<cu_num>cu/`` tree
+    that ``resolve_config_dir()`` picks for ``cu_num``. ``backend`` is
+    declared by the caller and defaults to ``"triton"``; there is no
+    cross-backend fallback.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -55,10 +59,10 @@ def _get_gemm_config_cached(
         and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
-    # Every GEMM family lives in the nested layout <arch>/<backend>/gemm/
-    # <d_type>/ (no arch prefix, default named DEFAULT.json); the shared path
-    # builder lives in resolve_config_dir().
-    cfg_dir = resolve_config_dir("gemm", config_name, backend=backend)
+    # <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default named
+    # DEFAULT.json), or the <arch>/<cu_num>cu/ tree of this CU count when it
+    # has its own DEFAULT.json; every file below comes from that one tree.
+    cfg_dir = resolve_config_dir("gemm", config_name, backend=backend, cu_num=cu_num)
 
     # Load default config (must exist)
     default_fpath = f"{cfg_dir}/DEFAULT.json"
@@ -77,29 +81,40 @@ def _get_gemm_config_cached(
             specialized_suffixes.append(f"B={B}-N={N}-K={K}")
         specialized_suffixes.append(f"N={N}-K={K}")
 
-    is_tuned = False
+    tuned_keys = set()
     for suffix in specialized_suffixes:
         specialized_config = load_config_json(
             f"{cfg_dir}/{config_name}-{suffix}.json", required=False
         )
         if specialized_config is not None:
-            config_dict, is_tuned = specialized_config, True
+            tuned_keys = set(specialized_config)
+            # A tuning-installed file holds only tuned buckets; DEFAULT.json serves the rest.
+            if specialized_config.get("DEFAULT_FALLBACK"):
+                specialized_config = {**config_dict, **specialized_config}
+            config_dict = specialized_config
             break
 
-    # use standard bounds unless custom bounds are passed
-    search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
+    # Explicit bounds override file-defined bounds; legacy files use the standard bounds.
+    search_bounds = (
+        bounds if bounds is not None else config_dict.get("M_BOUNDS", STANDARD_M_BOUNDS)
+    )
+    assert (
+        len(search_bounds) > 0
+        and all(type(x) is int and x > 0 for x in search_bounds)
+        and all(x < y for x, y in itertools.pairwise(search_bounds))
+    ), "M_BOUNDS must be a non-empty sequence of strictly increasing positive integers"
 
     # Search for M_LEQ_x keys
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return dict(config_dict[key]), key in tuned_keys
 
     # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return dict(config_dict[key]), key in tuned_keys
 
     if "any" in config_dict:
         return dict(config_dict["any"]), False
@@ -108,6 +123,18 @@ def _get_gemm_config_cached(
         f"No matching configuration found for M={M}, N={N}, K={K}, B={B}, "
         f"specialized_filename={specialized_filename!r} in config '{config_name}'."
     )
+
+
+def _copy_gemm_config(config: dict) -> dict:
+    # JSON leaves are immutable. Avoid deepcopy's per-scalar overhead on the
+    # GEMM launch path while keeping nested variant configs safe to mutate.
+    result = config.copy()
+    for key, value in config.items():
+        if isinstance(value, dict):
+            result[key] = _copy_gemm_config(value)
+        elif isinstance(value, list):
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 def get_gemm_config(
@@ -119,17 +146,21 @@ def get_gemm_config(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu_num=DEVICE_CU_NUM,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
 
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
+    0. resolve_config_dir() picks the tree: <arch>/<cu_num>cu/<backend>/gemm/<d_type>/
+       when the device's CU count has a tree with a DEFAULT.json, else
+       <arch>/<backend>/gemm/<d_type>/. Every file below comes from that one tree.
     1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
-    4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
+    4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match
 
@@ -138,21 +169,25 @@ def get_gemm_config(
         M: M dimension of the GEMM
         N: N dimension of the GEMM (optional)
         K: K dimension of the GEMM (optional)
-        bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
+        bounds: Override the file M_BOUNDS or STANDARD_M_BOUNDS (optional)
         specialized_filename: Custom specialized filename suffix (optional)
         backend: Backend whose config directory to read, "triton" (default)
             or "gluon". Declared by the caller; there is no fallback to
             the other backend.
         B: Batch dimension for batched GEMM (optional)
+        cu_num: CU count whose <arch>/<cu_num>cu/ tree is read when it has a
+            DEFAULT.json. Default: this device's (DEVICE_CU_NUM). None reads
+            the default tree only. Kernels never pass it; the tuning scripts
+            do, to address one tree.
 
     Returns:
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B
+        config_name, M, N, K, bounds, specialized_filename, backend, B, cu_num
     )
-    return copy.deepcopy(config), is_tuned
+    return _copy_gemm_config(config), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
@@ -223,6 +258,15 @@ def compute_splitk_params(config: dict, K: int) -> dict:
             config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
     return config
+
+
+def clamp_num_buffers(
+    num_buffers: int, k_tiles: int, prefetch_all: bool = False
+) -> int:
+    """
+    Clamp the NUM_BUFFERS of a gfx1250 Gluon GEMM to the K tiles of one split.
+    """
+    return min(num_buffers, k_tiles if prefetch_all else k_tiles + 1)
 
 
 def _padded_size_32_4(n):

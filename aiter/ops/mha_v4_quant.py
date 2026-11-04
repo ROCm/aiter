@@ -3,6 +3,8 @@
 
 """Quantization and packed-layout producers for MHA v4."""
 
+from typing import Optional
+
 import torch
 import triton
 from torch import Tensor
@@ -18,6 +20,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    FP6_K_BUFFER_SLACK_BYTES,
+    FP6_K_TILE_TOKENS,
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
     pack_fp6_v_data_scale_views,
@@ -35,15 +39,14 @@ MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 MHA_V4_MXFP4_V_TILE_TOKENS = FP4_V_TILE_TOKENS
 MHA_V4_MXFP4_V_PACKED_ROW_BYTES = FP4_V_PACKED_BYTES_PER_TOKEN
 MHA_V4_MXFP4_V_SCALE_TILE_BYTES = 512
+# One E8M0 scale per 32 contracted elements, which is what lets a descale shape name the head dim.
+MHA_V4_MX_BLOCK_ELEMENTS = 32
 MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
 # Dense kernels speculatively gather the overlapping final K-scale dword and two lookahead V-scale
 # tiles. Keep those reads mapped and zero without changing either scale tensor's logical shape.
 # Measured on gfx950: 1023 trailing V-scale bytes still fault, 1024 do not, whatever the shape.
 MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
 MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-# The ASM Q-scale gather is an unguarded global load covering a whole 256-row query tile, so a
-# partial final tile addresses rows past the logical sequence.
-MHA_V4_QUERY_TILE_ROWS = 256
 # K scales are gathered per KV tile with a two-tile producer lead, so the last tiles address rows
 # past the sequence even when it is already tile-aligned.
 MHA_V4_KV_TILE_ROWS = 128
@@ -60,9 +63,32 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
     return softmax_scale * MHA_V4_LOG2E
 
 
-@compile_ops("module_mha_v4_quant", develop=True)
-def rotate_activation_hd128(out: Tensor, input: Tensor) -> None:
+@compile_ops("module_mha_v4_quant", fc_name="rotate_activation_hd128", develop=True)
+def _rotate_activation_hd128(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor
+) -> None:
     """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
+
+
+def _or_empty(input: Tensor, mean: Optional[Tensor]) -> Tensor:  # noqa: UP045
+    """The quantizer kernels read an empty tensor as "no K mean"."""
+    return input.new_empty((0,), dtype=torch.float32) if mean is None else mean
+
+
+def rotate_activation_hd128(
+    out: Tensor,
+    input: Tensor,
+    mean: Optional[Tensor] = None,  # noqa: UP045
+    partial_amax: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    """Rotate hd128 rows, first subtracting a (batch, heads, 128) fp32 `mean` when given.
+
+    Pass `partial_amax` to have the kernel also emit a per-block amax of the rotated values,
+    which saves a per-tensor quantizer the full extra read its own amax pass would cost.
+    """
+    _rotate_activation_hd128(
+        out, input, _or_empty(input, mean), _or_empty(input, partial_amax)
+    )
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -71,6 +97,7 @@ def rotate_activation_mxfp8_quant(
     scale: Tensor,
     input: Tensor,
     multiplier: float,
+    mean: Tensor,
 ) -> None:
     """Apply hd128 Walsh-Hadamard rotation and quantize directly to MXFP8."""
 
@@ -90,8 +117,13 @@ def rotate_activation_mxfp6_quant_k(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    mean: Tensor,
+    head_split: int = 1,
 ) -> None:
-    """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers."""
+    """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers.
+
+    `head_split` 2 writes the hd256 layout from a [b, s, 2h, 128] half-head view.
+    """
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -99,6 +131,7 @@ def _quantize_v_mxfp6_fp6_p_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack V in the contraction order required by an FP6 P operand."""
 
@@ -118,8 +151,14 @@ def rotate_activation_mxfp4_quant_k(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    mean: Tensor,
+    head_split: int = 1,
 ) -> None:
-    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
+    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order.
+
+    `head_split` splits the head axis into (heads // head_split, head_split) and places the inner
+    index inside the tile axis; hd256 passes 2 to get its interleaved tile order directly.
+    """
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -127,6 +166,7 @@ def _quantize_v_mxfp4_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack V into the canonical column-major MXFP4 order."""
 
@@ -136,42 +176,67 @@ def _quantize_v_mxfp4_fp6_p_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
 
 def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
-    if input.dim() != 4 or input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError(f"{operation} requires contiguous hd128 BSHD input")
+    if input.dim() != 4 or not input.is_contiguous():
+        raise ValueError(f"{operation} requires a contiguous BSHD input")
+    if input.shape[-1] != 128:
+        raise ValueError(
+            f"{operation} is packed for head dimension 128, got {input.shape[-1]}"
+        )
     return input.shape
 
 
+# vec_size(16) * warp(64) / dim(128); must track the hd128 rotate kernel's m_block.
+MHA_V4_ROTATE_ROWS_PER_BLOCK = 8
+
+
 def _quantize_per_tensor(
-    input: Tensor, output_dtype: torch.dtype, dtype_max: float, clip: float
+    input: Tensor,
+    output_dtype: torch.dtype,
+    dtype_max: float,
+    clip: float,
+    partial: Optional[Tensor] = None,  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
+    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes."""
     if not input.is_contiguous():
         raise ValueError("MHA v4 per-tensor quantization requires contiguous input")
     numel = input.numel()
     blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
-    partial = input.new_empty((blocks,), dtype=torch.float32)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
-    mha_v4_per_tensor_amax_kernel[(blocks,)](
-        input,
-        partial,
-        numel,
-        BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
-        num_warps=8,
-    )
-    scale_block = triton.next_power_of_2(blocks)
-    mha_v4_per_tensor_scale_kernel[(1,)](
-        partial,
-        scale,
-        blocks,
-        dtype_max=dtype_max / clip,
-        BLOCK_SIZE=scale_block,
-        num_warps=8,
-    )
+    if partial is None:
+        partial = input.new_empty((blocks,), dtype=torch.float32)
+        mha_v4_per_tensor_amax_kernel[(blocks,)](
+            input,
+            partial,
+            numel,
+            BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
+            num_warps=8,
+        )
+        scale_block = triton.next_power_of_2(blocks)
+        mha_v4_per_tensor_scale_kernel[(1,)](
+            partial,
+            scale,
+            blocks,
+            dtype_max=dtype_max / clip,
+            BLOCK_SIZE=scale_block,
+            num_warps=8,
+        )
+    else:
+        # The rotate kernel emits one partial per 8-row block, far more than the per-tensor amax
+        # kernel would, so a single-program Triton reduction over them would need an unusable
+        # BLOCK_SIZE. torch reduces the small fp32 vector instead.
+        # An all-zero tensor must yield scale 1.0, not 0 (which would make the quantized
+        # data NaN) and not an epsilon; this matches the Triton scale kernel's contract.
+        amax = partial.amax()
+        scale.copy_(
+            torch.where(amax > 0, amax / (dtype_max / clip), amax.new_ones(())).view(1)
+        )
     mha_v4_per_tensor_quant_kernel[(blocks,)](
         input,
         output,
@@ -211,13 +276,23 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
-def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Apply normalized hd128 Walsh-Hadamard rotation, then per-tensor FP8 quantize."""
+def quantize_fp8_rotated(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate hd128 rows, optionally removing `mean` first, then per-tensor FP8 quantize.
+
+    The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
+    rather than three.
+    """
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
     rotated = torch.empty_like(input)
-    rotate_activation_hd128(rotated, input)
-    return quantize_fp8(rotated)
+    blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
+    partial = input.new_empty((blocks,), dtype=torch.float32)
+    rotate_activation_hd128(rotated, input, mean, partial)
+    return _quantize_per_tensor(
+        rotated, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0, partial
+    )
 
 
 def block_scale_storage(
@@ -245,52 +320,54 @@ def block_scale_storage(
     return storage[:elements].view(batch, sequence, heads, blocks)
 
 
-def query_block_scale(
-    input: Tensor, batch: int, sequence: int, heads: int, blocks: int
-) -> Tensor:
-    """Per-row Q-scale view backed by a padded 256-row query tile."""
-    return block_scale_storage(
-        input, batch, sequence, heads, blocks, MHA_V4_QUERY_TILE_ROWS
-    )
+def _plain_block_scale(input: Tensor) -> Tensor:
+    """One E8M0 scale per 32-element block, without the gather padding.
+
+    Safe for Q and K because both are gathered through a buffer descriptor whose num_records is
+    the logical extent, so the pipelines' deliberate overshoot past the sequence end -- a whole
+    256-row query tile, a two-tile K lead -- is clamped in hardware and returns zero without
+    touching memory. FP4 K and V still pad, and keep their own checks. Also used by the fakes,
+    which only have to agree on shape and dtype.
+    """
+    batch, sequence, heads, head_dim = input.shape
+    return input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD Q to MXFP8 data and E8M0 block scales."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP8 quantization")
+    _validate_bshd_hd128(input, "MXFP8 quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
-    rotate_activation_mxfp8_quant(quantized, scale, input, multiplier)
+    scale = _plain_block_scale(input)
+    rotate_activation_mxfp8_quant(
+        quantized, scale, input, multiplier, _or_empty(input, None)
+    )
     return quantized, scale
 
 
 @quantize_mxfp8_q.register_fake
 def _quantize_mxfp8_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     del multiplier
-    batch, sequence, heads, head_dim = input.shape
-    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    return input.new_empty(input.shape, dtype=dtypes.fp8), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k", mutates_args=())
-def quantize_mxfp8_k(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_mxfp8_k(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD K to MXFP8 data and E8M0 block scales."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(
-        input, "MXFP8 K quantization"
-    )
+    _validate_bshd_hd128(input, "MXFP8 K quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
-    rotate_activation_mxfp8_quant(quantized, scale, input, 1.0)
+    scale = _plain_block_scale(input)
+    rotate_activation_mxfp8_quant(quantized, scale, input, 1.0, _or_empty(input, mean))
     return quantized, scale
 
 
 @quantize_mxfp8_k.register_fake
-def _quantize_mxfp8_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+def _quantize_mxfp8_k_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    return input.new_empty(input.shape, dtype=dtypes.fp8), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
@@ -300,7 +377,7 @@ def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
     )
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp4_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -311,7 +388,7 @@ def _quantize_mxfp4_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
-    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    ), _plain_block_scale(input)
 
 
 def mxfp4_k_raw_buffer_size(batch: int, sequence: int, heads: int) -> int:
@@ -357,7 +434,9 @@ def mxfp6_v_raw_buffer_size(batch: int, sequence: int, heads: int) -> int:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_k_raw", mutates_args=())
-def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_mxfp4_k(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
     """Rotate and pack hd128 BSHD K into the coalesced MXFP4 ASM layout."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(
         input, "MXFP4 K quantization"
@@ -375,12 +454,14 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
         lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
         extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     )
-    rotate_activation_mxfp4_quant_k(raw, scale, input)
+    rotate_activation_mxfp4_quant_k(raw, scale, input, _or_empty(input, mean))
     return raw, scale
 
 
 @quantize_mxfp4_k.register_fake
-def _quantize_mxfp4_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_mxfp4_k_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
     scale_elements = batch * sequence * heads * (head_dim // 32)
     scale_storage = input.new_empty(
@@ -392,14 +473,18 @@ def _quantize_mxfp4_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
-    """Rebuild the logical MXFP4 K view from its contiguous backing buffer."""
-    batch, sequence, heads, _ = scale.shape
-    tiles = (sequence + 127) // 128
-    head_stride = tiles * 8192
+    """Rebuild the logical MXFP4 K view from its contiguous backing buffer.
+
+    The scale names the head dim: one E8M0 byte per 32 contracted elements.
+    """
+    batch, sequence, heads, blocks = scale.shape
+    row_bytes = blocks * MHA_V4_MX_BLOCK_ELEMENTS // 2
+    tiles = (sequence + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS
+    head_stride = tiles * MHA_V4_KV_TILE_ROWS * row_bytes
     return torch.as_strided(
         raw,
-        (batch, sequence, heads, 64),
-        (heads * head_stride, 64, head_stride, 1),
+        (batch, sequence, heads, row_bytes),
+        (heads * head_stride, row_bytes, head_stride, 1),
     )
 
 
@@ -423,7 +508,7 @@ def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp6_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -434,22 +519,26 @@ def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
-    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    ), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_raw", mutates_args=())
-def quantize_mxfp6_k(input: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_mxfp6_k(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
     """Rotate and pack hd128 BSHD K into raw MXFP6 ASM data and scale buffers."""
     batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP6 E2M3 K quantization")
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
     raw = input.new_empty((data_size,), dtype=torch.uint8)
     scale_raw = input.new_empty((scale_size,), dtype=torch.uint8)
-    rotate_activation_mxfp6_quant_k(raw, scale_raw, input)
+    rotate_activation_mxfp6_quant_k(raw, scale_raw, input, _or_empty(input, mean))
     return raw, scale_raw
 
 
 @quantize_mxfp6_k.register_fake
-def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_mxfp6_k_raw_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
     data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
     return input.new_empty((data_size,), dtype=torch.uint8), input.new_empty(
@@ -504,6 +593,10 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
         input.stride(2),
         input.stride(1),
         input.stride(3),
+        quantized.stride(0),
+        quantized.stride(2),
+        quantized.stride(1),
+        quantized.stride(3),
         scale.stride(0),
         scale.stride(1),
         batch,
@@ -545,24 +638,9 @@ def _mxfp4_v_buffers(
     return raw, scale
 
 
-@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
-def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
-    batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP4 V quantization")
-    raw, scale = _mxfp4_v_buffers(input, batch, sequence, heads)
-    _quantize_v_mxfp4_hip(raw, scale, input)
-    return raw, scale
-
-
-@quantize_v_mxfp4.register_fake
-def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, _ = input.shape
-    return _mxfp4_v_buffers(input, batch, sequence, heads)
-
-
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
 def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack MXFP4 V in the token order consumed by the FP6-P F4F4 kernel."""
+    """Pack MXFP4 V in the token order consumed by the FP6-P kernels."""
     batch, sequence, heads, _ = _validate_bshd_hd128(
         input, "MXFP4 V-for-FP6-P quantization"
     )
@@ -631,16 +709,339 @@ def _quantize_v_mxfp6_fp6_p_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
-    """Rebuild the logical MXFP4 V view from its contiguous backing buffer."""
-    batch, heads, _ = scale.shape
+    """Rebuild the logical MXFP4 V view from its contiguous backing buffer.
+
+    The last axis is the LOGICAL head dim while the row stride is the packed one. The scale image
+    is one E8M0 byte per 32 elements over the padded sequence, which is what names the head dim.
+    """
+    batch, heads, scale_bytes = scale.shape
     padded_sequence = mxfp4_v_padded_sequence(sequence)
+    head_dim = scale_bytes * MHA_V4_MX_BLOCK_ELEMENTS // padded_sequence
+    row_bytes = head_dim // 2
     return torch.as_strided(
         raw,
-        (batch, sequence, heads, 128),
+        (batch, sequence, heads, head_dim),
         (
-            heads * padded_sequence * MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
-            MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
-            padded_sequence * MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
+            heads * padded_sequence * row_bytes,
+            row_bytes,
+            padded_sequence * row_bytes,
             1,
         ),
+    )
+
+
+# ---- hd256 MXFP4 ---------------------------------------------------------------------------
+# hd256 reuses the hd128 producers on a [b, s, 2h, 128] view and permutes the result. Every hd256
+# layout is a permutation of the hd128 one -- both tile the SAME 16-byte lane slots, 128 tokens by
+# 4 chunks against 64 tokens by 8 -- so this is exact and needs no second HIP kernel. The Hadamard
+# then acts block-diagonally over the two halves, which is still orthogonal, so Q.K^T is unchanged
+# and the two halves are decorrelated independently rather than jointly.
+MHA_V4_HD256 = 256
+MHA_V4_MXFP4_TILE_BYTES = MHA_V4_MXFP4_V_TILE_TOKENS * MHA_V4_MXFP4_V_PACKED_ROW_BYTES
+
+
+def mxfp4_producer_tiles(sequence: int) -> int:
+    """Number of 128-token tiles the MXFP4 K and V producers emit."""
+    return (sequence + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS
+
+
+def _validate_bshd_hd256(input: Tensor, operation: str) -> tuple[int, int, int, int]:
+    if input.dim() != 4 or not input.is_contiguous():
+        raise ValueError(f"{operation} requires a contiguous BSHD input")
+    if input.shape[-1] != MHA_V4_HD256:
+        raise ValueError(
+            f"{operation} is packed for head dimension {MHA_V4_HD256}, got {input.shape[-1]}"
+        )
+    return input.shape
+
+
+def _hd256_half_heads(input: Tensor) -> Tensor:
+    """View [b, s, h, 256] as the [b, s, 2h, 128] the hd128 producers accept."""
+    batch, sequence, heads, head_dim = input.shape
+    return input.reshape(batch, sequence, heads * 2, head_dim // 2)
+
+
+# Custom ops, like their hd128 counterparts: the buffers below are deliberately larger than their
+# logical extent, and inlining these into a compiled graph lets the allocation be shrunk to what
+# the traced code reads. The kernels then gather past the end of a tile. Keep the boundary.
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_q_hd256", mutates_args=())
+def quantize_mxfp4_q_hd256(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD Q as MXFP4 data with E8M0 block scales."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 Q quantization"
+    )
+    quantized, scale = quantize_mxfp4_q(_hd256_half_heads(input), multiplier)
+    # Both are pure reshapes, so the scale keeps whatever storage the hd128 producer gave it.
+    return (
+        quantized.reshape(batch, sequence, heads, MHA_V4_HD256 // 2),
+        scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32),
+    )
+
+
+@quantize_mxfp4_q_hd256.register_fake
+def _quantize_mxfp4_q_hd256_fake(
+    input: Tensor, multiplier: float
+) -> tuple[Tensor, Tensor]:
+    del multiplier
+    batch, sequence, heads, _ = input.shape
+    return input.new_empty(
+        (batch, sequence, heads, MHA_V4_HD256 // 2), dtype=torch.uint8
+    ), _plain_block_scale(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_k_hd256", mutates_args=())
+def quantize_mxfp4_k_hd256(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD K into the coalesced MXFP4 ASM layout."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 K quantization"
+    )
+    half_heads = _hd256_half_heads(input)
+    half_mean = (
+        None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
+    )
+    blocks = MHA_V4_HD256 // 32
+    raw = input.new_empty(
+        (mxfp4_k_raw_buffer_size(batch, sequence, heads * 2),), dtype=torch.uint8
+    )
+    # The scale image is head-major over the logical head, so hd128's is already hd256's: half h
+    # of head j is blocks [4h, 4h+4) of row j, which is what a (.., heads, 8) view reads.
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        blocks,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    rotate_activation_mxfp4_quant_k(
+        raw, scale, half_heads, _or_empty(input, half_mean), 2
+    )
+    return raw, scale
+
+
+@quantize_mxfp4_k_hd256.register_fake
+def _quantize_mxfp4_k_hd256_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    del mean
+    batch, sequence, heads, _ = input.shape
+    blocks = MHA_V4_HD256 // 32
+    tiles = mxfp4_producer_tiles(sequence)
+    data = input.new_empty(
+        (batch * heads * tiles * MHA_V4_KV_TILE_ROWS * (MHA_V4_HD256 // 2),),
+        dtype=torch.uint8,
+    )
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        blocks,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    return data, scale
+
+
+def _mxfp4_v_hd256_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int, int]:
+    """(data payload, data allocation, scale elements) for an hd256 MXFP4 V buffer.
+
+    The real op and its fake both size their buffers here: a fake that under-allocates would let
+    a compiled graph hand the kernel a shorter buffer than eager does.
+    """
+    tiles = mxfp4_producer_tiles(sequence)
+    payload = batch * heads * 2 * tiles * MHA_V4_MXFP4_TILE_BYTES
+    # mxfp4_v_view's last axis is the LOGICAL head dim over PACKED rows, so its final element
+    # reaches half a row past the payload.
+    allocation = payload + MHA_V4_HD256 // 2
+    elements = batch * heads * 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    return payload, allocation, elements
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_hd256", mutates_args=())
+def quantize_v_mxfp4_fp6_p_hd256(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd256 MXFP4 V in the token order consumed by the FP6-P kernel."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 V-for-FP6-P quantization"
+    )
+    tiles = mxfp4_producer_tiles(sequence)
+    payload, allocation, elements = _mxfp4_v_hd256_sizes(batch, sequence, heads)
+
+    hd256_raw = input.new_empty((allocation,), dtype=torch.uint8)
+    hd256_raw[payload:].zero_()
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    storage[elements:].zero_()
+    _quantize_v_mxfp4_fp6_p_hip(hd256_raw, storage, _hd256_half_heads(input), 2)
+    hd256_scale = storage[:elements].view(
+        batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
+    return hd256_raw, hd256_scale
+
+
+@quantize_v_mxfp4_fp6_p_hd256.register_fake
+def _quantize_v_mxfp4_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    tiles = mxfp4_producer_tiles(sequence)
+    _, allocation, elements = _mxfp4_v_hd256_sizes(batch, sequence, heads)
+    data = input.new_empty((allocation,), dtype=torch.uint8)
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    scale = storage[:elements].view(
+        batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
+    return data, scale
+
+
+# ---- hd256 MXFP6 ---------------------------------------------------------------------------
+# Same half-head reuse as hd256 MXFP4: the hd128 HIP packers take head_split=2 and write the hd256
+# code object's 64-token records directly, each the two half-heads' blocks of one 64-token tile.
+MHA_V4_MXFP6_HD256_K_TILE_TOKENS = 64
+# Per 64-token tile: C0 8 KiB, C1 4 KiB, then the 1 KiB lane-major K-scale tail.
+MHA_V4_MXFP6_HD256_K_TILE_BYTES = 13312
+MHA_V4_MXFP6_HD256_K_ROW_BYTES = (
+    MHA_V4_MXFP6_HD256_K_TILE_BYTES // MHA_V4_MXFP6_HD256_K_TILE_TOKENS
+)
+MHA_V4_MXFP6_HD256_V_TILE_BYTES = 2 * MHA_V4_MXFP6_V_TILE_BYTES
+MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES = 2 * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
+
+
+def _fp6_producer_tiles(sequence: int) -> int:
+    return (sequence + FP6_K_TILE_TOKENS - 1) // FP6_K_TILE_TOKENS
+
+
+def _mxfp6_hd256_k_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int]:
+    """(data payload, data allocation) for an hd256 MXFP6 K buffer."""
+    tiles = _fp6_producer_tiles(sequence)
+    payload = batch * heads * 2 * tiles * MHA_V4_MXFP6_HD256_K_TILE_BYTES
+    return payload, payload + FP6_K_BUFFER_SLACK_BYTES
+
+
+def _mxfp6_hd256_v_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int]:
+    """(data payload, data allocation) for an hd256 MXFP6 V buffer."""
+    payload = batch * heads * mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_TILE_BYTES
+    return payload, payload + MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES
+
+
+def _mxfp6_hd256_v_view(raw: Tensor, batch: int, sequence: int, heads: int) -> Tensor:
+    head_stride = mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_TILE_BYTES
+    return torch.as_strided(
+        raw,
+        (batch, sequence, heads, MHA_V4_HD256),
+        (heads * head_stride, 2 * MHA_V4_MXFP6_V_PACKED_ROW_BYTES, head_stride, 1),
+    )
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_q_hd256", mutates_args=())
+def quantize_mxfp6_q_hd256(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD Q as MXFP6 E2M3 with E8M0 block scales."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP6 E2M3 Q quantization"
+    )
+    quantized, scale = quantize_mxfp6_q(_hd256_half_heads(input), multiplier)
+    return (
+        quantized.reshape(batch, sequence, heads, MHA_V4_HD256 // 32 * 24),
+        scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32),
+    )
+
+
+@quantize_mxfp6_q_hd256.register_fake
+def _quantize_mxfp6_q_hd256_fake(
+    input: Tensor, multiplier: float
+) -> tuple[Tensor, Tensor]:
+    del multiplier
+    batch, sequence, heads, _ = input.shape
+    return input.new_empty(
+        (batch, sequence, heads, MHA_V4_HD256 // 32 * 24), dtype=torch.uint8
+    ), _plain_block_scale(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_hd256_raw", mutates_args=())
+def quantize_mxfp6_k_hd256(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD K into raw MXFP6 ASM data and scale buffers."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP6 E2M3 K quantization"
+    )
+    half_mean = (
+        None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
+    )
+    payload, allocation = _mxfp6_hd256_k_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    raw[payload:].zero_()
+    # The scale buffer is head-major over the logical head, so hd128's is already hd256's.
+    _, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads * 2)
+    scale_raw = input.new_empty((scale_size,), dtype=torch.uint8)
+    rotate_activation_mxfp6_quant_k(
+        raw, scale_raw, _hd256_half_heads(input), _or_empty(input, half_mean), 2
+    )
+    return raw, scale_raw
+
+
+@quantize_mxfp6_k_hd256.register_fake
+def _quantize_mxfp6_k_hd256_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    del mean
+    batch, sequence, heads, _ = input.shape
+    _, allocation = _mxfp6_hd256_k_sizes(batch, sequence, heads)
+    _, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads * 2)
+    return input.new_empty((allocation,), dtype=torch.uint8), input.new_empty(
+        (scale_size,), dtype=torch.uint8
+    )
+
+
+def mxfp6_k_view_hd256(
+    raw: Tensor,
+    scale_raw: Tensor,
+    batch: int,
+    sequence: int,
+    heads: int,
+) -> tuple[Tensor, Tensor]:
+    """Rebuild the logical hd256 MXFP6 K and scale views from raw backing buffers."""
+    head_stride = 2 * _fp6_producer_tiles(sequence) * MHA_V4_MXFP6_HD256_K_TILE_BYTES
+    k_view = raw.as_strided(
+        (batch, sequence, heads, MHA_V4_HD256 // 32 * 24),
+        (heads * head_stride, MHA_V4_MXFP6_HD256_K_ROW_BYTES, head_stride, 1),
+    )
+    blocks = MHA_V4_HD256 // 32
+    scale = scale_raw[: batch * sequence * heads * blocks].view(
+        batch, sequence, heads, blocks
+    )
+    return k_view, scale
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6_fp6_p_hd256", mutates_args=())
+def quantize_v_mxfp6_fp6_p_hd256(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd256 MXFP6 V in the contraction order required by an FP6 P operand."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 FP6-P MXFP6 V quantization"
+    )
+    tiles = mxfp6_v_tiles(sequence)
+    # The packer zeroes the slack itself, as it does for hd128.
+    _, allocation = _mxfp6_hd256_v_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    scale = input.new_empty(
+        (batch, heads, tiles * MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES), dtype=torch.uint8
+    )
+    _quantize_v_mxfp6_fp6_p_hip(raw, scale, _hd256_half_heads(input), 2)
+    return _mxfp6_hd256_v_view(raw, batch, sequence, heads), scale
+
+
+@quantize_v_mxfp6_fp6_p_hd256.register_fake
+def _quantize_v_mxfp6_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    _, allocation = _mxfp6_hd256_v_sizes(batch, sequence, heads)
+    raw = input.new_empty((allocation,), dtype=torch.uint8)
+    return _mxfp6_hd256_v_view(raw, batch, sequence, heads), input.new_empty(
+        (batch, heads, mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES),
+        dtype=torch.uint8,
     )

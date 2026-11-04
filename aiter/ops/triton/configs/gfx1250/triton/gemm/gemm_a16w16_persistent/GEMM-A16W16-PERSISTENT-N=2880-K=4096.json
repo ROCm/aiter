@@ -8,7 +8,6 @@
         "num_stages": 3,
         "waves_per_eu": 2,
         "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_256": {
@@ -20,7 +19,6 @@
         "num_stages": 3,
         "waves_per_eu": 2,
         "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 32,
         "cache_modifier": null
     },
     "any": {
@@ -32,7 +30,6 @@
         "num_stages": 3,
         "waves_per_eu": 1,
         "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 32,
         "cache_modifier": null
     }
 }

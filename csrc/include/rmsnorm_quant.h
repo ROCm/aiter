@@ -13,9 +13,10 @@ void add_rmsnorm_quant(aiter_tensor_t& out,
                        aiter_tensor_t& scale,
                        aiter_tensor_t& weight,
                        double epsilon,
-                       int group_size     = 0,
-                       bool shuffle_scale = false,
-                       bool gemma_norm    = false);
+                       int group_size          = 0,
+                       bool shuffle_scale      = false,
+                       bool gemma_norm         = false,
+                       bool scale_layout_m32k4 = false);
 
 void add_rmsnorm(aiter_tensor_t& out,
                  aiter_tensor_t& input,
@@ -30,9 +31,10 @@ void rmsnorm_quant(aiter_tensor_t& out,
                    aiter_tensor_t& scale,
                    aiter_tensor_t& weight,
                    double epsilon,
-                   int group_size     = 0,
-                   bool shuffle_scale = false,
-                   bool gemma_norm    = false);
+                   int group_size          = 0,
+                   bool shuffle_scale      = false,
+                   bool gemma_norm         = false,
+                   bool scale_layout_m32k4 = false); // fp8 + e8m0 + group 32: ASM GEMM A-scale layout
 
 void rmsnorm(aiter_tensor_t& out,
              aiter_tensor_t& input,
