@@ -20,6 +20,8 @@ import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_BLOCK_SPARSE_MODES,
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
@@ -28,6 +30,7 @@ from aiter.ops.mha_v4 import (
     _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
@@ -39,7 +42,9 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
+    MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
+    MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -50,6 +55,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -59,6 +65,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
@@ -797,7 +804,7 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
     )
 
 
-# LSE itself is gfx950-only, so the gfx942 arm of this pair never had a path to pass.
+# gfx942's FP8 dense row stores no LSE and it has no MX rows, so only gfx950 has a row to check.
 @skipif(
     get_gfx() != "gfx950",
     reason="gfx950 LSE",
@@ -1115,12 +1122,26 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             if line.strip() and not line.startswith("#")
         ]
     header, rows = rows[0], rows[1:]
+    # Skipped explicitly: the gfx950 sorted-sparse and Sol-Attn objects (every geometry) predate
+    # the bounded-gather rebuild and still fetch MX scales with global loads. They are safe only
+    # because MHA_V4_QUERY_TILE_ROWS padding and the launcher's Q backing-storage check are
+    # kept for them. Drop this exclusion, and that padding, once they are rebuilt.
+    if arch == "gfx950":
+        rows = [
+            row
+            for row in rows
+            if int(row[header.index("mode")]) not in MHA_V4_BLOCK_SPARSE_MODES
+        ]
     co_names = sorted({row[header.index("co_name")] for row in rows})
     assert co_names, f"no dispatchable fmha_v4 rows for {arch}"
 
     # global_load_lds_dword is the bulk K-tile stage into LDS, not a scale fetch; it is bounded
     # by the FP4 K/V slack the producers still reserve.
     gather = re.compile(r"\bglobal_load_(?:dword|ubyte)\b")
+    # A load issued under a lane predicate reads only the lanes that pass it: the Sol-Attn LUT
+    # stage masks exec to the row's entry count. Only full-exec loads can overshoot.
+    narrow_exec = re.compile(r"\bs_mov_b64 exec, vcc\b|\bs_and_saveexec_b64\b")
+    restore_exec = re.compile(r"\bs_mov_b64 exec, -1\b|\bs_or_b64 exec, exec\b")
     offenders = {}
     for name in co_names:
         # gfx942 names its objects with an MI300/ prefix; gfx950 does not.
@@ -1134,7 +1155,14 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             text=True,
             check=True,
         ).stdout
-        hits = len(gather.findall(listing))
+        hits, masked = 0, False
+        for line in listing.splitlines():
+            if narrow_exec.search(line):
+                masked = True
+            elif restore_exec.search(line):
+                masked = False
+            elif gather.search(line) and not masked:
+                hits += 1
         if hits:
             offenders[name] = hits
     assert not offenders, (
@@ -1144,27 +1172,30 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
-@parametrize("sequence", [1, 128, 129, 257, 512])
+@parametrize("sequence", [1, 255, 256, 257, 513])
 @parametrize(
     "quantize",
-    [quantize_v_mxfp4_fp6_p],
-    ids=["fp6_p"],
+    [
+        param(lambda t: quantize_mxfp8_q(t, 1.0), id="mxfp8"),
+        param(lambda t: quantize_mxfp4_q(t, 1.0), id="mxfp4"),
+        param(lambda t: quantize_mxfp6_q(t, 1.0), id="mxfp6"),
+    ],
 )
-def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
-    quantize, sequence
-):
-    """The MXFP4 Q/K rows gather V scales two 512-byte tiles ahead of the running tile.
+def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
+    """The gfx950 sorted-sparse Q-scale gather addresses all 256 rows of the tile it is running.
 
-    The lead does not shrink at the end of the sequence, so the last tiles address scale bytes
-    past the final one whatever the length. Measured on gfx950: 1023 trailing mapped bytes still
-    fault, 1024 do not.
+    A partial final tile therefore reads past the logical sequence, so the backing storage must
+    cover the padded tile and read as zero. Without it those loads walk off the tensor and fault
+    the GPU at an unrelated later synchronization. The dense objects bound this gather in their
+    buffer descriptor; the sparse ones predate that and rely on this padding.
     """
     heads = 3
     value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
     _, scale = quantize(value)
 
-    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
-    assert slack == 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
+    slack = (padded - sequence) * heads * 4
+    assert scale.shape == (2, sequence, heads, 4)
     assert scale.is_contiguous()
     assert scale.untyped_storage().nbytes() == scale.numel() + slack
     assert torch.equal(
@@ -1173,30 +1204,46 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
     )
 
 
-# _check_lse_capable rejects every non-gfx950 arch before the recipe is looked at.
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@parametrize("sequence", [1, 128, 129, 257, 512])
+@parametrize(
+    ("quantize", "slack"),
+    [
+        param(quantize_v_mxfp4_fp6_p, MHA_V4_MXFP4_V_SCALE_SLACK_BYTES, id="mxfp4"),
+        param(
+            quantize_v_mxfp6_fp6_p, MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES, id="mxfp6"
+        ),
+    ],
+)
+def test_mha_v4_mx_v_scale_backing_storage_covers_the_64x64_gather(
+    quantize, slack, sequence
+):
+    """The 64x64 sparse MX-V rows gather V scales through a raw pointer, 512 bytes from the first
+    token of each 64-token block. A block in the second half of a 128-token scale tile reads 256
+    bytes past it, so the producers back the last tile with zeroed slack.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    assert slack >= MHA_V4_MXFP4_V_SCALE_TILE_BYTES // 2
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 validation")
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    # LSE ships for every measured format row, dense and sorted-sparse alike; a row outside that
-    # set is rejected rather than left to export a value nothing has compared against. Off gfx950
-    # the architecture gate fires first, so that is the message to expect there.
-    block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-    lse_rejection = (
-        "not implemented for Q=FP4_E2M1"
-        if get_gfx() == "gfx950"
-        else "LSE is not validated on"
-    )
-    with expect_raises(NotImplementedError, match=lse_rejection):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.FP8,
-            return_lse=True,
-            block_mask=block_mask,
-        )
+    if get_gfx() == "gfx942":
+        # Refused by the manifest's lse column: gfx942's FP8 dense object has no LSE store, and a
+        # buffer left as allocated would read as a log-sum-exp rather than as a failure.
+        fp8 = native_fp8_format()
+        with expect_raises(RuntimeError, match="has no LSE store in its code object"):
+            mha_v4(q, q, q, fp8, fp8, fp8, return_lse=True)
     with expect_raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1326,19 +1373,27 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     assert error < 0.25, error
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+# gfx942 stores LSE on its BF16 Q/K dense rows only, and has no MX rows.
+_GFX950_ONLY = get_gfx() != "gfx950"
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "max_spread"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
-        (AttentionFormat.BF16, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.INT8, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.FP8, AttentionFormat.FP8, 0.75),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6, 0.75),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35),
+        (AttentionFormat.BF16, native_fp8_format(), 0.05),
+        param(AttentionFormat.INT8, native_fp8_format(), 0.05, skip=_GFX950_ONLY),
+        param(native_fp8_format(), native_fp8_format(), 0.75, skip=_GFX950_ONLY),
+        param(native_fp8_format(), AttentionFormat.MXFP6, 0.75, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35, skip=_GFX950_ONLY),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35, skip=_GFX950_ONLY
+        ),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35, skip=_GFX950_ONLY
+        ),
     ],
 )
 def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_spread):
@@ -1384,21 +1439,16 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
-def test_mha_v4_lse_is_gated_off_gfx950():
-    """gfx942 carries the epilogue, but its exported value has never been measured.
+def test_mha_v4_lse_is_gated_off_unsupported_architectures():
+    """The architecture gate admits both deployed MHA v4 targets and rejects everything else."""
+    q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    A wrong LSE passes every output test, because O never reads it, so presence of the store is
-    not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
-    """
-    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
-        q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
-        formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
-
-        with expect_raises(NotImplementedError, match="not validated on gfx942"):
-            mha_v4(q, q, q, *formats, return_lse=True)
-
-        assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
+    with (
+        patched_attr(mha_v4_module, "get_gfx", lambda: "gfx000"),
+        expect_raises(NotImplementedError, match="not implemented on gfx000"),
+    ):
+        mha_v4(q, q, q, *formats, return_lse=True)
 
 
 @parametrize(
@@ -1477,10 +1527,57 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
         )
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+def test_mha_v4_packed_rejects_overlapping_lse_views():
+    """An expanded [1, 1, Sq] buffer has strides [0, 0, 1], so every (batch, head) row would write
+    the same Sq floats. The dense and the sparse launch must both refuse it, and still take a
+    contiguous buffer of the same shape."""
+    batch, heads, sequence = 2, 3, 256
+    q = torch.randn(
+        (batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    fp8, per_tensor = AttentionFormat.FP8, AttentionScaleMode.F32_PER_TENSOR
+    q_tile, kv_tile = 256, 128
+    mask = torch.ones(
+        (batch, heads, sequence // q_tile, sequence // kv_tile),
+        device="cuda",
+        dtype=torch.bool,
+    )
+    indices, start, count = block_attn_mask_to_ragged_lut(
+        mask, num_heads=heads, return_none_if_dense=False
+    )
+    sparse = {
+        "kv_block_indices": indices,
+        "lut_start": start,
+        "lut_count": count,
+        "block_tile": (q_tile, kv_tile),
+    }
+
+    def launch(lse, **lut):
+        args = (q, q, q, scale, scale, scale, fp8, fp8, fp8, per_tensor, per_tensor)
+        mha_v4_packed(*args, per_tensor, lse=lse, return_lse=True, **lut)
+        torch.cuda.synchronize()
+
+    overlapping = torch.empty((1, 1, sequence), device="cuda").expand(
+        batch, heads, sequence
+    )
+    assert overlapping.stride() == (0, 0, 1)
+    for lut in ({}, sparse):
+        with expect_raises(RuntimeError, match="LSE must be contiguous"):
+            launch(overlapping, **lut)
+        launch(torch.empty((batch, heads, sequence), device="cuda"), **lut)
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    # The launcher requires Q-scale backing for the whole 256-row query tile, so back the view
+    # with those rows.
+    scale_storage = torch.ones(
+        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
+    )
+    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -1559,12 +1656,13 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
-def test_mha_v4_packed_rejects_unbacked_mx_scales():
-    """An external caller passing exact-size scales would fault the speculative gathers.
+def test_mha_v4_packed_rejects_unbacked_mxfp4_k_scales():
+    """An external caller passing an exact-size MXFP4 K scale would fault the speculative gather.
 
     clone() keeps the logical shape the size checks look at but drops the producer's
     zeroed slack, which is exactly the shape of a caller-supplied tensor. Q is not checked:
-    its gather is bounded by a buffer descriptor, so it needs no slack.
+    its gather is bounded by a buffer descriptor, so it needs no slack. V is checked on the
+    64x64 rows only; see test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows.
     """
     torch.manual_seed(5)
     value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -1572,7 +1670,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
     mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4_fp6_p(value)
-    with expect_raises(RuntimeError, match="speculative tile gather"):
+    with expect_raises(RuntimeError, match="MX K descale needs"):
         mha_v4_packed(
             mxfp4_q,
             mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
@@ -1588,21 +1686,83 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
             AttentionScaleMode.E8M0_PER_1X32,
         )
 
-    with expect_raises(RuntimeError, match="MX V descale needs"):
-        mha_v4_packed(
-            mxfp4_q,
-            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
-            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
-            mxfp4_q_scale,
-            mxfp4_k_scale,
-            mxfp4_v_scale.clone(),
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
+
+def _mx_fp6_p_packed_operands(fmt, queries, keys):
+    """Producer-built (q, k, v, q_descale, k_descale, v_descale) for an MX FP6-P recipe."""
+    batch, sequence, heads, _ = keys.shape
+    if fmt == AttentionFormat.MXFP4:
+        q, q_scale = quantize_mxfp4_q(queries, 1.0)
+        k_raw, k_scale = quantize_mxfp4_k(keys)
+        v_raw, v_scale = quantize_v_mxfp4_fp6_p(keys)
+        k, v = mxfp4_k_view(k_raw, k_scale), mxfp4_v_view(v_raw, v_scale, sequence)
+        return q, k, v, q_scale, k_scale, v_scale
+    q, q_scale = quantize_mxfp6_q(queries, 1.0)
+    k_raw, k_scale_raw = quantize_mxfp6_k(keys)
+    k, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    v, v_scale = quantize_v_mxfp6_fp6_p(keys)
+    return q, k, v, q_scale, k_scale, v_scale
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+@parametrize("fmt", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows(fmt):
+    """Only the 64x64 sparse rows gather V scales through a raw pointer.
+
+    A 64-token block reads the 512 scale bytes from its first token, so with one 128-token tile
+    and only the second block selected the gather ends 256 bytes past the tensor. clone() keeps
+    the logical shape and drops the producer's slack, which is the shape of a caller-supplied
+    tensor. The dense and 256x128 rows bound the gather with a buffer descriptor, so the compact
+    scale is the same launch to them.
+    """
+    torch.manual_seed(5)
+    keys = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    queries = torch.randn((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
+    q, k, v, q_scale, k_scale, v_scale = _mx_fp6_p_packed_operands(fmt, queries, keys)
+    compact = v_scale.clone()
+    assert compact.untyped_storage().nbytes() == compact.numel()
+    modes = (AttentionScaleMode.E8M0_PER_1X32,) * 3
+
+    def launch(v_descale, **sparse):
+        out = mha_v4_packed(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_descale,
+            fmt,
+            fmt,
+            fmt,
+            *modes,
+            v_pack=AttentionPack.V_FOR_FP6_P,
+            **sparse,
         )
+        torch.cuda.synchronize()
+        return out
+
+    def lut(q_tile, kv_tile, blocks):
+        mask = torch.zeros(
+            (1, 1, 256 // q_tile, 128 // kv_tile), device="cuda", dtype=torch.bool
+        )
+        mask[..., blocks] = True
+        indices, start, count = block_attn_mask_to_ragged_lut(
+            mask, num_heads=1, return_none_if_dense=False
+        )
+        return {
+            "kv_block_indices": indices,
+            "lut_start": start,
+            "lut_count": count,
+            "block_tile": (q_tile, kv_tile),
+        }
+
+    assert torch.equal(launch(compact), launch(v_scale))
+    default = lut(256, 128, [0])
+    assert torch.equal(launch(compact, **default), launch(v_scale, **default))
+
+    fine = lut(64, 64, [1])
+    assert torch.isfinite(launch(v_scale, **fine)).all()
+    with expect_raises(RuntimeError, match="64x64 kernel's speculative tile gather"):
+        launch(compact, **fine)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
@@ -1671,7 +1831,9 @@ def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
     assert torch.count_nonzero(out[:, :, :2]) > 0
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 BF16-FP8 validation"
+)
 @parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     torch.manual_seed(sequence_q + sequence_k)
@@ -1694,7 +1856,7 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.FP8,
+        native_fp8_format(),
     )
     torch.cuda.synchronize()
 
@@ -2273,9 +2435,12 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 per-batch key lengths"
+)
+@parametrize("fp8_v", [False, True], ids=["bf16", "bf16fp8"])
 @parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
-def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
+def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths, fp8_v):
     torch.manual_seed(41)
     batch, sequence, heads = len(lengths), 512, 4
     q = torch.randn((batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
@@ -2289,7 +2454,7 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        native_fp8_format() if fp8_v else AttentionFormat.BF16,
         seqlens_k=seqlens_k,
     )
     torch.cuda.synchronize()
@@ -2400,6 +2565,16 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
+def _i8fp8_sparse_kv_tile():
+    """The KV tile of the INT8/FP8 sparse row, which a mask for that recipe has to be cut to."""
+    fp8 = native_fp8_format()
+    formats = (AttentionFormat.INT8, AttentionFormat.INT8, fp8)
+    return mha_v4_kv_tile(
+        mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
+        MHA_V4_SPARSE_MODE,
+    )
+
+
 @skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
     """Off gfx950 the capability gate preempts these, so the dtype and shape messages
@@ -2425,7 +2600,9 @@ def test_mha_v4_rejects_unusable_seqlens_k():
             AttentionFormat.INT8,
             native_fp8_format(),
             block_mask=torch.ones(
-                (2, 4, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+                (2, 4, 1, 256 // _i8fp8_sparse_kv_tile()),
+                device="cuda",
+                dtype=torch.bool,
             ),
             seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32),
         )
@@ -2532,19 +2709,19 @@ def check_varlen_capable_objects(arch="gfx950"):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@parametrize("arch", ["gfx950"])
+@skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
+@parametrize("arch", ["gfx942", "gfx950"])
 def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
     check_varlen_capable_objects(arch)
 
 
 def check_lse_capable_objects(arch="gfx950"):
-    """Every dense row _LSE_CAPABLE_QV claims must really read the LSE kernarg.
+    """Every row whose manifest declares `lse` must really read the LSE kernarg.
 
-    Same hole as the varlen gate: the key is (q_format, v_format) alone, so a pair that gains a
-    second object inherits the claim. O never reads LSE, so every output test still passes while
-    the returned LSE is whatever the buffer held. Matched on the kernarg load rather than a bare
-    literal, and calibrated against a pre-LSE object, which reads neither 0x40 nor 0x100.
+    The launcher honours return_lse on the column alone, so a row that declares it without being
+    rebuilt passes every output test -- O never reads LSE -- while the returned LSE is whatever
+    the buffer held. Matched on the kernarg load rather than a bare literal, and calibrated
+    against a pre-LSE object, which reads neither 0x40 nor 0x100.
     """
     asm_dir = os.environ.get(
         "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
@@ -2557,19 +2734,10 @@ def check_lse_capable_objects(arch="gfx950"):
             if line.strip() and not line.startswith("#")
         ]
     header, rows = rows[0], rows[1:]
-    q_at, v_at = header.index("q_format"), header.index("v_format")
-    mode_at, co_at = header.index("mode"), header.index("co_name")
+    lse_at, co_at = header.index("lse"), header.index("co_name")
 
-    claimed = sorted(
-        {
-            row[co_at]
-            for row in rows
-            if row[mode_at] == "0"
-            and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
-            in mha_v4_module._LSE_CAPABLE_QV
-        }
-    )
-    assert claimed, f"no dense {arch} rows are claimed LSE-capable"
+    claimed = sorted({row[co_at] for row in rows if row[lse_at] == "1"})
+    assert claimed, f"no {arch} rows declare lse"
 
     silent = []
     for name in claimed:
@@ -2585,7 +2753,7 @@ def check_lse_capable_objects(arch="gfx950"):
         ):
             silent.append(name)
     assert not silent, (
-        f"{arch} rows claimed in _LSE_CAPABLE_QV never load the LSE kernarg: {silent}; "
+        f"{arch} rows declaring lse never load the LSE kernarg: {silent}; "
         "they would return whatever the LSE buffer already held"
     )
     aiter.logger.info(
