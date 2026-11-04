@@ -2904,8 +2904,13 @@ def flash_attn_func(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
 
-    if _FLYDSL_AVAILABLE and (
-        cu_seqlens_q is None
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
+    if (
+        _FLYDSL_AVAILABLE
+        and not is_grad
+        and cu_seqlens_q is None
         and cu_seqlens_kv is None
         and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
@@ -3949,8 +3954,12 @@ def flash_attn_varlen_func(
             v_descale,
         )
 
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
     if (
         _FLYDSL_AVAILABLE
+        and not is_grad
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
