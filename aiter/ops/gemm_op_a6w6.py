@@ -1079,6 +1079,13 @@ def _launch_output_row_chunks(launch, A, A_scale, out, padK, a_tile_bytes):
         )
     steps = padK // _K_TILE + _PADK
     a_tile, scale_tile = steps * a_tile_bytes, steps * _SCALE_TILE_BYTES
+    if (
+        A.numel() != (padM // _TILE) * a_tile
+        or A_scale.numel() != (padM // _TILE) * scale_tile
+    ):
+        raise ValueError(
+            "packed A operand and scale buffer sizes must exactly match the launch dimensions"
+        )
     A, A_scale = A.reshape(-1), A_scale.reshape(-1)
     for start in range(0, padM, rows):
         stop = min(start + rows, padM)
