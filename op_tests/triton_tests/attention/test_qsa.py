@@ -6,8 +6,6 @@
 import pytest
 import torch
 
-torch.set_default_device("cuda")
-
 
 def _make_paged_scenario(
     rows,
@@ -141,13 +139,15 @@ def test_qsa_mfma_scorer_matches_vector_path(rows):
     index_heads, index_dim = 4, 128
     compressed_page_size = block // ratio
 
-    positions = torch.arange(rows, dtype=torch.int32)
-    tables = torch.randperm(pages).to(torch.int32)[None]
-    requests = torch.zeros(rows, dtype=torch.int32)
-    lengths = torch.tensor([rows], dtype=torch.int32)
-    index_q = torch.randn(rows, index_heads, index_dim, dtype=torch.bfloat16)
+    positions = torch.arange(rows, dtype=torch.int32, device="cuda")
+    tables = torch.randperm(pages, device="cuda").to(torch.int32)[None]
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    index_q = torch.randn(
+        rows, index_heads, index_dim, dtype=torch.bfloat16, device="cuda"
+    )
     compressed = torch.randn(
-        pages, compressed_page_size, 1, index_dim, dtype=torch.bfloat16
+        pages, compressed_page_size, 1, index_dim, dtype=torch.bfloat16, device="cuda"
     )
 
     # Vector path: score in chunks of 256 to stay on the non-MFMA kernel

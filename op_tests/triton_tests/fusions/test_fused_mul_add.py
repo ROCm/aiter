@@ -11,24 +11,20 @@ def generate_fused_mul_add_inputs(
     x = torch.randn(*shape, dtype=dtype, device="cuda")
 
     if a_type_is_scalar[1]:
-        a = torch.randn(1, dtype=dtype)
+        a = torch.randn(1, dtype=dtype, device="cuda")
     else:
         a = torch.randn(*shape, dtype=dtype, device="cuda")
 
     if b_type_is_scalar[1]:
-        b = torch.randn(1, dtype=dtype)
+        b = torch.randn(1, dtype=dtype, device="cuda")
     else:
         b = torch.randn(*shape, dtype=dtype, device="cuda")
 
     if a_type_is_scalar[0] in [float, int]:
         a = a_type_is_scalar[0](a.item() * 100)
-    else:
-        a = a.to("cuda")
 
     if b_type_is_scalar[0] in [float, int]:
         b = b_type_is_scalar[0](b.item() * 100)
-    else:
-        b = b.to("cuda")
 
     return x, a, b
 

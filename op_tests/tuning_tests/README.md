@@ -74,7 +74,7 @@ python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
 # Level 2: run_config validation (~20min, all tuned CSVs)
 python3 -m unittest op_tests.tuning_tests.test_run_config -v
 
-# Everything
+# Everything else
 python3 -m pytest op_tests/tuning_tests -v
 ```
 

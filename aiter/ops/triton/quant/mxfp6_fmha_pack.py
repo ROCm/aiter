@@ -134,7 +134,7 @@ def _v_kvtab_dev(device, direct_p: bool):
     kvtab = _V_KVTAB_CACHE.get(key)
     if kvtab is None:
         table = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
-        kvtab = torch.from_numpy(table.reshape(-1)).to(device)
+        kvtab = torch.as_tensor(table.reshape(-1), dtype=torch.int32, device=device)
         _V_KVTAB_CACHE[key] = kvtab
     return kvtab
 
@@ -536,7 +536,7 @@ def _qk_field_perm_dev(device):
     """Cache the last-dimension FP6 field permutation on each device."""
     cperm = _QK_FIELD_PERM_CACHE.get(device)
     if cperm is None:
-        cperm = torch.from_numpy(_qk_field_perm()).to(device)
+        cperm = torch.as_tensor(_qk_field_perm(), dtype=torch.int32, device=device)
         _QK_FIELD_PERM_CACHE[device] = cperm
     return cperm
 

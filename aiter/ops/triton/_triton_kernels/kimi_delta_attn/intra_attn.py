@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     IS_GATHER_SUPPORTED,
     IS_TF32_SUPPORTED,
     autotune_cache_kwargs,
+    chunk_delta_attn_tuned_config,
     exp2,
     input_guard,
 )
@@ -54,18 +55,23 @@ else:
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        # One block spans all of K.
+        "BK": lambda args: max(triton.next_power_of_2(args["K"]), 16),
     }
 )
 @triton.autotune(
     configs=autotune_configs(
         "CHUNK_DELTA_ATTN",
         [
-            triton.Config({"BH": BH, "BK": BK}, num_warps=nw)
+            triton.Config({"BH": BH}, num_warps=nw, num_stages=3)
             for BH in [1, 2, 4, 8]
-            for BK in [32, 64]
             for nw in [1, 2, 4, 8]
         ],
-        default_config=triton.Config({"BH": 1, "BK": 64}, num_warps=4),
+        # The fallback is the untuned pre-gfx950 default.
+        default_config=chunk_delta_attn_tuned_config(
+            "chunk_delta_attn_fwd_kernel_intra_token_parallel",
+            triton.Config({"BH": 1}, num_warps=4, num_stages=3),
+        ),
     ),
     key=["K", "H", "HV"],
     **autotune_cache_kwargs,
@@ -137,44 +143,38 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
 
     o_hv = i_hg * BH + tl.arange(0, BH)
     o_h = o_hv // G
+    o_k = tl.arange(0, BK)
     m_hv = o_hv < HV
+    m_k = o_k < K
+    m_hk = m_hv[:, None] & m_k[None, :]
 
+    # Token i's rows are loaded once, outside the loop over j; beta is folded
+    # into k.
+    p_qk = o_h[:, None] * K + o_k[None, :]
+    b_q = tl.load(q + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
+    b_k = tl.load(k + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
+    p_g = g + i_t * HV * K + o_hv[:, None] * K + o_k[None, :]
+    b_g = tl.load(p_g, mask=m_hk, other=0.0).to(tl.float32)
     p_beta = beta + i_t * HV + o_hv
-    b_beta = tl.load(p_beta, mask=m_hv, other=0.0).to(tl.float32)
+    b_k = b_k * tl.load(p_beta, mask=m_hv, other=0.0).to(tl.float32)[:, None]
 
-    # Accumulate dot products across K-tiles (BK ≤ 64 to avoid slow tl.dot / huge scatter loads)
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-        b_Aqk_j = tl.zeros([BH], dtype=tl.float32)
-        b_Akk_j = tl.zeros([BH], dtype=tl.float32)
-        for i_k in range(tl.cdiv(K, BK)):
-            o_k = i_k * BK + tl.arange(0, BK)
-            m_k = o_k < K
-            m_hk = m_hv[:, None] & m_k[None, :]
-            p_qk = o_h[:, None] * K + o_k[None, :]
+        b_kj = tl.load(k + j * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
+        p_gj = g + j * HV * K + o_hv[:, None] * K + o_k[None, :]
+        b_gj = tl.load(p_gj, mask=m_hk, other=0.0).to(tl.float32)
 
-            b_q = tl.load(q + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
-            b_k = tl.load(k + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
-            b_kj = tl.load(k + j * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
+        b_kgj = tl.where(m_k[None, :], b_kj * exp2(b_g - b_gj), 0.0)
+        b_Aqk = tl.sum(b_q * b_kgj, axis=1) * scale
+        b_Akk = tl.sum(b_k * b_kgj, axis=1) * tl.where(j < i_t, 1.0, 0.0)
 
-            p_g = g + i_t * HV * K + o_hv[:, None] * K + o_k[None, :]
-            p_gj = g + j * HV * K + o_hv[:, None] * K + o_k[None, :]
-            b_g = tl.load(p_g, mask=m_hk, other=0.0).to(tl.float32)
-            b_gj = tl.load(p_gj, mask=m_hk, other=0.0).to(tl.float32)
-
-            b_kgj = tl.where(m_k[None, :], b_kj * exp2(b_g - b_gj), 0.0)
-            b_Aqk_j += tl.sum(b_q * b_kgj, axis=1)
-            b_Akk_j += tl.sum(b_k * b_beta[:, None] * b_kgj, axis=1)
-
-        b_Aqk_j *= scale
-        b_Akk_j *= tl.where(j < i_t, 1.0, 0.0)
         tl.store(
             Aqk + i_t * HV * BT + o_hv * BT + j % BT,
-            b_Aqk_j.to(Aqk.dtype.element_ty),
+            b_Aqk.to(Aqk.dtype.element_ty),
             mask=m_hv,
         )
         tl.store(
             Akk + i_t * HV * BC + o_hv * BC + j - i_ts,
-            b_Akk_j.to(Akk.dtype.element_ty),
+            b_Akk.to(Akk.dtype.element_ty),
             mask=m_hv,
         )
 
