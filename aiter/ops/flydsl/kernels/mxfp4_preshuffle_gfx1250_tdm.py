@@ -4,6 +4,8 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import os
+
+_EXP_NOQUIT = os.environ.get("AITER_EXP_NOQUIT") == "1"  # TEMP
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -634,6 +636,8 @@ def build_gemm_a8w4_tdm_task(
             # outside the dynamic branch and the existing main-body guard
             # stays valid.
             expert = blk_m * 0 + n_experts
+            if const_expr(_EXP_NOQUIT):
+                has_work = True  # TEMP experiment: PR #7272's unconditional lookup
             if has_work:
                 # psum is sorted, so the owning expert is the count of experts
                 # ending at or before blk_m. Every lane loads a strided slice in
@@ -653,6 +657,8 @@ def build_gemm_a8w4_tdm_task(
                         fx.Int32(1 << sh), fx.Int32(WAVE)
                     )
                 expert = rocdl.readfirstlane(T.i32, psum_hits)
+        if const_expr(_EXP_NOQUIT and tile_meta is None):
+            has_work = expert < n_experts
         if const_expr(m_align):
             # tile_map holds unpadded expert ends while experts start on
             # m_align boundaries; a tile narrower than m_align can start in the
