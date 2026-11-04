@@ -937,6 +937,9 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "get_gfx": lambda: "gfx942",
             "check_LLVM_MAIN_REVISION": lambda: 0,
             "validate_and_update_archs": lambda: ["gfx942"],
+            # build_module (MainFunc) calls this since the gfx1250-strict work;
+            # gfx942 wants no cluster launch, so the real function returns False here.
+            "_cluster_launch_target": lambda _detect_gfx: False,
             "hip_flag_checker": lambda _flag: True,
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,

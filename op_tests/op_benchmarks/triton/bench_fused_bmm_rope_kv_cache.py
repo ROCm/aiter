@@ -1,11 +1,15 @@
 """
 Benchmark for the fused MLA BMM + RoPE + concat + KV-cache write kernels
 (fused_fp4_bmm_rope_cat_and_cache_mla and fused_fp8_bmm_rope_cat_and_cache_mla).
+
+The default uses rotating-buffer graph timing. Explicit graph/eager modes retain
+the fixed-buffer diagnostic timing used before the rotating-buffer conversion.
 """
+
+import functools
 
 import torch
 import triton
-
 from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
@@ -13,13 +17,18 @@ from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     positive_int,
     pow2_int,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     generate_batched_gemm_a16w8_inputs,
@@ -35,21 +44,38 @@ def get_benchmark_shapes(args):
     return [(t, args.qh_per_kh * kh, kh) for kh in args.kh for t in args.T]
 
 
-def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
+_OUT_VAL_KEYS = [
+    "q_nope",
+    "w_k",
+    "w_k_scale",
+    "q_pe",
+    "positions",
+    "cos",
+    "sin",
+    "k_nope",
+    "k_rope",
+    "kv_cache",
+    "k_scale",
+    "slot_mapping",
+]
+
+
+def _generate_pool_inputs(
+    T,
+    QH,
+    KH,
+    bmm,
+    kv_lora_rank,
+    nope_dim,
+    rope_dim,
+    cache_dtype,
+    reuse_freqs_front_part,
+):
     dtype = torch.bfloat16
     device = "cuda"
-    # Default BMM shape (N x K), from the unit tests: fp4 512 x 128, fp8 128 x 512.
-    test_n, test_k = (512, 128) if args.bmm == "fp4" else (128, 512)
-    kv_lora_rank = args.kv_lora_rank or test_n
-    nope_dim = args.qk_nope_dim or test_k
-    rope_dim = args.rope_dim
-    cache_dtype = str_to_torch_dtype[args.cache_dtype]
-    q_out_dtype = str_to_torch_dtype[args.q_out_dtype]
-    num_decode = T if args.num_decode_toks is None else args.num_decode_toks
-    torch.manual_seed(0)
 
     # Same input construction as the unit test, per BMM dtype.
-    if args.bmm == "fp4":
+    if bmm == "fp4":
         _, w_k, _, w_k_scale, _ = generate_batched_gemm_a16wfp4_inputs(
             QH, T, kv_lora_rank, nope_dim, dtype, layout="TN", output=False
         )
@@ -77,7 +103,7 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
         QH // KH,
         rope_dim,
         cached=True,
-        reuse_freqs_front_part=args.reuse_freqs_front_part,
+        reuse_freqs_front_part=reuse_freqs_front_part,
         nope=False,
         pos=True,
         offs=False,
@@ -85,64 +111,88 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
         layout="thd",
         dtype=dtype,
     )
-    k_lora = torch.randn((T, KH, kv_lora_rank), dtype=dtype, device=device)
-    k_pe = torch.randn((T, KH, rope_dim), dtype=dtype, device=device)
+    k_nope = torch.randn((T, KH, kv_lora_rank), dtype=dtype, device=device)
+    k_rope = torch.randn((T, KH, rope_dim), dtype=dtype, device=device)
     kv_cache = torch.zeros(
         (max(16384, T), KH, kv_lora_rank + rope_dim), dtype=cache_dtype, device=device
     )
     k_scale = torch.ones((), dtype=torch.float32, device=device)
     slot_mapping = torch.randperm(T, device=device)
 
+    return (
+        q_nope,
+        w_k,
+        w_k_scale,
+        q_pe,
+        positions,
+        cos,
+        sin,
+        k_nope,
+        k_rope,
+        kv_cache,
+        k_scale,
+        slot_mapping,
+    )
+
+
+def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
+    # Default BMM shape (N x K), from the unit tests: fp4 512 x 128, fp8 128 x 512.
+    test_n, test_k = (512, 128) if args.bmm == "fp4" else (128, 512)
+    kv_lora_rank = args.kv_lora_rank or test_n
+    nope_dim = args.qk_nope_dim or test_k
+    rope_dim = args.rope_dim
+    cache_dtype = str_to_torch_dtype[args.cache_dtype]
+    q_out_dtype = str_to_torch_dtype[args.q_out_dtype]
+    num_decode = T if args.num_decode_toks is None else args.num_decode_toks
+
+    _p_gen = functools.partial(
+        _generate_pool_inputs,
+        T,
+        QH,
+        KH,
+        args.bmm,
+        kv_lora_rank,
+        nope_dim,
+        rope_dim,
+        cache_dtype,
+        args.reuse_freqs_front_part,
+    )
+    if args.timing == "rotating-graph":
+        rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+        kv_cache = rot_bufs[0]["kv_cache"]
+    else:
+        torch.manual_seed(0)
+        fixed_inputs = dict(zip(_OUT_VAL_KEYS, _p_gen()))
+        kv_cache = fixed_inputs["kv_cache"]
+
     if args.bmm == "fp4":
-
-        def fn():
-            return fused_fp4_bmm_rope_cat_and_cache_mla(
-                q_nope,
-                w_k,
-                w_k_scale,
-                q_pe,
-                k_lora,
-                k_pe,
-                kv_cache,
-                slot_mapping,
-                positions,
-                cos,
-                sin,
-                k_scale=k_scale,
-                is_neox=args.neox,
-                q_out_dtype=q_out_dtype,
-                num_decode_toks_for_zeros=num_decode,
-            )
-
+        kernel_fn = functools.partial(
+            fused_fp4_bmm_rope_cat_and_cache_mla,
+            is_neox=args.neox,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
+        )
     else:
+        kernel_fn = functools.partial(
+            fused_fp8_bmm_rope_cat_and_cache_mla,
+            group_size=128,
+            is_neox=args.neox,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
+        )
 
-        def fn():
-            return fused_fp8_bmm_rope_cat_and_cache_mla(
-                q_nope,
-                w_k,
-                w_k_scale,
-                q_pe,
-                k_lora,
-                k_pe,
-                kv_cache,
-                slot_mapping,
-                positions,
-                cos,
-                sin,
-                group_size=128,
-                k_scale=k_scale,
-                is_neox=args.neox,
-                q_out_dtype=q_out_dtype,
-                num_decode_toks_for_zeros=num_decode,
-            )
-
-    # do_bench_cudagraph runs fn on a new stream that does not wait for the inputs above,
-    # so without this the kernel can index with a slot_mapping/positions not yet written.
-    torch.cuda.synchronize()
-    if args.timing == "graph":
-        ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+    if args.timing == "rotating-graph":
+        ms = bencher.bench(kernel_fn)
     else:
-        ms = triton.testing.do_bench(fn, warmup=25, rep=args.rep, return_mode="mean")
+        fn = functools.partial(kernel_fn, **fixed_inputs)
+        # The fixed-buffer graph helper uses a new stream. Wait for input writes.
+        torch.cuda.synchronize()
+        if args.timing == "graph":
+            ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+        else:
+            ms = triton.testing.do_bench(
+                fn, warmup=25, rep=args.rep, return_mode="mean"
+            )
     if metric == "time":
         return ms
     if metric == "throughput":
@@ -169,6 +219,9 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
 
 def run_benchmark(args):
     units = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}
+    timing_label = (
+        "rotating-graph" if args.timing == "rotating-graph" else f"fixed-{args.timing}"
+    )
     benchmark = triton.testing.Benchmark(
         x_names=["T", "QH", "KH"],
         x_vals=get_benchmark_shapes(args),
@@ -179,14 +232,21 @@ def run_benchmark(args):
         plot_name=(
             f"{get_caller_name_no_ext()}_{args.bmm}_{args.q_out_dtype}"
             f"_decode-{args.num_decode_toks if args.num_decode_toks is not None else 'T'}"
-            f"_{args.timing}"
+            f"_{timing_label}"
         ),
         args={},
+    )
+    bencher = (
+        RotatingBufferBench.from_dict(
+            {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+        )
+        if args.timing == "rotating-graph"
+        else None
     )
 
     @triton.testing.perf_report([benchmark])
     def bench_fn(T, QH, KH, metric):
-        return bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args)
+        return bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args)
 
     df = bench_fn.run(print_data=True, return_df=True)[0]
     if args.o:
@@ -263,9 +323,10 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--timing",
-        choices=["graph", "eager"],
-        default="graph",
-        help="GPU event timing of graph replay or eager public-wrapper calls",
+        choices=["rotating-graph", "graph", "eager"],
+        default="rotating-graph",
+        help="rotating-graph uses --graph-* and --rot-bufs-* controls; graph/eager "
+        "retain fixed-buffer diagnostic timing with --rep and ignore those controls",
     )
     parser.add_argument(
         "--neox", action="store_true", default=False, help="NeoX-style RoPE"
@@ -280,7 +341,8 @@ def parse_args(args: list[str] | None = None):
         "--rep",
         type=positive_int,
         default=20,
-        help="Measurement budget in ms",
+        help="Measurement budget in ms for fixed-buffer graph/eager diagnostics; "
+        "unused for rotating-graph (use --graph-* controls)",
     )
     parser.add_argument(
         "-print_vgpr",
