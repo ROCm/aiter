@@ -301,6 +301,12 @@ _LL128_MIXED_SIZES = {
 # owning block (16, 32 and 1 blocks) from one call to the next.
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
+# Back-to-back gfx1250 messages at 4+ ranks that alternate the LL two-shot kernel
+# (1.15 MB and 4.59 MB of bf16) with the one-shot LL (0.36 MB). Both use the LL
+# scratch and the per-block epochs, and the 4.59 MB message runs the two-shot
+# with 512-thread blocks instead of 256.
+_LL2S_GFX1250_MIXED_SIZES = [80 * 7168, 25 * 7168, 320 * 7168]
+
 
 def _is_gfx1250() -> bool:
     return (
@@ -335,7 +341,15 @@ def _start_queue_evictions(stop):
 
 
 def _allreduce_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method, stop, name, check_every
+    rank,
+    tp_size,
+    sizes,
+    iterations,
+    distributed_init_method,
+    stop,
+    name,
+    check_every,
+    alternate_sign=False,
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -352,6 +366,10 @@ def _allreduce_mixed_size_regression(
         x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    # With alternate_sign, odd rounds reduce the negated inputs, so a line left
+    # over from the previous round never matches the expected result.
+    neg_inputs = [-x for x in inputs] if alternate_sign else inputs
+    neg_refs = [-r for r in refs] if alternate_sign else refs
     # Opt-in: how the evictions behave depends on the host's KFD driver.
     evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
     # Rank 1 reads the peer slots that a faster rank's next call overlaps.
@@ -360,7 +378,9 @@ def _allreduce_mixed_size_regression(
     dist.barrier()
     done = torch.cuda.Event()
     for iteration in range(iterations):
-        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
+        odd = iteration % 2 == 1
+        round_inputs, round_refs = (neg_inputs, neg_refs) if odd else (inputs, refs)
+        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in round_inputs]
         if iteration % check_every != check_every - 1:
             continue
         done.record()
@@ -374,7 +394,7 @@ def _allreduce_mixed_size_regression(
                 stop.set()
                 deadline, evicting = time.time() + 60, False
             time.sleep(0.001)
-        for n, out, ref in zip(sizes, outs, refs):
+        for n, out, ref in zip(sizes, outs, round_refs):
             context = f"{name} {rank=} {iteration=} numel={n}"
             torch.testing.assert_close(
                 out,
@@ -420,7 +440,25 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
     )
 
 
-def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
+def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
+    # The LL two-shot kernel shares the one-shot LL's scratch and epochs; mixing
+    # the two, and two-shot launches of different block sizes, must neither
+    # accept a stale line nor overwrite a slower peer's unread one.
+    if not _is_gfx1250() or tp_size < 4:
+        return
+    _run_mixed_size_regression(
+        tp_size,
+        _LL2S_GFX1250_MIXED_SIZES,
+        iterations,
+        "gfx1250 LL two-shot",
+        1,
+        alternate_sign=True,
+    )
+
+
+def _run_mixed_size_regression(
+    tp_size, sizes, iterations, name, check_every, alternate_sign=False
+):
     torch.multiprocessing.spawn(
         _allreduce_mixed_size_regression,
         args=(
@@ -431,6 +469,7 @@ def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
             torch.multiprocessing.get_context("spawn").Event(),
             name,
             check_every,
+            alternate_sign,
         ),
         nprocs=tp_size,
         join=True,
@@ -560,6 +599,7 @@ if __name__ == "__main__":
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_ll2s_gfx1250_mixed_size_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
