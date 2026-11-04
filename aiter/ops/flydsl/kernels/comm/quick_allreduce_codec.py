@@ -97,7 +97,7 @@ _SCALE_BIAS = 12
 # called from nested functions, so FlyDSL does not hash them into the disk
 # cache key; the kernels put this tag in their launch names, which is what
 # keeps a warm cache from loading binaries built with an older codec.
-SCALE_CODEC_TAG = "s4m3s5m2fp32v3"
+SCALE_CODEC_TAG = "s4m3s5m2fp32v4"
 E4M3_MAX = 480.0
 E4M3_SLICE_MIN = 2.0**-6
 SCALE_COLOR_MASK = 0xFFFF
@@ -165,8 +165,10 @@ class ScaleMetadata:
             return (bits << fx.Int32(16)) | (color & fx.Int32(SCALE_COLOR_MASK))
 
         def decode(get, sub, atom):
-            source = index(sub, atom)
+            # Slice ownership is wave-uniform, including its cached word.
+            source = fx.Int32(rocdl.readfirstlane(T.i32, index(sub, atom).ir_value()))
             value = get(source // fx.Int32(16))
+            value = fx.Int32(rocdl.readfirstlane(T.i32, value.ir_value()))
             return (
                 value.shrui(fx.Int32(16) + source % fx.Int32(16)) & fx.Int32(1)
             ) != 0
