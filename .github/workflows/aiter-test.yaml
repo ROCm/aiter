@@ -858,7 +858,9 @@ jobs:
             ck_path="3rdparty/composable_kernel"
             ck_sha="${{ steps.ck_submodule.outputs.sha }}"
             git submodule sync "${ck_path}"
-            if git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
+            if [ "${{ steps.restore_ck_submodule.outcome }}" = "success" ] && \
+              [ -n "${{ steps.restore_ck_submodule.outputs.cache-hit }}" ] && \
+              git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
               git -C "${ck_path}" cat-file -e "${ck_sha}^{commit}" >/dev/null 2>&1; then
               echo "Using restored CK submodule cache for ${ck_sha}"
               echo "fetched=false" >> "$GITHUB_OUTPUT"
