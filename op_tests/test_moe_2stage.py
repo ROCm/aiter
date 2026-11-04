@@ -822,12 +822,10 @@ if ci_profile == "standard":
     # Standard CI keeps the representative-token sweep but must not disable the
     # FlyDSL/Opus CSV validation path; that would silently weaken the check.
     args.tokenNum = _STANDARD_MOE_2STAGE_TOKENS
-elif ci_profile == "full":
-    # Preserve the caller's parsed arguments exactly; only the "standard"
-    # profile reduces the token sweep.
-    pass
-else:
-    args.tokenNum = _DEFAULT_MOE_2STAGE_TOKENS
+# Outside the "standard" profile, preserve whatever argparse already parsed:
+# the historical full-sweep default when "-t"/"--tokenNum" is omitted, or the
+# caller's explicit token selection otherwise. Neither "full" nor the unset/
+# "default" profile should discard an explicit "-t" override.
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
