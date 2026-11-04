@@ -490,7 +490,8 @@ std::string device_arch(int device_id) {
     hipDeviceProp_t prop;
     HIP_CALL(hipGetDeviceProperties(&prop, device_id));
     std::string arch = prop.gcnArchName;
-    return arch.substr(0, arch.find(':'));
+    arch = arch.substr(0, arch.find(':'));
+    return arch == "gfx1250-strict" ? "gfx1250" : arch;
 }
 
 // Groups the Table builder cuts `rows` rows of `seqs` sequences into, at most: one a row, or up

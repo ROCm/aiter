@@ -548,6 +548,9 @@ def _config(
             f"bits), got {max_seq_len}"
         )
     arch = _device_arch(dev)
+    # Strict gfx1250 uses the same layout and instance registry as gfx1250.
+    if arch == "gfx1250-strict":
+        arch = GFX1250
     if (arch, heads) in _ELSEWHERE:
         raise ValueError(_ELSEWHERE[arch, heads])
     if _PAGE_SIZE.get(arch, page_size) != page_size:
