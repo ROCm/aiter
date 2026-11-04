@@ -576,3 +576,60 @@ def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
         ref = _torch_reference(inp, 0.0, None, None)
         assert out.dtype == inp.dtype
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _torch_mx_reference(inp, swiglu_limit, dtype_quant):
+    """fp32 act(gate) * up, then E4M3 with group-32 E8M0 scales rounded up to a
+    power of two, as the kernels compute it. Returns (fp8, scale exponents)."""
+    gate, up = inp.float().chunk(2, dim=-1)
+    if swiglu_limit > 0:
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        gate = torch.clamp(gate, max=swiglu_limit)
+    y = F.silu(gate) * up
+    M, N = y.shape
+    groups = y.view(M, N // 32, 32)
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    bits = (amax / torch.finfo(dtype_quant).max).view(torch.int32)
+    exp = (bits + 0x007FFFFF) & 0x7F800000
+    scale = exp.view(torch.float32)
+    q = torch.where(scale == 0, 0.0, groups / torch.where(scale == 0, 1.0, scale))
+    return q.view(M, N).to(dtype_quant), (exp >> 23).to(torch.uint8).view(M, N // 32)
+
+
+@pytest.mark.parametrize("M", [1, 8, 48, 97])
+@pytest.mark.parametrize("n_half", [288, 576, 1152, 2304])
+@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_mx_partial_width(M, n_half, swiglu_limit, backend):
+    """Native MX (ue8m0, group 32) quant on rows that are whole groups but not a
+    multiple of 128: the shared expert's intermediate at TP4 (576) and TP8 (288).
+    The tile is the next power of two, so every row has masked columns."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    dtype_quant = aiter.dtypes.fp8
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16) * 4
+    inp[0, :32] = 0  # an all-zero group: scale exponent 0, data 0
+
+    out, scale = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=dtype_quant,
+        quant_block_size=32,
+        scale_dtype_fmt="ue8m0",
+        backend=backend,
+    )
+    assert out.shape == (M, n_half) and scale.shape == (M, n_half // 32)
+
+    ref_q, ref_e = _torch_mx_reference(inp, swiglu_limit, dtype_quant)
+    # A 1-ulp difference in silu can move the group max across a power of two or
+    # a value across an E4M3 rounding boundary; anything more is a real bug.
+    scale_diff = (scale.int() - ref_e.int()).abs()
+    assert scale_diff.max().item() <= 1
+    assert (scale_diff != 0).float().mean().item() < 1e-3
+    deq = out.float().view(M, -1, 32) * torch.exp2(scale.float() - 127)[..., None]
+    ref = ref_q.float().view(M, -1, 32) * torch.exp2(ref_e.float() - 127)[..., None]
+    torch.testing.assert_close(
+        deq.view(M, n_half), ref.view(M, n_half), atol=1e-6, rtol=0.13
+    )
+    assert torch.all(out[0, :32].float() == 0)

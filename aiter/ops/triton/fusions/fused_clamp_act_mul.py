@@ -133,7 +133,7 @@ def fused_clamp_act_mul(
         out if no quant, otherwise (out, scale).
 
     Constraints:
-        N must be a power of two, at least 128, and a multiple of 128.
+        N must be a multiple of 32 and, when quantizing, of quant_block_size.
     """
 
     # setup inputs
@@ -216,8 +216,17 @@ def fused_clamp_act_mul(
         else:
             assert out.shape == (M, n_half)
 
-    assert n_half >= 128
-    assert n_half % 128 == 0
+    # Both kernels mask the columns past n_half within their power-of-two tile,
+    # but a quant group straddling n_half would take its scale over masked
+    # lanes, so a quantized row holds whole groups.
+    assert (
+        n_half >= 32 and n_half % 32 == 0
+    ), f"n_half ({n_half}) must be a multiple of 32"
+    if HAS_QUANT:
+        assert n_half % quant_block_size == 0, (
+            f"n_half ({n_half}) must be a multiple of quant_block_size "
+            f"({quant_block_size})"
+        )
 
     # default block width is the whole row, can change at config
     BLOCK_SIZE_N = triton.next_power_of_2(n_half)
