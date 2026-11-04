@@ -3286,6 +3286,8 @@ def get_kernel_instance(
 ) -> OpusGemmInstance | None:
     """Return a kernel registered for ``(family, arch, cu_num, kid, Y.dtype)``."""
     arch = str(arch).lower().split(":", 1)[0]
+    # Fold strict to the gfx1250 family, as get_registry does.
+    arch = base_gfx_arch(arch)
     family = str(family).lower()
     family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
     if family_tags is None:
