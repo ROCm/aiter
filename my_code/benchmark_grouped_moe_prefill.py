@@ -19,6 +19,17 @@ import sys
 from pathlib import Path
 
 
+def _find_grouped_config_with_padding(find, pad, query):
+    """Preserve raw token rows and support callers that pad before lookup."""
+    row = find(**query)
+    if row is None:
+        padded_tokens = pad(query["token_num"])
+        if padded_tokens != query["token_num"]:
+            query = dict(query, token_num=padded_tokens)
+            row = find(**query)
+    return row, query
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -87,7 +98,9 @@ def main():
             topk=-1,
             ep_fused=True,
         )
-        row = find(**production_query)
+        row, production_query = _find_grouped_config_with_padding(
+            find, moe._get_padded_m, production_query
+        )
         assert row is not None, "The requested EP workload has no tuned row"
         selected.update(
             receive_bound=receive_bound,
