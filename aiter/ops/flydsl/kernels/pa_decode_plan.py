@@ -281,13 +281,12 @@ def plan_pa_decode(
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
-    Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to
-    ``max_batch_size`` and the device's LDS capacity. Each bucket requires four
-    LDS bytes per sequence plus scan storage. Actual batch, task capacity,
-    partition cap and window are runtime values; capacity only specializes the
-    block size (64--1024), and the window whether it is enabled.
-    ``python -m aiter.aot.flydsl.pa_decode_plan`` precompiles every variant up
-    to a ``max_batch_size``.
+    Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to the
+    device's LDS capacity, independent of ``max_batch_size``. Each bucket
+    requires four LDS bytes per sequence plus scan storage. Actual batch, task
+    capacity, partition cap and window are runtime values; capacity only
+    specializes the block size (64--1024), and the window whether it is enabled.
+    ``python -m aiter.aot.flydsl.pa_decode_plan`` precompiles every variant.
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
@@ -329,9 +328,11 @@ def plan_pa_decode(
             f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
             f"{shared_memory_per_block} bytes per block"
         )
-    # Clip the last bucket so rounding up cannot reject a batch that fits LDS.
+    # A cap below the power-of-two bound has the same lookup depth and row path,
+    # so buckets ignore it. Clip the last bucket so rounding up cannot reject a
+    # batch that fits LDS.
     lds_max_batch = _lds_max_batch(shared_memory_per_block)
-    max_batch = min(max_batch_size, lds_max_batch, 1 << (batch - 1).bit_length())
+    max_batch = min(lds_max_batch, 1 << (batch - 1).bit_length())
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:

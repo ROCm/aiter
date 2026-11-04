@@ -42,9 +42,9 @@ def device(monkeypatch):
         (257, None, 4096, 8193, 4, None, 512),
         (4096, None, 8192, 0, 1, None, 4096),
         (1, 1, 1, 0, 1, 1, 1),
-        (65, None, None, 0, 1, 100, 100),
-        (100, None, None, 0, 1, 100, 100),
-        (4097, None, None, 0, 1, 5000, 5000),
+        (65, None, None, 0, 1, 100, 128),
+        (100, None, None, 0, 1, 100, 128),
+        (4097, None, None, 0, 1, 5000, 8192),
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
 )
@@ -150,7 +150,10 @@ def test_pa_decode_plan(
 
     if bucket > 1:
         # Change both runtime values inside the same batch/block-size bucket.
-        other_batch = batch + 1 if batch < bucket else batch - 1
+        if batch < min(bucket, plan.max_batch_size):
+            other_batch = batch + 1
+        else:
+            other_batch = batch - 1
         other_budget = max(
             1,
             (budget if budget is not None else 2 * properties.multi_processor_count)

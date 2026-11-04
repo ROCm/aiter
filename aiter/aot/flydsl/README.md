@@ -228,20 +228,17 @@ python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
 The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
-clipped to `max_batch_size` and the arch's LDS), block size (64 to 1024
-threads, from the plan's task capacity) and dense/windowed mode; batch,
-capacity, partition cap and window are passed at launch. `run_aot` replays
-the whole set for `max_batch_size=81792`, gfx1250's LDS limit; each arch clips
-the final bucket to its own limit (16256 on gfx942, 40832 on gfx950). That set
-serves every power-of-two cap, including the default 4096, and every cap at or
-above the arch's limit. Another cap's final bucket (e.g. 5000) needs its own
-run.
+clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
+task capacity) and dense/windowed mode; batch, capacity, partition cap and
+window are passed at launch, and `max_batch_size` only bounds the batch.
+`run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
+40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
 
 ```bash
 # every planner kernel up to each arch's LDS limit, as the wheel build does
 python -m aiter.aot.flydsl.pa_decode_plan
-# a non-power-of-two cap, one arch
-GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 5000
+# one arch
+GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
