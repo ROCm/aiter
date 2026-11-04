@@ -492,7 +492,12 @@ def on_decision(callback: Callable[[Decision], None]) -> None:
 
 
 def decision_counts() -> Counter[tuple[str, str, str, str | None]]:
-    """Decisions so far, keyed ``(op, route, reason, provider)``."""
+    """Decisions so far, keyed ``(op, route, reason, provider)``.
+
+    Decisions, not launches: a CUDA graph replay runs no Python, so a captured
+    op counts once for the life of the graph however often it replays. Do not
+    read these as a call mix.
+    """
 
     return Counter(_decision_counts)
 
