@@ -329,7 +329,7 @@ def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device)
         [0] + list(itertools.accumulate(pages)), dtype=dtypes.i32, device=device
     )
     last_lens = torch.tensor(
-        [sk - (p - 1) * page_size for sk, p in zip(seqs_k, pages)],
+        [sk - (p - 1) * page_size if p else 0 for sk, p in zip(seqs_k, pages)],
         dtype=dtypes.i32, device=device,
     )
     k_flat = k_pool.view(-1, H_kv, d_qk)
@@ -338,8 +338,9 @@ def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device)
     for b, sk in enumerate(seqs_k):
         ids = page_ids[kv_indptr[b] : kv_indptr[b + 1]].tolist()
         rows = [slice(i * page_size, (i + 1) * page_size) for i in ids]
-        k_dense.append(torch.cat([k_flat[r] for r in rows], 0)[:sk])
-        v_dense.append(torch.cat([v_flat[r] for r in rows], 0)[:sk])
+        # An empty-KV sequence owns no pages, so there is nothing to concatenate.
+        k_dense.append(torch.cat([k_flat[r] for r in rows], 0)[:sk] if rows else k_flat[:0])
+        v_dense.append(torch.cat([v_flat[r] for r in rows], 0)[:sk] if rows else v_flat[:0])
     return (
         k_pool, v_pool, page_ids, kv_indptr, last_lens,
         torch.cat(k_dense, 0), torch.cat(v_dense, 0),
