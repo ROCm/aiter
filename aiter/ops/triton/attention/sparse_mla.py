@@ -17,7 +17,12 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
     _FN_ATTRS as _FP8_FN_ATTRS,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
+    INV_ROPE_DIM,
     LOG2E,
+    SEG_FLAT,
+    SEG_ONE_LOOP,
+    SEG_TWO_LOOPS,
+    XCDS,
     _sparse_mla_fp8,
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
@@ -308,12 +313,8 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
 
 
 class _Fp8Segments(NamedTuple):
-    """How the fp8 kernel addresses a paged or two-list call (SEG 1 / 2, see the
-    kernel's docstring). The maps are (row offset, block stride in rows, block
-    size, a power of two) from a list's slot ids to rows of its base: for SEG 1
-    both lists' base is the kernel's cache, for SEG 2 the extra list's is
-    extra_kv. extra_indptr is None for one paged list; extra_kv_scale is None
-    when the extra cache shares kv_scale."""
+    """The fp8 kernel's paged lists. A map is (row offset, block stride in rows,
+    power-of-two block size) from slot ids to rows of the list's base cache."""
 
     seg: int
     main_map: tuple
@@ -322,6 +323,14 @@ class _Fp8Segments(NamedTuple):
     extra_map: tuple = (0, 1, 1)
     extra_kv: torch.Tensor | None = None
     extra_kv_scale: torch.Tensor | None = None
+
+
+class _Fp8Route(NamedTuple):
+    """How the fp8 kernel reads a call's caches (_fp8_route)."""
+
+    cache: torch.Tensor  # u8 base of the rows
+    segs: _Fp8Segments | None  # None: one flat list
+    addr64: bool  # rows past 2 GB from cache
 
 
 def _fp8_paged_map(cache, base_ptr, row):
@@ -342,7 +351,8 @@ def _fp8_paged_map(cache, base_ptr, row):
     return (off // row, cache.stride(0) // row, block), extent
 
 
-def _fp8_kernel_caches(
+def _fp8_route(
+    *,
     arch,
     fmt,
     fp8_dots,
@@ -362,9 +372,8 @@ def _fp8_kernel_caches(
     extra_indptr,
     extra_indices,
 ):
-    """Whether the fp8 kernel (_gluon_kernels/.../sparse_mla_fp8.py) takes this
-    call, and how it then reads the caches: (base cache, _Fp8Segments or None,
-    64-bit gathers), else None.
+    """The _Fp8Route if the fp8 kernel (_gluon_kernels/.../sparse_mla_fp8.py)
+    takes this call, else None.
 
     It takes the fp8_scalar cache with fp8 dots and a 512-wide latent, with no
     rope buffer (DeepSeek-V4 / V4.1, GLM-5.3-Flash) or a 64-wide one (GLM-5.2),
@@ -406,29 +415,35 @@ def _fp8_kernel_caches(
                 cache.ndim == 2 and cache.stride(0) == row and cache.stride(1) == 1
             ):
                 return None
-            return cache, None, cache.numel() >= limit
+            return _Fp8Route(cache, None, cache.numel() >= limit)
         got = _fp8_paged_map(cache, cache.data_ptr(), row)
         if got is None:
             return None
-        return cache, _Fp8Segments(1, got[0]), got[1] >= limit
-    cache = kv_buffer.view(torch.uint8)
+        return _Fp8Route(
+            cache, _Fp8Segments(SEG_ONE_LOOP.value, got[0]), got[1] >= limit
+        )
+    main_u8 = kv_buffer.view(torch.uint8)
     x_u8 = extra_kv.view(torch.uint8)
-    one_alloc = cache.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
+    one_alloc = (
+        main_u8.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
+    )
     one_scale = extra_kv_scale.data_ptr() == kv_scale.data_ptr()
     if one_alloc and one_scale:
-        base = cache if cache.data_ptr() <= x_u8.data_ptr() else x_u8
-        main = _fp8_paged_map(cache, base.data_ptr(), row)
+        base = main_u8 if main_u8.data_ptr() <= x_u8.data_ptr() else x_u8
+        main = _fp8_paged_map(main_u8, base.data_ptr(), row)
         extra = _fp8_paged_map(x_u8, base.data_ptr(), row)
         if main is None or extra is None:
             return None
-        segs = _Fp8Segments(1, main[0], extra_indptr, extra_indices, extra[0])
-        return base, segs, max(main[1], extra[1]) >= limit
-    main = _fp8_paged_map(cache, cache.data_ptr(), row)
+        segs = _Fp8Segments(
+            SEG_ONE_LOOP.value, main[0], extra_indptr, extra_indices, extra[0]
+        )
+        return _Fp8Route(base, segs, max(main[1], extra[1]) >= limit)
+    main = _fp8_paged_map(main_u8, main_u8.data_ptr(), row)
     extra = _fp8_paged_map(x_u8, x_u8.data_ptr(), row)
     if main is None or extra is None:
         return None
     segs = _Fp8Segments(
-        2,
+        SEG_TWO_LOOPS.value,
         main[0],
         extra_indptr,
         extra_indices,
@@ -436,7 +451,7 @@ def _fp8_kernel_caches(
         x_u8,
         None if one_scale else extra_kv_scale.reshape(1).to(torch.float32),
     )
-    return cache, segs, max(main[1], extra[1]) >= limit
+    return _Fp8Route(main_u8, segs, max(main[1], extra[1]) >= limit)
 
 
 def _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8):
@@ -497,9 +512,7 @@ def _fp8_plan(num_queries, num_heads, avg_topk, two_loops=False):
 def _sparse_mla_fp8_launch(
     q,
     q_scale,
-    cache,
-    segs,
-    big,
+    route,
     kv_scale,
     kv_indptr,
     kv_indices,
@@ -516,14 +529,16 @@ def _sparse_mla_fp8_launch(
 ):
     """The fp8 kernel's launch: heads per program and split count, the kernel and,
     when split, the generic merge. q [C, H, 512 + rope] fp8 (+ a [1] f32 q_scale)
-    or bf16; (cache, segs, big) from _fp8_kernel_caches; kv_scale [1] f32.
-    out [C, H, >= 512] bf16, or None with out_mxfp8 (e4m3 data [C, H * 512],
-    E8M0 scales [C, H * 16]). Returns (out, lse or None)."""
+    or bf16; route from _fp8_route; kv_scale [1] f32. out [C, H, >= 512] bf16, or
+    None with out_mxfp8 (e4m3 data [C, H * 512], E8M0 scales [C, H * 16]).
+    Returns (out, lse or None)."""
     C, H, _ = q.shape
+    segs = route.segs
     avg_topk = kv_indices.numel() / max(1, C)
     if segs is not None and segs.extra_indices is not None:
         avg_topk += segs.extra_indices.numel() / max(1, C)
-    G, num_splits = _fp8_plan(C, H, avg_topk, segs is not None and segs.seg == 2)
+    two_loops = segs is not None and segs.seg == SEG_TWO_LOOPS.value
+    block_h, num_splits = _fp8_plan(C, H, avg_topk, two_loops)
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     split = num_splits > 1
@@ -534,38 +549,47 @@ def _sparse_mla_fp8_launch(
         if return_lse
         else None
     )
+    # the kernel's paged-list arguments
     if segs is None:
-        seg = {"SEG": 0, "MB_SH": 0, "XB_SH": 0}
-        sargs = (None,) * 8
-    else:
-        seg = {
-            "SEG": segs.seg,
-            "MB_SH": segs.main_map[2].bit_length() - 1,
-            "XB_SH": segs.extra_map[2].bit_length() - 1,
-        }
-        x_kv = None if segs.extra_kv is None else segs.extra_kv.view(torch.uint8)
-        sargs = (
-            segs.extra_indptr,
-            segs.extra_indices,
-            segs.main_map[0],
-            segs.main_map[1],
-            segs.extra_map[0],
-            segs.extra_map[1],
-            x_kv,
-            segs.extra_kv_scale,
+        lists = dict(
+            SEG=SEG_FLAT.value,
+            MAIN_BLOCK_LOG2=0,
+            EXTRA_BLOCK_LOG2=0,
+            x_indptr_ptr=None,
+            x_idx_ptr=None,
+            main_row0=None,
+            main_stride=None,
+            extra_row0=None,
+            extra_stride=None,
+            x_kv_ptr=None,
+            x_ks_ptr=None,
         )
+    else:
+        lists = dict(
+            SEG=segs.seg,
+            MAIN_BLOCK_LOG2=segs.main_map[2].bit_length() - 1,
+            EXTRA_BLOCK_LOG2=segs.extra_map[2].bit_length() - 1,
+            x_indptr_ptr=segs.extra_indptr,
+            x_idx_ptr=segs.extra_indices,
+            main_row0=segs.main_map[0],
+            main_stride=segs.main_map[1],
+            extra_row0=segs.extra_map[0],
+            extra_stride=segs.extra_map[1],
+            x_kv_ptr=None if segs.extra_kv is None else segs.extra_kv.view(torch.uint8),
+            x_ks_ptr=segs.extra_kv_scale,
+        )
+    # the output epilogue's arguments, shared with the merge
     inv = inv_rope_positions is not None
     mx = out_mxfp8 is not None
-    if inv:
-        cs = inv_rope_cos_sin_cache
-        eargs = (inv_rope_positions, cs, cs.stride(0))
-    else:
-        eargs = (None, None, 0)
+    epi = dict(
+        pos_ptr=inv_rope_positions,
+        cs_ptr=inv_rope_cos_sin_cache,
+        cs_stride=inv_rope_cos_sin_cache.stride(0) if inv else 0,
+        osc_ptr=out_mxfp8[1] if mx else None,
+        osc_stride=out_mxfp8[1].stride(0) if mx else 0,
+    )
     if mx:
         out = out_mxfp8[0].view(C, H, 512)
-        eargs = eargs + (out_mxfp8[1], out_mxfp8[1].stride(0))
-    else:
-        eargs = eargs + (None, 0)
 
     if split:
         part_m = torch.empty((C, P, H), dtype=torch.float32, device=q.device)
@@ -573,49 +597,46 @@ def _sparse_mla_fp8_launch(
         part_acc = torch.empty((C, P, H, 512), dtype=torch.bfloat16, device=q.device)
     else:
         part_m = part_l = part_acc = None
-    # A row's head blocks run back to back on one XCD (_Program.initialize), so
+    # A row's head blocks run back to back on one XCD (Program.initialize), so
     # the later blocks' gathers hit its L2.
-    hblk = H // G
-    if hblk > 1:
-        grid = (-(-C // 8) * 8 * hblk, 1, P)
+    head_blocks = H // block_h
+    if head_blocks > 1:
+        grid = (-(-C // XCDS.value) * XCDS.value * head_blocks, 1, P)
     else:
         grid = (C, 1, P)
     _sparse_mla_fp8[grid](
-        q if q_bf16 else q.view(torch.uint8),
-        cache,
-        None if split else out,
-        kv_indptr,
-        kv_indices,
-        attn_sink,
-        None if q_bf16 else q_scale,
-        kv_scale.reshape(1).to(torch.float32),
-        None if split else lse,
-        part_m,
-        part_l,
-        part_acc,
-        *sargs,
-        *eargs,
-        C,
-        H,
-        softmax_scale * LOG2E.value,
-        num_splits,
-        q.stride(0),
-        q.stride(1),
-        out.stride(0),
-        out.stride(1),
-        G=G,
-        ROPE=rope,
-        LAZY=_FP8_LAZY,
-        BIG=big,
-        XH=hblk,
-        # the RoPE tile needs waves on keys: 64 heads take 8 waves there
-        num_warps=8 if (rope and G == 64) else 4,
+        q_ptr=q if q_bf16 else q.view(torch.uint8),
+        kv_ptr=route.cache,
+        out_ptr=None if split else out,
+        indptr_ptr=kv_indptr,
+        idx_ptr=kv_indices,
+        sink_ptr=attn_sink,
+        q_scale_ptr=None if q_bf16 else q_scale,
+        ks_ptr=kv_scale.reshape(1).to(torch.float32),
+        lse_ptr=None if split else lse,
+        part_m_ptr=part_m,
+        part_l_ptr=part_l,
+        part_acc_ptr=part_acc,
+        num_queries=C,
+        num_heads=H,
+        sm_scale_log2=softmax_scale * LOG2E.value,
+        num_splits=num_splits,
+        q_stride0=q.stride(0),
+        q_stride1=q.stride(1),
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+        BLOCK_H=block_h,
+        ROPE_TAIL=rope,
+        LAZY_LOG2=_FP8_LAZY,
+        ADDR64=route.addr64,
+        HEAD_BLOCKS=head_blocks,
+        **lists,
+        **epi,
+        # the RoPE tile needs key waves: 64 heads take 8 waves there
+        num_warps=8 if (rope and block_h == 64) else 4,
         waves_per_eu=2,
         llvm_fn_attrs=_FP8_FN_ATTRS,
-        # The FMAs are written as gl.fma and nothing else may contract (3.8 would
-        # by default, 3.9 does not), so results do not depend on the Triton version.
-        enable_fp_fusion=False,
-        **seg,
+        enable_fp_fusion=True,
     )
     if split:
         _sparse_mla_reduce_gfx950[(C, H)](
@@ -640,12 +661,12 @@ def _sparse_mla_fp8_launch(
             ADAPTIVE_SPLITS=True,
             lse_ptr=lse,
             HAS_LSE=lse is not None,
-            pos_ptr=eargs[0],
-            cos_sin_ptr=eargs[1],
-            cs_stride=eargs[2],
-            out_scale_ptr=eargs[3],
-            os_stride0=eargs[4],
-            ROPE_DIM=64,
+            pos_ptr=epi["pos_ptr"],
+            cos_sin_ptr=epi["cs_ptr"],
+            cs_stride=epi["cs_stride"],
+            out_scale_ptr=epi["osc_ptr"],
+            os_stride0=epi["osc_stride"],
+            ROPE_DIM=INV_ROPE_DIM.value,
             INV_ROPE=inv,
             OUT_MXFP8=mx,
             # a 2-split tile spans two warps; more would hold duplicate lanes
@@ -959,7 +980,8 @@ def sparse_mla_fwd(
                 tensor scale fp8 kv cache only; gfx950 only.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
-            prologue, one scale per (query, head-block) tile; fp8 q is passed
+            prologue, one scale per head in the fp8_scalar kernel and per
+            (query, head-block) tile in the generic one; fp8 q is passed
             straight through, and fp8 q under "bf16" dots is widened in-kernel.
 
         q_scale: scalar f32, required when q arrives already fp8 (the scale it
@@ -1101,8 +1123,9 @@ def sparse_mla_fwd(
     fp8_dots = _resolve_dot_precision(dot_precision, fmt, arch)
     if not q_is_fp8:
         # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
-        # per (query, head-block) tile when the dots are fp8, so a caller-supplied
-        # scale has nothing to apply to; callers pass layer._q_scale regardless.
+        # q itself when the dots are fp8 (per head or per (query, head-block)
+        # tile, depending on the kernel), so a caller-supplied scale has nothing
+        # to apply to; callers pass layer._q_scale regardless.
         q_scale = None
     kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
@@ -1115,40 +1138,40 @@ def sparse_mla_fwd(
 
     # The fp8 kernel takes every call it can address; the rest runs the generic
     # kernel below.
-    fp8_caches = _fp8_kernel_caches(
-        arch,
-        fmt,
-        fp8_dots,
-        skip_reduce,
-        has_invalid,
-        q,
-        out,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        kv_buffer,
-        cache,
-        block_size,
-        scl,
-        kv_indices,
-        extra_kv if has_extra else None,
-        x_scl if has_extra else None,
-        extra_indptr,
-        extra_indices,
+    fp8_route = _fp8_route(
+        arch=arch,
+        fmt=fmt,
+        fp8_dots=fp8_dots,
+        skip_reduce=skip_reduce,
+        has_invalid=has_invalid,
+        q=q,
+        out=out,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_buffer=kv_buffer,
+        cache=cache,
+        block_size=block_size,
+        kv_scale=scl,
+        kv_indices=kv_indices,
+        extra_kv=extra_kv if has_extra else None,
+        extra_kv_scale=x_scl if has_extra else None,
+        extra_indptr=extra_indptr,
+        extra_indices=extra_indices,
     )
-    if epilogue and (fp8_caches is None or qk_rope_head_dim):
+    if epilogue and (fp8_route is None or qk_rope_head_dim):
         raise ValueError(
             "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, or "
             "an fp8_scalar one with dot_precision='fp8' in the 512-wide rope-inside "
             f"geometry; got {fmt}"
         )
-    if fp8_caches is not None:
+    if fp8_route is not None:
         _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8)
         if out_mxfp8 is None:
             out = _check_out(out, q, kv_lora_rank)
         return _sparse_mla_fp8_launch(
             q,
             q_scale,
-            *fp8_caches,
+            fp8_route,
             scl,
             kv_indptr,
             kv_indices,

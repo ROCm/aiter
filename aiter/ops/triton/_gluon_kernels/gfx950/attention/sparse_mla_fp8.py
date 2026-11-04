@@ -2,54 +2,35 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Gluon (gfx950) sparse MLA on a per-tensor fp8 KV cache ("fp8_scalar") with fp8
-dots. sparse_mla_fwd (attention/sparse_mla.py) launches it for every call it can
-address; every other call runs the generic kernel in sparse_mla.py, whose split
-merge (_sparse_mla_reduce) and output store (_epilogue_store) this one reuses.
+dots. sparse_mla_fwd (attention/sparse_mla.py) launches it whenever it can address
+the call; the rest runs on the generic kernel in this directory's sparse_mla.py,
+whose split merge and output store this kernel reuses.
 
-Geometry (ROPE):
-    0   one 512-byte row per key, V = the whole row: DeepSeek-V4 / V4.1 (RoPE inside
-        the row, per-head sink) and GLM-5.3-Flash (no RoPE, no sink)
-    64  512 latent bytes + a 64-byte RoPE tail per key, V = the latent (GLM-5.2);
-        QK adds one 16x16x32 MFMA chain over the RoPE dims
-q is fp8 with one scale for the tensor, or bf16 quantized in the prologue (one
-scale per head). The cache scale folds into the score scale (K side) and the final
-normalization (V side).
+KV rows are 512 bytes (DeepSeek-V4 / V4.1, GLM-5.3-Flash; V is the whole row) or
+512 + a 64-byte RoPE tail (GLM-5.2; V is the latent). q is fp8 with a tensor scale,
+or bf16 quantized in the prologue with one scale per head.
 
-A program is one query row, G heads (8..64) and one split of the row's keys. G and
-the wave count NW fix the layouts (_Config), and the layouts fix how the waves
-share the work, so there is one loop body for every head count:
-    QK  waves = HW head groups x KG key groups, HW = min(NW, GM / 16), KG = NW / HW
-        (GM = max(G, 16) MFMA rows; G = 8 pads to 16)
-    PV  waves split the 512 output dims
-With KG = 1 (64 heads on 4 waves) a wave owns whole rows: QK runs as two 32-key
-halves, since a whole tile's K operand would be 128 registers, its K read in
-128-dim chunks one chunk ahead of its MFMAs, and the row sum is reduced in-wave
-every tile. With KG > 1 the row sum is deferred (a [GM, 64] accumulator, reduced
-once).
+A program is one query row, BLOCK_H heads and one split of the row's keys. Each
+tile of 64 keys is gathered straight into a 2-slot LDS ring one tile ahead, with
+its row ids loaded one further ahead. QK gives each wave 16 heads and puts any
+waves left over on keys (QK_KEY_WAVES); PV splits the output dims. When a wave
+owns whole rows, QK runs as two 32-key halves with K read one chunk ahead, since
+a whole tile's K operand would not fit in registers.
 
-Per tile, from a 2-slot LDS ring of [64, 512] fp8 tiles that direct-to-LDS gathers
-fill one tile ahead:
-    wait tile t | gather t + 1 | row ids of t + 2 | QK | mask | softmax |
-    P, alpha -> LDS, barrier | rescale if a row max moved | PV
-The softmax runs in base 2 with a lagging row max: it moves only when a score
-beats it by more than 2^LAZY, so most tiles skip the accumulator rescale (LAZY = 0
-is the exact max). P goes to PV as e4m3, scaled by 2^LOG2_PS = 448 / 2^LAZY, so it
-reaches the format's largest value even with the max lagging; the scale is folded
-into the subtracted max, so p is exp2 of one FMA, and cancels in the normalization.
+The softmax is base 2 with a lazy max: it only moves when a score beats it by
+2^LAZY_LOG2, so most tiles skip the rescale. P goes to PV as e4m3 scaled so that
+it still reaches 448 with the max lagging; the scale cancels in the normalization.
 
-Key lists (SEG):
-    0  one list of pool row ids, a flat [rows, 512 + ROPE] pool
-    1  paged caches (slot s is row o + (s >> b) * stride + (s & (2^b - 1))) with
-       up to two lists, DeepSeek-V4's SWA window (main) and top-k (extra), read as
-       one list in one loop: both caches in one allocation, under one scale
-    2  the same two lists from two allocations or under two scales: two loops
-       carrying (acc, m, l), the second in the extra cache's V units
-The lists hold no -1 sentinels; the caller sends those calls to the generic kernel.
+Key lists: SEG_FLAT is one list of row ids. The paged layouts hold slot ids and
+take up to two lists (DeepSeek-V4's SWA window and top-k): SEG_ONE_LOOP reads them
+as one list when both caches share an allocation and a scale, SEG_TWO_LOOPS runs a
+loop per list otherwise. The lists hold no -1 sentinels.
 
-Split-K programs write the generic kernel's partials (base-2 row max, row sum, bf16
-unnormalized acc in V units) for _sparse_mla_reduce. The output store can apply
-DeepSeek-V4's inverse RoPE and MXFP8 quantization, here or in the merge.
+Split programs write the generic kernel's partials for _sparse_mla_reduce. The
+output store can apply DeepSeek-V4's inverse RoPE and MXFP8 quantization.
 """
+
+import math
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -62,12 +43,20 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 LOG2E: gl.constexpr = gl.constexpr(1.4426950408889634)
-_LOG2_448 = 8.807354922057604  # log2 of e4m3's largest value
+LN2: gl.constexpr = gl.constexpr(0.6931471805599453)
+E4M3_MAX: gl.constexpr = gl.constexpr(448.0)
+_LOG2_E4M3_MAX = math.log2(448.0)
 BN: gl.constexpr = gl.constexpr(64)  # keys per tile
 D: gl.constexpr = gl.constexpr(512)  # latent width = V width
+INV_ROPE_DIM: gl.constexpr = gl.constexpr(64)  # dims the output's inverse RoPE turns
+XCDS: gl.constexpr = gl.constexpr(8)  # program ids are dealt round-robin over 8 XCDs
+
+SEG_FLAT: gl.constexpr = gl.constexpr(0)
+SEG_ONE_LOOP: gl.constexpr = gl.constexpr(1)
+SEG_TWO_LOOPS: gl.constexpr = gl.constexpr(2)
 
 # Triton 3.8 spells shared_memory_descriptor.reinterpret as _reinterpret and has
-# no gl.amd.hint.sched_barrier (_sched_barrier falls back to an asm fence); both
+# no gl.amd.hint.sched_barrier (sched_barrier falls back to an asm fence); both
 # settled at compile time.
 _HAS_REINTERPRET = gl.constexpr(
     hasattr(_gl_core.shared_memory_descriptor, "reinterpret")
@@ -81,13 +70,12 @@ _FN_ATTRS = "amdgpu-agpr-alloc=0"
 
 
 @gluon.jit
-def _sched_barrier():
+def sched_barrier():
     if _HAS_SCHED_BARRIER:
         gl.amd.hint.sched_barrier()
     else:
-        # Triton 3.8 has no sched_barrier op. An empty side-effecting asm statement
-        # is a weaker stand-in: memory operations do not move across it, MFMAs
-        # can (QK's K read-ahead holds partly, Pro prefill -4%).
+        # Triton 3.8 has no sched_barrier. An empty asm fence keeps memory ops in
+        # place but not MFMAs, so the K read-ahead only partly holds there.
         fence_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
         gl.inline_asm_elementwise(
             "; fence", "=v,v", [gl.full([64], 0, gl.int32, fence_l)], dtype=gl.int32,
@@ -99,7 +87,7 @@ def _sched_barrier():
 # v_pk_*, which cannot issue while an MFMA is in flight; these can, and two waves
 # can dual-issue them.
 @gluon.jit
-def _fma(a, b, c):
+def fma(a, b, c):
     return gl.inline_asm_elementwise(
         "v_fma_f32 $0, $1, $2, $3", "=v,v,v,v", [a, b, c], dtype=gl.float32,
         is_pure=True, pack=1,
@@ -107,7 +95,7 @@ def _fma(a, b, c):
 
 
 @gluon.jit
-def _mul(a, b):
+def mul(a, b):
     return gl.inline_asm_elementwise(
         "v_mul_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True,
         pack=1,
@@ -115,18 +103,17 @@ def _mul(a, b):
 
 
 @gluon.jit
-def _add(a, b):
+def add(a, b):
     return gl.inline_asm_elementwise(
         "v_add_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True,
         pack=1,
     )  # fmt: skip
 
 
-# _add / _fma behind one wait state, for an operand a v_exp_f32 may have written in
-# the previous instruction: LLVM pads its own readers of a TRANS result (gfx950's
-# trans forwarding hazard), not inline asm, which then reads stale lanes.
+# For operands a v_exp_f32 may have just written: LLVM pads the trans forwarding
+# hazard for its own instructions but not for inline asm, which reads stale lanes.
 @gluon.jit
-def _add_t(a, b):
+def add_after_trans(a, b):
     return gl.inline_asm_elementwise(
         "s_nop 0\n\tv_add_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32,
         is_pure=True, pack=1,
@@ -134,7 +121,7 @@ def _add_t(a, b):
 
 
 @gluon.jit
-def _fma_t(a, b, c):
+def fma_after_trans(a, b, c):
     return gl.inline_asm_elementwise(
         "s_nop 0\n\tv_fma_f32 $0, $1, $2, $3", "=v,v,v,v", [a, b, c],
         dtype=gl.float32, is_pure=True, pack=1,
@@ -142,7 +129,7 @@ def _fma_t(a, b, c):
 
 
 @gluon.jit
-def _relayout(smem, layout: gl.constexpr):
+def relayout(smem, layout: gl.constexpr):
     """The same LDS bytes under another shared layout."""
     if _HAS_REINTERPRET:
         r = smem.reinterpret(smem.dtype, smem.shape, layout)
@@ -153,195 +140,202 @@ def _relayout(smem, layout: gl.constexpr):
 
 @aggregate
 @strip_annotate
-class _Config:
-    """What a program fixes at compile time: G heads on NW waves, the RoPE tail
-    width, LAZY, BIG (64-bit gather addresses) and the layouts."""
+class Config:
+    """Compile-time shape and layouts. Shared layouts end in _SH, distributed
+    ones in _L."""
 
-    G: gl.constexpr
-    NW: gl.constexpr
-    ROPE: gl.constexpr
-    LAZY: gl.constexpr
-    BIG: gl.constexpr
-    GM: gl.constexpr  # MFMA rows, max(G, 16)
-    KG: gl.constexpr  # QK key groups; 1: a wave owns whole rows
-    LOG2_PS: gl.constexpr  # P scale: a score 2^LAZY above the lagging max gives 448
-    INV_PS: gl.constexpr
-    QK: gl.constexpr  # 16x16x128 QK MFMA
-    QR: gl.constexpr  # 16x16x32 MFMA over the RoPE dims
-    PV: gl.constexpr  # PV MFMA, waves on the 512 output dims
-    PV_SCALED: gl.constexpr  # PV is a 32x32x64 scaled MFMA, else a 16x16x32 one
-    KW_PV: gl.constexpr  # PV operands' k_width
-    GATHER: gl.constexpr  # [64, 512] tile gather
-    GATHER_R: gl.constexpr  # [64, ROPE] RoPE tail gather
-    K_SH: gl.constexpr  # ring tile as written, and read as K
+    BLOCK_H: gl.constexpr  # heads per program
+    NUM_WARPS: gl.constexpr
+    ROPE_TAIL: gl.constexpr  # RoPE bytes after the 512 latent bytes
+    LAZY_LOG2: gl.constexpr
+    ADDR64: gl.constexpr  # cache past 2 GB
+    BLOCK_M: gl.constexpr  # MFMA rows, max(BLOCK_H, 16)
+    QK_KEY_WAVES: gl.constexpr  # waves sharing a tile's keys in QK
+    WHOLE_ROWS: gl.constexpr  # QK_KEY_WAVES == 1
+    P_SCALE_LOG2: gl.constexpr
+    INV_P_SCALE: gl.constexpr
+    QK_MFMA: gl.constexpr
+    ROPE_MFMA: gl.constexpr
+    PV_MFMA: gl.constexpr
+    PV_SCALED: gl.constexpr  # 32x32x64 scaled PV, else 16x16x32
+    PV_K_WIDTH: gl.constexpr
+    GATHER_L: gl.constexpr
+    GATHER_ROPE_L: gl.constexpr
+    K_SH: gl.constexpr  # ring tile as written and read as K
     V_SH: gl.constexpr  # ring tile read as V^T
-    KR_SH: gl.constexpr  # RoPE tile
+    ROPE_SH: gl.constexpr
     P_SH: gl.constexpr  # P as the softmax writes it
     P_PV_SH: gl.constexpr  # P as PV reads it
     ROW_L: gl.constexpr  # one value per head
     KEY_L: gl.constexpr  # one value per gathered key
-    WIDE_L: gl.constexpr  # [GM, 512] rows, 16 B per lane
+    WIDE_L: gl.constexpr  # [BLOCK_M, 512], 16 B per lane
 
     @gluon.constexpr_function
-    def __init__(self, G, NW, ROPE, LAZY, BIG):
-        GM = max(G, 16)
-        HW = min(NW, GM // 16)
-        KG = NW // HW
-        qk = gl.amd.AMDMFMALayout(4, [16, 16, 128], True, [HW, KG])
-        # The ring tile's LDS image: a [64, 512] tile is 15 address bits (key, dim).
-        # Bits 0-3 are a 16 B run of dims, bits 4-9 one 1 KB block, the rest pick the
-        # block, with a pad after every KB. The orders below make the 32-lane passes
-        # of the K reads (ds_read_b128) and the V^T reads (ds_read_b64_tr_b8) hit
-        # distinct banks.
-        if GM >= 32:
+    def __init__(self, BLOCK_H, NUM_WARPS, ROPE_TAIL, LAZY_LOG2, ADDR64):
+        BLOCK_M = max(BLOCK_H, 16)
+        head_waves = min(NUM_WARPS, BLOCK_M // 16)
+        key_waves = NUM_WARPS // head_waves
+        qk = gl.amd.AMDMFMALayout(4, [16, 16, 128], True, [head_waves, key_waves])
+        # LDS image of a [64, 512] tile: a 16 B run of dims, then 1 KB blocks with a
+        # pad after each. The bit orders keep the 32-lane passes of the K reads
+        # (ds_read_b128) and V^T reads (ds_read_b64_tr_b8) on distinct banks.
+        if BLOCK_M >= 32:
             # 32x32x64 scaled PV; key3 is block bit 3, moved 256 B by the 32 B pad
             pv = gl.amd.AMDMFMALayout(
-                4, [32, 32, 64], True, [1, NW], tiles_per_warp=[1, 512 // 32 // NW]
-            )
-            kw_pv = 16
+                4, [32, 32, 64], True, [1, NUM_WARPS],
+                tiles_per_warp=[1, 512 // 32 // NUM_WARPS],
+            )  # fmt: skip
+            pv_k_width = 16
             pad = 32
             kv = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [0, 32],
                   [0, 64], [0, 128], [0, 256], [16, 0], [8, 0], [32, 0]]  # fmt: skip
             vv = kv
             pp = None
         else:
-            # 16x16x32 PV, whose V^T pass varies key3: V and P are read through views
-            # with key bits 3 and 4 swapped (PV sums over keys, so a key permutation
-            # common to P and V is exact)
+            # 16x16x32 PV, whose V^T pass varies key3: read V and P with key bits 3
+            # and 4 swapped (the same permutation on both, so PV is unchanged)
             pv = gl.amd.AMDMFMALayout(
-                4, [16, 16, 32], True, [1, NW], tiles_per_warp=[1, 512 // 16 // NW]
-            )
-            kw_pv = 8
+                4, [16, 16, 32], True, [1, NUM_WARPS],
+                tiles_per_warp=[1, 512 // 16 // NUM_WARPS],
+            )  # fmt: skip
+            pv_k_width = 8
             pad = 16
             kv = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [0, 32],
                   [0, 64], [16, 0], [0, 128], [0, 256], [32, 0], [8, 0]]  # fmt: skip
             vv = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [0, 32],
                   [0, 64], [8, 0], [0, 128], [0, 256], [32, 0], [16, 0]]  # fmt: skip
             pp = [[0, 1], [0, 2], [0, 4], [0, 16], [0, 8], [0, 32]]
-            pp = pp + [[1 << i, 0] for i in range(GM.bit_length() - 1)]
+            pp = pp + [[1 << i, 0] for i in range(BLOCK_M.bit_length() - 1)]
         k_sh = gl.PaddedSharedLayout([[1024, pad]], kv, [], [64, 512])
-        p_sh = gl.PaddedSharedLayout.with_identity_for([[64, 16]], [GM, 64], [1, 0])
-        # Gather: a lane per 16 B of one 1 KB block (the copy writes each wave's
-        # 64 x 16 B contiguously), the block bits on registers and waves. Dims before
-        # keys on registers: register order is issue order, and a key bit early makes
-        # the next gather wait on every gather in flight.
-        nwb = NW.bit_length() - 1
+        p_sh = gl.PaddedSharedLayout.with_identity_for(
+            [[64, 16]], [BLOCK_M, 64], [1, 0]
+        )
+        # A lane per 16 B of a 1 KB block. Dims come before keys on registers, since
+        # register order is issue order and an early key bit makes the next gather
+        # wait on all of them.
+        warp_bits = NUM_WARPS.bit_length() - 1
         block = sorted(kv[10:], key=lambda b: b[0] != 0)
+        reg_blocks = len(block) - warp_bits
         gather = gl.DistributedLinearLayout(
-            reg_bases=kv[:4] + block[: 5 - nwb],
+            reg_bases=kv[:4] + block[:reg_blocks],
             lane_bases=kv[4:10],
-            warp_bases=block[5 - nwb :],
+            warp_bases=block[reg_blocks:],
             block_bases=[],
             shape=[64, 512],
         )
-        kr_sh = k_sh
-        gather_r = gather
-        if ROPE > 0:
-            assert ROPE == 64 and KG > 1, "the RoPE tile runs with key-split QK"
+        rope_sh = k_sh
+        gather_rope = gather
+        if ROPE_TAIL > 0:
+            assert ROPE_TAIL == 64 and key_waves > 1, "the RoPE tile needs key waves"
             rb = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0], [4, 0], [8, 0], [0, 16],
                   [0, 32], [16, 0], [32, 0]]  # fmt: skip
-            kr_sh = gl.PaddedSharedLayout([[1024, 16]], rb, [], [64, ROPE])
-            nr = min(nwb, 2)
-            gather_r = gl.DistributedLinearLayout(
+            rope_sh = gl.PaddedSharedLayout([[1024, 16]], rb, [], [64, ROPE_TAIL])
+            # the tail has two block bits, so waves 4-7 copy the same bytes again
+            nr = min(warp_bits, 2)
+            gather_rope = gl.DistributedLinearLayout(
                 reg_bases=rb[:4] + rb[10:][: 2 - nr],
                 lane_bases=rb[4:10],
-                warp_bases=rb[10:][2 - nr :] + [[0, 0]] * (nwb - nr),
+                warp_bases=rb[10:][2 - nr :] + [[0, 0]] * (warp_bits - nr),
                 block_bases=[],
-                shape=[64, ROPE],
+                shape=[64, ROPE_TAIL],
             )
 
-        self.G = gl.constexpr(G)
-        self.NW = gl.constexpr(NW)
-        self.ROPE = gl.constexpr(ROPE)
-        self.LAZY = gl.constexpr(LAZY)
-        self.BIG = gl.constexpr(BIG)
-        self.GM = gl.constexpr(GM)
-        self.KG = gl.constexpr(KG)
-        self.LOG2_PS = gl.constexpr(_LOG2_448 - LAZY)
-        self.INV_PS = gl.constexpr(2.0 ** (LAZY - _LOG2_448))
-        self.QK = gl.constexpr(qk)
-        self.QR = gl.constexpr(gl.amd.AMDMFMALayout(4, [16, 16, 32], True, [HW, KG]))
-        self.PV = gl.constexpr(pv)
-        self.PV_SCALED = gl.constexpr(GM >= 32)
-        self.KW_PV = gl.constexpr(kw_pv)
-        self.GATHER = gl.constexpr(gather)
-        self.GATHER_R = gl.constexpr(gather_r)
+        self.BLOCK_H = gl.constexpr(BLOCK_H)
+        self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        self.ROPE_TAIL = gl.constexpr(ROPE_TAIL)
+        self.LAZY_LOG2 = gl.constexpr(LAZY_LOG2)
+        self.ADDR64 = gl.constexpr(ADDR64)
+        self.BLOCK_M = gl.constexpr(BLOCK_M)
+        self.QK_KEY_WAVES = gl.constexpr(key_waves)
+        self.WHOLE_ROWS = gl.constexpr(key_waves == 1)
+        self.P_SCALE_LOG2 = gl.constexpr(_LOG2_E4M3_MAX - LAZY_LOG2)
+        self.INV_P_SCALE = gl.constexpr(2.0 ** (LAZY_LOG2 - _LOG2_E4M3_MAX))
+        self.QK_MFMA = gl.constexpr(qk)
+        self.ROPE_MFMA = gl.constexpr(
+            gl.amd.AMDMFMALayout(4, [16, 16, 32], True, [head_waves, key_waves])
+        )
+        self.PV_MFMA = gl.constexpr(pv)
+        self.PV_SCALED = gl.constexpr(BLOCK_M >= 32)
+        self.PV_K_WIDTH = gl.constexpr(pv_k_width)
+        self.GATHER_L = gl.constexpr(gather)
+        self.GATHER_ROPE_L = gl.constexpr(gather_rope)
         self.K_SH = gl.constexpr(k_sh)
         self.V_SH = gl.constexpr(
             gl.PaddedSharedLayout([[1024, pad]], vv, [], [64, 512])
         )
-        self.KR_SH = gl.constexpr(kr_sh)
+        self.ROPE_SH = gl.constexpr(rope_sh)
         self.P_SH = gl.constexpr(p_sh)
         if pp is None:
             self.P_PV_SH = gl.constexpr(p_sh)
         else:
             self.P_PV_SH = gl.constexpr(
-                gl.PaddedSharedLayout([[64, 16]], pp, [], [GM, 64])
+                gl.PaddedSharedLayout([[64, 16]], pp, [], [BLOCK_M, 64])
             )
         self.ROW_L = gl.constexpr(gl.SliceLayout(1, qk))
         self.KEY_L = gl.constexpr(gl.SliceLayout(1, gather))
-        self.WIDE_L = gl.constexpr(gl.BlockedLayout([1, 8], [1, 64], [NW, 1], [1, 0]))
+        self.WIDE_L = gl.constexpr(
+            gl.BlockedLayout([1, 8], [1, 64], [NUM_WARPS, 1], [1, 0])
+        )
 
 
-# A key list (ix) is one of
-#   (ids,)                 a flat pool's row ids
-#   (main, extra, n_main)  two lists of paged slot ids read as their concatenation,
-#                          main for its first n_main keys; a list is
-#                          (ids, o, stride, b), slot s being row
-#                          o + (s >> b) * stride + (s & (2^b - 1))
-# The code dispatches on len(ix): tuple members lose constexpr-ness in a callee.
+# A key list ix is (ids,) for a flat pool, or (main, extra, n_main) for paged
+# slot ids, read as main's first n_main keys then extra's. A paged list is
+# (ids, row0, stride, block_log2): slot s is row
+# row0 + (s >> block_log2) * stride + s % 2^block_log2.
+# Dispatch is on len(ix), since tuple members lose constexpr-ness in a callee.
 
 
 @gluon.jit
-def _key_lists(
+def one_loop_list(
     indptr_ptr,
     idx_ptr,
     x_indptr_ptr,
     x_idx_ptr,
     row,
-    mo,
-    mstr,
-    xo,
-    xstr,
+    main_row0,
+    main_stride,
+    extra_row0,
+    extra_stride,
     SEG: gl.constexpr,
-    MB_SH: gl.constexpr,
-    XB_SH: gl.constexpr,
+    MAIN_BLOCK_LOG2: gl.constexpr,
+    EXTRA_BLOCK_LOG2: gl.constexpr,
 ):
-    """(start, end, ix) of a row read in one loop (SEG 0 / 1). start and end are
-    the positions the concatenated list would have (masks and splits only)."""
+    """(start, end, ix) of a row read in one loop. start and end only feed the
+    masks and the split."""
     start = gl.load(indptr_ptr + row)
     end = gl.load(indptr_ptr + row + 1)
-    if SEG == 0:
+    if SEG == SEG_FLAT:
         ix = (idx_ptr + start,)
     else:
-        main = (idx_ptr + start, mo, mstr, MB_SH)
+        main = (idx_ptr + start, main_row0, main_stride, MAIN_BLOCK_LOG2)
         if x_indptr_ptr is None:  # one paged list
             ix = (main, main, end - start)
         else:
-            es = gl.load(x_indptr_ptr + row)
-            ee = gl.load(x_indptr_ptr + row + 1)
-            ix = (main, (x_idx_ptr + es, xo, xstr, XB_SH), end - start)
-            start = start + es
-            end = end + ee
+            x_start = gl.load(x_indptr_ptr + row)
+            x_end = gl.load(x_indptr_ptr + row + 1)
+            extra = (x_idx_ptr + x_start, extra_row0, extra_stride, EXTRA_BLOCK_LOG2)
+            ix = (main, extra, end - start)
+            start = start + x_start
+            end = end + x_end
     return start, end, ix
 
 
 @gluon.jit
-def _rows(ix, k, n, KL: gl.constexpr):
-    """Start loading the row ids of keys k .. k + 64 (relative to the list start);
-    keys past n - 1 clamp onto it. Returns what _rid resolves after the wait that
-    covers these loads. Flat ids load straight in the gather's key layout KL;
-    paged ones one key per lane, mapped and spread to KL by _rid: two loads plus
-    the mapping per gathered register cost more than the loop has to spare."""
+def load_row_ids(ix, k, n, KL: gl.constexpr):
+    """Start loading the row ids of keys k .. k + 64, clamped to n - 1; resolve
+    them with resolve_row_ids after the next wait. An empty list loads index -1,
+    which the buffer load reads as 0: one harmless gather of row 0. Paged ids load
+    one per lane and are spread to KL later, which is cheaper than mapping every
+    gathered register."""
     if len(ix) > 1:
+        main, extra, n_main = ix
         cl: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
         j = gl.minimum(k + gl.arange(0, BN, layout=cl), n - 1)
-        n_main = ix[2]
         # no other=: a masked buffer load reads 0, while other=0 is a select right
         # after the load, an s_waitcnt vmcnt(0) behind the gathers in flight
-        sm = gl.amd.cdna4.buffer_load(ix[0][0], j, mask=j < n_main)
-        sx = gl.amd.cdna4.buffer_load(ix[1][0], j - n_main, mask=j >= n_main)
-        r = (sm, sx, k, n)
+        s_main = gl.amd.cdna4.buffer_load(main[0], j, mask=j < n_main)
+        s_extra = gl.amd.cdna4.buffer_load(extra[0], j - n_main, mask=j >= n_main)
+        r = (s_main, s_extra, k, n)
     else:
         kg = gl.arange(0, BN, layout=KL)
         r = (gl.amd.cdna4.buffer_load(ix[0], gl.minimum(k + kg, n - 1)),)
@@ -349,28 +343,30 @@ def _rows(ix, k, n, KL: gl.constexpr):
 
 
 @gluon.jit
-def _slot_row(s, lst):
-    return lst[1] + (s >> lst[3]) * lst[2] + (s & ((1 << lst[3]) - 1))
+def slot_to_row(s, lst):
+    _, row0, stride, block_log2 = lst
+    return row0 + (s >> block_log2) * stride + (s & ((1 << block_log2) - 1))
 
 
 @gluon.jit
-def _rid(ix, r, KL: gl.constexpr):
-    """The row ids in layout KL, from _rows' r."""
+def resolve_row_ids(ix, r, KL: gl.constexpr):
+    """The row ids in layout KL, from load_row_ids' r."""
     if len(ix) > 1:
+        main, extra, n_main = ix
         # The ids are lane-uniform: left alone, the backend moves them to SGPRs
         # (v_readlane) right after the load, an s_waitcnt behind the gathers in
         # flight. A non-pure VGPR copy keeps that math after the step's wait.
-        sm = gl.inline_asm_elementwise(
+        s_main = gl.inline_asm_elementwise(
             "v_mov_b32 $0, $1", "=v,v", [r[0]], dtype=gl.int32, is_pure=False, pack=1
         )
-        sx = gl.inline_asm_elementwise(
+        s_extra = gl.inline_asm_elementwise(
             "v_mov_b32 $0, $1", "=v,v", [r[1]], dtype=gl.int32, is_pure=False, pack=1
         )
         k = r[2]
         n = r[3]
-        kc = gl.arange(0, BN, layout=sm.type.layout)
-        in_main = gl.minimum(k + kc, n - 1) < ix[2]
-        rid = gl.where(in_main, _slot_row(sm, ix[0]), _slot_row(sx, ix[1]))
+        keys = gl.arange(0, BN, layout=s_main.type.layout)
+        in_main = gl.minimum(k + keys, n - 1) < n_main
+        rid = gl.where(in_main, slot_to_row(s_main, main), slot_to_row(s_extra, extra))
         rid = gl.convert_layout(rid, KL)
     else:
         rid = r[0]
@@ -378,34 +374,34 @@ def _rid(ix, r, KL: gl.constexpr):
 
 
 @gluon.jit
-def _copy(
-    dst, kv_ptr, rid, cols, RS: gl.constexpr, OFF: gl.constexpr, BIG: gl.constexpr
+def copy_rows(
+    dst, kv_ptr, rid, cols, PITCH: gl.constexpr, OFF: gl.constexpr, ADDR64: gl.constexpr
 ):
-    """Bytes OFF + cols of rows rid (row pitch RS) into dst, no commit."""
-    if BIG:
+    """Bytes OFF + cols of rows rid (row pitch PITCH) into dst, no commit."""
+    if ADDR64:
         # a 64-bit row base: buffer offsets are i32
-        rp = kv_ptr + rid.to(gl.int64) * RS + OFF
+        rp = kv_ptr + rid.to(gl.int64) * PITCH + OFF
         gl.amd.cdna4.async_copy.global_load_to_shared(dst, rp[:, None] + cols[None, :])
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dst, kv_ptr, (rid * RS + OFF)[:, None] + cols[None, :]
+            dst, kv_ptr, (rid * PITCH + OFF)[:, None] + cols[None, :]
         )
 
 
 @gluon.jit
-def _gather(cfg, kv_dst, kr_dst, kv_ptr, ix, r, cols):
-    """One tile into a ring slot, the latent into kv_dst and the RoPE tail into
-    kr_dst, as one commit group. cols: their byte columns in the gather layouts."""
-    rid = _rid(ix, r, cfg.KEY_L)
-    _copy(kv_dst, kv_ptr, rid, cols[0], D + cfg.ROPE, 0, cfg.BIG)
-    if cfg.ROPE > 0:
-        rid_r = gl.convert_layout(rid, gl.SliceLayout(1, cfg.GATHER_R))
-        _copy(kr_dst, kv_ptr, rid_r, cols[1], D + cfg.ROPE, D, cfg.BIG)
+def gather_tile(cfg, kv_dst, rope_dst, kv_ptr, ix, r, cols):
+    """One tile into a ring slot (latent and RoPE tail), as one commit group."""
+    rid = resolve_row_ids(ix, r, cfg.KEY_L)
+    PITCH: gl.constexpr = D + cfg.ROPE_TAIL
+    copy_rows(kv_dst, kv_ptr, rid, cols[0], PITCH, 0, cfg.ADDR64)
+    if cfg.ROPE_TAIL > 0:
+        rid_r = gl.convert_layout(rid, gl.SliceLayout(1, cfg.GATHER_ROPE_L))
+        copy_rows(rope_dst, kv_ptr, rid_r, cols[1], PITCH, D, cfg.ADDR64)
     gl.amd.cdna4.async_copy.commit_group()
 
 
 @gluon.jit
-def _mask(S, k0, end):
+def mask_tail(S, k0, end):
     """-inf on the keys k0 + column of S past end (the row's last tile only)."""
     kcol = gl.arange(0, S.shape[1], layout=gl.SliceLayout(0, S.type.layout))
     if k0 + S.shape[1] > end:
@@ -414,94 +410,98 @@ def _mask(S, k0, end):
 
 
 @gluon.jit
-def _qk(cfg, kvt, q_dot):
+def qk_tile(cfg, kvt, q_dot):
     """Scores of the whole tile: 16x16x128 scaled MFMAs, unit scales."""
-    k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK, 16)
+    k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK_MFMA, 16)
     k = kvt.permute([1, 0]).load(k_op)
-    acc = gl.zeros([q_dot.shape[0], BN], gl.float32, cfg.QK)
+    acc = gl.zeros([q_dot.shape[0], BN], gl.float32, cfg.QK_MFMA)
     return gl.amd.cdna4.mfma_scaled(
         q_dot, None, "e4m3", k.to(gl.float8e4nv, bitcast=True), None, "e4m3", acc
     )
 
 
 @gluon.jit
-def _kc(cfg, kvt, i: gl.constexpr, NK: gl.constexpr):
+def k_chunk(cfg, kvt, i: gl.constexpr, NK: gl.constexpr):
     """K chunk i of the tile, as the QK MFMA's B operand: keys (i // 4) * NK ..
     + NK, dims (i % 4) * 128 .. + 128."""
-    k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK, 16)
+    k_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QK_MFMA, 16)
     kc = kvt.slice((i // 4) * NK, NK, dim=0).slice((i % 4) * 128, 128, dim=1)
     return kc.permute([1, 0]).load(k_op).to(gl.float8e4nv, bitcast=True)
 
 
 @gluon.jit
-def _qk_halves(cfg, kvt, qc):
+def qk_halves(cfg, kvt, qc):
     """Scores of the tile's two 32-key halves, one accumulator each, q in 128-dim
     chunks qc. Each K chunk is read before the previous chunk's MFMAs; the fences
     hold that order, since left alone LLVM moves every read down to its MFMA and
     waits lgkmcnt(0) there."""
     HB: gl.constexpr = BN // 2
-    S0 = gl.zeros([qc[0].shape[0], HB], gl.float32, cfg.QK)
+    S0 = gl.zeros([qc[0].shape[0], HB], gl.float32, cfg.QK_MFMA)
     S1 = S0
-    k = _kc(cfg, kvt, 0, HB)
+    k = k_chunk(cfg, kvt, 0, HB)
     for i in gl.static_range(8):
         kn = k
         if i + 1 < 8:
-            kn = _kc(cfg, kvt, i + 1, HB)
-        _sched_barrier()
+            kn = k_chunk(cfg, kvt, i + 1, HB)
+        sched_barrier()
         if i < 4:
             S0 = gl.amd.cdna4.mfma_scaled(qc[i], None, "e4m3", k, None, "e4m3", S0)
         else:
             S1 = gl.amd.cdna4.mfma_scaled(
                 qc[i - 4], None, "e4m3", k, None, "e4m3", S1
             )
-        _sched_barrier()
+        sched_barrier()
         k = kn
     return S0, S1
 
 
 @gluon.jit
-def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
-    """QK, softmax and PV of the tile in kvt (its RoPE part in krt): keys k0 ..
-    k0 + 64 of a row ending at end. q: the (latent, RoPE) operands; c: the base-2
-    score scale per row; l_i: the row sum, [GM] (KG = 1) or the deferred [GM, 64]
-    accumulator."""
-    HALVES: gl.constexpr = cfg.KG == 1
-    HB: gl.constexpr = BN // 2
-
-    # c > 0, so the max of the scaled scores is the scaled max
-    if HALVES:
-        # K read ahead pays here only: with KG > 1 the fences cost more (GLM-5.2)
-        # and the chunked q costs the small decodes 2-4%
-        S0, S1 = _qk_halves(cfg, kvt, q[0])
-        S0 = _mask(S0, k0, end)
-        S1 = _mask(S1, k0 + HB, end)
+def tile_scores(cfg, kvt, ropet, q, k0, end):
+    """(S0, S1, row max): the two 32-key halves with WHOLE_ROWS, else the whole
+    tile in S0 (S1 = S0)."""
+    if cfg.WHOLE_ROWS:
+        # K read-ahead only here: with key waves the fences and chunked q cost more
+        HB: gl.constexpr = BN // 2
+        S0, S1 = qk_halves(cfg, kvt, q[0])
+        S0 = mask_tail(S0, k0, end)
+        S1 = mask_tail(S1, k0 + HB, end)
         mx = gl.maximum(gl.max(S0, axis=1), gl.max(S1, axis=1))
     else:
-        S0 = _qk(cfg, kvt, q[0])
-        if cfg.ROPE > 0:
-            kr_op: gl.constexpr = gl.DotOperandLayout(1, cfg.QR, 8)
-            kr = krt.permute([1, 0]).load(kr_op).to(gl.float8e4nv, bitcast=True)
+        S0 = qk_tile(cfg, kvt, q[0])
+        if cfg.ROPE_TAIL > 0:
+            kr_op: gl.constexpr = gl.DotOperandLayout(1, cfg.ROPE_MFMA, 8)
+            kr = ropet.permute([1, 0]).load(kr_op).to(gl.float8e4nv, bitcast=True)
             # Its own accumulator, added after: chaining onto S0 makes this MFMA
             # read another shape's MFMA result, a hazard Triton 3.8's LLVM pads
             # with no wait states (nondeterministic scores).
-            sr = gl.amd.cdna4.mfma(q[1], kr, gl.zeros(S0.shape, gl.float32, cfg.QR))
-            S0 = S0 + gl.convert_layout(sr, cfg.QK)
-        S0 = _mask(S0, k0, end)
+            sr = gl.amd.cdna4.mfma(
+                q[1], kr, gl.zeros(S0.shape, gl.float32, cfg.ROPE_MFMA)
+            )
+            S0 = S0 + gl.convert_layout(sr, cfg.QK_MFMA)
+        S0 = mask_tail(S0, k0, end)
         S1 = S0
         mx = gl.max(S0, axis=1)
+    return S0, S1, mx
 
-    # A row with no key so far keeps m = -inf: subtract 0, rescale by 1.
+
+@gluon.jit
+def softmax_to_lds(cfg, S0, S1, mx, c, m_i, l_i, p_smem, alpha_smem):
+    """Writes P (e4m3) and the rescale alpha to LDS, returns (m, l). l is
+    [BLOCK_M], or with key waves a [BLOCK_M, 64] sum reduced at the end."""
+    # c > 0, so the max of the scaled scores is the scaled max
     m_cand = gl.maximum(m_i, mx * c)
-    m_new = gl.where(m_cand > m_i + cfg.LAZY, m_cand, m_i)
+    m_new = gl.where(m_cand > m_i + cfg.LAZY_LOG2, m_cand, m_i)
+    # A row with no key so far keeps m = -inf: subtract 0, rescale by 1.
     live = m_new > float("-inf")
     alpha = gl.where(live, gl.exp2(m_i - m_new), 1.0)
-    m_sub = gl.where(live, m_new - cfg.LOG2_PS, 0.0)
+    m_sub = gl.where(live, m_new - cfg.P_SCALE_LOG2, 0.0)
     c2 = gl.broadcast(c[:, None], S0)[0]
     nm = gl.broadcast(-m_sub[:, None], S0)[0]
-    p0 = gl.exp2(_fma(S0, c2, nm))
-    if HALVES:
-        p1 = gl.exp2(_fma(S1, c2, nm))
-        l_i = _fma(l_i, alpha, gl.reduce(_add_t(p0, p1), 1, _add))
+    p0 = gl.exp2(fma(S0, c2, nm))
+    if cfg.WHOLE_ROWS:
+        HB: gl.constexpr = BN // 2
+        p1 = gl.exp2(fma(S1, c2, nm))
+        l_i = fma(l_i, alpha, gl.reduce(add_after_trans(p0, p1), 1, add))
         p_smem.slice(0, HB, dim=1).store(
             p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
         )
@@ -510,32 +510,46 @@ def _tile(cfg, kvt, krt, p_smem, a_smem, q, c, acc, m_i, l_i, k0, end):
         )
     else:
         # deferred row sum: no cross-wave reduction per tile
-        l_i = _fma_t(l_i, gl.broadcast(alpha[:, None], S0)[0], p0)
+        l_i = fma_after_trans(l_i, gl.broadcast(alpha[:, None], S0)[0], p0)
         p_smem.store(p0.to(gl.float8e4nv).to(gl.uint8, bitcast=True))
-    a_smem.store(alpha)
-    gl.barrier()
+    alpha_smem.store(alpha)
+    return m_new, l_i
 
+
+@gluon.jit
+def tile_pv(cfg, kvt, p_smem, alpha_smem, acc):
+    """acc * alpha + P V, once a barrier has published P."""
     # a uniform branch: on most tiles no row max moved
-    alpha_pv = a_smem.load(gl.SliceLayout(1, cfg.PV))
-    if gl.min(alpha_pv, axis=0) < 1.0:
-        acc = _mul(acc, gl.broadcast(alpha_pv[:, None], acc)[0])
-    p_op: gl.constexpr = gl.DotOperandLayout(0, cfg.PV, cfg.KW_PV)
-    v_op: gl.constexpr = gl.DotOperandLayout(1, cfg.PV, cfg.KW_PV)
-    v = _relayout(kvt, cfg.V_SH).load(v_op).to(gl.float8e4nv, bitcast=True)
-    p = _relayout(p_smem, cfg.P_PV_SH).load(p_op).to(gl.float8e4nv, bitcast=True)
+    alpha = alpha_smem.load(gl.SliceLayout(1, cfg.PV_MFMA))
+    if gl.min(alpha, axis=0) < 1.0:
+        acc = mul(acc, gl.broadcast(alpha[:, None], acc)[0])
+    p_op: gl.constexpr = gl.DotOperandLayout(0, cfg.PV_MFMA, cfg.PV_K_WIDTH)
+    v_op: gl.constexpr = gl.DotOperandLayout(1, cfg.PV_MFMA, cfg.PV_K_WIDTH)
+    v = relayout(kvt, cfg.V_SH).load(v_op).to(gl.float8e4nv, bitcast=True)
+    p = relayout(p_smem, cfg.P_PV_SH).load(p_op).to(gl.float8e4nv, bitcast=True)
     if cfg.PV_SCALED:
         acc = gl.amd.cdna4.mfma_scaled(p, None, "e4m3", v, None, "e4m3", acc)
     else:
         acc = gl.amd.cdna4.mfma(p, v, acc)
-    return acc, m_new, l_i
+    return acc
+
+
+@gluon.jit
+def attend_tile(cfg, kvt, ropet, p_smem, alpha_smem, q, c, acc, m_i, l_i, k0, end):
+    """One tile: keys k0 .. k0 + 64 of a row ending at end."""
+    S0, S1, mx = tile_scores(cfg, kvt, ropet, q, k0, end)
+    m_i, l_i = softmax_to_lds(cfg, S0, S1, mx, c, m_i, l_i, p_smem, alpha_smem)
+    gl.barrier()
+    acc = tile_pv(cfg, kvt, p_smem, alpha_smem, acc)
+    return acc, m_i, l_i
 
 
 @aggregate
 @strip_annotate
-class _Program:
-    """One query row, G heads from h0, one split of the row's keys."""
+class Program:
+    """One query row, BLOCK_H heads from h0, one split of the row's keys."""
 
-    cfg: _Config
+    cfg: Config
     row: gl.tensor
     h0: gl.tensor
     split: gl.tensor
@@ -546,19 +560,20 @@ class _Program:
 
     @gluon.jit
     def initialize(
-        cfg, XH: gl.constexpr, q_ptr, q_stride0, q_stride1, num_heads, num_splits
+        cfg,
+        HEAD_BLOCKS: gl.constexpr,
+        q_ptr,
+        q_stride0,
+        q_stride1,
+        num_heads,
+        num_splits,
     ):
-        # XH > 1: a row's XH head blocks run at program ids L, L + 8, .. (one XCD,
-        # back to back, so the later blocks' gathers hit its L2); the grid pads the
-        # rows to a multiple of 8.
-        if XH > 1:
-            L = gl.program_id(0)
-            row = (L // (8 * XH)) * 8 + L % 8
-            h0 = (L // 8) % XH * cfg.G
-        else:
-            row = gl.program_id(0)
-            h0 = gl.program_id(1) * cfg.G
-        return _Program(
+        # A row's head blocks run at program ids L, L + 8, ..: on one XCD, so the
+        # later blocks hit the first one's gathers in L2.
+        L = gl.program_id(0)
+        row = (L // (XCDS * HEAD_BLOCKS)) * XCDS + L % XCDS
+        h0 = (L // XCDS) % HEAD_BLOCKS * cfg.BLOCK_H
+        return Program(
             cfg, row, h0, gl.program_id(2), num_splits, num_heads,
             q_ptr + row.to(gl.int64) * q_stride0 + h0 * q_stride1, q_stride1,
         )  # fmt: skip
@@ -573,25 +588,27 @@ class _Program:
 
     @gluon.jit
     def load_q(self, C0: gl.constexpr, NC: gl.constexpr, layout: gl.constexpr):
-        """Columns C0 .. C0 + NC of the program's GM heads; rows G .. GM read 0."""
-        G: gl.constexpr = self.cfg.G
-        GM: gl.constexpr = self.cfg.GM
-        hq = gl.arange(0, GM, layout=gl.SliceLayout(1, layout))
+        """Columns C0 .. C0 + NC; padding heads read 0."""
+        BLOCK_H: gl.constexpr = self.cfg.BLOCK_H
+        BLOCK_M: gl.constexpr = self.cfg.BLOCK_M
+        hq = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
         cq = gl.arange(0, NC, layout=gl.SliceLayout(0, layout))
         off = hq[:, None] * self.q_stride + cq[None, :]
-        if G < GM:
-            q = gl.amd.cdna4.buffer_load(self.q_ptr + C0, off, mask=(hq < G)[:, None])
+        if BLOCK_H < BLOCK_M:
+            q = gl.amd.cdna4.buffer_load(
+                self.q_ptr + C0, off, mask=(hq < BLOCK_H)[:, None]
+            )
         else:
             q = gl.amd.cdna4.buffer_load(self.q_ptr + C0, off)
         return q
 
     @gluon.jit
     def q_fp8(self):
-        """(latent, RoPE) operands of fp8 q, loaded straight into the operand layouts;
-        with KG = 1 the latent as four 128-dim chunks (_qk_halves)."""
+        """(latent, RoPE) dot operands; the latent in four 128-dim chunks with
+        WHOLE_ROWS. Without a RoPE tail the second is a placeholder."""
         cfg = self.cfg
-        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK, 16)
-        if cfg.KG == 1:
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK_MFMA, 16)
+        if cfg.WHOLE_ROWS:
             q_dot = (
                 self.load_q(0, 128, q_op).to(gl.float8e4nv, bitcast=True),
                 self.load_q(128, 128, q_op).to(gl.float8e4nv, bitcast=True),
@@ -600,22 +617,25 @@ class _Program:
             )
         else:
             q_dot = self.load_q(0, D, q_op).to(gl.float8e4nv, bitcast=True)
-        if cfg.ROPE > 0:
-            qr_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QR, 8)
-            qr_dot = self.load_q(D, cfg.ROPE, qr_op).to(gl.float8e4nv, bitcast=True)
-        elif cfg.KG == 1:
-            qr_dot = q_dot[0]  # unused without RoPE
+        if cfg.ROPE_TAIL > 0:
+            qr_op: gl.constexpr = gl.DotOperandLayout(0, cfg.ROPE_MFMA, 8)
+            qr_dot = self.load_q(D, cfg.ROPE_TAIL, qr_op).to(
+                gl.float8e4nv, bitcast=True
+            )
+        elif cfg.WHOLE_ROWS:
+            qr_dot = q_dot[0]
         else:
             qr_dot = q_dot
         return q_dot, qr_dot
 
     @gluon.jit
     def q_bf16(self):
-        """bf16 q as e4m3 with one scale per head (over latent and RoPE):
-        ((latent, RoPE) operands as q_fp8 returns them, the scale per row)."""
+        """q_fp8's operands from bf16 q, plus the per-head scale."""
         cfg = self.cfg
-        if cfg.KG == 1:
-            ql: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [cfg.NW, 1], [1, 0])
+        if cfg.WHOLE_ROWS:
+            ql: gl.constexpr = gl.BlockedLayout(
+                [1, 8], [4, 16], [cfg.NUM_WARPS, 1], [1, 0]
+            )
             q0 = self.load_q(0, 128, ql).to(gl.float32)
             q1 = self.load_q(128, 128, ql).to(gl.float32)
             q2 = self.load_q(256, 128, ql).to(gl.float32)
@@ -627,14 +647,16 @@ class _Program:
         else:
             q = self.load_q(0, D, cfg.WIDE_L).to(gl.float32)
             amax = gl.max(gl.abs(q), axis=1)
-        if cfg.ROPE > 0:
-            rl: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [cfg.NW, 1], [1, 0])
-            qr = self.load_q(D, cfg.ROPE, rl).to(gl.float32)
+        if cfg.ROPE_TAIL > 0:
+            rl: gl.constexpr = gl.BlockedLayout(
+                [1, 8], [8, 8], [cfg.NUM_WARPS, 1], [1, 0]
+            )
+            qr = self.load_q(D, cfg.ROPE_TAIL, rl).to(gl.float32)
             amax_r = gl.convert_layout(gl.max(gl.abs(qr), axis=1), amax.type.layout)
             amax = gl.maximum(amax, amax_r)
-        s = gl.maximum(amax, 1e-30) / 448.0
-        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK, 16)
-        if cfg.KG == 1:
+        s = gl.maximum(amax, 1e-30) / E4M3_MAX
+        q_op: gl.constexpr = gl.DotOperandLayout(0, cfg.QK_MFMA, 16)
+        if cfg.WHOLE_ROWS:
             q_dot = (
                 gl.convert_layout((q0 / s[:, None]).to(gl.float8e4nv), q_op),
                 gl.convert_layout((q1 / s[:, None]).to(gl.float8e4nv), q_op),
@@ -645,53 +667,50 @@ class _Program:
         else:
             q_dot = gl.convert_layout((q / s[:, None]).to(gl.float8e4nv), q_op)
             qr_dot = q_dot
-        if cfg.ROPE > 0:
+        if cfg.ROPE_TAIL > 0:
             sr = gl.convert_layout(s, gl.SliceLayout(1, rl))
             qr_dot = gl.convert_layout(
-                (qr / sr[:, None]).to(gl.float8e4nv), gl.DotOperandLayout(0, cfg.QR, 8)
+                (qr / sr[:, None]).to(gl.float8e4nv),
+                gl.DotOperandLayout(0, cfg.ROPE_MFMA, 8),
             )
         return (q_dot, qr_dot), gl.convert_layout(s, cfg.ROW_L)
 
     @gluon.jit
     def loop(self, q, kv_ptr, ix, start, n, t0, t1, c, init):
-        """Tiles t0 .. t1 of the n-key list ix (start: its position in the
-        concatenated list, for the masks). q: the (latent, RoPE) operands, or None
-        to load fp8 q ahead of the first gather. init: None or the (acc, m, l) to
-        continue from. Returns (acc, m, l), l as _tile keeps it."""
+        """Tiles t0 .. t1 of the n-key list ix, continuing from init = (acc, m, l)
+        if given. q = None loads fp8 q here, behind the first gather."""
         cfg = self.cfg
-        GM: gl.constexpr = cfg.GM
-        ROPE: gl.constexpr = cfg.ROPE
+        BLOCK_M: gl.constexpr = cfg.BLOCK_M
+        ROPE_TAIL: gl.constexpr = cfg.ROPE_TAIL
 
         # one allocation per slot, so the slots have static addresses
         kv0 = gl.allocate_shared_memory(gl.uint8, [BN, D], cfg.K_SH)
         kv1 = gl.allocate_shared_memory(gl.uint8, [BN, D], cfg.K_SH)
-        # made once here: made in _gather, the columns cost the SEG 2 kernel at 64
-        # heads a spill
-        cg = gl.arange(0, D, layout=gl.SliceLayout(0, cfg.GATHER))
-        if ROPE > 0:
-            kr0 = gl.allocate_shared_memory(gl.uint8, [BN, ROPE], cfg.KR_SH)
-            kr1 = gl.allocate_shared_memory(gl.uint8, [BN, ROPE], cfg.KR_SH)
-            cols = (cg, gl.arange(0, ROPE, layout=gl.SliceLayout(0, cfg.GATHER_R)))
+        # built once here; inside gather_tile they cost a spill at 64 heads
+        cg = gl.arange(0, D, layout=gl.SliceLayout(0, cfg.GATHER_L))
+        if ROPE_TAIL > 0:
+            rope0 = gl.allocate_shared_memory(gl.uint8, [BN, ROPE_TAIL], cfg.ROPE_SH)
+            rope1 = gl.allocate_shared_memory(gl.uint8, [BN, ROPE_TAIL], cfg.ROPE_SH)
+            cr = gl.arange(0, ROPE_TAIL, layout=gl.SliceLayout(0, cfg.GATHER_ROPE_L))
+            cols = (cg, cr)
         else:
-            kr0 = kv0
-            kr1 = kv1
+            rope0 = kv0
+            rope1 = kv1
             cols = (cg, cg)
-        p_smem = gl.allocate_shared_memory(gl.uint8, [GM, BN], cfg.P_SH)
-        a_smem = gl.allocate_shared_memory(
-            gl.float32, [GM], gl.SwizzledSharedLayout(1, 1, 1, [0])
+        p_smem = gl.allocate_shared_memory(gl.uint8, [BLOCK_M, BN], cfg.P_SH)
+        alpha_smem = gl.allocate_shared_memory(
+            gl.float32, [BLOCK_M], gl.SwizzledSharedLayout(1, 1, 1, [0])
         )
 
         if init is None:
-            m_i = gl.full([GM], float("-inf"), gl.float32, cfg.ROW_L)
-            if cfg.KG == 1:
-                l_i = gl.zeros([GM], gl.float32, cfg.ROW_L)
+            m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, cfg.ROW_L)
+            if cfg.WHOLE_ROWS:
+                l_i = gl.zeros([BLOCK_M], gl.float32, cfg.ROW_L)
             else:
-                l_i = gl.zeros([GM, BN], gl.float32, cfg.QK)
-            acc = gl.zeros([GM, D], gl.float32, cfg.PV)
+                l_i = gl.zeros([BLOCK_M, BN], gl.float32, cfg.QK_MFMA)
+            acc = gl.zeros([BLOCK_M, D], gl.float32, cfg.PV_MFMA)
         else:
-            acc = init[0]
-            m_i = init[1]
-            l_i = init[2]
+            acc, m_i, l_i = init
 
         # r: the row ids of the next tile to gather
         n_s = gl.minimum(n, t1 * BN)
@@ -699,9 +718,9 @@ class _Program:
         if q is None:
             # its latency hides behind the list bounds -> row ids -> gather chain
             q = self.q_fp8()
-        r = _rows(ix, kb, n_s, cfg.KEY_L)
-        _gather(cfg, kv0, kr0, kv_ptr, ix, r, cols)
-        r = _rows(ix, kb + BN, n_s, cfg.KEY_L)
+        r = load_row_ids(ix, kb, n_s, cfg.KEY_L)
+        gather_tile(cfg, kv0, rope0, kv_ptr, ix, r, cols)
+        r = load_row_ids(ix, kb + BN, n_s, cfg.KEY_L)
 
         # Unrolled over the two slots. An odd tile count runs one fully masked
         # tile, which reads nothing of the next split: its keys end at n_s.
@@ -710,66 +729,106 @@ class _Program:
             t = it * 2
             # tile t landed; the wait's barrier also retires the reads of the other slot
             gl.amd.cdna4.async_copy.wait_group(0)
-            _gather(cfg, kv1, kr1, kv_ptr, ix, r, cols)
-            r = _rows(ix, kb + (t + 2) * BN, n_s, cfg.KEY_L)
-            acc, m_i, l_i = _tile(
-                cfg, kv0, kr0, p_smem, a_smem, q, c, acc, m_i, l_i,
+            gather_tile(cfg, kv1, rope1, kv_ptr, ix, r, cols)
+            r = load_row_ids(ix, kb + (t + 2) * BN, n_s, cfg.KEY_L)
+            acc, m_i, l_i = attend_tile(
+                cfg, kv0, rope0, p_smem, alpha_smem, q, c, acc, m_i, l_i,
                 start + kb + t * BN, end_s,
             )  # fmt: skip
             gl.amd.cdna4.async_copy.wait_group(0)
-            _gather(cfg, kv0, kr0, kv_ptr, ix, r, cols)
-            r = _rows(ix, kb + (t + 3) * BN, n_s, cfg.KEY_L)
-            acc, m_i, l_i = _tile(
-                cfg, kv1, kr1, p_smem, a_smem, q, c, acc, m_i, l_i,
+            gather_tile(cfg, kv0, rope0, kv_ptr, ix, r, cols)
+            r = load_row_ids(ix, kb + (t + 3) * BN, n_s, cfg.KEY_L)
+            acc, m_i, l_i = attend_tile(
+                cfg, kv1, rope1, p_smem, alpha_smem, q, c, acc, m_i, l_i,
                 start + kb + (t + 1) * BN, end_s,
             )  # fmt: skip
         gl.amd.cdna4.async_copy.wait_group(0)
         return acc, m_i, l_i
 
     @gluon.jit
+    def loop_two_lists(
+        self, q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
+        main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr,
+        MAIN_BLOCK_LOG2: gl.constexpr, EXTRA_BLOCK_LOG2: gl.constexpr,
+    ):  # fmt: skip
+        """The SWA list from kv, then the top-k list from x_kv. A split's tile range
+        may cover either list or both. Returns (acc, m, l, acc's V scale)."""
+        row = self.row
+        main_start = gl.load(indptr_ptr + row)
+        n_main = gl.load(indptr_ptr + row + 1) - main_start
+        x_start = gl.load(x_indptr_ptr + row)
+        n_extra = gl.load(x_indptr_ptr + row + 1) - x_start
+        main = (idx_ptr + main_start, main_row0, main_stride, MAIN_BLOCK_LOG2)
+        extra = (x_idx_ptr + x_start, extra_row0, extra_stride, EXTRA_BLOCK_LOG2)
+        if x_ks_ptr is None:
+            x_scale = k_scale
+            c_extra = c
+        else:
+            x_scale = gl.load(x_ks_ptr)
+            c_extra = c * (x_scale / k_scale)
+        main_tiles = gl.cdiv(n_main, BN)
+        u0, u1 = self.tiles(main_tiles + gl.cdiv(n_extra, BN))
+        st = self.loop(
+            q, kv_ptr, (main, main, n_main), 0, n_main, gl.minimum(u0, main_tiles),
+            gl.minimum(u1, main_tiles), c, None,
+        )  # fmt: skip
+        if x_ks_ptr is not None:  # the first list's V in the second one's units
+            st = (st[0] * (k_scale / x_scale), st[1], st[2])
+        acc, m_i, l_i = self.loop(
+            q, x_kv_ptr, (extra, extra, 0), 0, n_extra,
+            gl.maximum(u0 - main_tiles, 0), gl.maximum(u1 - main_tiles, 0), c_extra,
+            st,
+        )  # fmt: skip
+        return acc, m_i, l_i, x_scale
+
+    @gluon.jit
+    def store_rows(self, x, base_ptr, row_stride):
+        """x as bf16 rows, BLOCK_H heads at base_ptr + head * row_stride."""
+        cfg = self.cfg
+        o = gl.convert_layout(x.to(gl.bfloat16), cfg.WIDE_L)
+        ho = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.WIDE_L))
+        co = gl.arange(0, D, layout=gl.SliceLayout(0, cfg.WIDE_L))
+        gl.amd.cdna4.buffer_store(
+            o, base_ptr, ho[:, None] * row_stride + co[None, :],
+            mask=(ho < cfg.BLOCK_H)[:, None],
+        )  # fmt: skip
+
+    @gluon.jit
     def store_partial(
         self, acc, m_i, l_i, v_scale, part_m_ptr, part_l_ptr, part_acc_ptr
     ):
-        """This split's (m, l, acc) for _sparse_mla_reduce: [C, P, H] f32 row max
-        (base 2) and row sum, [C, P, H, 512] bf16 unnormalized acc in V units, P
-        the launched split count. acc = None writes an empty split."""
+        """This split's base-2 row max, row sum and unnormalized acc for
+        _sparse_mla_reduce. acc = None writes an empty split."""
         cfg = self.cfg
         base = (self.row * gl.num_programs(2) + self.split).to(gl.int64)
         base = base * self.num_heads + self.h0
-        hs = gl.arange(0, cfg.GM, layout=m_i.type.layout)
-        gl.store(part_m_ptr + base + hs, m_i, mask=hs < cfg.G)
-        gl.store(part_l_ptr + base + hs, l_i * cfg.INV_PS, mask=hs < cfg.G)
+        hs = gl.arange(0, cfg.BLOCK_M, layout=m_i.type.layout)
+        gl.store(part_m_ptr + base + hs, m_i, mask=hs < cfg.BLOCK_H)
+        gl.store(part_l_ptr + base + hs, l_i * cfg.INV_P_SCALE, mask=hs < cfg.BLOCK_H)
         if acc is not None:
-            o = gl.convert_layout(
-                (acc * (v_scale * cfg.INV_PS)).to(gl.bfloat16), cfg.WIDE_L
-            )
-            ho = gl.arange(0, cfg.GM, layout=gl.SliceLayout(1, cfg.WIDE_L))
-            co = gl.arange(0, D, layout=gl.SliceLayout(0, cfg.WIDE_L))
-            gl.amd.cdna4.buffer_store(
-                o, part_acc_ptr + base * D, ho[:, None] * D + co[None, :],
-                mask=(ho < cfg.G)[:, None],
-            )  # fmt: skip
+            x = acc * (v_scale * cfg.INV_P_SCALE)
+            self.store_rows(x, part_acc_ptr + base * D, D)
 
     @gluon.jit
     def finish(
         self, acc, m_i, l_i, v_scale, sink_ptr, lse_ptr, out_ptr, out_stride0,
         out_stride1, epi,
     ):  # fmt: skip
-        """Normalize (the sink is one more term in the denominator), store the
-        rows and, with lse_ptr, the natural-log LSE. An empty row comes out 0.
-        epi = (positions, cos_sin, its stride, E8M0 scales, their row stride)."""
+        """Normalize (the sink adds to the denominator) and store the rows, and the
+        natural-log LSE if asked. An empty row comes out 0."""
         cfg = self.cfg
-        G: gl.constexpr = cfg.G
-        INV_ROPE: gl.constexpr = epi[0] is not None
-        OUT_MXFP8: gl.constexpr = epi[3] is not None
+        BLOCK_H: gl.constexpr = cfg.BLOCK_H
+        pos_ptr, cs_ptr, cs_stride, osc_ptr, osc_stride = epi
+        INV_ROPE: gl.constexpr = pos_ptr is not None
+        OUT_MXFP8: gl.constexpr = osc_ptr is not None
         row = self.row
         h0 = self.h0
-        hs = gl.arange(0, cfg.GM, layout=m_i.type.layout)
-        hm = hs < G
+        hs = gl.arange(0, cfg.BLOCK_M, layout=m_i.type.layout)
+        hm = hs < BLOCK_H
         if sink_ptr is not None:
             sink = gl.load(sink_ptr + h0 + hs, mask=hm, other=0.0) * LOG2E
-            # an empty row gets l = inf here, so 0
-            r = v_scale / (l_i + gl.exp2(sink - m_i + cfg.LOG2_PS))
+            # an empty row gets l = inf here, so 0 (assumes a finite sink)
+            r = v_scale / (l_i + gl.exp2(sink - m_i + cfg.P_SCALE_LOG2))
         else:
             r = gl.where(l_i > 0.0, v_scale / l_i, 0.0)
         if lse_ptr is not None:
@@ -778,58 +837,53 @@ class _Program:
             if sink_ptr is not None:
                 m_f = gl.maximum(m_i, sink)
             l_t = gl.where(
-                m_i > float("-inf"), l_i * gl.exp2(m_i - m_f - cfg.LOG2_PS), 0.0
+                m_i > float("-inf"), l_i * gl.exp2(m_i - m_f - cfg.P_SCALE_LOG2), 0.0
             )
             if sink_ptr is not None:
                 l_t = l_t + gl.exp2(sink - m_f)
             gl.store(
                 lse_ptr + row.to(gl.int64) * self.num_heads + h0 + hs,
-                (m_f + gl.log2(l_t)) * 0.6931471805599453,
+                (m_f + gl.log2(l_t)) * LN2,
                 mask=hm,
             )
         x = acc * gl.convert_layout(r, gl.SliceLayout(1, acc.type.layout))[:, None]
         if INV_ROPE or OUT_MXFP8:
-            # rows G .. GM are padding, so the head bound is h0 + G
+            # 32 dims per lane = one MXFP8 scale block
             epi_l: gl.constexpr = gl.BlockedLayout(
-                [1, 32], [16, 4], [cfg.NW // 4, 4], [1, 0]
+                [1, 32], [16, 4], [cfg.NUM_WARPS // 4, 4], [1, 0]
             )
             _epilogue_store(
-                x, out_ptr, out_stride0, out_stride1, row, h0, h0 + G, epi_l, epi[0],
-                epi[1], epi[2], epi[3], epi[4], 64, INV_ROPE, OUT_MXFP8,
+                x, out_ptr, out_stride0, out_stride1, row, h0, h0 + BLOCK_H, epi_l,
+                pos_ptr, cs_ptr, cs_stride, osc_ptr, osc_stride, INV_ROPE_DIM,
+                INV_ROPE, OUT_MXFP8,
             )  # fmt: skip
         else:
-            o = gl.convert_layout(x.to(gl.bfloat16), cfg.WIDE_L)
-            ho = gl.arange(0, cfg.GM, layout=gl.SliceLayout(1, cfg.WIDE_L))
-            co = gl.arange(0, D, layout=gl.SliceLayout(0, cfg.WIDE_L))
-            gl.amd.cdna4.buffer_store(
-                o,
-                out_ptr + row.to(gl.int64) * out_stride0 + h0 * out_stride1,
-                ho[:, None] * out_stride1 + co[None, :],
-                mask=(ho < G)[:, None],
-            )
+            base = out_ptr + row.to(gl.int64) * out_stride0 + h0 * out_stride1
+            self.store_rows(x, base, out_stride1)
 
 
 @gluon.jit(do_not_specialize=["num_queries", "num_splits"])
 def _sparse_mla_fp8(
-    q_ptr,  # [C, H, 512 + ROPE] fp8 (u8 view) or bf16
-    kv_ptr,  # u8 base of the cache(s): rows of 512 + ROPE bytes
+    q_ptr,  # [C, H, 512 + ROPE_TAIL] fp8 (u8 view) or bf16
+    kv_ptr,  # u8 base of the cache(s): rows of 512 + ROPE_TAIL bytes
     out_ptr,  # [C, H, 512] bf16 or MXFP8 e4m3 data; None when split
     indptr_ptr,  # [C + 1] int32, the main list
-    idx_ptr,  # int32 row ids (SEG 0) or slot ids (SEG 1 / 2)
+    idx_ptr,  # int32 row ids (SEG_FLAT) or slot ids
     sink_ptr,  # [H] f32 or None
     q_scale_ptr,  # [1] f32 for fp8 q, None for bf16 q
     ks_ptr,  # [1] f32 cache scale
     lse_ptr,  # [C, H] f32 or None; None when split
-    part_m_ptr,  # split partials (_Program.store_partial); None unless split
+    part_m_ptr,  # split partials (Program.store_partial); None unless split
     part_l_ptr,
     part_acc_ptr,
-    # SEG 1 / 2: the extra list and the paged maps; SEG 2: the extra cache, scale
+    # paged lists: the extra list, both lists' slot -> row maps (row0, stride);
+    # SEG_TWO_LOOPS adds the extra cache and its scale (None: kv's scale)
     x_indptr_ptr,
     x_idx_ptr,
-    mo,
-    mstr,
-    xo,
-    xstr,
+    main_row0,
+    main_stride,
+    extra_row0,
+    extra_stride,
     x_kv_ptr,
     x_ks_ptr,
     # output epilogue: positions and cos_sin (+ stride) for the inverse RoPE,
@@ -847,27 +901,27 @@ def _sparse_mla_fp8(
     q_stride1,
     out_stride0,
     out_stride1,
-    G: gl.constexpr,
-    ROPE: gl.constexpr,
-    LAZY: gl.constexpr,
-    BIG: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    ROPE_TAIL: gl.constexpr,
+    LAZY_LOG2: gl.constexpr,
+    ADDR64: gl.constexpr,
     SEG: gl.constexpr,
-    MB_SH: gl.constexpr,
-    XB_SH: gl.constexpr,
-    XH: gl.constexpr,
+    MAIN_BLOCK_LOG2: gl.constexpr,
+    EXTRA_BLOCK_LOG2: gl.constexpr,
+    HEAD_BLOCKS: gl.constexpr,
 ):
-    cfg = _Config(G, gl.num_warps(), ROPE, LAZY, BIG)
+    cfg = Config(BLOCK_H, gl.num_warps(), ROPE_TAIL, LAZY_LOG2, ADDR64)
     SPLIT: gl.constexpr = part_m_ptr is not None
     Q_BF16: gl.constexpr = q_scale_ptr is None
-    pgm = _Program.initialize(
-        cfg, XH, q_ptr, q_stride0, q_stride1, num_heads, num_splits
+    pgm = Program.initialize(
+        cfg, HEAD_BLOCKS, q_ptr, q_stride0, q_stride1, num_heads, num_splits
     )
-    if XH > 1:
+    if HEAD_BLOCKS > 1:
         if pgm.row >= num_queries:
             return
     if SPLIT:
         if pgm.split >= num_splits:  # padding of the launched split count
-            m0 = gl.full([cfg.GM], float("-inf"), gl.float32, cfg.ROW_L)
+            m0 = gl.full([cfg.BLOCK_M], float("-inf"), gl.float32, cfg.ROW_L)
             pgm.store_partial(
                 None, m0, gl.zeros_like(m0), 0.0, part_m_ptr, part_l_ptr, part_acc_ptr
             )
@@ -880,51 +934,31 @@ def _sparse_mla_fp8(
         q, q_s = pgm.q_bf16()
         c = q_s * (k_scale * sm_scale_log2)
     else:
-        q = None  # loaded by the loop, ahead of its first gather
-        c = gl.zeros([cfg.GM], gl.float32, cfg.ROW_L) + (
+        q = None  # loaded by the loop
+        c = gl.zeros([cfg.BLOCK_M], gl.float32, cfg.ROW_L) + (
             gl.load(q_scale_ptr) * k_scale * sm_scale_log2
         )
 
-    if SEG == 2:
-        # The SWA window from kv, then the top-k from x_kv. A split takes a range of
-        # the concatenated tiles, so it may cover part of either list or both.
+    if SEG == SEG_TWO_LOOPS:
         if not Q_BF16:
+            # once, for both loops
             q = pgm.q_fp8()
-        row = pgm.row
-        ms = gl.load(indptr_ptr + row)
-        na = gl.load(indptr_ptr + row + 1) - ms
-        es = gl.load(x_indptr_ptr + row)
-        nb = gl.load(x_indptr_ptr + row + 1) - es
-        main = (idx_ptr + ms, mo, mstr, MB_SH)
-        extra = (x_idx_ptr + es, xo, xstr, XB_SH)
-        if x_ks_ptr is None:
-            v_scale = k_scale
-            c_b = c
-        else:
-            v_scale = gl.load(x_ks_ptr)
-            c_b = c * (v_scale / k_scale)
-        nta = gl.cdiv(na, BN)
-        u0, u1 = pgm.tiles(nta + gl.cdiv(nb, BN))
-        st = pgm.loop(
-            q, kv_ptr, (main, main, na), 0, na, gl.minimum(u0, nta),
-            gl.minimum(u1, nta), c, None,
-        )  # fmt: skip
-        if x_ks_ptr is not None:  # the first list's V in the second one's units
-            st = (st[0] * (k_scale / v_scale), st[1], st[2])
-        acc, m_i, l_i = pgm.loop(
-            q, x_kv_ptr, (extra, extra, 0), 0, nb, gl.maximum(u0 - nta, 0),
-            gl.maximum(u1 - nta, 0), c_b, st,
+        acc, m_i, l_i, v_scale = pgm.loop_two_lists(
+            q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
+            main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr,
+            MAIN_BLOCK_LOG2, EXTRA_BLOCK_LOG2,
         )  # fmt: skip
     else:
-        start, end, ix = _key_lists(
-            indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr, pgm.row, mo, mstr, xo, xstr,
-            SEG, MB_SH, XB_SH,
+        start, end, ix = one_loop_list(
+            indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr, pgm.row, main_row0,
+            main_stride, extra_row0, extra_stride, SEG, MAIN_BLOCK_LOG2,
+            EXTRA_BLOCK_LOG2,
         )  # fmt: skip
         t0, t1 = pgm.tiles(gl.cdiv(end - start, BN))
         acc, m_i, l_i = pgm.loop(q, kv_ptr, ix, start, end - start, t0, t1, c, None)
         v_scale = k_scale
-    if cfg.KG > 1:
-        l_i = gl.sum(l_i, axis=1)
+    if not cfg.WHOLE_ROWS:
+        l_i = gl.sum(l_i, axis=1)  # the deferred row sum
 
     if SPLIT:
         pgm.store_partial(acc, m_i, l_i, v_scale, part_m_ptr, part_l_ptr, part_acc_ptr)
