@@ -532,17 +532,16 @@ def verify_auto_routed_head_dims(num_heads):
             tag = _auto_variant(s_q, s_k, nh, hd)
             if not _variant_supports(tag, nh, hd):
                 raise AssertionError(f"routed to {tag}, which cannot run at hd={hd}")
-            if (s_q, s_k) == tuple(_PRODUCTION_CASE.values()):
-                verify_fp8_mqa_logits(
-                    s_q,
-                    s_k,
-                    nh,
-                    hd,
-                    _DEFAULT_Q_DTYPES[0],
-                    _DEFAULT_KV_DTYPES[0],
-                    True,
-                    "causal",
-                )
+            verify_fp8_mqa_logits(
+                s_q,
+                s_k,
+                nh,
+                hd,
+                _DEFAULT_Q_DTYPES[0],
+                _DEFAULT_KV_DTYPES[0],
+                True,
+                "causal",
+            )
             status = "ok"
         except Exception as exc:  # noqa: BLE001 - record, keep sweeping
             aiter.logger.error("FAILED auto_routed_head_dim case: %s: %s", label, exc)

@@ -330,7 +330,7 @@ def _variant_supports(tag, num_heads, head_size):
     return (
         num_heads % _VARIANT_MFMA_M[tag] == 0
         and head_size % _VARIANT_MFMA_K[tag] == 0
-        and _variant_lds_bytes(tag, head_size) <= get_lds_capacity_bytes()
+        and _variant_lds_bytes(tag, head_size) <= get_lds_capacity_bytes(_ARCH)
     )
 
 
@@ -424,8 +424,8 @@ class _Route:
 
 # Tuned gfx950 routes, (num_heads, head_size) class -> routes by seq_len,
 # shortest first, then by seq_len_kv within one seq_len bound, the last of each
-# unbounded. A route is tuned at the class's own (num_heads, head_size): other sizes that
-# map to the class run untuned and may spill.
+# unbounded. A route is tuned at the class's own (num_heads, head_size): other
+# sizes that map to the class run untuned and may spill.
 _GFX950_LARGE_HEAD_FALLBACK = "mfma32x32x64_bkv64_r1_w4_lds2_rs_hfma_wpe4"
 _GFX950_ROUTES = {
     (32, 64): (
@@ -504,7 +504,10 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
         ``seq_len_kv`` wins. Routed tags use the
         32x32x64 atom (K=64), except in the 128 head_size class, where a
         16x16x128 atom (K=128) is also allowed: head sizes are powers of two,
-        so every head_size >= 128 is a multiple of 128.
+        so every head_size >= 128 is a multiple of 128. Routes are tuned at
+        head_size 64 and 128; a route whose LDS slots do not fit the device
+        at a larger head_size (``_variant_lds_bytes``) is skipped, and
+        ``_GFX950_LARGE_HEAD_FALLBACK`` is used if none fits.
     """
     if _ARCH == "gfx942":
         rpb2_min_elems = 2**19
@@ -522,15 +525,16 @@ def _auto_variant(seq_len, seq_len_kv, num_heads, head_size=128):
         h = 32 if num_heads <= 32 else (128 if num_heads >= 128 else 64)
         routes = _GFX950_ROUTES[(h, 128 if head_size >= 128 else 64)]
         # Routes are tuned at D=64/128; a larger head size may overflow a
-        # route's LDS slots (causgin build-time error), so the first
-        # admitted route that fits is selected.
+        # route's LDS slots (a build-time error), so the first admitted route
+        # whose slots fit is selected, else the fixed fallback.
         return next(
             (
                 r.tag
                 for r in routes
                 if (r.max_seq_len is None or seq_len <= r.max_seq_len)
                 and (r.max_seq_len_kv is None or seq_len_kv <= r.max_seq_len_kv)
-                and _variant_lds_bytes(r.tag, head_size) <= get_lds_capacity_bytes()
+                and _variant_lds_bytes(r.tag, head_size)
+                <= get_lds_capacity_bytes(_ARCH)
             ),
             _GFX950_LARGE_HEAD_FALLBACK,
         )
@@ -597,9 +601,7 @@ def _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size=128):
     return tag
 
 
-def _policy_num_splits(
-    launcher, args, variant, seq_len, seq_len_kv, num_heads, device_index
-):
+def _policy_num_splits(launcher, args, variant, seq_len, seq_len_kv, device_index):
     """The split policy's ``num_splits`` for ``launcher``, built from
     ``variant``; ``args`` are its launch arguments (for occupancy)."""
     bkv, rows_per_block = _parse_variant(variant)
@@ -786,7 +788,6 @@ def flydsl_fp8_mqa_logits(
                 variant,
                 seq_len,
                 seq_len_kv,
-                num_heads,
                 Q.device.index,
             )
         _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
