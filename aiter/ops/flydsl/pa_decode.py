@@ -277,6 +277,8 @@ def pa_decode(
     max_partitions is bounded by device CUs. Match sliding_window and, for
     windowed plans, query_length. Scratch is [KV heads, capacity, query rows
     (, D)], with query rows = query_length * query_group_size.
+    One-partition direct output does not allocate partial scratch; supplied
+    scratch tensors are still validated against the same contract.
 
     ``max_context_length`` selects the scheduling bound, rounded up to
     whole pages as in tuning. This keeps the selected specialization independent
@@ -747,50 +749,37 @@ def pa_decode(
 
     total_rows = query_length * query_group_size
     expected_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
-    if pmax is None:
+    if pmax is None and not one_partition_output:
         pmax = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
-    if psum is None:
+    if psum is None and not one_partition_output:
         psum = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
-    if pout is None:
+    if pout is None and not one_partition_output:
         pout = torch.empty(
             *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
         )
-    for name, tensor in (
-        ("max_logits", pmax),
-        ("exp_sums", psum),
-        ("temporary_output", pout),
+    expected_output_shape = (*expected_scalar_shape, head_dim)
+    for name, tensor, expected_shape, expected_dtype in (
+        ("max_logits", pmax, expected_scalar_shape, torch.float32),
+        ("exp_sums", psum, expected_scalar_shape, torch.float32),
+        ("temporary_output", pout, expected_output_shape, output.dtype),
     ):
+        # Missing scratch is unused only by one-partition direct output. Keep
+        # validating supplied tensors even when that specialization ignores them.
+        if tensor is None:
+            continue
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(
                 f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
             )
-    if pmax.shape != expected_scalar_shape:
-        raise ValueError(
-            f"max_logits shape {tuple(pmax.shape)} != {expected_scalar_shape}"
-        )
-    if psum.shape != expected_scalar_shape:
-        raise ValueError(
-            f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
-        )
-    expected_output_shape = (*expected_scalar_shape, head_dim)
-    if pout.shape != expected_output_shape:
-        raise ValueError(
-            f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
-        )
-    if pmax.dtype != torch.float32:
-        raise TypeError(f"max_logits must be float32, got {pmax.dtype}")
-    if psum.dtype != torch.float32:
-        raise TypeError(f"exp_sums must be float32, got {psum.dtype}")
-    if pout.dtype != output.dtype:
-        raise TypeError(
-            f"temporary_output dtype {pout.dtype} must match output dtype "
-            f"{output.dtype}"
-        )
-    for name, tensor in (
-        ("max_logits", pmax),
-        ("exp_sums", psum),
-        ("temporary_output", pout),
-    ):
+        if tensor.shape != expected_shape:
+            raise ValueError(f"{name} shape {tuple(tensor.shape)} != {expected_shape}")
+        if tensor.dtype != expected_dtype:
+            if name == "temporary_output":
+                raise TypeError(
+                    f"temporary_output dtype {tensor.dtype} must match output dtype "
+                    f"{output.dtype}"
+                )
+            raise TypeError(f"{name} must be float32, got {tensor.dtype}")
         if tensor.device != dev:
             raise ValueError(
                 f"{name} must be on the same device as query ({dev}), "
@@ -819,10 +808,14 @@ def pa_decode(
                 if one_partition_output
                 else ptr_arg(pmax, fx.Float32)
             ),
-            ptr_arg(psum, fx.Float32),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if one_partition_output
+                else ptr_arg(psum, fx.Float32)
+            ),
             ptr_arg(
                 output if one_partition_output else pout,
-                _flydsl_pointer_dtype(pout.dtype),
+                _flydsl_pointer_dtype(output.dtype),
             ),
             ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),

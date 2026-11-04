@@ -10,6 +10,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 
 DEFAULT_MAX_BATCH_SIZE = 4096
@@ -157,8 +159,9 @@ class PADecodePlan:
     ``arrival_counters`` is [batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE]
     int32 and zero between decodes: gfx1250 decodes that merge partitions in
     the tile kernel count finished tasks in slot 0 and the last one resets it,
-    so decodes running concurrently must not share a plan. ``None`` keeps the
-    shared reducer.
+    so decodes running concurrently must not share a plan. It is allocated
+    only for gfx1250 plans with capacity equal to batch and more than one
+    partition; other plans use one-partition output, clusters or the reducer.
     """
 
     work_info: torch.Tensor
@@ -290,11 +293,18 @@ def plan_pa_decode(
             sliding_window,
             query_length,
             max_batch_size,
-            # Zeroed once here: every decode that counts arrivals resets them.
-            torch.zeros(
-                (batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE),
-                dtype=torch.int32,
-                device=dev,
+            # Only last-arriver merges use counters. Zeroed once here; every
+            # decode that counts arrivals resets them before returning.
+            (
+                torch.zeros(
+                    (batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE),
+                    dtype=torch.int32,
+                    device=dev,
+                )
+                if get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+                and capacity == batch
+                and max_partitions > 1
+                else None
             ),
         )
     else:
