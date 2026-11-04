@@ -1067,14 +1067,14 @@ def test_pa_decode_one_partition_workspace(
         dim**-0.5,
         length,
     )
-    options = dict(
-        work_plan=plan,
-        compute_type=key.dtype,
-        key_scale=key_scale,
-        value_scale=value_scale,
-        sinks=sinks,
-        max_context_length=1027,
-    )
+    options = {
+        "work_plan": plan,
+        "compute_type": key.dtype,
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "sinks": sinks,
+        "max_context_length": 1027,
+    }
 
     def launch(**workspace):
         pa.pa_decode(*arguments, **options, **workspace)
