@@ -26,7 +26,16 @@ of freedom) and all zeros:
   one rank delayed (``torch.cuda._sleep``, a private torch API), each
   reproduce the isolated output of their own input bit for bit;
 * tensors the engine must refuse are refused: wrong size ratio, a partial
-  tile, overlapping and misaligned buffers.
+  tile, overlapping and misaligned buffers; so are engines the modes cannot run
+  on (the ring, a fine-grained inbox);
+* after ``compile_sp`` (which launches nothing and leaves its tensors alone)
+  both modes capture into one CUDA graph, and every replay with new inputs
+  equals an eager run of the same inputs bit for bit; capturing on an engine
+  that has not loaded its builds is refused;
+* all-reduce, reduce-scatter and all-gather alternate on one engine in every
+  ordered pair, with each rank slowed in turn, and every output equals the
+  isolated result of its call bit for bit: once on a one-rung ST=1 engine at a
+  small grid cap (several tiles per block), once on the shipping ladder.
 
 ``rows * hidden * 2`` must be a whole number of 32 KiB tiles and ``rows`` a
 multiple of the world size; the default hidden 2560 needs rows % 32 == 0.
@@ -41,6 +50,8 @@ import itertools
 import os
 import re
 import sys
+from contextlib import ExitStack, closing
+from functools import partial
 from multiprocessing import Pool, freeze_support, set_start_method
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -104,6 +115,26 @@ _VALIDITY_SHAPES = {
     4: [(1024, 2560), (4928, 2560)],
     8: [(1024, 2560), (4928, 2560)],
 }
+# Graph test: rows of the full tensor (160 tiles at hidden 2560, a whole number
+# of tiles and of ranks at every TP) and replays, each with new inputs.
+_GRAPH_ROWS = 1024
+_GRAPH_REPLAYS = 4
+# Interleave test. The ordered-transition cycle repeats this often. The pinned
+# engine runs at this grid cap, so a block runs several tiles of the
+# single-phase size; the shipping ladder runs the larger one, which is above the
+# TP2 and TP8 caps.
+_INTERLEAVE_ROUNDS = 3
+_PINNED_CAP = 64
+_INTERLEAVE_SP_ROWS = {"pinned": 1024, "shipped": 4096}
+# All-reduce sizes tried for each engine, largest first: one is kept for every
+# binary the engine picks (at TP8 the shipping ladder has an ST=8 rung and, for
+# payloads under eight tiles, the ST=1 engine that the single-phase modes share).
+_AR_ROW_CANDIDATES = (16384, 1024, 32)
+# fp32 matmuls the slowed rank runs on a side stream: real work that competes
+# with its kernels for the CUs, like the drag of the all-reduce test's run-ahead.
+_DRAG_STEPS = 200
+_OPS = ("ar", "rs", "ag")
+_OP_METHODS = {"ar": "allreduce", "rs": "reduce_scatter", "ag": "all_gather"}
 
 
 def _make_inp(
@@ -322,6 +353,245 @@ def _measure(
     return row
 
 
+def _chain_text(exc: BaseException) -> str:
+    """The messages of *exc* and of what it was raised from or during."""
+    texts = []
+    while exc is not None:
+        texts.append(str(exc))
+        exc = exc.__cause__ or exc.__context__
+    return " | ".join(texts)
+
+
+def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
+    """``compile_sp``, then both modes captured into one CUDA graph and replayed.
+
+    Every replay gets new inputs written in place and must reproduce an eager
+    run of the same inputs bit for bit and stay within NMSE_MAX of a fresh fp32
+    reference: a graph that baked in the capture-time data, or a launch that was
+    captured wrongly, fails one of the two. No eager launch precedes the
+    capture, so it also shows that ``compile_sp`` alone keeps the JIT and the
+    module load out of it.
+    """
+    import torch.distributed as dist
+
+    rows, hidden = _GRAPH_ROWS, _REFUSE_HIDDEN
+    shard_rows = rows // tp
+    x = torch.zeros((rows, hidden), dtype=torch.bfloat16, device=device)
+    s = torch.zeros((shard_rows, hidden), dtype=torch.bfloat16, device=device)
+    rs_out, ag_out = torch.empty_like(s), torch.empty_like(x)
+    # compile_sp launches nothing and leaves its tensors alone
+    full, shard = torch.full_like(x, _SENTINEL), torch.full_like(s, _SENTINEL)
+    fly.compile_sp(full, shard)
+    torch.cuda.synchronize()
+    res = {
+        "capture_error": None,
+        "compile_sp_untouched": bool(
+            (full == _SENTINEL).all() and (shard == _SENTINEL).all()
+        ),
+        "replay_mismatches": 0,
+        "replay_nmse": 0.0,
+    }
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            fly.reduce_scatter(x, rs_out)
+            fly.all_gather(s, ag_out)
+    except Exception as exc:  # noqa: BLE001 -- reported, and ends the test
+        res["capture_error"] = f"{type(exc).__name__}: {exc}"
+    errors = [None] * tp
+    dist.all_gather_object(errors, res["capture_error"], group=gloo)
+    # A rank that replays alone hangs on its peers' kernels.
+    if any(errors):
+        return res
+    for k in range(_GRAPH_REPLAYS):
+        x.copy_(
+            _make_inp(
+                rows, hidden, rank=rank, salt=10 + k, fill="normal", device=device
+            )
+        )
+        s.copy_(
+            _make_inp(
+                shard_rows, hidden, rank=rank, salt=20 + k, fill="normal", device=device
+            )
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        rs_eager, ag_eager = torch.empty_like(rs_out), torch.empty_like(ag_out)
+        fly.reduce_scatter(x, rs_eager)
+        fly.all_gather(s, ag_eager)
+        torch.cuda.synchronize()
+        res["replay_mismatches"] += int(
+            not torch.equal(_bits(rs_out), _bits(rs_eager))
+        ) + int(not torch.equal(_bits(ag_out), _bits(ag_eager)))
+        ref = x.float().clone()
+        dist.all_reduce(ref)
+        ref_ag = torch.cat([p.float() for p in _gather(s, tp)])
+        res["replay_nmse"] = max(
+            res["replay_nmse"],
+            _nmse(rs_out.float(), ref[rank * shard_rows : (rank + 1) * shard_rows]),
+            _nmse(ag_out.float(), ref_ag),
+        )
+    return res
+
+
+def _cold_capture_refused(fly, tp: int, device) -> bool:
+    """A capture of a single-phase mode on an engine that has not loaded its
+    builds (no ``compile_sp``, no eager launch) is refused with a message that
+    names ``compile_sp``: loading cannot run under capture."""
+    full = torch.zeros(
+        (_GRAPH_ROWS, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device
+    )
+    shard = torch.empty(
+        (_GRAPH_ROWS // tp, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device
+    )
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
+            fly.reduce_scatter(full, shard)
+    except Exception as exc:  # noqa: BLE001 -- the text of the refusal is checked
+        return "compile_sp" in _chain_text(exc)
+    return False
+
+
+def _op_rows(op: str, rows: int, tp: int) -> tuple[int, int]:
+    """(input rows, output rows) of *op* on a *rows*-row full tensor."""
+    return {"ar": (rows, rows), "rs": (rows, rows // tp), "ag": (rows // tp, rows)}[op]
+
+
+def _ar_rows(fly) -> list[int]:
+    """The all-reduce row counts that run each distinct binary *fly* would pick."""
+    seen, rows_for = set(), []
+    for rows in _AR_ROW_CANDIDATES:
+        symbol = fly.variant(rows * _REFUSE_HIDDEN * 2).split("/")[0]
+        if symbol not in seen:
+            seen.add(symbol)
+            rows_for.append(rows)
+    return rows_for
+
+
+def _interleave_ops(ar_rows: list[int], sp_rows: int) -> list[tuple[str, int]]:
+    """``(op, full-tensor rows)`` calls: for every all-reduce size a cycle through
+    all six ordered transitions between the three ops, repeated."""
+    ops = [
+        step
+        for rows in ar_rows
+        for step in (
+            ("ar", rows),
+            ("rs", sp_rows),
+            ("ag", sp_rows),
+            ("ar", rows),
+            ("ag", sp_rows),
+            ("rs", sp_rows),
+        )
+    ] * _INTERLEAVE_ROUNDS
+    pairs = {(a, b) for (a, _), (b, _) in itertools.pairwise(ops)}
+    assert pairs == {(a, b) for a in _OPS for b in _OPS if a != b}, pairs
+    return ops
+
+
+def _interleave(fly, rank: int, tp: int, device, sp_rows: int) -> dict:
+    """Back-to-back all-reduce / reduce-scatter / all-gather calls with no sync
+    between them, each with its own input, one rank slowed in turn; every output
+    must equal the isolated result of its call bit for bit.
+
+    The three modes share the engine's inbox and colors, so a launch that starts
+    on its neighbour's leftovers (a slow reader, a flag of the other mode) reads
+    the payload of the wrong call and differs. The slowed rank runs fp32 matmuls
+    on a side stream.
+    """
+    import torch.distributed as dist
+
+    ops = _interleave_ops(_ar_rows(fly), sp_rows)
+    ins, isolated = [], []
+    for i, (op, rows) in enumerate(ops):
+        n_in, n_out = _op_rows(op, rows, tp)
+        ins.append(
+            _make_inp(
+                n_in,
+                _REFUSE_HIDDEN,
+                rank=rank,
+                salt=100 + i,
+                fill="normal",
+                device=device,
+            )
+        )
+        out = torch.empty((n_out, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+        dist.barrier()
+        getattr(fly, _OP_METHODS[op])(ins[-1], out)
+        torch.cuda.synchronize()
+        isolated.append(out)
+    mismatches = 0
+    for slow in range(tp):
+        outs = [torch.empty_like(o) for o in isolated]
+        dist.barrier()
+        if rank == slow:
+            with torch.cuda.stream(torch.cuda.Stream()):
+                drag = torch.randn(2048, 2048, device=device)
+                for _ in range(_DRAG_STEPS):
+                    drag = drag @ drag.T * 1e-6
+        for (op, _), inp, out in zip(ops, ins, outs):
+            getattr(fly, _OP_METHODS[op])(inp, out)
+        torch.cuda.synchronize()
+        mismatches += sum(
+            not torch.equal(_bits(o), _bits(iso)) for o, iso in zip(outs, isolated)
+        )
+    return {"launches": len(ops) * tp, "mismatches": mismatches}
+
+
+def _check_unsupported_engines(rank: int, tp: int, device, gloo) -> None:
+    """Engines the single-phase modes cannot run on refuse them before any
+    launch: the ring, and a fine-grained inbox (validated on the uncached one)."""
+    from aiter.ops.flydsl import QuickAllReduceInt4
+
+    full = torch.zeros((32 * tp, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+    shard = torch.zeros((32, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+    # The ring has no default ladder on xGMI.
+    ring_rung = TwoShotRung(
+        min_bytes=0, super_tile=8, grid_cap=_PINNED_CAP, block=BLOCK
+    )
+    for label, pattern, kw in (
+        (
+            "fine-grained inbox",
+            "uncached inbox",
+            {"inbox_memory": "finegrained", "ladder": _sp_ladder(_PINNED_CAP)},
+        ),
+        ("ring", "mesh algorithm", {"algorithm": "ring", "ladder": (ring_rung,)}),
+    ):
+        with closing(
+            QuickAllReduceInt4(
+                group=gloo, device=device, rank=rank, world_size=tp, **kw
+            )
+        ) as fly:
+            for name, call in (
+                ("reduce_scatter", partial(fly.reduce_scatter, full, shard)),
+                ("all_gather", partial(fly.all_gather, shard, full)),
+                ("compile_sp", partial(fly.compile_sp, full, shard)),
+            ):
+                _expect_refused(call, pattern, f"{label}: {name}")
+
+
+def _init_rank(rank: int, tp: int, init_method: str):
+    """Set up this rank's device and process groups; (device, gloo group)."""
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group;
+    # NCCL stays for the fp32 references.
+    return device, dist.new_group(backend="gloo")
+
+
+def _sp_ladder(grid_cap: int):
+    """The single-phase kernels are super_tile=1 only."""
+    return (TwoShotRung(min_bytes=0, super_tile=1, grid_cap=grid_cap, block=BLOCK),)
+
+
 def _run_rank(
     rank: int,
     tp: int,
@@ -336,27 +606,13 @@ def _run_rank(
 
     from aiter.ops.flydsl import QuickAllReduceInt4
 
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=init_method,
-        world_size=tp,
-        rank=rank,
-        device_id=device,
-    )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group;
-    # NCCL stays for the fp32 references.
-    gloo = dist.new_group(backend="gloo")
+    device, gloo = _init_rank(rank, tp, init_method)
     fly = QuickAllReduceInt4(
         group=gloo,
         device=device,
         rank=rank,
         world_size=tp,
-        # The single-phase kernels are super_tile=1 only.
-        ladder=(
-            TwoShotRung(min_bytes=0, super_tile=1, grid_cap=grid_cap, block=BLOCK),
-        ),
+        ladder=_sp_ladder(grid_cap),
     )
     rows = []
     try:
@@ -387,7 +643,66 @@ def _run_rank(
     return rows
 
 
-def _spawn(world_size, pairs, *, fills, time_it, grid_cap=DEFAULT_GRID_CAP):
+def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
+    """The graph, interleave and unsupported-engine checks of one rank."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import QuickAllReduceInt4
+
+    device, gloo = _init_rank(rank, tp, init_method)
+    res = {}
+    try:
+        with ExitStack() as stack:
+            # Pinned: the one ST=1 rung the single-phase modes need, at a small
+            # grid cap; the all-reduce runs on the same engine.
+            pinned = stack.enter_context(
+                closing(
+                    QuickAllReduceInt4(
+                        group=gloo,
+                        device=device,
+                        rank=rank,
+                        world_size=tp,
+                        ladder=_sp_ladder(_PINNED_CAP),
+                    )
+                )
+            )
+            res["graph"] = _graph_replay(pinned, rank, tp, device, gloo)
+            res["interleave_pinned"] = _interleave(
+                pinned, rank, tp, device, _INTERLEAVE_SP_ROWS["pinned"]
+            )
+            shipped = stack.enter_context(
+                closing(
+                    QuickAllReduceInt4(
+                        group=gloo, device=device, rank=rank, world_size=tp
+                    )
+                )
+            )
+            res["interleave_shipped"] = _interleave(
+                shipped, rank, tp, device, _INTERLEAVE_SP_ROWS["shipped"]
+            )
+            _check_unsupported_engines(rank, tp, device, gloo)
+            # Last, on an engine nothing has launched on: a refused capture must
+            # not leave the others in a state that fails their checks.
+            cold = stack.enter_context(
+                closing(
+                    QuickAllReduceInt4(
+                        group=gloo,
+                        device=device,
+                        rank=rank,
+                        world_size=tp,
+                        ladder=_sp_ladder(_PINNED_CAP),
+                    )
+                )
+            )
+            res["cold_capture_refused"] = _cold_capture_refused(cold, tp, device)
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+    return res
+
+
+def _run_pool(world_size, worker, **kwds):
+    """Run *worker* on every rank of a fresh spawn pool; its results by rank."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
@@ -399,16 +714,12 @@ def _spawn(world_size, pairs, *, fills, time_it, grid_cap=DEFAULT_GRID_CAP):
     try:
         results = [
             pool.apply_async(
-                _run_rank,
+                worker,
                 kwds={
                     "rank": rank,
                     "tp": world_size,
                     "init_method": init_method,
-                    "tokens": [t for t, _ in pairs],
-                    "hiddens": [h for _, h in pairs],
-                    "fills": fills,
-                    "grid_cap": grid_cap,
-                    "time_it": time_it,
+                    **kwds,
                 },
             )
             for rank in range(world_size)
@@ -422,6 +733,18 @@ def _spawn(world_size, pairs, *, fills, time_it, grid_cap=DEFAULT_GRID_CAP):
     finally:
         pool.join()
     return ranks
+
+
+def _spawn(world_size, pairs, *, fills, time_it, grid_cap=DEFAULT_GRID_CAP):
+    return _run_pool(
+        world_size,
+        _run_rank,
+        tokens=[t for t, _ in pairs],
+        hiddens=[h for _, h in pairs],
+        fills=fills,
+        grid_cap=grid_cap,
+        time_it=time_it,
+    )
 
 
 def _assert_validity(ranks, *, world_size, label) -> dict:
@@ -473,6 +796,36 @@ def _assert_validity(ranks, *, world_size, label) -> dict:
     if fails:
         raise AssertionError("; ".join(fails))
     return ranks[0][0]
+
+
+def _assert_extras(ranks, *, world_size) -> None:
+    fails = []
+    for rank, res in enumerate(ranks):
+        where = f"tp={world_size} rank {rank}"
+        graph = res["graph"]
+        if graph["capture_error"]:
+            fails.append(f"{where}: graph capture failed: {graph['capture_error']}")
+        else:
+            if graph["replay_mismatches"]:
+                fails.append(
+                    f"{where}: {graph['replay_mismatches']} graph replay outputs "
+                    "differ from an eager run of the same inputs"
+                )
+            # written so that a NaN fails
+            if not graph["replay_nmse"] <= NMSE_MAX:
+                fails.append(f"{where}: graph replay NMSE {graph['replay_nmse']:.3e}")
+        if not graph["compile_sp_untouched"]:
+            fails.append(f"{where}: compile_sp wrote to its tensors")
+        for name in ("interleave_pinned", "interleave_shipped"):
+            if res[name]["mismatches"]:
+                fails.append(
+                    f"{where}: {name}: {res[name]['mismatches']} of "
+                    f"{res[name]['launches']} outputs differ from their isolated result"
+                )
+        if not res["cold_capture_refused"]:
+            fails.append(f"{where}: capture without compile_sp was not refused")
+    if fails:
+        raise AssertionError("; ".join(fails))
 
 
 @benchmark()
@@ -547,6 +900,7 @@ def main():
                 world_size=tp,
                 label=f"validity cap={grid_cap}",
             )
+        _assert_extras(_run_pool(tp, _run_rank_extras), world_size=tp)
 
     df = []
     for tp, mnk in itertools.product(args.tp, args.mnk):
