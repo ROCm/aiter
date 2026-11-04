@@ -12,6 +12,7 @@ the packed API; the work table is built inside the sparse custom op.
 import csv
 import functools
 import os
+from collections.abc import Callable
 from enum import IntEnum
 from typing import NamedTuple, Optional, Union
 
@@ -22,24 +23,32 @@ from aiter.jit.core import AITER_ROOT_DIR, compile_ops
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     MHA_V4_LOG2E,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
+    quantize_mxfp4_k_hd256,
     quantize_mxfp4_q,
+    quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
+    quantize_mxfp6_k_hd256,
     quantize_mxfp6_q,
+    quantize_mxfp6_q_hd256,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
+    quantize_v_mxfp6_fp6_p_hd256,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
@@ -52,26 +61,34 @@ __all__ = (
     "AttentionScaleMode",
     "mha_v4",
     "mha_v4_kv_tile",
+    "mha_v4_mx_producers",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
     "mha_v4_sparse_work_table",
     "mxfp4_k_view",
     "mxfp4_v_view",
     "mxfp6_k_view",
+    "mxfp6_k_view_hd256",
     "native_fp8_format",
     "quantize_fp8",
     "quantize_fp8_rotated",
     "quantize_int8",
     "quantize_mxfp4_k",
+    "quantize_mxfp4_k_hd256",
     "quantize_mxfp4_q",
+    "quantize_mxfp4_q_hd256",
     "quantize_mxfp6_k",
+    "quantize_mxfp6_k_hd256",
     "quantize_mxfp6_q",
+    "quantize_mxfp6_q_hd256",
     "quantize_mxfp8_k",
     "quantize_mxfp8_q",
     "quantize_v_fp8",
     "quantize_v_mxfp4_fp6_p",
+    "quantize_v_mxfp4_fp6_p_hd256",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
+    "quantize_v_mxfp6_fp6_p_hd256",
     "rotate_activation_hd128",
     "rotate_activation_mxfp6_quant",
     "scale_modes_for_formats",
@@ -183,6 +200,80 @@ _PACKED_QK_WIDTH = {
     AttentionFormat.FP6_E2M3: 96,
     AttentionFormat.FP4_E2M1: 64,
 }
+_MHA_V4_BASE_HEAD_DIM = 128
+
+
+def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
+    """Packed last-dim size of a Q/K tensor. The table above is the hd128 row; every format's
+    width is linear in the head dim, so scaling it is exact rather than a second table.
+    """
+    return _PACKED_QK_WIDTH[q_format] * head_dim // _MHA_V4_BASE_HEAD_DIM
+
+
+# (Q/K format, V format) pairs with a head-dim 256 object. All are dense-only.
+_HD256_QV = frozenset(
+    {
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+    }
+)
+
+
+def _check_head_dim(
+    head_dim: int,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+    sparse: bool,
+    operation: str,
+) -> None:
+    if head_dim == _MHA_V4_BASE_HEAD_DIM:
+        return
+    if head_dim != MHA_V4_HD256:
+        raise ValueError(
+            f"{operation} supports head dimension 128 or 256, got {head_dim}"
+        )
+    if (q_format, v_format) not in _HD256_QV:
+        raise ValueError(
+            f"{operation} head dimension 256 is all-MXFP4 or all-MXFP6 only, got "
+            f"{q_format.name} Q/K with {v_format.name} V"
+        )
+    if sparse:
+        raise ValueError(f"{operation} head dimension 256 is dense-only")
+
+
+# hd256 runs the hd128 HIP producers on a [b, s, 2h, 128] view through separate custom ops; the
+# Hadamard is then block-diagonal over the two halves, still orthogonal, so Q.K^T holds.
+_MX_PRODUCERS = {
+    (AttentionFormat.MXFP4, 128): (
+        quantize_mxfp4_q,
+        quantize_mxfp4_k,
+        quantize_v_mxfp4_fp6_p,
+    ),
+    (AttentionFormat.MXFP4, 256): (
+        quantize_mxfp4_q_hd256,
+        quantize_mxfp4_k_hd256,
+        quantize_v_mxfp4_fp6_p_hd256,
+    ),
+    (AttentionFormat.MXFP6, 128): (
+        quantize_mxfp6_q,
+        quantize_mxfp6_k,
+        quantize_v_mxfp6_fp6_p,
+    ),
+    (AttentionFormat.MXFP6, 256): (
+        quantize_mxfp6_q_hd256,
+        quantize_mxfp6_k_hd256,
+        quantize_v_mxfp6_fp6_p_hd256,
+    ),
+}
+_MXFP6_K_VIEWS = {128: mxfp6_k_view, 256: mxfp6_k_view_hd256}
+
+
+def mha_v4_mx_producers(
+    qk_format: AttentionFormat, head_dim: int
+) -> tuple[Callable, Callable, Callable]:
+    """(Q, K, same-format FP6-P V) production quantizers for an MX Q/K format and head dim."""
+    return _MX_PRODUCERS[(qk_format, head_dim)]
+
 
 _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
@@ -928,18 +1019,20 @@ def mha_v4_packed(
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Q, K, and V must have contiguous last dimensions")
 
-    logical_head_dim = 128
-    expected_q_width = _PACKED_QK_WIDTH[q_format]
+    # V is the only operand carrying the logical head dim in its last axis; Q/K carry packed ones.
+    logical_head_dim = v.shape[-1]
+    _check_head_dim(logical_head_dim, q_format, v_format, lut is not None, "MHA v4")
+    expected_q_width = _packed_qk_width(q_format, logical_head_dim)
     if q.shape[-1] != expected_q_width or k.shape[-1] != expected_q_width:
         raise ValueError(
             f"{q_format.name} Q/K must have packed width {expected_q_width}"
         )
-    if v.shape[-1] != logical_head_dim:
-        raise ValueError("MHA v4 currently requires logical V head dimension 128")
     if q_format == AttentionFormat.MXFP4:
+        # The MXFP4 K producer tiles 128 tokens whatever KV tile the kernel runs.
         tiles = (k.shape[1] + 127) // 128
-        head_stride = tiles * 8192
-        expected_k_stride = (k.shape[2] * head_stride, 64, head_stride, 1)
+        row_bytes = logical_head_dim // 2
+        head_stride = tiles * 128 * row_bytes
+        expected_k_stride = (k.shape[2] * head_stride, row_bytes, head_stride, 1)
         if k.stride() != expected_k_stride:
             raise ValueError("MXFP4 K must use the coalesced MHA v4 tile layout")
 
@@ -1093,7 +1186,13 @@ def _launch_mxfp6(
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
     resolved_v_pack = AttentionPack(v_pack)
-    k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
+    # Q is always FP6 here, so its packed width names the head dim; MXFP4 V arrives as a flat buffer.
+    head_dim = (
+        _MHA_V4_BASE_HEAD_DIM * q.shape[-1] // _PACKED_QK_WIDTH[AttentionFormat.MXFP6]
+    )
+    k, k_descale = _MXFP6_K_VIEWS[head_dim](
+        k_raw, k_descale_raw, q.shape[0], sequence_k, heads
+    )
     v = (
         mxfp4_v_view(v_data, v_descale, sequence_k)
         if resolved_v_format == AttentionFormat.MXFP4
@@ -1214,8 +1313,8 @@ def _validate_mha_v4_raw_inputs(
         or v.dtype != torch.bfloat16
     ):
         raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError(f"{operation} currently supports head dimension 128 only")
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        raise ValueError(f"{operation} requires one head dimension across Q, K, and V")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
@@ -1281,6 +1380,7 @@ def mha_v4(
         _check_varlen_capable(q_format, v_format)
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
+    _check_head_dim(q.shape[-1], q_format, v_format, sparse, "mha_v4")
     recipe = _resolve_raw_recipe(
         q_format,
         k_format,
@@ -1343,10 +1443,13 @@ def mha_v4(
             v_quantized, v_descale = quantize_v_mxfp6(v)
     elif recipe.kind == _RawRecipeKind.MXFP4:
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
-        v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            softmax_scale = q.shape[-1] ** -0.5
+        quant_q, quant_k, quant_v = mha_v4_mx_producers(
+            AttentionFormat.MXFP4, q.shape[-1]
+        )
+        q_quantized, q_descale = quant_q(q, mha_v4_q_multiplier(softmax_scale))
+        k_quantized, k_descale = quant_k(k, k_mean)
+        v_quantized, v_descale = quant_v(v)
         if lut_indices is None:
             launch = functools.partial(
                 _launch_mxfp4_coalesced,
@@ -1369,13 +1472,16 @@ def mha_v4(
             v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
+            softmax_scale = q.shape[-1] ** -0.5
+        quant_q, quant_k, quant_v = mha_v4_mx_producers(
+            AttentionFormat.MXFP6, q.shape[-1]
+        )
+        q_quantized, q_descale = quant_q(q, mha_v4_q_multiplier(softmax_scale))
+        k_quantized, k_descale = quant_k(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:
-            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            v_quantized, v_descale = quant_v(v)
         else:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
