@@ -15,7 +15,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
-      - '.github/scripts/install_flash_attention.sh'
+      - '.github/scripts/flash_attention/**'
       - '.github/workflows/ci-config.yaml'
   pull_request:
     branches: [main]
@@ -31,7 +31,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
-      - '.github/scripts/install_flash_attention.sh'
+      - '.github/scripts/flash_attention/**'
       - '.github/workflows/ci-config.yaml'
   workflow_dispatch:
 
@@ -84,7 +84,7 @@ jobs:
               - 'setup.py'
               - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
-              - '.github/scripts/install_flash_attention.sh'
+              - '.github/scripts/flash_attention/**'
               - '.github/workflows/ci-config.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
@@ -178,7 +178,7 @@ jobs:
           COPY . /aiter
           ENV FA_BRANCH=${{ env.FA_BRANCH }}
           ENV FA_REPOSITORY_URL=${{ env.FA_REPOSITORY_URL }}
-          RUN bash /aiter/.github/scripts/install_flash_attention.sh /aiter /flash-attention
+          RUN bash /aiter/.github/scripts/flash_attention/install.sh /aiter /flash-attention
 
           # Verify aiter is installed from PR branch
           RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
@@ -234,11 +234,8 @@ jobs:
         timeout-minutes: 60
         run: |
           set -o pipefail
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            python benchmarks/benchmark_flash_attention.py
-          " |& tee benchmark_fa_triton_${{ matrix.label }}.log
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/bench.sh fa \
+            |& tee benchmark_fa_triton_${{ matrix.label }}.log
 
       # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
       # (all arches) and on push-to-main for MI35X, where the baseline is published.
@@ -247,11 +244,8 @@ jobs:
         timeout-minutes: 60
         run: |
           set -o pipefail
-          docker exec fa_triton_test bash -c "
-            cd /aiter
-            python op_tests/op_benchmarks/triton/bench_mha.py \
-              -impl dao_ai -metric throughput -o /tmp/bench_dao_ai
-          " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/bench.sh mha /tmp/bench_dao_ai \
+            |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
 
       # Full correctness suite (output + varlen + kvcache) — runs on MI35X (and any
@@ -260,20 +254,7 @@ jobs:
         if: ${{ github.event_name != 'push' && matrix.label != 'RDNA3' }}
         timeout-minutes: 90
         run: |
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_output \
-              -k '2048-2048' && \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output \
-              -k '1024-1024' && \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
-              -k '16-20000'
-          "
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-pr
 
       # RDNA3 is much slower (and optional), so the full varlen + kvcache sweep blows
       # the 90-min cap. It runs only the output test.
@@ -281,26 +262,13 @@ jobs:
         if: ${{ github.event_name != 'push' && matrix.label == 'RDNA3' }}
         timeout-minutes: 90
         run: |
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py::test_flash_attn_output \
-              -k '2048-2048'
-          "
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-pr-rdna3
 
       - name: Post-merge correctness tests (v2)
         if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
         timeout-minutes: 360
         run: |
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 \
-            pytest -v --reruns 2 --timeout=120 \
-              tests/test_flash_attn_triton_amd.py
-          "
+          docker exec fa_triton_test bash /aiter/.github/scripts/flash_attention/test.sh v2-full
 
       - name: Clean up v2 container
         if: always()
@@ -373,34 +341,13 @@ jobs:
         if: ${{ github.event_name != 'push' && matrix.label == 'MI35X' }}
         timeout-minutes: 90
         run: |
-          docker exec fa_triton_v3_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            export PYTHONPATH=/flash-attention/hopper:\${PYTHONPATH:-}
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_output \
-              -k '4096-4096' && \
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output \
-              -k '1024-1024' && \
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
-              -k '16-20000'
-          "
+          docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-pr
 
       - name: Post-merge correctness tests (v3)
         if: ${{ github.event_name == 'push' && matrix.label == 'MI35X' }}
         timeout-minutes: 360
         run: |
-          docker exec fa_triton_v3_test bash -c "
-            cd /flash-attention
-            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
-            export PYTHONPATH=/flash-attention/hopper:\${PYTHONPATH:-}
-            pytest -v --reruns 2 --timeout=120 \
-              hopper/test_flash_attn_triton_amd.py
-          "
+          docker exec fa_triton_v3_test bash /aiter/.github/scripts/flash_attention/test.sh v3-full
 
       - name: Clean up v3 container
         if: ${{ always() && matrix.label == 'MI35X' }}
@@ -561,7 +508,7 @@ jobs:
         run: |
           # Invoked through `bash` rather than executed: this job is windows-latest, where the
           # exec bit does not survive checkout.
-          BUILD_TARGET=rocm bash .github/scripts/install_flash_attention.sh \
+          BUILD_TARGET=rocm bash .github/scripts/flash_attention/install.sh \
             . "$RUNNER_TEMP/flash-attention" editable
         shell: bash
 

@@ -10,14 +10,14 @@
 # aiter to undo the copy: four steps to undo one, written out per job, and they drifted --
 # ROCm/aiter#5620 fixed two of the four places and left the others.
 #
-# Usage: install_flash_attention.sh <aiter-dir> <fa-dest> [editable]
+# Usage: install.sh <aiter-dir> <fa-dest> [editable]
 #   editable   install flash-attention editable too (aiter always is)
 #   FA_BRANCH, FA_REPOSITORY_URL   from the workflow env
 #   BUILD_TARGET                   passed through if the caller exports it
 set -euo pipefail
 
-AITER="${1:?usage: install_flash_attention.sh <aiter-dir> <fa-dest> [editable]}"
-DEST="${2:?usage: install_flash_attention.sh <aiter-dir> <fa-dest> [editable]}"
+AITER="${1:?usage: install.sh <aiter-dir> <fa-dest> [editable]}"
+DEST="${2:?usage: install.sh <aiter-dir> <fa-dest> [editable]}"
 EDITABLE="${3:-}"
 
 # THE AITER UNDER TEST, FIRST. Uninstalled before installing because the image may ship its own
