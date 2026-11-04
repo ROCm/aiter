@@ -578,6 +578,8 @@ def build_hstu_attention_bwd_dq(
             return ds_packs
 
         # ==== GEMM (dQ): dS(reused frag) * K -> dQ (alpha applied at epilogue) ====
+        # Unlike dV/dK, the K B-operand stays a scalar gather: a per-tile K^T built
+        # in LDS measured 0.5-2% slower on gfx942 at the tuned 2-wave dQ tiles.
         def accum_dq_tile(dq_acc, ds_packs):
             """dQ[q, hc] += dS[q, kv] * K[kv, hc]. A = dS frag, B = K[kv, hc] from LDS."""
             for c in range_constexpr(HC_CHUNKS):
