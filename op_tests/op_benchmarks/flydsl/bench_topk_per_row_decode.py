@@ -254,11 +254,11 @@ class Arms:
 
     def __init__(self):
         from aiter.jit.utils.chip_info import get_gfx_runtime
-        from aiter.ops import topk
+        from aiter.ops import topk, topk_decode_gate
         from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
         from aiter.ops.flydsl.topk import topk_per_row as host
 
-        self.topk, self.host = topk, host
+        self.topk, self.gate, self.host = topk, topk_decode_gate, host
         params = inspect.signature(host._decode_with_backend).parameters
         self._takes_bound = "max_row_len" in params
         # The adaptive arm is forced past the gate, which never picks it on a
@@ -373,8 +373,8 @@ def run_cell(
             recs.append({**rec, "supported": False})
             continue
         call = arms.call(arm, x, sl, out, cell, bound)
-        saved = arms.topk._FLYDSL_TOPK_DECODE_DISABLED
-        arms.topk._FLYDSL_TOPK_DECODE_DISABLED = arm == "hip"
+        saved = arms.gate._FLYDSL_TOPK_DECODE_DISABLED
+        arms.gate._FLYDSL_TOPK_DECODE_DISABLED = arm == "hip"
         t0 = time.perf_counter()
         try:
             call()
@@ -407,7 +407,7 @@ def run_cell(
                 error=f"{type(exc).__name__}: {exc}"[:300],
             )
         finally:
-            arms.topk._FLYDSL_TOPK_DECODE_DISABLED = saved
+            arms.gate._FLYDSL_TOPK_DECODE_DISABLED = saved
         rec["wall_s"] = round(time.perf_counter() - t0, 3)
         recs.append(rec)
     del x, sl

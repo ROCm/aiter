@@ -10,10 +10,10 @@ import torch
 
 from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx_runtime
 from aiter.ops.asm.asm_utils import load_hip
-from aiter.ops.topk import (
+from aiter.ops.topk_decode_gate import (
     BACKEND_ADAPTIVE,
     decode_adaptive_width,
-    decode_backend_for_call,
+    decode_backend_for_shape,
 )
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
@@ -588,18 +588,15 @@ def _decode_with_backend(
     starts = row_starts if packed else len_slot
 
     if backend is None:
-        backend = decode_backend_for_call(
+        # The tensor contract was enforced above, so only the shape is asked.
+        backend = decode_backend_for_shape(
             logits,
-            next_n,
             seq_lens,
-            indices,
             rows,
-            stride0,
-            stride1,
             k,
             stable,
             values,
-            max_row_len=max_row_len,
+            max_row_len,
             width=plane_width,
         )
 

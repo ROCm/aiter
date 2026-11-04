@@ -14,6 +14,7 @@ from aiter.jit.utils import chip_info
 from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx, get_gfx_runtime
 from aiter.ops import topk
 from aiter.ops import topk as T
+from aiter.ops import topk_decode_gate as G
 from aiter.ops import topk_select as S
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
@@ -1629,7 +1630,7 @@ def test_flydsl_decode_gates():
     limit, so narrowing the sweep shapes cannot leave a gate untested.
     """
     arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES or T._FLYDSL_TOPK_DECODE_DISABLED:
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or G._FLYDSL_TOPK_DECODE_DISABLED:
         print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
         return
     torch.set_default_device("cuda:0")

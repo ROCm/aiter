@@ -9,9 +9,25 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num_device, get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
+from . import topk_decode_gate as _gate
+
+# Re-exported: callers and tests reach the gate through this module.
+from .topk_decode_gate import (
+    _ADAPTIVE_BANDS,  # noqa: F401
+    _ADAPTIVE_BANDS_BY_K_GROUP,  # noqa: F401
+    _FLYDSL_TOPK_DECODE_GATES,  # noqa: F401
+    _FLYDSL_TOPK_DECODE_KS,  # noqa: F401
+    BACKEND_ADAPTIVE,  # noqa: F401
+    BACKEND_DEFAULT,
+    BACKEND_SINGLE,  # noqa: F401
+    _decode_backend,  # noqa: F401
+    _in_bands,  # noqa: F401
+    decode_adaptive_width,  # noqa: F401
+    decode_backend_for_shape,
+)
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -1177,356 +1193,6 @@ def _top_k_per_row_decode(
 ) -> None: ...
 
 
-_FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
-    "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
-) in ("1", "true", "True", "yes", "YES")
-
-# Dispatch uses physical width because seq_lens is device-resident; padded rows
-# with short effective lengths may therefore enter a long-row gate.
-# (minimum width, maximum width, maximum rows), with inclusive bounds.
-_FLYDSL_TOPK_DECODE_GATES = {
-    "gfx942": {
-        True: (
-            (0, 20_000, 64),
-            (131_072, None, 16),
-        ),
-        False: ((524_288, None, 32),),
-    },
-    "gfx950": {
-        True: (
-            (0, 20_000, 128),
-            (32_768, 65_535, 16),
-            (65_536, 131072, 32),
-            (131072, 200_000, 48),
-            (200_000, None, 64),
-        ),
-        False: ((131_072, None, 32),),
-    },
-}
-_FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
-
-# What the gate answers. `default` names no kernel: the call keeps its entry
-# point's own dispatch, which runs the FlyDSL one-block kernel where that is
-# enabled and the C++ one-block kernel elsewhere.
-BACKEND_DEFAULT = "default"
-BACKEND_SINGLE = "single"
-BACKEND_ADAPTIVE = "adaptive"
-
-# Which shapes the adaptive kernel is fastest for. One entry, with names in
-# place of the numbers:
-#
-#   (arch, cu_count): {
-#       stable: {
-#           (k, ...): (
-#               (min_width, max_width, min_rows, max_rows),
-#               ...
-#           ),
-#       },
-#   },
-#
-# Every k in a group shares its bands. Bounds are inclusive, and a max_width of
-# None means no upper bound: (4_096, 4_096, 128, 512) admits width 4096 at 128
-# to 512 rows. The row minimum is not decoration: one row of a narrow buffer
-# goes to a one-block kernel, which has no grid to fill while the adaptive
-# kernel pays for having one.
-#
-# Keyed by CU count as well as arch: one arch name spans several, and the grid
-# these were measured against is built from that count. A pair the table does
-# not name is routed by the single-launch gate below alone.
-#
-# A cell is admitted only when this kernel is the fastest of the four decode
-# kernels (adaptive, single-launch, FlyDSL one-block, C++ one-block) and at least
-# 1.05x faster than the kernel the gate would pick without it, on a full buffer
-# and on a padded one alike, which the gate cannot tell apart. Every entry
-# assumes the caller declares `max_row_len`.
-_ADAPTIVE_BANDS_BY_K_GROUP = {
-    ("gfx942", 80): {
-        True: {
-            (256,): (
-                (4_096, 4_096, 128, 512),
-                (8_192, 8_192, 1, 4),
-                (16_384, 20_000, 1, 512),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 8),
-                (131_072, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 524_288, 1, 4),
-                (1_048_576, 1_048_576, 1, 2),
-            ),
-            (512, 1024, 2048): (
-                (4_096, 8_192, 128, 512),
-                (16_384, 20_000, 1, 512),
-                (32_768, 32_768, 1, 4),
-                (65_536, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 524_288, 1, 4),
-                (1_048_576, 1_048_576, 1, 2),
-            ),
-            (4096,): (
-                (8_192, 8_192, 128, 512),
-                (16_384, 1_048_576, 1, 512),
-            ),
-        },
-        False: {
-            (256,): (
-                (4_096, 32_768, 128, 512),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 8),
-                (262_144, 262_144, 1, 4),
-                (524_288, 1_048_576, 1, 2),
-            ),
-            (512, 1024, 2048): (
-                (4_096, 20_000, 128, 512),
-                (32_768, 32_768, 1, 8),
-                (65_536, 65_536, 1, 16),
-                (131_072, 262_144, 1, 8),
-                (524_288, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (8_192, 20_000, 128, 512),
-                (32_768, 32_768, 1, 16),
-                (65_536, 1_048_576, 1, 32),
-            ),
-        },
-    },
-    ("gfx942", 228): {
-        True: {
-            (256,): (
-                (8_192, 8_192, 1, 16),
-                (16_384, 20_000, 1, 512),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (8_192, 8_192, 256, 512),
-                (16_384, 20_000, 1, 512),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (8_192, 8_192, 256, 512),
-                (16_384, 16_384, 1, 64),
-                (20_000, 1_048_576, 1, 512),
-            ),
-        },
-        False: {
-            (256,): (
-                (4_096, 8_192, 256, 512),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (4_096, 8_192, 256, 512),
-                (32_768, 32_768, 1, 4),
-                (65_536, 65_536, 1, 32),
-                (131_072, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (8_192, 8_192, 256, 512),
-                (32_768, 32_768, 1, 16),
-                (65_536, 1_048_576, 1, 64),
-            ),
-        },
-    },
-    ("gfx942", 304): {
-        True: {
-            (256,): (
-                (8_192, 8_192, 1, 2),
-                (16_384, 20_000, 1, 128),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (16_384, 20_000, 1, 128),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (16_384, 32_768, 1, 128),
-                (65_536, 1_048_576, 1, 512),
-            ),
-        },
-        False: {
-            (256,): (
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (32_768, 32_768, 1, 4),
-                (65_536, 131_072, 1, 32),
-                (262_144, 524_288, 1, 16),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (32_768, 32_768, 1, 16),
-                (65_536, 131_072, 1, 64),
-                (262_144, 524_288, 1, 128),
-                (1_048_576, 1_048_576, 1, 64),
-            ),
-        },
-    },
-    ("gfx950", 256): {
-        True: {
-            (256,): (
-                (8_192, 16_384, 1, 2),
-                (20_000, 20_000, 1, 8),
-                (65_536, 65_536, 1, 8),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 2),
-            ),
-            (512, 1024, 2048): (
-                (16_384, 16_384, 1, 4),
-                (20_000, 20_000, 16, 64),
-                (65_536, 65_536, 1, 8),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (8_192, 8_192, 1, 4),
-                (16_384, 16_384, 2, 4),
-                (32_768, 32_768, 1, 16),
-                (65_536, 65_536, 1, 64),
-                (131_072, 1_048_576, 1, 512),
-            ),
-        },
-        False: {
-            (256,): (
-                (65_536, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 262_144, 1, 8),
-                (524_288, 524_288, 1, 16),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 64),
-                (262_144, 262_144, 1, 128),
-                (524_288, 1_048_576, 1, 64),
-            ),
-        },
-    },
-}
-
-_ADAPTIVE_BANDS = {
-    device: {
-        stable: {k: bands for ks, bands in per_group.items() for k in ks}
-        for stable, per_group in per_emit.items()
-    }
-    for device, per_emit in _ADAPTIVE_BANDS_BY_K_GROUP.items()
-}
-
-
-def _in_bands(bands, width: int, num_rows: int) -> bool:
-    return any(
-        min_width <= width
-        and (max_width is None or width <= max_width)
-        and min_rows <= num_rows <= max_rows
-        for min_width, max_width, min_rows, max_rows in bands
-    )
-
-
-@functools.lru_cache(maxsize=256)
-def _decode_backend(
-    arch: str,
-    cu_count: int,
-    stable: bool,
-    width: int,
-    num_rows: int,
-    k: int,
-    indices_only: bool,
-    adaptive_width: int | None,
-) -> str:
-    """Which of the four decode kernels is fastest for this shape.
-
-    The two tables read different lengths and must keep doing so. The adaptive
-    bands read `adaptive_width`, the caller's bound, because that kernel is
-    configured from it; `None` means no bound was stated and declines them. The
-    single-launch bands read the physical `width` they were fitted on, so a
-    bound never moves a call between the single-launch kernel and the one-block
-    path.
-
-    Both entry points ask this one function rather than deciding again further
-    down, which is what keeps them from disagreeing.
-    """
-    if indices_only and adaptive_width is not None:  # adaptive emits no values
-        per_k = _ADAPTIVE_BANDS.get((arch, cu_count), {}).get(stable, {})
-        if _in_bands(per_k.get(k, ()), adaptive_width, num_rows):
-            return BACKEND_ADAPTIVE
-    if (
-        arch in _FLYDSL_TOPK_DECODE_GATES
-        and k in _FLYDSL_TOPK_DECODE_KS
-        and _in_bands(
-            (
-                (lo, hi, 1, rows)
-                for lo, hi, rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
-            ),
-            width,
-            num_rows,
-        )
-    ):
-        return BACKEND_SINGLE
-    return BACKEND_DEFAULT
-
-
-def decode_adaptive_width(width: int, max_row_len: int) -> int:
-    """The row length the adaptive path should be gated and configured on.
-
-    A decode buffer is allocated once at the model's maximum context, so its
-    physical width says what a row *could* hold and `seq_lens` says what it
-    does. `seq_lens` is device-resident and this runs on the host, so the only
-    way the host learns the live length is for the caller to state a bound.
-
-    Both the band lookup and `decode_adaptive_config` take this, and they must
-    take the same value: gating on one length and configuring for another is
-    how a band admits a shape that then runs the wrong kernel for it.
-
-    `top_k_per_row_decode` holds the `max_row_len` contract. It is required here:
-    the gate declines the adaptive path when the caller states no bound (see
-    `decode_backend_for_call`), so `None` reaching this function is a bug. The
-    physical width is not a fallback, because the bands were admitted assuming
-    a configuration sized to the bound.
-    """
-    if max_row_len is None:
-        raise ValueError(
-            "max_row_len is required to configure the adaptive path; the gate "
-            "declines when it is None, so this path should be unreachable"
-        )
-    if max_row_len < 1:
-        raise ValueError(f"max_row_len must be positive, got {max_row_len}")
-    return min(width, max_row_len)
-
-
 def decode_backend_for_call(
     logits: torch.Tensor,
     next_n: int,
@@ -1544,34 +1210,11 @@ def decode_backend_for_call(
 ) -> str:
     """The backend this call should run, shape rule and tensor contract together.
 
-    `topk_per_row.py` calls this for a caller that arrives there directly, so
-    the FlyDSL host never picks a kernel the gate did not pick. `width` is the
-    plane width packed rows stand for, and defaults to the logits' own.
+    `width` is the plane width packed rows stand for, and defaults to the
+    logits' own.
     """
-    if (
-        _FLYDSL_TOPK_DECODE_DISABLED
-        or not isinstance(logits, torch.Tensor)
-        or logits.ndim != 2
-    ):
-        return BACKEND_DEFAULT
-
-    width = logits.shape[1] if width is None else width
-    backend = _decode_backend(
-        get_gfx_runtime(),
-        get_cu_num_device(logits.device.index),
-        stable,
-        width,
-        num_rows,
-        k,
-        values is None,
-        # No bound means the host cannot size the adaptive config, and no
-        # `seq_lens` leaves the adaptive kernel nothing to read row lengths from,
-        # so either declines it; the single-launch bands still see the width.
-        (
-            None
-            if max_row_len is None or seq_lens is None
-            else decode_adaptive_width(width, max_row_len)
-        ),
+    backend = decode_backend_for_shape(
+        logits, seq_lens, num_rows, k, stable, values, max_row_len, width=width
     )
     if backend == BACKEND_DEFAULT:
         return BACKEND_DEFAULT
@@ -1701,7 +1344,7 @@ def top_k_per_row_decode(
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
-    if not _FLYDSL_TOPK_DECODE_DISABLED:
+    if not _gate._FLYDSL_TOPK_DECODE_DISABLED:
         from .flydsl.topk.topk_per_row import (
             _is_flydsl_radix_topk_one_block_supported,
         )
@@ -1787,7 +1430,7 @@ def _top_k_per_row_decode_packed(
         raise ValueError("packed logits must be a contiguous flat buffer")
     if row_starts.dtype != torch.int32 or row_starts.shape != (num_rows,):
         raise ValueError("row_starts must be int32 [num_rows]")
-    if _FLYDSL_TOPK_DECODE_DISABLED:
+    if _gate._FLYDSL_TOPK_DECODE_DISABLED:
         raise ValueError("packed rows need the FlyDSL decode top-k")
     from .flydsl.topk import topk_per_row as flydsl_topk
 
