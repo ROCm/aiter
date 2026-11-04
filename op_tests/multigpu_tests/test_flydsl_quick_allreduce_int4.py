@@ -317,17 +317,47 @@ _FILLS = (
     "overflow_512",
     "large_every_rank",
     "zeros",
+    "tiny",
+    "above_fp16",
+    "channel_outliers",
+    "massive_tokens",
 )
 
 
 def _make_inp(
-    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+    tokens: int,
+    hidden: int,
+    fill: str,
+    *,
+    rank: int,
+    device: torch.device,
+    world_size: int = 8,
 ) -> torch.Tensor:
     """One rank's contribution, for whichever edge case *fill* names."""
     shape = (tokens, hidden)
     gen = torch.Generator().manual_seed(1234 + rank)
-    if fill in ("normal", "outlier", "small"):
-        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
+    if fill == "channel_outliers":
+        shared = torch.Generator().manual_seed(77)
+        channels = torch.exp(torch.randn(hidden, generator=shared) * 1.5)
+        channels *= 400.0 / (float(channels.max()) * 5.0 * world_size**0.5)
+        src = torch.randn(shape, generator=gen) * channels
+    elif fill == "massive_tokens":
+        src = torch.randn(shape, generator=gen)
+        shared = torch.Generator().manual_seed(78)
+        rows = torch.randperm(tokens, generator=shared)[: max(1, tokens // 50)]
+        cols = torch.randperm(hidden, generator=shared)[:4]
+        magnitude = torch.empty(len(rows), 4).uniform_(3e3, 2e4, generator=shared)
+        sign = torch.where(torch.rand(len(rows), 4, generator=shared) < 0.5, -1.0, 1.0)
+        src[rows[:, None], cols[None, :]] = sign * magnitude / world_size
+    elif fill == "above_fp16":
+        src = torch.randn(shape, generator=gen)
+        columns = torch.arange(hidden)
+        large = columns % 64 == 5
+        sign = 1.0 - 2.0 * ((columns // 64) % 2).float()
+        magnitude = 132000.0 if rank < 2 else 11700.0
+        src[:, large] = (sign * magnitude)[large]
+    elif fill in ("normal", "outlier", "small", "tiny"):
+        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005, "tiny": 1e-3}[fill]
         src = torch.randn(shape, generator=gen, dtype=torch.float32) * std
     elif fill == "degenerate":
         # Half the rows exactly zero, half far below the scale's magnitude
@@ -359,7 +389,7 @@ def _make_inp(
             "overflow_512": 512.0 if rank == 0 else 0.0,
             # Every partial and the reduced sum above 480: the E4M3 scale
             # clipped both packs here (SQNR about 1 dB), and on the ring every
-            # requantized hop. MiniMax-M3 all-reduce outputs reach 6400-16800.
+            # requantized hop.
             "large_every_rank": 2048.0,
             "zeros": 0.0,
         }[fill]
@@ -643,7 +673,12 @@ def _metrics(
         msg=f"quick_allreduce_int4 rank {rank}",
     )
     return {
+        "finite": bool(torch.isfinite(got).all()),
         "sqnr_db": _sqnr_db(got, ref),
+        "quiet_sqnr_db": _sqnr_db(
+            got[ref.abs().amax(dim=-1) < 480],
+            ref[ref.abs().amax(dim=-1) < 480],
+        ),
         "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref, tile_bytes),
         "lanes_differing": _lanes_differing(out, group),
         "rel_mae": _rel_mae(got, ref),
@@ -657,10 +692,11 @@ def _metrics(
 def _worst(a: dict, b: dict) -> dict:
     """Per-field worst of two metric dicts, for a row checked several times."""
     out = dict(a)
-    for key in ("sqnr_db", "min_tile_sqnr_db"):
+    for key in ("sqnr_db", "min_tile_sqnr_db", "quiet_sqnr_db"):
         out[key] = min(a[key], b[key])
     for key in ("err", "n_mismatch", "max_abs_err", "lanes_differing"):
         out[key] = max(a[key], b[key])
+    out["finite"] = a["finite"] and b["finite"]
     # NaN must win, so compare with isfinite rather than max().
     if not math.isfinite(b["rel_mae"]) or b["rel_mae"] > a["rel_mae"]:
         out["rel_mae"] = b["rel_mae"]
@@ -803,7 +839,12 @@ def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group)
         )
         sqnr = min(sqnr, _sqnr_db(out.float(), ref))
         lanes = max(lanes, _lanes_differing(out, group))
-    return {"calls": len(outs), "sqnr_db": sqnr, "lanes_differing": lanes}
+    return {
+        "calls": len(outs),
+        "sqnr_db": sqnr,
+        "lanes_differing": lanes,
+        "finite": all(bool(torch.isfinite(out).all()) for out in outs),
+    }
 
 
 def _run_rank(
@@ -852,7 +893,7 @@ def _run_rank(
                     }
                 )
                 continue
-            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
+            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device, world_size=tp)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
             dist.barrier(group=group)
@@ -1323,6 +1364,10 @@ def _check(label: str, fails: list[str]) -> bool:
 def _identity_fails(rows: list[dict], algorithm: str) -> list[str]:
     """Cross-rank bit-identity, asserted for both schedules."""
     return [
+        f"rank {rank}: non-finite output"
+        for rank, row in enumerate(rows)
+        if not row["finite"]
+    ] + [
         f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between ranks"
         for rank, row in enumerate(rows)
         if row["lanes_differing"]
@@ -1589,6 +1634,70 @@ def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
         check_close=fill != "outlier",
     )
     return ret
+
+
+def _scale_key(tp, algorithm, rs_codec, ag_codec, super_tile=None, block=None):
+    from aiter.ops.flydsl.quick_allreduce_int4 import ALGORITHMS, _resolve_codecs
+
+    kw = {"algorithm": algorithm}
+    if _resolve_codecs(ALGORITHMS[algorithm], tp, None, None) != (rs_codec, ag_codec):
+        kw.update(rs_codec=rs_codec, ag_codec=ag_codec)
+    if super_tile is not None:
+        kw.update(super_tile=super_tile, block=block, grid_cap=64)
+    return _key(tp, **kw)
+
+
+@benchmark()
+def test_quick_allreduce_scale_range(
+    tokens,
+    hidden,
+    tp,
+    algorithm,
+    rs_codec,
+    ag_codec,
+    fill,
+    divisor,
+    super_tile=None,
+    block=None,
+):
+    """Adaptive scale precision and the fp32 divisor, against the fp32 sum."""
+    key = _scale_key(tp, algorithm, rs_codec, ag_codec, super_tile, block)
+    rows = _result(key, (tokens, hidden, fill, False, divisor))
+    label = (
+        f"tp={tp} {algorithm} {rs_codec}/{ag_codec} {tokens}x{hidden} "
+        f"{fill} divisor={divisor}"
+    )
+    if fill == "above_fp16" and divisor == 1:
+        _check(label, _identity_fails(rows, algorithm))
+    else:
+        floor = (
+            SQNR_MIN_DB_TP8_INT4_RING
+            if algorithm == "ring" and rs_codec == "int4" and tp >= 4
+            else SQNR_MIN_DB
+        )
+        _check_sqnr(
+            label,
+            rows,
+            floor=floor,
+            expected_st=None,
+            algorithm=algorithm,
+            check_close=False,
+        )
+        if fill in ("normal", "channel_outliers", "massive_tokens"):
+            quiet_floor = 19.0 if algorithm == "mesh" else floor
+            _check(
+                label,
+                [
+                    f"rank {r}: quiet SQNR {row['quiet_sqnr_db']:.2f} < {quiet_floor}"
+                    for r, row in enumerate(rows)
+                    if row["quiet_sqnr_db"] < quiet_floor
+                ],
+            )
+    return {
+        **_summary(rows),
+        "quiet_sqnr_db": min(r["quiet_sqnr_db"] for r in rows),
+        "finite": all(r["finite"] for r in rows),
+    }
 
 
 @benchmark()
@@ -1914,6 +2023,35 @@ def _verify(args, tps, algos, dts, link) -> None:
         if fill == "outlier":
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
 
+    scale_range = []
+    for tp, algorithm in plans:
+        codecs = [("int4", "int4"), ("int6", "int6")]
+        if algorithm == "ring":
+            codecs.append(("int6", "int4"))
+        for rs, ag in codecs:
+            for tokens, hidden in ((512, 5120), (32768, 5120)):
+                for fill, div in (
+                    ("normal", 1.0),
+                    ("tiny", 1.0),
+                    ("channel_outliers", 1.0),
+                    ("massive_tokens", 1.0),
+                    ("above_fp16", 1.0),
+                    ("above_fp16", 8.0),
+                ):
+                    scale_range.append(
+                        (tokens, hidden, tp, algorithm, rs, ag, fill, div, None, None)
+                    )
+    if (2, "ring") in plans:
+        scale_range.extend(
+            (512, 5120, 2, "ring", "int6", "int4", fill, div, 32, 512)
+            for fill, div in (("massive_tokens", 1.0), ("above_fp16", 8.0))
+        )
+    for tokens, hidden, tp, algorithm, rs, ag, fill, div, st, block in scale_range:
+        _register(
+            _scale_key(tp, algorithm, rs, ag, st, block),
+            (tokens, hidden, fill, False, div),
+        )
+
     def _int4_rows(cases):
         return [
             test_quick_allreduce_int4(
@@ -1967,6 +2105,10 @@ def _verify(args, tps, algos, dts, link) -> None:
             test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
             for tp, tokens, hidden, rs, ag in pinned
         ],
+    )
+    _summarize(
+        "flydsl quick allreduce adaptive INT4/INT6 scale range",
+        [test_quick_allreduce_scale_range(*case) for case in scale_range],
     )
     _summarize(
         "flydsl quick allreduce transport (fp16 wire, bit-exact)",
