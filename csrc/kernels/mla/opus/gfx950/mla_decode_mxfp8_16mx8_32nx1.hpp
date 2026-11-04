@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mla_decode_kargs.h"
+#include "../mla_decode_kargs.h"
 #include "mla_decode_traits.h"
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
