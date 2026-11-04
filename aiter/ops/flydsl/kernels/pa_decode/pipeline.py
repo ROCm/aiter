@@ -1391,7 +1391,14 @@ class Gfx1250WavePipeline:
         ctx, t = self.ctx, self.t
         # Unmasked scores are finite and the row scale is nonnegative, so it
         # commutes with the maximum and fuses into the exponent.
-        fused = not masked and t.per_token_kv and t.softmax_scale >= 0
+        # New tiles subtract the maximum of explicitly scaled, rounded logits.
+        # Keep the existing four-tile arithmetic intact.
+        fused = (
+            not masked
+            and t.per_token_kv
+            and t.softmax_scale >= 0
+            and t.m_tiles == t.NWARP
+        )
         buffer = ((token_base - begin) // t.TOKENS) % 2
         tdm_ops.tensor_wait(0)
         fx.rocdl.s_wait_asynccnt(0)
