@@ -139,17 +139,10 @@ class _UAParams(NamedTuple):
 
 
 def _length_aware_split(config, params: _UAParams):
-    """(split_budget, NUM_SEGMENTS, SEQ_BLOCK) for the length-aware KV split, or None.
+    """Return (split_budget, NUM_SEGMENTS, SEQ_BLOCK) for the length-aware KV split, or None.
 
-    A kv_split entry opts in with SPLIT_PROGRAMS_PER_CU, for batches where every
-    sequence fits one query block (decode, short verify queries). Each sequence
-    takes a share of num_sms * SPLIT_PROGRAMS_PER_CU working programs by its KV
-    length, read on the GPU (see seq_num_segments), so a CUDA graph captured
-    with the 1M max_seqlen_k bound still splits by the real lengths.
-    NUM_SEGMENTS is then SPLIT_NUM_SEGMENTS, which only caps one sequence's
-    split; calls left out, skip_reduce included, keep the uniform NUM_SEGMENTS.
-    SEQ_BLOCK is the number of KV lengths the kernels read per step, from the
-    entry's SPLIT_SEQ_BLOCK_MIN/MAX.
+    It applies when the kv_split entry sets SPLIT_PROGRAMS_PER_CU
+    and every sequence fits one query block.
     """
     per_cu = config.get("SPLIT_PROGRAMS_PER_CU")
     num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])

@@ -35,12 +35,8 @@ A section with no axes, like reduce above, is just a config.
 Tile size and number of splits (segments) are derived from the following parameters:
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
-A kv_split entry may add SPLIT_PROGRAMS_PER_CU to make the Triton 3D split
-length-aware: each sequence takes its share of num_sms * SPLIT_PROGRAMS_PER_CU
-programs by its KV length on the GPU, capped by the segment count that
-SPLIT_SEGMENTS_PER_CU gives. The launcher uses it only for bf16 Q with head
-size 64 (Q/K and V); other calls keep the uniform NUM_SEGMENTS. See
-_length_aware_split in attention/unified_attention.py.
+SPLIT_PROGRAMS_PER_CU in a kv_split entry splits KV by each sequence's real length
+(bf16 Q, head size 64 only). See _length_aware_split.
 """
 
 import copy

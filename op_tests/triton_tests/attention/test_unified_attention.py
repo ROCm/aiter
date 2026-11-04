@@ -388,9 +388,8 @@ def ref_paged_attn(
 def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
     """Bound each request's relative L2 error against the reference.
 
-    Long-KV rows average many tokens and stay small (|out| <= ~0.03 at 20k KV), so
-    a fixed atol would pass all-zero rows. gfx950 measures ~0.0025, and dropping one
-    64-token KV tile gives ~0.06. seq_lens holds (query_len, kv_len) per request.
+    Long-KV outputs are small, so a fixed atol would pass all-zero rows.
+    gfx950 measures ~0.0025; one dropped 64-token KV tile gives ~0.06.
     """
     start = 0
     for q_len, kv_len in seq_lens:
