@@ -282,7 +282,8 @@ def test_pa_decode_merge_alignment(
             **workspace,
         )
         _check_output(output, reference)
-        assert torch.count_nonzero(plan.arrival_counters) == 0
+        if plan.arrival_counters is not None:
+            assert torch.count_nonzero(plan.arrival_counters) == 0
     last_arriver = mode == "last" and scratch_offset == 0
     assert compile_kwargs[-1]["direct_output"] == last_arriver
     assert compile_kwargs[-1]["cluster_merge"] == (
@@ -1237,6 +1238,330 @@ _SELECT_INVALID_CASES = [
 def _check_output(output, reference):
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+
+
+def _check_workspace_contract(launch, workspace):
+    for name, tensor in workspace.items():
+        invalid = (
+            (0, TypeError, f"{name} must be a torch.Tensor"),
+            (tensor.flatten(), ValueError, f"{name} shape"),
+            (tensor.double(), TypeError, f"{name} (must be|dtype)"),
+            (
+                torch.empty(
+                    (*tensor.shape, 2), dtype=tensor.dtype, device=tensor.device
+                )[..., 0],
+                ValueError,
+                f"{name} must be contiguous",
+            ),
+            (tensor.cpu(), ValueError, f"{name} must be on the same device"),
+        )
+        for bad, error, match in invalid:
+            with pytest.raises(error, match=match):
+                launch(**dict(workspace, **{name: bad}))
+
+
+@pytest.mark.parametrize(
+    "architecture", ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"]
+)
+@pytest.mark.parametrize("max_partitions,budget", [(1, 1), (4, 1), (4, 16)])
+def test_pa_decode_plan_counter_allocation(
+    monkeypatch, architecture, max_partitions, budget
+):
+    """Only a last-arriver-capable plan allocates counters; refresh keeps buffers.
+
+    Fake tensors and suppressed launches check allocation policy without a GPU.
+    """
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from torch._subclasses import fake_tensor
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    planner = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_plan")
+    monkeypatch.setattr(fake_tensor, "init_gpu_context", lambda device: None)
+    monkeypatch.setattr(planner, "get_gfx_runtime", lambda: architecture)
+    monkeypatch.setattr(planner, "compile_pa_decode_plan", lambda *args: None)
+    monkeypatch.setattr(planner, "_run_compiled", lambda *args: None)
+    monkeypatch.setattr(planner, "ptr_arg", lambda tensor, dtype: tensor)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            multi_processor_count=256, shared_memory_per_block=65536
+        ),
+    )
+
+    with FakeTensorMode():
+        context = torch.empty((4,), dtype=torch.int32, device="cuda:0")
+        plan = planner.plan_pa_decode(
+            context, 2, max_partitions=max_partitions, workgroup_budget=budget
+        )
+        assert plan.capacity == (8 if budget == 16 and max_partitions == 4 else 4)
+        needs_counters = (
+            architecture in ("gfx1250", "gfx1250-strict")
+            and max_partitions == 4
+            and budget == 1
+        )
+        assert (plan.arrival_counters is not None) == needs_counters
+        if needs_counters:
+            assert plan.arrival_counters.shape == (
+                context.numel(),
+                2,
+                planner.ARRIVAL_COUNTER_STRIDE,
+            )
+            assert plan.arrival_counters.dtype == torch.int32
+            assert plan.arrival_counters.device == context.device
+
+        def unexpected_allocation(*args, **kwargs):
+            pytest.fail("refresh must retain the plan's existing allocations")
+
+        monkeypatch.setattr(torch, "empty", unexpected_allocation)
+        monkeypatch.setattr(torch, "zeros", unexpected_allocation)
+        refreshed = planner.plan_pa_decode(context, 2, plan=plan)
+        assert refreshed is plan
+
+
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("output_mode", ["direct", "sinks", "strided"])
+def test_pa_decode_one_partition_workspace_dispatch(
+    monkeypatch, query_dtype, kv_dtype, output_mode
+):
+    """Fake tensors verify scratch allocations and pointer routing without a GPU."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from torch._subclasses import fake_tensor
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    monkeypatch.setattr(fake_tensor, "init_gpu_context", lambda device: None)
+    monkeypatch.setattr(pa, "get_gfx_runtime", lambda: "gfx1250")
+    monkeypatch.setattr(pa.dtypes, "fp8", torch.float8_e4m3fn)
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", lambda **kwargs: {"launch": None})
+    monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pa, "ptr_arg", lambda tensor, dtype: tensor)
+    monkeypatch.setattr(pa.flyc, "from_c_void_p", lambda dtype, value: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=256),
+    )
+    launches = []
+    monkeypatch.setattr(pa, "_run_compiled", lambda *args: launches.append(args))
+    with FakeTensorMode():
+        query = torch.empty((16, 32, 128), dtype=query_dtype, device="cuda:0")
+        output = torch.empty_like(query)
+        if output_mode == "strided":
+            output = torch.empty((16, 32, 129), dtype=query_dtype, device="cuda:0")[
+                ..., :128
+            ]
+        context = torch.empty((4,), dtype=torch.int32, device="cuda:0")
+        table = torch.empty((4, 9), dtype=torch.int32, device="cuda:0")
+        vector = 8 if kv_dtype == "bf16" else 16
+        cache_dtype = torch.bfloat16 if kv_dtype == "bf16" else torch.float8_e4m3fn
+        key = torch.empty(
+            (36, 2, 128 // vector, 128, vector), dtype=cache_dtype, device="cuda:0"
+        )
+        value = torch.empty_like(key)
+        scales = (
+            torch.empty((36, 2, 128, 1), device="cuda:0") if kv_dtype == "fp8" else None
+        )
+        plan = pa.PADecodePlan(
+            torch.empty((4, 4), dtype=torch.int32, device="cuda:0"),
+            torch.empty((4, 2), dtype=torch.int32, device="cuda:0"),
+            2,
+            1,
+        )
+        sinks = torch.empty((32,), device="cuda:0") if output_mode == "sinks" else None
+        allocations = []
+        empty = torch.empty
+
+        def count_empty(*args, **kwargs):
+            tensor = empty(*args, **kwargs)
+            allocations.append(tensor)
+            return tensor
+
+        def launch(**workspace):
+            pa.pa_decode(
+                output,
+                query,
+                key,
+                value,
+                context,
+                table,
+                128**-0.5,
+                4,
+                work_plan=plan,
+                sinks=sinks,
+                key_scale=scales,
+                value_scale=scales,
+                **workspace,
+            )
+
+        with monkeypatch.context() as allocation_patch:
+            allocation_patch.setattr(torch, "empty", count_empty)
+            launch()
+        direct = output_mode == "direct"
+        assert len(allocations) == (0 if direct else 3)
+        if direct:
+            assert launches[-1][1] is plan.reduce_info
+            assert launches[-1][2] is None
+            assert launches[-1][3] is output
+        else:
+            assert launches[-1][1].shape == (2, 4, 64)
+            assert launches[-1][2].shape == (2, 4, 64)
+            assert launches[-1][3].shape == (2, 4, 64, 128)
+        workspace = {
+            "max_logits": torch.empty((2, 4, 64), device="cuda:0"),
+            "exp_sums": torch.empty((2, 4, 64), device="cuda:0"),
+            "temporary_output": torch.empty(
+                (2, 4, 64, 128), dtype=query_dtype, device="cuda:0"
+            ),
+        }
+        launch(**workspace)
+        _check_workspace_contract(launch, workspace)
+
+
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("output_mode", ["direct", "sinks", "strided"])
+def test_pa_decode_one_partition_workspace(
+    device, monkeypatch, query_dtype, kv_dtype, output_mode
+):
+    """Direct output skips internal scratch while fallback and validation remain.
+
+    Graph replay refreshes metadata after empty and nonempty rows exchange
+    lengths. Explicit scratch retains its shape/dtype/device/layout contract,
+    including when direct output leaves it untouched.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 one-partition direct output")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    length, heads, group, dim, page = 4, 2, 16, 128, 128
+    query, key, value, table, context = _make_inputs(
+        length,
+        heads,
+        group,
+        dim,
+        page,
+        query_dtype,
+        "varied",
+        device,
+        (0, 1, 257, 1027),
+    )
+    key_scale = value_scale = None
+    vector = 8
+    if kv_dtype == "fp8":
+        vector = 16
+        key, key_scale = pertoken_quant(key, quant_dtype=torch.float8_e4m3fn)
+        value, value_scale = pertoken_quant(value, quant_dtype=torch.float8_e4m3fn)
+    else:
+        key, value = key.bfloat16(), value.bfloat16()
+    logical_key = key.float() * (1.0 if key_scale is None else key_scale)
+    logical_value = value.float() * (1.0 if value_scale is None else value_scale)
+    key_cache = (
+        key.reshape(-1, heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(-1, heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    output = torch.empty_like(query)
+    if output_mode == "strided":
+        output = torch.empty(
+            (*query.shape[:-1], dim + 1), dtype=query_dtype, device=device
+        )[..., :dim]
+    sinks = (
+        torch.full((heads * group,), float("-inf"), device=device)
+        if output_mode == "sinks"
+        else None
+    )
+    plan = pa.plan_pa_decode(context, heads, max_partitions=1)
+    assert plan.arrival_counters is None
+    arguments = (
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        length,
+    )
+    options = {
+        "work_plan": plan,
+        "compute_type": key.dtype,
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "sinks": sinks,
+        "max_context_length": 1027,
+    }
+
+    def launch(**workspace):
+        pa.pa_decode(*arguments, **options, **workspace)
+
+    def check():
+        _check_output(
+            output,
+            _reference(
+                query, logical_key, logical_value, table, context, length, 0, sinks
+            ),
+        )
+
+    launch()
+    check()
+    allocations = []
+    empty = torch.empty
+
+    def count_empty(*args, **kwargs):
+        tensor = empty(*args, **kwargs)
+        allocations.append(tensor)
+        return tensor
+
+    with monkeypatch.context() as allocation_patch:
+        allocation_patch.setattr(torch, "empty", count_empty)
+        launch()
+    direct = output_mode == "direct"
+    assert len(allocations) == (0 if direct else 3)
+    check()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert pa.plan_pa_decode(context, heads, plan=plan) is plan
+        launch()
+    for lengths in ((1027, 257, 0, 1), (0, 0, 0, 0)):
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        query.neg_()
+        output.fill_(float("nan"))
+        graph.replay()
+        check()
+
+    scalar_shape = (heads, plan.capacity, length * group)
+    workspace = {
+        "max_logits": torch.full(scalar_shape, float("nan"), device=device),
+        "exp_sums": torch.full(scalar_shape, float("nan"), device=device),
+        "temporary_output": torch.full(
+            (*scalar_shape, dim), float("nan"), dtype=query_dtype, device=device
+        ),
+    }
+    # Supplied scratch must remain unused for nonempty direct-output rows too.
+    context.copy_(torch.tensor((0, 1, 257, 1027), dtype=torch.int32, device=device))
+    assert pa.plan_pa_decode(context, heads, plan=plan) is plan
+    output.fill_(float("nan"))
+    launch(**workspace)
+    check()
+    if not direct:
+        return
+    assert all(torch.isnan(tensor).all() for tensor in workspace.values())
+    _check_workspace_contract(launch, workspace)
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
