@@ -423,7 +423,7 @@ template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
-    const opus_mla_v4_prefill_kargs kargs = opus_mla_prefill_base(args);
+    const auto kargs = opus_mla_prefill_base(args);
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -518,9 +518,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    int stride_o_n = kargs.stride_qo_n;
+    int stride_o_h = kargs.stride_qo_h;
+    if constexpr(T::SEPARATE_OUT_STRIDES)
+    {
+        stride_o_n = kargs.stride_o_n;
+        stride_o_h = kargs.stride_o_h;
+    }
+    const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * stride_o_n + static_cast<int64_t>(h_block_start) * stride_o_h;
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * stride_o_h * sizeof(D_ATTN));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
+    auto u_o = make_layout_o<T>(warp_id, lane_id, stride_o_h);
     auto v_o_attn = cast<D_ATTN>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }

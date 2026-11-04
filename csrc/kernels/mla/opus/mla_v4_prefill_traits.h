@@ -20,7 +20,8 @@ template <int Q_TILE_SIZE_  = 16,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 8,
           typename D_ATTN_  = bf16_t,
-          bool SPLIT_       = false>
+          bool SPLIT_       = false,
+          bool SEPARATE_OUT_STRIDES_ = false>
 struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
@@ -28,9 +29,13 @@ struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
+    static constexpr bool SEPARATE_OUT_STRIDES = SEPARATE_OUT_STRIDES_;
+    using base_kargs_type = std::conditional_t<SEPARATE_OUT_STRIDES_,
+                                               opus_mla_v4_prefill_kargs_gfx950,
+                                               opus_mla_v4_prefill_kargs>;
     using kargs_type = std::conditional_t<SPLIT_,
-                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
-                                          opus_mla_v4_prefill_kargs>;
+                                          opus_mla_prefill_split_kargs<base_kargs_type>,
+                                          base_kargs_type>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -91,7 +96,8 @@ template <int Q_TILE_SIZE_  = 16,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 4,
           typename D_ATTN_  = bf16_t,
-          bool SPLIT_       = false>
+          bool SPLIT_       = false,
+          bool SEPARATE_OUT_STRIDES_ = false>
 struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
@@ -99,9 +105,13 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
+    static constexpr bool SEPARATE_OUT_STRIDES = SEPARATE_OUT_STRIDES_;
+    using base_kargs_type = std::conditional_t<SEPARATE_OUT_STRIDES_,
+                                               opus_mla_v4_prefill_kargs_gfx950,
+                                               opus_mla_v4_prefill_kargs>;
     using kargs_type = std::conditional_t<SPLIT_,
-                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
-                                          opus_mla_v4_prefill_kargs>;
+                                          opus_mla_prefill_split_kargs<base_kargs_type>,
+                                          base_kargs_type>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
