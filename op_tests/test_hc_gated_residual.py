@@ -742,6 +742,12 @@ def _run_combine_and_mix_shape(inp, hc_count, fold_w, label):
 
 def _run_pipeline_depth():
     """Deep pipelines must cover their preload; short K is rejected, not read."""
+    if get_gfx() != "gfx950":
+        # gfx942 cannot fit an exact-preload pipeline: block_k=256 overflows
+        # its 64 KiB LDS, and block_k=128 needs stages >= 5, which exceeds the
+        # GEMM's 63-load vmcnt budget.
+        print("[skip] pipe_depth: no exact-preload config fits gfx942")
+        return
     # stream_dim=512, block_k=256 -> 4 K tiles: 5 stages preload exactly 4.
     inp = _make_shape_inputs(64, 2, 512, seed=33)
     kwargs = {"split_k": 1, "block_k": 256, "dn_block_m": 32, "use_tuned": False}
