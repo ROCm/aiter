@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-import argparse
 import csv
 import inspect
 import tempfile
@@ -23,6 +22,7 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -178,17 +178,19 @@ def bench_mlp_single_weight_init(
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
 
     # -- init data --
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), device=dev, dtype=torch.float32)
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev, dtype=torch.float32)
+    w2 = torch.randn(
+        (n_expts_tot, dim2 // TP // 2, dim1), device=dev, dtype=torch.float32
+    )
+    bg = torch.randn((n_expts_tot,), device=dev, dtype=torch.float32)
+    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev, dtype=torch.float32)
+    b2 = torch.randn((n_expts_tot, dim1), device=dev, dtype=torch.float32)
 
     # -- numerics --
     w_dtype_str = w_dtype
     if w_dtype_str == "fp8":
-        w_static_scale = torch.tensor(1e-4, device=dev)
+        w_static_scale = torch.tensor(1e-4, device=dev, dtype=torch.float32)
         w_dtype = torch.float8_e4m3fn
         wg, _ = quantize(wg, "bf16")
         w1 = downcast_to_static_fp8_3d(w1, w_static_scale)
@@ -216,7 +218,7 @@ def bench_mlp_single_weight_init(
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
     if x_dtype_str == "fp8":
-        x_static_scale = torch.tensor(1e-4, device=dev)
+        x_static_scale = torch.tensor(1e-4, device=dev, dtype=torch.float32)
 
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
@@ -420,7 +422,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",

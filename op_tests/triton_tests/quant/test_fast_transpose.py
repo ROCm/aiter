@@ -31,7 +31,7 @@ from aiter.ops.triton.quant.fast_transpose import (
 def test_fast_transpose_2d_correctness(M, N, dtype):
     torch.manual_seed(0)
     if dtype == torch.float8_e4m3fnuz:
-        x = torch.randn(M, N, device="cuda").to(dtype)
+        x = torch.randn(M, N, dtype=torch.float32, device="cuda").to(dtype)
         ref = x.view(torch.int8).t().contiguous().view(dtype)
     else:
         x = torch.randn(M, N, dtype=dtype, device="cuda")

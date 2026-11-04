@@ -1,7 +1,6 @@
-import concurrent.futures
-import os
 from collections import namedtuple
 
+from aiter_worker_limits import adopt_legacy_max_jobs, run_configs
 from csrc.cpp_itfs.pa.pa_v1 import compile
 
 PAConfig = namedtuple(
@@ -101,11 +100,9 @@ def main():
                                 )
                             )
 
-    with concurrent.futures.ProcessPoolExecutor(
-        os.environ.get("MAX_JOBS", os.cpu_count())
-    ) as executor:
-        executor.map(process_config, configs)
+    run_configs(configs, process_config)
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

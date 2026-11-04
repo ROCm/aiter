@@ -38,9 +38,23 @@ _TILE_K = (128, 256)
 # the bytes in flight per trip, for the latency-bound small-M tiles. Appended
 # after the rest of the catalog so the existing kernel ids keep their numbers.
 _TILE_K_512_TILE_M = (16, 32, 64)
+_ODD_TILE_M = (48,)
+_ODD_TILE_N = (192,)
+_EXTRA_TILE_M = (192,)
 # The fp8/fp8/bf16 split-K tiles again with fused_split_k (_fsk), appended last
 # with their ids offset past the 8-wave range (dispatch is by kernelName).
 KERNEL_ID_BASE_FSK = 2_000_000
+KERNEL_ID_BASE_PF = 4_000_000
+KERNEL_ID_BASE_PF_NT = 5_000_000
+_PF_TILE_M_MAX = 192
+_PF_MAX_DEPTH = 8
+_PF_MID_TILE_M = 96
+_PF_MULTI_M_TILE_M = 48
+_PF_MID_MAX_DEPTH = 3
+# A 192-row tile's ring is twice a 96-row one's: P = 2 beat 3 by 4-6% on
+# 160-192 x 25600 x 6144 (192x128x128).
+_PF_BIG_TILE_M = 192
+_PF_BIG_MAX_DEPTH = 2
 # Occupancy hints, following the (0, 2, 4) selection
 # flydsl/kernels/small_m_hgemm.py already uses: 0 (no hint) is a distinct mode,
 # and the odd values in between duplicate their neighbours rather than adding
@@ -97,6 +111,8 @@ def make_kernel_name(
     split_k: int = 1,
     blockscale: str = "none",
     fused_split_k: bool = False,
+    prefetch: bool = False,
+    b_nt: bool = False,
 ) -> str:
     """The one place the mxpsh kernelName is spelled.
 
@@ -109,13 +125,16 @@ def make_kernel_name(
     the CSV keeps one spelling per launch config, so CSVs tuned before the suffix
     existed keep working unchanged. `_fsk` marks a split-K reduced in-kernel by
     each tile's last-arriving block (fused_split_k, 1x32 row scales) instead of
-    by a separate reduce launch; it is part of the CSV grammar.
+    by a separate reduce launch; it is part of the CSV grammar. So are `_pf`, the
+    prefetch pipeline (its depth derived by `prefetch_depth`, not named), and
+    `_nt` after it, B streamed non-temporal.
     """
     a, b, o = _DTYPE_SHORT[a_dtype], _DTYPE_SHORT[b_dtype], _DTYPE_SHORT[out_dtype]
     name = (
         f"flydsl_mxpsh_{tile_m}x{tile_n}x{tile_k}"
         f"_{a}_{b}_{o}_w{waves_per_eu}_x{xcd_swizzle}_sk{split_k}"
         f"{'_fsk' if fused_split_k else ''}"
+        f"{'_pf' if prefetch else ''}{'_nt' if b_nt else ''}"
     )
     return name if blockscale == "none" else f"{name}_bs{blockscale}"
 
@@ -132,6 +151,8 @@ class kernelInstance:
     xcd_swizzle: int = 0  # 0=off, >0=XCD L2-rasterization group size
     split_k: int = 1  # 1=no split-K, >1=K-batch (partials reduced in fp32)
     fused_split_k: bool = False  # split-K reduced in-kernel (1x32 row scales)
+    prefetch: bool = False  # prefetch pipeline (a8w8 row scales), _pf
+    b_nt: bool = False  # B streamed non-temporal (prefetch only), _nt
 
     @property
     def name(self) -> str:
@@ -146,12 +167,14 @@ class kernelInstance:
             self.xcd_swizzle,
             self.split_k,
             fused_split_k=self.fused_split_k,
+            prefetch=self.prefetch,
+            b_nt=self.b_nt,
         )
 
 
 _NAME_RE = re.compile(
     r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)"
-    r"(?:_x(\d+))?(?:_sk(\d+))?(_fsk)?$"
+    r"(?:_x(\d+))?(?:_sk(\d+))?(_fsk)?(_pf)?(_nt)?$"
 )
 
 
@@ -159,12 +182,13 @@ def parse_kernel_name(name: str):
     """kernelName string -> dict of launch params (None if it isn't an mxpsh name).
 
     The _x{xcd} and _sk{split_k} suffixes are optional (older names without them
-    default to xcd_swizzle=0 / split_k=1); a trailing _fsk sets fused_split_k.
+    default to xcd_swizzle=0 / split_k=1); a trailing _fsk sets fused_split_k,
+    then _pf prefetch and _nt b_nt.
     """
     m = _NAME_RE.match(name.strip())
     if not m:
         return None
-    tm, tn, tk, a, b, o, wpe, xcd, sk, fsk = m.groups()
+    tm, tn, tk, a, b, o, wpe, xcd, sk, fsk, pf, nt = m.groups()
     return {
         "tile_m": int(tm),
         "tile_n": int(tn),
@@ -176,17 +200,13 @@ def parse_kernel_name(name: str):
         "xcd_swizzle": int(xcd) if xcd is not None else 0,
         "split_k": int(sk) if sk is not None else 1,
         "fused_split_k": fsk is not None,
+        "prefetch": pf is not None,
+        "b_nt": nt is not None,
     }
 
 
-# Each operand's e8m0 scale is a block and a layout -- the kernel's
-# a_/b_scale_block and a_/b_scale_layout Constexprs. A block is "1x32", or the
-# coarse "1x128" (A) / "128x128" (B) broadcast to the 1x32 MFMA (a8w8 only).
-# A layout is "mfma_tile" (pre-shuffled by the caller) or "row" (the unshuffled
-# row-major [rows, K // 32] scale, staged through LDS by the kernel; 1x32 only).
-# The defaults spell the a8w8 blockscale contract the tuned tables were built for.
 SCALE_BLOCKS_A = ("1x32", "1x128")
-SCALE_BLOCKS_B = ("1x32", "128x128")
+SCALE_BLOCKS_B = ("1x32", "128x128", "32x32")
 SCALE_LAYOUTS = ("mfma_tile", "row")
 
 # "row" layout: K-tiles per LDS scale-panel row.
@@ -209,18 +229,72 @@ def row_scale_panel(rows: int, tile_k: int, num_threads: int) -> tuple[int, int,
     return rs, passes, (size + 15) // 16 * 16
 
 
+def col_scale_panel(tile_m: int, tile_k: int, num_threads: int) -> int:
+    """Bytes of one 1x128 column-major A-scale LDS panel: a K-tile's scales a
+    byte per lane in dword slots of their own, word-major (E slots per pair word
+    and 16-row lane), padded to whole passes."""
+    k_halves = tile_k // 128
+    slots = max(1, tile_m // 32) * max(1, k_halves // 2) * 16 * 2 * min(2, k_halves)
+    return -(-slots // num_threads) * num_threads * 4
+
+
+def _prefetch_loads(tile_m: int, tile_n: int, tile_k: int) -> tuple[int, int]:
+    """(VMEM loads one steady iteration of the prefetch pipeline issues per
+    thread, bytes of one buffer of the two row scale panels) of an a8w8 tile --
+    the kernel's PF_LOADS and SC_LDS_B."""
+    n_waves = min(_WAVES_PER_WG, tile_n // _MFMA_N)
+    threads = n_waves * 64
+    _, pass_a, panel_a = row_scale_panel(tile_m, tile_k, threads)
+    _, pass_b, panel_b = row_scale_panel(tile_n, tile_k, threads)
+    b_loads = (tile_n // n_waves // _MFMA_N) * (tile_k // 128) * 2  # lo, hi
+    a_loads = tile_m * tile_k // (threads * 16)
+    return pass_a + pass_b + b_loads + a_loads, panel_a + panel_b
+
+
+def prefetch_depth(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    N: int,
+    K: int,
+    split_k: int = 1,
+    b_nt: bool = False,
+) -> int:
+    k_tiles = K // tile_k // max(split_k, 1)
+    loads, panels = _prefetch_loads(tile_m, tile_n, tile_k)
+    lds_cap = _max_lds_bytes()
+    want = min(_PF_MAX_DEPTH, -(-(N // tile_n * max(split_k, 1)) // _GFX950_CU_NUM))
+    mid = tile_m >= _PF_MID_TILE_M or (tile_m >= _PF_MULTI_M_TILE_M and not b_nt)
+    max_depth = _PF_MID_MAX_DEPTH if mid else _PF_MAX_DEPTH
+    if tile_m >= _PF_BIG_TILE_M:
+        max_depth = _PF_BIG_MAX_DEPTH
+    best = 0
+    for p in range(2, min(max_depth, k_tiles) + 1):
+        lds = tile_m * tile_k * (p + 1) + (2 + -(-(p - 1) // ROW_SCALE_CHUNK)) * panels
+        if (p - 1) * loads <= 63 and lds <= lds_cap and lds_cap // lds >= want:
+            best = p
+    return best
+
+
 def estimated_lds_bytes(
     ki: kernelInstance,
     a_scale_layout: str = "mfma_tile",
     b_scale_layout: str = "mfma_tile",
+    a_scale_block: str = "1x32",
+    b_scale_block: str = "1x32",
 ) -> int:
     """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes],
-    plus the double-buffered scale panel of each row-layout operand."""
+    plus the double-buffered scale panel of each row-layout operand: a 1x32-row
+    panel, a 1x128 A's column panel, none for a 128x128 B (read from global)."""
     lds = 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
     threads = min(_WAVES_PER_WG, ki.tile_n // _MFMA_N) * 64
-    for layout, rows in ((a_scale_layout, ki.tile_m), (b_scale_layout, ki.tile_n)):
-        if layout == "row":
-            lds += 2 * row_scale_panel(rows, ki.tile_k, threads)[2]
+    if a_scale_layout == "row":
+        if a_scale_block == "1x128":
+            lds += 2 * col_scale_panel(ki.tile_m, ki.tile_k, threads)
+        else:
+            lds += 2 * row_scale_panel(ki.tile_m, ki.tile_k, threads)[2]
+    if b_scale_layout == "row" and b_scale_block != "128x128":
+        lds += 2 * row_scale_panel(ki.tile_n, ki.tile_k, threads)[2]
     return lds
 
 
@@ -240,10 +314,12 @@ def instance_valid(ki: kernelInstance) -> bool:
     ):
         return False
     if ki.tile_m % 32 != 0 and not (
-        ki.tile_m == 16 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
+        ki.tile_m in (16, 48) and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
     ):
-        # The per-1x32 MX path packs M chunks in pairs. The M=16 exception is
-        # reserved for the blockscale a8w8 path, where one A scale broadcasts.
+        # A pre-shuffled per-1x32 A scale packs M chunks in pairs. a8w8 may run
+        # one 16-row chunk: its raw (row) scales pack a lone chunk's word with
+        # itself, and a mfma_tile 1x128 scale broadcasts. Three (tile_m 48)
+        # need the row-layout scales, which fits_shape checks.
         return False
     if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
         return False
@@ -254,6 +330,12 @@ def instance_valid(ki: kernelInstance) -> bool:
         ki.tile_m, ki.tile_n
     ):
         return False  # unschedulable occupancy hint -- see _estimate_max_wpe
+    if ki.b_nt and not ki.prefetch:
+        return False  # B is streamed non-temporal by the prefetch pipeline only
+    if ki.prefetch and (
+        (ki.a_dtype, ki.b_dtype) != ("fp8", "fp8") or ki.tile_m > _PF_TILE_M_MAX
+    ):
+        return False
     arb = _a_row_bytes(ki.a_dtype, ki.tile_k)
     if (
         ki.tile_m * arb
@@ -267,10 +349,11 @@ def fits_shape(
     M: int,
     N: int,
     K: int,
-    a_scale_block: str = "1x128",
-    b_scale_block: str = "128x128",
-    a_scale_layout: str = "mfma_tile",
-    b_scale_layout: str = "mfma_tile",
+    *,
+    a_scale_block: str,
+    b_scale_block: str,
+    a_scale_layout: str,
+    b_scale_layout: str,
 ) -> bool:
     """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
     microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
@@ -281,26 +364,56 @@ def fits_shape(
     whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
     so the split boundary never straddles a tile or a microscale word.
 
-    The scale blocks / layouts are the kernel's (see SCALE_LAYOUTS); the defaults
-    are the a8w8 blockscale contract. A row-layout operand's scale panel must fit
-    LDS next to A."""
+    The scale blocks / layouts are the kernel's (see SCALE_LAYOUTS), always named
+    by the caller. A row-layout operand's scale panel must fit LDS next to A."""
     if K % 128 != 0:
         return False
     row_row = (a_scale_layout, b_scale_layout) == ("row", "row")
+    # An odd chunk count over one (tile_m 48: three 16-row chunks; tile_n 192:
+    # three 16-col chunks a wave) half-fills its last scale word, which only
+    # the row-layout 1x32 / 32x32 scale panels read.
+    m_chunks = ki.tile_m // 16
+    n_chunks = ki.tile_n // min(4, ki.tile_n // 16) // 16
+    row_a = (a_scale_layout, a_scale_block) == ("row", "1x32")
+    row_b = b_scale_layout == "row" and b_scale_block in ("1x32", "32x32")
+    if m_chunks > 1 and m_chunks % 2 and not row_a:
+        return False
+    if n_chunks > 1 and n_chunks % 2 and not row_b:
+        return False
     if ki.tile_k == 512 and not row_row:
         return False  # a mfma_tile scale word spans 256 K: tile_k <= 256
     if ki.fused_split_k and not row_row:
         return False  # the in-kernel reduce reads row-layout scales' fp32 partials
+    if ki.prefetch:
+        if not (
+            row_row
+            and a_scale_block == "1x32"
+            and b_scale_block in ("1x32", "32x32")
+            and prefetch_depth(
+                ki.tile_m, ki.tile_n, ki.tile_k, N, K, ki.split_k, ki.b_nt
+            )
+            >= 2
+        ):
+            return False
+        # B is read once when the shape is a single M tile: stream it (_nt)
+        # then, and only then -- several M tiles reuse it through L2.
+        if ki.b_nt != (M <= ki.tile_m):
+            return False
     if (
         "row" in (a_scale_layout, b_scale_layout)
-        and estimated_lds_bytes(ki, a_scale_layout, b_scale_layout) > _max_lds_bytes()
+        and estimated_lds_bytes(
+            ki, a_scale_layout, b_scale_layout, a_scale_block, b_scale_block
+        )
+        > _max_lds_bytes()
     ):
         return False
     if ki.tile_m == 16 and M > 16:
         return False
-    # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
-    # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6
-    # combos run the per-1x32 MX path (blockscale=False) and are exempt.
+    if b_scale_block == "32x32" and (b_scale_layout != "row" or N % 32 != 0):
+        return False  # read row-major, one scale row per whole 32-N block
+    # A 128x128 b_scale is a8w8-only and needs whole 128-N blocks: (N//128, K//128)
+    # scales, one per 128-N block. fp4/fp6 combos run the per-1x32 MX path and
+    # are exempt.
     if (
         (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
         and b_scale_block == "128x128"
@@ -354,9 +467,30 @@ def _build_kernels_list():
                         if instance_valid(ki):
                             out[idx] = ki
                             idx += 1
+    odd = [(tm, tn) for tm in _ODD_TILE_M for tn in _TILE_N + _ODD_TILE_N]
+    odd += [(tm, tn) for tm in _TILE_M for tn in _ODD_TILE_N]
+    odd += [(tm, tn) for tm in _EXTRA_TILE_M for tn in _TILE_N + _ODD_TILE_N]
+    for tm, tn in odd:
+        for tk in _TILE_K + ((512,) if tm <= 64 else ()):
+            for wpe in _WAVES_PER_EU:
+                for xcd in _XCD_SWIZZLE:
+                    for sk in _SPLIT_K:
+                        ki = kernelInstance(
+                            tm, tn, tk, "fp8", "fp8", "bf16", wpe, xcd, sk
+                        )
+                        if instance_valid(ki):
+                            out[idx] = ki
+                            idx += 1
     for i, ki in list(out.items()):
         if ki.split_k > 1 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8"):
             out[KERNEL_ID_BASE_FSK + i] = replace(ki, fused_split_k=True)
+    for i, ki in list(out.items()):
+        pf = replace(ki, prefetch=True)
+        if instance_valid(pf):
+            j = i - KERNEL_ID_BASE_FSK if i >= KERNEL_ID_BASE_FSK else i
+            fsk_off = 500_000 if ki.fused_split_k else 0  # below each base + 500k
+            out[KERNEL_ID_BASE_PF + fsk_off + j] = pf
+            out[KERNEL_ID_BASE_PF_NT + fsk_off + j] = replace(pf, b_nt=True)
     return out
 
 
@@ -439,6 +573,27 @@ MXFP8_ROW_SCALES = (
     ("b_scale_layout", "row"),
 )
 
+MXFP8_ROW_SCALES_W32X32 = (
+    ("a_scale_block", "1x32"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "32x32"),
+    ("b_scale_layout", "row"),
+)
+
+MXFP8_ROW_SCALES_W128X128 = (
+    ("a_scale_block", "1x128"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "128x128"),
+    ("b_scale_layout", "row"),
+)
+# gemm_a8w8_mxfp8_bpreshuffle's w_scale block -> its kernels' scales (the
+# x_scale block goes with it: 1x128 for 128x128, else 1x32).
+MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK = {
+    "1x32": MXFP8_ROW_SCALES,
+    "32x32": MXFP8_ROW_SCALES_W32X32,
+    "128x128": MXFP8_ROW_SCALES_W128X128,
+}
+
 
 @dataclass(frozen=True)
 class Pipeline:
@@ -458,9 +613,40 @@ def _fits_mxpsh_row(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     )
 
 
+def _fits_mxpsh_row_w32x32(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    return (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and fits_shape(
+        ki, M, N, K, **dict(MXFP8_ROW_SCALES_W32X32)
+    )
+
+
+def _fits_8wave_w32x32(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+    return N % 32 == 0 and fits_shape_8wave(ki, M, N, K)
+
+
+def _fits_mxpsh_row_w128x128(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    return (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and fits_shape(
+        ki, M, N, K, **dict(MXFP8_ROW_SCALES_W128X128)
+    )
+
+
+def _fits_8wave_w128x128(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+    # A chunk stages a dword of each 128x128 scale row: K // 128 >= 4.
+    return N % 128 == 0 and K >= 512 and fits_shape_8wave(ki, M, N, K)
+
+
 # Order is the order candidates are emitted per shape. mxpsh's _fsk variants
 # are kernels_list entries (fused_split_k), not a pipeline of their own.
 MXFP8_ROW_PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("mxpsh", kernels_list, _fits_mxpsh_row),
     Pipeline("8wave", kernels_list_8wave, fits_shape_8wave),
+)
+# The same kernels (and kernelNames) on a 32x32 w_scale, and on the blockscale
+# pair (1x128 column-major x_scale, 128x128 w_scale).
+MXFP8_ROW_W32X32_PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("mxpsh", kernels_list, _fits_mxpsh_row_w32x32),
+    Pipeline("8wave", kernels_list_8wave, _fits_8wave_w32x32),
+)
+MXFP8_ROW_W128X128_PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("mxpsh", kernels_list, _fits_mxpsh_row_w128x128),
+    Pipeline("8wave", kernels_list_8wave, _fits_8wave_w128x128),
 )

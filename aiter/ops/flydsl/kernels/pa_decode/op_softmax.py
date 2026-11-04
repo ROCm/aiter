@@ -35,15 +35,14 @@ class PaDecodeSoftmax:
         return valid
 
     def scale_mask(self, tile_valid, window_left):
-        ctx_thr = fx.Vector.from_elements(
-            [
-                tile_valid.to(fx.Float32)
-                - fx.Int32(
-                    self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
-                ).to(fx.Float32)
-            ],
-            dtype=fx.Float32,
-        ).broadcast_to(4)
+        ctx_thr = fx.full(
+            4,
+            tile_valid.to(fx.Float32)
+            - fx.Int32(
+                self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
+            ).to(fx.Float32),
+            fx.Float32,
+        )
         window_scale_thr = None
         if const_expr(self.traits.sliding_window > 0):
             # Only the MTP window union may set the shared FP8 scale;
@@ -51,16 +50,15 @@ class PaDecodeSoftmax:
             first_visible = (window_left - (self.traits.query_length - 1)).to(
                 fx.Float32
             )
-            window_scale_thr = fx.Vector.from_elements(
-                [
-                    first_visible
-                    - fx.Int32(
-                        self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
-                    ).to(fx.Float32)
-                ],
-                dtype=fx.Float32,
-            ).broadcast_to(4)
-        zero4_scale = fx.Vector.filled(4, 0.0, fx.Float32)
+            window_scale_thr = fx.full(
+                4,
+                first_visible
+                - fx.Int32(
+                    self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
+                ).to(fx.Float32),
+                fx.Float32,
+            )
+        zero4_scale = fx.full(4, 0.0, fx.Float32)
         return ctx_thr, window_scale_thr, zero4_scale
 
     def mask_v_scale(self, vec, a, bounds):
@@ -73,31 +71,36 @@ class PaDecodeSoftmax:
             + m * MFMA_MNK * self.traits.NWARP_PAD * self.traits.f32
         )
 
+    def lsum_offset(self, m):
+        return (
+            self.traits.sLsum_off
+            + m * MFMA_MNK * self.traits.NWARP_PAD * self.traits.f32
+        )
+
+    def p_offset(self, m):
+        return self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
+
     def row_thresholds(self, tile_valid, window_left, m):
         n_valid_tile = (tile_valid - self.ctx.causal_offset[m]).to(fx.Float32)
         base_tok_f = fx.Int32(
             self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
         ).to(fx.Float32)
-        thr = fx.Vector.from_elements(
-            [n_valid_tile - base_tok_f], dtype=fx.Float32
-        ).broadcast_to(4)
+        thr = fx.full(4, n_valid_tile - base_tok_f, fx.Float32)
         window_thr = None
         if const_expr(self.traits.sliding_window > 0):
             # Subtract before converting to avoid rounding large edges.
             first_valid_tile = (window_left - self.ctx.causal_offset[m]).to(fx.Float32)
-            window_thr = fx.Vector.from_elements(
-                [first_valid_tile - base_tok_f], dtype=fx.Float32
-            ).broadcast_to(4)
+            window_thr = fx.full(4, first_valid_tile - base_tok_f, fx.Float32)
         return thr, window_thr
 
     @flyc.jit
     def multi_scores(self, frag_Ss, scale, k_scale_shared, tile_valid, window_left, m):
         thr, window_thr = self.row_thresholds(tile_valid, window_left, m)
-        neg4 = fx.Vector.filled(4, float("-inf"), fx.Float32)
+        neg4 = fx.full(4, float("-inf"), fx.Float32)
 
         # Scale finite logits before selecting -inf to avoid 0 * -inf
         # for zero-Q rows. The stored row max is already scaled.
-        scale_b = fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(4)
+        scale_b = fx.full(4, scale, fx.Float32)
         if const_expr(self.traits.per_token_kv):
             scaled_frags = [
                 frag_Ss[a] * k_scale_shared[a] * scale_b
@@ -192,16 +195,14 @@ class PaDecodeSoftmax:
         v_max_scaled = v_max_global * fx.Float32(1.0 / self.traits.FP8_MAX)
         v_max_safe = v_max_scaled + fx.Float32(1e-8 / self.traits.FP8_MAX)
         norm_factor = fx.Float32(rcp_f32(v_max_safe))
-        norm_factor_b = fx.Vector.from_elements(
-            [norm_factor], dtype=fx.Float32
-        ).broadcast_to(4)
+        norm_factor_b = fx.full(4, norm_factor, fx.Float32)
         return v_max_scaled, norm_factor_b
 
     def single_scores(
-        self, frag_Ss, scale, tile_valid, window_left, cur_kv_buf, bounds
+        self, frag_Ss, scale, tile_valid, window_left, cur_kv_buf, bounds, m
     ):
-        thr, window_thr = self.row_thresholds(tile_valid, window_left, 0)
-        neg4 = fx.Vector.filled(
+        thr, window_thr = self.row_thresholds(tile_valid, window_left, m)
+        neg4 = fx.full(
             4,
             float("-inf") if self.traits.M1_SCALE_BEFORE_MASK else -1e30,
             fx.Float32,
@@ -209,7 +210,7 @@ class PaDecodeSoftmax:
         # As in Phase A, scale before -inf masking to avoid zero-Q NaNs.
         scale_b = None
         if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
-            scale_b = fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(4)
+            scale_b = fx.full(4, scale, fx.Float32)
         v_scale_vecs = None
         if const_expr(self.traits.per_token_kv):
             v_scale_vecs = []
@@ -244,7 +245,7 @@ class PaDecodeSoftmax:
         # pass 1: per-warp max for this qhead
         self.stage_row_max(
             masked_chunks,
-            self.traits.sLmax_off,
+            self.lmax_offset(m),
             scale,
             self.traits.M1_SCALE_BEFORE_MASK,
         )
@@ -270,9 +271,7 @@ class PaDecodeSoftmax:
             )
             m_new_saved.append(m_new)
             safe_max = (m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F)
-            safe_max_saved.append(
-                fx.Vector.from_elements([safe_max], dtype=fx.Float32).broadcast_to(4)
-            )
+            safe_max_saved.append(fx.full(4, fx.Float32(safe_max), fx.Float32))
         ls_saved = [self.ctx.ZERO_F for _ in range_constexpr(self.traits.M_TILES)]
         # Share one scale fragment across queries, not the full scale tile.
         for a in range_constexpr(self.traits.NCHUNK):
@@ -336,7 +335,7 @@ class PaDecodeSoftmax:
         )
         # Empty rows need exponent reference 0 to avoid -inf-(-inf).
         safe_max = (m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F)
-        m_new_b = fx.Vector.from_elements([safe_max], dtype=fx.Float32).broadcast_to(4)
+        m_new_b = fx.full(4, fx.Float32(safe_max), fx.Float32)
         ls = fx.Float32(0.0)
         words = []
         for a in range_constexpr(self.traits.NCHUNK):
@@ -352,7 +351,7 @@ class PaDecodeSoftmax:
                 )
                 p_scaled = Pa * v_sc * norm_factor_b
             else:
-                p_scaled = Pa * fx.Vector.filled(4, self.traits.FP8_MAX, fx.Float32)
+                p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
                 p_scaled.to(fx.BFloat16)
                 if const_expr(self.traits.is_bf16_kv)
@@ -390,22 +389,30 @@ class PaDecodeSoftmax:
 
     @flyc.jit
     def pack_single(
-        self, masked_chunks, m_prev, scale, v_scale_vecs, cur_kv_buf, norm_factor_b
+        self,
+        masked_chunks,
+        m_prev,
+        scale,
+        v_scale_vecs,
+        cur_kv_buf,
+        norm_factor_b,
+        m,
     ):
-        # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum
+        # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum.
+        # M-tile m owns its Lmax, P and Lsum slots.
         if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
-            tile_max = self.lds.load_wave(
-                self.traits.sLmax_off, self.ctx.lane16
-            ).reduce(ReductionOp.MAX, fastmath=self.ctx.fm_nnan)
+            tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
+                ReductionOp.MAX, fastmath=self.ctx.fm_nnan
+            )
             m_new = (
                 tile_max
                 if const_expr(self.traits.single_tile_plan)
                 else fx.maxnumf(m_prev, tile_max, fastmath=self.ctx.fm_nnan)
             )
         else:
-            tile_max = self.lds.load_wave(
-                self.traits.sLmax_off, self.ctx.lane16
-            ).reduce(ReductionOp.MAX)
+            tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
+                ReductionOp.MAX
+            )
             m_new = (
                 tile_max
                 if const_expr(self.traits.single_tile_plan)
@@ -416,19 +423,17 @@ class PaDecodeSoftmax:
         softmax_max = m_new
         if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
             softmax_max = (m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F)
-        m_new_b = fx.Vector.from_elements([softmax_max], dtype=fx.Float32).broadcast_to(
-            4
-        )
+        m_new_b = fx.full(4, fx.Float32(softmax_max), fx.Float32)
         ls = fx.Float32(0.0)
         words = []
         if const_expr(not self.traits.M1_SCALE_BEFORE_MASK):
-            zero4_p = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero4_p = fx.full(4, 0.0, fx.Float32)
         for a in range_constexpr(self.traits.NCHUNK):
             if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
                 Pa = fx.Vector(fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast"))
             else:
                 # Finite mask sentinels require an explicit zero probability.
-                valid_a = masked_chunks[a] > fx.Vector.filled(4, -1e29, fx.Float32)
+                valid_a = masked_chunks[a] > fx.full(4, -1e29, fx.Float32)
                 Pa = valid_a.select(
                     fx.Vector(
                         fx.exp2(
@@ -449,14 +454,14 @@ class PaDecodeSoftmax:
                 )
                 p_scaled = Pa * v_scale_this * norm_factor_b
             else:
-                p_scaled = Pa * fx.Vector.filled(4, self.traits.FP8_MAX, fx.Float32)
+                p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
                 p_scaled.to(fx.BFloat16)
                 if const_expr(self.traits.is_bf16_kv)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
         p_off0 = (
-            self.traits.sP_off
+            self.p_offset(m)
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
             + (self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4)
             * self.traits.QP_ELEM_BYTES
@@ -480,7 +485,5 @@ class PaDecodeSoftmax:
             else fx.Float32(fx.exp2(m_prev - softmax_max, fastmath="fast"))
         )
         if self.ctx.rgroup == 0:
-            self.lds.store_wave(
-                self.traits.sLsum_off, self.ctx.lane16, self.ctx.warp, ls
-            )
+            self.lds.store_wave(self.lsum_offset(m), self.ctx.lane16, self.ctx.warp, ls)
         return m_new, corr_reg
