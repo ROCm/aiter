@@ -168,6 +168,22 @@ def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
     }
 
 
+@benchmark()
+def test_jdbba_block_k_invalid(B, D, Kout, Mi, block_k, dtype):
+    d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
+    out = _nan_out(d["L"], d["N"], dtype)
+    try:
+        _launch(d, out, B, Mi, True, block_k=block_k)
+    except ValueError:
+        raised = True
+    else:
+        raised = False
+    untouched = bool(out.isnan().all())
+    assert raised, f"block_k={block_k} with K={D} must raise ValueError"
+    assert untouched, f"block_k={block_k}: rejected call must not write C"
+    return {"gfx": get_gfx(), "raised ValueError": raised, "C untouched": untouched}
+
+
 def _permute_group_lengths_(seq_offsets):
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     permuted = torch.zeros_like(seq_offsets)
@@ -358,6 +374,14 @@ def main():
     ):
         rows.append(test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype))
     _summarize("jagged_dense_bmm block_k", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regression_shapes
+    ):
+        for block_k in (0, 24, 3 * D // 8):
+            rows.append(test_jdbba_block_k_invalid(B, D, Kout, Mi, block_k, dtype))
+    _summarize("jagged_dense_bmm invalid block_k", rows)
 
     rows = []
     for dtype, (B, D, Kout, Mi), seed in itertools.product(
