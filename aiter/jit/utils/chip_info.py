@@ -28,6 +28,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Windows ROCm ships `hipinfo` instead of `rocminfo`; the output formats differ,
 # so each has its own compute-unit parser below.
 _GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
+_GFX_ARCH_PATTERN = r"gfx[0-9a-z]+(?:-[0-9a-z]+)*"
 
 
 @functools.lru_cache(maxsize=1)
@@ -43,7 +44,7 @@ def _gpu_info_output() -> str:
 
 
 def _gfx_from_text(text: str) -> str | None:
-    match = re.search(r"\b(gfx\w+)\b", text, re.IGNORECASE)
+    match = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", text, re.IGNORECASE)
     return match.group(1).lower() if match else None
 
 
@@ -99,8 +100,14 @@ def _gpu_info_archs() -> list[str]:
     archs: list[str] = []
     # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200". ISA names
     # ("Name: amdgcn-amd-amdhsa--gfx9-4-generic") are not device archs.
+    # Preserve the exact ROCr-reported identity, including the gfx1250-strict
+    # (MI450 A0) variant. strict is mapped to the gfx1250 kernel family only at
+    # explicitly validated dispatch sites, via base_gfx_arch()/is_gfx1250_family();
+    # build artifacts, caches, tuned configs and prebuilt binaries stay keyed by
+    # the exact target. Folding here would make _needs_arch_rebuild() treat a
+    # strict .so as not covering a strict device and rebuild in a loop.
     for match in re.finditer(
-        r"^\s*(?:Name|gcnArchName):\s*(gfx\w+)",
+        rf"^\s*(?:Name|gcnArchName):\s*({_GFX_ARCH_PATTERN})\b",
         _gpu_info_output(),
         re.IGNORECASE | re.MULTILINE,
     ):
@@ -178,6 +185,7 @@ _LDS_CAPACITY_BYTES = {
     "gfx1200": 64 * 1024,
     "gfx1201": 64 * 1024,
     "gfx1250": 320 * 1024,
+    "gfx1250-strict": 320 * 1024,
 }
 
 
@@ -300,7 +308,7 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         key, value = m.group(1), m.group(2)
         if key == "Name" and name is None:
             # Agent names can carry target-id features ("gfx942:sramecc+").
-            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            m2 = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", value, re.IGNORECASE)
             name = m2.group(1) if m2 else value
         elif key == "Device Type":
             kind = value
@@ -319,7 +327,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     for block in re.split(r"^device#", _gpu_info_output(), flags=re.MULTILINE)[1:]:
         # gcnArchName can carry target-id features ("gfx942:sramecc+").
         name = re.search(
-            r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
+            rf"^gcnArchName:\s*({_GFX_ARCH_PATTERN})",
+            block,
+            re.MULTILINE | re.IGNORECASE,
         )
         rev = re.search(
             r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE
@@ -514,7 +524,8 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed).
+         get_build_targets_env() (no GPU needed), which pairs each arch with
+         every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
@@ -841,7 +852,7 @@ def _get_device_name(device_id: int) -> str:
         if num_xcds == 4:
             return "MI350P"
         return "MI350"
-    elif gfx == "gfx1250":
+    elif gfx in ("gfx1250", "gfx1250-strict"):
         return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")

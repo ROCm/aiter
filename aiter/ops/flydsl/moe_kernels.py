@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
+    current_stream_arg,
     ptr_arg,
 )
 
@@ -2042,6 +2043,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2117,6 +2119,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            use_valid_token_count=use_valid_token_count,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2368,6 +2371,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2389,6 +2393,9 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    use_valid_token_count: atomic a16w-mix only; bound scatter rows by
+        num_valid_ids[1] (the sort's real token count) when out is padded.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2421,6 +2428,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
@@ -2605,7 +2613,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             int(E),
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return counter, topids_to_rows.view(token_num, topk)
 
@@ -2671,7 +2679,7 @@ def flydsl_moe_topids_to_rows(
             topids_to_rows_kernel,
             *route_args,
             *_ep_tail,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     else:
         from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -2700,7 +2708,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             route_grid,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     return counter, topids_to_rows.view(token_num, topk)
 
@@ -3530,7 +3538,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         if use_token_multidest:
@@ -3561,7 +3569,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         # The M16 scatter consumes a finalized inverse map and K1024 tiles.
@@ -3584,7 +3592,7 @@ def flydsl_moe_fused_quant_preshuffle(
             from aiter.jit.utils.chip_info import get_cu_num
 
             apre_workers = max(1, 4 * (get_cu_num() or 1))
-            stream = torch.cuda.current_stream()
+            stream = current_stream_arg()
             if prequantized:
                 # MoRI already produced packed FP4 and padded E8M0 rows.
                 compact_payload = grouped_in.contiguous()
@@ -3669,7 +3677,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return out_payload, out_scale
 
@@ -3691,6 +3699,6 @@ def flydsl_moe_fused_quant_preshuffle(
         n_rows,
         max_m,
         grid_blocks,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return out_payload, out_scale
