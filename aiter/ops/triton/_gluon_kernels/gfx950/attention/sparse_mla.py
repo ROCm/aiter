@@ -2876,9 +2876,9 @@ def _sparse_mla_reduce(
             ptr=pl_row_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
         # Issued before the weights exist: nothing in the address depends on them.
-        a_off = (
-            offs_s[:, None] * pa_stride_s + h * pa_stride_h + offs_d[None, :]
-        ).to(gl.int32)
+        a_off = (offs_s[:, None] * pa_stride_s + h * pa_stride_h + offs_d[None, :]).to(
+            gl.int32
+        )
         acc_s = gl.amd.cdna4.buffer_load(
             ptr=pa_row_ptr,
             offsets=a_off,

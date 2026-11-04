@@ -3,31 +3,7 @@
 
 """Gluon (gfx950) sparse MLA on a per-tensor fp8 KV cache ("fp8_scalar") with fp8
 dots. sparse_mla_fwd (attention/sparse_mla.py) launches it whenever it can address
-the call; the rest runs on the generic kernel in this directory's sparse_mla.py,
-whose split merge and output store this kernel reuses.
-
-KV rows are 512 bytes (DeepSeek-V4 / V4.1, GLM-5.3-Flash; V is the whole row) or
-512 + a 64-byte RoPE tail (GLM-5.2; V is the latent). q is fp8 with a tensor scale,
-or bf16 quantized in the prologue with one scale per head.
-
-A program is one query row, BLOCK_H heads and one split of the row's keys. Each
-tile of 64 keys is gathered straight into a 2-slot LDS ring one tile ahead, with
-its row ids loaded one further ahead. QK gives each wave 16 heads and puts any
-waves left over on keys (QK_KEY_WAVES); PV splits the output dims. When a wave
-owns whole rows, QK runs as two 32-key halves with K read one chunk ahead, since
-a whole tile's K operand would not fit in registers.
-
-The softmax is base 2 with a lazy max: it only moves when a score beats it by
-2^LAZY_LOG2, so most tiles skip the rescale. P goes to PV as e4m3 scaled so that
-it still reaches 448 with the max lagging; the scale cancels in the normalization.
-
-Key lists: SEG_FLAT is one list of row ids. The paged layouts hold slot ids and
-take up to two lists (DeepSeek-V4's SWA window and top-k): SEG_ONE_LOOP reads them
-as one list when both caches share an allocation and a scale, SEG_TWO_LOOPS runs a
-loop per list otherwise. The lists hold no -1 sentinels.
-
-Split programs write the generic kernel's partials for _sparse_mla_reduce. The
-output store can apply DeepSeek-V4's inverse RoPE and MXFP8 quantization.
+the call
 """
 
 import math
@@ -49,11 +25,6 @@ _LOG2_E4M3_MAX = math.log2(448.0)
 BN: gl.constexpr = gl.constexpr(64)  # keys per tile
 D: gl.constexpr = gl.constexpr(512)  # latent width = V width
 INV_ROPE_DIM: gl.constexpr = gl.constexpr(64)  # dims the output's inverse RoPE turns
-XCDS: gl.constexpr = gl.constexpr(8)  # program ids are dealt round-robin over 8 XCDs
-
-SEG_FLAT: gl.constexpr = gl.constexpr(0)
-SEG_ONE_LOOP: gl.constexpr = gl.constexpr(1)
-SEG_TWO_LOOPS: gl.constexpr = gl.constexpr(2)
 
 # Triton 3.8 spells shared_memory_descriptor.reinterpret as _reinterpret and has
 # no gl.amd.hint.sched_barrier (sched_barrier falls back to an asm fence); both
@@ -64,9 +35,6 @@ _HAS_REINTERPRET = gl.constexpr(
 _HAS_SCHED_BARRIER = gl.constexpr(
     hasattr(gl.amd, "hint") and hasattr(gl.amd.hint, "sched_barrier")
 )
-# No AGPRs. Triton 3.9's LLVM infers this; 3.8's does not for kernels with async
-# copies and splits the budget into 128 VGPRs + 128 AGPRs at 2 waves/SIMD.
-_FN_ATTRS = "amdgpu-agpr-alloc=0"
 
 
 @gluon.jit
@@ -296,7 +264,7 @@ def one_loop_list(
     main_stride,
     extra_row0,
     extra_stride,
-    SEG: gl.constexpr,
+    PAGED: gl.constexpr,
     MAIN_BLOCK_LOG2: gl.constexpr,
     EXTRA_BLOCK_LOG2: gl.constexpr,
 ):
@@ -304,7 +272,7 @@ def one_loop_list(
     masks and the split."""
     start = gl.load(indptr_ptr + row)
     end = gl.load(indptr_ptr + row + 1)
-    if SEG == SEG_FLAT:
+    if not PAGED:
         ix = (idx_ptr + start,)
     else:
         main = (idx_ptr + start, main_row0, main_stride, MAIN_BLOCK_LOG2)
@@ -447,9 +415,7 @@ def qk_halves(cfg, kvt, qc):
         if i < 4:
             S0 = gl.amd.cdna4.mfma_scaled(qc[i], None, "e4m3", k, None, "e4m3", S0)
         else:
-            S1 = gl.amd.cdna4.mfma_scaled(
-                qc[i - 4], None, "e4m3", k, None, "e4m3", S1
-            )
+            S1 = gl.amd.cdna4.mfma_scaled(qc[i - 4], None, "e4m3", k, None, "e4m3", S1)
         sched_barrier()
         k = kn
     return S0, S1
@@ -562,17 +528,18 @@ class Program:
     def initialize(
         cfg,
         HEAD_BLOCKS: gl.constexpr,
+        NUM_XCDS: gl.constexpr,
         q_ptr,
         q_stride0: gl.constexpr,
         q_stride1: gl.constexpr,
         num_heads: gl.constexpr,
         num_splits,
     ):
-        # A row's head blocks run at program ids L, L + 8, ..: on one XCD, so the
-        # later blocks hit the first one's gathers in L2.
+        # A row's head blocks run at program ids L, L + NUM_XCDS, ..: on one XCD,
+        # so the later blocks hit the first one's gathers in L2.
         L = gl.program_id(0)
-        row = (L // (XCDS * HEAD_BLOCKS)) * XCDS + L % XCDS
-        h0 = (L // XCDS) % HEAD_BLOCKS * cfg.BLOCK_H
+        row = (L // (NUM_XCDS * HEAD_BLOCKS)) * NUM_XCDS + L % NUM_XCDS
+        h0 = (L // NUM_XCDS) % HEAD_BLOCKS * cfg.BLOCK_H
         return Program(
             cfg, row, h0, gl.program_id(2), num_splits, num_heads,
             q_ptr + row.to(gl.int64) * q_stride0 + h0 * q_stride1, q_stride1,
@@ -868,7 +835,7 @@ def _sparse_mla_fp8(
     kv_ptr,  # u8 base of the cache(s): rows of 512 + ROPE_TAIL bytes
     out_ptr,  # [C, H, 512] bf16 or MXFP8 e4m3 data; None when split
     indptr_ptr,  # [C + 1] int32, the main list
-    idx_ptr,  # int32 row ids (SEG_FLAT) or slot ids
+    idx_ptr,  # int32 row ids (flat pool) or slot ids
     sink_ptr,  # [H] f32 or None
     q_scale_ptr,  # [1] f32 for fp8 q, None for bf16 q
     ks_ptr,  # [1] f32 cache scale
@@ -877,7 +844,7 @@ def _sparse_mla_fp8(
     part_l_ptr,
     part_acc_ptr,
     # paged lists: the extra list, both lists' slot -> row maps (row0, stride);
-    # SEG_TWO_LOOPS adds the extra cache and its scale (None: kv's scale)
+    # two loops add the extra cache and its scale (None: kv's scale)
     x_indptr_ptr,
     x_idx_ptr,
     main_row0,
@@ -895,7 +862,7 @@ def _sparse_mla_fp8(
     osc_stride: gl.constexpr,
     num_queries,
     num_heads: gl.constexpr,
-    sm_scale_log2,
+    sm_scale,
     num_splits,
     q_stride0: gl.constexpr,
     q_stride1: gl.constexpr,
@@ -905,29 +872,30 @@ def _sparse_mla_fp8(
     ROPE_TAIL: gl.constexpr,
     LAZY_LOG2: gl.constexpr,
     ADDR64: gl.constexpr,
-    SEG: gl.constexpr,
     MAIN_BLOCK_LOG2: gl.constexpr,
     EXTRA_BLOCK_LOG2: gl.constexpr,
     HEAD_BLOCKS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
     cfg = Config(BLOCK_H, gl.num_warps(), ROPE_TAIL, LAZY_LOG2, ADDR64)
     SPLIT: gl.constexpr = part_m_ptr is not None
     Q_BF16: gl.constexpr = q_scale_ptr is None
+    PAGED: gl.constexpr = main_stride is not None
+    TWO_LOOPS: gl.constexpr = x_kv_ptr is not None
     pgm = Program.initialize(
-        cfg, HEAD_BLOCKS, q_ptr, q_stride0, q_stride1, num_heads, num_splits
+        cfg, HEAD_BLOCKS, NUM_XCDS, q_ptr, q_stride0, q_stride1, num_heads, num_splits
     )
-    if HEAD_BLOCKS > 1:
-        if pgm.row >= num_queries:
-            return
-    if SPLIT:
-        if pgm.split >= num_splits:  # padding of the launched split count
-            m0 = gl.full([cfg.BLOCK_M], float("-inf"), gl.float32, cfg.ROW_L)
-            pgm.store_partial(
-                None, m0, gl.zeros_like(m0), 0.0, part_m_ptr, part_l_ptr, part_acc_ptr
-            )
-            return
+    if HEAD_BLOCKS > 1 and pgm.row >= num_queries:  # rows padded to the XCD count
+        return
+    if SPLIT and pgm.split >= num_splits:  # padding of the launched split count
+        m0 = gl.full([cfg.BLOCK_M], float("-inf"), gl.float32, cfg.ROW_L)
+        pgm.store_partial(
+            None, m0, gl.zeros_like(m0), 0.0, part_m_ptr, part_l_ptr, part_acc_ptr
+        )
+        return
 
     # base-2 score scale per row: q scale x cache scale x softmax scale
+    sm_scale_log2 = sm_scale * LOG2E
     k_scale = gl.load(ks_ptr)
     if Q_BF16:
         # quantized before the ring is live, so its LDS scratch aliases the ring
@@ -939,7 +907,7 @@ def _sparse_mla_fp8(
             gl.load(q_scale_ptr) * k_scale * sm_scale_log2
         )
 
-    if SEG == SEG_TWO_LOOPS:
+    if TWO_LOOPS:
         if not Q_BF16:
             # once, for both loops
             q = pgm.q_fp8()
@@ -951,7 +919,7 @@ def _sparse_mla_fp8(
     else:
         start, end, ix = one_loop_list(
             indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr, pgm.row, main_row0,
-            main_stride, extra_row0, extra_stride, SEG, MAIN_BLOCK_LOG2,
+            main_stride, extra_row0, extra_stride, PAGED, MAIN_BLOCK_LOG2,
             EXTRA_BLOCK_LOG2,
         )  # fmt: skip
         t0, t1 = pgm.tiles(gl.cdiv(end - start, BN))
