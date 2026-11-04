@@ -31,6 +31,8 @@ from .gemm_common_gfx1250 import (
     pipeline_fence_wait,
     situv2_consts,
     workgroup_barrier,
+    fmin_f32,
+    fclamp_f32,
 )
 from .kernels_common import ceildiv
 from .mega_moe_gfx1250.tdm_gather_shim import (
@@ -154,6 +156,71 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
+
+
+def _batched_silu_swiglu_tanh_fma(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+    """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+
+    Tanh is issued in groups of CHUNK; after each group a sched_barrier
+    lets the compiler interleave the previous group's VALU consumers
+    (add-one, mul-half, final products) with the next group's TRANS
+    latency, avoiding a long TRANS-only stall.
+
+    Args:
+        pairs: list of (gate, up) f32 value pairs.
+        swiglu: True for swiglu, False for silu.
+        limit_f32, neg_limit_f32: clamp bounds.
+        range_constexpr: the FlyDSL ``range_constexpr`` helper.
+
+    Returns:
+        list of activated f32 values, same length as *pairs*.
+    """
+    _one = fx.Float32(1.0)
+    _half = fx.Float32(0.5)
+    _half_scale = fx.Float32((1.702 * 0.5) if swiglu else 0.5)
+    N = len(pairs)
+    CHUNK = 8
+    # Stage 1: clamp all pairs
+    gs, us = [], []
+    for i in range_constexpr(N):
+        g = fmin_f32(pairs[i][0], limit_f32)
+        u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
+        gs.append(g)
+        us.append(u)
+    rocdl.sched_barrier(0)
+    # Stage 2+3 interleaved: issue CHUNK tanh, then consume previous CHUNK.
+    tanh_vals = [None] * N
+    results = [None] * N
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    for c in range_constexpr(n_chunks):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, N)
+        for i in range_constexpr(lo, hi):
+            tanh_vals[i] = fx.Float32(
+                rocdl.tanh(T.f32, _raw(gs[i] * _half_scale))
+            )
+        rocdl.sched_barrier(0)
+        prev_lo = (c - 1) * CHUNK if c > 0 else None
+        prev_hi = lo if c > 0 else None
+        if prev_lo is not None:
+            for i in range_constexpr(prev_lo, prev_hi):
+                sig = fx.Float32(fx.fma(_half, tanh_vals[i], _half))
+                if swiglu:
+                    results[i] = gs[i] * sig * (us[i] + _one)
+                else:
+                    results[i] = gs[i] * sig * us[i]
+    # Drain last chunk's VALU
+    drain_lo = (n_chunks - 1) * CHUNK
+    for i in range_constexpr(drain_lo, N):
+        sig = fx.Float32(fx.fma(_half, tanh_vals[i], _half))
+        if swiglu:
+            results[i] = gs[i] * sig * (us[i] + _one)
+        else:
+            results[i] = gs[i] * sig * us[i]
+    return results
 
 
 def _pack_bytes_i32(byte_vals):
@@ -395,18 +462,42 @@ def launch_gemm_a8w4_tdm(
             )
     use_spec_prefill_opt = bool(a_is_fp4 and a_preshuffled and tmnk256_wpmn2_b4)
     # Ring-unrolled loops retain explicit zeroing; only the peeled tile initializes C.
-    inline_zero_acc = (use_spec_prefill_opt and cluster_m == 1 and bool(next_stage_on)
+    inline_zero_acc = (use_spec_prefill_opt
+                       and (cluster_m == 1 or
+                            (bool(explicit_vgpr_partition) and cluster_n == 2
+                             and stage1_act == 1
+                             and bool(stage1_quant_out))) and bool(next_stage_on)
                        and K // tile_k > num_buffers)
     interleaved_m_rows = (inline_zero_acc and stage1_act == 1 and bool(stage1_quant_out)
                           and cluster_n == 4 and not row_major_ascale
                           and not tdm_as_in_prologue and K % tile_k == 0)
     M_ROW_STEP = 32 if interleaved_m_rows else 16
+    pin_automatic_ds_addresses = bool(interleaved_m_rows and not explicit_vgpr_partition
+                          and callable(getattr(rocdl, "sched_vgpr", None)))
+    narrow_stage1_row_skip = bool(a_is_fp4 and a_preshuffled
+                                 and not persistent_workers and not enable_ep_scatter
+                                 and stage1_act and stage1_quant_out
+                                 and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+                                     == (64, 256, 256, 1, 4, 3)
+                                 and callable(getattr(rocdl, "sched_vgpr", None)))
+    # Plain native GEMM2 uses the same operand layout and K dependency
+    # as fused GEMM1. Keep EP scatter on its existing output protocol.
+    plain_gemm_prefill = (use_spec_prefill_opt and not stage1_act
+                          and not stage1_quant_out and not enable_ep_scatter)
     fp4_prefill = use_spec_prefill_opt and cluster_m > 1
     quant_gemm1_prefill = fp4_prefill and stage1_act == 1 and bool(stage1_quant_out)
+    native_prefill_compute = quant_gemm1_prefill or plain_gemm_prefill
     reuse_lds_stage_base = fp4_prefill and bool(planar_lds_on)
     skip_initial_cluster_sync = fp4_prefill and bool(next_stage_on) and not tdm_as_in_prologue
     pinned_fp4_prefill = fp4_prefill and explicit_vgpr_partition
     resident_ring_addresses = pinned_fp4_prefill and bool(next_stage_on) and not rolled_drain
+    # Preserve fused GEMM1's prior gates; native GEMM2 shares identical
+    # operands without requiring the resident register layout.
+    # The peeled first K128 has no predecessor WMMA. Keep its hints
+    # clear, and enable reuse only in paths that peel initialization.
+    native_operand_reuse = (explicit_vgpr_partition and inline_zero_acc
+                            and (plain_gemm_prefill
+                                 or (quant_gemm1_prefill and resident_ring_addresses)))
     checked_recip_expert = (pinned_fp4_prefill or
                             (use_spec_prefill_opt and explicit_vgpr_partition
                              and stage1_act == 1 and bool(stage1_quant_out))) and 1 < n_experts <= 65536
@@ -615,7 +706,8 @@ def launch_gemm_a8w4_tdm(
         # DeepGEMM contiguous-M swizzle, run at physical-cluster granularity.
         TILES_PER_GROUP = 16
         if const_expr(use_spec_prefill_opt):
-            TILES_PER_GROUP = 32
+            TILES_PER_GROUP = (4 if native_prefill_compute and cluster_m <= 4
+                               else 32)
         assert TILES_PER_GROUP % cluster_m == 0
         if const_expr(resident_ring_addresses):
             total_n_tiles = ceildiv(fx.Uint32(i32_n), tile_n)
@@ -1015,7 +1107,8 @@ def launch_gemm_a8w4_tdm(
             k_adv=PACK_TK * 16,
             wv=waves[1],
             wg_mask=b_mcast_mask,
-            cache_modifier=(2 if resident_ring_addresses else tdm_b_th),
+            cache_modifier=(0 if resident_ring_addresses and native_prefill_compute else
+                            (2 if resident_ring_addresses else tdm_b_th)),
             b_payload=True,
         )
         if const_expr(row_major_ascale and tdm_as_in_prologue):
@@ -1086,6 +1179,8 @@ def launch_gemm_a8w4_tdm(
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
                 split_inner=AS_SUPERS < len(waves[2]),
+                # Share unchanged native scales across A's N peers.
+                wg_mask=(a_mcast_mask if native_operand_reuse else None),
             )
         add_tdm_loads(
             gSB_base,
@@ -1100,6 +1195,8 @@ def launch_gemm_a8w4_tdm(
             lds_row=SC_INNER,
             k_adv=SC_INNER * 4,
             wv=waves[3],
+            # Preserve B's exact expert/M peer mask for its scales.
+            wg_mask=(b_mcast_mask if native_operand_reuse else None),
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
@@ -1273,6 +1370,12 @@ def launch_gemm_a8w4_tdm(
                             constraints=f"={{v{32 + address_slot * 4 + component}}},0",
                             has_side_effects=True, is_align_stack=False,
                         ).res)
+                    if const_expr(pin_automatic_ds_addresses):
+                        # Pin only the live DS addresses; A/B/C still use the
+                        # automatic allocator. Consume the returned SSA value.
+                        value = fx.Int32(rocdl.sched_vgpr(
+                            _raw(fx.Int32(value)), 32 + address_slot * 4 + component
+                        ))
                     values.append(value)
                 return LdsAddr(*values)
             if const_expr(isinstance(slot, int)):
@@ -1441,8 +1544,17 @@ def launch_gemm_a8w4_tdm(
                                 scale_b,
                                 scaleAType=0,
                                 scaleBType=wm % 2,
-                                reuseB=(pinned_fp4_prefill and stage1_act == 1
-                                        and bool(stage1_quant_out) and wn_raw + 1 < wmma_n_rep),
+                                # ISA matrix A is wt[wn]. Serpentine M rows
+                                # repeat it at the next same-opcode WMMA.
+                                reuseA=(native_operand_reuse
+                                        and not initialize_acc
+                                        and wn_raw + 1 == wmma_n_rep
+                                        and i + 1 < (len(wm_list) if end is None else end)),
+                                reuseB=((native_operand_reuse
+                                         or (pinned_fp4_prefill and stage1_act == 1
+                                             and bool(stage1_quant_out) and inline_zero_acc))
+                                        and not initialize_acc
+                                        and wn_raw + 1 < wmma_n_rep),
                             )
                         )
                     else:
@@ -2053,18 +2165,27 @@ def launch_gemm_a8w4_tdm(
 
                     def steady_mid(my_jobs):
                         if const_expr(cluster_m > 1):
+                            # Peel initialization without rotating the steady ring.
+                            if const_expr(inline_zero_acc):
+                                steady_mid_iteration(my_jobs, 0, 0, initialize_acc=True)
                             for ring in range(n_steady // num_buffers):
                                 for phase in range_constexpr(num_buffers):
                                     kt = ring * num_buffers + phase
-                                    steady_mid_iteration(my_jobs, kt, phase)
+                                    if const_expr(inline_zero_acc and phase == 0):
+                                        if ring != 0:
+                                            steady_mid_iteration(my_jobs, kt, phase)
+                                    else:
+                                        steady_mid_iteration(my_jobs, kt, phase)
                                 if const_expr(  # noqa: SIM102 - preserve DSL staging
                                     not DISABLE_CLUSTER_SYNC and not pinned_fp4_prefill
                                 ):
                                     if full_cluster:
                                         cluster_sync()
                             for phase in range_constexpr(n_steady % num_buffers):
-                                kt = (n_steady // num_buffers) * num_buffers + phase
-                                steady_mid_iteration(my_jobs, kt, phase)
+                                if const_expr(not inline_zero_acc or phase != 0
+                                              or n_steady // num_buffers > 0):
+                                    kt = (n_steady // num_buffers) * num_buffers + phase
+                                    steady_mid_iteration(my_jobs, kt, phase)
                         else:
                             if const_expr(inline_zero_acc):
                                 # Same first tile and input fences; only C uses inline zero.
@@ -2129,8 +2250,17 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(peel_last):
                         compute_drain_tile(PRE - 1, False, kws=KWS_TAIL)
 
-            # Keep the v80 six/seven bodies adjacent and emit the output tail once.
-            if const_expr(interleaved_m_rows and not explicit_vgpr_partition):
+            # The route's live extent is shared by multicast peers. Retain the
+            # full descriptor and output layouts while skipping only M16 rows
+            # wholly beyond the expert's live rows. Other row counts use the
+            # complete original body, including ragged K and activation logic.
+            if const_expr(narrow_stage1_row_skip):
+                if mn_oob <= 2 * M_ROW_STEP:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=2)
+                else:
+                    run_mainloop(bool(interleaved_lds_load_on))
+            # Place the six/seven-row bodies together and emit the output tail once.
+            elif const_expr(interleaved_m_rows and not explicit_vgpr_partition):
                 if fx.Boolean(llvm_dialect.intr_expect(
                     ((4 * M_ROW_STEP < mn_oob) & (7 * M_ROW_STEP >= mn_oob)).ir_value(),
                     fx.Boolean(True).ir_value(),
@@ -2310,11 +2440,13 @@ def launch_gemm_a8w4_tdm(
                                 )
                             else:
                                 # Clamp successive slices without extending every pair's live range.
-                                activation_chunk = (4 if quant_gemm1_prefill and resident_ring_addresses
+                                activation_chunk = (8 if quant_gemm1_prefill and resident_ring_addresses
                                                     else len(pairs))
                                 all_vals = []
                                 for act_begin in range_constexpr(0, len(pairs), activation_chunk):
-                                    all_vals += batched_silu_swiglu(
+                                    all_vals += (_batched_silu_swiglu_tanh_fma if
+                                                     quant_gemm1_prefill and resident_ring_addresses
+                                                     else batched_silu_swiglu)(
                                         pairs[act_begin:act_begin + activation_chunk],
                                         swiglu=is_swiglu,
                                         limit_f32=f32_swiglu_limit,
