@@ -632,6 +632,12 @@ def main(argv):
             print(json.dumps(review_payload(pr), indent=2, ensure_ascii=False))
     if failed:
         print(f"  ❌ failed to post: {failed}")
+        # Exit non-zero, or a review that was refused is indistinguishable from one
+        # that went up. The refusal this most likely is -- a token that may post issue
+        # comments but not create reviews -- would otherwise be invisible to the caller
+        # on every single run, and the card would be lost each time while the step
+        # stayed green. The API message is printed above; this makes someone read it.
+        return 1
     return 0
 
 

@@ -194,6 +194,30 @@ def test_no_citation_check_means_nothing_is_anchored(report, monkeypatch):
     assert _publish.flagged_citations("9999") is None
 
 
+def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):
+    """A refusal the caller cannot see is a refusal that happens every run.
+
+    The likeliest refusal is a token that may post issue comments but not create
+    reviews: `Issues: write` without `Pull requests: write`. That fails both the
+    anchored and the summary-only attempt, so the degrade path cannot save it --
+    and if main() still returns 0, the step stays green while every card is lost.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    # Only the review POST is refused. Stubbing every call would make the gate skip on
+    # PR metadata instead, and a test that never reaches the code it names proves nothing.
+    def _refuse_reviews(path, method="GET", body=None):
+        if method == "POST" and path.endswith("/reviews"):
+            return {"message": "Resource not accessible by personal access token"}
+        return {"state": "open", "merged_at": None, "head": {"sha": "f" * 40}}
+
+    monkeypatch.setattr(_publish, "_api", _refuse_reviews)
+    rc = _publish.main(["9999", "--post"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "failed to post" in out
+    assert "not accessible" in out  # the API's own words reach the operator
+
+
 def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
     """A traceback in citations.txt must forbid anchoring, not permit it.
 
