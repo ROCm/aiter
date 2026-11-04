@@ -399,13 +399,17 @@ def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
+    from .deployments import DEFAULT_DEPLOYMENTS
     from .mega_moe import run as run_mega_moe_replay
     from .moe import DEFAULT_CSVS as MOE_CSVS
     from .moe import run as run_moe_replay
     from .replay import run_default
 
     errors = []
-    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+    moe_failed_archs = run_moe_replay(
+        [p for p in MOE_CSVS if os.path.isfile(p)],
+        deployments=[p for p in DEFAULT_DEPLOYMENTS if os.path.isfile(p)],
+    )
     if moe_failed_archs:
         errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
     if run_mega_moe_replay():

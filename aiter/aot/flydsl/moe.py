@@ -25,6 +25,19 @@ different kernels, the M between them are bisected down to every M at which
 the runtime switches kernels: a row can switch more than once in its bucket
 (the gfx1250 stage-1 quant's K split steps through several values).
 
+A caller behind an expert-parallel dispatch also passes an expert mask, which
+brings in launches no tuned row reaches: the gfx950 stage-2 reduction, compiled
+for the mask's length, and the gfx1250 route. The mask's length follows from
+the deployment (global experts, EPLB replicas, fused shared experts), which no
+tuned row records, so these callers come from the ``fused_moe`` deployments of
+``moe_deployments.json`` (see :mod:`aiter.aot.flydsl.deployments`): what one
+rank passes ``fused_moe`` and the largest M it passes. The file also lists
+tensor-parallel deployments, whose rank passes no mask but the split
+intermediate dim and the shared-expert handling its framework uses (FHMoE
+among them). Each deployment is replayed at every bucket's smallest and largest
+M up to that M, bisected as above, and reads the tuned tables serving reads; it
+needs no tuned row. Its calls pass the model's activation clamp.
+
 A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
 naming targets, as the wheel build sets it, only rows of those archs are
 replayed; unset or ``native``, every arch the tables have. aiter fixes some
@@ -45,6 +58,9 @@ Usage:
     # Custom CSV file(s)
     python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 
+    # Custom deployment file(s) only
+    python -m aiter.aot.flydsl.moe --deployments /path/to/deployments.json
+
     # Verify a cache instead: fail on any kernel the replay would compile
     python -m aiter.aot.flydsl.moe --check
 
@@ -62,6 +78,7 @@ import sys
 import time
 import zlib
 from collections import Counter
+from collections.abc import Sequence
 from contextlib import contextmanager
 from unittest import mock
 
@@ -76,6 +93,8 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
     worker_waves,
 )
+from aiter.aot.flydsl.deployments import DEFAULT_DEPLOYMENTS, FusedMoECall
+from aiter.aot.flydsl.deployments import load as load_deployments
 from aiter.aot.flydsl.replay import requested_kernels
 from aiter.jit.core import AITER_CONFIGS
 from aiter_worker_limits import adopt_legacy_max_jobs
@@ -110,9 +129,19 @@ _ROW_FIELDS = (
     "gate_mode",
     "kernelName1",
     "kernelName2",
+    "expert_mask_size",
 )
 # gate_mode is overwritten by each job's variant.
 _ROW_KEY = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
+# (q_dtype_a, q_dtype_w) of the deployments' quant recipes; gfx950 and gfx1250,
+# the archs fused_moe deployments target, take OCP FP8.
+_DEPLOYMENT_DTYPES = {
+    "a8w4": ("torch.float8_e4m3fn", "torch.float4_e2m1fn_x2"),
+    "a4w4": ("torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2"),
+}
+# get_padded_M: M below the first tier takes the next power of two, larger M
+# the highest tier not above it.
+_PADDED_M_TIERS = (32768, 131072)
 # Jobs of one row share most of their kernels, so one worker replays them in
 # turn; capped so no single worker trails the rest of the build.
 _JOBS_PER_WORKER = 12
@@ -139,7 +168,10 @@ def job_arch(job: dict) -> str:
 
 
 def _is_grouped(row: dict) -> bool:
-    """A row of the gfx1250 grouped table, served by FlyDSL's grouped GEMM."""
+    """Served by FlyDSL's grouped GEMM: a row of the gfx1250 grouped table, or
+    a gfx1250 deployment."""
+    if row.get("deployment"):
+        return job_arch(row) == "gfx1250"
     return (row.get("kernelName1") or "").strip().startswith("grouped_gemm")
 
 
@@ -266,6 +298,93 @@ def parse_csv(csv_path: str, edges: bool = True) -> list[dict]:
     return dedupe_jobs(jobs)
 
 
+def _buckets(max_token: int) -> list[tuple[int, int, int]]:
+    """``(bucket, smallest M, largest M)`` of each tuning bucket that
+    ``get_padded_M`` maps some M in 1..max_token to."""
+    first, *rest = _PADDED_M_TIERS
+    result, low = [], 1
+    while low <= max_token:
+        if low < first:
+            bucket = 1 << (low - 1).bit_length()
+        else:
+            bucket = max(tier for tier in _PADDED_M_TIERS if tier <= low)
+        above = [tier for tier in rest if tier > bucket]
+        high = bucket if bucket < first else (above[0] - 1 if above else max_token)
+        result.append((bucket, low, min(high, max_token)))
+        low = high + 1
+    return result
+
+
+def deployment_row(call: FusedMoECall) -> dict:
+    """What one rank of a deployment passes ``fused_moe``, in the columns of a
+    tuned row."""
+    q_dtype_a, q_dtype_w = _DEPLOYMENT_DTYPES[call.quant]
+    row = dict.fromkeys(_ROW_FIELDS, "")
+    row.update(
+        deployment=call.id,
+        gfx=call.gfx,
+        cu_num=str(call.cu_num),
+        model_dim=str(call.model.model_dim),
+        inter_dim=str(call.inter_dim),
+        expert=str(call.local_experts),
+        topk=str(call.topk_cols),
+        expert_mask_size=str(call.mask_size or ""),
+        shared_expert_id=(
+            str(call.shared_expert_id) if call.shared_expert_id >= 0 else ""
+        ),
+        act_type=f"ActivationType.{call.model.activation}",
+        dtype="torch.bfloat16",
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type="QuantType.per_1x32",
+        use_g1u1="1",
+        doweight_stage1="0",
+    )
+    if call.shared_expert_id >= 0:
+        # FHMoE reads the gate/up layout from the row, not from the caller.
+        row["gate_mode"] = f"GateMode.{_caller_gate_mode(row).name}"
+    return row
+
+
+def parse_deployments(paths: Sequence[str], edges: bool = True) -> list[dict]:
+    """One job per (``fused_moe`` deployment, tuning bucket, replayed M,
+    caller-side variant) of the deployment files ``paths``."""
+    jobs = []
+    for call in load_deployments(paths).fused_moe:
+        shape = deployment_row(call)
+        variants = _variants(shape)
+        if not call.is_ep:
+            # num_local_tokens is the count an EP dispatch received.
+            variants = [v for v in variants if not v["local_tokens"]]
+        for bucket, low, high in _buckets(call.max_tokens):
+            row = {
+                **shape,
+                "token": str(bucket),
+                "swiglu_limit": call.model.swiglu_limit or None,
+            }
+            points = [low, high] if edges and low < high else [high]
+            for index, variant in enumerate(variants):
+                for m in points:
+                    jobs.append(
+                        {
+                            **row,
+                            **variant,
+                            "csv_path": call.path,
+                            "m": m,
+                            "primary": index == 0,
+                            "kernel_name": call.id,
+                        }
+                    )
+    return dedupe_jobs(jobs)
+
+
+def _collect_jobs(csv_paths, deployments, edges: bool) -> list[dict]:
+    jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
+    if deployments:
+        jobs += parse_deployments(deployments, edges)
+    return dedupe_jobs(jobs)
+
+
 def _dtype(name: str):
     import torch
 
@@ -388,6 +507,8 @@ def _caller_inputs(job: dict) -> dict:
     }
     if job["local_tokens"]:
         inputs["num_local_tokens"] = empty(1, dtype=dtypes.i32)
+    if job["expert_mask_size"]:
+        inputs["expert_mask"] = empty(_int(job["expert_mask_size"]), dtype=dtypes.i32)
     if job["bias"] in ("both", "stage1"):
         inputs["bias1"] = empty(experts, w1_rows, dtype=dtypes.fp32)
     if job["bias"] == "both":
@@ -415,6 +536,7 @@ def _replay(job: dict) -> None:
         "hidden_pad": _int(job["hidden_pad"]),
         "intermediate_pad": _int(job["intermediate_pad"]),
         "gate_mode": job["gate_mode"],
+        "swiglu_limit": job.get("swiglu_limit"),
     }
     shared_expert_id = _int(job["shared_expert_id"], -1)
     if shared_expert_id >= 0:
@@ -453,15 +575,18 @@ def _without_device_queries():
 
 @contextmanager
 def _runtime_reads(job: dict):
-    """Point the runtime's tuned-config lookup at the row's own table."""
-    if _is_grouped(job):
-        env_name = "AITER_CONFIG_GROUPED_FMOE"
+    """Point the runtime's tuned-config lookup at the row's own table. A
+    deployment reads the tables serving reads."""
+    if job.get("deployment"):
+        env = {}
+    elif _is_grouped(job):
+        env = {"AITER_CONFIG_GROUPED_FMOE": job["csv_path"]}
     elif _int(job["shared_expert_id"], -1) >= 0:
-        env_name = "AITER_CONFIG_FHMOE"
+        env = {"AITER_CONFIG_FHMOE": job["csv_path"]}
     else:
-        env_name = "AITER_CONFIG_FMOE"
+        env = {"AITER_CONFIG_FMOE": job["csv_path"]}
     get_config_file = type(AITER_CONFIGS).get_config_file
-    with mock.patch.dict(os.environ, {env_name: job["csv_path"]}):
+    with mock.patch.dict(os.environ, env):
         get_config_file.cache_clear()
         try:
             yield
@@ -471,10 +596,14 @@ def _runtime_reads(job: dict):
 
 def _describe(job: dict) -> str:
     variant = [f"gate={job['gate_mode']}"]
+    if job["expert_mask_size"]:
+        variant.insert(0, f"expert_mask={job['expert_mask_size']}")
     if job["bias"] != "none":
         variant.append(f"bias={job['bias']}")
     if job["beta"] is not None:
         variant.append(f"beta={job['beta']:g}/{job['linear_beta']:g}")
+    if job.get("swiglu_limit"):
+        variant.append(f"swiglu_limit={job['swiglu_limit']:g}")
     if job["local_tokens"]:
         variant.append("num_local_tokens")
     if not job["clamp_shared"]:
@@ -660,21 +789,31 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     return failed + probes_failed
 
 
-def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int:
-    """Replay every FlyDSL row of ``csv_paths`` whose arch ``GPU_ARCHS`` names
-    (every row when it names none), one process per arch. Returns the number of
+def run(
+    csv_paths: Sequence[str],
+    *,
+    deployments: Sequence[str] = (),
+    edges: bool = True,
+    check: bool = False,
+) -> int:
+    """Replay every FlyDSL row of ``csv_paths`` and every ``fused_moe``
+    deployment of the files ``deployments`` whose arch ``GPU_ARCHS`` names (all
+    of them when it names none), one process per arch. Returns the number of
     archs whose replay failed."""
-    jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
+    jobs = _collect_jobs(csv_paths, deployments, edges)
     targets = aot_target_archs()
     skipped = Counter(
         job_arch(job) for job in jobs if targets and job_arch(job) not in targets
     )
     jobs = [job for job in jobs if job_arch(job) not in skipped]
     archs = sorted({job_arch(job) for job in jobs})
-    rows = {tuple(job[f] for f in _ROW_KEY) for job in jobs}
+    rows = {
+        tuple(job[f] for f in _ROW_KEY) for job in jobs if not job.get("deployment")
+    }
+    calls = {job["deployment"] for job in jobs if job.get("deployment")}
     print(
-        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(jobs)} jobs, "
-        f"archs {', '.join(archs) or '-'}",
+        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(calls)} deployments, "
+        f"{len(jobs)} jobs, archs {', '.join(archs) or '-'}",
         flush=True,
     )
     for arch, count in sorted(skipped.items()):
@@ -706,8 +845,10 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         replays = []
         for arch, share in wave.items():
             command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
-            command += ["--csv"]
-            command += csv_paths
+            if csv_paths:
+                command += ["--csv", *csv_paths]
+            if deployments:
+                command += ["--deployments", *deployments]
             if not edges:
                 command.append("--row-tokens-only")
             if check:
@@ -719,20 +860,30 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AOT pre-compile the FlyDSL kernels of tuned fused-MoE configs",
+        description="AOT pre-compile the FlyDSL kernels of tuned fused-MoE configs "
+        "and MoE deployments",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "--csv",
         type=str,
         nargs="+",
-        default=DEFAULT_CSVS,
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
+    )
+    parser.add_argument(
+        "--deployments",
+        type=str,
+        nargs="+",
+        help="Path(s) to MoE deployment file(s), whose fused_moe deployments are\n"
+        "replayed; default moe_deployments.json. Without --csv and\n"
+        "--deployments both defaults are replayed, with one of them only\n"
+        "what it names.",
     )
     parser.add_argument(
         "--row-tokens-only",
         action="store_true",
-        help="replay each row only at its tuned token count",
+        help="replay each row only at its tuned token count, and each EP\n"
+        "deployment at each bucket's largest M",
     )
     parser.add_argument(
         "--check",
@@ -742,17 +893,20 @@ def main():
     parser.add_argument("--arch", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    csv_paths = [os.path.abspath(p) for p in args.csv]
-    for csv_path in csv_paths:
-        if not os.path.isfile(csv_path):
-            print(f"Error: CSV file not found: {csv_path}")
+    if args.csv is None and args.deployments is None:
+        args.csv, args.deployments = DEFAULT_CSVS, DEFAULT_DEPLOYMENTS
+    csv_paths = [os.path.abspath(p) for p in args.csv or ()]
+    deployments = [os.path.abspath(p) for p in args.deployments or ()]
+    for path in csv_paths + deployments:
+        if not os.path.isfile(path):
+            print(f"Error: file not found: {path}")
             sys.exit(1)
     if args.check:
         os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
     edges = not args.row_tokens_only
 
     if args.arch:
-        jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
+        jobs = _collect_jobs(csv_paths, deployments, edges)
         jobs = [job for job in jobs if job_arch(job) == args.arch]
         sys.exit(1 if jobs and _replay_arch(jobs, args.arch) else 0)
 
@@ -764,11 +918,15 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
+    for path in deployments:
+        print(f"  Deployments:  {path}")
     print(f"  Cache dir:    {cache_dir}")
     print("=" * 72, flush=True)
 
     total_t0 = time.time()
-    failed_archs = run(csv_paths, edges=edges, check=args.check)
+    failed_archs = run(
+        csv_paths, deployments=deployments, edges=edges, check=args.check
+    )
     print(f"\n  Total time:   {time.time() - total_t0:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")
