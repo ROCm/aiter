@@ -1355,7 +1355,7 @@ def _run_rank(
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
-    from aiter.ops.flydsl.allreduce_host_shared import _resolve_inbox_flags
+    from aiter.ops.flydsl.comm_collectives_host_shared import _resolve_inbox_flags
 
     # Only the uncached (MoRI heap) path needs MoRI.
     _CTX.inbox_memory = _resolve_inbox_flags(inbox_memory, world_size)[1]
