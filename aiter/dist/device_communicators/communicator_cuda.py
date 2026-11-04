@@ -240,6 +240,40 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_backend if value is not None else None
         )
 
+    def _gluon_plain_ar_fits(self, input_) -> bool:
+        return (
+            self.gluon_ar_plain is not None
+            and input_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and input_.numel() % 4 == 0
+            and input_.data_ptr() % 16 == 0
+            and input_.numel() * 2 <= _GLUON_PLAIN_AR_MAX_BYTES
+        )
+
+    def all_reduce_add(
+        self,
+        input_,
+        other,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other); the Gluon all-reduce does the add as it
+        loads, so the sum is never written."""
+        if (
+            self._gluon_plain_ar_fits(input_)
+            and other.dtype == input_.dtype
+            and other.shape == input_.shape
+            and other.is_contiguous()
+            and other.data_ptr() % 16 == 0
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce as gluon_all_reduce
+
+            return gluon_all_reduce(
+                input_, self.cpu_group, *self.gluon_ar_plain, x2=other
+            )
+        return self.all_reduce(input_ + other, use_new, ca_fp8_quant, prefill_support)
+
     def all_reduce(
         self,
         input_,
@@ -247,14 +281,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        if (
-            self.gluon_ar_plain is not None
-            and input_.dtype == torch.bfloat16
-            and input_.is_contiguous()
-            and input_.numel() % 4 == 0
-            and input_.data_ptr() % 16 == 0
-            and input_.numel() * 2 <= _GLUON_PLAIN_AR_MAX_BYTES
-        ):
+        if self._gluon_plain_ar_fits(input_):
             from aiter.ops.triton.comms.all_reduce import all_reduce as gluon_all_reduce
 
             return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)

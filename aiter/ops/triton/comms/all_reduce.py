@@ -65,7 +65,9 @@ def all_reduce_free(group, inboxes):
     pool.close()
 
 
-def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
+def all_reduce(
+    x: torch.Tensor, group, inboxes, calls, x2: torch.Tensor | None = None
+) -> torch.Tensor:
     """
     Returns the sum of the bf16 tensor x over the 4 ranks of ``group`` on gfx1250,
     with one kernel launch. All ranks get the same bits. All ranks must make the
@@ -76,19 +78,26 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
             values and at most max_bytes.
         inboxes, calls: The result of ``all_reduce_init``. If a poll times out,
             the sum is wrong and calls[-1] is more than 0.
+        x2 (torch.Tensor, optional): Laid out as x. The kernel reduces x + x2,
+            each sum rounded to bf16 first, so the result has the bits of
+            ``all_reduce(x + x2)`` without the separate add.
     """
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % 4 == 0
+    if x2 is not None:
+        assert x2.dtype == x.dtype and x2.is_contiguous() and x2.shape == x.shape
+        assert x2.data_ptr() % 16 == 0
     chunks = (calls.numel() - 1) // 2
     n = x.numel()
     assert x.data_ptr() % 16 == 0 and n <= 6 * _LINES * chunks
 
-    _LOGGER.info("ALL_REDUCE [gluon]: x=%s", x.shape)
+    _LOGGER.info("ALL_REDUCE [gluon]: x=%s add=%s", x.shape, x2 is not None)
 
     y = torch.empty_like(x)
     num_chunks = triton.cdiv(n, 6 * _LINES)  # 6 values a line
     programs = min(num_chunks, _PROGRAMS)
     _all_reduce_kernel[(num_chunks + programs,)](
         x,
+        x if x2 is None else x2,
         y,
         inboxes,
         calls,
@@ -99,6 +108,7 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
         LINES=_LINES,
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
+        HAS_X2=x2 is not None,
         num_warps=1,
     )
     return y

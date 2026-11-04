@@ -13,12 +13,38 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     """Advances the call counter. Returns the call and the lines of 2 units [x[value],
     x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask."""
-    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    call = gl.load(counter) % (1 << 30) + 1  # 1 to 2^30
-    # Buffer loads: a mask does not make a branch.
+    v0, v1, v2 = _load3(x, value, mask0, mask1, mask2, PLANE)
+    return _pack(v0, v1, v2, value, counter)
+
+
+@gluon.jit
+def _load3(x, value, mask0, mask1, mask2, PLANE: gl.constexpr):
+    """x[value], x[value + PLANE] and x[value + 2 PLANE], 0 out of the masks.
+    Buffer loads: a mask does not make a branch."""
     v0 = gl.amd.cdna5.buffer_load(x, value, mask=mask0, other=0)
     v1 = gl.amd.cdna5.buffer_load(x, value + PLANE, mask=mask1, other=0)
     v2 = gl.amd.cdna5.buffer_load(x, value + 2 * PLANE, mask=mask2, other=0)
+    return v0, v1, v2
+
+
+@gluon.jit
+def _lines_add(x, x2, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
+    """`_lines` of x + x2, each sum rounded to bf16 as a bf16 add rounds it, so the
+    reduced bits are those of all-reducing the materialized sum."""
+    v0, v1, v2 = _load3(x, value, mask0, mask1, mask2, PLANE)
+    w0, w1, w2 = _load3(x2, value, mask0, mask1, mask2, PLANE)
+    v0 = (v0.to(gl.float32) + w0.to(gl.float32)).to(gl.bfloat16)
+    v1 = (v1.to(gl.float32) + w1.to(gl.float32)).to(gl.bfloat16)
+    v2 = (v2.to(gl.float32) + w2.to(gl.float32)).to(gl.bfloat16)
+    return _pack(v0, v1, v2, value, counter)
+
+
+@gluon.jit
+def _pack(v0, v1, v2, value, counter):
+    """Advances the call counter. Returns the call and the lines of 2 units
+    [v0, v1, v2, tag] of `_lines`."""
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
+    call = gl.load(counter) % (1 << 30) + 1  # 1 to 2^30
     gl.barrier()  # all waves have read the old call number
     gl.store(counter, call)
     b0 = v0.to(gl.int16, bitcast=True).to(gl.int32) & 65535
@@ -132,6 +158,7 @@ _all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
 @gluon.jit(repr=_all_reduce_repr, do_not_specialize=["n", "programs"])
 def _all_reduce_kernel(
     x,
+    x2,
     y,
     inboxes,
     calls,
@@ -142,8 +169,9 @@ def _all_reduce_kernel(
     LINES: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
+    HAS_X2: gl.constexpr,
 ):
-    """y = the sum of the n values of x over the 4 ranks. Programs 0 to C-1 send the C
+    """y = the sum of the n values of x (of x + x2 with HAS_X2) over the 4 ranks. Programs 0 to C-1 send the C
     chunks, one each: a load after a remote store waits for its ack. Programs C to
     C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
     order, so a waiting receiver cannot block a sender."""
@@ -161,9 +189,14 @@ def _all_reduce_kernel(
         first = 6 * pid * LINES + 2 * line  # one mask for the 2 units of a line
         ok1 = first + 2 * LINES < n
         ok2 = first + 4 * LINES < n
-        call, lines = _lines(
-            x, first + pair, first < n, ok1, ok2, 2 * LINES, calls + 2 * pid
-        )
+        if HAS_X2:
+            call, lines = _lines_add(
+                x, x2, first + pair, first < n, ok1, ok2, 2 * LINES, calls + 2 * pid
+            )
+        else:
+            call, lines = _lines(
+                x, first + pair, first < n, ok1, ok2, 2 * LINES, calls + 2 * pid
+            )
         # All lines of the chunk, also past n: no old tag can stay.
         pos = 4 * (pid * LINES + line4) + col4
         _post(lines, inboxes, pos, line4 < LINES, call, RANK, SLOT)
@@ -173,9 +206,14 @@ def _all_reduce_kernel(
             value = first + pair
             ok1 = first + 2 * LINES < n
             ok2 = first + 4 * LINES < n
-            call, lines = _lines(
-                x, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
-            )
+            if HAS_X2:
+                call, lines = _lines_add(
+                    x, x2, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
+                )
+            else:
+                call, lines = _lines(
+                    x, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
+                )
             pos = 4 * (c * LINES + line4) + col4
             needed = 6 * c * LINES + 2 * line4 < n  # the line has values of x
             s0, s1, s2 = _receive(
