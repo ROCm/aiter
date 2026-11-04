@@ -836,22 +836,28 @@ class TestMpTunerResubmission(unittest.TestCase):
         )
         self.assertEqual(submissions, [["a", "fault", "c", "d"], ["c", "d"]])
 
-    def test_a_stale_pid_map_restarts_the_pool_and_resubmits_the_group(self):
+    def test_a_stale_pid_map_waits_for_the_restart_a_fault_triggers(self):
         attempts = []
 
-        def remapped_work_group(gpu_map, *args):
-            attempts.append(gpu_map)
-            if len(attempts) == 1:
-                raise KeyError("pid not in GPU map")
-            return _faulting_work_group(gpu_map, *args)
+        def remapped_work_group(gpu_map, fast, err, in_data, tasks, *rest):
+            if tasks[0][0][0] == "s1":
+                attempts.append(gpu_map)
+                if len(attempts) == 1:
+                    raise KeyError("pid not in GPU map")
+            return _faulting_work_group(gpu_map, fast, err, in_data, tasks, *rest)
 
         results, submissions = self.run_tuner(
-            ["a", "b"], work_group=remapped_work_group
+            [("s1", "a"), ("s1", "b"), ("s2", "fault")],
+            work_group=remapped_work_group,
+            in_datas=[(2, None), (1, None)],
+            return_status=True,
         )
         self.assertEqual(
-            [(info[1], us) for info, us, _ in results], [("a", 2.0), ("b", 2.0)]
+            [(info[1], status) for info, *_, status, _ in results],
+            [("a", "ok"), ("b", "ok"), ("fault", "crash")],
         )
-        self.assertEqual(submissions, [["a", "b"], ["a", "b"]])
+        # The fault fails once; s1 reruns only in the restart that fault caused.
+        self.assertEqual(submissions, [["a", "b"], ["fault"], ["a", "b"]])
 
     def test_each_fault_consumes_a_candidate_until_the_budget(self):
         tuner = importlib.import_module("aiter.utility.mp_tuner")
