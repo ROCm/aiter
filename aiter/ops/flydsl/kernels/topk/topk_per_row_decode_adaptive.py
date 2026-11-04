@@ -2054,7 +2054,7 @@ def create_topk_per_row_decode_adaptive_kernel(
 
             # Leave the row's control slots zero for the next launch. A one-part
             # row touched only the emit's output counters. On a multi-part row the
-            # last part out clears the row: every peer arrives only after its last
+            # last part out clears the row: each peer's exit add releases its last
             # use of the slots, so nothing lands behind the clear.
             def clear_out_counters(ctrs):
                 for counter in (COUNTER_OUT_FRONT, COUNTER_OUT_BACK):
@@ -2074,7 +2074,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                         counter_ptr(COUNTER_EXIT),
                         c_one,
                         syncscope=_AGENT,
-                        ordering=fx.AtomicOrdering.Monotonic,
+                        ordering=fx.AtomicOrdering.AcqRel,
                     )
                     s_meta[SMEM_META_EXIT] = arrived
                 gpu.barrier()
