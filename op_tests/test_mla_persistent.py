@@ -635,6 +635,7 @@ def torch_mla_extend_split_kv(
         *plan_dtypes,
         fast_mode=fast_mode,
         intra_batch_mode=intra_batch_mode,
+        page_size=page_size,
     ).fold_factor
     if fold_factor > 1:
         # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
@@ -1688,18 +1689,20 @@ def test_mla(
                 )
             )
 
-            checkAllclose(
+            split_err = checkAllclose(
                 split_out_ref,
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
+            assert split_err < 0.05
 
             if partial_out_ref.shape[0] > 0:
-                checkAllclose(
+                partial_err = checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
+                assert partial_err < 0.05
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -2264,7 +2267,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (64, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )

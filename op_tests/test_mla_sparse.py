@@ -600,11 +600,12 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        checkAllclose(
+        quant_err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        assert quant_err < 0.05
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -722,7 +723,7 @@ parser.add_argument(
     "--nhead",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(16, 2), (48, 1), (128, 2)],
+    default=[(16, 2), (48, 1), (64, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
