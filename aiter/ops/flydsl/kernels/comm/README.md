@@ -92,7 +92,9 @@ The kernels do reduction and quantization in packed fp16.
   unchanged. A tail holds at least one 64 B sector and grows by whole sectors
   for large super-tiles. Extra metadata sectors complete before the first
   sector signals readiness, and receivers validate every word's epoch before
-  consuming any format bits. Ring all-gather forwards payload and format bits
+  consuming any format bits. Validated metadata is cached in LDS across the
+  sub-tiles instead of being reread remotely during each decode.
+  Ring all-gather forwards payload and format bits
   without requantization.
 * NaN and Inf become finite values. `SCALE_CODEC_TAG` is part of every kernel's
   launch name: bump it when the codec changes, or a warm FlyDSL cache keeps

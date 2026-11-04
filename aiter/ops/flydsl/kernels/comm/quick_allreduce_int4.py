@@ -260,7 +260,11 @@ def mesh_lds_bytes(
     metadata = ScaleMetadata(
         int(world_size) - 1, super_tile, int(tile_atoms) // int(world_size), block
     )
-    return pack_rows * c.rank_tile_bytes + norm_red_bytes + metadata.lds_i32 * 4
+    return (
+        pack_rows * c.rank_tile_bytes
+        + norm_red_bytes
+        + (metadata.lds_i32 + int(world_size) * metadata.release_i32) * 4
+    )
 
 
 def make_quick_allreduce_int4_kernel(
@@ -400,7 +404,12 @@ def make_quick_allreduce_int4_kernel(
     # One fp32 partial sum of squares per (wave, row) for the fused RMSNorm.
     norm_red_f32 = (block // WAVE) * tile_atoms
     if fuse_norm:
-        PackStorage = make_pack_norm_storage(pack_i32, norm_red_f32, metadata.lds_i32)
+        PackStorage = make_pack_norm_storage(
+            pack_i32,
+            norm_red_f32,
+            metadata.lds_i32,
+            world_size * metadata.release_i32,
+        )
         ATOMS_PER_ROW = (int(norm_hidden) * 2) // (block * 16)
         ROWS_PER_TILE = tile_atoms // ATOMS_PER_ROW
         SCALE_N = mxfp4_scale_shape(1, norm_hidden)[1]
@@ -415,7 +424,9 @@ def make_quick_allreduce_int4_kernel(
             else 2 if (world_size, super_tile) == (8, 1) else 1
         )
     else:
-        PackStorage = make_pack_storage(pack_i32, metadata.lds_i32)
+        PackStorage = make_pack_storage(
+            pack_i32, metadata.lds_i32, world_size * metadata.release_i32
+        )
 
     # flags_i32 is also the i32 offset of the wire area, so the flag prefix has
     # to be a whole number of 64 B sectors (16 i32s). At a smaller multiple every
@@ -477,6 +488,11 @@ def make_quick_allreduce_int4_kernel(
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
         _stage_format, _format_word, _decode_format = metadata.bind(lds.formats, tid)
+        received = lds.received.view(
+            fx.make_layout(
+                (world_size, metadata.release_i32), (metadata.release_i32, 1)
+            )
+        )
 
         peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
@@ -959,6 +975,7 @@ def make_quick_allreduce_int4_kernel(
             current = _load_flag(flag)
             while (current & fx.Int32(SCALE_COLOR_MASK)) != color:
                 current = _load_flag(flag)
+            return current
 
         def _wait_release(phase, color):
             # Every metadata word must carry this epoch: observing the first
@@ -977,7 +994,8 @@ def make_quick_allreduce_int4_kernel(
                         + fx.Int32(release_i32_off)
                         + word
                     )
-                    _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
+                    value = _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
+                    fx.memref_store(value, received, (spin_src, word))
             gpu.barrier()
             # Unconditional and after the join. Scoping the acquire to the
             # polling lanes would leave the other waves
@@ -1004,15 +1022,7 @@ def make_quick_allreduce_int4_kernel(
             words, word = _codec_load(c, _get, tid, scale_slot)
 
             def _get_format(slot):
-                return _buffer_load(
-                    inbox,
-                    _sub_tile_i32(phase, src, fx.Int32(0))
-                    + fx.Int32(release_i32_off)
-                    + slot,
-                    1,
-                    fx.Int32,
-                    recv_policy,
-                )[0]
+                return fx.Int32(fx.memref_load(received, (src, slot)))
 
             is_e5 = _decode_format(_get_format, sub, k)
             return words, _scale_from_word(c, word, pair_in_slot, is_e5)

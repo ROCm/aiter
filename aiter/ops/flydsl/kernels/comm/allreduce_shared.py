@@ -569,7 +569,7 @@ def _acquire_inbox(scope):
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 
-def make_pack_storage(n_i32: int, n_format_i32: int = 0):
+def make_pack_storage(n_i32: int, n_format_i32: int = 0, n_received_i32: int = 0):
     """LDS staging for *n_i32* packed words, 16 B aligned."""
 
     if n_format_i32:
@@ -578,6 +578,7 @@ def make_pack_storage(n_i32: int, n_format_i32: int = 0):
         class PackFormatStorage:
             pack: fx.Array[fx.Int32, n_i32, 16]
             formats: fx.Array[fx.Int32, n_format_i32, 16]
+            received: fx.Array[fx.Int32, n_received_i32, 16]
 
         return PackFormatStorage
 
@@ -588,7 +589,12 @@ def make_pack_storage(n_i32: int, n_format_i32: int = 0):
     return PackStorage
 
 
-def make_pack_norm_storage(n_i32: int, n_red_f32: int, n_format_i32: int = 0):
+def make_pack_norm_storage(
+    n_i32: int,
+    n_red_f32: int,
+    n_format_i32: int = 0,
+    n_received_i32: int = 0,
+):
     """``make_pack_storage`` plus *n_red_f32* fp32 words of norm partial sums."""
 
     if n_format_i32:
@@ -598,6 +604,7 @@ def make_pack_norm_storage(n_i32: int, n_red_f32: int, n_format_i32: int = 0):
             pack: fx.Array[fx.Int32, n_i32, 16]
             red: fx.Array[fx.Float32, n_red_f32, 16]
             formats: fx.Array[fx.Int32, n_format_i32, 16]
+            received: fx.Array[fx.Int32, n_received_i32, 16]
 
         return PackNormFormatStorage
 

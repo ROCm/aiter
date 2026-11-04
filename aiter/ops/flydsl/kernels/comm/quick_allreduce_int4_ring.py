@@ -210,8 +210,8 @@ def make_quick_allreduce_ring_kernel(
     # one destination only. At TP8 with INT6, this is 1664 B.
     pack_row_i32 = max(rs.rank_tile_i32, ag.rank_tile_i32)
     pack_i32 = rank_atoms * pack_row_i32
-    lds_bytes = (pack_i32 + metadata.lds_i32) * 4
-    PackStorage = make_pack_storage(pack_i32, metadata.lds_i32)
+    lds_bytes = (pack_i32 + metadata.lds_i32 + metadata.release_i32) * 4
+    PackStorage = make_pack_storage(pack_i32, metadata.lds_i32, metadata.release_i32)
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -251,6 +251,9 @@ def make_quick_allreduce_ring_kernel(
         lds = fx.SharedAllocator().allocate(PackStorage).peek()
         smem_ptr = lds.pack.ptr
         _stage_format, _format_word, _decode_format = metadata.bind(lds.formats, tid)
+        received = lds.received.view(
+            fx.make_layout((1, metadata.release_i32), (metadata.release_i32, 1))
+        )
         pack_views = {
             c.name: lds.pack.view(
                 fx.make_layout((rank_atoms, c.rank_tile_i32), (c.rank_tile_i32, 1))
@@ -339,15 +342,9 @@ def make_quick_allreduce_ring_kernel(
 
             return _codec_load(codec, _get, tid, scale_slot)
 
-        def _format_of(step, sub, j):
+        def _format_of(sub, j):
             def _get(slot):
-                return _load_i32_at(
-                    inbox,
-                    _slot_i32(step, fx.Int32(0))
-                    + fx.Int32(release_i32_off[step])
-                    + slot,
-                    _RECV_POLICY,
-                )
+                return fx.Int32(fx.memref_load(received, (fx.Int32(0), slot)))
 
             return _decode_format(_get, sub, j)
 
@@ -456,6 +453,7 @@ def make_quick_allreduce_ring_kernel(
                 current = _load_flag(flag)
                 while (current & fx.Int32(SCALE_COLOR_MASK)) != color:
                     current = _load_flag(flag)
+                fx.memref_store(current, received, (fx.Int32(0), tid))
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
             # Only metadata polling lanes spin, so an acquire inside the loop
@@ -513,7 +511,7 @@ def make_quick_allreduce_ring_kernel(
                     acc = _codec_dequant(
                         c_in,
                         words_in,
-                        _scale_of(c_in, word_in, _format_of(k - 2, sub, j)),
+                        _scale_of(c_in, word_in, _format_of(sub, j)),
                         tid,
                         atoms[j],
                     )
@@ -532,7 +530,7 @@ def make_quick_allreduce_ring_kernel(
                     acc = _codec_dequant(
                         c_in,
                         words_in,
-                        _scale_of(c_in, word_in, _format_of(k - 2, sub, j)),
+                        _scale_of(c_in, word_in, _format_of(sub, j)),
                         tid,
                         atoms[j],
                     )
@@ -553,7 +551,7 @@ def make_quick_allreduce_ring_kernel(
                 # additional error -- and it is why c_in is c_out here.
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
-                    is_e5 = _format_of(k - 2, sub, j)
+                    is_e5 = _format_of(sub, j)
                     _store_chunk_atom(
                         tile,
                         chunk,
@@ -576,7 +574,7 @@ def make_quick_allreduce_ring_kernel(
                         _codec_dequant(
                             c_in,
                             words_in,
-                            _scale_of(c_in, word_in, _format_of(k - 2, sub, j)),
+                            _scale_of(c_in, word_in, _format_of(sub, j)),
                             tid,
                         ),
                     )
