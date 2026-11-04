@@ -90,10 +90,11 @@ The kernels do reduction and quantization in packed fp16.
 * Format bits occupy the high halves of the release-tail words; their low
   halves hold a nonzero 16-bit epoch. The INT4 and INT6 payload layouts stay
   unchanged. A tail holds at least one 64 B sector and grows by whole sectors
-  for large super-tiles. Extra metadata sectors complete before the first
-  sector signals readiness, and receivers validate every word's epoch before
-  consuming any format bits. Validated metadata is cached in LDS across the
-  sub-tiles instead of being reread remotely during each decode.
+  for large super-tiles. Receivers validate every word's epoch across all
+  sectors before consuming any format bits, without an extra inter-sector
+  drain. Staged format rows are zero-padded to whole 16-bit words so their
+  gather uses one word base and constant offsets. Validated metadata is cached
+  in LDS across the sub-tiles instead of being reread remotely during each decode.
   Ring all-gather forwards payload and format bits
   without requantization.
 * NaN and Inf become finite values. `SCALE_CODEC_TAG` is part of every kernel's

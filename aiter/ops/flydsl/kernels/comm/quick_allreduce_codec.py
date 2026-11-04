@@ -97,7 +97,7 @@ _SCALE_BIAS = 12
 # called from nested functions, so FlyDSL does not hash them into the disk
 # cache key; the kernels put this tag in their launch names, which is what
 # keeps a warm cache from loading binaries built with an older codec.
-SCALE_CODEC_TAG = "s4m3s5m2fp32v4"
+SCALE_CODEC_TAG = "s4m3s5m2fp32v5"
 E4M3_MAX = 480.0
 E4M3_SLICE_MIN = 2.0**-6
 SCALE_COLOR_MASK = 0xFFFF
@@ -122,8 +122,16 @@ class ScaleMetadata:
         return self.super_tile * self.rank_atoms * (self.block // WAVE)
 
     @property
+    def format_words(self):
+        return ceildiv(self.slices, 16)
+
+    @property
+    def padded_slices(self):
+        return self.format_words * 16
+
+    @property
     def lds_i32(self):
-        return self.destinations * self.slices
+        return self.destinations * self.padded_slices
 
     @property
     def release_i32(self):
@@ -135,7 +143,15 @@ class ScaleMetadata:
             (self.rank_atoms * (self.block // WAVE), self.block // WAVE, 1),
         )
         data = storage.view(
-            fx.make_layout((self.destinations, self.slices), (self.slices, 1))
+            fx.make_layout(
+                (self.destinations, self.padded_slices), (self.padded_slices, 1)
+            )
+        )
+        words = storage.view(
+            fx.make_layout(
+                (self.destinations, self.format_words, 16),
+                (self.padded_slices, 16, 1),
+            )
         )
         for i in range_constexpr(ceildiv(self.lds_i32, self.block)):
             index = tid + fx.Int32(i * self.block)
@@ -155,13 +171,13 @@ class ScaleMetadata:
                 scf.YieldOp([])
 
         def word(dest, slot, color):
+            live = slot < self.format_words
+            safe = live.select(slot, fx.Int32(0))
             bits = fx.Int32(0)
-            for bit in range_constexpr(16):
-                source = slot * fx.Int32(16) + fx.Int32(bit)
-                live = source < self.slices
-                safe = live.select(source, fx.Int32(0))
-                value = fx.Int32(fx.memref_load(data, (dest, safe)))
-                bits = bits | (live.select(value, fx.Int32(0)) << fx.Int32(bit))
+            for bit in range_constexpr(min(16, self.slices)):
+                value = fx.Int32(fx.memref_load(words, (dest, safe, fx.Int32(bit))))
+                bits = bits | (value << fx.Int32(bit))
+            bits = live.select(bits, fx.Int32(0))
             return (bits << fx.Int32(16)) | (color & fx.Int32(SCALE_COLOR_MASK))
 
         def decode(get, sub, atom):

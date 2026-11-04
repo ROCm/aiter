@@ -923,8 +923,8 @@ def make_quick_allreduce_int4_kernel(
             """Drain payload NT stores, then write *color* into every peer inbox.
 
             Each tail word carries *color* in its low 16 bits and format
-            bits in its high half. Extra metadata sectors are drained before
-            the first sector publishes readiness.
+            bits in its high half. Receivers validate every word's epoch,
+            including every sector of a larger tail.
 
             ``vmcnt(0)``: this 64-lane wave's NT payload stores are done.
             The workgroup barrier: the other three 64-lane waves issued
@@ -949,8 +949,6 @@ def make_quick_allreduce_int4_kernel(
             dest = tid // fx.Int32(FLAG_LANES)
             safe = (dest < limit).select(dest, fx.Int32(0))
             for sector in range_constexpr(metadata.release_i32 // 16 - 1, -1, -1):
-                if const_expr(sector == 0 and metadata.release_i32 > 16):
-                    rocdl.s_waitcnt(vmcnt=0)
                 if dest < limit:
                     slot = fx.Int32(sector * 16) + (
                         tid % fx.Int32(FLAG_LANES)
@@ -1165,10 +1163,10 @@ def make_quick_allreduce_int4_kernel(
     value_attrs = {"rocdl.flat_work_group_size": flat_wg}
     if NORM_LATENCY:
         value_attrs["rocdl.waves_per_eu"] = NORM_LATENCY_WGS_PER_CU
-    elif fuse_norm or (block == BLOCK and super_tile == 8 and world_size in (2, 4)):
+    elif fuse_norm:
         # The host sizes the persistent grid from the plain kernel's
         # residency. One wave per SIMD per workgroup at BLOCK, so pin the
-        # fused epilogue and persistent plain builds to that VGPR budget.
+        # fused epilogue to the same VGPR budget.
         value_attrs["rocdl.waves_per_eu"] = _resident_wgs_per_cu(world_size, super_tile)
 
     @flyc.jit

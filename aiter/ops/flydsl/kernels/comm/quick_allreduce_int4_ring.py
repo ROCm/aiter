@@ -405,8 +405,6 @@ def make_quick_allreduce_ring_kernel(
             if const_expr(release_scope is not None):
                 _release_inbox(release_scope)
             for sector in range_constexpr(metadata.release_i32 // 16 - 1, -1, -1):
-                if const_expr(sector == 0 and metadata.release_i32 > 16):
-                    rocdl.s_waitcnt(vmcnt=0)
                 if tid < fx.Int32(FLAG_LANES):
                     slot = fx.Int32(sector * 16) + tid * fx.Int32(FLAG_I32_PER_LANE)
                     elem = (
