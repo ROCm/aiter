@@ -9,10 +9,9 @@ adapted to expert parallelism:
   per-expert counts ``L_DCNT``), not the whole replicated expert set;
 * the routing scanned is the dispatched ``(token, expert)`` pairs this rank *received*
   -- ``a["recv_le"]`` (received pair -> local expert id) over ``a["nrecv"]`` pairs --
-  which ``dispatch_send`` fills, not the all-gathered routing;
-* a local expert routed by ``R`` received tokens runs as ``ceil(R / rch)`` row chunks,
-  each in ``P`` equal inter pieces (``P`` chosen to balance ``#CU`` CTAs), the unit list
-  sliced per CTA ``[u_lo, u_hi)`` XCD-aware -- identical to TP.
+  which the dispatch fills, not the all-gathered routing;
+* a local expert routed by ``R`` received tokens runs as ``ceil(R / rch)`` row chunks
+  (echunks), whose n-tiles the CTAs of the owning XCD pull from a tile queue.
 
 The GEMM1+act+GEMM2 body (``unit_tile``) and the per-expert received-row gather
 (``gather_recv_chunk``) are stubs filled by the compute / dispatch milestones; the
@@ -32,13 +31,12 @@ from flydsl.expr.typing import T
 from ..kernels_common import ceildiv
 from .common import (
     ACQ_REL,
+    AUX_SYS,
     _ctpop,
     bld,
     bst,
-    REL,
-    dma4,
-    dma16,
     g_add_agent,
+    g_ld_sys,
     g_st_sys,
     i32,
     lds_atomic_add,
@@ -49,59 +47,38 @@ from .common import (
     lds_st_rel,
     now,
     rsrc,
-    spin0,
-    spin_lds_ge,
     wait_lgkm0,
     wait_vm,
     wave_rank,
 )
 
 # Device-phase profiling (matches mega_moe_ep_kernel._PROF): slots 4,5 are stamped in
-# compute_units (post dispatch_wait / post dyn_plan) to split the `roles` phase.
+# compute_units (post routing wait / post dyn_plan) to split the `roles` phase.
 _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
-_PROF_SLOTS = 19  # +7 post-gemm1, +8 post-gemm2, +9/10/11 (see mega_moe_ep_kernel)
+_PROF_SLOTS = 24  # +7 post-gemm1, +8 post-gemm2, +9/10/11 (see mega_moe_ep_kernel)
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
-    C_CNT,
+    C_EBASE,
     C_ELAST,
-    C_K1,
-    C_K2,
-    C_S1,
-    C_S2,
-    BAL,
     C_NACT,
     C_NCH,
-    C_PLAN,
     C_QIDX,
     C_ROT,
-    C_UL,
-    C_UROWS,
-    C_USEQ,
     ECNT1,
+    EPOCH_SLOT,
     ERR_COMPUTE,
-    DISPW,
-    DQF,
-    DYNQ,
-    EMAJ,
-    ESYNC,
-    FLAT,
-    NAB,
+    ERR_DISPATCH,
+    FLAG_SBP,
+    GBAR_X,
+    GBAR_XG,
+    MAX_NPES,
     N_XCD,
-    NSX,
-    OVG0,
-    OVL,
+    OVG0_HI,
+    OVG0_LO,
+    OVG0_MIN,
     QCNT,
     QDONE,
-    XCDMAP,
-    NLOAD,
-    RC_AFREE,
-    RC_ASEQ,
-    RC_G1GO,
-    RC_G2GO,
-    RC_WFREE,
-    RC_WSEQ,
-    UL_MAX,
     KernelCtx,
 )
 
@@ -119,103 +96,90 @@ def _hw_xcc_id():
 
 def build_schedule(kc: KernelCtx) -> dict:
     """The dispatch-planner device functions of one instance (added to kc)."""
-    DYN_PS, EPR, I, KS2, TOPK = kc.get("DYN_PS EPR I KS2 TOPK")
+    EPR, TOPK = kc.get("EPR TOPK")
     L_CTL, L_DCH, L_DCNT, L_DYN = kc.get("L_CTL L_DCH L_DCNT L_DYN")
     L_EOFF, L_RIX, L_WSUM, NBW = kc.get("L_EOFF L_RIX L_WSUM NBW")
-    L_RCTL = kc.get("L_RCTL")[0]
     ECNT2, CE_BITS, L_DIX, NDIXW = kc.get("ECNT2 CE_BITS L_DIX NDIXW")
     const_expr, rch, N_TILES = kc.get("const_expr rch N_TILES")
-    N_TILES2 = kc.get("N_TILES2")[0]
-    # GEMM1/GEMM2 + the per-unit A loaders (gemm.build_gemm) and the combine epilogue
+    HWBAR = kc.get("HWBAR")[0]
+    N_TILES2, INTER_XBASE = kc.get("N_TILES2 INTER_XBASE")
+    # The inline-A GEMMs (gemm.build_gemm) and the combine epilogue
     # (communication.build_communication) are added to kc before build_schedule.
-    a_loader_g1, a_loader_g2 = kc.get("a_loader_g1 a_loader_g2")
-    gemm1, gemm2 = kc.get("gemm1 gemm2")
-    gemm2_combine = kc.get("gemm2_combine")[0]
-    # NW=8 (all-8-waves-compute, serial-comm) variants: inline-A GEMMs + the a2a send done
-    # by the compute waves themselves (no concurrent dispatch/loader band).
-    gemm1_nw8, gemm2_pipe_nw8, gemm2_combine_nw8 = kc.get(
-        "gemm1_nw8 gemm2_pipe_nw8 gemm2_combine_nw8"
-    )
-    gemm2_scatter_nw8, comb_arrive_rows = kc.get("gemm2_scatter_nw8 comb_arrive_rows")
+    gemm1_nw8, gemm2_scatter_nw8 = kc.get("gemm1_nw8 gemm2_scatter_nw8")
+    comb_arrive_rows = kc.get("comb_arrive_rows")[0]
+    QLA = kc.get("QLA")[0]
+    SBXP, sbx_send, sbx_wait = kc.get("SBXP sbx_send sbx_wait")
+    src_windows, sbx_done, sbx_scrub = kc.get("src_windows sbx_done sbx_scrub")
+    sbx_wait_hdr, sbx_tag = kc.get("sbx_wait_hdr sbx_tag")
+    _sbx_word = kc.get("sbx_word")[0]
     _pmark = kc.get("_pmark")[0]
-    dispatch_send, dispatch_send_all = kc.get("dispatch_send dispatch_send_all")
     dispatch_route_all, payload_send_ovl = kc.get("dispatch_route_all payload_send_ovl")
     payload_wait, payload_reset = kc.get("payload_wait payload_reset")
-    combine_send, report = kc.get("combine_send report")
-    dispatch_wait = kc.get("dispatch_wait")[0]
+    SDMAD, sd_rows, sd_wait_c = kc.get("SDMAD sd_rows sd_wait_c")
+    NSXK, OVG0K = kc.get("NSXK OVG0K")
+    report = kc.get("report")[0]
     dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
     grid_bar = kc.get("grid_bar")[0]
     ctrl_at, spin_sys_ge = kc.get("ctrl_at spin_sys_ge")
     L_PF_ = kc.get("L_PF")[0]
-    NW, NT, B_LOADER = kc.get("NW NT B_LOADER")  # per-launch warp-spec width (not globals)
+    NW, NT = kc.get("NW NT")
+    # The plan hand-off (ecnt, rowlist) goes through memory with system-scope accesses
+    # and each XCD gathers only its own tile-queue echunks, so neither barrier before the
+    # GEMMs needs the agent-scope L2 writeback / invalidate (needs the check that
+    # bid % N_XCD is the hardware XCC).
+    AUX_PL = AUX_SYS
+    # Small-batch variant: every CTA counts the whole routing window into LDS itself and
+    # each XCD buckets the rows of its own expert-aligned echunk range with an XCD-private
+    # position counter, so the plan needs neither the grid barrier nor rowlist / gather.
+    SBP = SBXP
+    # SBP up to this many NT-route rounds: every CTA ranks its XCD's routes itself (sb_local)
+    SBL_ROUNDS = 4
     assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
-
     @flyc.jit
     def cbar(L, tid):
         """The four compute waves' LDS generation barrier (TP ``communication.cbar``)."""
         wait_lgkm0()
-        if (tid % i32(64)) == i32(0):
-            g = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
-            old = lds_atomic_add(L, L_CTL + C_BARCNT * 4, 1, ACQ_REL)
-            if old == i32(NW - 1):
-                lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
-                lds_st_rel(L, L_CTL + C_BARGEN * 4, g + i32(1))
-            else:
-                cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
-                while cur == g:
-                    rocdl.s_sleep(0)
+        if const_expr(HWBAR):
+            gpu.barrier()
+        else:
+            if (tid % i32(64)) == i32(0):
+                g = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+                old = lds_atomic_add(L, L_CTL + C_BARCNT * 4, 1, ACQ_REL)
+                if old == i32(NW - 1):
+                    lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
+                    lds_st_rel(L, L_CTL + C_BARGEN * 4, g + i32(1))
+                else:
                     cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+                    while cur == g:
+                        rocdl.s_sleep(0)
+                        cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
         rocdl.sched_barrier(0)
 
     @flyc.jit
-    def gbar(L, tid, a, P):
-        """Barrier between GEMM passes, wrapped for the warp-specialized block.
-
-        When ``P == 1`` every echunk's four passes run on the SAME CTA (echunk == bid), so
-        the shared global round-trips (rowmap / inter / gout) are same-CTA: ``wait_vm``
-        orders write-before-read and ``cbar`` syncs the compute waves -- the costly
-        cross-CTA handshake + L1 flush/invalidate are SKIPPED (so a high-``nch`` launch that
-        cannot shard pays no multi-pass overhead).
-
-        When ``P > 1`` the n-tile shards of an echunk live on DIFFERENT CTAs, so an
-        agent-scope *release* fence writes this CU's L1 back to the device-wide L2, the
-        tid0-only ``grid_bar`` is the cross-CTA handshake (no block barrier -- the
-        dispatch/idle bands are elsewhere), and an agent-scope *acquire* fence then
-        invalidates this CU's L1 so the next pass reads the other shards' fresh data."""
+    def xbar(L, tid, a):
+        """Barrier over this XCD's CTAs (bid % N_XCD).  Their drained stores are in the
+        shared L2, so no L2 writeback / invalidate."""
         wait_vm(0)
-        cbar(L, tid)
-        if P > i32(1):
-            fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            grid_bar(a, tid)
-            cbar(L, tid)
-            fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-
-    @flyc.jit
-    def echunk_done(L, tid, a, slot):
-        """EP_ESYNC (P>1): this CTA's n-tile shard of an echunk pass is written -- release
-        it device-wide (same L2 writeback as gbar) and add 1 to ctrl[slot]; the pre-add
-        count lands in LDS C_ELAST for every compute wave (== P-1: this was the last)."""
-        wait_vm(0)
-        fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
         cbar(L, tid)
         if tid == i32(0):
-            lds_st(L, L_CTL + C_ELAST * 4, g_add_agent(ctrl_at(a, slot), i32(1)))
+            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            ca = ctrl_at(a, i32(GBAR_X) + x)
+            ga = ctrl_at(a, i32(GBAR_XG) + x)
+            cx = (i32(gpu.grid_dim.x) - i32(1) - x) // i32(N_XCD) + i32(1)
+            g = g_ld_sys(ga)
+            if g_add_agent(ca, i32(1)) == cx - i32(1):
+                g_st_sys(ca, i32(0))
+                wait_vm(0)  # the reset lands before the generation lets a CTA re-arrive
+                g_st_sys(ga, g + i32(1))
+            spin_sys_ge(ga, g + i32(1), a, ERR_COMPUTE)
         cbar(L, tid)
 
     @flyc.jit
-    def echunk_wait(a, lane0, slot, P):
-        """EP_ESYNC (P>1): block until all P shards of an echunk pass published, then
-        acquire (L1 invalidate) so this wave reads their data.  ``lane0`` polls; the
-        caller syncs the rest of its waves."""
+    def echunk_wait(a, lane0, slot, n):
+        """Block until ctrl[slot] (an echunk's tile counter) reaches n.  ``lane0`` polls;
+        the caller syncs the rest of its waves."""
         if lane0:
-            spin_sys_ge(ctrl_at(a, slot), P, a, ERR_COMPUTE)
-
-    def unit_fields(L, u):
-        f = [
-            lds_ld_i32(L, L_CTL + (i32(C_UL) + u * i32(4) + i32(k)) * i32(4))
-            for k in range(4)
-        ]
-        return f[0], f[1], f[2], f[3]
+            spin_sys_ge(ctrl_at(a, slot), n, a, ERR_COMPUTE)
 
     def masked(le):
         # invalid / foreign slot: le >= EPR (and -1 wraps to a huge unsigned value)
@@ -270,6 +234,32 @@ def build_schedule(kc: KernelCtx) -> dict:
         """Valid rows of chunk c of ``expert`` (the last chunk may be partial)."""
         return fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)) - c * i32(rch), i32(rch))
 
+    def _act_rank(L, e):
+        """Active index of (active) local expert e (its L_DCH slot)."""
+        wv = lds_ld_i32(L, L_DYN + (e >> i32(5)) * i32(4))
+        low = (i32(1) << (e & i32(31))) - i32(1)
+        return lds_ld_i32(L, L_DYN + (i32(NBW) + (e >> i32(5))) * i32(4)) + _ctpop(wv & low)
+
+    def _xsnap(L, b, nch):
+        """Echunk boundary b snapped to the nearer start of the expert group holding it."""
+        _, c, ce = dch(L, b)
+        s0 = b - c
+        return fx.min(fx.max(((c + c) <= ce).select(s0, s0 + ce), i32(0)), nch)
+
+    def _xrange(L, nch, x):
+        """XCD x's tile-queue echunks [lo, hi): an even split of nch; SBP snaps the bounds to
+        expert groups so one XCD owns all of an expert's echunks."""
+        lo = x * nch // i32(N_XCD)
+        hi = (x + i32(1)) * nch // i32(N_XCD)
+        if SBP:
+            lo = (x == i32(0)).select(i32(0), _xsnap(L, lo, nch))
+            hi = (x == i32(N_XCD - 1)).select(nch, _xsnap(L, hi, nch))
+        return lo, hi
+
+    def _sbl(a):
+        """SBP batch small enough for sb_local."""
+        return _rwin(a) <= i32(SBL_ROUNDS * NT)
+
     def _wave_prefix(v, bits):
         pre, tot = i32(0), i32(0)
         for b in range_constexpr(bits):
@@ -277,86 +267,6 @@ def build_schedule(kc: KernelCtx) -> dict:
             pre = pre + (below << i32(b))
             tot = tot + (cnt << i32(b))
         return pre, tot
-
-    def _pick_p(nun, C, ps):
-        # pick the GEMM1 inter-piece count that best fills the CTAs within UL_MAX units
-        P = i32(ps[0])
-        best = ceildiv(nun * i32(ps[0]), C) * i32(KS2 // ps[0])
-        for q in ps[1:]:
-            cost = ceildiv(nun * i32(q), C) * i32(KS2 // q)
-            better = (cost < best) & (nun * i32(q) <= C * i32(UL_MAX))
-            P = better.select(i32(q), P)
-            best = better.select(cost, best)
-        return P
-
-    def _xcd_rank(C):
-        bid = i32(gpu.block_id("x"))
-        return (C % i32(N_XCD) == i32(0)).select(
-            (bid % i32(N_XCD)) * (C // i32(N_XCD)) + bid // i32(N_XCD), bid
-        )
-
-    def _walk_start(U, C):
-        """First item of this CTA's stride-C walk over U echunks / units (every walk of
-        one item kind -- compute, both loader bands -- must agree; P==1 relies on one CTA
-        owning all passes of an echunk).  XCDMAP, one round (U <= C): XCD x's CTAs take
-        the contiguous block [x*Q, x*Q + Q), Q = ceil(U / N_XCD) -- an expert's echunks
-        share an XCD and the idle CTAs spread evenly over the XCDs; more rounds: the
-        XCD-major rank."""
-        bid = i32(gpu.block_id("x"))
-        if not XCDMAP:
-            return bid
-        x = bid % i32(N_XCD)
-        k = bid // i32(N_XCD)
-        Q = ceildiv(U, i32(N_XCD))
-        one = (k < Q).select(x * Q + k, U)
-        return (C % i32(N_XCD) == i32(0)).select((U <= C).select(one, _xcd_rank(C)), bid)
-
-    # ---- NW=4 GEMM pass split -------------------------------------------------------
-    # A pass over NTn n-tiles per echunk is cut into shards of S n-tiles: q = NTn // S
-    # full shards per echunk (one CTA item each) + the r = NTn % S remainder shards,
-    # packed K per CTA item.  Items: [0, uf) full (echunk t//q, shard t%q), [uf, uc)
-    # packs (echunks (t-uf)*K + j, j < K, n-tiles [q*S, NTn)).  Every echunk then has
-    # Pe = q + (r > 0) shards -- the ESYNC completion target.  S / K are planned once
-    # (_bal_plan) and every band (compute, A-loader, W-loader) re-derives the walk.
-    def _phase_split(nch, C, NTn, P_leg):
-        if not BAL:  # the legacy P-way split's largest shard, remainders unpacked
-            return ceildiv(i32(NTn), P_leg), i32(1)
-        S, K = i32(NTn), i32(1)  # no S fits (nch > C): whole echunks, multi-round walk
-        for i in range_constexpr(NTn):
-            cand = NTn - i  # descending: the smallest fitting S wins
-            q, r = NTn // cand, NTn % cand
-            k = cand // r if r else 1
-            need = nch * i32(q) + (ceildiv(nch, i32(k)) if r else i32(0))
-            ok = need <= C
-            S = ok.select(i32(cand), S)
-            K = ok.select(i32(k), K)
-        return S, K
-
-    def _phase(L, nch, NTn, S, K):
-        q = NTn // S
-        r = NTn - q * S
-        uf = nch * q
-        rem = r > i32(0)
-        uc = uf + rem.select(ceildiv(nch, K), i32(0))
-        return q, r, uf, uc, q + rem.select(i32(1), i32(0))
-
-    def _unit(t, j, rnd, S, K, q, r, uf, NTn):
-        """(echunk, nt_lo, nt_hi, qb) of slot j of item t (round rnd of a multi-round
-        walk); qb = n-tiles the CTA ran earlier in the pass (ring-tile base)."""
-        full = t < uf
-        eq = t // q
-        eg = full.select(eq, (t - uf) * K + j)
-        lo = full.select((t - eq * q) * S, q * S)
-        hi = full.select(lo + S, NTn)
-        qb = full.select(rnd * S, j * r)
-        return eg, lo, hi, qb
-
-    def _nslots(t, uf, K):
-        return (t < uf).select(i32(1), K)
-
-    def _plan_ld(L, ph2):
-        cs, ck = (C_S2, C_K2) if ph2 else (C_S1, C_K1)
-        return lds_ld_i32(L, L_CTL + cs * 4), lds_ld_i32(L, L_CTL + ck * 4)
 
     @flyc.jit
     def _dyn_prefix(L, tid):
@@ -418,20 +328,6 @@ def build_schedule(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_NCH * 4, base)
 
     @flyc.jit
-    def _bal_plan(L, tid):
-        if tid == i32(0):
-            nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
-            C = i32(gpu.grid_dim.x)
-            P = fx.max(fx.min(C // fx.max(nch, i32(1)), i32(N_TILES)), i32(1))
-            S1, K1 = _phase_split(nch, C, N_TILES, P)
-            S2, K2 = _phase_split(nch, C, N_TILES2, P)
-            lds_st(L, L_CTL + C_S1 * 4, S1)
-            lds_st(L, L_CTL + C_K1 * 4, K1)
-            lds_st(L, L_CTL + C_S2 * 4, S2)
-            lds_st(L, L_CTL + C_K2 * 4, K2)
-            lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
-
-    @flyc.jit
     def pre_pos(L, tid, a):
         """Balanced-gather pre-pass (pre-sort): give every received (token,route) pair a
         GLOBAL per-local-expert position (0..R_e-1 rank) via an agent-scope atomic counter
@@ -445,18 +341,165 @@ def build_schedule(kc: KernelCtx) -> dict:
         cap = a["npes"] * a["mtpr"]
         rlist = rsrc(a["rowlist"], i32(EPR) * cap * i32(4))
         ecnt = fx.Int64(a["ecnt"])
-        blk = a["m"] * i32(TOPK)
-        stride_p = a["mtpr"] * i32(TOPK)
         base = i32(gpu.block_id("x")) * i32(NT) + tid
         gstride = i32(gpu.grid_dim.x) * i32(NT)
-        for c_ in range(base, a["npes"] * blk, gstride):
-            c = i32(c_)
-            p = c // blk
-            idx = p * stride_p + (c - p * blk)
-            le = fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
+        for c_ in range(base, _rwin(a), gstride):
+            idx, le = _recv_le_at(a, rle, i32(c_))
             if masked(le) == fx.Boolean(False):
                 pos = g_add_agent(ecnt + fx.Int64(le) * fx.Int64(4), i32(1))
-                bst(idx, rlist, (le * cap + pos) * i32(4), 0, 0)
+                bst(idx, rlist, (le * cap + pos) * i32(4), 0, AUX_PL)
+
+    def _epoch_bump(a):
+        # skip 0 (the zeroed flags would pass its waits) by 2: the parity banks alternate
+        e1 = a["epoch"] + i32(1)
+        g_st_sys(ctrl_at(a, EPOCH_SLOT), (e1 == i32(0)).select(i32(2), e1))
+
+    def _plan_cnt(L, recnt, e):
+        """Routes of local expert e: SBP's own LDS count, else pre_pos's global ecnt."""
+        if SBP:
+            return lds_ld_i32(L, L_DCNT + e * i32(4))
+        cnt = fx.Int32(bld(recnt, e * i32(4), 0, T.i32, AUX_PL))
+        lds_st(L, L_DCNT + e * i32(4), cnt)  # distinct e per thread: no race
+        return cnt
+
+    def _rwin(a):
+        """Routing-window size: every source's own m_p * topk (src_windows prefix)."""
+        return a["sbo"][MAX_NPES]
+
+    def _recv_slot(a, c):
+        """Recv slot of routing-window entry c (source p's block [o[p], o[p+1]))."""
+        o = a["sbo"]
+        p, base = i32(0), i32(0)
+        for j in range_constexpr(1, MAX_NPES):
+            ge = c >= o[j]
+            p = ge.select(i32(j), p)
+            base = ge.select(o[j], base)
+        return p * (a["mtpr"] * i32(TOPK)) + (c - base)
+
+    def _recv_le_at(a, rle, c):
+        """Routing entry c of the window: (recv slot idx, local expert)."""
+        idx = _recv_slot(a, c)
+        if const_expr(SBXP):
+            return idx, _sbx_word(a, rle, idx)
+        return idx, fx.Int32(bld(rle, idx * i32(4), 0, T.i32, 0))
+
+    @flyc.jit
+    def sb_count(L, tid, a):
+        """SBP: L_DCNT[e] = routes of local expert e, from this CTA's own scan."""
+        for e_ in range(tid, i32(EPR), i32(NT)):
+            lds_st(L, L_DCNT + i32(e_) * i32(4), i32(0))
+        cbar(L, tid)
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        n = _rwin(a)
+        for c_ in range(tid, n, i32(NT)):
+            _, le = _recv_le_at(a, rle, i32(c_))
+            if masked(le) == fx.Boolean(False):
+                lds_atomic_add(L, L_DCNT + le * i32(4), 1)
+        cbar(L, tid)
+
+    @flyc.jit
+    def sb_bucket(L, tid, a, lo, hi):
+        """SBP gather: XCD x owns every expert whose echunks start in [lo, hi); its CTAs
+        give each of those routes a position from an XCD-private counter (ecnt + x*EPR)
+        and publish it straight to rowidx / rowmap, then zero the partial chunks' pad
+        rows.  Readers are the XCD's own GEMM tiles (xbar)."""
+        bid = i32(gpu.block_id("x"))
+        x = bid % i32(N_XCD)
+        cx = (i32(gpu.grid_dim.x) - i32(1) - x) // i32(N_XCD) + i32(1)
+        k0 = (bid // i32(N_XCD)) * i32(NT) + tid
+        xs = cx * i32(NT)
+        ecx = fx.Int64(a["ecnt"]) + fx.Int64(x * i32(EPR * 4))
+        r_rowmap = rsrc(a["rowmap"])
+        r_rowidx = rsrc(a["rowidx"])
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        n = _rwin(a)
+        for c_ in range(k0, n, xs):
+            idx, le = _recv_le_at(a, rle, i32(c_))
+            if masked(le) == fx.Boolean(False):
+                s0 = lds_ld_i32(L, L_DCH + _act_rank(L, le) * i32(4))
+                if (s0 >= lo) & (s0 < hi):
+                    pos = g_add_agent(ecx + fx.Int64(le) * fx.Int64(4), i32(1))
+                    off = (s0 * i32(rch) + pos) * i32(4)
+                    bst(idx, r_rowidx, off, 0, 0)
+                    bst(idx // i32(TOPK), r_rowmap, off, 0, 0)
+        _sb_pads(L, lo, hi, k0, xs, r_rowidx, r_rowmap)
+
+    @flyc.jit
+    def _sb_pads(L, lo, hi, k0, xs, r_rowidx, r_rowmap):
+        """Zero the pad rows of the partial last chunks of echunks [lo, hi)."""
+        for t_ in range(k0, (hi - lo) * i32(rch), xs):
+            t = i32(t_)
+            ei = lo + t // i32(rch)
+            r = t - (t // i32(rch)) * i32(rch)
+            expert, cc, _ = dch(L, ei)
+            if r >= dch_rows(L, expert, cc):
+                off = (ei * i32(rch) + r) * i32(4)
+                bst(i32(0), r_rowidx, off, 0, 0)
+                bst(i32(0), r_rowmap, off, 0, 0)
+
+    def _pop64(m):
+        return _ctpop(i32(m & fx.Int64(0xFFFFFFFF))) + _ctpop(i32(m >> fx.Int64(32)))
+
+    def _match_rank(key, lane, bits):
+        """(lanes below with the same key, lanes with the same key) of a fully active
+        wave; key < 2**bits."""
+        m = fx.Int64(-1)
+        for b in range_constexpr(bits):
+            hit = ((key >> i32(b)) & i32(1)) == i32(1)
+            bal = fx.Int64(rocdl.ballot(T.i64, hit))
+            m = m & hit.select(bal, bal ^ fx.Int64(-1))
+        lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
+        return _pop64(m & lt), _pop64(m)
+
+    @flyc.jit
+    def sb_local(L, tid, a, lo, hi):
+        """SBP gather for tiny batches (<= SBL_ROUNDS x NT routes): every CTA of XCD x
+        ranks the routes of its experts itself, in routing order (wave match-rank +
+        cross-wave / cross-round prefix in LDS), so all of them compute the SAME rowidx /
+        rowmap.  Each writes the whole table (identical values) and reads back its own
+        drained stores: no position atomics, no XCD barrier."""
+        r_rowmap = rsrc(a["rowmap"])
+        r_rowidx = rsrc(a["rowidx"])
+        rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
+        n = _rwin(a)
+        w = tid // i32(64)
+        LW, LB = L_C, L_C + NW * EPR * 4  # per-wave key counts | running per-expert base
+        for e_ in range(tid, i32(EPR), i32(NT)):
+            lds_st(L, LB + i32(e_) * i32(4), i32(0))
+        for rnd_ in range(i32(0), ceildiv(n, i32(NT)), i32(1)):
+            c = i32(rnd_) * i32(NT) + tid
+            idx, le = _recv_le_at(a, rle, fx.min(c, n - i32(1)))
+            own = (c < n) & (masked(le) == fx.Boolean(False))
+            j = _act_rank(L, own.select(le, i32(0)))
+            s0 = lds_ld_i32(L, L_DCH + j * i32(4))
+            own = own & (s0 >= lo) & (s0 < hi)
+            key = own.select(le, i32(EPR))
+            for t_ in range(tid, i32(NW * EPR), i32(NT)):
+                lds_st(L, LW + i32(t_) * i32(4), i32(0))
+            cbar(L, tid)
+            below, cnt = _match_rank(key, tid % i32(64), EPR.bit_length())
+            if own & (below == i32(0)):
+                lds_st(L, LW + (w * i32(EPR) + key) * i32(4), cnt)
+            cbar(L, tid)
+            if own:
+                pos = lds_ld_i32(L, LB + key * i32(4)) + below
+                for v in range_constexpr(NW - 1):
+                    wv = lds_ld_i32(L, LW + (i32(v * EPR) + key) * i32(4))
+                    pos = pos + (i32(v) < w).select(wv, i32(0))
+                off = (s0 * i32(rch) + pos) * i32(4)
+                bst(idx, r_rowidx, off, 0, 0)
+                bst(idx // i32(TOPK), r_rowmap, off, 0, 0)
+            cbar(L, tid)
+            for e_ in range(tid, i32(EPR), i32(NT)):
+                e = i32(e_)
+                s = lds_ld_i32(L, LB + e * i32(4))
+                for v in range_constexpr(NW):
+                    s = s + lds_ld_i32(L, LW + (i32(v * EPR) + e) * i32(4))
+                lds_st(L, LB + e * i32(4), s)
+            cbar(L, tid)
+        _sb_pads(L, lo, hi, tid, i32(NT), r_rowidx, r_rowmap)
+        wait_vm(0)
+        cbar(L, tid)
 
     @flyc.jit
     def dyn_plan(L, tid, a):
@@ -465,12 +508,11 @@ def build_schedule(kc: KernelCtx) -> dict:
         pre_pos's global ``ecnt`` (one value per local expert; pre_pos already did the
         agent-atomic scan of recv_le) -- so dyn_plan reads only EPR ints instead of
         re-scanning the whole npes x m x topk routing window (which otherwise contends for
-        HBM with the overlapped payload a2a).  gbar(2) before this publishes ecnt."""
+        HBM with the overlapped payload a2a).  The grid_bar before this publishes ecnt."""
         recnt = rsrc(fx.Int64(a["ecnt"]), i32(EPR) * i32(4))
         for e_ in range(tid, i32(EPR), i32(NT)):
             e = i32(e_)
-            cnt = fx.Int32(bld(recnt, e * i32(4), 0, T.i32, 0))
-            lds_st(L, L_DCNT + e * i32(4), cnt)  # distinct e per thread: no race
+            cnt = _plan_cnt(L, recnt, e)
             if cnt > i32(0):
                 lds_atomic_or(  # bitmap word shared by 32 experts: atomic
                     L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31))
@@ -485,9 +527,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         if const_expr(NDIXW):
             _dix_fill(L, tid)
-            cbar(L, tid)  # L_DIX complete before _bal_plan releases C_PLAN to the loader
-        _bal_plan(L, tid)
-        cbar(L, tid)
+            cbar(L, tid)
 
     @flyc.jit
     def gather_recv_chunk(L, tid, a, expert, cc, ce):
@@ -503,25 +543,10 @@ def build_schedule(kc: KernelCtx) -> dict:
         R = fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)) - lo, i32(rch))
         for r_ in range(tid, R, i32(NT)):
             r = i32(r_)
-            idx = fx.Int32(bld(rlist, (expert * cap + lo + r) * i32(4), 0, T.i32, 0))
+            idx = fx.Int32(bld(rlist, (expert * cap + lo + r) * i32(4), 0, T.i32, AUX_PL))
             lds_st(L, L_RIX + r * i32(4), idx)
         cbar(L, tid)
         return R
-
-    @flyc.jit
-    def _ring_reset_g2go(L, tid):
-        """Reset the A / W rings for GEMM2 + release the loaders' PASS-2 phase (inter is
-        written + flushed).  Safe: PASS 1 drained the rings and the loaders park on
-        RC_G2GO, so nothing touches them."""
-        if tid == i32(0):
-            for b in range_constexpr(NAB):
-                lds_st(L, L_RCTL + (i32(RC_ASEQ) + i32(b)) * i32(4), i32(0))
-                lds_st(L, L_RCTL + (i32(RC_AFREE) + i32(b)) * i32(4), i32(0))
-            for b in range_constexpr(4):
-                lds_st(L, L_RCTL + (i32(RC_WSEQ) + i32(b)) * i32(4), i32(0))
-                lds_st(L, L_RCTL + (i32(RC_WFREE) + i32(b)) * i32(4), i32(0))
-            lds_st_rel(L, L_RCTL + RC_G2GO * i32(4), i32(1))
-        cbar(L, tid)  # compute waves see the zeroed ring before consuming GEMM2 A
 
     @flyc.jit
     def _prof_mark(tid, a, slot):
@@ -530,161 +555,19 @@ def build_schedule(kc: KernelCtx) -> dict:
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(slot)) * i32(8), 0, 0)
 
-    @flyc.jit
-    def _gemm_passes_nw4(L, tid, a, nch, nblk, bid_e, S1, K1, q1, r1, uf1, uc1, P1,
-                         S2, K2, q2, r2, uf2, uc2, P2):
-        """NW=4 GEMM1 -> GEMM2 (+ combine) over the pass splits (_phase / _unit); the
-        loader bands walk the identical item / slot / n-tile sequence.  ESYNC: an echunk
-        pass's shards publish ECNT1 / ECNT2 (Pe shards each) unless P1 == P2 == 1 (all
-        passes of an echunk on one CTA); P2 == 1 runs the fused-combine GEMM2."""
-        local = (P1 == i32(1)) & (P2 == i32(1))
-        # --- PASS 1 (GEMM1) -> inter[echunk] n-tile slices.
-        t1 = _walk_start(uc1, nblk)
-        for t_ in range(t1, uc1, nblk):
-            t = i32(t_)
-            rnd = (t - t1) // nblk
-            for j_ in range(i32(0), _nslots(t, uf1, K1), i32(1)):
-                eg, lo, hi, qb = _unit(t, i32(j_), rnd, S1, K1, q1, r1, uf1, i32(N_TILES))
-                if eg < nch:
-                    expert, _, _ = dch(L, eg)
-                    gemm1(L, tid, a, expert, eg, lo, hi, qb)
-                    if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                        if local == fx.Boolean(False):
-                            echunk_done(L, tid, a, i32(ECNT1) + eg)
-        _prof_mark(tid, a, 7)  # post gemm1
-        if const_expr(ESYNC):
-            gbar(L, tid, a, i32(1))
-        else:
-            gbar(L, tid, a, local.select(i32(1), i32(2)))
-        _ring_reset_g2go(L, tid)
-        # --- PASS 2 (GEMM2) [+ fused combine at P2 == 1: whole echunks per CTA].
-        t2 = _walk_start(uc2, nblk)
-        if P2 == i32(1):
-            for ei_ in range(t2, nch, nblk):
-                ei = i32(ei_)
-                expert, cc, _ = dch(L, ei)
-                rows = dch_rows(L, expert, cc)
-                if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                    if P1 > i32(1):
-                        echunk_wait(a, tid == i32(0), i32(ECNT1) + ei, P1)
-                        cbar(L, tid)
-                        fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-                gemm2_combine(L, tid, a, expert, ei, rows,
-                              (ei - t2) // nblk * i32(N_TILES2))
-                if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                    # sole consumer (its A-loader waited before staging): reset for reuse
-                    if (P1 > i32(1)) & (tid == i32(0)):
-                        g_st_sys(ctrl_at(a, i32(ECNT1) + ei), i32(0))
-            _prof_mark(tid, a, 8)  # post gemm2
-        else:
-            for t_ in range(t2, uc2, nblk):
-                t = i32(t_)
-                rnd = (t - t2) // nblk
-                for j_ in range(i32(0), _nslots(t, uf2, K2), i32(1)):
-                    eg, lo, hi, qb = _unit(t, i32(j_), rnd, S2, K2, q2, r2, uf2,
-                                           i32(N_TILES2))
-                    if eg < nch:
-                        expert, _, _ = dch(L, eg)
-                        if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate
-                            echunk_wait(a, tid == i32(0), i32(ECNT1) + eg, P1)
-                            cbar(L, tid)
-                            fx.memory_fence(syncscope="agent",
-                                            ordering=fx.AtomicOrdering.Acquire)
-                        gemm2(L, tid, a, expert, eg, lo, hi, rsrc(a["gout"]), qb)
-                        if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate
-                            # the echunk's last GEMM2 shard combines it right away; every
-                            # GEMM1/GEMM2 waiter of eg has passed, so reset both counters.
-                            echunk_done(L, tid, a, i32(ECNT2) + eg)
-                            if lds_ld_i32(L, L_CTL + C_ELAST * 4) == P2 - i32(1):
-                                if tid == i32(0):
-                                    g_st_sys(ctrl_at(a, i32(ECNT2) + eg), i32(0))
-                                    g_st_sys(ctrl_at(a, i32(ECNT1) + eg), i32(0))
-                                fx.memory_fence(syncscope="agent",
-                                                ordering=fx.AtomicOrdering.Acquire)
-                                combine_send(L, tid, a, rsrc(a["gout"]), eg,
-                                             dch_rows(L, expert, dch(L, eg)[1]))
-            _prof_mark(tid, a, 8)  # post gemm2
-            if const_expr(not ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                gbar(L, tid, a, i32(2))
-                for ei_ in range(bid_e, nch, nblk):
-                    ei = i32(ei_)
-                    expert, cc, _ = dch(L, ei)
-                    combine_send(L, tid, a, rsrc(a["gout"]), ei, dch_rows(L, expert, cc))
-
-    # ---- NW=8 flat split (EP_FLAT) ---------------------------------------------------
-    # A pass's T = nch * NTn n-tiles (echunk-major) are cut into nblk contiguous ranges
-    # [v*T//nblk, (v+1)*T//nblk), v = the CTA's XCD-major rank, so neighbouring ranges --
-    # the same expert's echunks -- share an XCD's L2.  Tile x belongs to rank
-    # ((x+1)*nblk - 1) // T, so echunk e is split over _flat_owners(e) CTAs (its ECNT
-    # target).  GEMM1 and GEMM2 tile counts differ, so every echunk syncs via ECNT1.
-    def _flat_owners(e, NTn, T, C):
-        first = ((e * i32(NTn) + i32(1)) * C - i32(1)) // T
-        last = ((e + i32(1)) * i32(NTn) * C - i32(1)) // T
-        return last - first + i32(1)
-
-    def _flat_rank(C):
-        if XCDMAP:
-            return _xcd_rank(C)
-        return i32(gpu.block_id("x"))
-
-    @flyc.jit
-    def _flat_passes_nw8(L, tid, a, nch, nblk):
-        v = _flat_rank(nblk)
-        # --- PASS 1 (GEMM1) -> inter[echunk] n-tile slices.
-        T1 = nch * i32(N_TILES)
-        lo1 = v * T1 // nblk
-        hi1 = (v + i32(1)) * T1 // nblk
-        for e_ in range(lo1 // i32(N_TILES), ceildiv(hi1, i32(N_TILES)), i32(1)):
-            e = i32(e_)
-            n0 = fx.max(lo1 - e * i32(N_TILES), i32(0))
-            n1 = fx.min(hi1 - e * i32(N_TILES), i32(N_TILES))
-            if n1 > n0:
-                expert, _, _ = dch(L, e)
-                gemm1_nw8(L, tid, a, expert, e, n0, n1)
-                echunk_done(L, tid, a, i32(ECNT1) + e)
-        _prof_mark(tid, a, 7)  # post gemm1
-        gbar(L, tid, a, i32(1))
-        # --- PASS 2 (GEMM2 + fused combine of each n-tile slice).
-        T2 = nch * i32(N_TILES2)
-        lo2 = v * T2 // nblk
-        hi2 = (v + i32(1)) * T2 // nblk
-        for e_ in range(lo2 // i32(N_TILES2), ceildiv(hi2, i32(N_TILES2)), i32(1)):
-            e = i32(e_)
-            n0 = fx.max(lo2 - e * i32(N_TILES2), i32(0))
-            n1 = fx.min(hi2 - e * i32(N_TILES2), i32(N_TILES2))
-            if n1 > n0:
-                expert, cc, _ = dch(L, e)
-                rows = dch_rows(L, expert, cc)
-                echunk_wait(a, tid == i32(0), i32(ECNT1) + e,
-                            _flat_owners(e, N_TILES, T1, nblk))
-                cbar(L, tid)
-                fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-                gemm2_combine_nw8(L, tid, a, expert, e, rows, n0, n1)
-                # the echunk's last GEMM2 slice: every ECNT1 waiter of e has passed
-                echunk_done(L, tid, a, i32(ECNT2) + e)
-                if lds_ld_i32(L, L_CTL + C_ELAST * 4) == _flat_owners(
-                    e, N_TILES2, T2, nblk
-                ) - i32(1):
-                    if tid == i32(0):
-                        g_st_sys(ctrl_at(a, i32(ECNT2) + e), i32(0))
-                        g_st_sys(ctrl_at(a, i32(ECNT1) + e), i32(0))
-        _prof_mark(tid, a, 8)  # post gemm2
-
-    # EP_DYNQ: XCD x's CTAs pull tiles i = 0, 1, ... of its echunks [e_lo, e_lo + nx) from
-    # ctrl[QCNT + x]: i < T1 is GEMM1 tile (nt, e) = divmod(i, nx), then GEMM2 the same way.
+    # XCD x's CTAs pull tiles i = 0, 1, ... of its echunks [e_lo, e_lo + nx) from
+    # ctrl[QCNT + x]: i < nx * N_TILES is a GEMM1 tile (_qtile), then GEMM2 the same way.
     # Every GEMM1 tile is pulled before any GEMM2 tile and all CTAs are resident, so a
     # GEMM2 tile's ECNT1 wait always resolves.  Each CTA ends on exactly one pull past the
     # end, so the pull that returns end + #CTAs-on-the-XCD - 1 is the last: it resets.
     @flyc.jit
     def _dynq_done(L, tid, a, slot):
-        if const_expr(DQF):
-            echunk_done(L, tid, a, slot)
-        else:  # XCD-local: drained stores are in the shared L2
-            wait_vm(0)
-            cbar(L, tid)
-            if tid == i32(0):
-                lds_st(L, L_CTL + C_ELAST * 4, g_add_agent(ctrl_at(a, slot), i32(1)))
-            cbar(L, tid)
+        # XCD-local: drained stores are in the shared L2
+        wait_vm(0)
+        cbar(L, tid)
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_ELAST * 4, g_add_agent(ctrl_at(a, slot), i32(1)))
+        cbar(L, tid)
 
     @flyc.jit
     def _dynq_pull(L, tid, qa):
@@ -696,30 +579,29 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _dynq_next(L, tid, a, slot, qa):
         """_dynq_done(slot) then _dynq_pull(qa); the XCD-local form issues both atomics
         back to back, so they cost one round trip and one cbar."""
-        if const_expr(DQF):
-            _dynq_done(L, tid, a, slot)
-            _dynq_pull(L, tid, qa)
-        else:
-            wait_vm(0)
-            cbar(L, tid)
-            if tid == i32(0):
-                c = g_add_agent(ctrl_at(a, slot), i32(1))
-                q = g_add_agent(qa, i32(1))
-                lds_st(L, L_CTL + C_ELAST * 4, c)
-                lds_st(L, L_CTL + C_QIDX * 4, q)
-            cbar(L, tid)
+        wait_vm(0)
+        cbar(L, tid)
+        if tid == i32(0):
+            c = g_add_agent(ctrl_at(a, slot), i32(1))
+            q = g_add_agent(qa, i32(1))
+            lds_st(L, L_CTL + C_ELAST * 4, c)
+            lds_st(L, L_CTL + C_QIDX * 4, q)
+        cbar(L, tid)
 
-    OVL_LB = ceildiv(EPR, N_XCD)  # EP_OVL send rounds (communication.payload_send_ovl)
+    OVL_LB = ceildiv(EPR, N_XCD)  # payload send rounds (communication.payload_send_ovl)
     L_C = kc.get("L_C")[0]
+    assert (NW + 1) * EPR * 4 <= 16 * kc.get("TILE_N")[0] * 4  # sb_local's L_C scratch
+
+    def _ovg0(a):
+        """Payload rounds every CTA sends up front (the rest go to the NSX senders)."""
+        if OVG0K is not None:
+            return i32(min(OVG0K, OVL_LB))
+        return (a["m"] >= i32(OVG0_MIN)).select(i32(min(OVG0_HI, OVL_LB)),
+                                                i32(min(OVG0_LO, OVL_LB)))
 
     def _dynq_tile(L, j, NTn, e_lo, nx):
         """(echunk, n-tile, expert, chunk) of tile j of a pass over the XCD's echunks
         [e_lo, e_lo + nx)."""
-        if not EMAJ:
-            nt = j // nx
-            e = e_lo + j - nt * nx
-            expert, c, _ = dch(L, e)
-            return e, nt, expert, c
         # expert-major: a group (an expert's echunks in the range, n_g of them) spans
         # NTn * n_g tiles, so tile j lies in echunk e_lo + j // NTn's group; within it
         # n-tile-major, echunk minor
@@ -733,9 +615,20 @@ def build_schedule(kc: KernelCtx) -> dict:
         e = gs + jj - nt * ng
         return e, nt, expert, e - g0
 
+    def _qtile(L, i, B1, e_lo, nx):
+        """(is GEMM2, echunk, n-tile, expert, chunk) of queue index i (< TT)."""
+        g2 = i >= B1
+        NTn = g2.select(i32(N_TILES2), i32(N_TILES))
+        j = g2.select(i - B1, i)
+        # re-read per tile: a value live across the GEMM spills in its k-loop
+        j = j + NTn * lds_ld_i32(L, L_CTL + C_ROT * 4)
+        j = (j >= NTn * nx).select(j - NTn * nx, j)
+        e, ntb, expert, cc = _dynq_tile(L, j, NTn, e_lo, nx)
+        return g2, e, ntb, expert, cc
+
     @flyc.jit
     def _ovl_rot(L, tid, e_lo, nx):
-        """EP_OVL: C_ROT = the first whole group (echunk offset from e_lo) whose expert is
+        """C_ROT = the first whole group (echunk offset from e_lo) whose expert is
         sent in round 0 (le % LB == 0), else 0; the walk starts there and wraps, so the
         groups come in send-round order."""
         if tid == i32(0):
@@ -752,48 +645,50 @@ def build_schedule(kc: KernelCtx) -> dict:
     @flyc.jit
     def _dynq_passes_nw8(L, tid, a, nch, nblk):
         x = i32(gpu.block_id("x")) % i32(N_XCD)
-        if const_expr(not DQF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):
-                if (_hw_xcc_id() & i32(N_XCD - 1)) != x:
-                    report(a, ERR_COMPUTE)
-        if const_expr(OVL and OVG0 < OVL_LB):
-            # the first EP_NSX CTAs of each XCD send the remaining rounds, then join
-            ns = fx.min(i32(NSX * N_XCD), nblk)
+        if tid == i32(0):  # noqa: SIM102 - dynamic scf.if, kept separate
+            if (_hw_xcc_id() & i32(N_XCD - 1)) != x:
+                report(a, ERR_COMPUTE)
+        if const_expr(not SBXP):
+            # the first NSX CTAs of each XCD send the remaining rounds, then join
+            ns = fx.min(i32(NSXK * N_XCD), nblk)
             if i32(gpu.block_id("x")) < ns:
                 t0 = fx.Int32(now())
-                payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), ns, i32(OVG0), i32(OVL_LB))
+                payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), ns, _ovg0(a), i32(OVL_LB))
                 if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
                     if tid == i32(0):
                         lds_st(L, L_PF_ + i32(9 * 4), fx.Int32(now()) - t0)
         cx = (nblk - i32(1) - x) // i32(N_XCD) + i32(1)
-        e_lo = x * nch // i32(N_XCD)
-        nx = (x + i32(1)) * nch // i32(N_XCD) - e_lo
-        T1 = nx * i32(N_TILES)
-        TT = T1 + nx * i32(N_TILES2)
-        if const_expr(OVL):  # noqa: SIM102 - compile-time gate, not dynamic
-            _ovl_rot(L, tid, e_lo, nx)
+        e_lo, e_hi = _xrange(L, nch, x)
+        nx = e_hi - e_lo
+        if const_expr(INTER_XBASE):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # published by _dynq_pull's cbar
+                lds_st(L, L_CTL + C_EBASE * 4, e_lo)
+        # queue: GEMM1 tiles [0, B1), GEMM2 tiles [B1, TT)
+        B1 = nx * i32(N_TILES)
+        TT = B1 + nx * i32(N_TILES2)
+        _ovl_rot(L, tid, e_lo, nx)
         qa = ctrl_at(a, i32(QCNT) + x)
         _pmark(L, tid, i32(6))  # EP_PROF_DEV: start the per-tile split's clock
         _dynq_pull(L, tid, qa)
         i = lds_ld_i32(L, L_CTL + C_QIDX * 4)
+        # QLA: the next pull runs between this tile's K-loop and its epilogue (a CTA
+        # holding an unstarted GEMM1 tile is itself on a GEMM1 tile, which never waits)
+        claim = None
+        if const_expr(QLA):
+            def claim():
+                _dynq_pull(L, tid, qa)
         while i < TT:
-            g2 = i >= T1
-            NTn = g2.select(i32(N_TILES2), i32(N_TILES))
-            j = g2.select(i - T1, i)
-            if const_expr(OVL):
-                # re-read per tile: a value live across the GEMM spills in its k-loop
-                j = j + NTn * lds_ld_i32(L, L_CTL + C_ROT * 4)
-                j = (j >= NTn * nx).select(j - NTn * nx, j)
-            e, ntb, expert, cc = _dynq_tile(L, j, NTn, e_lo, nx)
+            g2, e, ntb, expert, cc = _qtile(L, i, B1, e_lo, nx)
             if g2:
                 rows = dch_rows(L, expert, cc)
                 echunk_wait(a, tid == i32(0), i32(ECNT1) + e, i32(N_TILES))
                 cbar(L, tid)
-                if const_expr(DQF):
-                    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
                 _pmark(L, tid, i32(13))
-                gemm2_scatter_nw8(L, tid, a, expert, e, rows, ntb, ntb + i32(1))
-                _dynq_next(L, tid, a, i32(ECNT2) + e, qa)
+                gemm2_scatter_nw8(L, tid, a, expert, e, rows, ntb, ntb + i32(1), claim)
+                if const_expr(QLA):
+                    _dynq_done(L, tid, a, i32(ECNT2) + e)
+                else:
+                    _dynq_next(L, tid, a, i32(ECNT2) + e, qa)
                 _pmark(L, tid, i32(11))
                 # the echunk's last GEMM2 tile: every part store of e is drained and every
                 # ECNT1 waiter of e has passed
@@ -801,30 +696,42 @@ def build_schedule(kc: KernelCtx) -> dict:
                     if tid == i32(0):
                         g_st_sys(ctrl_at(a, i32(ECNT2) + e), i32(0))
                         g_st_sys(ctrl_at(a, i32(ECNT1) + e), i32(0))
-                    comb_arrive_rows(tid, a, e, rows, i32(N_TILES2))
+                    if const_expr(not SBXP):
+                        comb_arrive_rows(tid, a, e, rows, i32(N_TILES2))
             else:
-                if const_expr(OVL):
+                if const_expr(not SBXP):
                     if tid == i32(0):
                         t0 = fx.Int32(now())
-                        payload_wait(a, expert, lds_ld_i32(L, L_DCNT + expert * i32(4)))
-                        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+                        if const_expr(SDMAD):
+                            sd_wait_c(L, a, expert % i32(OVL_LB))
+                        else:
+                            payload_wait(a, expert, lds_ld_i32(L, L_DCNT + expert * i32(4)))
+                        if const_expr(_PROF):
                             lds_st(L, L_PF_ + i32(8 * 4),
                                    lds_ld_i32(L, L_PF_ + i32(8 * 4)) + fx.Int32(now()) - t0)
                     cbar(L, tid)
                 _pmark(L, tid, i32(12))
-                gemm1_nw8(L, tid, a, expert, e, ntb, ntb + i32(1))
-                _dynq_next(L, tid, a, i32(ECNT1) + e, qa)
+                gemm1_nw8(L, tid, a, expert, e, ntb, ntb + i32(1), dch_rows(L, expert, cc), claim)
+                if const_expr(QLA):
+                    _dynq_done(L, tid, a, i32(ECNT1) + e)
+                else:
+                    _dynq_next(L, tid, a, i32(ECNT1) + e, qa)
                 _pmark(L, tid, i32(10))
             i = lds_ld_i32(L, L_CTL + C_QIDX * 4)
         if tid == i32(0):
             if i == TT + cx - i32(1):
                 g_st_sys(qa, i32(0))
-            if const_expr(OVL):  # noqa: SIM102 - compile-time gate, not dynamic
-                # the last CTA out: every expert's routes were counted and waited
-                if g_add_agent(ctrl_at(a, i32(QDONE)), i32(1)) == nblk - i32(1):
-                    g_st_sys(ctrl_at(a, i32(QDONE)), i32(0))
+            # the last CTA out: every expert's routes were counted and waited
+            if g_add_agent(ctrl_at(a, i32(QDONE)), i32(1)) == nblk - i32(1):
+                g_st_sys(ctrl_at(a, i32(QDONE)), i32(0))
+                if const_expr(SBXP):
+                    sbx_scrub(a)
+                    sbx_done(a)
+                else:
                     payload_reset(a)
-        if const_expr(_PROF and OVL):  # slot 6: payload-wait ticks | send ticks << 32
+                if const_expr(SBP):  # every CTA has read the epoch
+                    _epoch_bump(a)
+        if const_expr(_PROF):  # noqa: SIM102 - slot 6: payload-wait ticks | send ticks << 32
             if tid == i32(0):
                 bst(fx.Int64(lds_ld_i32(L, L_PF_ + i32(8 * 4)))
                     + fx.Int64(lds_ld_i32(L, L_PF_ + i32(9 * 4))) * fx.Int64(1 << 32),
@@ -835,39 +742,36 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def compute_units(L, tid, a):
-        """Local-expert GEMM as GATHER -> GEMM1 -> GEMM2 -> COMBINE passes separated by
-        device grid barriers (``gbar``).  Each CTA walks its slice of the work with a
-        stride-#CU loop, so a chunk count ``nch`` (or unit count ``nch*P``) that EXCEEDS
-        the grid runs in multiple waves (high bs); when it fits one wave the loop body
-        runs once.  gather/combine iterate echunks (CTA bid owns echunks bid, bid+nblk,
-        ...); GEMM1/GEMM2 iterate (echunk, n-tile shard) units.  The gather pass publishes
-        each row's recv-slot (``rowidx``) + payload-row (``rowmap``) to GLOBAL so the later
-        passes -- on different CTAs once P>1 shards an echunk -- can read them."""
-        if const_expr(NW == 8):
-            # NW=8 (all 8 waves compute MFMA): there is no concurrent dispatch band, so the
-            # CTA does its a2a scatter HERE (serial; EP_DISPW: on all 8 waves, else wave 0),
-            # then all 8 waves proceed to the planner + inline-A GEMM.  Trades the
-            # comm/compute overlap for 2 MFMA waves/SIMD.  (The A-loader band is likewise
-            # gone; the GEMMs self-stage A.)
-            if const_expr(OVL):  # payload rounds >= OVG0 later, by the senders (_dynq_passes_nw8)
-                dispatch_route_all(L, tid, a)
-                if const_expr(OVG0 > 0):  # noqa: SIM102 - compile-time gate, not dynamic
-                    payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), i32(gpu.grid_dim.x),
-                                     i32(0), i32(min(OVG0, OVL_LB)))
-            else:
-                if const_expr(DISPW):
-                    dispatch_send_all(L, tid, a)
-                else:
-                    if tid < i32(64):
-                        dispatch_send(L, tid, a)
-            gpu.barrier()
-            if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                if tid == i32(0):  # post dispatch_send (slot 9)
-                    bst(now(), rsrc(a["dbg"]),
-                        (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(9)) * i32(8), 0, 0)
-        if tid == i32(0):
-            dispatch_wait_meta(a, a["epoch"] & i32(1), i32(0))  # wait ROUTING only (fast)
-        cbar(L, tid)
+        """Dispatch, plan, GATHER, then the per-XCD GEMM1 -> GEMM2 tile queue
+        (_dynq_passes_nw8, whose GEMM2 epilogue scatters straight to the source ranks).
+        The gather publishes each row's recv-slot (``rowidx``) + payload-row (``rowmap``)
+        to GLOBAL for the XCD's GEMM tiles."""
+        # All 8 waves compute MFMA, so the CTA does its a2a scatter HERE on all 8 waves,
+        # then all of them run the planner + inline-A GEMM.
+        if const_expr(SBXP):
+            sbx_send(L, tid, a)
+            _prof_mark(tid, a, 19)
+        else:  # the rest of the payload rounds later, by the senders (_dynq_passes_nw8)
+            if const_expr(SDMAD):
+                sd_rows(L, tid, a)
+            dispatch_route_all(L, tid, a)
+            _prof_mark(tid, a, 19)
+            payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), i32(gpu.grid_dim.x),
+                             i32(0), _ovg0(a))
+        gpu.barrier()
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post dispatch send (slot 9)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(9)) * i32(8), 0, 0)
+        if const_expr(SBXP):
+            sbx_wait_hdr(tid, a)
+            cbar(L, tid)
+            a["sbtag"] = sbx_tag(a)
+        else:
+            if tid == i32(0):
+                dispatch_wait_meta(a, a["epoch"] & i32(1), i32(0))  # wait ROUTING only (fast)
+            cbar(L, tid)
+        a["sbo"] = src_windows(a)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post dispatch_wait_meta (slot 4)
                 bst(now(), rsrc(a["dbg"]),
@@ -875,10 +779,21 @@ def build_schedule(kc: KernelCtx) -> dict:
         # balanced-gather pre-pass: assign global per-expert positions, then a true
         # cross-CTA barrier (the scan is distributed) publishes rowlist to every CTA.
         # All of pre_pos / dyn_plan / PASS0-gather read only the routing (recv_le), so
-        # they run NOW -- overlapping the big payload a2a still in flight -- and GEMM1
-        # below waits for the payload (dispatch_wait) just before it needs it.
-        pre_pos(L, tid, a)
-        gbar(L, tid, a, i32(2))  # forced cross-CTA (pre_pos is a distributed scan)
+        # they run NOW -- overlapping the big payload a2a still in flight -- and each
+        # GEMM1 tile waits for its expert's payload just before it needs it.
+        if const_expr(SBP):
+            sb_count(L, tid, a)
+        else:
+            pre_pos(L, tid, a)
+            _prof_mark(tid, a, 20)
+            # pre_pos's atomics returned and its rowlist stores went to memory
+            wait_vm(0)
+            cbar(L, tid)
+            grid_bar(a, tid)
+            cbar(L, tid)
+            if (i32(gpu.block_id("x")) == i32(0)) & (tid == i32(0)):  # every CTA has read it
+                _epoch_bump(a)
+        _prof_mark(tid, a, 21)
         dyn_plan(L, tid, a)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post dyn_plan (slot 5)
@@ -886,38 +801,47 @@ def build_schedule(kc: KernelCtx) -> dict:
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(5)) * i32(8), 0, 0)
         nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
         nblk = i32(gpu.grid_dim.x)
-        # P-way CU split: shard each echunk's GEMM n-tiles across ~nblk/nch CTAs (capped
-        # at N_TILES).  When nch >= nblk (high bs) P collapses to 1 and nch itself spills
-        # into multiple waves via the loops below.
-        P = fx.max(fx.min(nblk // fx.max(nch, i32(1)), i32(N_TILES)), i32(1))
-        bid_e = _walk_start(nch, nblk)  # echunk walks (gather / P==1 GEMM2 / combine)
-        bid = _walk_start(nch * P, nblk)  # (echunk, shard) unit walks (NW=8)
-        S1, K1 = _plan_ld(L, False)  # NW=4 pass splits (_phase / _unit)
-        S2, K2 = _plan_ld(L, True)
-        q1, r1, uf1, uc1, P1 = _phase(L, nch, i32(N_TILES), S1, K1)
-        q2, r2, uf2, uc2, P2 = _phase(L, nch, i32(N_TILES2), S2, K2)
         r_rowmap = rsrc(a["rowmap"])
         r_rowidx = rsrc(a["rowidx"])
         # --- PASS 0 (gather): walk this CTA's echunks, publish per-row recv-slot (rowidx,
         #     for combine) + payload-row (rowmap, for GEMM1's A-gather) to global.
-        for ei_ in range(bid_e, nch, nblk):
-            ei = i32(ei_)
-            expert, cc, ce = dch(L, ei)
-            R = gather_recv_chunk(L, tid, a, expert, cc, ce)  # -> L_RIX, R; ends in cbar
-            for r_ in range(tid, i32(rch), i32(NT)):
-                r = i32(r_)
-                idx = (r < R).select(lds_ld_i32(L, L_RIX + r * i32(4)), i32(0))
-                off = (ei * i32(rch) + r) * i32(4)
-                bst(idx, r_rowidx, off, 0, 0)
-                bst((r < R).select(idx // i32(TOPK), i32(0)), r_rowmap, off, 0, 0)
-            cbar(L, tid)  # done reading L_RIX before the next echunk's gather overwrites it
-        if const_expr(NW == 8):
-            if const_expr(FLAT or DYNQ):  # GEMM1 tiles read other CTAs' gather
-                gbar(L, tid, a, i32(2))
+        if const_expr(SBP):
+            x_lo, x_hi = _xrange(L, nch, i32(gpu.block_id("x")) % i32(N_XCD))
+            if _sbl(a):
+                sb_local(L, tid, a, x_lo, x_hi)
             else:
-                gbar(L, tid, a, P)
-        else:  # P1 == 1: each echunk's GEMM1 runs on its gather CTA (same walk start)
-            gbar(L, tid, a, P1)
+                sb_bucket(L, tid, a, x_lo, x_hi)
+                _prof_mark(tid, a, 22)
+                xbar(L, tid, a)
+                if const_expr(SBXP):  # noqa: SIM102 - the XCD's position atomics returned: re-zero
+                    if i32(gpu.block_id("x")) < i32(N_XCD):
+                        for e_ in range(tid, i32(EPR), i32(NT)):
+                            g_st_sys(fx.Int64(a["ecnt"]) + fx.Int64(
+                                (i32(gpu.block_id("x")) * i32(EPR) + i32(e_)) * i32(4)), i32(0))
+        else:
+            # XCD x gathers its tile-queue echunks [x*nch/8, (x+1)*nch/8)
+            gx = i32(gpu.block_id("x")) % i32(N_XCD)
+            g_lo = gx * nch // i32(N_XCD) + i32(gpu.block_id("x")) // i32(N_XCD)
+            g_hi = (gx + i32(1)) * nch // i32(N_XCD)
+            g_st = (nblk - i32(1) - gx) // i32(N_XCD) + i32(1)
+            r_rpos = rsrc(a["mine"] + fx.Int64(a["off_rpos"]))
+            for ei_ in range(g_lo, g_hi, g_st):
+                ei = i32(ei_)
+                expert, cc, ce = dch(L, ei)
+                R = gather_recv_chunk(L, tid, a, expert, cc, ce)  # -> L_RIX, R; ends in cbar
+                for r_ in range(tid, i32(rch), i32(NT)):
+                    r = i32(r_)
+                    idx = (r < R).select(lds_ld_i32(L, L_RIX + r * i32(4)), i32(0))
+                    off = (ei * i32(rch) + r) * i32(4)
+                    bst(idx, r_rowidx, off, 0, 0)
+                    sk = idx // i32(TOPK)
+                    if const_expr(SDMAD):  # the source's compacted row (sd_rows)
+                        sk = sk - sk % a["mtpr"] + fx.Int32(bld(r_rpos, sk * i32(4), 0, T.i32, AUX_PL))
+                    bst((r < R).select(sk, i32(0)), r_rowmap, off, 0, 0)
+                cbar(L, tid)  # done reading L_RIX before the next echunk's gather overwrites it
+            _prof_mark(tid, a, 22)
+        if const_expr(not SBP):  # GEMM tiles read only their own XCD's gather (SBP: synced above)
+            xbar(L, tid, a)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post gather (slot 10)
                 bst(now(), rsrc(a["dbg"]),
@@ -925,124 +849,15 @@ def build_schedule(kc: KernelCtx) -> dict:
         # payload wait: only NOW does the kernel need the dispatched activation (GEMM1's
         # A-gather). The planning + gather above overlapped the payload a2a, so this spin
         # is short (payload mostly landed). After it, the rows for every echunk are live.
-        # (EP_OVL, NW=8 only: per expert, in the tile queue.)
-        if const_expr(not (OVL and NW == 8)):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):
-                dispatch_wait(a, a["epoch"] & i32(1), i32(0))
+        # (Large kernel: per expert, in the tile queue.)
+        if const_expr(SBXP):
+            sbx_wait(tid, a, FLAG_SBP, ERR_DISPATCH)
         cbar(L, tid)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # post payload wait (slot 11)
                 bst(now(), rsrc(a["dbg"]),
                     (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(11)) * i32(8), 0, 0)
-        if tid == i32(0):  # release the A-loader wave: payload + rowmap are now live
-            lds_st_rel(L, L_RCTL + RC_G1GO * i32(4), i32(1))
-        if const_expr(NW == 8 and bool(DYNQ)):
-            _dynq_passes_nw8(L, tid, a, nch, nblk)
-        if const_expr(NW == 8 and bool(FLAT) and not DYNQ):
-            _flat_passes_nw8(L, tid, a, nch, nblk)
-        if const_expr(NW == 8 and not FLAT and not DYNQ):
-            # --- PASS 1 (GEMM1): walk this CTA's (echunk, shard) units -> inter[echunk] slice.
-            # uord = this CTA's unit ordinal in the stride-#CU walk (matches a_loader_units),
-            # so the running A-ring tile index is identical on both the producer and consumer.
-            for gi_ in range(bid, nch * P, nblk):
-                gi = i32(gi_)
-                eg = gi // P
-                expert, _, _ = dch(L, eg)
-                if NW == 8:
-                    s = gi - eg * P
-                    gemm1_nw8(L, tid, a, expert, eg, s * i32(N_TILES) // P,
-                              (s + i32(1)) * i32(N_TILES) // P)
-                else:
-                    gemm1(L, tid, a, expert, eg, gi - eg * P, P, (gi - bid) // nblk)
-                if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                    if P > i32(1):
-                        echunk_done(L, tid, a, i32(ECNT1) + eg)
-            if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                if tid == i32(0):  # post gemm1 (slot 7)
-                    bst(now(), rsrc(a["dbg"]),
-                        (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(7)) * i32(8), 0, 0)
-            # EP_ESYNC: GEMM2 units wait their own echunk's GEMM1 shards (echunk_wait), so
-            # only the local drain is needed here; else a grid barrier at P>1.
-            if const_expr(ESYNC):
-                gbar(L, tid, a, i32(1))
-            else:
-                gbar(L, tid, a, P)
-            # reset the A-ring for GEMM2 + release the A-loader's PASS-2 phase (inter is now
-            # written + gbar-flushed).  Safe here: PASS-1 drained the ring (compute consumed,
-            # loader produced) and the loader is parked on RC_G2GO, so nothing touches it.
-            if tid == i32(0):
-                for b in range_constexpr(NAB):
-                    lds_st(L, L_RCTL + (i32(RC_ASEQ) + i32(b)) * i32(4), i32(0))
-                    lds_st(L, L_RCTL + (i32(RC_AFREE) + i32(b)) * i32(4), i32(0))
-                for b in range_constexpr(4):  # W ring (EP_WLDS): the loader parks on G2GO too
-                    lds_st(L, L_RCTL + (i32(RC_WSEQ) + i32(b)) * i32(4), i32(0))
-                    lds_st(L, L_RCTL + (i32(RC_WFREE) + i32(b)) * i32(4), i32(0))
-                lds_st_rel(L, L_RCTL + RC_G2GO * i32(4), i32(1))
-            cbar(L, tid)  # compute waves see the zeroed ring before consuming GEMM2 A
-            # --- PASS 2 (GEMM2) [+ fused combine at P==1].  P==1 (high bs): each echunk's
-            #     GEMM2 scatters its output straight to the source ``part`` from the cshuffle
-            #     epilogue (gemm2_combine) -- no gout round-trip, and the cross-rank P2P
-            #     overlaps the NEXT n-tile's MFMA.  P>1 (gout n-tile-sharded across CTAs):
-            #     grid-barrier, then combine full rows in this band (pass 3, combine_send).
-            if P == i32(1):
-                # fused-combine GEMM2: the bf16 output scatters straight to each row's source
-                # part from the epilogue (no gout). rows = valid count (padding skipped).
-                for ei_ in range(bid_e, nch, nblk):
-                    ei = i32(ei_)
-                    expert, cc, _ = dch(L, ei)
-                    rows = dch_rows(L, expert, cc)
-                    if NW == 8:
-                        gemm2_combine_nw8(L, tid, a, expert, ei, rows, i32(0),
-                                          i32(N_TILES2))
-                    else:
-                        gemm2_combine(L, tid, a, expert, ei, rows, (ei - bid_e) // nblk)
-                if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                    if tid == i32(0):  # post gemm2 (slot 8)
-                        bst(now(), rsrc(a["dbg"]),
-                            (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(8)) * i32(8),
-                            0, 0)
-            else:
-                for gi_ in range(bid, nch * P, nblk):
-                    gi = i32(gi_)
-                    eg = gi // P
-                    expert, _, _ = dch(L, eg)
-                    if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                        echunk_wait(a, tid == i32(0), i32(ECNT1) + eg, P)
-                        cbar(L, tid)
-                        fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-                    if NW == 8:
-                        s = gi - eg * P
-                        gemm2_pipe_nw8(L, tid, a, expert, eg, s * i32(N_TILES2) // P,
-                                       (s + i32(1)) * i32(N_TILES2) // P, rsrc(a["gout"]))
-                    else:
-                        gemm2(L, tid, a, expert, eg, gi - eg * P, P,
-                              rsrc(a["gout"]), (gi - bid) // nblk)
-                    if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                        # the echunk's last GEMM2 shard combines it right away (no grid
-                        # barrier); every GEMM1/GEMM2 waiter of eg has passed, so reset both.
-                        echunk_done(L, tid, a, i32(ECNT2) + eg)
-                        if lds_ld_i32(L, L_CTL + C_ELAST * 4) == P - i32(1):
-                            if tid == i32(0):
-                                g_st_sys(ctrl_at(a, i32(ECNT2) + eg), i32(0))
-                                g_st_sys(ctrl_at(a, i32(ECNT1) + eg), i32(0))
-                            fx.memory_fence(syncscope="agent",
-                                            ordering=fx.AtomicOrdering.Acquire)
-                            combine_send(L, tid, a, rsrc(a["gout"]), eg,
-                                         dch_rows(L, expert, dch(L, eg)[1]))
-                if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                    if tid == i32(0):  # post gemm2 (slot 8)
-                        bst(now(), rsrc(a["dbg"]),
-                            (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(8)) * i32(8),
-                            0, 0)
-                if const_expr(not ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                    gbar(L, tid, a, P)
-                    for ei_ in range(bid_e, nch, nblk):
-                        ei = i32(ei_)
-                        expert, cc, _ = dch(L, ei)
-                        combine_send(L, tid, a, rsrc(a["gout"]), ei, dch_rows(L, expert, cc))
-        if const_expr(NW == 4):
-            _gemm_passes_nw4(L, tid, a, nch, nblk, bid_e, S1, K1, q1, r1, uf1, uc1, P1,
-                             S2, K2, q2, r2, uf2, uc2, P2)
+        _dynq_passes_nw8(L, tid, a, nch, nblk)
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
             if tid == i32(0):  # per-n-tile GEMM tick sums (gemm.py _pmark) -> slots 13..18
                 for k in range_constexpr(6):
@@ -1051,157 +866,5 @@ def build_schedule(kc: KernelCtx) -> dict:
                         rsrc(a["dbg"]),
                         (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(13 + k)) * i32(8),
                         0, 0)
-
-    @flyc.jit
-    def a_loader_units(L, tid, a):
-        """Dedicated A-loader band driver (TP-style).  Two phases, each gated by a go flag
-        the compute band raises once the A source is live: PASS 1 (RC_G1GO -- dispatched
-        payload + PASS-0 rowmap) stages each GEMM1 unit's A, PASS 2 (RC_G2GO -- the GEMM1
-        intermediate written + gbar-flushed, ring reset) stages each GEMM2 unit's inter A.
-        Walks the SAME stride-#CU unit walk + P as compute_units so the running ring tile
-        index matches the consumer; GEMM2 mirrors the P==1 (per-echunk) / P>1 (per-shard)
-        split of compute_units PASS 2."""
-        lane = tid - i32(B_LOADER)  # loader-local lane 0..NLOAD-1 (= ATileLoader override)
-        nblk = i32(gpu.grid_dim.x)
-        # PASS 1: GEMM1 A (dispatched payload, indexed gather).
-        spin0(L, lane, L_RCTL + RC_G1GO * i32(4), i32(1))
-        nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
-        S1, K1 = _plan_ld(L, False)
-        S2, K2 = _plan_ld(L, True)
-        q1, r1, uf1, uc1, P1 = _phase(L, nch, i32(N_TILES), S1, K1)
-        q2, r2, uf2, uc2, P2 = _phase(L, nch, i32(N_TILES2), S2, K2)
-        t1 = _walk_start(uc1, nblk)
-        for t_ in range(t1, uc1, nblk):
-            t = i32(t_)
-            rnd = (t - t1) // nblk
-            for j_ in range(i32(0), _nslots(t, uf1, K1), i32(1)):
-                eg, lo, hi, qb = _unit(t, i32(j_), rnd, S1, K1, q1, r1, uf1, i32(N_TILES))
-                if eg < nch:
-                    a_loader_g1(L, lane, a, dch(L, eg)[0], eg, lo, hi, qb)
-        # PASS 2: GEMM2 A (the intermediate, non-indexed) -- same item walk (P2 == 1:
-        # whole echunks, the fused-combine GEMM2's walk).
-        spin0(L, lane, L_RCTL + RC_G2GO * i32(4), i32(1))
-        cross = (P1 > i32(1)) | (P2 > i32(1))  # the echunk's GEMM1 ran on other CTAs
-        t2 = _walk_start(uc2, nblk)
-        for t_ in range(t2, uc2, nblk):
-            t = i32(t_)
-            rnd = (t - t2) // nblk
-            for j_ in range(i32(0), _nslots(t, uf2, K2), i32(1)):
-                eg, lo, hi, qb = _unit(t, i32(j_), rnd, S2, K2, q2, r2, uf2, i32(N_TILES2))
-                if eg < nch:
-                    if const_expr(ESYNC):  # noqa: SIM102 - compile-time gate, not dynamic
-                        if cross:
-                            echunk_wait(a, lane == i32(0), i32(ECNT1) + eg, P1)
-                            fx.memory_fence(syncscope="agent",
-                                            ordering=fx.AtomicOrdering.Acquire)
-                    a_loader_g2(L, lane, a, eg, lo, hi - lo, qb)
-
-    # ---- W-loader (EP_WLDS, NW=4): the two waves past the A-loader -------------------
-    # Walks the SAME unit / n-tile / K-step sequence as the A-loader (running ring tile q
-    # per GEMM phase) and LDS-DMAs tile q's W (TILE_N/16 n-blocks x 2 KB, BWeightLoader
-    # layout) + B-scale (TILE_N/32 groups x 256 B, BScaleLoader layout) into W-ring bank
-    # q % NWB, which the compute waves read instead of HBM (gemm.py _wl_*).  Bank layout:
-    # chunk c = nb_local*2 + ksub at c*1 KB (lane*16 B within), scale group g at
-    # WB_W + g*256 (lane*4 B within).  Each wave stages half a tile (16 x 1 KB + 4 x 256 B
-    # = WL_OPS DMAs) and publishes it WL_D-1 tiles later (wait_vm keeps WL_D tiles in
-    # flight); the last tile of a phase flushes.  GEMM2 starts after compute's G2GO (which
-    # follows its ring reset), so the loader never touches the counters across the reset.
-    H, K_ITERS = kc.get("H K_ITERS")
-    K_ITERS2 = I // (H // K_ITERS)  # GEMM2 K-steps (same TILE_K)
-    TILE_N, WL, NWB, L_W, WB = kc.get("TILE_N WL NWB L_W WB")
-    NB_W = TILE_N // 16  # 16-col weight blocks per n-tile
-    NG_S = TILE_N // 32  # 32-col scale groups per n-tile
-    WB_W = NB_W * 2048  # W bytes per bank (the B-scale follows)
-    WL_OPS = NB_W + NG_S // 2  # DMAs per loader wave per tile
-    WL_D = max(NWB, 1)  # tiles in flight per loader wave (<= NWB: no publish deadlock)
-    assert WL_OPS * (WL_D - 1) <= 63  # vmcnt range
-    assert EPR * 2 * I * (H // 2) < 2**31 and EPR * H * (I // 2) < 2**31  # i32 soffset
-
-    @flyc.jit
-    def _wl_put(L, lw, lane, q, rw, rws, sw, ss, sn0, srow4):
-        """Stage this wave's half of tile q (soffsets sw / ss = the tile's W / scale base)."""
-        if lane == i32(0):
-            spin_lds_ge(L, L_RCTL + (i32(RC_WFREE) + q % i32(NWB)) * i32(4),
-                        i32(NW) * (q // i32(NWB)))
-        rocdl.sched_barrier(0)
-        wb = L + i32(L_W) + (q % i32(NWB)) * i32(WB)
-        for j in range_constexpr(NB_W):
-            c = lw * i32(NB_W) + i32(j)
-            dma16(wb + c * i32(1024), rw, lane * i32(16),
-                  sw + (c >> i32(1)) * sn0 + (c & i32(1)) * i32(1024))
-        for j in range_constexpr(NG_S // 2):
-            g = lw * i32(NG_S // 2) + i32(j)
-            dma4(wb + i32(WB_W) + g * i32(256), rws, lane * i32(4), ss + g * srow4)
-
-    @flyc.jit
-    def _wl_pub(L, lane, q, last):
-        """Publish tile q - (WL_D-1) (its DMAs are done once <= (WL_D-1) tiles' remain);
-        at the phase's last tile drain and publish the rest."""
-        if q >= i32(WL_D - 1):
-            wait_vm(WL_OPS * (WL_D - 1))
-            if lane == i32(0):
-                t = q - i32(WL_D - 1)
-                lds_atomic_add(L, L_RCTL + (i32(RC_WSEQ) + t % i32(NWB)) * i32(4), 1, REL)
-        if last:
-            wait_vm(0)
-            if lane == i32(0):
-                for d in range_constexpr(WL_D - 1):
-                    t = q - i32(d)
-                    if t >= i32(0):
-                        lds_atomic_add(
-                            L, L_RCTL + (i32(RC_WSEQ) + t % i32(NWB)) * i32(4), 1, REL)
-
-    @flyc.jit
-    def w_lds_units(L, tid, a):
-        """One phase-parameterised walk (ph 0 = GEMM1 W1 [2I, H], ph 1 = GEMM2 W2 [H, I])
-        on one V# per phase at the local-expert slab base; expert / n-tile / K-step offsets
-        go in the (uniform) soffset.  P==1 makes nt_lo/nt_hi span all n-tiles, matching
-        compute's per-echunk GEMM2."""
-        wl = tid - i32(B_LOADER + NLOAD)  # 0..127
-        lw = wl // i32(64)
-        lane = wl % i32(64)
-        nblk = i32(gpu.grid_dim.x)
-        spin_lds_ge(L, L_CTL + C_PLAN * 4, i32(1))
-        nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
-        for ph_ in range(i32(0), i32(2), i32(1)):
-            g2 = i32(ph_) == i32(1)
-            if g2:
-                if lane == i32(0):
-                    spin_lds_ge(L, L_RCTL + RC_G2GO * 4, i32(1))
-                rocdl.sched_barrier(0)
-            rw = rsrc(g2.select(fx.Int64(a["w2"]), fx.Int64(a["w1"])))
-            rws = rsrc(g2.select(fx.Int64(a["w2s"]), fx.Int64(a["w1s"])))
-            ntn = g2.select(i32(N_TILES2), i32(N_TILES))
-            kn = g2.select(i32(K_ITERS2), i32(K_ITERS))
-            sn0 = g2.select(i32(I * 8), i32(H * 8))
-            srow4 = g2.select(i32(I // 256 * 256), i32(H // 256 * 256))
-            ew = g2.select(i32(H * (I // 2)), i32(2 * I * (H // 2)))
-            es = g2.select(i32(H * (I // 32)), i32(2 * I * (H // 32)))
-            S = g2.select(lds_ld_i32(L, L_CTL + C_S2 * 4), lds_ld_i32(L, L_CTL + C_S1 * 4))
-            K = g2.select(lds_ld_i32(L, L_CTL + C_K2 * 4), lds_ld_i32(L, L_CTL + C_K1 * 4))
-            q, r, uf, uc, _ = _phase(L, nch, ntn, S, K)
-            t0 = _walk_start(uc, nblk)
-            for t_ in range(t0, uc, nblk):
-                t = i32(t_)
-                rnd = (t - t0) // nblk
-                ns = _nslots(t, uf, K)
-                for j_ in range(i32(0), ns, i32(1)):
-                    j = i32(j_)
-                    eg, nt_lo, nt_hi, qb = _unit(t, j, rnd, S, K, q, r, uf, ntn)
-                    if eg < nch:
-                        expert, _, _ = dch(L, eg)
-                        # this CTA's last unit of the phase: flush the delayed publishes
-                        lastu = (t + nblk >= uc) & ((j == ns - i32(1)) | (eg + i32(1) >= nch))
-                        for nt_ in range(nt_lo, nt_hi, i32(1)):
-                            nt = i32(nt_)
-                            sw = expert * ew + nt * i32(NB_W) * sn0
-                            ss = expert * es + nt * i32(NG_S) * srow4
-                            lastn = lastu & (nt == nt_hi - i32(1))
-                            for sp_ in range(i32(0), kn, i32(1)):
-                                sp = i32(sp_)
-                                q_ = (qb + nt - nt_lo) * kn + sp
-                                _wl_put(L, lw, lane, q_, rw, rws, sw + sp * i32(2048),
-                                        ss + sp * i32(256), sn0, srow4)
-                                _wl_pub(L, lane, q_, lastn & (sp == kn - i32(1)))
 
     return locals()

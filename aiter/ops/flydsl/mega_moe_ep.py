@@ -114,6 +114,11 @@ class MegaMoeEP:
 
     __call__ = forward
 
+    def prepare(self) -> None:
+        """Collective: compile every launch variant on every rank (forward's first call
+        does it otherwise; call it before capturing a CUDA graph)."""
+        self.engine.prepare()
+
     def reference_forward(self, x_bf16, wts, topk_ids, ref_weights):
         """Pure-torch EP MoE oracle for these inputs (对拍); ``ref_weights`` are the
         unshuffled quantized weights ``(w1_q, w1_scale, w2_q, w2_scale)``."""

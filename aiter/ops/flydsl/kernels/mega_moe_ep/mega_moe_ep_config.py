@@ -27,9 +27,6 @@ from ..mega_moe_tp.common import DEADLINE, MAX_TP
 from ..mega_moe_tp.mega_moe_tp_config import KernelCtx
 
 __all__ = [
-    "B_COMBINE",
-    "B_DISPATCH",
-    "B_LOADER",
     "CTRL_ERR",
     "C_BARCNT",
     "C_BARGEN",
@@ -38,16 +35,14 @@ __all__ = [
     "C_GEXP",
     "C_NACT",
     "C_NCH",
-    "C_PLAN",
     "C_UL",
-    "C_UNIT",
     "C_UROWS",
     "C_USEQ",
     "DYN_MAX",
+    "EPOCH_SLOT",
     "ERR_COMBINE",
     "ERR_COMPUTE",
     "ERR_DISPATCH",
-    "FLAG_COMBINE",
     "FLAG_COMB_CNT",
     "FLAG_DISPATCH",
     "FLAG_DISPM",
@@ -56,9 +51,13 @@ __all__ = [
     "FLAG_INIT",
     "FLAG_INIT_CNT",
     "FLAG_INTS",
+    "FLAG_SRCM",
     "GBAR_CNT",
     "GBAR_GEN",
-    "GOUT_ROWS",
+    "GBAR_X",
+    "GBAR_XG",
+    "MAGG_G",
+    "MAGG_X",
     "MAX_NPES",
     "NCTA_MAX",
     "NT",
@@ -78,63 +77,27 @@ MAX_NPES = MAX_TP
 NCTA_MAX = 256
 N_XCD = 8
 
-# Block geometry: one CTA per CU, eight 64-lane waves.  Default (NW=4): warp-specialized
-# -- 4 compute waves + 4 aux (dispatch / A-loader / combine) running CONCURRENTLY so the
-# a2a + A-staging overlap the GEMM (1 MFMA wave/SIMD).  EP_NW8=1: all 8 waves compute MFMA
-# (2 MFMA waves/SIMD, the V2-style occupancy) with the comm done SERIALLY by the compute
-# waves (no aux band, no A-loader ring) -- a prototype of the "trade comm overlap for 2x
-# MFMA occupancy" direction.  Block stays 8 waves (NTT=512) either way.
-EP_NW8 = bool(int(os.environ.get("EP_NW8", "0")))
-# Engine auto-selects the NW=8 (all-8-wave-MFMA, serial-comm) variant per launch once the
-# token count reaches this. EP_NW8=1 forces it always.  With the NW=8 K-loop prefetch
-# (EP_G8PF) NW=8 is never slower: bs1 even, bs8..512 -8%..-30%, bs1536 -44% vs NW=4.
-EP_NW8_MIN = int(os.environ.get("EP_NW8_MIN", "1"))
-NW = 8 if EP_NW8 else 4  # module default (compile path takes NW per-launch; see kernel_config)
-NT = NW * 64  # 512 (NW8) or 256 compute threads
-NTT = NT + (0 if EP_NW8 else 4 * 64)  # 512 threads (8 waves) in both modes
-
-# Role bands by tid (see mega_moe_ep_kernel.roles):
-#   [0, NT)                   compute_units (local-expert GEMM1 + act + GEMM2)
-#   [NT, NT+64)               dispatch_send (a2a scatter tokens to expert-owner ranks)
-#   [B_LOADER, B_LOADER+NLOAD) a_loader (TP-style: stage A K-tiles into the NAB-bank ring)
-#   [B_LOADER+NLOAD, NTT)     W-loader (EP_WLDS: stage W + B-scale into the NWB-bank W ring), else idle
-B_DISPATCH = NT
-B_LOADER = NT + 64
-B_COMBINE = NT + 128
-# The dedicated A-loader occupies NLOAD_W waves starting at B_LOADER (producer of the
-# NAB-bank A-ring the compute waves consume); more waves = more A-staging throughput.
-NLOAD_W = 1
-NLOAD = NLOAD_W * 64
-# NW=4 only: the two waves past the A-loader LDS-DMA each K-step's W + B-scale into an
-# NWB-bank LDS ring (NWB = what the free LDS fits, >= 2) that the compute waves read
-# instead of HBM -- deepens the weight stream past the compute waves' 2-step registers.
-EP_WLDS = int(os.environ.get("EP_WLDS", "0"))
+# Block geometry: one CTA per CU, eight 64-lane waves, all of them compute MFMA (2 MFMA
+# waves/SIMD); the a2a dispatch and the combine scatter run serially on the same waves.
+NW = 8
+NT = NW * 64
+NTT = NT
 
 # GEMM geometry (the compute waves reuse the mega_moe stage1/stage2 MFMA atoms; see
-# gemm.py). The GEMM runs on the NW=4 compute waves (NT=256 threads). TILE_K is the
-# MFMA K-step byte granularity; TILE_N the GEMM1 output column tile over the gate|up
-# halves (2*inter_dim). FP4 activations halve the per-K-step A bytes.
+# gemm.py). TILE_K is the MFMA K-step byte granularity; TILE_N the GEMM1 output column
+# tile over the gate|up halves (2*inter_dim). FP4 activations halve the per-K-step A bytes.
 KCS = 2  # A K-chunks staged together
 TILE_K = 256
-# Output-col tile.  NW=8 doubles it to 512 so each of the 8 compute waves still owns 32
-# output cols = exactly one 1x32 MX quant group (NUM_ACC_N=4, gui_n=2) -- the register
-# GEMM1 epilogue + the chunked GEMM2 cshuffle need the per-wave group to be in-wave, which
-# TILE_N/NW=64 gives at NW=8 just as TILE_N/NW=64 does at NW=4 (TILE_N=256).
-TILE_N = 512 if EP_NW8 else 256
-# A-ring banks for the TP-style dedicated A-loader prefetch (producer/consumer depth):
-# the GEMM1/GEMM2 compute waves read A K-tiles from this many LDS banks while the loader
-# wave stages the next ones ahead.  >=2 (double-buffer); bounded by the LDS budget.
-NAB = 4
+# Each of the 8 compute waves owns TILE_N / NW = 64 output cols, i.e. 32 per gate|up half
+# = exactly one 1x32 MX quant group (NUM_ACC_N=4, gui_n=2): the register GEMM1 epilogue +
+# the chunked GEMM2 cshuffle need the per-wave group to be in-wave.
+TILE_N = 512
 
 # Up to this many received (token, expert) pairs per rank use the dynamic planner
 # (the one ported here); larger batches want an LB-style two-phase planner (future).
 DYN_MAX = 256
-# gout rows: only the n-tile-sharded (P > 1) passes write gout, and they need
-# nch <= #CTA <= NCTA_MAX, so NCTA_MAX echunks of at most GOUT_RG rows.  Every other
-# per-echunk table (chunk lookup, ECNT counters, inter / inters / rowmap / rowidx) is
-# sized by nch_max() / inter_rows().
-GOUT_RG = 128
-GOUT_ROWS = NCTA_MAX * GOUT_RG
+# The per-echunk tables (chunk lookup, ECNT counters, inter / inters / rowmap / rowidx)
+# are sized by nch_max() / inter_rows().
 
 
 def nch_max(tmax: int, topk: int, rg: int, epr: int) -> int:
@@ -162,14 +125,17 @@ def ctrl_ints(tmax: int, topk: int, epr: int, rg_min: int = 32) -> int:
 # counter self-resets each launch; ``reset()`` clears residue after a timeout.
 #   FLAG_DISPATCH + parity*NCTA_MAX + tile   dispatch receive tile ready (epoch)
 #   FLAG_DISP_CNT + parity*NCTA_MAX + tile   dispatch receive tile arrival counter
-#   FLAG_COMBINE  + parity*NCTA_MAX + tile   combine partial tile ready (epoch)
-#   FLAG_COMB_CNT + parity*NCTA_MAX + tile   combine partial tile arrival counter
+#   FLAG_SRCM     + parity*NCTA_MAX + src    source rank src's m (written before its META
+#                                            arrival; ranks may differ)
+#   FLAG_COMB_CNT + parity*NCTA_MAX + 0      combine partial arrival counter: the source
+#                                            waits its own m*TOPK*COMB_W (zeroed by the
+#                                            launch before its next use)
 # NOTE: per-tile granularity is the scaffold's bound; the final tile->slot mapping may
 # be refined once dispatch_send fixes the receive-tile count.
 FLAG_DISPATCH = 0
 FLAG_DISP_CNT = FLAG_DISPATCH + 2 * NCTA_MAX
-FLAG_COMBINE = FLAG_DISP_CNT + 2 * NCTA_MAX
-FLAG_COMB_CNT = FLAG_COMBINE + 2 * NCTA_MAX
+FLAG_SRCM = FLAG_DISP_CNT + 2 * NCTA_MAX
+FLAG_COMB_CNT = FLAG_SRCM + 2 * NCTA_MAX
 # FLAG_INIT + parity*NCTA_MAX + 0        post-init all-to-all barrier ready (epoch)
 # FLAG_INIT_CNT + parity*NCTA_MAX + 0    post-init arrival counter (npes*n_cta)
 FLAG_INIT = FLAG_COMB_CNT + 2 * NCTA_MAX
@@ -180,11 +146,24 @@ FLAG_INIT_CNT = FLAG_INIT + 2 * NCTA_MAX
 # gather, all routing-only) while the big payload a2a is still in flight.
 FLAG_DISPM = FLAG_INIT_CNT + 2 * NCTA_MAX
 FLAG_DISPM_CNT = FLAG_DISPM + 2 * NCTA_MAX
-# FLAG_PAYC + parity*NCTA_MAX + le    EP_OVL: routes to local expert le whose payload row
+# FLAG_PAYC + parity*NCTA_MAX + le    routes to local expert le whose payload row
 # has landed (senders add after draining; the owner compares with its L_DCNT[le] and its
 # last CTA out zeroes the parity's counters).
 FLAG_PAYC = FLAG_DISPM_CNT + 2 * NCTA_MAX
-FLAG_INTS = FLAG_PAYC + 2 * NCTA_MAX
+# SBX (small-batch protocol), one bank, slot = the peer rank; a launch never
+# confuses a past one's stamp (epochs only grow / the tag differs):
+#   FLAG_SBM + src   src's header: tag | its m (the routing words carry the same tag)
+#   FLAG_SBP + src   src's payload rows to this rank landed (epoch)
+#   FLAG_SBD + own   owner rank ``own`` finished its whole tile queue (epoch): every
+#                    part row it scattered to this rank landed
+# The SBX tag is the epoch's low 32 - SBX_TB bits above SBX_TB value bits.  Routing
+# words start (and are re-scrubbed once per tag period, communication.sbx_scrub) as -1:
+# all-ones value bits never pass, so a word unwritten for a whole period can't match.
+SBX_TB = 9
+FLAG_SBM = FLAG_PAYC + 2 * NCTA_MAX
+FLAG_SBP = FLAG_SBM + MAX_NPES
+FLAG_SBD = FLAG_SBP + MAX_NPES
+FLAG_INTS = FLAG_SBD + MAX_NPES
 
 # Global control ints (device tensor): a sticky watchdog error word plus room.
 CTRL_ERR = 0
@@ -194,105 +173,106 @@ ERR_DISPATCH, ERR_COMPUTE, ERR_COMBINE = 1, 2, 4
 # the LDS cbar: the last arriver zeroes the counter and bumps the generation. Zeroed
 # once at engine init; the generation grows monotonically (wrap-safe == compare).
 GBAR_CNT, GBAR_GEN = 16, 17
-# Per-echunk pass-completion counters (P>1, EP_ESYNC): each GEMM1 / GEMM2 n-tile shard
-# release-adds 1 when its slice of inter / gout is written, so a consumer waits only
-# for its own echunk's P shards instead of a grid barrier.  The last GEMM2 shard of an
-# echunk combines it and zeroes both counters (every waiter has passed by then).
-# [ECNT1, ECNT1 + NCHM): GEMM1 shards done per echunk; [ECNT2, ECNT2 + NCHM): GEMM2.
+# [GBAR_X, GBAR_X + N_XCD): per-XCD arrival counters (2-level grid_bar, XCD barrier);
+# [GBAR_XG, GBAR_XG + N_XCD): per-XCD generations of the XCD-local barrier.
+GBAR_X, GBAR_XG = 48, 56
+# [MAGG_X, MAGG_X + N_XCD) + MAGG_G: per-XCD / per-rank counters that fold this rank's
+# CTAs' dispatch META arrivals into one arrival per owner (self-resetting).
+MAGG_X, MAGG_G = 18, 26
+# Launch epoch (device-side, so a captured CUDA graph replays with a fresh one): every
+# CTA reads it at entry; CTA 0 bumps it once the plan grid barrier shows all have.
+EPOCH_SLOT = 27
+# Per-echunk tile counters: each GEMM1 / GEMM2 tile of an echunk adds 1 once its slice of
+# inter / part is written, so a GEMM2 tile waits only its own echunk's N_TILES GEMM1 tiles.
+# The echunk's last GEMM2 tile zeroes both (every waiter has passed by then).
+# [ECNT1, ECNT1 + NCHM): GEMM1 tiles done per echunk; [ECNT2, ECNT2 + NCHM): GEMM2.
 # NCHM = nch_max() of the instance, so ECNT2 = ECNT1 + NCHM is per-instance (kc).
 ECNT1 = 64
-ESYNC = int(os.environ.get("EP_ESYNC", "1"))
-# GEMM unit walk in XCD-major CTA order (workgroups land on XCDs round-robin): the
-# consecutive echunks of one expert -- same n-tile shard, same pace -- then run on the
-# same XCD, so their identical weight stream is fetched from HBM once and L2-shared.
-XCDMAP = int(os.environ.get("EP_XCDMAP", "1"))
-# NW=4 GEMM pass split (needs EP_ESYNC): shard size S = the smallest that fits the grid
-# with the NTn%S remainder shards packed several per CTA (vs the P = nblk//nch even
-# split, which leaves nblk - nch*P CTAs idle and caps every CTA at ceil(NTn/P)).
-# Off by default: the packed-remainder CTAs (all on the last XCD) lose the per-expert L2
-# reuse and, finishing last, serially combine_send all K of their echunks.
-BAL = int(os.environ.get("EP_BAL", "0")) and ESYNC
-# NW=8 flat GEMM split (needs EP_ESYNC): each pass's nch * N_TILES n-tiles are cut into
-# nblk contiguous, equal ranges (one per CTA, XCD-major) instead of whole echunks per CTA
-# -- no idle CTAs at nch < nblk and no partial last round at nch > nblk.  An echunk split
-# across CTAs syncs through the ECNT counters; the fused combine arrives per n-tile.
-# Off by default: CTAs no longer walk an expert's n-tiles in lockstep, so the XCD's L2
-# stops sharing its weight stream (GEMM time +35% despite the better balance).
-FLAT = int(os.environ.get("EP_FLAT", "0")) and ESYNC
-# NW=8 dispatch send on all 8 waves (vs wave 0 alone while the other 7 wait at the barrier).
-# Measured neutral: the send is xGMI-bandwidth-bound, not issue-bound.
-DISPW = int(os.environ.get("EP_DISPW", "1"))
-# NW=8 dynamic tile queue (needs EP_ESYNC): XCD x owns the echunks [x*nch/8, (x+1)*nch/8)
-# and its CTAs pull single n-tiles from an XCD-local atomic counter -- all GEMM1 tiles
-# (n-tile-major, so concurrent CTAs share each expert's W tile in L2), then all GEMM2
-# tiles (each waits its echunk's N_TILES GEMM1 tiles; the echunk's last GEMM2 tile
-# arrives the combine).  No idle CTAs, no partial rounds, no gbar between the GEMMs.
-# Wins where the whole-echunk walk idles many CTAs (bs3072 -13%, bs6144 -6%); near
-# neutral at bs2048/4096, where the GEMM is bandwidth-bound and the extra CTAs only
-# slow every tile down (a static round-robin deal of the same order measured the same).
-DYNQ = int(os.environ.get("EP_DYNQ", "1")) and ESYNC
-# EP_DYNQ tile sync scope: 0 = XCD-local (an echunk's producers and consumers share the
-# XCD's L2, so drained stores + the counter suffice; a CTA whose hardware XCC is not
-# bid % N_XCD reports ERR_COMPUTE), 1 = agent-scope release/acquire per tile.
-DQF = int(os.environ.get("EP_DQF", "0"))
+# Tile queue: XCD x owns a contiguous echunk range and its CTAs pull single n-tiles from
+# an XCD-local atomic counter -- all GEMM1 tiles, then all GEMM2 tiles (each waits its
+# echunk's N_TILES GEMM1 tiles; the echunk's last GEMM2 tile arrives the combine).  No
+# idle CTAs, no partial rounds, no grid barrier between the GEMMs (vs a whole-echunk
+# walk: bs3072 -13%, bs6144 -6%).  An echunk's producers and consumers share the XCD's
+# L2, so drained stores + the counter suffice; a CTA whose hardware XCC is not
+# bid % N_XCD reports ERR_COMPUTE.  The queue runs expert-major (an expert's n-tiles,
+# its echunks minor, so the expert's A stays in L2 across its n-tiles).
 QCNT = 32  # [QCNT, QCNT + N_XCD): per-XCD tile-queue counters (self-resetting)
-QDONE = QCNT + N_XCD  # EP_OVL: CTAs past the tile queue (the last one resets FLAG_PAYC)
+QDONE = QCNT + N_XCD  # CTAs past the tile queue (the last one resets FLAG_PAYC)
 assert QDONE < ECNT1
-# NW=8 dispatch/GEMM overlap (needs EP_DYNQ): the payload goes in LB = ceil(EPR / N_XCD)
-# rounds -- round g: the (token, owner) rows whose smallest le % LB over the token's local
-# experts on that owner is g, so expert le is complete after round le % LB, about one
-# expert per owner XCD per round -- each counting its landed routes into the owner's
-# FLAG_PAYC[le].  Every CTA sends rounds [0, EP_OVG0) with the routing (before plan: the
-# plan's grid barriers would wait on any CTA still sending), then EP_NSX CTAs per XCD
-# send the rest while the others start the tile queue.  The queue runs expert-major from
-# the XCD's first round-0 expert, and a GEMM1 tile waits its expert's count.  vs EMAJ
-# alone: bs2048 -4%, 4096 -7%, 8192 -7% (NSX 2..4 within noise; OVG0=1/3 slower).
-OVL = int(os.environ.get("EP_OVL", "1")) and DYNQ
-NSX = int(os.environ.get("EP_NSX", "4"))
-OVG0 = int(os.environ.get("EP_OVG0", "2"))
-# EP_DYNQ tile order: expert-major (an expert's n-tiles, its echunks minor, so the
-# expert's A stays in L2 across its n-tiles) vs n-tile-major over the XCD's whole echunk
-# range.  EP_OVL needs expert-major.
-EMAJ = int(os.environ.get("EP_EMAJ", "1")) or OVL
-# NW=8 GEMM K-loop (gemm1_nw8 / _gemm2_core_nw8), bit flags.  1: A ds_read addresses as
-# two per-lane pointers + immediate offsets (AS2RLoader's one-expression address kept a
-# VGPR per (m-tile, ksub, bank) live across the loop).  2: W + B-scale loaded one K-step
-# ahead (else issued after the step's barrier and waited on by its first MFMA).  4: W +
-# B-scale wave-uniform address terms in the SGPR soffset (the per-load VALU address math
-# kept ~16 VGPRs live and spilled 30): -3..-5% e2e bs256..8192.  8: 4-bank A ring, one
-# barrier per two K-steps, A gathered two K-steps ahead: a further -1% bs2048, -3% bs8192.
-# 16: A operand ds_read one (m-tile, ksub) ahead of its MFMAs: -1% bs2048..8192.
-G8PF_DEF = 31
-G8PF = int(os.environ.get("EP_G8PF", str(G8PF_DEF)))
+# Dispatch/GEMM overlap: the payload goes in LB = ceil(EPR / N_XCD) rounds -- round g:
+# the (token, owner) rows whose smallest le % LB over the token's local experts on that
+# owner is g, so expert le is complete after round le % LB, about one expert per owner
+# XCD per round -- each counting its landed routes into the owner's FLAG_PAYC[le].
+# Every CTA sends the first rounds with the routing (before plan: the plan's grid
+# barriers would wait on any CTA still sending), then NSX CTAs per XCD send the rest
+# while the others start the tile queue.  The queue starts at the XCD's first round-0
+# expert, and a GEMM1 tile waits its expert's count (bs2048 -4%, 4096 -7%, 8192 -7%).
+# The up-front rounds are picked per launch from m: OVG0_HI at m >= OVG0_MIN, else
+# OVG0_LO (8x MI355X a8w4 / a4w4, 1 vs 2 rounds: bs512 +2%, bs1024 even, bs2048..32768
+# -1..-4%; 0 rounds slower everywhere).  NSX 2 vs 4: a8w4 mtpr 32768 bs8192..32768
+# -1..-2%, elsewhere even (1 / 3 / 8 slower).
+NSX = 2
+OVG0_LO, OVG0_HI, OVG0_MIN = 2, 1, 1024
+# [SBX_SCNT, SBX_SCNT + MAX_NPES): SBX payload senders to owner d done (self-resetting;
+# the MAGG slots, unused by SBX)
+SBX_SCNT = MAGG_X
+
+# AITER_MEGAMOE_EP_SDMA=1 (large kernel, experimental, default off): the payload rounds go
+# by MORI device SDMA.
+# Every sender packs round g's rows per owner p contiguously at the compacted row
+# off(p, g) + pos (pos from per-(p, g) counters, then a grid barrier), into its own
+# arena's stage region (p == rank: straight into its payload); the round's last CTA posts
+# one put per (owner, payload / scale) and the owner waits the per-(source, queue)
+# signal counts instead of FLAG_PAYC.  The owner finds a row through recv_pos.
+# 8x MI355X a8w4 graph vs off: mtpr 32768 bs8192 / 16384 / 32768 -2 / -5 / -6%, mtpr 8192
+# bs4096 / 8192 -1%, bs2048 +4% (the extra counting pass + grid barrier, ~5 us per put).
+SDMA_ENV = int(os.environ.get("AITER_MEGAMOE_EP_SDMA", "0"))
+SD_QP, SD_QS = 1, 2  # SDMA queues: payload rows, their scales
+SD_GMAX = 8  # >= payload rounds (ceil(EPR / N_XCD))
+# sdst (local int32 tensor) slots
+SD_CNT = 0  # [MAX_NPES * SD_GMAX]: rows per (owner, round) (self-resetting)
+SD_RD = SD_CNT + MAX_NPES * SD_GMAX  # [SD_GMAX]: CTAs done packing round g (self-resetting)
+SD_TURN = SD_RD + SD_GMAX  # the next round to post (puts in round order; self-resetting)
+SD_SELF = SD_TURN + 1  # epoch * SD_GMAX + rounds of this rank's own rows written
+SD_LAND = SD_SELF + 1  # epoch * SD_GMAX + rounds some CTA saw landed from every source
+SD_BASE = SD_SELF + 7  # [MAX_NPES * 2]: this launch's signal base per (source, SD_QP / SD_QS)
+SD_INTS = SD_BASE + 2 * MAX_NPES
+SD_DUM = 64  # bytes per source of the dummy-put target (a round without rows)
+# SDMA: the packing is local, so it takes more up-front rounds and sender CTAs (vs NSX /
+# OVG0: mtpr 32768 bs16384..32768 -2..-3%; all 6 rounds up front within 0.7%)
+SD_NSX, SD_OVG0 = 8, 2
+
+
+def sbx_on(SB):
+    """SB kernel small-batch protocol (SBX) -- no init barrier, no host recv fill, no META /
+    PAYC counting: each sender writes its header (m) and whole routing block, all
+    epoch-tagged, then its payload rows (FLAG_SBP); each owner stamps FLAG_SBD at every
+    source once its tile queue is done, which the source's combine waits.  The next launch
+    then only starts after every owner finished this one, so the inputs are safe
+    single-banked; the part region is epoch-parity double-banked."""
+    return bool(SB)
+
+
+def a_banks(SB):
+    """GEMM K-loop A-ring banks: 4 (one barrier per two K-steps, A gathered two K-steps
+    ahead: -1% bs2048, -3% bs8192 vs 2), except the SB kernel's 2 (8x MI355X graph mtpr
+    256 vs 4: a4 mt4 bs1..256 -0.2..-3%, a8 bs1..256 -0.2..-2%; 2 banks in the large
+    kernel are +20% at a8 bs32768)."""
+    return 2 if SB else 4
+
 
 # LDS control slots (ints at ``L_CTL``; see schedule.py). The cbar generation barrier,
 # the dynamic plan's bookkeeping and the per-CTA unit list live here.
-C_BARCNT, C_BARGEN = 0, 1  # 4-compute-wave LDS generation barrier
-C_NACT, C_NCH, C_PLAN, C_DYNP = 2, 3, 4, 5  # #active experts, #units, plan-ready, P
+C_BARCNT, C_BARGEN = 0, 1  # compute-wave LDS generation barrier
+C_NACT, C_NCH, C_DYNP = 2, 3, 5  # #active experts, #units, P
 C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather cache
-C_S1, C_K1, C_S2, C_K2 = 6, 7, 8, 9  # NW=4 pass split: shard size / packed remainders
-C_ELAST = 10  # EP_ESYNC: old value of this CTA's last echunk-counter add (tid0 -> waves)
-C_QIDX = 11  # EP_DYNQ: the tile index tid0 pulled from the XCD queue (tid0 -> waves)
-C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
-C_ROT = 14  # EP_OVL: the expert-major walk's start group (in echunks from e_lo)
+C_ELAST = 10  # old value of this CTA's last echunk-counter add (tid0 -> waves)
+C_QIDX = 11  # the tile index tid0 pulled from the XCD queue (tid0 -> waves)
+C_ROT = 14  # the expert-major walk's start group (in echunks from e_lo)
+C_EBASE = 15  # INTER_XBASE: first echunk of this CTA's XCD range (the inter base)
+C_SDL = 12  # SDMA: epoch * SD_GMAX + payload rounds this CTA saw landed (tid0)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
-
-# A-loader ring (producer/consumer) control slots, in their OWN LDS region ``L_RCTL`` so
-# the NAB per-bank counters don't crowd the unit-list area of ``L_CTL``.  The dedicated
-# loader wave publishes RC_ASEQ[bank] (an A K-tile is staged) and spins on RC_AFREE[bank]
-# (all NW compute waves released that bank's prior generation); the compute waves spin on
-# RC_ASEQ before reading and bump RC_AFREE after consuming.  RC_G1GO/RC_G2GO are the
-# per-pass go flags (compute sets them once the A source for that GEMM is live).
-RC_ASEQ = 0  # [RC_ASEQ, RC_ASEQ + NAB): produced seq (monotonic tile count) per ring bank
-RC_AFREE = NAB  # [RC_AFREE, RC_AFREE + NAB): consumer release count per ring bank
-RC_G1GO = 2 * NAB  # GEMM1 A-stream go (compute sets it after dispatch_wait + gather)
-RC_G2GO = 2 * NAB + 1  # GEMM2 A-stream go (Stage 2)
-# W ring (EP_WLDS): RC_WSEQ[bank] = W-loader wave publishes (2 per staged tile),
-# RC_WFREE[bank] = compute-wave releases (NW per consumed tile); up to 4 banks.
-RC_WSEQ = 2 * NAB + 8
-RC_WFREE = RC_WSEQ + 4
-RC_INTS = RC_WFREE + 4  # ints in L_RCTL
 
 ACT_SET = ("silu", "situv2")
 
@@ -312,7 +292,7 @@ def ep_shape_supported(
 
 @functools.cache
 def mega_moe_ep_consts(
-    H: int, I: int, MT: int, EPR: int, TMAX: int, a8: bool = False, NW: int = NW
+    H: int, I: int, MT: int, EPR: int, TMAX: int, a8: bool = False, SB: bool = False
 ) -> dict:
     """Per-instance LDS layout (bytes): one row tile's activation + E8M0 scale +
     intermediate staging, plus the dynamic planner's tables (active-expert bitmap /
@@ -322,9 +302,6 @@ def mega_moe_ep_consts(
     ``mega_moe_tp_consts`` carries once the GEMM device code lands.
     """
     RG = MT * 16  # rows per GEMM tile (sort_block_m)
-    # GEMM1 output-col tile (local to the NW arg so one process can hold both variants;
-    # NW8 doubles it to 512 so each of the 8 compute waves still owns 32 cols = 1 MX group).
-    TILE_N = 512 if NW == 8 else 256
     a_row = H if a8 else H // 2  # activation bytes per row (FP8 vs packed FP4)
     a_scale = H // 32  # E8M0 scale bytes per row
     inter_row = I if a8 else I // 2
@@ -337,13 +314,8 @@ def mega_moe_ep_consts(
     # the pool uses the GEMM2 cshuffle (RG*TILE_N*4), which also fits GEMM1's.
     a_k_step = TILE_K if a8 else TILE_K // 2
     a_lds_size = RG * a_k_step
-    # The A pool is the A-ring. NW4's dedicated async loader uses the full NAB-bank ring;
-    # NW8's inline-A GEMMs only double-buffer (2 banks, _bank % 2 in gemm1_nw8 / gemm2_nw8),
-    # so size the pool to the banks ACTUALLY used. At NW8 this reclaims (NAB-2)*a_lds_size
-    # (~16 KB a4 / 32 KB a8), which drops a4w4 NW8 back under the 80 KB (2 CTA/CU) occupancy
-    # threshold (the TILE_N=512 cshuffle L_C had pushed it to 83.8 KB -> only 1 CTA/CU).
-    a_banks = (4 if G8PF & 8 else 2) if NW == 8 else NAB
-    lds_pool = a_banks * a_lds_size
+    # The A pool is the inline-A GEMMs' bank ring (gemm.py A_NBK)
+    lds_pool = a_banks(SB) * a_lds_size
     c = {
         "RG": RG,
         "A_ROW": a_row,
@@ -361,7 +333,6 @@ def mega_moe_ep_consts(
         "A_K_STEP": a_k_step,
         "K_ITERS": H // TILE_K,
         "A_LDS_I32": a_lds_size // 4,
-        "NAB": NAB,
     }
     off = 0
 
@@ -376,17 +347,16 @@ def mega_moe_ep_consts(
     # full RG x inter tile would blow the 160 KB budget for FP8. The cshuffle epilogue
     # aliases the A pool (compile_gemm1 pattern); GEMM2 reads the intermediate from
     # global. TODO(tune): keep it per-inter-piece in LDS to drop the global round-trip.
-    c["L_A"] = take(lds_pool)  # A NAB-bank ring (GEMM1 + GEMM2 loader); cshuffle is in L_C
+    c["L_A"] = take(lds_pool)  # A bank ring (GEMM1 + GEMM2); cshuffle is in L_C
     c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile (compute-side stage)
-    # GEMM1's cshuffle C-tile gets its OWN region: the A-loader runs ahead into the L_A
-    # ring during the epilogue, so the C-tile can no longer alias L_A.  GEMM1 now uses a
-    # register epilogue (no C-tile); GEMM2's cshuffle is processed one MFMA m-tile (16
-    # rows) at a time, so L_C only needs 16 x TILE_N f32 (16 KB, not RG x TILE_N = 64 KB).
-    # The 48 KB saved lets the whole block fit twice per CU (2 MFMA waves/SIMD) while the
-    # shuffled layout (coalesced gout store / combine P2P) is preserved.  See gemm.py
-    # _epilogue_g2 / _epilogue_g2_combine (CROWS=16 per-mi chunking).
+    # GEMM2's cshuffle C-tile gets its OWN region (the A ring is staged ahead during the
+    # epilogue, so it can't alias L_A).  GEMM1 uses a register epilogue (no C-tile);
+    # GEMM2's cshuffle is processed one MFMA m-tile (16 rows) at a time, so L_C only
+    # needs 16 x TILE_N f32 (32 KB, not RG x TILE_N).
+    # The saving lets the whole block fit twice per CU (2 MFMA waves/SIMD) while the
+    # shuffled layout (coalesced combine P2P) is preserved.  See gemm.py
+    # _epilogue_g2_combine (CROWS=16 per-mi chunking).
     c["L_C"] = take(16 * TILE_N * 4)
-    c["L_RCTL"] = take(RC_INTS * 4)  # A-loader ring counters (RC_* slots)
     # dynamic planner tables
     c["L_DYN"] = take((2 * NBW + EPR) * 4)  # bitmap words | prefix words | dense list
     c["L_DCNT"] = take(EPR * 4)  # received rows per local expert
@@ -422,50 +392,33 @@ def kernel_config(
     situ_linear_beta: float = 1.0,
     swiglu_limit: float | None = None,
     a8: bool = False,
-    indexed_payload: bool = False,
-    NW: int = NW,
+    SB: bool = False,
+    WNT: bool = False,
 ):
     """Derived compile-time values of one ``compile_mega_moe_ep`` instance.
 
-    ``indexed_payload`` mirrors the dispatch fix: at the indexed-capable MTPR class
-    every rank receives payload keyed by source token (row = rank*mtpr + token,
+    ``SB`` selects the small-batch variant (mtpr <= SB_MAX, so all ranks agree): a
+    separate kernel whose latency-bound prologue / sync path differs from the
+    large-batch one.  ``WNT`` (SB only) streams the W1 / W2 loads non-temporally.
+
+    Every rank receives payload keyed by source token (row = rank*mtpr + token,
     bounded by npes*mtpr), overflow-proof under any cross-rank routing skew.
     """
     if act not in ACT_SET:
         raise ValueError(f"mega_moe_ep act must be one of {ACT_SET}, got {act!r}")
     if swiglu_limit is None:
         swiglu_limit = float("inf")
-    # Per-launch warp-specialization width (NW=4 default = 4 compute + 4 aux waves; NW=8
-    # all-8-wave MFMA with serial comm). Derive NT/NTT/TILE_N/role-bands HERE (not the
-    # module globals) so one process can compile both variants; they ride into KernelCtx
-    # via locals() and the builders / kernel roles read them from kc.
-    NT = NW * 64
-    NTT = NT + (0 if NW == 8 else 4 * 64)
-    TILE_N = 512 if NW == 8 else 256
-    B_DISPATCH = NT
-    B_LOADER = NT + 64
-    B_COMBINE = NT + 128
-    c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8, NW)
+    c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8, SB)
     RG, LDS_BYTES, NBW = c["RG"], c["LDS_BYTES"], c["NBW"]
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
     L_DIX, NDIXW = c["L_DIX"], c["NDIXW"]
-    L_C, L_RCTL, L_PF = c["L_C"], c["L_RCTL"], c["L_PF"]
-    # W ring (EP_WLDS, NW=4): one bank = one K-step of the CTA's W (TILE_N cols x TILE_K
-    # fp4) + its B-scale (TILE_N/32 groups x 256 B); as many banks as the free LDS fits.
-    WB = TILE_N * TILE_K // 2 + (TILE_N // 32) * 256
-    NWB = min(4, (160 * 1024 - LDS_BYTES) // WB) if (NW == 4 and EP_WLDS) else 0
-    NWB = NWB if NWB >= 2 else 0
-    WL = NWB > 0
-    L_W = ceildiv(LDS_BYTES, 128) * 128
-    if WL:
-        LDS_BYTES = L_W + NWB * WB
+    L_C, L_PF = c["L_C"], c["L_PF"]
     KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
     CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
     A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
-    NAB = c["NAB"]
     # GEMM1 inter-piece choices the planner balances over. BRING-UP: fixed at P=1 (no
     # inter split). unit_tile fuses GEMM1->GEMM2 per unit and GEMM2 contracts the full
     # inter dim, so one unit must own the whole inter dim; P>1 would feed GEMM2 an
@@ -478,26 +431,55 @@ def kernel_config(
     CE_BITS = ceildiv(TMAX, RG).bit_length()  # bits of one expert's chunk count
     # inter (/ inters) past 2 GB: rebase its 64-bit base per echunk so the 32-bit buffer
     # offsets stay within one echunk; rowmap / rowidx stay 32-bit
-    INTER_REBASE = inter_rows(TMAX, TOPK, EPR) * (I if a8 else I // 2) >= 2**31
+    REBASE_AUTO = inter_rows(TMAX, TOPK, EPR) * (I if a8 else I // 2) >= 2**31
+    # mt=8 (a4w4): the non-rebased per-echunk offset math spills its K-loop (e2e
+    # +11% bs8192), so it always rebases
+    INTER_REBASE = REBASE_AUTO or MT == 8
+    SDMAD = not SB and bool(SDMA_ENV)
+    NSXK = SD_NSX if SDMAD else NSX  # payload sender CTAs per XCD
+    OVG0K = SD_OVG0 if SDMAD else None  # up-front payload rounds (None: by m, OVG0_*)
+    assert not SDMAD or ceildiv(EPR, N_XCD) <= SD_GMAX
+    # An XCD's tiles only touch its own echunk range [e_lo, e_lo + nx),
+    # nx <= ceil(nch / N_XCD) under any routing, so rebase once per CTA at e_lo (C_EBASE)
+    # instead of per echunk.  8x MI355X mtpr 32768: a8w4 bs8192..32768 -1..-2%; a4w4
+    # +1.5% (cause unknown), so a8 only.
+    INTER_XBASE = INTER_REBASE and a8
+    if INTER_XBASE:
+        assert ceildiv(NCHM, N_XCD) * RG * (I if a8 else I // 2) < 2**31
     assert NCHM * RG * 4 < 2**31
-    assert RG <= GOUT_RG, f"RG={RG} > GOUT_RG={GOUT_RG} (gout scratch rows per echunk)"
     const_expr = fx.const_expr
+    SBXP = sbx_on(SB)
+    A_NBK = a_banks(SB)
+    # SB kernel: cbar = wait_lgkm0 + s_barrier instead of the LDS generation barrier
+    # (every wave of the CTA computes, so the hardware barrier covers them all; 8x MI355X
+    # graph mtpr 256 bs1..256: a4 -0.4..-2.9%, a8 -1.3..-5.2%).  The large kernel keeps
+    # the LDS barrier: s_barrier there spills its mt8 K-loop (VGPR spill 38 -> 191,
+    # mtpr 8192 a4 bs2048 / 8192 +14%).
+    HWBAR = bool(SB)
+    # GEMM2 n-tile: no quant group ties it to the wave, and the tile queue ends on GEMM2
+    # tiles, so the SB mt2 kernel halves it to shorten the queue's tail (8x MI355X graph
+    # mtpr 256, with QLA: bs1..128 -0.8..-6.7%, bs7 +1%; the mt4 SB kernel is +1.5% at
+    # a8 bs168, so it keeps TILE_N).
+    TILE_N2 = 256 if SB and MT == 2 else TILE_N
+    # SB tile queue: pull the next tile after the K-loop, before this tile's epilogue,
+    # instead of after its drain (a4 / a8 bs1..256 -0.6..-2.2%).  Pre-loading that tile's
+    # first B K-steps into the caches there measured slower (k=2 even, k=4 +4..7%).
+    QLA = bool(SB)
+    # WNT: W1 / W2 buffer loads sc0 nt (each SB weight tile is read about once).  The host
+    # picks it from m >= 2 (8x MI355X graph mtpr 256 vs cached: a4 / a8 bs2..256 -6..-10%,
+    # bs1 +11%; nt alone is within 1% of sc0 nt).
+    assert SB or not WNT
+    BNT = 3 if WNT else 0
+    # m / local expert in SBX_TB bits; all-ones value bits = a scrubbed routing word
+    assert not SBXP or max(TMAX // NPES, EPR) < (1 << SBX_TB) - 1
     name = (
-        f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_nw{NW}_{act}"
+        f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_{act}"
         + ("_a8" if a8 else "_a4")
-        + ("_ix" if indexed_payload else "")
-        + (f"_wl{NWB}" if WL else "")
-        + ("" if ESYNC else "_noes")
-        + ("" if XCDMAP else "_nx")
-        + ("_bal" if BAL and NW == 4 else "")
-        + ("_fl" if FLAT and NW == 8 else "")
-        + ("_dw0" if not DISPW and NW == 8 else "")
-        + ("" if DYNQ or NW == 4 else "_nodq")
-        + ("_dqf" if DYNQ and DQF and NW == 8 else "")
-        + ("" if not DYNQ or NW == 4 or (OVL and NSX == 4 and OVG0 == 2)
-           else f"_ovl{NSX}g{OVG0}" if OVL else "_noovl" if EMAJ else "_noovl_noem")
-        + ("" if G8PF == G8PF_DEF or NW == 4 else f"_pf{G8PF}")
+        + ("_sb" if SB else "")
+        + ("_wnt" if WNT else "")
+        + ("_rb" if INTER_REBASE and not REBASE_AUTO else "")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
+        + ("_sdma" if SDMAD else "")
     )
     layout_tag = f"{ECNT2 + NCHM}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
-    return KernelCtx(**locals())
+    return KernelCtx(**locals(), NW=NW, NT=NT, NTT=NTT, TILE_N=TILE_N)

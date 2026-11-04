@@ -1,22 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Fused EP MegaMoE kernel (gfx950): the wave roles, the kernel entry and its launcher.
+"""Fused EP MegaMoE kernel (gfx950): the kernel entry and its launcher.
 
-One persistent CTA per CU (grid=#CU, block=512 = 8 waves). ``compile_mega_moe_ep``
-assembles the device parts over one shared ``KernelCtx``:
+One persistent CTA per CU (grid=#CU, block=512 = 8 waves, all of them compute).
+``compile_mega_moe_ep`` assembles the device parts over one shared ``KernelCtx``:
 
 * ``schedule.build_schedule``       -> dyn_plan + compute_units + gather_recv_chunk
-* ``communication.build_communication`` -> arena/flag primitives, dispatch_send,
-  combine_send / combine_final, watchdog
+* ``communication.build_communication`` -> arena/flag primitives, dispatch sends,
+  combine_final, watchdog
+* ``gemm.build_gemm``               -> the inline-A GEMM1 / GEMM2 (+ fused combine)
 
-roles() splits the block by tid: compute (local-expert GEMM over the planned units) /
-dispatch_send (a2a scatter) / a_loader / comm_help. init sentinels the received-routing
-region; the finish phase does the source-side top-k weighted sum (combine_final).
-
-SCAFFOLD STATE: the GEMM1+act+GEMM2 math (``schedule.unit_tile``), its A-loader and the
-comm_help drain are no-op stubs pending the compute milestone + GPU bring-up; everything
-else (planner, dispatch, combine addressing, flags) is wired. The per-unit GEMM2-epilog
-scatter (``combine_send``) is called from compute once ``unit_tile`` produces output.
+``compute_units`` runs the a2a dispatch, the planner, the GEMM passes and the combine
+scatter; the finish phase does the source-side top-k weighted sum (combine_final).
 """
 
 from __future__ import annotations
@@ -29,17 +24,17 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .common import bst, i32, lds_st, now, rsrc, uni
+from .common import bst, g_ld_sys, i32, lds_st, now, rsrc, uni
 
 # Device-phase profiling: when EP_PROF_DEV=1, each CTA's tid0 stamps now() into a
 # per-CTA global `dbg` buffer at the kernel phase boundaries (entry / post-barrier_init
-# / post-roles / post-combine_final). Off by default (zero runtime cost -- the writes
+# / post-compute / post-combine_final). Off by default (zero runtime cost -- the writes
 # are compile-time gated and the `dbg` arg is just an unused pointer).
 _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
-_PROF_SLOTS = 19  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
-#   4:post-dispatch_wait 5:post-dyn_plan 7:post-gemm1 8:post-gemm2 (schedule)
-#   6: EP_OVL payload-wait tick sum | sender send ticks << 32 (schedule)
-#   9:post-dispatch_send(NW8) 10:post-gather 11:post-payload-wait (schedule)
+_PROF_SLOTS = 24  # 0:entry 1:post-barrier_init 2:post-compute 3:post-combine_final
+#   4:post-routing-wait 5:post-dyn_plan 7:post-gemm1 8:post-gemm2 (schedule)
+#   6: payload-wait tick sum | sender send ticks << 32 (schedule)
+#   9:post-dispatch-send 10:post-gather 11:post-payload-wait (schedule)
 #   12:post-combine_wait (communication.combine_final)
 #   13..18: gemm1 {kloop, pre-epi cbar, epi}, gemm2 {..} tick sums (gemm.py _pmark)
 from .communication import build_communication
@@ -47,9 +42,7 @@ from .gemm import build_gemm
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
-    C_PLAN,
-    NLOAD,
-    RC_INTS,
+    EPOCH_SLOT,
     kernel_config,
 )
 from .schedule import build_schedule
@@ -73,10 +66,11 @@ def compile_mega_moe_ep(
     situ_linear_beta: float = 1.0,
     swiglu_limit: float | None = None,
     a8: bool = False,
-    indexed_payload: bool = False,
-    NW: int = 4,
+    SB: bool = False,
+    WNT: bool = False,
 ):
     """Build the launcher of one (shape, variant) EP instance (see the module docstring)."""
+    assert TMAX % NPES == 0
     kc = kernel_config(
         H=H,
         I=I,
@@ -91,57 +85,34 @@ def compile_mega_moe_ep(
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
         a8=a8,
-        indexed_payload=indexed_payload,
-        NW=NW,
+        SB=SB,
+        WNT=WNT,
     )
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
     name, LDS_BYTES = kc.get("name LDS_BYTES")
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
-    L_RCTL, L_PF = kc.get("L_RCTL L_PF")
-    compute_units, dispatch_send = kc.get("compute_units dispatch_send")
-    a_loader_units, w_lds_units = kc.get("a_loader_units w_lds_units")
-    WL = kc.get("WL")[0]
+    L_PF = kc.get("L_PF")[0]
+    compute_units = kc.get("compute_units")[0]
     combine_final, barrier_init = kc.get("combine_final barrier_init")
-    NT, NTT, B_LOADER = kc.get("NT NTT B_LOADER")  # per-launch warp-spec bands (not globals)
+    NTT = kc.get("NTT")[0]
+    SBXP = kc.get("SBXP")[0]
 
     @flyc.jit
     def init_lds(L, tid, a):
         # zero the dynamic planner's LDS tables (active-expert bitmap + prefix + dense
-        # list, per-local-expert counts) and the barrier / plan-ready control slots.
+        # list, per-local-expert counts) and the barrier control slots.
         for s_ in range(tid, i32(2 * NBW + EPR), i32(NTT)):
             lds_st(L, L_DYN + i32(s_) * i32(4), i32(0))
         for s_ in range(tid, i32(EPR), i32(NTT)):
             lds_st(L, L_DCNT + i32(s_) * i32(4), i32(0))
-        # zero the A-loader ring counters (RC_ASEQ / RC_AFREE per bank + the go flags)
-        for s_ in range(tid, i32(RC_INTS), i32(NTT)):
-            lds_st(L, L_RCTL + i32(s_) * i32(4), i32(0))
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid < i32(16):  # gemm.py _pmark tick sums + last mark, 8/9: EP_OVL waits
+            if tid < i32(16):  # gemm.py _pmark tick sums + last mark, 8/9: payload waits
                 lds_st(L, L_PF + tid * i32(4), i32(0))
         if tid == i32(0):
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
             lds_st(L, L_CTL + C_BARGEN * 4, i32(0))
-            lds_st(L, L_CTL + C_PLAN * 4, i32(0))
-
-    @flyc.jit
-    def comm_help(L, tid, a, epoch):
-        # TODO(tune): assist dispatch / combine (drain pending a2a packets, poll flags).
-        del L, tid, a, epoch
-
-    @flyc.jit
-    def roles(L, tid, a, epoch):
-        del epoch
-        if tid < i32(NT):  # compute band: planner + GEMM + combine (fused into GEMM2 at
-            compute_units(L, tid, a)  # P==1; pass 3 in-band at P>1)
-        elif tid < i32(B_LOADER):  # [NT, NT+64): a2a dispatch scatter (input)
-            dispatch_send(L, tid % i32(64), a)
-        elif tid < i32(B_LOADER + NLOAD):  # A-loader: stage GEMM1 A into the NAB-bank ring
-            a_loader_units(L, tid, a)
-        else:  # [B_LOADER+NLOAD, NTT): W-loader into the LDS W ring (EP_WLDS), else idle
-            if const_expr(WL):  # noqa: SIM102 - compile-time gate, not dynamic
-                w_lds_units(L, tid, a)
 
     Shared = fx.struct(
         type(
@@ -176,7 +147,6 @@ def compile_mega_moe_ep(
         off_out: fx.Int64,
         inter: fx.Int64,
         inters: fx.Int64,
-        gout: fx.Int64,
         rowmap: fx.Int64,
         rowidx: fx.Int64,
         rowlist: fx.Int64,
@@ -187,9 +157,21 @@ def compile_mega_moe_ep(
         epr: fx.Int32,
         m: fx.Int32,
         mtpr: fx.Int32,
-        epoch: fx.Int32,
+        dc: fx.Int64,
+        sdst: fx.Int64,
+        spos: fx.Int64,
+        off_stage: fx.Int64,
+        off_sstage: fx.Int64,
+        off_rpos: fx.Int64,
+        off_sdum: fx.Int64,
     ):
         a = dict(locals())
+        # npes / epr / mtpr are the compiled-in NPES / EPR / TMAX // NPES (the host passes
+        # exactly those): as constants the per-peer guards fold and e // epr, sk // mtpr
+        # become multiply-shifts instead of runtime divisions with spilled SGPRs
+        npes, epr, mtpr = i32(NPES), i32(EPR), i32(TMAX // NPES)
+        a.update(npes=npes, epr=epr, mtpr=mtpr)
+        a["epoch"] = uni(g_ld_sys(fx.Int64(ctrl) + fx.Int64(EPOCH_SLOT * 4)))
         tid = fx.Int32(gpu.thread_id("x"))
         assert name
         lds = fx.SharedAllocator().allocate(Shared).peek()
@@ -204,6 +186,9 @@ def compile_mega_moe_ep(
         a["nrecv"] = (
             npes * mtpr * i32(TOPK)
         )  # dynamic-planner scan bound (indexed recv)
+        if const_expr(SBXP):  # this launch's part bank
+            a["off_part"] = off_part + fx.Int64(a["epoch"] & i32(1)) * fx.Int64(
+                mtpr * i32(TOPK * (H + H // 8)))
 
         def _ts(slot):
             if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
@@ -223,9 +208,10 @@ def compile_mega_moe_ep(
         # recv_le is sentinel'd on the host on THIS stream before the launch (stream
         # order); barrier_init is the cross-rank wait so a peer only dispatches once every
         # rank's fill is done -- no host sync/barrier, so forward() stays a stream pipeline.
-        barrier_init(L, tid, a)
+        if const_expr(not SBXP):
+            barrier_init(L, tid, a)
         _ts(1)
-        roles(L, tid, a, epoch)
+        compute_units(L, tid, a)
         _ts(2)
         gpu.barrier()
         combine_final(L, tid, a)
@@ -263,7 +249,6 @@ def compile_mega_moe_ep(
         off_out: fx.Int64,
         inter: fx.Int64,
         inters: fx.Int64,
-        gout: fx.Int64,
         rowmap: fx.Int64,
         rowidx: fx.Int64,
         rowlist: fx.Int64,
@@ -274,14 +259,18 @@ def compile_mega_moe_ep(
         epr: fx.Int32,
         m: fx.Int32,
         mtpr: fx.Int32,
-        epoch: fx.Int32,
+        dc: fx.Int64,
+        sdst: fx.Int64,
+        spos: fx.Int64,
+        off_stage: fx.Int64,
+        off_sstage: fx.Int64,
+        off_rpos: fx.Int64,
+        off_sdum: fx.Int64,
         i32_grid: fx.Int32,
         stream: fx.Stream,
     ):
         loc = locals()
-        _wpe = int(os.environ.get("EP_WPE", "0"))
-        _va = {"value_attrs": {"rocdl.waves_per_eu": _wpe}} if _wpe else {}
-        mega_moe_ep_kernel(*[loc[k] for k in kargs], **_va).launch(
+        mega_moe_ep_kernel(*[loc[k] for k in kargs]).launch(
             grid=(fx.Int64(i32_grid), 1, 1), block=(NTT, 1, 1), stream=stream
         )
 
