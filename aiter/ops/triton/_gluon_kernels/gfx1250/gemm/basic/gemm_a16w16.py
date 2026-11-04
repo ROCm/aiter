@@ -980,6 +980,148 @@ def _gemm_a16w16_compute_bound_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
+# ---------------------------------------------------------------------------
+# LM-head argmax: the GEMM with an argmax epilogue (gemm_a16w16_argmax_units).
+#
+# A tile reduces its bf16-rounded logits to one (max, first column) per row and
+# stores it as a key: (monotone int32 of the fp32 bits) << 32 | (2^32 - 1 -
+# column), so that the larger key has the larger logit, and of equal logits the
+# lower column. -0.0 is read as +0.0, which torch.argmax does not tell apart
+# either. The logits themselves are not written. _argmax_units_kernel then
+# reduces a row's tile keys and writes the pack image of lm_head_argmax_units
+# (atom/model_ops/lm_head_argmax.py): rank `rank`'s (max, vocab_start + column)
+# as 8 byte-valued bf16 units in its slot of a [WORLD, M, 8] image, 0 in the
+# other slots.
+# ---------------------------------------------------------------------------
+
+
+@gluon.jit
+def _argmax_key(vals, cols):
+    """Per row of vals (fp32 [R, C]): the key of its maximum and first column."""
+    vals = gl.where(vals == 0.0, 0.0, vals)  # -0.0 ties +0.0
+    best = gl.max(vals, axis=1)
+    big = gl.zeros_like(cols) + 2147483647
+    first = gl.min(gl.where(vals == best[:, None], cols, big), axis=1)
+    bits = best.to(gl.int32, bitcast=True)
+    mono = bits ^ ((bits >> 31) & 2147483647)
+    return (mono.to(gl.int64) << 32) | (4294967295 - first.to(gl.int64))
+
+
+_gemm_a16w16_argmax_repr = make_kernel_repr(
+    "_gemm_a16w16_gfx1250_argmax_kernel",
+    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_BUFFERS", "LAYOUT"],
+)
+
+
+@gluon.jit(repr=_gemm_a16w16_argmax_repr)
+def _gemm_a16w16_argmax_kernel(
+    a_ptr,
+    b_ptr,
+    keys_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_keys,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+):
+    """keys[m, n // BLOCK_N] = the key of row m's maximum over the columns of
+    tile n of A @ B (int64, row stride stride_keys)."""
+    gl.static_assert(NUM_BUFFERS >= 2, "the argmax GEMM requires NUM_BUFFERS >= 2")
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+    accumulator = _compute_bound_accumulate(
+        a_ptr,
+        b_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BUFFERS,
+        LAYOUT,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B,
+        WMMA_LAYOUT,
+        OPERAND_LAYOUT_A,
+        OPERAND_LAYOUT_B,
+    )
+    # The logits as the GEMM stores them (bf16), widened back.
+    vals = accumulator.to(a_ptr.type.element_ty).to(gl.float32)
+    cols = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    )
+    rows = pid_m * BLOCK_M + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    )
+    vals = gl.where(cols[None, :] < N, vals, float("-inf"))
+    cols2 = gl.zeros([BLOCK_M, BLOCK_N], gl.int32, WMMA_LAYOUT) + cols[None, :]
+    key = _argmax_key(vals, cols2)
+    gl.store(keys_ptr + rows.to(gl.int64) * stride_keys + pid_n, key, mask=rows < M)
+
+
+@gluon.jit
+def _argmax_units_kernel(
+    keys_ptr,
+    units_ptr,
+    M,
+    num_tiles,
+    stride_keys,
+    vocab_start,
+    rank,
+    WORLD: gl.constexpr,
+    BLOCK_T: gl.constexpr,
+):
+    """Row program_id(0) of the pack image from its tile keys (see above)."""
+    row = gl.program_id(0)
+    KEYS: gl.constexpr = gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
+    t = gl.arange(0, BLOCK_T, layout=KEYS)
+    best = gl.full([BLOCK_T], -(2**63), gl.int64, KEYS)
+    for start in range(0, num_tiles, BLOCK_T):
+        k = gl.load(
+            keys_ptr + row.to(gl.int64) * stride_keys + start + t,
+            mask=start + t < num_tiles,
+            other=-(2**63),
+        )
+        best = gl.maximum(best, k)
+    best = gl.max(best, axis=0)
+    mono = (best >> 32).to(gl.int32)
+    bits = mono ^ ((mono >> 31) & 2147483647)
+    token = (4294967295 - (best & 4294967295) + vocab_start).to(gl.int32)
+    UNITS: gl.constexpr = gl.BlockedLayout([1, 8], [32, 1], [gl.num_warps(), 1], [1, 0])
+    slot = gl.arange(0, 32, layout=gl.SliceLayout(1, UNITS))[:, None]
+    unit = gl.arange(0, 8, layout=gl.SliceLayout(0, UNITS))[None, :]
+    word = gl.where(unit < 4, bits, token)
+    image = ((word >> ((unit % 4) * 8)) & 255).to(gl.float32)
+    image = gl.where(slot == rank, image, 0.0).to(units_ptr.type.element_ty)
+    gl.store(
+        units_ptr + (slot * M + row) * 8 + unit,
+        image,
+        mask=(slot < WORLD) & (unit < 8),
+    )
+
+
 _KERNEL_MAP = {
     "bandwidth_bound": _gemm_a16w16_bandwidth_bound_kernel,
     "compute_bound": _gemm_a16w16_compute_bound_kernel,

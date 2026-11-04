@@ -954,3 +954,115 @@ def gemm_a16w16_gated(
     if aligned and compiled is not None:
         _GATED_COMPILED[ckey] = compiled
     return y
+
+
+# ---------------------------------------------------------------------------
+# gemm_a16w16_argmax_units: the LM-head GEMM of a TP rank with an argmax
+# epilogue (gfx1250 gluon). See _gemm_a16w16_argmax_kernel.
+# ---------------------------------------------------------------------------
+
+
+def gemm_a16w16_argmax_keys(
+    x: torch.Tensor, w: torch.Tensor, config: dict | None = None
+) -> torch.Tensor:
+    """The per-tile argmax keys of x @ w.T, without writing the logits: int64
+    [M, cdiv(N, BLOCK_N)], key (t, m) the (max, first column) of row m over the
+    columns of tile t as (monotone int32 of the fp32 bits) << 32 | (2^32 - 1 -
+    column). The larger key has the larger logit, of equal logits the lower
+    column, and -0.0 counts as +0.0.
+
+    The GEMM is the compute-bound gfx1250 gluon kernel at ``gemm_a16w16``'s config
+    for the shape, and the logits compared are the bf16 ones it would store.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        _gemm_a16w16_argmax_kernel,
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+
+    assert _is_gluon_available(), "gemm_a16w16_argmax_keys needs gfx1250"
+    M, K = x.shape
+    N = w.shape[0]
+    assert w.shape[1] == K and x.dtype == w.dtype and M >= 1
+    assert x.dtype in (torch.bfloat16, torch.float16) and N < 2**31
+    if config is None:
+        config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+    config = dict(config)
+    config["kernel_type"] = "compute_bound"  # the epilogue's kernel
+    wt = w.T
+    _, grid, meta, num_warps, waves_per_eu = _gluon_plan(
+        M,
+        N,
+        K,
+        x.stride(),
+        wt.stride(),
+        x.element_size() * 8,
+        "compute_bound",
+        config,
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+    keys = torch.empty(
+        (M, triton.cdiv(N, meta["BLOCK_N"])), dtype=torch.int64, device=x.device
+    )
+    _gemm_a16w16_argmax_kernel[grid](
+        x,
+        wt,
+        keys,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        wt.stride(0),
+        wt.stride(1),
+        keys.stride(0),
+        **meta,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+    return keys
+
+
+def gemm_a16w16_argmax_units(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    vocab_start: int,
+    rank: int,
+    world: int,
+    units: torch.Tensor | None = None,
+    config: dict | None = None,
+) -> torch.Tensor:
+    """The [world * M * 8] bf16 argmax pack image of x @ w.T, in two launches
+    and without writing the logits.
+
+    The same image as ``lm_head_argmax_units(gemm_a16w16(x, w), vocab_start,
+    rank, world)`` (ATOM): rank ``rank``'s (max, ``vocab_start`` + first column
+    of it) per row as byte units in its slot, zeros in the others. The pick is the
+    same, ties included (see `gemm_a16w16_argmax_keys`); only a maximum of -0.0
+    is packed as +0.0.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        _argmax_units_kernel,
+    )
+
+    assert 1 <= world <= 32
+    M = x.shape[0]
+    if units is None:
+        units = torch.empty((world * M * 8,), dtype=x.dtype, device=x.device)
+    assert units.numel() == world * M * 8 and units.is_contiguous()
+    keys = gemm_a16w16_argmax_keys(x, w, config)
+    num_tiles = keys.shape[1]
+    _argmax_units_kernel[(M,)](
+        keys,
+        units,
+        M,
+        num_tiles,
+        keys.stride(0),
+        vocab_start,
+        rank,
+        WORLD=world,
+        BLOCK_T=min(1024, max(32, triton.next_power_of_2(num_tiles))),
+        num_warps=4,
+    )
+    return units
