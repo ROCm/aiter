@@ -18,7 +18,7 @@ from .kernels.comm.allreduce_shared import (
     SUPPORTED_WORLDS,
 )
 from .kernels.tensor_shim import _preload_compiled
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .ipc_heap import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
