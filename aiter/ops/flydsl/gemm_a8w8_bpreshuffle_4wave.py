@@ -23,6 +23,9 @@ BLOCK_K = 128
 MIN_K = 2 * BLOCK_K
 DEFAULT_XCD_SWIZZLE = 8
 _I32_MAX = 2**31
+# Full-range signed INT8 products reach 128 * 128, and all K of them accumulate
+# in INT32.
+MAX_K = (_I32_MAX - 1) // (128 * 128) // BLOCK_K * BLOCK_K
 
 _compile_int8_gemm_4w = None
 _run_compiled = None
@@ -95,10 +98,10 @@ def parse_4wave_kernel_name(name: str) -> dict[str, int | str] | None:
 def _validate_compile_config(
     *, K: int, xcd_swizzle: int, num_cu: int, num_xcds: int
 ) -> None:
-    if K < MIN_K or K % BLOCK_K:
+    if K < MIN_K or K > MAX_K or K % BLOCK_K:
         raise ValueError(
-            f"[FlyDSL INT8 4wave] K must be >= {MIN_K} and divisible by "
-            f"{BLOCK_K}, got {K}"
+            f"[FlyDSL INT8 4wave] K must be in [{MIN_K}, {MAX_K}] and divisible "
+            f"by {BLOCK_K}, got {K}"
         )
     if xcd_swizzle < 0:
         raise ValueError(
@@ -179,7 +182,7 @@ def supports_4wave_int8_shape(M: int, N: int, K: int) -> bool:
         M >= 0
         and N > 0
         and N % 16 == 0
-        and K >= MIN_K
+        and MIN_K <= K <= MAX_K
         and K % BLOCK_K == 0
         and M * N * 2 < _I32_MAX
         and M * K < _I32_MAX

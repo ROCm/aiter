@@ -822,6 +822,25 @@ def run_int8_4wave_ci_correctness():
     ).to(torch.bfloat16)
     assert torch.equal(extreme, extreme_ref)
 
+    # At the largest K, all-(-128) products sum to just below the INT32 limit.
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import BLOCK_K, MAX_K
+
+    ones_m = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    ones_n = torch.ones((1, 16), dtype=torch.float32, device="cuda")
+    limit = aiter.gemm_a8w8_bpreshuffle(
+        torch.full((1, MAX_K), -128, dtype=torch.int8, device="cuda"),
+        shuffle_weight(
+            torch.full((16, MAX_K), -128, dtype=torch.int8, device="cuda"),
+            layout=(16, 16),
+        ).contiguous(),
+        ones_m,
+        ones_n,
+    )
+    limit_ref = torch.full(
+        (1, 16), float(128 * 128 * MAX_K), dtype=torch.float32, device="cuda"
+    )
+    assert torch.equal(limit, limit_ref.to(torch.bfloat16))
+
     # Zero rows return an empty BF16 matrix without compiling a specialization.
     n = k = 256
     zero = aiter.gemm_a8w8_bpreshuffle(
@@ -892,6 +911,15 @@ def run_int8_4wave_ci_correctness():
             torch.ones((1, 32), dtype=torch.float32, device="cuda"),
         ),
     )
+    expect_value_error(
+        "accumulate in INT32",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            torch.zeros((1, MAX_K + BLOCK_K), dtype=torch.int8, device="cuda"),
+            torch.zeros((16, MAX_K + BLOCK_K), dtype=torch.int8, device="cuda"),
+            ones_m,
+            ones_n,
+        ),
+    )
 
     # Compile, graph and stream smoke use one small untuned specialization.
     case = make_int8_4wave_case((257, 272, 384), 11)
@@ -924,7 +952,8 @@ def run_int8_4wave_ci_correctness():
     assert torch.equal(consumed, eager.float() * 2)
     aiter.logger.info(
         "INT8 4-wave correctness: passed %d bit-exact shapes, padded K, signed "
-        "extrema, zero rows, contract rejections, compile, graph and stream",
+        "extrema up to the INT32 K limit, zero rows, contract rejections, "
+        "compile, graph and stream",
         len(cases),
     )
 

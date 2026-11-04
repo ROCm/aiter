@@ -35,12 +35,12 @@ requires_gfx950 = pytest.mark.skipif(
 )
 
 
-def _int8_operands(k, weight_k, m=2):
+def _int8_operands(k, weight_k, m=2, n=16):
     return (
         torch.zeros((m, k), device="cuda", dtype=torch.int8),
-        torch.zeros((16, weight_k), device="cuda", dtype=torch.int8),
+        torch.zeros((n, weight_k), device="cuda", dtype=torch.int8),
         torch.ones((m, 1), device="cuda", dtype=torch.float32),
-        torch.ones((1, 16), device="cuda", dtype=torch.float32),
+        torch.ones((1, n), device="cuda", dtype=torch.float32),
     )
 
 
@@ -174,6 +174,38 @@ def test_non_power_of_two_xcd_remap_is_a_permutation():
 def test_persistent_mode_rejects_odd_k128_tile_count():
     with pytest.raises(ValueError, match="even number of K128 tiles"):
         four_wave._validate_compile_config(K=384, xcd_swizzle=8, num_cu=256, num_xcds=8)
+
+
+def test_k_limit_keeps_full_range_int8_sums_in_int32():
+    max_k, over_k = four_wave.MAX_K, four_wave.MAX_K + four_wave.BLOCK_K
+    assert max_k * 128 * 128 < 2**31 <= over_k * 128 * 128
+    assert four_wave.supports_4wave_int8_shape(1, 16, max_k)
+    assert not four_wave.supports_4wave_int8_shape(1, 16, over_k)
+    with pytest.raises(ValueError, match="K must be in"):
+        four_wave._validate_compile_config(
+            K=over_k, xcd_swizzle=8, num_cu=0, num_xcds=8
+        )
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "m,n,k,message",
+    [
+        (1, 16, four_wave.MAX_K + four_wave.BLOCK_K, "accumulate in INT32"),
+        (65536, 16384, 256, r"M\*N\*2, M\*K_w and N\*K_w below 2\*\*31"),
+    ],
+)
+def test_int8_contract_rejects_oversized_shapes_before_dispatch(
+    monkeypatch, m, n, k, message
+):
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        gemm_mod,
+        "get_GEMM_config_with_quant_type",
+        lambda *_args, **_kwargs: pytest.fail("config lookup before the check"),
+    )
+    with pytest.raises(ValueError, match=message):
+        gemm_mod.gemm_a8w8_bpreshuffle(*_int8_operands(k, k, m, n))
 
 
 def test_common_tuner_registers_int8_4wave_after_existing_pipelines():

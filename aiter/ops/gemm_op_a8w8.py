@@ -887,6 +887,18 @@ def _check_int8_bpreshuffle_contract(
             "gemm_a8w8_bpreshuffle INT8 requires K >= 256 and both logical "
             f"and preshuffled K divisible by 128, got {K} and {weight_k}"
         )
+    from .flydsl.gemm_a8w8_bpreshuffle_4wave import MAX_K
+
+    if weight_k > MAX_K:
+        raise ValueError(
+            f"gemm_a8w8_bpreshuffle INT8 requires K_w <= {MAX_K} so full-range "
+            f"products accumulate in INT32, got K_w={weight_k}"
+        )
+    if M * N * 2 >= 2**31 or M * weight_k >= 2**31 or N * weight_k >= 2**31:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires M*N*2, M*K_w and N*K_w below "
+            f"2**31, got M={M}, N={N}, K_w={weight_k}"
+        )
     if x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32:
         raise ValueError(
             "gemm_a8w8_bpreshuffle INT8 requires FP32 x_scale/w_scale, got "
@@ -965,6 +977,8 @@ def gemm_a8w8_bpreshuffle(
     than K. In that padded-weight case XQ is zero-padded and dispatch resolves
     against the effective launch K_w. The kernel uses 32-bit offsets, so
     ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
+    It accumulates in INT32, so K_w is at most 130944: K_w full-range products
+    of 128 * 128 must stay below ``2**31``.
 
     AOT packaging covers only specializations reachable from tuned CSV rows.
     An untuned fallback whose K, CU/XCD topology, or persistence variant is not
