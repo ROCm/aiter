@@ -7,6 +7,20 @@ import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 
+
+def base_gfx_arch(gfx: str) -> str:
+    """Kernel-family base arch for ``gfx`` (gfx1250-strict -> gfx1250; identity otherwise).
+
+    A local copy of ``aiter.jit.utils.build_targets.base_gfx_arch``: these Opus
+    codegen scripts run standalone from a staging tree (e.g. ``aiter_meta/``)
+    where the aiter package is not importable, so the helper is duplicated here.
+    Keep the two in sync. Used only to select shared gfx1250 kernel definitions;
+    build targets, caches, and prebuilt ``.co`` paths stay keyed by the exact
+    target.
+    """
+    return "gfx1250" if gfx == "gfx1250-strict" else gfx
+
+
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
@@ -2941,6 +2955,9 @@ class KernelKey:
 
 
 def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, object]:
+    # gfx1250-strict (A0) shares the gfx1250 kernel family in the registry;
+    # callers keep the gfx1250-strict spelling in KernelKey (compile target).
+    gfx = base_gfx_arch(gfx)
     tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
     if not tables:
         return {}
@@ -2953,6 +2970,8 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     """Select available kernels from the family/gfx/CU table."""
     family = family.strip().lower()
     gfx = gfx.split(":", 1)[0].strip().lower()
+    # Fold strict here too so the a16w16 gfx1250 CO-existence filter below applies.
+    gfx = base_gfx_arch(gfx)
     records = _get_registry_records(family, gfx, cu_num)
     if family == "a16w16" and gfx == "gfx1250":
         return {
@@ -2995,7 +3014,8 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the default compile set from the current CU table."""
-    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((gfx, cu_num), ())
+    lookup_gfx = base_gfx_arch(gfx)
+    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
     return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
