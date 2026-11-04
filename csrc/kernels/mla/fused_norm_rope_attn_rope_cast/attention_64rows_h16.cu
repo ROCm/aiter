@@ -3,10 +3,30 @@
 #include "attention_64rows.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+#if __has_include("../opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp")
+#include "../opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
+#else
 #include "../opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
+#endif
 namespace fused_mla_h16 {
 using namespace opus;
 using namespace opus_mla_v41_prefill_a8w8_16mx1_16nx4;
+
+// Keep the full-tile store paired with make_layout_rv's half-vector swizzle.
+template <class T, class S, class V, class U>
+__device__ inline void store_v(S& s_kv, const V& v_kv, const U& u_sk, int lane_id)
+{
+    constexpr int HALF = T::VEC_KV / 2;
+    const int swz     = ((lane_id % T::W_N) >> 2) & 1;
+    auto offs         = layout_to_offsets<T::VEC_KV>(u_sk);
+    static_for<sizeof(offs) / sizeof(offs[0])>([&](auto i) {
+        constexpr int b = i.value * T::VEC_KV;
+        store<HALF>(s_kv, slice(v_kv, number<b>{}, number<b + HALF>{}), offs[i.value] + HALF * swz);
+        store<HALF>(s_kv,
+                    slice(v_kv, number<b + HALF>{}, number<b + 2 * HALF>{}),
+                    offs[i.value] + HALF - HALF * swz);
+    });
+}
 
 template <class D>
 __device__ __forceinline__ auto load16(const D* ptr)
@@ -319,7 +339,7 @@ accumulate(const FusedNormRopeAttnRopeCastParams& a,
             k_bf16_pk[d.value * 2 + 1] =
                 __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_w[d.value], scale, true);
         });
-        store_v_swizzled<T>(s_kv, v_k_bf16, u_sk, lane_id);
+        store_v<T>(s_kv, v_k_bf16, u_sk, lane_id);
 
         const int next_live = is_live(kv_page);
         v_k                 = load_values<T>(data(kv_page), u_rk);
@@ -393,7 +413,10 @@ fused_norm_rope_attn_rope_cast_h16_body(FusedNormRopeAttnRopeCastParams a)
     fused::specialize_heads<Heads>(a);
     const int token = blockIdx.x, lane = threadIdx.x % 64, warp = threadIdx.x / 64;
     const int head_start = Heads == 16 ? 0 : blockIdx.y * 16;
-    __shared__ __align__(16) char smem[T::smem_bytes() + 256];
+    // Q preparation reuses this scratch; OPUS's separate Q staging is not needed.
+    constexpr int smem_bytes = T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(bf16_t) +
+                               T::T_N * T::W_M * (sizeof(float) + T::W_N * sizeof(bf16_t)) + 256;
+    __shared__ __align__(16) char smem[smem_bytes];
     char* kv_smem  = smem;
     char* max_smem = kv_smem + 64 * 528 * 2;
     char* p_smem   = max_smem + 256;
