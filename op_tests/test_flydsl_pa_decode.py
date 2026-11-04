@@ -187,6 +187,9 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         ("cluster", 128, 1, 3, 16, 16, "bf16"),
         ("cluster", 384, 1, 1, 16, 16, "bf16"),
         ("reducer", 128, 1, 1, 16, 16, "bf16"),
+        # A single FP8 query tile exercises direct and cluster output stores.
+        ("single", 128, 1, 1, 128, 16, "fp8"),
+        ("cluster", 128, 1, 1, 128, 16, "fp8"),
         # The FP8 wave-query pipeline keeps its reducer for independent output.
         # Cover two different query/group combinations selecting that pipeline.
         ("single", 128, 1, 4, 128, 16, "fp8"),
@@ -354,7 +357,21 @@ def test_pa_decode_merge_alignment(
         check(reference)
     last_arriver_eligible = mode == "last" and scratch_offset == 0
     last_arriver = last_arriver_eligible and output_layout == "same"
-    wave_fallback = kv_dtype == "fp8" and output_layout != "same"
+    wave_fallback = (
+        output_layout != "same"
+        and pa.Gfx1250Traits(
+            head_dim=dim,
+            query_group_size=group,
+            block_size=page,
+            softmax_scale=dim**-0.5,
+            query_dtype="bf16" if dtype == torch.bfloat16 else "f16",
+            per_token_kv=False,
+            query_length=query_length,
+            trans_v=True,
+            sliding_window=0,
+            compute_dtype=kv_dtype,
+        ).wave_query_tiles
+    )
     assert compile_kwargs[-1]["direct_output"] == (
         (last_arriver or mode == "single") and not wave_fallback
     )
