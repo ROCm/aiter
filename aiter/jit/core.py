@@ -697,6 +697,9 @@ class AITER_CONFIG:
             keys.append("cu_num")
         if "gfx" in merge_df.columns and "gfx" not in keys:
             keys.append("gfx")
+        # gfx and cu_num cannot tell MI300X from MI325X.
+        if "gpu_model" in merge_df.columns and "gpu_model" not in keys:
+            keys.append("gpu_model")
         if "_tag" in merge_df.columns:
             keys.append("_tag")
         # Only key on columns actually present in the merged frame. Most
