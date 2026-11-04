@@ -309,6 +309,69 @@ def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
 
 
 @kernel(
+    "FUSED-BF16-BMM-ROPE-CAT-QUANT-PAD-CACHE-MLA",
+    dims=("B", "M", "N", "K"),
+    backend_kwarg=False,
+)
+def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(shape, backend):
+    """B: query heads per rank, N: kv_lora_rank, K: qk_nope_head_dim. GPT-J
+    RoPE, as Kimi-K2."""
+    import torch
+
+    from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+        fused_bf16_bmm_rope_cat_quant_pad_cache_mla as fused,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        generate_inputs,
+        generate_rope_cache_inputs,
+        vllm_fp8_max,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
+    kv_c, k_pe, cos_sin_cache, positions, slot_mapping, kv_cache = (
+        generate_rope_cache_inputs(M, kv_lora=N)
+    )
+    fp8 = get_fp8_e4m3_dtype()
+    kv_cache = kv_cache.view(fp8)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    k_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
+    padded_heads = math.lcm(B, 16)
+    out = torch.empty((M, padded_heads, N + q_pe.shape[-1]), dtype=fp8, device="cuda")
+    fp8_max = vllm_fp8_max()
+
+    # The cache write is idempotent, so the timed calls need no reset.
+    def call(config, q_nope, w_uk_t, q_pe, q_scale, out, kv_c, k_pe, kv_cache):
+        return fused(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            kv_c,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            k_scale,
+            positions,
+            cos_sin_cache,
+            False,
+            padded_heads,
+            out=out,
+            fp8_max=fp8_max,
+            config=config,
+        )
+
+    def should_skip(config):
+        block_sizes = (config[f"BLOCK_SIZE_{d}"] for d in "MNK")
+        return min(block_sizes) < 16  # tl.dot needs 16-wide tiles
+
+    inputs = (q_nope, w_uk_t, q_pe, q_scale, out, kv_c, k_pe, kv_cache)
+    return call, inputs, should_skip
+
+
+@kernel(
     "GEMM-A16W16",
     gluon_archs=(
         "gfx1250",
