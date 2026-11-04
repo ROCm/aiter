@@ -203,6 +203,44 @@ def test_deterministic_zero_routing_weights(M):
 
 
 @_SKIP
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_reduction_skips_dropped_routes(use_mask):
+    """The stage-2 reduction with skip_dropped leaves out slots whose topk_ids
+    are -1, whose rows are never written (NaN here), also together with the
+    expert-parallel mask."""
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    token, topk, model_dim, E = 64, 4, 512, 8
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    topk_ids = torch.randint(0, E, (token, topk), generator=gen, device="cuda")
+    topk_ids[::2, 1:] = -1
+    topk_ids[1::4, 0] = -1
+    topk_ids = topk_ids.to(dtypes.i32)
+    # Small integers, so every sum is exact in bf16.
+    target = torch.randint(
+        1, 9, (token * topk, model_dim), generator=gen, device="cuda"
+    ).to(dtypes.bf16)
+    target[topk_ids.view(-1) < 0] = float("nan")
+    expert_mask = torch.tensor([1, 0] * (E // 2), dtype=dtypes.i32, device="cuda")
+    keep = topk_ids >= 0
+    if use_mask:
+        keep &= expert_mask[topk_ids.clamp(min=0).long()] != 0
+    ref = torch.where(keep[..., None], target.view(token, topk, model_dim).float(), 0)
+    out = torch.empty((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    _run_moe_reduction(
+        target,
+        out,
+        token,
+        topk,
+        model_dim,
+        expert_mask=expert_mask if use_mask else None,
+        topk_ids=topk_ids,
+        skip_dropped=True,
+    )
+    assert torch.equal(out, ref.sum(1).to(dtypes.bf16))
+
+
+@_SKIP
 @pytest.mark.parametrize("capacity,local", [(2, 1), (8, 3), (300, 129)])
 def test_deterministic_num_local_tokens(capacity, local):
     """With num_local_tokens below the batch capacity, the local tokens match the

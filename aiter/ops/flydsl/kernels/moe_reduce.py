@@ -182,7 +182,12 @@ def _moe_reduction_body(
                     [vk[i] * wk for i in range_constexpr(V)], fx.Float32
                 )
             if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
+                tk_k = tk_ptr[k]
+                if const_expr(skip_dropped):
+                    # Dropped routes (-1) are discarded below; look up an index
+                    # in range so the expert_mask read stays in bounds.
+                    tk_k = (tk_k >= fx.Int32(0)).select(tk_k, fx.Int32(0))
+                vk = (em_ptr[tk_k] != fx.Int32(0)).select(
                     vk, fx.full(V, 0.0, fx.Float32)
                 )
             if const_expr(skip_dropped):
