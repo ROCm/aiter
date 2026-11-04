@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import importlib.util
 import os
 from typing import Any
@@ -17,7 +16,7 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
@@ -875,9 +874,20 @@ _GFX1250_VARLEN_ASM_BF16 = 1  # fmha_fwd_with_sink_varlen_asm
 _GFX1250_VARLEN_ASM_FP8 = 2  # fmha_fwd_fp8_varlen_asm
 
 
-@functools.lru_cache(maxsize=1)
-def _is_gfx1250_asm_device() -> bool:
-    return get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
+def _probe_gfx1250_asm_device() -> bool:
+    # The running GPU, not the build target: get_gfx() follows GPU_ARCHS, which
+    # can name another arch (or several) than the device in use.
+    try:
+        arch = get_gfx_runtime()
+    except Exception:  # noqa: BLE001 - no GPU to probe (e.g. a build host)
+        return False
+    return arch in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
+
+
+# Probed once at import, like asm_guard._ASM_SUPPORTED: the dispatch sites read a
+# module-level constant, which costs nothing per call and stays a plain constant
+# under torch.compile.
+_IS_GFX1250_ASM_DEVICE = _probe_gfx1250_asm_device()
 
 
 def _select_gfx1250_fmha_fwd_varlen_asm(
@@ -915,7 +925,7 @@ def _select_gfx1250_fmha_fwd_varlen_asm(
     check, for callers ahead of the `maybe_contiguous` in
     _flash_attn_varlen_forward.  Cheap checks first, strides last.
     """
-    if not _is_gfx1250_asm_device():
+    if not _IS_GFX1250_ASM_DEVICE:
         return 0
     hdim_q, hdim_v = q.shape[-1], v.shape[-1]
     if q.dtype == dtypes.bf16:
@@ -955,7 +965,8 @@ def _select_gfx1250_fmha_fwd_varlen_asm(
         kind = _GFX1250_VARLEN_ASM_FP8
     else:
         return 0
-    if q.shape[-2] % k.shape[-2] != 0:
+    nhead_q, nhead_k = q.shape[-2], k.shape[-2]
+    if nhead_q <= 0 or nhead_k <= 0 or nhead_q % nhead_k != 0:
         return 0
     # Attention options: plain or causal (bottom-right) attention only.
     if max_seqlen_q <= 0 or return_softmax:
@@ -3328,7 +3339,7 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     gfx1250_asm = 0
-    if _is_gfx1250_asm_device():
+    if _IS_GFX1250_ASM_DEVICE:
         gfx1250_asm = _select_gfx1250_fmha_fwd_varlen_asm(
             q,
             k,
@@ -3400,9 +3411,11 @@ def _flash_attn_varlen_forward(
             out,
         )
         # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
-        # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
-        # and the autograd backward see a consistent layout regardless of path.
-        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        # convention (mha_varlen_fwd) is (nheads, total_q).  Made contiguous only
+        # when it is returned: FlashAttnVarlenFunc needs return_lse for backward.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1)
+        if return_lse:
+            softmax_lse = softmax_lse.contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif gfx1250_asm == _GFX1250_VARLEN_ASM_FP8:
@@ -3425,8 +3438,11 @@ def _flash_attn_varlen_forward(
             bool(return_lse),
             out,
         )
-        # packed (total_q, nheads, 1) -> the varlen API's (nheads, total_q)
-        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        # packed (total_q, nheads, 1) -> the varlen API's (nheads, total_q),
+        # copied only when it is returned (as in the bf16 branch above)
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1)
+        if return_lse:
+            softmax_lse = softmax_lse.contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd():
@@ -4078,8 +4094,7 @@ def flash_attn_varlen_func(
     # gfx1250 varlen ASM goes ahead of FlyDSL.  _flash_attn_varlen_forward asks
     # the same gate with the arguments FlashAttnVarlenFunc passes it, so an
     # accepted call is served by that ASM kernel.
-    gfx1250_asm = 0
-    if _is_gfx1250_asm_device():
+    if _IS_GFX1250_ASM_DEVICE:
         gfx1250_asm = _select_gfx1250_fmha_fwd_varlen_asm(
             q,
             k,
@@ -4105,41 +4120,41 @@ def flash_attn_varlen_func(
             return_softmax=return_attn_probs and dropout_p > 0,
             dense_last_dim_later=True,  # _flash_attn_varlen_forward fixes it
         )
-    if gfx1250_asm == _GFX1250_VARLEN_ASM_FP8 or (
-        gfx1250_asm == _GFX1250_VARLEN_ASM_BF16
-        and not _prefer_flydsl_over_gfx1250_bf16_varlen_asm(q, causal)
-    ):
-        return FlashAttnVarlenFunc.apply(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            min_seqlen_q,
-            dropout_p,
-            softmax_scale,
-            logits_soft_cap,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            block_table,
-            out,
-            torch.is_grad_enabled(),
-            cu_seqlens_q_padded,
-            cu_seqlens_k_padded,
-            True,
-            how_v3_bf16_cvt,
-            sink_ptr,
-            q_descale,
-            k_descale,
-            v_descale,
-        )
+        if gfx1250_asm == _GFX1250_VARLEN_ASM_FP8 or (
+            gfx1250_asm == _GFX1250_VARLEN_ASM_BF16
+            and not _prefer_flydsl_over_gfx1250_bf16_varlen_asm(q, causal)
+        ):
+            return FlashAttnVarlenFunc.apply(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                min_seqlen_q,
+                dropout_p,
+                softmax_scale,
+                logits_soft_cap,
+                causal,
+                window_size,
+                bias,
+                alibi_slopes,
+                deterministic,
+                return_lse,
+                return_attn_probs,
+                block_table,
+                out,
+                torch.is_grad_enabled(),
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
+                True,
+                how_v3_bf16_cvt,
+                sink_ptr,
+                q_descale,
+                k_descale,
+                v_descale,
+            )
 
     if (
         _FLYDSL_AVAILABLE
@@ -4616,7 +4631,7 @@ def flash_attn_varlen_fp8_pertensor_func(
     # The gfx1250 FP8 D192x128 ASM kernel is reached through
     # _flash_attn_varlen_forward, which takes it before CK; with CK disabled,
     # go there only for calls that kernel accepts (same gate, same arguments).
-    use_fp8_varlen_asm = _is_gfx1250_asm_device() and (
+    use_fp8_varlen_asm = _IS_GFX1250_ASM_DEVICE and (
         _select_gfx1250_fmha_fwd_varlen_asm(
             q,
             k,
