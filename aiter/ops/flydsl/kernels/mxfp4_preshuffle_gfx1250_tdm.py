@@ -88,6 +88,8 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 TDM_EARLY_TIMEOUT = int(os.environ.get("AITER_FLYDSL_TDM_EARLY_TIMEOUT", "1"))
+WMMA_2X4 = int(os.environ.get("AITER_FLYDSL_WMMA_2X4", "0"))
+PREFENCE_MMA = int(os.environ.get("AITER_FLYDSL_PREFENCE_MMA", "4"))
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -102,6 +104,10 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 if TDM_EARLY_TIMEOUT not in (0, 1):
     raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
+if WMMA_2X4 not in (0, 1):
+    raise ValueError("AITER_FLYDSL_WMMA_2X4 must be 0 or 1")
+if PREFENCE_MMA < 0:
+    raise ValueError("AITER_FLYDSL_PREFENCE_MMA must be nonnegative")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -266,6 +272,14 @@ def launch_gemm_a8w4_tdm(
     sched_mma_group = iglp_params["mma_group"]
     sched_first_group = iglp_params["mma_first_group"]
     sched_ds_first = iglp_params["ds_first_n"]
+    # The hardware WMMA axes are N32 x M16 in this transposed GEMM.
+    # Group two N fragments and four M fragments into a 64x64 output block.
+    wmma_2x4 = bool(
+        WMMA_2X4
+        and a_is_fp4
+        and tile_m == tile_n == tile_k == 256
+        and m_warp == n_warp == 2
+    )
     cache_tag = (
         K,
         tile_m,
@@ -300,6 +314,8 @@ def launch_gemm_a8w4_tdm(
         sched_mma_group,
         sched_first_group,
         sched_ds_first,
+        wmma_2x4,
+        PREFENCE_MMA,
         SUPPORT_EXPLICIT_VGPR_PARTITION,
         planar_lds_on,
         interleaved_lds_load_on,
@@ -339,6 +355,15 @@ def launch_gemm_a8w4_tdm(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
+    if PREFENCE_MMA != 4:
+        prefix_capacity = ((wmma_m_rep + 1) // 2) * wmma_n_rep
+        if not a_is_fp4 or tile_k != 256:
+            raise ValueError("AITER_FLYDSL_PREFENCE_MMA requires A4W4 K256")
+        if PREFENCE_MMA > prefix_capacity:
+            raise ValueError(
+                "AITER_FLYDSL_PREFENCE_MMA must be between "
+                f"0 and {prefix_capacity}"
+            )
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
@@ -476,6 +501,8 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
+    _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
+    _prefence = f"_prefence{PREFENCE_MMA}" if PREFENCE_MMA != 4 else ""
     _kname = (
         f"a8w4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -485,7 +512,8 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}{_wmma_2x4}"
+        f"{_prefence}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -615,7 +643,7 @@ def launch_gemm_a8w4_tdm(
             # A multicasts across each row, while B multicasts down each column.
             cluster_first_m = m_unit * cluster_m
             valid_m_tiles = (tile_map[n_experts - 1] + tile_m - 1) // tile_m
-            full_cluster = cluster_first_m + cluster_m <= valid_m_tiles
+            full_cluster = cluster_first_m + cluster_m <= valid_m_tiles and False
             prev_expert = (expert > 0).select(expert - 1, 0)
             prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
             first_m = (expert > 0).select(
@@ -1250,43 +1278,53 @@ def launch_gemm_a8w4_tdm(
         # tiles can have n_acc as low as the tail itself, so clamp it to keep at
         # least one group for the interleaved part.
         FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
-        # Whole KSL1 rows before the reuse fence, separate from IGLP group size.
-        PREFENCE_MMA = 4
 
-        def mma_rows(wm_list, act, wt, sa_k, sb_k, start=0, end=None):
-            for i in range_constexpr(start, len(wm_list) if end is None else end):
+        def mma_rows(
+            wm_list, act, wt, sa_k, sb_k, start_mma=0, end_mma=None
+        ):
+            group_m = 4 if wmma_2x4 else 1
+            group_n = 2 if wmma_2x4 else wmma_n_rep
+            mma_order = []
+            for wm_base in range_constexpr(0, len(wm_list), group_m):
+                for wn_base in range_constexpr(0, wmma_n_rep, group_n):
+                    for i in range_constexpr(
+                        wm_base, min(wm_base + group_m, len(wm_list))
+                    ):
+                        wn_end = min(wn_base + group_n, wmma_n_rep)
+                        for wn in range_constexpr(wn_base, wn_end):
+                            mma_order.append((i, wn))
+            mma_end = len(mma_order) if end_mma is None else end_mma
+            for mma_index in range_constexpr(start_mma, mma_end):
+                i, wn = mma_order[mma_index]
                 wm = wm_list[i]
-                for wn in range_constexpr(wmma_n_rep):
-                    idx = wm * wmma_n_rep + wn
-                    scale_a = sb_k[wn if a_is_fp4 else wn // 2]
-                    scale_b = sa_k[wm // 2]
-                    if const_expr(a_is_fp4):
-                        wt_value = wt[wn].load()
-                        act_value = act[i].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                c_frags[idx].load().ir_value(),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                                # Retain activation for the next WMMA in this row.
-                                reuseB=wn + 1 < wmma_n_rep,
-                            )
+                idx = wm * wmma_n_rep + wn
+                scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                scale_b = sa_k[wm // 2]
+                if const_expr(a_is_fp4):
+                    wt_value = wt[wn].load()
+                    act_value = act[i].load()
+                    c_frags[idx].store(
+                        rocdl.wmma_scale_f32_32x16x128_f4(
+                            T.vec(16, T.f32),
+                            wt_value.ir_value(),
+                            act_value.ir_value(),
+                            c_frags[idx].load().ir_value(),
+                            scale_a,
+                            scale_b,
+                            scaleAType=0,
+                            scaleBType=wm % 2,
                         )
-                    else:
-                        fx.gemm(
-                            wmma_atoms[wn % 2][wm % 2],
-                            c_frags[idx],
-                            wt[wn],
-                            act[i],
-                            c_frags[idx],
-                            scale_a=scale_a,
-                            scale_b=scale_b,
-                        )
+                    )
+                else:
+                    fx.gemm(
+                        wmma_atoms[wn % 2][wm % 2],
+                        c_frags[idx],
+                        wt[wn],
+                        act[i],
+                        c_frags[idx],
+                        scale_a=scale_a,
+                        scale_b=scale_b,
+                    )
 
         DS_A = 2 if a_is_fp4 else 4
         # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
@@ -1399,11 +1437,11 @@ def launch_gemm_a8w4_tdm(
             num_outstanding_tdm=None,
             issue_fn=None,
             fence_fn=None,
-            pre_fence_rows=0,
+            pre_fence_mma=0,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
-            if const_expr(pre_fence_rows > 0):
+            if const_expr(pre_fence_mma > 0):
                 sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
                 mma_rows(
                     FRONT,
@@ -1411,11 +1449,11 @@ def launch_gemm_a8w4_tdm(
                     cur_rmem.b,
                     sa_k,
                     sb_k,
-                    end=pre_fence_rows,
+                    end_mma=pre_fence_mma,
                 )
                 # Close the prefix region before the LDS-reuse fence. The
                 # suffix hints must not count these WMMAs a second time.
-                rocdl.sched_mfma(pre_fence_rows * wmma_n_rep)
+                rocdl.sched_mfma(pre_fence_mma)
                 rocdl.sched_barrier(0)
             if const_expr(issue_fn is not None):
                 # The carried operands may still be reading the LDS buffer
@@ -1437,7 +1475,7 @@ def launch_gemm_a8w4_tdm(
                 cur_rmem.b,
                 sa_k,
                 sb_k,
-                start=pre_fence_rows,
+                start_mma=pre_fence_mma,
             )
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
@@ -1570,16 +1608,16 @@ def launch_gemm_a8w4_tdm(
                     )
                 else:
                     next_rmem, load_nxt_fn = None, None
-                # Split whole WMMA rows on K256's issuing KSL1.
+                # Split the same WMMA count on K256's issuing KSL1, using
+                # instruction positions so a grouped row is not skipped.
                 # Other shapes and drain steps keep their original schedule.
-                pre_fence_rows = (
-                    PREFENCE_MMA // wmma_n_rep
+                pre_fence_mma = (
+                    PREFENCE_MMA
                     if (
                         a_is_fp4
                         and kws == 2
                         and ksl == 1
                         and prefetch_kt is not None
-                        and PREFENCE_MMA % wmma_n_rep == 0
                         and PREFENCE_MMA <= front_wm * wmma_n_rep
                     )
                     else 0
@@ -1597,7 +1635,7 @@ def launch_gemm_a8w4_tdm(
                         else None
                     ),
                     fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
-                    pre_fence_rows=pre_fence_rows,
+                    pre_fence_mma=pre_fence_mma,
                 )
                 # The optional prefix has its own region. Keep all DS/TDM
                 # hints here, but omit all already-issued prefix WMMAs.
@@ -1612,7 +1650,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         else 0
                     ),
-                    pre_fence_mma=pre_fence_rows * wmma_n_rep,
+                    pre_fence_mma=pre_fence_mma,
                 )
                 rocdl.sched_barrier(0)
 
