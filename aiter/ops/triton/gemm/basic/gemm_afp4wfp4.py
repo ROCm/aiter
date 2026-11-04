@@ -31,8 +31,14 @@ _LOGGER = AiterTritonLogger()
 _USE_GEMM_SPLITK_BF16 = False
 
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
-_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
-_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_PRESHUFFLE_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+_GLUON_DEFAULT_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def set_use_gemm_splitk_bf16(value: bool):
@@ -160,12 +166,11 @@ def gemm_afp4wfp4_(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    # gfx1150 and gfx1151 (RDNA3.5) can lower this Triton dot_scaled kernel
-    # without native FP4 instructions. Keep the exception local: other FP4
-    # entry points need their own configs and validation before they can run
-    # on these targets.
+    # Archs without native FP4 instructions can lower this Triton dot_scaled
+    # kernel, see is_sw_emulated_fp4_avail(). Other FP4 entry points need their
+    # own configs and validation before they can run on these targets.
     assert arch_info.is_fp4_avail() or (
-        backend == "triton" and arch_info.get_arch() in ("gfx1150", "gfx1151")
+        backend == "triton" and arch_info.is_sw_emulated_fp4_avail()
     ), "MXFP4 is not available on your device"
 
     if backend == "gluon":
