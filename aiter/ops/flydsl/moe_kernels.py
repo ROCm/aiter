@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
+    current_stream_arg,
     ptr_arg,
 )
 
@@ -2485,6 +2486,15 @@ def _get_compiled_topids_to_rows():
     return build_moe_topids_to_rows_module()
 
 
+@functools.lru_cache(maxsize=128)
+def _get_compiled_topids_to_rows_lds(n_buckets: int):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_module,
+    )
+
+    return build_moe_topids_to_rows_lds_module(n_buckets)
+
+
 @functools.cache
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
@@ -2596,7 +2606,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             int(E),
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return counter, topids_to_rows.view(token_num, topk)
 
@@ -2662,10 +2672,27 @@ def flydsl_moe_topids_to_rows(
             topids_to_rows_kernel,
             *route_args,
             *_ep_tail,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from aiter.ops.flydsl.kernels.moe_route_maps import (
+            MAX_TP_ROUTE_BUCKETS,
+            tp_route_min_routes,
+        )
+
+        # Keep small calls and wave64 paths unchanged. Wider expert sets
+        # require more routes to amortize their per-workgroup histogram sweeps.
+        use_lds = (
+            get_gfx_runtime() == "gfx1250"
+            and 0 < int(E) <= MAX_TP_ROUTE_BUCKETS
+            and numel >= tp_route_min_routes(int(E))
+        )
+        topids_to_rows_kernel = (
+            _get_compiled_topids_to_rows_lds(int(E))
+            if use_lds
+            else _get_compiled_topids_to_rows()
+        )
         _dispatch_compiled(
             topids_to_rows_kernel,
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
@@ -2674,7 +2701,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             route_grid,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     return counter, topids_to_rows.view(token_num, topk)
 
@@ -3534,7 +3561,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         if use_token_multidest:
@@ -3565,7 +3592,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         # The M16 scatter consumes a finalized inverse map and K1024 tiles.
@@ -3588,7 +3615,7 @@ def flydsl_moe_fused_quant_preshuffle(
             from aiter.jit.utils.chip_info import get_cu_num
 
             apre_workers = max(1, 4 * (get_cu_num() or 1))
-            stream = torch.cuda.current_stream()
+            stream = current_stream_arg()
             if prequantized:
                 # MoRI already produced packed FP4 and padded E8M0 rows.
                 compact_payload = grouped_in.contiguous()
@@ -3673,7 +3700,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return out_payload, out_scale
 
@@ -3699,6 +3726,6 @@ def flydsl_moe_fused_quant_preshuffle(
         n_rows,
         max_m,
         grid_blocks,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return out_payload, out_scale

@@ -992,6 +992,55 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
     )
 
 
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_kimi_tp_route_histogram_public_path(data_format, monkeypatch):
+    """Wide expert dispatch changes only routing, through the real fused_moe API."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_module,
+    )
+
+    selected = []
+    getter = moe_kernels._get_compiled_topids_to_rows_lds
+
+    def counted(experts):
+        selected.append(experts)
+        return getter(experts)
+
+    monkeypatch.setattr(moe_kernels, "_get_compiled_topids_to_rows_lds", counted)
+    if data_format == "a8w4":
+        monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    else:
+        monkeypatch.delenv("AITER_FORCE_A8W4", raising=False)
+    shape = {
+        "experts": 896,
+        "tokens": 513,
+        "topk": 16,
+        "model_dim": 3584,
+        "inter_dim": 384,
+        "data_format": data_format,
+        "activation": ActivationType.Situv2,
+        "use_bias": False,
+        "seed": 19,
+        "data_init": "uniform",
+        "scale_init": "auto",
+    }
+    result, reference, _, _ = _run_grouped_via_fused_moe(**shape)
+    assert 896 in selected, "wide ordinary-TP histogram was not reached"
+    assert _logits_diff(result, reference) < LOGITS_DIFF_TOL
+
+    # Compare with the real original route kernel, not a mocked GEMM. The
+    # fixture recreates identical seeded inputs and all downstream operations.
+    original_router = build_moe_topids_to_rows_module()
+    monkeypatch.setattr(
+        moe_kernels, "_get_compiled_topids_to_rows_lds", lambda experts: original_router
+    )
+    baseline, baseline_ref, _, _ = _run_grouped_via_fused_moe(**shape)
+    torch.testing.assert_close(reference, baseline_ref, rtol=0, atol=0)
+    torch.testing.assert_close(result, baseline, rtol=0, atol=0)
+
+
 # The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
 # AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
 # single ragged tile (K < tile_k). 20000 tokens are past the table, so the other

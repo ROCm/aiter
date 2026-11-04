@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 
+import flydsl.expr as fx
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import _run_compiled, ptr_arg
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
@@ -147,6 +148,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     rolled_drain=0,
     gemm_stage=None,
     quant_payload_preshuffled=None,
+    m_align=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -174,9 +176,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_payload_preshuffled = bool(
             a_preshuffled and stage1_quant_out and stage1_act
         )
-    if quant_payload_preshuffled and not (
-        a_is_fp4 and stage1_quant_out and stage1_act
-    ):
+    if quant_payload_preshuffled and not (a_is_fp4 and stage1_quant_out and stage1_act):
         raise ValueError("preshuffled quant output requires fused MXFP4 activation")
     if quant_payload_preshuffled and (
         N % 256 or tile_n % 64 or contiguous_m % 16 or tile_m % 16
@@ -195,7 +195,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
 
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = current_stream_arg()
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
@@ -210,19 +210,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # These tensor arguments only supply base addresses, so normalize their
-    # ranks without specializing the compiled callable on buffer shapes.
-    quant_scale_tensor = (
-        out if quant_scale is None else quant_scale.view(torch.uint8)
-    ).view(-1)
-    a_scale_tensor = a_scales.view(torch.int32)
-    if row_major_ascale and a_scale_row_stride_bytes:
-        # Compact dispatch interleaves payload and scale rows in one allocation.
-        # The launcher only needs this base address; the TDM descriptor carries
-        # the source pitch. Preserve the strided storage instead of copying it.
-        a_scale_tensor = a_scale_tensor.as_strided((1,), (1,))
-    else:
-        a_scale_tensor = a_scale_tensor.view(-1)
+    # These arguments only supply base addresses. Pass pointers below so large
+    # buffers do not cross the C ABI with signed 32-bit tensor dimensions.
+    quant_scale_tensor = out if quant_scale is None else quant_scale
+    out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
+    if stage1_quant_out:
+        out_dtype = fx.Uint8
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
@@ -269,7 +262,7 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
-    ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
+    ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     gemm_spec = (
         K,
         tile_m,
@@ -308,12 +301,19 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers,
         rolled_drain,
         int(a_preshuffled),
+        int(m_align),
     )
     explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
-    if (a_is_fp4 and a_preshuffled and not persistent_workers
-            and tile_m == 64 and m_warp == 1 and n_warp == 4
-            and num_buffers == 3
-            and (tile_n, tile_k) in ((256, 256), (512, 128))):
+    if (
+        a_is_fp4
+        and a_preshuffled
+        and not persistent_workers
+        and tile_m == 64
+        and m_warp == 1
+        and n_warp == 4
+        and num_buffers == 3
+        and (tile_n, tile_k) in ((256, 256), (512, 128))
+    ):
         # The narrow-N tile fits the automatic allocation without spilling;
         # high fixed registers unnecessarily restrict its wave residency.
         # The wide-N tile needs the larger register budget to avoid scratch
@@ -324,23 +324,29 @@ def flydsl_grouped_gemm_a8w4_masked(
         launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(
             explicit_vgpr_partition
         )
-    elif (a_is_fp4 and a_preshuffled and not persistent_workers
-            and not enable_ep_scatter and not stage1_act and not stage1_quant_out
-            and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-                == (256, 256, 256, 2, 2, 4)
-            and cluster_m == 1
-            and callable(getattr(rocdl, "sched_vgpr", None))):
+    elif (
+        a_is_fp4
+        and a_preshuffled
+        and not persistent_workers
+        and not enable_ep_scatter
+        and not stage1_act
+        and not stage1_quant_out
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (256, 256, 256, 2, 2, 4)
+        and cluster_m == 1
+        and callable(getattr(rocdl, "sched_vgpr", None))
+    ):
         # The new allocator's automatic layout is slower for this output tile.
         # Use its explicit SSA placement under either global register policy.
         explicit_vgpr_partition = 1
         launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        out.view(-1),
+        ptr_arg(out, out_dtype),
         ptr_arg(a),
         ptr_arg(w),
-        a_scale_tensor,
-        w_scales.view(torch.int32).view(-1),
+        ptr_arg(a_scales, fx.Int32),
+        ptr_arg(w_scales, fx.Int32),
         contiguous_m,
         stream,
         N,
@@ -350,10 +356,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         bias_ptr,
         float(swiglu_limit),
         *quant_spec,
-        quant_scale_tensor,
+        ptr_arg(quant_scale_tensor),
         *tdm_spec,
         *ep_spec,
-        ep_row_map_tensor,
+        ptr_arg(ep_row_map_tensor, fx.Int32),
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
