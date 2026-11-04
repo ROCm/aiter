@@ -251,7 +251,7 @@ class TestA6W6Manifest(unittest.TestCase):
         exact_columns = ["exact_M", "exact_N", "exact_K"]
         specialized = configs[(configs[exact_columns] > 0).all(axis=1)]
         self.assertEqual(len(specialized), 35)
-        for row in specialized.itertuples():
+        for row in configs.itertuples():
             match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", row.knl_name)
             self.assertIsNotNone(match)
             declared_length, entrypoint = match.groups()
@@ -294,9 +294,9 @@ class TestA6W6Manifest(unittest.TestCase):
             ),
             (0, 0, 0),
         )
-        grp16 = configs[configs["knl_name"] == "f6gemm_dmabig_grp16_kernel_func"].iloc[
-            0
-        ]
+        grp16 = configs[
+            configs["knl_name"] == "_ZN5aiter35f6gemm_bf16_per1x32Fp6_dmabig_grp16E"
+        ].iloc[0]
         self.assertEqual(grp16["swizzle_max_M"], 65536)
         manifest_dir = os.path.dirname(MANIFEST)
         for co_name in configs["co_name"]:

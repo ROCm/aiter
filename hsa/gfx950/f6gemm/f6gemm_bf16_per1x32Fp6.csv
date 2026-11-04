@@ -1,9 +1,9 @@
 tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_max_N,swizzle_max_K,exact_M,exact_N,exact_K,knl_name,co_name
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,0,0,0,f6gemm_dmabig_kernel_func,gemm_mxfp6_dmabig.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,0,0,0,f6gemm_dmabig_swz0_kernel_func,gemm_mxfp6_dmabig_swz0.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,f6gemm_dmabig_grp16_kernel_func,gemm_mxfp6_dmabig_grp16.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,0,0,0,f6gemm_dmabig_grp64_kernel_func,gemm_mxfp6_dmabig_grp64.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,0,0,0,f6gemm_dmabig_allk_kernel_func,gemm_mxfp6_dmabig_allk.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,0,0,0,_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE,f6gemm_bf16_per1x32Fp6_dmabig.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,0,0,0,_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E,f6gemm_bf16_per1x32Fp6_dmabig_swz0.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,_ZN5aiter35f6gemm_bf16_per1x32Fp6_dmabig_grp16E,f6gemm_bf16_per1x32Fp6_dmabig_grp16.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,0,0,0,_ZN5aiter35f6gemm_bf16_per1x32Fp6_dmabig_grp64E,f6gemm_bf16_per1x32Fp6_dmabig_grp64.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,0,0,0,_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_allkE,f6gemm_bf16_per1x32Fp6_dmabig_allk.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscale.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscale.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g16_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_g16_dscale.co
