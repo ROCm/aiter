@@ -31,6 +31,7 @@ def gemm_a16w16_all_reduce_rmsnorm(
     group,
     inboxes,
     calls,
+    residual_rows: torch.Tensor | None = None,
 ):
     """
     Returns out = RMSNorm(residual_out) and residual_out = all-reduce(x @ w.T) +
@@ -47,11 +48,19 @@ def gemm_a16w16_all_reduce_rmsnorm(
         weight (torch.Tensor): bf16 (hidden,). With gemma, the norm uses 1 + weight.
         inboxes, calls: The result of ``all_reduce_init``, for this op and one hidden
             size only.
+        residual_rows (torch.Tensor): None, or int32 / int64 (tokens,): gathers the
+            residual, so that output row r is RMSNorm(all-reduce(x @ w.T)[r] +
+            residual[residual_rows[r]]). residual then has any number of rows.
     """
     tokens, k = x.shape
     hidden = w.shape[0]
     assert x.dtype == w.dtype == residual.dtype == weight.dtype == torch.bfloat16
-    assert w.shape == (hidden, k) and residual.shape == (tokens, hidden)
+    assert w.shape == (hidden, k) and residual.shape[1:] == (hidden,)
+    if residual_rows is None:
+        assert residual.shape[0] == tokens
+    else:
+        assert residual_rows.shape == (tokens,) and residual_rows.is_contiguous()
+        assert residual_rows.dtype in (torch.int32, torch.int64)
     assert weight.shape == (hidden,)
     assert all(t.is_contiguous() for t in (x, w, residual, weight))
     assert hidden >= 256 and hidden & (hidden - 1) == 0
@@ -82,6 +91,7 @@ def gemm_a16w16_all_reduce_rmsnorm(
         x,
         w,
         residual,
+        residual_rows,
         weight,
         out,
         residual_out,

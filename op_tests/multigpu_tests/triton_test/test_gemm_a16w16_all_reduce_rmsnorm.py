@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import multiprocessing as mp
 
 import pytest
@@ -78,6 +79,7 @@ def _worker(rank, init_method):
     group = tp.cpu_group
     cases = [_inputs(tokens, rank, device) for tokens in TOKENS]
     inboxes, calls = all_reduce_init(group, max(TOKENS) * HIDDEN * 2)
+    state = (inboxes, calls)
     failures = []
     try:
         # First, while the inboxes are empty: the call numbers wrap from 2^30 to 1.
@@ -112,6 +114,49 @@ def _worker(rank, init_method):
         for tokens, o, (_, _, _, _, *ref) in zip(TOKENS, outs, cases):
             name = f"rank {rank} graph tokens {tokens}"
             failures += _compare(name, o, *ref, tp.device_group)
+        # A gathered residual: output row r adds residual row rows[r] of a longer
+        # residual (the MTP drafter keeps one row of each sequence's verify rows).
+        for tokens in (1, 13, 16, 17, 49, 64, 128):
+            x, w, residual, weight, *_ = _inputs(tokens, rank, device)
+            gen = torch.Generator(device=device).manual_seed(7 + tokens)
+            full = torch.randn(
+                (5 * tokens + 3, HIDDEN),
+                generator=gen,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            rows = torch.randperm(full.shape[0], generator=gen, device=device)
+            for dtype in (torch.int64, torch.int32):
+                pick = rows[:tokens].to(dtype)
+                ref = gemm_a16w16_all_reduce_rmsnorm(
+                    x, w, full[pick].contiguous(), weight, EPS, True, group, *state
+                )
+                fused = functools.partial(
+                    gemm_a16w16_all_reduce_rmsnorm,
+                    x,
+                    w,
+                    full,
+                    weight,
+                    EPS,
+                    True,
+                    group,
+                    *state,
+                    residual_rows=pick,
+                )
+                for graphed in (False, True):
+
+                    if graphed:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            outs = fused()
+                        graph.replay()
+                    else:
+                        outs = fused()
+                    if not all(torch.equal(a, b) for a, b in zip(outs, ref)):
+                        failures.append(
+                            f"rank {rank} tokens {tokens} {dtype} graph {graphed}: "
+                            "the gathered residual is not the gather's"
+                        )
         if calls[-1].item():
             failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")
     finally:

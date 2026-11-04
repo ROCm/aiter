@@ -292,8 +292,20 @@ def _receive_all(
 
 
 @gluon.jit
+def _residual_row(residual, residual_rows, row, ok, HIDDEN: gl.constexpr):
+    """The first value of the residual row of output row ``row``: row, or
+    residual_rows[row] when the residual is gathered. 0 out of ``ok``."""
+    if residual_rows is None:
+        src = row
+    else:
+        src = gl.load(residual_rows + gl.where(ok, row, 0))
+    return residual + src * HIDDEN
+
+
+@gluon.jit
 def _receive_norm(
     residual,
+    residual_rows,
     weight,
     out,
     residual_out,
@@ -329,15 +341,16 @@ def _receive_norm(
         if row < tokens:
             # The counter of triple t counts the calls with its rows.
             call = gl.load(calls + t) % (1 << 30) + 1
-            # The residual is local: load it before the wait.
-            res = residual + row * HIDDEN
-            r0 = gl.amd.cdna5.buffer_load(res, col)
-            r1 = gl.amd.cdna5.buffer_load(
-                res, col + ROWS * HIDDEN, mask=row + ROWS < tokens, other=0
-            )
-            r2 = gl.amd.cdna5.buffer_load(
-                res, col + 2 * ROWS * HIDDEN, mask=row + 2 * ROWS < tokens, other=0
-            )
+            # The residual is local: load it before the wait. Row r of the residual,
+            # or row residual_rows[r] when it is gathered.
+            ok1 = row + ROWS < tokens
+            ok2 = row + 2 * ROWS < tokens
+            res0 = _residual_row(residual, residual_rows, row, row < tokens, HIDDEN)
+            res1 = _residual_row(residual, residual_rows, row + ROWS, ok1, HIDDEN)
+            res2 = _residual_row(residual, residual_rows, row + 2 * ROWS, ok2, HIDDEN)
+            r0 = gl.amd.cdna5.buffer_load(res0, col)
+            r1 = gl.amd.cdna5.buffer_load(res1, col, mask=ok1, other=0)
+            r2 = gl.amd.cdna5.buffer_load(res2, col, mask=ok2, other=0)
             s0, s1, s2 = _receive_all(
                 inboxes, 2 * HIDDEN * t + pos, call, err, RANK, SLOT, MAXIT
             )
@@ -385,6 +398,7 @@ def _gemm_a16w16_all_reduce_rmsnorm_kernel(
     x,
     w,
     residual,
+    residual_rows,
     weight,
     out,
     residual_out,
@@ -412,7 +426,8 @@ def _gemm_a16w16_all_reduce_rmsnorm_kernel(
     OPERAND_LAYOUT_B: gl.constexpr,
 ):
     """A block has 3 ROWS rows of x. Triple j of block m has rows 3 ROWS m + j, + ROWS and
-    + 2 ROWS. Programs 0 to G - 1 compute the G tiles of y. Programs G to G + P - 1
+    + 2 ROWS. residual_rows (or None) gathers the residual: output row r adds
+    residual row residual_rows[r]. Programs 0 to G - 1 compute the G tiles of y. Programs G to G + P - 1
     receive triples p, p + P, ... (P = programs). The GPU starts programs in order, so a
     waiting receiver cannot block a GEMM program."""
     blocks = gl.cdiv(tokens, 3 * ROWS)
@@ -445,6 +460,7 @@ def _gemm_a16w16_all_reduce_rmsnorm_kernel(
     else:
         _receive_norm(
             residual,
+            residual_rows,
             weight,
             out,
             residual_out,
