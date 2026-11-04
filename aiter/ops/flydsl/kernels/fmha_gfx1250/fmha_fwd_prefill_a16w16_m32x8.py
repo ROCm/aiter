@@ -90,6 +90,7 @@ from .fmha_utils import (
     _copy_wait,
     _epi_state,
     _keepalive,
+    _keepalive_sgpr,
     _kv_drain_depths,
     _lane_id,
     _load_seqlen_pair,
@@ -777,8 +778,11 @@ class _ContiguousKVPolicy:
 
     num_state_slots = 0
 
-    def prepare(self, tile_idx, carried):
-        return None, []
+    def indices(self, tile_idx, carried):
+        return None
+
+    def advance(self, tile_idx):
+        return []
 
     def indices_for(self, tile_idx):
         return None
@@ -852,12 +856,16 @@ class _PagedKVPolicy:
             num_records_bytes=self._num_page_entries * 4,
         )
 
-    def prepare(self, tile_idx, carried):
-        """This tile's page indices, and the set to carry for the next body."""
+    def indices(self, tile_idx, carried):
+        """This tile's page indices. ``carried`` was loaded a body ago for this tile."""
         if not self._carry:
-            return self._load(tile_idx), []
-        # ``carried`` was loaded a body ago for exactly this tile; start the next one now
-        return [fx.Int32(c) for c in carried], self._load(tile_idx + fx.Int32(1))
+            return self._load(tile_idx)
+        return [fx.Int32(c) for c in carried]
+
+    def advance(self, tile_idx):
+        """Start the next body's load. Nothing in THIS body consumes it, so the caller
+        places it wherever the kmcnt wait is cheapest."""
+        return self._load(tile_idx + fx.Int32(1)) if self._carry else []
 
     def indices_for(self, tile_idx):
         """Direct load, for the prologue's own start descriptor -- there is no earlier
@@ -1394,9 +1402,7 @@ def _attention_core_multi_kv_tiles(
             + [_raw(fx.full(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
-                    fx.full(8, float("-inf"), fx.Float32)
-                    if _is_lagging_softmax
-                    else fx.full(8, 0.0, fx.Float32).to(elem_dtype)
+                    fx.full(8, float("-inf") if _is_lagging_softmax else 0.0, fx.Float32)
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1551,9 +1557,7 @@ def _attention_core_multi_kv_tiles(
         prefetch_tile_idx = tile_idx + fx.Int32(1)
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
-        prefetch_page_indices, kv_state_next = kv_policy.prepare(
-            prefetch_tile_idx, kv_state_prev
-        )
+        prefetch_page_indices = kv_policy.indices(prefetch_tile_idx, kv_state_prev)
 
         # This half's descriptor for the prefetched tile's K (LO) or V (HI) into the
         # oldest slot.
@@ -1592,7 +1596,7 @@ def _attention_core_multi_kv_tiles(
             # only the remainder is issued here.
             return _issue_head(_vk_emit, _num_head_carry, _num_prefetch, head_carry)
 
-        def _softmax_phase(s_in, o_in):
+        def _softmax_phase(s_in, o_in, anchor=()):
             # This lane's query (tile q_tile_idx) attends [q_min, q_max] in batch-relative kv.
             # None bounds are skipped, so a clean-region tile passes all-None and does
             # zero per-element masking. kv_len is passed only on the right-boundary
@@ -1618,6 +1622,14 @@ def _attention_core_multi_kv_tiles(
                 q_min_list=q_min_list,
                 kv_len=kv_len,
             )
+
+            # Uniform values whose s_wait_kmcnt belongs HERE -- at the end of softmax
+            # main, still ahead of the deferred-rescale branch. The wait binds to the
+            # use, and MachineSink chases the use, so this placement is the whole point.
+            if anchor:
+                rocdl.sched_barrier(0)
+                _keepalive_sgpr(anchor)
+                rocdl.sched_barrier(0)
 
             # Rescale each q-tile's running O by this tile's corr. The leading half
             # rescales at the END of the body and the next body's PV accumulates onto the
@@ -1696,6 +1708,7 @@ def _attention_core_multi_kv_tiles(
         # S^T = K(tile_idx) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
         # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
         if _is_lagging_softmax:
+            kv_state_next = kv_policy.advance(prefetch_tile_idx)
             prefetch_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
@@ -1725,6 +1738,12 @@ def _attention_core_multi_kv_tiles(
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             head_next = []
         else:
+            # Past the latch: the carry crosses the back edge as f32, so the exit test
+            # sits between the producing softmax and this narrowing. _keepalive anchors
+            # it ahead of the drain -- MachineSink would otherwise push it into the gemm.
+            carry_prev = _convert_vectors(carry_prev, elem_dtype)
+            _keepalive([v for pt in carry_prev for v in pt])
+            rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
             prefetch_desc.async_load()
@@ -1742,7 +1761,14 @@ def _attention_core_multi_kv_tiles(
                 head=pvqk_head,
             )
             _phase_barrier()
-            carry_f32, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
+            # Ahead of softmax: nothing here consumes it, so the whole softmax covers
+            # the kmcnt wait the next body's descriptor build opens with.
+            kv_state_next = kv_policy.advance(prefetch_tile_idx)
+            if kv_state_next:
+                rocdl.sched_barrier(0)
+            carry_f32, m_new_list, d_new_list, o_out = _softmax_phase(
+                s_list, o_acc, anchor=kv_state_next
+            )
             # Next body's ring head: V(tile_idx) from the slot this body read K from, resident
             # and already fenced. Mirrors the lagging half -- both issue the head just
             # before the barrier preceding the gemm that consumes it, ahead of the
@@ -1751,8 +1777,7 @@ def _attention_core_multi_kv_tiles(
             head_next = _issue_head(
                 lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
             )
-            rocdl.sched_barrier(0)
-            carry_next = _convert_vectors(carry_f32, elem_dtype)
+            carry_next = carry_f32
 
         # Yield: num_q_tiles updated (m, d, O, P) groups, then the ds pointers and slot bases
         # left-rotated by one so slot 0 holds tile tile_idx (next body's PV) and the oldest

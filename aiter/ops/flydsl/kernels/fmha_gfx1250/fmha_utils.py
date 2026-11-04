@@ -201,6 +201,15 @@ def _keepalive(vals):
     )
 
 
+def _keepalive_sgpr(vals):
+    """``_keepalive`` for uniform values. The wait the SMEM result needs lands HERE, not
+    at the load, so placing this late is what buys the issue-to-wait distance."""
+    ops = [_ir(v) for v in vals]
+    llvm_dialect.inline_asm(
+        None, ops, "", ",".join("s" for _ in ops), has_side_effects=True
+    )
+
+
 def _epi_state(*, m_list, d_list, o_list, o_lds_warp):
     """Flatten a core's finished softmax/O state into scf.if-yieldable raw values."""
     out = []
