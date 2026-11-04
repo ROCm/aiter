@@ -113,14 +113,26 @@ def match_presorted_moe(
     block_m,
     num_experts,
     topk,
+    stage_block_m=None,
     expert_mask=None,
     num_local_tokens=None,
     output=None,
 ):
+    """Return ``aux`` if it can replace fused_moe's own sort for this call, else None.
+
+    ``block_m`` is the selected kernels' tile size; ``stage_block_m`` is the
+    block size fused_moe hands its sort and stages (a caller's block_size_M),
+    which defaults to ``block_m``. Both must be 16.
+    """
     if not aux:
         return None
     if int(block_m) != PRESORTED_MOE_BLOCK_M:
         presorted_moe_ignored(f"block_m={block_m}")
+        return None
+    # The stages index sorted_expert_ids by stage_block_m rows, so a caller's
+    # block_size_M that overrides the kernels' tile would misread a BM=16 sort.
+    if stage_block_m is not None and int(stage_block_m) != int(block_m):
+        presorted_moe_ignored(f"block_size_M={stage_block_m} != kernel block_m")
         return None
     # The presort has no expert mask applied and covers every row of topk_ids;
     # moe_sorting honors both, so a masked or row-limited call must re-sort.

@@ -1408,10 +1408,10 @@ def test_presorted_moe_hook():
     presorted, and "own err" (diff vs the own sort on the timed routing) for both
     presorted calls. Its eager summed kernel time does not rank the two presorted
     calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
-    contract: a reused-address moe_buf is zeroed, an underaligned output is
-    copied back, and a registration that does not match the call is ignored and
-    still consumed, so it never leaks into a later call, even when fused_moe
-    exits before sorting.
+    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
+    copied back while a 4-byte-aligned one is used in place, and a registration
+    that does not match the call is ignored and still consumed, so it never
+    leaks into a later call, even when fused_moe exits before sorting.
     """
     global fused_moe
     fm = aiter.fused_moe
@@ -1653,14 +1653,32 @@ def test_presorted_moe_hook():
         assert handed and out is stale, "presort did not allocate its own moe_buf"
         check_close(ref, out, "reused-address moe_buf was not zeroed")
 
-        # An output that is not 16-byte aligned cannot be the atomic moe_buf
-        # (GEMM2 faults on it): fused_moe uses a fresh one and copies back.
-        odd = torch.empty(token * model_dim + 1, dtype=dtype)[1:].view(token, model_dim)
-        sort_calls.clear()
-        fm.register_presorted_moe(presort(topk_ids, topk_weights))
-        out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=odd, **kwargs)
-        assert out is odd and not sort_calls
-        check_close(ref, out, "underaligned output")
+        # An output at an odd bf16 element (2-byte aligned) cannot be the atomic
+        # moe_buf (GEMM2's 4-byte atomics fault on it): fused_moe uses a fresh
+        # one and copies back. A 4-byte-aligned one is used in place.
+        real_return = fm._return_output
+        copies = []
+
+        def tracking_return(ret, output):
+            copies.append(output is not None and ret is not output)
+            return real_return(ret, output)
+
+        for offset, copied in ((1, True), (2, False)):
+            pool = torch.empty(token * model_dim + offset, dtype=dtype)
+            buf = pool[offset:].view(token, model_dim)
+            sort_calls.clear()
+            copies.clear()
+            fm.register_presorted_moe(presort(topk_ids, topk_weights))
+            try:
+                fm._return_output = tracking_return
+                out = fused_moe(
+                    hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
+                )
+            finally:
+                fm._return_output = real_return
+            assert out is buf and not sort_calls
+            assert copies == [copied], f"{2 * offset}-byte offset: copied={copies}"
+            check_close(ref, out, f"{2 * offset}-byte-aligned output")
 
         # Registered for another topk_ids or topk_weights tensor: ignored, and
         # consumed.
@@ -1752,9 +1770,8 @@ def _presorted_aux_stub(ids, weights, E, block_m=16):
     matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
-    BM = 16
-    active = min(E, M * topk)
-    max_sorted = (M * topk + active * (BM - 1) + BM - 1) // BM * BM
+    BM = presorted_moe.PRESORTED_MOE_BLOCK_M
+    max_sorted = presorted_moe.aux_sort_capacity(M, topk, E, BM)
     i32 = dtypes.i32
     return {
         "sorted_token_ids": torch.empty(max_sorted, dtype=i32, device=ids.device),
@@ -1918,6 +1935,19 @@ def test_presorted_moe_block_m():
 
     assert match(16) is not None, "a matching BM=16 presort was rejected"
     assert match(32) is None, "a BM=32 presort was accepted"
+    # BM=16 kernels, but a caller's block_size_M hands the stages another size.
+    aux = _presorted_aux_stub(ids, weights, E)
+    for stage_block_m, ok in ((16, True), (32, False)):
+        got = presorted_moe.match_presorted_moe(
+            aux,
+            ids,
+            weights,
+            block_m=16,
+            num_experts=E,
+            topk=topk,
+            stage_block_m=stage_block_m,
+        )
+        assert (got is not None) == ok, f"block_size_M={stage_block_m}: {ok=}"
     aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
 
 
@@ -2387,7 +2417,11 @@ else:
     test_presorted_moe_layout_mismatch()
     test_presorted_moe_ignored_is_logged()
     test_presorted_moe_compile_order()
-    if get_gfx() == "gfx950":
+    # The hook test quantizes E=896 weights and times three candidates; skip it
+    # for an explicit CLI quant sweep, like the tuned-CSV validation above.
+    if args.quant is not None:
+        aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
+    elif get_gfx() == "gfx950":
         test_presorted_moe_hook()
     else:
         aiter.logger.warning(

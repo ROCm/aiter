@@ -1964,8 +1964,9 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # The selected kernels' tile size, which a caller's block_size_M can
-        # disagree with; the presort layout has to match the kernels.
+        # The presort layout has to match both the selected kernels' tile size
+        # and the block size the stages are given, which a caller's
+        # block_size_M can override.
         presorted = match_presorted_moe(
             presorted_aux,
             topk_ids,
@@ -1973,6 +1974,7 @@ def _fused_moe_impl(
             block_m=metadata.block_m,
             num_experts=global_E,
             topk=topk,
+            stage_block_m=block_size_M,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
             output=output,
@@ -1985,10 +1987,10 @@ def _fused_moe_impl(
             sort_m_indices = presorted["m_indices"]
             sort_reverse_sorted = presorted["reverse_sorted"]
             if _atomic and not runtime_stage2_reduce:
-                # Atomic GEMM2 faults on a destination that is not 16-byte aligned
-                # (as the adaptive sort guards), so an underaligned caller output
-                # gets a fresh moe_buf and _return_output copies back.
-                in_place = output is not None and output.data_ptr() % 16 == 0
+                # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
+                # output at an odd bf16 element, so such an output gets a fresh
+                # moe_buf and _return_output copies back.
+                in_place = output is not None and output.data_ptr() % 4 == 0
                 moe_buf = (
                     output
                     if in_place
