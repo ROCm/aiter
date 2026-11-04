@@ -40,6 +40,8 @@ and the SPLIT_MIN_* floors; see compute_segment_params.
 import copy
 import functools
 import itertools
+import json
+import os
 
 import torch
 import triton
@@ -53,6 +55,45 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
+
+# Candidate D3 (default off): AITER_GFX1250_UA3D_NHD_CFG='{"SEGMENTS_PER_CU": 16, "num_stages": 1, ...}' overrides the
+# kv_split (SEGMENTS_PER_CU / MIN_SEGMENTS / MAX_SEGMENTS) and attn_3d (num_warps / num_stages / waves_per_eu) entries
+# of the gfx1250 Triton 3D split-KV decode path for the plain (non-shuffled) bf16 q + bf16 KV cache only, which today
+# falls to the tables' generic "any" entries.  Unset = unchanged lookup.  Arithmetic and kernel source are unchanged;
+# only the KV split count and launch/pipelining parameters move.
+_UA3D_NHD_KEYS = {"kv_split": ("SEGMENTS_PER_CU", "MIN_SEGMENTS", "MAX_SEGMENTS"),
+                  "attn_3d": ("num_warps", "num_stages", "waves_per_eu")}
+
+
+def _parse_ua3d_nhd_override():
+    raw = os.environ.get("AITER_GFX1250_UA3D_NHD_CFG", "").strip()
+    if not raw:
+        return None
+    cfg = json.loads(raw)
+    allowed = {k for ks in _UA3D_NHD_KEYS.values() for k in ks}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"AITER_GFX1250_UA3D_NHD_CFG={raw!r}: expected a JSON object")
+    bad = [k for k, v in cfg.items() if k not in allowed or not isinstance(v, int) or v < 1]
+    if bad:
+        raise ValueError(f"AITER_GFX1250_UA3D_NHD_CFG={raw!r}: keys must be positive ints from {sorted(allowed)}")
+    return cfg
+
+
+_UA3D_NHD_OVERRIDE = _parse_ua3d_nhd_override()
+
+
+def _ua3d_nhd_override_applies(op, params, backend, arch) -> bool:
+    return (
+        _UA3D_NHD_OVERRIDE is not None
+        and op in _UA3D_NHD_KEYS
+        and backend == "triton"
+        and (arch or arch_info.get_arch()) == "gfx1250"
+        and not params.shuffled_kv_cache
+        and params.all_decode
+        and params.sliding_window <= 0
+        and params.q_dtype == torch.bfloat16
+        and params.kv_cache_dtype == torch.bfloat16
+    )
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
 # Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
@@ -363,9 +404,12 @@ def get_unified_attention_config(
         arch,
         params.num_queries_per_kv,
     )
+    config = copy.deepcopy(config)
+    if _ua3d_nhd_override_applies(op, params, backend, arch):
+        config.update({k: v for k, v in _UA3D_NHD_OVERRIDE.items() if k in _UA3D_NHD_KEYS[op]})
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
-    return compute_segment_params(copy.deepcopy(config), params)
+    return compute_segment_params(config, params)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
