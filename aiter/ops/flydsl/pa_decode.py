@@ -1067,11 +1067,18 @@ def pa_decode(
         )
         else 0
     )
-    if quant_output and not (one_partition_output or cluster_merge == 8):
-        raise NotImplementedError(
-            "quantized PA output requires the selected gfx1250 direct or cluster8 "
-            "output mode"
-        )
+    # The quant epilogue exists only in the one-partition direct output and the
+    # cluster-of-8 merge. Any other output mode the plan picks (it depends on the
+    # batch and context) writes the BF16 output as usual and quantizes it after
+    # with the standalone per-token kernel, which is exactly the unfused path.
+    quant_after_output = quant_output and not (
+        one_partition_output or cluster_merge == 8
+    )
+    if quant_after_output:
+        quant_output = False
+        if not store_output:
+            # Keep the caller's BF16 buffer untouched, as the fused path does.
+            output = torch.empty_like(output)
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -1228,30 +1235,36 @@ def pa_decode(
             *merge_args,
             s,
         )
-        if direct_output or cluster_merge:
-            return
-        output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, query_group_size, head_dim
-        )
-        launch_pa_decode_ps_reduce(
-            output_5d,
-            psum,
-            pmax,
-            pout,
-            sinks,
-            output_5d.stride(0),
-            output_5d.stride(1),
-            output_5d.stride(2),
-            output_5d.stride(3),
-            pmax.stride(0),
-            pmax.stride(1),
-            pout.stride(0),
-            pout.stride(1),
-            pout.stride(2),
-            query_seq_len=query_length,
-            query_group_size=query_group_size,
-            head_size=head_dim,
-            max_partitions=max_partitions,
-            stream=s,
-            reduce_info=work_plan.reduce_info,
-        )
+        if not (direct_output or cluster_merge):
+            output_5d = output.reshape(
+                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+            )
+            launch_pa_decode_ps_reduce(
+                output_5d,
+                psum,
+                pmax,
+                pout,
+                sinks,
+                output_5d.stride(0),
+                output_5d.stride(1),
+                output_5d.stride(2),
+                output_5d.stride(3),
+                pmax.stride(0),
+                pmax.stride(1),
+                pout.stride(0),
+                pout.stride(1),
+                pout.stride(2),
+                query_seq_len=query_length,
+                query_group_size=query_group_size,
+                head_size=head_dim,
+                max_partitions=max_partitions,
+                stream=s,
+                reduce_info=work_plan.reduce_info,
+            )
+        if quant_after_output:
+            from ..quant import dynamic_per_token_scaled_quant
+
+            rows = output.shape[0]
+            dynamic_per_token_scaled_quant(
+                quantized_output.view(rows, -1), output.view(rows, -1), output_scale
+            )
