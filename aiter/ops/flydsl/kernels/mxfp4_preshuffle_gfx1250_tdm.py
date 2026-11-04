@@ -763,13 +763,20 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(
+        def tiled_store(gt, tile, lds_ptr, lds_row):
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gt,
-                [outer, None],
-                strides=[stride, None],
+                fx.make_layout(tile, (lds_row, 1)),
+                tile,
                 num_warps=num_waves,
             )
+            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            box = tensor_view(lds_ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row))
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom, wave, fx.make_layout(num_waves, 1), box, blk
+            )
+            fx.copy(atom, ts[None, 0], tg[None, 0])
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -2451,46 +2458,31 @@ def build_gemm_a8w4_tdm_task(
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
                     gtC = tensor_view(
                         c_iter + c_off_rt,
-                        (tile_m // 16, STORE_N * 16),
+                        ((mn_oob + 15) // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, c_q_base_ptr),
+                    tiled_store(
+                        gtC,
                         (tile_m // 16, STORE_N * 16),
-                        (STORE_N * 16, 1),
+                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        STORE_N * 16,
                     )
-                    fx.copy(atomC, src, gtC)
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                    if const_expr(STORE_PAD == 0):
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
-                        )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, c_q_base_ptr),
-                            (tile_m, STORE_N),
-                            (STORE_N, 1),
-                        )
-                    else:
-                        # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                        # extent clamps the inner axis to STORE_N so the pad never lands.
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                        )
-                        atomC = fx.rocdl.make_tdm_atom(
-                            gtC,
-                            [mn_oob, STORE_N],
-                            strides=[out_stride, None],
-                            num_warps=num_waves,
-                        )
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_PITCH),
-                            (STORE_PITCH, 1),
-                        )
-                    fx.copy(atomC, src, gtC)
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1)
+                    )
+                    # The LDS tile is (tile_m, STORE_PITCH) dense; gtC's inner
+                    # extent is STORE_N, so the pad columns never reach global.
+                    # c_q_base_ptr is base_ptr unless defer_c_wait, and that
+                    # asserts stage1_act and not enable_ep_scatter -- the only
+                    # case it differs already has STORE_PAD == 0 (PITCH == N).
+                    tiled_store(
+                        gtC,
+                        (tile_m, STORE_PITCH),
+                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        STORE_PITCH,
+                    )
                 if const_expr(tdm_snop):
                     rocdl.s_nop(0)
                 if const_expr(not defer_c_wait):
@@ -2528,11 +2520,11 @@ def build_gemm_a8w4_tdm_task(
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
-    arg_c: fx.Tensor,
+    arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -2553,7 +2545,7 @@ def launch_gemm_a8w4_tdm(
     f32_swiglu_limit: fx.Float32,
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
-    arg_quant_scale: fx.Tensor = None,
+    arg_quant_scale: fx.Pointer = None,
     cluster_n: Constexpr[int] = 1,
     cluster_m: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
@@ -2567,7 +2559,7 @@ def launch_gemm_a8w4_tdm(
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
-    arg_ep_row_map: fx.Tensor = None,
+    arg_ep_row_map: fx.Pointer = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
@@ -2706,15 +2698,15 @@ def launch_gemm_a8w4_tdm(
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
     kargs = (
-        fx.get_iter(arg_c),
+        arg_c,
         arg_a,
         arg_b,
-        fx.get_iter(arg_scale_a),
-        fx.get_iter(arg_scale_b),
+        arg_scale_a,
+        arg_scale_b,
         arg_m_tile_map,
         arg_bias,
-        fx.get_iter(arg_quant_scale),
-        fx.get_iter(arg_ep_row_map),
+        arg_quant_scale,
+        arg_ep_row_map,
         i32_m,
         N,
         f32_swiglu_limit,
