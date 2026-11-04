@@ -703,7 +703,7 @@ def _flash_attn_forward(
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
         assert (
             out_dtype == q.dtype
-        ), f"Output and input must have the same dtype, got out_dtype={out_dtype} and q.dtype={q.dtype}."
+        ), f"Output and input must have the same dtype in dao_ai impl, got out_dtype={out_dtype} and q.dtype={q.dtype}."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,

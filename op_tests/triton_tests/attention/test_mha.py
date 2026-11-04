@@ -371,19 +371,29 @@ def test_mha_forward_out_dtype(
     ref, ref_lse = forward(out_dtype=torch.float32)
     out, lse = forward() if OUT_DTYPE is None else forward(out_dtype=OUT_DTYPE)
     expected_dtype = OUT_DTYPE or (torch.float32 if FP8 else dtype)
-    assert out.dtype == expected_dtype
-    assert lse.dtype == torch.float32 and torch.equal(lse, ref_lse)
+    assert (
+        out.dtype == expected_dtype
+    ), f"output dtype is {out.dtype}, expected {expected_dtype}"
+    assert (
+        lse.dtype == torch.float32
+    ), f"softmax_lse dtype is {lse.dtype}, expected torch.float32"
+    assert torch.equal(lse, ref_lse), "softmax_lse changed with out_dtype"
     expected = ref.to(expected_dtype)
-    # An fp16 store can fuse the 1/l multiply into the cast (v_fma_mixlo_f16) and
-    # round once, so a few values differ from the double-rounded cast by 1 ulp.
+    # An fp16 store can fuse the 1/l multiply into the cast (v_fma_mixlo_f16) and round
+    # once. Then about 1 in 16k values differ by 1 ulp from the double-rounded cast.
     finfo = torch.finfo(expected_dtype)
     torch.testing.assert_close(
         out.float(),
         expected.float(),
         atol=finfo.smallest_normal * finfo.eps,
         rtol=finfo.eps,
+        msg=lambda m: f"output is not within 1 ulp of the cast float32 output\n{m}",
     )
-    assert (out != expected).sum() <= out.numel() // 1000
+    n_diff = int((out != expected).sum())
+    assert n_diff <= out.numel() // 1000, (
+        f"{n_diff} of {out.numel()} values differ from the cast float32 output, "
+        "more than 1 in 1000"
+    )
 
 
 @pytest.mark.parametrize(
