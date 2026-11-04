@@ -15,16 +15,13 @@
     "stage1_config": "any",
     "stage2_config": "any",
     "validation": {
-      "source": "artifacts/pr5059_eval_run/all_integer_public_vs_vllm_w10_i30/public_aiter_vs_vllm_all_m.csv",
       "optimized_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/all_m_xcd1_w10_i30/public_aiter_vs_vllm_all_m.csv",
-      "pr_head": "a161002aedf0bae06a6f8ee9ba835bbd5eba2159",
+      "reference_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/ref_all_m_xcd1/reference_all_m.csv",
       "docker_image": "vllm/vllm-openai-rocm:v0.22.0",
       "machine": "supermicro5",
       "warmup": 10,
       "iters": 30,
-      "three_path_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/three_path_all_m_w1_i3/three_path_all_m.csv",
-      "reference_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/ref_all_m_xcd1/reference_all_m.csv",
-      "dispatch_policy": "full_swept_interval_new_path_beats_vllm_and_original_aiter",
+      "dispatch_policy": "full_swept_interval_new_path_beats_vllm_and_passes_reference",
       "performance_preferred_mean_delta_vs_vllm_pct": 0.0,
       "performance_preferred_median_delta_vs_vllm_pct": 0.0,
       "swept_rows": 1537,
@@ -38,16 +35,7 @@
       "worst_median_delta_vs_vllm_pct": 3.43,
       "performance_preferred_rows": 1537,
       "new_reference_fail_rows": 0,
-      "original_aiter_fallback": "runnable_with_opus_dpp_fix_cu64_metadata_and_preshuffled_weights",
-      "original_aiter_rows": 1537,
-      "original_aiter_reference_pass_rows": 1534,
-      "original_aiter_reference_fail_rows": [
-        1037,
-        1120,
-        1282
-      ],
-      "new_beats_original_mean_rows": 1537,
-      "original_aiter_notes": "Default Opus sorting needed a gfx1201-compatible DPP scan. Qwen3.6 BF16 rows are keyed to AITER runtime cu_num=64. Original AITER comparison uses preshuffled weights because the CK rows are preshuffle_on."
+      "scope_note": "original AITER fallback repair and #4815 config corrections are intentionally excluded from this PR"
     },
     "m_ranges": [
       [
