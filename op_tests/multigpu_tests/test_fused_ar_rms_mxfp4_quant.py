@@ -10,7 +10,7 @@ Two coverage modes:
   path -- 1-stage, 2-stage, fallback) at ``stage=auto`` /
   ``emit_bf16=False``, sweeping ``tp_size in [2, 4, 8]`` so every
   production TP is covered. Every case runs with and without ``gemma_norm``,
-  and once more with ``hadamard_rotate`` (Gemma weights, bf16 side output on). Picked up automatically by
+  and once more each with ``hadamard_rotate`` (bf16 side output on). Picked up automatically by
   ``.github/scripts/aiter_test.sh`` which executes every multi-GPU test
   with no flags. Pass ``-t N`` to restrict to a single TP for debugging.
 * Local full sweep (~50 min across TP=2/4/8): ``--full`` runs
@@ -554,11 +554,13 @@ def main():
             {
                 "shape": shape,
                 "emit_bf16": True,
-                "gemma_norm": True,
+                "gemma_norm": gemma_norm,
                 "hadamard_rotate": True,
             }
             # The rotated quant needs the gfx950 hardware FP4 convert.
-            for shape in (shapes if get_gfx() == "gfx950" else [])
+            for shape, gemma_norm in itertools.product(
+                shapes if get_gfx() == "gfx950" else [], gemma_norm_values
+            )
         ]
         # When forcing a specific kernel, only exercise shapes that the
         # kernel actually supports. Fallbacks under override would just

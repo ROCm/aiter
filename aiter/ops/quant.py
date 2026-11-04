@@ -562,6 +562,9 @@ def per_1x32_mx_quant_hip(
         assert (
             quant_dtype == dtypes.fp4x2 and num_rows is None and scale is None
         ), "scale_layout_m32k4 here needs fp4x2 output, no num_rows and no static scale"
+        assert (
+            not hadamard_rotate
+        ), "hadamard_rotate does not support scale_layout_m32k4"
         scale = torch.empty(
             ((m + 31) // 32 * 32, n // 32), dtype=torch.uint8, device=device
         ).view(dtypes.fp8_e8m0)
