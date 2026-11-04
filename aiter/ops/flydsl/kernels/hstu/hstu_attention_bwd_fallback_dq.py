@@ -55,8 +55,13 @@ validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd_fallback
 # Small-head tiles defer the SiLU derivative until dS construction. This overlaps
 # exp2/reciprocal work with dA MFMAs without changing the live-state size.
 #
-# HSTU_DQ_GATE_LATE=1/0 overrides the default at import time for custom tiles.
-# It is not a kernel-cache key; use a fresh process and runtime cache when changing it.
+# On gfx942 at head_dim=64 the late gate measured up to 16% faster on target
+# masks and neutral on plain causal.
+#
+# HSTU_DQ_GATE_LATE forces the placement for every head_dim: "1" defers, any
+# other value (including "true") evaluates the gate in GEMM1. It only affects
+# this fallback dQ kernel, not the fused default. Read once at import, so set it
+# before the process starts; the resolved flag is part of FlyDSL's kernel key.
 # `const_expr` is required below so FlyDSL removes the inactive path.
 _GATE_LATE_ENV = os.environ.get("HSTU_DQ_GATE_LATE")
 _GATE_LATE_MAX_HEAD_DIM = 64
