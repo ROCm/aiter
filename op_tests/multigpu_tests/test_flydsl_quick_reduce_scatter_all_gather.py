@@ -19,7 +19,9 @@ of freedom) and all zeros:
   by one block rolls the outputs by one rank, bit for bit;
 * AG accuracy, bitwise-equal output on every rank, and the own block is
   round-tripped through the codec (it does not equal the input);
-* all-zero inputs give bitwise ``+0.0`` outputs;
+* all-zero inputs give all-zero outputs (either sign: the codec's zero group
+  decodes to ``-0.0``, which still compares equal to zero), never NaN or a
+  stray value;
 * inputs unchanged, and every output element written and nothing past it (the
   outputs start as a sentinel and are followed by a guard);
 * back-to-back launches of both modes, alternating between two inputs, with
@@ -272,7 +274,9 @@ def _measure(
     ref = ref[rank * shard_rows : (rank + 1) * shard_rows]
     row["rs_nmse"] = _nmse(out.float(), ref)
     row["rs_err"] = _close_err(ref, out, f"rs rank {rank}")
-    row["rs_zero"] = not bool(_bits(out).any())
+    row["rs_zero"] = bool((out == 0).all())
+    if fill == "zeros":
+        row["rs_zero_bits"] = torch.unique(_bits(out)).tolist()
     row["rs_clean"] = torch.equal(_bits(x), _bits(x0)) and bool(
         (out_tail == _SENTINEL).all()
     )
@@ -296,7 +300,9 @@ def _measure(
     ref_ag = torch.cat([p.float() for p in _gather(s, tp)])
     row["ag_nmse"] = _nmse(full.float(), ref_ag)
     row["ag_err"] = _close_err(ref_ag, full, f"ag rank {rank}")
-    row["ag_zero"] = not bool(_bits(full).any())
+    row["ag_zero"] = bool((full == 0).all())
+    if fill == "zeros":
+        row["ag_zero_bits"] = torch.unique(_bits(full)).tolist()
     outs = _gather(full, tp)
     row["ag_ranks_equal"] = all(torch.equal(_bits(outs[0]), _bits(o)) for o in outs[1:])
     own = full[rank * shard_rows : (rank + 1) * shard_rows]
@@ -756,11 +762,17 @@ def _assert_validity(ranks, *, world_size, label) -> dict:
                 f"hidden={row['hidden']} fill={row['fill']}"
             )
             if row["fill"] == "zeros":
-                # NMSE is 0 / 0 here: the bitwise check is the accuracy gate
+                # NMSE is 0 / 0 here: the all-zero check is the accuracy gate
                 if not row["rs_zero"]:
-                    fails.append(f"{where}: RS of all-zero partials is not +0.0")
+                    fails.append(
+                        f"{where}: RS of all-zero partials is not zero "
+                        f"(int16 bit patterns {row['rs_zero_bits']})"
+                    )
                 if not row["ag_zero"]:
-                    fails.append(f"{where}: AG of all-zero shards is not +0.0")
+                    fails.append(
+                        f"{where}: AG of all-zero shards is not zero "
+                        f"(int16 bit patterns {row['ag_zero_bits']})"
+                    )
             else:
                 # written so that a NaN fails
                 if not row["rs_nmse"] <= NMSE_MAX:
