@@ -53,6 +53,7 @@ skip_tests=(
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
+    "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
@@ -107,9 +108,14 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_mla_v4_nm.py)
+            # The test cases are pytest functions; the script entry point is an
+            # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
