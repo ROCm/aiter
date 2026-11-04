@@ -2585,7 +2585,8 @@ def get_mla_metadata_v1(
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
     # mla_decode_fwd checks its launch against this: for some shapes the head
-    # plan, folded or native, depends on round-robin CP.
+    # plan, folded or native, depends on round-robin CP. The flag lives on this
+    # tensor object, so a view or copy of it skips the check.
     work_metadata_ptrs._aiter_planned_cp_round_robin = bool(is_cp_round_robin)
 
 

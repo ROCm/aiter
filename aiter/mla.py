@@ -1407,7 +1407,7 @@ def mla_decode_fwd(
         if fp32_single_split_lse:
             return o, final_lse
     else:
-        head_plan, max_splits = _mla_decode_launch_plan(
+        plan_shape = (
             ori_nhead,
             max_seqlen_q,
             q.dtype,
@@ -1416,23 +1416,14 @@ def mla_decode_fwd(
             intra_batch_mode,
             page_size,
             cp_world_size,
-            g_kv_indptr is not None,
-            q_scale is not None and kv_scale is not None,
+        )
+        has_scales = q_scale is not None and kv_scale is not None
+        head_plan, max_splits = _mla_decode_launch_plan(
+            *plan_shape, g_kv_indptr is not None, has_scales
         )
         planned_cprr = getattr(work_meta_data, "_aiter_planned_cp_round_robin", None)
         if planned_cprr is not None and planned_cprr != (g_kv_indptr is not None):
-            planned, _ = _mla_decode_launch_plan(
-                ori_nhead,
-                max_seqlen_q,
-                q.dtype,
-                kv_buffer.dtype,
-                fast_mode,
-                intra_batch_mode,
-                page_size,
-                cp_world_size,
-                planned_cprr,
-                q_scale is not None and kv_scale is not None,
-            )
+            planned, _ = _mla_decode_launch_plan(*plan_shape, planned_cprr, has_scales)
             if (planned.qk_batch_ratio, planned.kernel_num_heads) != (
                 head_plan.qk_batch_ratio,
                 head_plan.kernel_num_heads,
