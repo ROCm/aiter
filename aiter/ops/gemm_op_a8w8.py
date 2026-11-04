@@ -907,6 +907,27 @@ def _check_int8_bpreshuffle_contract(
         )
 
 
+def _int8_row_runs_on_flydsl(config: dict, m: int, k: int) -> bool:
+    """Whether a tuned INT8 row launches a FlyDSL kernel at this M and launch K.
+
+    The generic FlyDSL launcher hands an unparseable name, an M above
+    PRESHUFFLE_M_MAX, or a K that its split-K or tile_k does not divide to CK,
+    whose bpreshuffle kernels take only FP8 operands.
+    """
+    if str(config["libtype"]) != "flydsl":
+        return False
+    kernel_name = str(config.get("kernelName", ""))
+    if kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+        return True
+    from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX
+
+    parsed = _parse_flydsl_kernel_name(kernel_name)
+    if parsed is None:
+        return False
+    tk, k_split = parsed[2], parsed[8]
+    return m <= PRESHUFFLE_M_MAX and k % k_split == 0 and (k // k_split) % tk == 0
+
+
 @functools.cache
 def _warn_untuned_int8_fallback(
     gfx: str, m: int, n: int, k: int, kernel_name: str
@@ -1016,7 +1037,7 @@ def _gemm_a8w8_bpreshuffle_into(
             q_dtype,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
-    if is_int8 and config is not None and str(config["libtype"]) != "flydsl":
+    if is_int8 and config is not None and not _int8_row_runs_on_flydsl(config, m, w_k):
         config = None
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w

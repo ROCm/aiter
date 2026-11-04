@@ -35,11 +35,11 @@ requires_gfx950 = pytest.mark.skipif(
 )
 
 
-def _int8_operands(k, weight_k):
+def _int8_operands(k, weight_k, m=2):
     return (
-        torch.zeros((2, k), device="cuda", dtype=torch.int8),
+        torch.zeros((m, k), device="cuda", dtype=torch.int8),
         torch.zeros((16, weight_k), device="cuda", dtype=torch.int8),
-        torch.ones((2, 1), device="cuda", dtype=torch.float32),
+        torch.ones((m, 1), device="cuda", dtype=torch.float32),
         torch.ones((1, 16), device="cuda", dtype=torch.float32),
     )
 
@@ -91,15 +91,24 @@ def test_128cu_tuning_miss_uses_xcd4_runtime_variant(monkeypatch):
     assert seen["kernel_name"].endswith("_k256_xcd4")
 
 
+_GENERIC_INT8_ROW = "flydsl_bpreshuflle_64x64x128_I8_I8_B16_1x2x0x2_default"
+
+
 @requires_gpu
 @pytest.mark.parametrize(
-    "libtype,expected",
+    "libtype,row_kernel,m,uses_row",
     [
-        ("flydsl", "row_kernel"),
-        ("asm", four_wave.make_4wave_kernel_name(K=256)),
+        ("flydsl", four_wave.make_4wave_kernel_name(K=256), 2, True),
+        ("flydsl", _GENERIC_INT8_ROW, 2, True),
+        # The generic launcher would hand M > PRESHUFFLE_M_MAX to the FP8-only CK.
+        ("flydsl", _GENERIC_INT8_ROW, 65537, False),
+        ("flydsl", "row_kernel", 2, False),
+        ("asm", "row_kernel", 2, False),
     ],
 )
-def test_int8_dispatch_uses_only_flydsl_rows(monkeypatch, libtype, expected):
+def test_int8_dispatch_uses_only_rows_that_run_on_flydsl(
+    monkeypatch, libtype, row_kernel, m, uses_row
+):
     seen = {}
     _capture_flydsl(monkeypatch, seen)
     monkeypatch.setattr(
@@ -108,12 +117,13 @@ def test_int8_dispatch_uses_only_flydsl_rows(monkeypatch, libtype, expected):
         lambda *_args, **_kwargs: {
             "libtype": libtype,
             "splitK": 0,
-            "kernelName": "row_kernel",
+            "kernelName": row_kernel,
         },
     )
-    gemm_mod.gemm_a8w8_bpreshuffle(*_int8_operands(256, 256))
+    gemm_mod.gemm_a8w8_bpreshuffle(*_int8_operands(256, 256, m))
 
-    assert seen["kernel_name"] == expected
+    fallback = four_wave.default_4wave_kernel_name(m, 16, 256)
+    assert seen["kernel_name"] == (row_kernel if uses_row else fallback)
 
 
 @requires_gpu
