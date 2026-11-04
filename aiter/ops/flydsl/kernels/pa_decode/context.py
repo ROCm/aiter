@@ -72,17 +72,8 @@ class PaDecodeContext:
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
         self.n_kv = fx.Int32(gpu.grid_dim.y) // self.traits.query_splits
-        if const_expr(self.traits.batch_first_plan_grid):
-            self.part = fx.Int32(
-                fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
-                + fx.Uint32(gpu.block_id("z"))
-            )
-            # Physical x groups packed slots, not sequences.
-            capacity = fx.Int32(fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z))
-            self.partial_slot = self.kv_h * capacity + self.part
-        else:
-            self.part = fx.Int32(gpu.block_id("x"))
-            self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
+        self.part = fx.Int32(gpu.block_id("x"))
+        self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
 
     def init_query_mapping(self):
         self.rgroup = (

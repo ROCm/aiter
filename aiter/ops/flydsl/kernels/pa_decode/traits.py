@@ -355,24 +355,6 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
-        # Require an exact one-tile task budget and the small planned reducer.
-        batch_first_plan_grid = (
-            TUNED_PER_TOKEN
-            and single_tile_plan
-            and query_length == query_splits == 4
-            and num_kv_heads == 1
-            and query_group_size == 16
-            and block_size == 128
-            and 4096 <= sliding_window <= 8192
-            and 4 <= num_seqs <= 24
-            and num_partitions <= 64
-            and work_capacity == num_seqs * window_tiles
-            and split_workgroups <= 2 * num_compute_units
-            # Flat grids avoid regressions for these even batch/tile combinations.
-            and not (
-                num_seqs > 8 and num_seqs % 8 in (2, 4, 6) and window_tiles % 2 == 0
-            )
-        )
         cache_key = (
             head_dim,
             query_group_size,
@@ -389,7 +371,6 @@ class PaDecodeSchedule:
             PER_TOKEN_M1,
             query_splits,
             single_tile_plan,
-            batch_first_plan_grid,
             sliding_window,
             kv_dtype,
             bool(mask_unowned_kv),
@@ -428,7 +409,6 @@ class PaDecodeTraits:
     sliding_window: int
     single_tile_plan: bool
     prefetch_v: bool
-    batch_first_plan_grid: bool
     buffer_plan_output: bool
     D256_PIPE: bool
     stage_page_capacity: int
@@ -530,7 +510,6 @@ class PaDecodeTraits:
             PER_TOKEN_M1,
             query_splits,
             single_tile_plan,
-            batch_first_plan_grid,
             sliding_window,
             kv_dtype,
             mask_unowned_kv,
@@ -753,7 +732,6 @@ class PaDecodeTraits:
             sliding_window=sliding_window,
             single_tile_plan=single_tile_plan,
             prefetch_v=prefetch_v,
-            batch_first_plan_grid=batch_first_plan_grid,
             buffer_plan_output=buffer_plan_output,
             D256_PIPE=D256_PIPE,
             stage_page_capacity=stage_page_capacity,
