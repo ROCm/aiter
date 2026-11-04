@@ -427,7 +427,8 @@ def make_quick_allreduce_ring_kernel(
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
-            There is only one source, so only one thread spins. The poll
+            One lane polls each metadata word's epoch so a torn release
+            sector cannot expose stale format bits. The poll
             must bypass the caches (``_load_flag`` is ``sc0
             sc1``): a load answered from a stale line would spin forever, which
             is a hang rather than a slowdown.
@@ -445,9 +446,9 @@ def make_quick_allreduce_ring_kernel(
             value LLVM cannot prove uniform, sourcing all four descriptor
             dwords from VGPRs and serializing the wave around them.
             """
-            if tid == fx.Int32(0):
+            if tid < fx.Int32(metadata.release_i32):
                 flag = self_base + _i32_to_bytes(
-                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step]) + tid
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below orders the
@@ -457,8 +458,8 @@ def make_quick_allreduce_ring_kernel(
                     current = _load_flag(flag)
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
-            # Only `tid == 0` spins, so an acquire inside the loop would cover
-            # one lane of one wave and leave the rest of the workgroup reading
+            # Only metadata polling lanes spin, so an acquire inside the loop
+            # would leave the rest of the workgroup reading
             # the payload unordered after it -- and would be skipped entirely
             # in the common case where the flag is already set on the first
             # read.

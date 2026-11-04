@@ -961,19 +961,26 @@ def make_quick_allreduce_int4_kernel(
                 current = _load_flag(flag)
 
         def _wait_release(phase, color):
-            # Lane ``t`` watches one source. Our own flag is never published,
-            # so the N-1 lanes step over our own index.
-            spin_src = tid
-            if tid >= fx.Int32(self_rank):
-                spin_src = tid + fx.Int32(1)
-            if tid < n_push:
-                elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
-                    release_i32_off
-                )
-                _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
+            # Every metadata word must carry this epoch: observing the first
+            # word alone cannot rule out a partially updated release sector.
+            n_poll = n_push * metadata.release_i32
+            for rnd in range_constexpr((n_poll + block - 1) // block):
+                slot = tid + fx.Int32(rnd * block)
+                if slot < n_poll:
+                    spin_src = slot // fx.Int32(metadata.release_i32)
+                    spin_src = (spin_src >= self_rank).select(
+                        spin_src + fx.Int32(1), spin_src
+                    )
+                    word = slot % fx.Int32(metadata.release_i32)
+                    elem = (
+                        _sub_tile_i32(phase, spin_src, fx.Int32(0))
+                        + fx.Int32(release_i32_off)
+                        + word
+                    )
+                    _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
             gpu.barrier()
-            # Unconditional and after the join. Only `tid < n_push` spun,
-            # so scoping the acquire to the spin would leave the other waves
+            # Unconditional and after the join. Scoping the acquire to the
+            # polling lanes would leave the other waves
             # of this workgroup reading the payload unordered after it -- and
             # would also skip it entirely in the common case where the flag is
             # already set on the first read.
