@@ -155,6 +155,7 @@ def _benchmark_shape(
             None,
             torch.bfloat16,
             outputs["gluon_preshuffle"],
+            backend="gluon",
         )
     if "ck" in backends:
         config = get_GEMM_config_with_quant_type(
