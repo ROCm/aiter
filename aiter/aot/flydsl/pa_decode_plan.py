@@ -8,130 +8,112 @@
 ``plan_pa_decode`` compiles one kernel per batch bucket, block size and
 dense/windowed mode; batch, capacity, partition cap and window are runtime
 values. The kernels for batches up to a ``max_batch_size`` therefore form a
-finite set per arch, derived here from the planner's own bucket and block-size
-rules and the arch's LDS capacity. ``run_aot`` compiles the set for
+finite set per arch. This module replays ``plan_pa_decode`` itself on
+FakeTensors inside :func:`aiter.aot.flydsl.dry_run.dry_run` (see
+``replay.py``): for each bucket, at its largest batch, and at each task
+capacity where the block size can change, dense and windowed.
+
+Buckets are 1, 2, 4, ... and the cap, clipped to the arch's LDS limit, and a
+bucket's largest batch reaches every block size its smaller ones do. The block
+size follows the capacity up to 1024 threads, and the capacity stops at the
+batch times the CU count (the partition cap's bound), so each arch replays
+with the most CUs any of its devices has. ``run_aot`` replays the set for
 ``AOT_MAX_BATCH_SIZE``, which reaches every arch's LDS limit and therefore
 covers every power-of-two cap and every cap at or above that limit; other caps
 need their own run.
 
 Usage:
     python -m aiter.aot.flydsl.pa_decode_plan                        # 81792
-    python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 5000 --arch gfx950
+    GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 5000
+    python -m aiter.aot.flydsl.pa_decode_plan --check
 """
 
 from __future__ import annotations
 
 import argparse
-import time
 
-from aiter.aot.flydsl.common import (
-    aot_target_archs,
-    compile_only_env,
-    dedupe_jobs,
-    override_env,
-    run_jobs_parallel,
-)
+from aiter.aot.flydsl import replay as _replay
+from aiter.aot.flydsl.common import dedupe_jobs
 
-# Archs that pa_decode dispatches to.
-AOT_ARCHS = ("gfx942", "gfx950", "gfx1250")
+LABEL = "PA_DECODE_PLAN"
+# No tuned table: the jobs come from the planner's bucket and block-size steps.
+DEFAULT_CSVS: list[str] = []
+# Archs that pa_decode dispatches to, with the most CUs of any of their devices.
+AOT_ARCHS = {"gfx942": 304, "gfx950": 256, "gfx1250": 256}
 # gfx1250's LDS limit, the largest of AOT_ARCHS; each arch clips the final
 # bucket to its own limit (16256 on gfx942, 40832 on gfx950).
 AOT_MAX_BATCH_SIZE = 81792
-
-
-def plan_variants(max_batch_size: int, lds_bytes: int) -> list[tuple[int, int, bool]]:
-    """Every ``compile_pa_decode_plan`` key that ``plan_pa_decode`` can reach
-    for batches up to ``max_batch_size`` on a device with ``lds_bytes``.
-
-    Buckets are every power of two below the cap and the cap itself, which the
-    runtime clips to ``max_batch_size`` and the LDS limit. Capacity lies in
-    [batch, batch * max_partitions], so a bucket's smallest batch fixes its
-    smallest block and every larger block up to 1024 remains reachable for
-    some partition cap.
-    """
-    from aiter.ops.flydsl.kernels.pa_decode_plan import _block_threads, _lds_max_batch
-
-    max_batch = min(max_batch_size, _lds_max_batch(lds_bytes))
-    buckets = [1 << bit for bit in range((max_batch - 1).bit_length())]
-    buckets.append(max_batch)
-    variants = []
-    for bucket in buckets:
-        # The previous bucket is the largest power of two below this one.
-        threads = _block_threads((1 << (bucket - 1).bit_length()) // 2 + 1)
-        while threads <= 1024:
-            for windowed in (False, True):
-                variants.append((bucket, threads, windowed))
-            threads *= 2
-    return variants
+# Capacities at which the block size can change (64 to 1024 threads).
+_BLOCK_STEPS = (64, 128, 256, 512, 1024)
 
 
 def jobs_for_arch(arch: str, max_batch_size: int) -> list[dict]:
+    """A job per bucket, block-size step and window mode of ``arch``."""
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels.pa_decode_plan import _lds_max_batch
 
-    return [
-        {
-            "kernel_name": (
-                f"pa_decode_plan_{arch}_b{max_batch}_t{threads}"
-                f"_{'window' if windowed else 'dense'}"
-            ),
-            "arch": arch,
-            "max_batch": max_batch,
-            "threads": threads,
-            "windowed": windowed,
-        }
-        for max_batch, threads, windowed in plan_variants(
-            max_batch_size, get_lds_capacity_bytes(arch)
-        )
-    ]
+    cu_num = AOT_ARCHS[arch]
+    max_batch = min(max_batch_size, _lds_max_batch(get_lds_capacity_bytes(arch)))
+    batches = [1 << bit for bit in range((max_batch - 1).bit_length())]
+    batches.append(max_batch)
+    jobs = []
+    for batch in batches:
+        capacities = {min(max(step, batch), batch * cu_num) for step in _BLOCK_STEPS}
+        for capacity in sorted(capacities):
+            for windowed in (False, True):
+                jobs.append(
+                    {
+                        "kernel_name": (
+                            f"pa_decode_plan_b{batch}_c{capacity}"
+                            f"_{'window' if windowed else 'dense'}"
+                        ),
+                        "gfx": arch,
+                        "cu_num": cu_num,
+                        "batch": batch,
+                        "capacity": capacity,
+                        "windowed": windowed,
+                        "max_batch_size": max_batch_size,
+                    }
+                )
+    return jobs
 
 
 def default_jobs(max_batch_sizes: list[int] | None = None) -> list[dict]:
-    """Every variant of the archs ``GPU_ARCHS`` names (all supported archs when
-    unset) for each ``max_batch_size``, by default ``AOT_MAX_BATCH_SIZE``."""
-    targets = aot_target_archs()
-    archs = [arch for arch in AOT_ARCHS if targets is None or arch in targets]
+    """Every job of each arch for each ``max_batch_size``, by default
+    ``AOT_MAX_BATCH_SIZE``. ``replay.run`` drops archs ``GPU_ARCHS`` omits."""
     jobs = []
     for max_batch_size in max_batch_sizes or [AOT_MAX_BATCH_SIZE]:
-        for arch in archs:
+        for arch in AOT_ARCHS:
             jobs.extend(jobs_for_arch(arch, max_batch_size))
     return dedupe_jobs(jobs)
 
 
-def _compile_to_cache(*, max_batch, threads, windowed):
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
+def replay(job: dict) -> None:
+    import torch
 
-    from aiter.ops.flydsl.kernels.pa_decode_plan import compile_pa_decode_plan
+    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
 
-    # Mirror the launch at the end of plan_pa_decode: pointer dtypes, the four
-    # Int32 runtime values and the stream argument form the cache key, not
-    # their values.
-    null = flyc.from_c_void_p(fx.Int32, 0)
-    flyc.compile(
-        compile_pa_decode_plan(max_batch, threads, windowed),
-        null,
-        null,
-        null,
+    batch, capacity = job["batch"], job["capacity"]
+    # One KV head: the budget is the capacity, which the partition cap admits.
+    plan_pa_decode(
+        torch.empty(batch, dtype=torch.int32, device="cuda"),
         1,
-        1,
-        1,
-        0,
-        None,
+        max_partitions=-(-capacity // batch),
+        max_batch_size=job["max_batch_size"],
+        workgroup_budget=capacity,
+        sliding_window=int(job["windowed"]),
     )
 
 
-def compile_one_config(**job) -> dict:
-    result = {**job, "compile_time": None}
-    params = {k: v for k, v in job.items() if k not in ("kernel_name", "arch")}
-    started = time.time()
-    try:
-        # COMPILE_ONLY is mandatory: without it flyc.compile also launches.
-        with override_env("FLYDSL_GPU_ARCH", job["arch"]), compile_only_env():
-            _compile_to_cache(**params)
-        result["compile_time"] = time.time() - started
-    except Exception as error:  # noqa: BLE001
-        print(f"  [FAIL] {job['kernel_name']}: {error}")
-    return result
+def describe(job: dict) -> str:
+    return (
+        f"{job['kernel_name']} max_batch_size={job['max_batch_size']} "
+        f"cu_num={job['cu_num']}"
+    )
+
+
+def collect_jobs(_csv_paths: list[str], args: argparse.Namespace | None) -> list:
+    return default_jobs(None if args is None else args.max_batch_size)
 
 
 def _positive_int(value):
@@ -141,39 +123,20 @@ def _positive_int(value):
     return number
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-batch-size",
         type=_positive_int,
         nargs="+",
         help=f"planner batch caps to cover (default: {AOT_MAX_BATCH_SIZE})",
     )
-    parser.add_argument(
-        "--arch",
-        nargs="+",
-        choices=AOT_ARCHS,
-        help="target archs (default: GPU_ARCHS, or every supported arch)",
+
+
+def main() -> None:
+    _replay.main(
+        "aiter.aot.flydsl.pa_decode_plan",
+        "AOT pre-compile the FlyDSL paged-attention decode planner",
     )
-    parser.add_argument("--list", action="store_true", help="print the jobs and exit")
-    args = parser.parse_args()
-    if args.arch:
-        with override_env("GPU_ARCHS", ";".join(args.arch)):
-            jobs = default_jobs(args.max_batch_size)
-    else:
-        jobs = default_jobs(args.max_batch_size)
-    if args.list:
-        for job in jobs:
-            print(job["kernel_name"])
-        print(f"{len(jobs)} jobs")
-        return
-    if not jobs:
-        print("no supported arch selected; nothing to compile")
-        return
-    results = run_jobs_parallel(compile_one_config, jobs)
-    failed = sum(result["compile_time"] is None for result in results)
-    print(f"Compiled: {len(results) - failed} ok, {failed} failed")
-    raise SystemExit(1 if failed else 0)
 
 
 if __name__ == "__main__":
