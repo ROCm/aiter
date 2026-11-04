@@ -26,7 +26,7 @@ class _EntryPoint:
 class _Provider:
     def __init__(self, name: str, selected: plugin.KernelCandidate | None = None):
         self.name = name
-        self.api_version = plugin.API_VERSION
+        self.api_versions = {plugin.API_VERSION}
         self.op_versions = {"test.add": {1}}
         self.selected = selected
         self.select_calls = 0
@@ -229,7 +229,7 @@ def test_enable_list_order_is_honoured_through_configure(monkeypatch):
 def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     warnings = []
     incompatible = _Provider("old")
-    incompatible.api_version = plugin.API_VERSION + 1
+    incompatible.api_versions = {plugin.API_VERSION + 1}
     good = _Provider("good", _candidate("good"))
     monkeypatch.setenv("AITER_PLUGIN_ENABLE", "good")
     monkeypatch.setattr(plugin.logger, "warning", lambda *args: warnings.append(args))
@@ -258,7 +258,7 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     }
     assert set(skipped) == {"broken", "old"}
     assert "missing dependency" in skipped["broken"]
-    assert "not accepted" in skipped["old"]
+    assert "this aiter accepts" in skipped["old"]
 
 
 def test_force_and_per_op_disable_are_explicit(monkeypatch):
@@ -754,7 +754,7 @@ def test_route_changes_are_logged_once_per_generation(monkeypatch):
 
 def _provider_at(api_version: int, name: str = "aklr"):
     provider = _Provider(name, _candidate(name))
-    provider.api_version = api_version
+    provider.api_versions = {api_version}
     return provider
 
 
@@ -869,3 +869,65 @@ def test_status_lists_what_is_deprecated_and_when_it_goes(monkeypatch):
             "removed_in": "aiter 0.5",
         },
     )
+
+
+def test_a_provider_supporting_several_api_versions_is_served_on_the_newest():
+    """One release covering several AITER versions is the point of the set."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.api_versions = {plugin.API_VERSION - 1, plugin.API_VERSION}
+
+    assert plugin._declared_api_versions(provider) == frozenset(
+        {plugin.API_VERSION - 1, plugin.API_VERSION}
+    )
+
+
+def test_the_single_api_version_spelling_still_works_and_says_so(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    legacy = _Provider("aklr", _candidate("aklr"))
+    del legacy.api_versions
+    legacy.api_version = plugin.API_VERSION
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint("aklr", legacy),))
+
+    assert _route_add([])(2, 3) == 100, "the old spelling must keep working"
+    assert len(warnings) == 1
+    assert "declare api_versions instead" in warnings[0]
+
+
+def test_two_providers_cannot_answer_to_one_name(monkeypatch):
+    """A name is an identity: enable, force and every Decision address it."""
+
+    first = _Provider("aklr", _candidate("aklr", 100))
+    second = _Provider("aklr", _candidate("aklr", 200))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("a-entry", first), _EntryPoint("b-entry", second)),
+    )
+
+    assert _route_add([])(2, 3) == 100, "the first entry point keeps the name"
+    assert second.select_calls == 0
+    # Skipped, never raised: a bad install must not break ``import aiter``.
+    skipped = {
+        e["entry_point"]: e["reason"] for e in plugin.status()["skipped_providers"]
+    }
+    assert "already used by entry point 'a-entry'" in skipped["b-entry"]
+
+
+def test_a_var_signature_warns_that_it_pays_the_generic_binder(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        plugin.logger, "info", lambda fmt, *rest: messages.append(fmt % rest)
+    )
+
+    @plugin.route(op="test.varargs", version=1)
+    def anything(*args, **kwargs):
+        return "native"
+
+    assert len(messages) == 1
+    assert "Signature.bind on every call" in messages[0]

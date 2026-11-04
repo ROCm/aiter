@@ -34,6 +34,9 @@ API_VERSION = 1
 # removes it. The window exists so adapting is never an emergency; the runtime
 # warning always names the removal point, so nobody learns it from a crash.
 SUPERSEDED_API_VERSIONS: Mapping[int, str] = MappingProxyType({})
+# The single-version ``api_version`` spelling, and the release that stops
+# reading it. Providers declare ``api_versions``.
+SUPERSEDED_API_SPELLING: str | None = "a later aiter release"
 ENTRY_POINT_GROUP = "aiter.kernel_providers"
 
 _Canonicalizer = Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]
@@ -87,8 +90,20 @@ class KernelProvider(Protocol):
     """
 
     name: str
-    api_version: int
     op_versions: Mapping[str, Collection[int]]
+
+    # Declare ``api_versions`` -- every provider API version this provider
+    # supports -- so one wheel can cover several AITER releases. ``api_version``
+    # is the single-version spelling the first prototype used; it is read as a
+    # one-element set while it is still accepted (``SUPERSEDED_API_SPELLING``).
+    api_versions: Collection[int]
+    api_version: int
+
+    # The interface also describes an architecture, dtype, layout and shape
+    # coverage declaration. It is deliberately not implemented here: no form is
+    # defined for it yet, and a declaration surface is public contract -- harder
+    # to undo than to add. Coverage is answered per call by select() until the
+    # form is settled.
 
     def select(
         self, op: Op, args: tuple[Any, ...], kwargs: Mapping[str, Any]
@@ -113,6 +128,8 @@ class Decision:
 class _ProviderRecord:
     entry_point: str
     provider: KernelProvider
+    # the provider API version this provider and this AITER agreed on
+    api_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,13 +582,11 @@ def status() -> Mapping[str, Any]:
                         {
                             "kind": "provider-api",
                             "subject": record.provider.name,
-                            "version": record.provider.api_version,
-                            "removed_in": SUPERSEDED_API_VERSIONS[
-                                record.provider.api_version
-                            ],
+                            "version": record.api_version,
+                            "removed_in": SUPERSEDED_API_VERSIONS[record.api_version],
                         }
                         for record in _providers()
-                        if record.provider.api_version in SUPERSEDED_API_VERSIONS
+                        if record.api_version in SUPERSEDED_API_VERSIONS
                     ]
                     + [
                         {
@@ -714,6 +729,13 @@ def _build_canonicalizer(contract: Signature) -> _Canonicalizer:
 
     source = _canonicalizer_source(contract)
     if source is None:
+        # Roughly sixty times the per-call cost, paid silently otherwise.
+        logger.info(
+            "Routed op with signature %s cannot use a generated binder and will "
+            "canonicalize through Signature.bind on every call; give it explicit "
+            "parameters to avoid that.",
+            contract,
+        )
         return _binding_canonicalizer(contract)
 
     # Defaults travel through the namespace, never through source text: a
@@ -906,6 +928,35 @@ def _providers() -> Sequence[_ProviderRecord]:
     return _provider_records
 
 
+def _accepted_api_versions() -> frozenset[int]:
+    return frozenset({API_VERSION, *SUPERSEDED_API_VERSIONS})
+
+
+def _declared_api_versions(provider: KernelProvider) -> frozenset[int]:
+    """Every provider API version this provider says it supports.
+
+    ``api_versions`` is the spelling the interface asks for. A provider that
+    only has the prototype's single ``api_version`` is read as declaring that
+    one version, and warned once.
+    """
+
+    declared = getattr(provider, "api_versions", None)
+    if declared is not None:
+        return frozenset(declared)
+    single = provider.api_version
+    if SUPERSEDED_API_SPELLING is not None:
+        _warn_once(
+            ("spelling", provider.name),
+            "Provider %s declares api_version=%s; declare api_versions instead, "
+            "so one release can support several. %s stops reading the single "
+            "spelling.",
+            provider.name,
+            single,
+            SUPERSEDED_API_SPELLING,
+        )
+    return frozenset({single})
+
+
 def _discover_providers() -> tuple[_ProviderRecord, ...]:
     global _skipped_providers
     records: list[_ProviderRecord] = []
@@ -915,31 +966,35 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             loaded = entry_point.load()
             provider = loaded if hasattr(loaded, "select") else loaded()
             name = provider.name
-            api_version = provider.api_version
             _ = provider.op_versions
-            removal = SUPERSEDED_API_VERSIONS.get(api_version)
-            if api_version != API_VERSION and removal is None:
-                accepted = sorted({API_VERSION, *SUPERSEDED_API_VERSIONS})
+            declared = _declared_api_versions(provider)
+            accepted = _accepted_api_versions()
+            usable = declared & accepted
+            if not usable:
                 reason = (
-                    f"API version {api_version} is not accepted; "
-                    f"this aiter accepts {accepted}"
+                    f"declares API versions {sorted(declared)}; "
+                    f"this aiter accepts {sorted(accepted)}"
                 )
                 logger.warning("Skipping provider %s: %s", name, reason)
                 skipped.append(_SkippedProvider(entry_point.name, reason))
                 continue
+
+            # Both sides may support several; the newest shared one is used.
+            matched = max(usable)
+            removal = SUPERSEDED_API_VERSIONS.get(matched)
             if removal is not None:
                 # Inside the window: it loads, but nobody should learn the
                 # removal release from a future crash.
                 _warn_once(
-                    ("api", name, api_version),
-                    "Provider %s uses superseded provider API version %s; %s "
-                    "removes it. Adapt to version %s.",
+                    ("api", name, matched),
+                    "Provider %s is served on superseded provider API version "
+                    "%s; %s removes it. Support version %s.",
                     name,
-                    api_version,
+                    matched,
                     removal,
                     API_VERSION,
                 )
-            records.append(_ProviderRecord(entry_point.name, provider))
+            records.append(_ProviderRecord(entry_point.name, provider, matched))
         except Exception as error:  # noqa: BLE001 - one plugin must not break AITER
             logger.warning(
                 "Skipping provider entry point %s: %s", entry_point.name, error
@@ -947,10 +1002,29 @@ def _discover_providers() -> tuple[_ProviderRecord, ...]:
             # status() reports what was skipped and why: an installed provider
             # that never serves is the question an operator asks first.
             skipped.append(_SkippedProvider(entry_point.name, str(error)))
+    ordered = sorted(records, key=lambda item: (item.provider.name, item.entry_point))
+    kept: list[_ProviderRecord] = []
+    claimed: dict[str, str] = {}
+    for record in ordered:
+        owner = claimed.get(record.provider.name)
+        if owner is not None:
+            # A provider name is an identity: AITER_PLUGIN_ENABLE and
+            # AITER_PLUGIN_FORCE address it, and a Decision names it. Two
+            # providers answering to one name would make every one of those
+            # ambiguous and would let install order decide which serves.
+            # Skipped rather than raised: a bad install must never break
+            # ``import aiter``.
+            reason = f"name {record.provider.name!r} is already used by entry point {owner!r}"
+            logger.warning(
+                "Skipping provider entry point %s: %s", record.entry_point, reason
+            )
+            skipped.append(_SkippedProvider(record.entry_point, reason))
+            continue
+        claimed[record.provider.name] = record.entry_point
+        kept.append(record)
+
     _skipped_providers = tuple(skipped)
-    return tuple(
-        sorted(records, key=lambda item: (item.provider.name, item.entry_point))
-    )
+    return tuple(kept)
 
 
 def _entry_points() -> Sequence[metadata.EntryPoint]:
@@ -982,6 +1056,7 @@ def _reset_for_testing() -> None:
 
 __all__ = [
     "API_VERSION",
+    "SUPERSEDED_API_SPELLING",
     "SUPERSEDED_API_VERSIONS",
     "Decision",
     "Explanation",
