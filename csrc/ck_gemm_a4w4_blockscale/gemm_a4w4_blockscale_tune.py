@@ -199,14 +199,14 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
             return {}
-        df = pd.read_csv(file)
+        df = pd.read_csv(file, comment="#")
         shuffle_df = (
             df[df["bpreshuffle"] == 1]
             .reset_index()
-            .sort_values(by=["tile_M", "tile_N", "splitK"])
+            .sort_values(by=["tile_M", "tile_N", "splitK", "ps"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_M", "tile_N", "splitK"])["knl_name"]
+            shuffle_df.groupby(["tile_M", "tile_N", "splitK", "ps"])["knl_name"]
             .apply(list)
             .to_dict()
         )
@@ -315,13 +315,13 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
             asm_tiles = [key for key in asm_kernels]
             for key in asm_tiles:
-                tile_m, tile_n, splitk = key
+                tile_m, tile_n, splitk, _ps = key
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
                     if useSplitK
                     else 0
                 )
-                kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
+                kernelName = asm_kernels.get(key, [])
                 if len(kernelName) == 0:
                     print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                     continue
