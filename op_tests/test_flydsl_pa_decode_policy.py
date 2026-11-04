@@ -185,6 +185,8 @@ def test_invalid_geometry_rejected(changes):
         (16, 1, 16, 128, 1, 128, 8192, 0, True, False),
         (16, 1, 16, 128, 1, 128, 8192, 0, False, True),
         (32, 1, 32, 128, 1, 64, 8192, 0, False, False),
+        # FP8 expands the reducer budget; BF16 retains the original capacity.
+        (64, 1, 16, 128, 1, 128, 32768, 0, False, False),
     ],
 )
 def test_policy_graph_decode(
@@ -288,6 +290,12 @@ def test_policy_graph_decode(
         sliding_window=window,
         max_context_length=context,
     )
+    if (
+        context == 32768
+        and torch.cuda.get_device_properties(query.device).multi_processor_count == 256
+    ):
+        assert plan.max_partitions == 256
+        assert plan.capacity == (1024 if kv_dtype == "fp8" else 512)
     scalar_shape = (heads, plan.capacity, qlen * group)
     workspace = {
         "exp_sums": torch.empty(scalar_shape, device=query.device),
@@ -342,3 +350,7 @@ def test_policy_graph_decode(
     plan_pa_decode(lengths, heads, sliding_window=window, query_length=qlen, plan=plan)
     graph.replay()
     check()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q", *sys.argv[1:]]))
