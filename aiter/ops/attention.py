@@ -588,6 +588,21 @@ def _attention_ps_reduce_asm(
     """
 
 
+def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
+    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
+
+    This is not a live split count. Callers with padded kv_indices should pass
+    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
+    """
+    if num_cu != 256 or not 1 <= batch_size <= 8:
+        return 0
+    output_rows = batch_size * 4 * 16
+    if output_rows < num_cu:
+        return 0
+    context_threshold = 32768 if output_rows <= num_cu else 65536
+    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
+
+
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -618,8 +633,10 @@ def pa_persistent_fwd(
     LSE is undefined and must not be read; the forward kernel does not produce it.
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
-    reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 preserves the
-    existing heuristic, while 1/8 applies a choice made before graph capture.
+    reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
+    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    policy expects packed kv_indices containing only used pages. Other paths
+    retain the original heuristic. No tuning or device-to-host readback occurs.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -674,6 +691,24 @@ def pa_persistent_fwd(
     if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
         return logits, final_lse
 
+    batch_size = qo_indptr.numel() - 1
+    if (
+        use_asm_reduce
+        and reduce_waves == 0
+        and max_qlen == 4
+        and total_s == batch_size * 4
+        and nhead == 16
+        and K.shape[1] == 1
+        and K.dtype == dtypes.fp8
+        and V.dtype == dtypes.fp8
+        and quant_type == QuantType.per_Token
+        and mask == 1
+    ):
+        reduce_waves = _pa_ps_reduce_waves(
+            batch_size,
+            kv_indices.numel(),
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
     reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
     reduce_kwargs = {"merge_waves": reduce_waves} if use_asm_reduce else {}
     reduce_fn(
