@@ -5,7 +5,8 @@ This is a single-GPU compute fixture, not a distributed EP benchmark. The
 existing op test supplies routing, quantization, reference, tolerance, and
 torch.profiler timing. Only configuration lookup is adapted: it uses the
 global receive bound and local expert count of the requested EP deployment.
-GEMM1 input preparation precedes the measured GEMM1 callable.
+GEMM1 input preparation precedes the measured GEMM1 callable. By default,
+the tuned CSV selects the input layout, including the small-batch fallback.
 """
 
 import argparse
@@ -37,6 +38,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
     parser.add_argument("--scenario", choices=("kernel", "verify"), default="kernel")
+    parser.add_argument(
+        "--a-preshuffle",
+        choices=("csv", "0", "1"),
+        default="csv",
+        help="Use the production CSV input layout, or explicitly override it",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     assert args.global_experts > 0 and args.ep_world_size > 0
@@ -47,6 +54,10 @@ def main():
     config = args.config.resolve()
     assert config.is_file()
     os.environ["AITER_CONFIG_GROUPED_FMOE"] = str(config)
+    if args.a_preshuffle == "csv":
+        os.environ.pop("AITER_GROUPED_A4W4_A_PRESHUFFLE", None)
+    else:
+        os.environ["AITER_GROUPED_A4W4_A_PRESHUFFLE"] = args.a_preshuffle
     sys.path.insert(0, str(repo))
 
     import torch
@@ -68,19 +79,28 @@ def main():
     make_topk = test._make_topk
 
     def ep_compute_config(**query):
+        receive_bound = args.ep_world_size * args.tokens
         production_query = dict(
             query,
-            token_num=args.ep_world_size * args.tokens,
+            token_num=receive_bound,
             experts=local_experts,
             topk=-1,
             ep_fused=True,
         )
         row = find(**production_query)
         assert row is not None, "The requested EP workload has no tuned row"
-        selected.update(receive_bound=production_query["token_num"], row=dict(row))
-        # Both revisions consume the same already-preshuffled compute input.
-        # Older revisions select it only through CSV, without an env override.
-        return dict(row, a_preshuffle="1")
+        selected.update(
+            receive_bound=receive_bound,
+            lookup_token=production_query["token_num"],
+            row=dict(row),
+        )
+        # Keep CSV fallbacks intact unless the command explicitly requests a
+        # layout. Apply the same override to revisions without the env switch.
+        return (
+            row
+            if args.a_preshuffle == "csv"
+            else dict(row, a_preshuffle=args.a_preshuffle)
+        )
 
     def capture_topk(hidden, experts, topk):
         ids, weights = make_topk(hidden, experts, topk)
@@ -133,7 +153,9 @@ def main():
         )
         record = {name: int(params[name]) for name in fields if name in params}
         record["stage"] = 1 if params["stage1_act"] else 2
-        assert record["a_preshuffled"] == 1 and not record["enable_ep_scatter"]
+        assert not record["enable_ep_scatter"]
+        if args.a_preshuffle != "csv":
+            assert record["a_preshuffled"] == int(args.a_preshuffle)
         launches.append(record)
         result = dispatch(launcher, *values, **kwargs)
         # Restore before the op test creates timed partials or invokes its timer.
@@ -172,7 +194,12 @@ def main():
     assert {entry["stage"] for entry in launches} == {1, 2} and len(launches) == 2
     assert metrics["passed"] and metrics["logits_diff"] < 0.01
     report = {
-        "pipeline": "single_gpu_preshuffled_compute",
+        "pipeline": (
+            "single_gpu_preshuffled_compute"
+            if launches[0]["a_preshuffled"]
+            else "single_gpu_compute_csv_fallback"
+        ),
+        "a_preshuffle_mode": args.a_preshuffle,
         "ep4_runtime_validated": False,
         "global_experts": args.global_experts,
         "local_experts": local_experts,

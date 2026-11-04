@@ -820,6 +820,9 @@ def _grouped_a8w4_tdm_moe(
     _fused_tp_route = (
         not herd_topk
         and not _compact
+        # APRE quantization consumes the inverse row_to_token map. This fused
+        # helper only builds topids_to_rows; the ordinary remapper fills both.
+        and not a_preshuffled
         and not _is_ep
         and not enable_ep_scatter
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
