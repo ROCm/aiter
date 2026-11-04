@@ -41,14 +41,11 @@ _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
 _BUFFER_LIMIT_BYTES = 1 << 32
-_ALLOWED_GFX = ("gfx942", "gfx950")
-# 2 is the non-temporal cache policy; the BF16 and FP8 outputs are write-once
-# and never read back.
-_STORE_CACHE_MODIFIER = 2
-# Block-source loads issued ahead of the source being consumed; the prefix is
-# already in registers.
-_SOURCE_PREFETCH_IN_FLIGHT = 3
-# Multi-wave rows when T exceeds the CU count.
+# 2 is the non-temporal cache policy. Outputs are write-once and never read back.
+# Block sources are read once per launch, so they use it only where
+# _ArchTuning.nontemporal_block_loads is set.
+_NONTEMPORAL_CACHE_MODIFIER = 2
+# Multi-wave rows on the wide grid.
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
 # Two sources fill one batched wave-sum register; one source per barrier lost
@@ -254,6 +251,35 @@ def _resolve_rows_per_wg(row_threads: int, rows_per_wg: int | None) -> int:
 
 
 @dataclass(frozen=True)
+class _ArchTuning:
+    """Launch and codegen choices for one GPU arch.
+
+    The gfx942 values are measured on MI300X. gfx950 keeps its earlier values
+    because these levers are unmeasured there.
+    """
+
+    nontemporal_block_loads: bool
+    # Block-source loads in flight on the narrow grid; the prefix is already in
+    # registers.
+    narrow_prefetch_in_flight: int
+    wide_grid_cu_divisor: int
+
+
+_ARCH_TUNING = {
+    "gfx942": _ArchTuning(
+        nontemporal_block_loads=True,
+        narrow_prefetch_in_flight=8,
+        wide_grid_cu_divisor=2,
+    ),
+    "gfx950": _ArchTuning(
+        nontemporal_block_loads=False,
+        narrow_prefetch_in_flight=3,
+        wide_grid_cu_divisor=1,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class _AttnResSpec:
     """Must hold every compile-time choice: it is the ``_build_attn_res`` cache key."""
 
@@ -269,6 +295,8 @@ class _AttnResSpec:
     rows_per_wg: int
     wide_grid: bool
     native_swap: bool
+    nontemporal_block_loads: bool
+    narrow_prefetch_in_flight: int
     fp8_dtype: torch.dtype | None = None
     block_alias: bool = False
     bf16_dot: bool = False
@@ -312,6 +340,7 @@ def _build_attn_res(spec: _AttnResSpec):
     output_rms_eps = spec.output_rms_eps
     scale = spec.scale
     wide_grid = spec.wide_grid
+    nontemporal_block_loads = spec.nontemporal_block_loads
     fp8 = spec.fp8_dtype is not None
     fp8_max = torch.finfo(spec.fp8_dtype).max if fp8 else 1.0
     if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
@@ -341,7 +370,7 @@ def _build_attn_res(spec: _AttnResSpec):
     red_slots = row_threads // _WARP_SIZE
     num_sources = num_blocks + 1
     prefetch = (
-        _WIDE_SOURCE_PREFETCH_IN_FLIGHT if wide_grid else _SOURCE_PREFETCH_IN_FLIGHT
+        _WIDE_SOURCE_PREFETCH_IN_FLIGHT if wide_grid else spec.narrow_prefetch_in_flight
     )
     prefetch_in_flight = min(prefetch, max(num_blocks - 1, 0))
     prefix_slot = 0 if wide_grid else num_blocks
@@ -501,14 +530,17 @@ def _build_attn_res(spec: _AttnResSpec):
             )
             if width in tile_widths
         }
-        store_atoms = {
-            width: fx.make_copy_atom(copy_op(_STORE_CACHE_MODIFIER), fx.BFloat16)
+        nontemporal_atoms = {
+            width: fx.make_copy_atom(copy_op(_NONTEMPORAL_CACHE_MODIFIER), fx.BFloat16)
             for width, copy_op in (
                 (_VEC_WIDTH, fx.rocdl.BufferCopy128b),
                 (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy64b),
             )
             if width in tile_widths
         }
+        block_atoms = (
+            nontemporal_atoms if const_expr(nontemporal_block_loads) else copy_atoms
+        )
         vector_layouts = {width: fx.make_layout(width, 1) for width in copy_atoms}
 
         def divide_row(row):
@@ -517,11 +549,11 @@ def _build_attn_res(spec: _AttnResSpec):
                 for width, layout in vector_layouts.items()
             }
 
-        def issue_bf16_vec(divided, tile):
+        def issue_bf16_vec(divided, tile, atoms=copy_atoms):
             width = tile_widths[tile]
             register = fx.make_rmem_tensor(width, fx.BFloat16)
             fx.copy(
-                copy_atoms[width],
+                atoms[width],
                 fx.slice(divided[width], (None, vector_index_for(tile))),
                 register,
             )
@@ -535,13 +567,13 @@ def _build_attn_res(spec: _AttnResSpec):
             register = fx.make_rmem_tensor(width, fx.BFloat16)
             fx.memref_store_vec(value, register)
             fx.copy(
-                store_atoms[width],
+                nontemporal_atoms[width],
                 register,
                 fx.slice(divided[width], (None, vector_index_for(tile))),
             )
 
         fp8_atoms = {
-            width: fx.make_copy_atom(copy_op(_STORE_CACHE_MODIFIER), fx.Int8)
+            width: fx.make_copy_atom(copy_op(_NONTEMPORAL_CACHE_MODIFIER), fx.Int8)
             for width, copy_op in (
                 (_VEC_WIDTH, fx.rocdl.BufferCopy64b),
                 (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy32b),
@@ -589,7 +621,7 @@ def _build_attn_res(spec: _AttnResSpec):
                 block_div = row_of(blocks_buf, token, block)
                 handles = []
                 for tile in range_constexpr(tiles_per_thread):
-                    handles.append(issue_bf16_vec(block_div, tile))
+                    handles.append(issue_bf16_vec(block_div, tile, block_atoms))
                 return handles
 
             def load_issued_source(handles):
@@ -1151,12 +1183,13 @@ def _plan_launch(
         raise ValueError("all tensors must be CUDA tensors")
 
     gfx = get_gfx_runtime()
-    if gfx not in _ALLOWED_GFX:
+    if gfx not in _ARCH_TUNING:
         raise ValueError(
-            f"flydsl_attn_res requires wave64 CDNA ({', '.join(_ALLOWED_GFX)}); "
+            f"flydsl_attn_res requires wave64 CDNA ({', '.join(_ARCH_TUNING)}); "
             f"got {gfx}. This kernel uses _WARP_SIZE={_WARP_SIZE} DPP "
             "reductions and readlane(..., 63)."
         )
+    tuning = _ARCH_TUNING[gfx]
 
     for name, tensor in tensors.items():
         if tensor.numel():
@@ -1187,7 +1220,7 @@ def _plan_launch(
     if num_tokens:
         wide_grid = (
             row_threads > _WARP_SIZE
-            and num_tokens > _num_cus(prefix.device)
+            and num_tokens > _num_cus(prefix.device) // tuning.wide_grid_cu_divisor
             and _wide_row_supported(hidden_size)
         )
         gfx950_ops = _has_gfx950_ops()
@@ -1209,6 +1242,8 @@ def _plan_launch(
                 fp8_dtype=out_quant_dtype,
                 block_alias=block_alias,
                 native_swap=gfx950_ops,
+                nontemporal_block_loads=tuning.nontemporal_block_loads,
+                narrow_prefetch_in_flight=tuning.narrow_prefetch_in_flight,
                 bf16_dot=gfx950_ops
                 and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),
             )
