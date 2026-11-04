@@ -1289,9 +1289,12 @@ def schedule_bank(value, bank=0, soft=False, reason=None):
     """gfx1250 VGPR bank hint: ask the allocator to place ``value`` in ``bank``."""
     if schedule_bank.initialized is False:
         try:  # gfx1250 VGPR bank hint; absent on older FlyDSL
-            from flydsl.expr.rocdl import schedule_bank as func
+            from flydsl.expr.rocdl.experimental import sched_bank as func
         except ImportError:  # pragma: no cover
-            func = None
+            try:
+                from flydsl.expr.rocdl import schedule_bank as func
+            except ImportError:
+                func = getattr(rocdl, "sched_bank", None)
         schedule_bank.func = func
         schedule_bank.initialized = True
 

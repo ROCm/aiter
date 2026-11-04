@@ -53,18 +53,31 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
+def _get_sched_vgpr():
+    """Resolve sched_vgpr from the experimental ROCDL API (fallback: legacy path)."""
+    try:
+        from flydsl.expr.rocdl.experimental import sched_vgpr as _sched_vgpr
+
+        return _sched_vgpr
+    except ImportError:
+        return getattr(rocdl, "sched_vgpr", None) or getattr(rocdl, "ScheduleVGPR", None)
+
+
 def _is_sched_vgpr_available():
-    """Return whether this FlyDSL build has rocdl.sched_vgpr."""
-    return hasattr(rocdl, "sched_vgpr") or hasattr(rocdl, "ScheduleVGPR")
+    """Return whether this FlyDSL build has experimental/legacy sched_vgpr."""
+    return _get_sched_vgpr() is not None
 
 
 def sched_vgpr_rmem(rmem, regnum, soft=False):
     """Hint an rmem_tensor to a specific starting VGPR."""
     from flydsl.expr.typing import Vector as _Vec
 
+    sched_vgpr = _get_sched_vgpr()
+    if sched_vgpr is None:
+        raise AttributeError("FlyDSL sched_vgpr is unavailable")
     val = rmem.load()
     val_ir = val.ir_value() if hasattr(val, "ir_value") else val
-    hinted = rocdl.sched_vgpr(val_ir, regnum=regnum, soft=soft)
+    hinted = sched_vgpr(val_ir, regnum=regnum, soft=soft)
     rmem.store(_Vec(hinted))
 
 
@@ -1260,7 +1273,7 @@ def launch_gemm_a8w4_tdm(
                             scaleBType=wm % 2,
                         )
                         if const_expr(_USE_SCHED_VGPR):
-                            wmma_result = rocdl.sched_vgpr(
+                            wmma_result = _get_sched_vgpr()(
                                 wmma_result, regnum=512 + idx * WMMA_VECTOR_DWORDS,
                             )
                         c_frags[idx].store(wmma_result)
