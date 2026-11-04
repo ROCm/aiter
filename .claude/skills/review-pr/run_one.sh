@@ -40,6 +40,17 @@ trap _on_signal TERM INT
 # that starts counting after them can still overrun the job cap.
 : "${AITER_RUN_BUDGET:=6000}"      # 100 min, under the job's timeout-minutes of 120
 : "${AITER_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+# The two knobs are coupled, and the coupling has no other enforcement. A review runs TWO
+# agents in series -- the worker and the independent refuter -- and the budget gate below
+# refuses to START one that cannot finish inside the deadline. So if a raised
+# AITER_AGENT_TIMEOUT leaves less than one more agent's worth of budget, the refuter never
+# runs, the `independent` gate reds, and the review is withheld. Raising one knob alone is
+# the obvious thing to do and it silently breaks the run an hour later, reported as a
+# timeout whose named fix (raise AGENT_TIMEOUT) makes it worse. Hit for real on ATOM#2762.
+if [ $(( AITER_AGENT_TIMEOUT * 2 )) -gt "$AITER_RUN_BUDGET" ]; then
+  echo "::error title=review-pr::AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT}s x2 agents (worker + refuter) exceeds AITER_RUN_BUDGET=${AITER_RUN_BUDGET}s, so the refuter could not start and the review would be withheld after the worker had already run. Raise AITER_RUN_BUDGET to at least $(( AITER_AGENT_TIMEOUT * 2 ))s, or lower AITER_AGENT_TIMEOUT." >&2
+  exit 2
+fi
 DEADLINE=$(( $(date +%s) + AITER_RUN_BUDGET ))
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
