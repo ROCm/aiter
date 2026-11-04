@@ -47,10 +47,32 @@ from .tensor_shim import (
     AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 )
 
+try:
+    from flydsl.experimental import register_allocation as fx_regalloc
+except ModuleNotFoundError as exc:
+    if exc.name not in (
+        "flydsl.experimental",
+        "flydsl.experimental.register_allocation",
+    ):
+        raise
+    fx_regalloc = None
 
-def is_fx_set_register_available():
+
+def is_vgpr_placement_available():
     """Return whether this FlyDSL build supports explicit register placement."""
-    return callable(getattr(fx, "set_register", None))
+    return callable(getattr(fx_regalloc, "register_place", None)) or callable(
+        getattr(fx, "set_register", None)
+    )
+
+
+def _place_vgpr(storage, start):
+    """Place register memory using the installed FlyDSL placement API."""
+    if fx_regalloc is not None:
+        fx_regalloc.register_place(
+            storage, fx_regalloc.rocdl.VGPR32, start_idx=start
+        )
+    else:
+        fx.set_register(storage, register_class=fx.rocdl.VGPR, start=start)
 
 
 TDM_DESCRIPTOR_VERSION = 1
@@ -110,7 +132,7 @@ if PREFENCE_MMA < 0:
     raise ValueError("AITER_FLYDSL_PREFENCE_MMA must be nonnegative")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
-    EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
+    EXPLICIT_VGPR_PARTITION and is_vgpr_placement_available()
 )
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
@@ -1244,29 +1266,31 @@ def launch_gemm_a8w4_tdm(
         if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
-                fx.set_register(
-                    c_frags[idx],
-                    register_class=fx.rocdl.VGPR,
-                    start=512 + idx * WMMA_VECTOR_DWORDS,
-                )
+                _place_vgpr(c_frags[idx], 512 + idx * WMMA_VECTOR_DWORDS)
 
         def init_accumulators():
             # Cover prologue TDM latency before the first pipeline wait.
             rocdl.sched_barrier(0)
             for cf in c_frags:
-                # A tied identity emits no instruction, but its side effect
-                # keeps zero materialization from sinking past the wait.
                 zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
-                cf.store(
-                    llvm_dialect.InlineAsmOp(
-                        res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
-                        operands_=[zero],
-                        asm_string="",
-                        constraints="=v,0",
-                        has_side_effects=True,
-                        is_align_stack=False,
-                    ).res
-                )
+                if const_expr(
+                    SUPPORT_EXPLICIT_VGPR_PARTITION and fx_regalloc is not None
+                ):
+                    # The new backend restricts inline-asm "v" to v0-v255;
+                    # placed accumulators start at v512.
+                    cf.store(zero)
+                else:
+                    # Keep legacy zero materialization ahead of the wait.
+                    cf.store(
+                        llvm_dialect.InlineAsmOp(
+                            res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                            operands_=[zero],
+                            asm_string="",
+                            constraints="=v,0",
+                            has_side_effects=True,
+                            is_align_stack=False,
+                        ).res
+                    )
             rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
@@ -1367,20 +1391,18 @@ def launch_gemm_a8w4_tdm(
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
+                    _place_vgpr(a[wm], reg)
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
+                    _place_vgpr(b[wn], reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
                 # WMMA scales use v0-v255. Keep the two scale slots disjoint
                 # from one another and from the pinned payload/accumulators.
                 scale_reg = 64 + slot_idx * (SA_WIDTH + SB_WIDTH)
                 assert scale_reg + SA_WIDTH + SB_WIDTH <= 256
-                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=scale_reg)
-                fx.set_register(
-                    sb, register_class=fx.rocdl.VGPR, start=scale_reg + SA_WIDTH
-                )
+                _place_vgpr(sa, scale_reg)
+                _place_vgpr(sb, scale_reg + SA_WIDTH)
             return RmemSlot(
                 a=a,
                 b=b,
@@ -2659,4 +2681,5 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
 }
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
-    launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
+    if fx_regalloc is None:
+        launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
