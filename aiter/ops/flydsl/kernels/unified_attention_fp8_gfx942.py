@@ -111,33 +111,29 @@ def _store(ptr, offset, value, alignment):
     fx.generic_store(_at(ptr, offset, alignment), value)
 
 
-def _frag_i64(raw):
+def _frag_i64(value):
     """One lane's i64 A or B operand as the register tensor ``fx.gemm`` takes."""
     frag = fx.make_rmem_tensor(1, fx.Int64)
-    frag.store(fx.Vector.from_elements([fx.Int64(raw)]))
+    frag.store(fx.Vector.from_elements([value]))
     return frag
 
 
 def _mfma16(mma, a, b, c):
     """c + A B for one 16x16x32 FNUZ atom, on one lane's i64 fragments."""
     acc = fx.make_rmem_tensor(4, fx.Float32)
-    acc.store(fx.Vector(c))
+    acc.store(c)
     fx.gemm(mma, acc, _frag_i64(a), _frag_i64(b), acc)
     return fx.Vector(acc.load())
 
 
 def _exp2(x):
     # Only afn: masked scores are -inf and must still give exp2 == 0.
-    return fx.Float32(fx.exp2(x, fastmath="afn"))
+    return fx.exp2(x, fastmath="afn")
 
 
 def _pack4(values):
-    lo = rocdl.cvt_pk_fp8_f32(
-        T.i32, values[0].ir_value(), values[1].ir_value(), fx.Int32(0).ir_value(), 0
-    )
-    return fx.Int32(
-        rocdl.cvt_pk_fp8_f32(T.i32, values[2].ir_value(), values[3].ir_value(), lo, 1)
-    )
+    lo = rocdl.cvt_pk_fp8_f32(T.i32, values[0], values[1], fx.Int32(0), 0)
+    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, values[2], values[3], lo, 1))
 
 
 def _pack_bf16(a, b):
@@ -373,13 +369,8 @@ def build_unified_attention_fp8_gfx942_module(
         def descales():
             """(log2-domain QK scale, V descale over P's 240), loaded by each
             role next to its sequence lengths."""
-            log_scale = (
-                fx.Float32(fx.memref_load(QD, 0))
-                * fx.Float32(fx.memref_load(KD, 0))
-                * scale
-                * LOG2E
-            )
-            return log_scale, fx.Float32(fx.memref_load(VD, 0)) * (1.0 / 240.0)
+            log_scale = fx.memref_load(QD, 0) * fx.memref_load(KD, 0) * scale * LOG2E
+            return log_scale, fx.memref_load(VD, 0) * (1.0 / 240.0)
 
         kp, vp = fx.get_iter(K), fx.get_iter(V)
         splits = groups * waves
@@ -720,7 +711,7 @@ def build_unified_attention_fp8_gfx942_module(
                             )
                         p_corr = _exp2(p_m_old - p_m)
                         p_rescale = fx.Int64(
-                            rocdl.ballot(T.i64, (p_m != p_m_old).ir_value())
+                            rocdl.ballot(T.i64, p_m != p_m_old)
                         ) != fx.Int64(0)
                         p_probs = []
                         p_psum = fx.Float32(0.0)
@@ -763,10 +754,7 @@ def build_unified_attention_fp8_gfx942_module(
                             for i in range_constexpr(8):
                                 db, h = pv_order[grp * 8 + i]
                                 p_next[db] = _mfma16(
-                                    mma,
-                                    p_vgroup[i].ir_value(),
-                                    p_pfrags[h].ir_value(),
-                                    p_next[db],
+                                    mma, p_vgroup[i], p_pfrags[h], p_next[db]
                                 )
                             p_vgroup = p_nxt
                         gpu.barrier()
@@ -823,9 +811,9 @@ def build_unified_attention_fp8_gfx942_module(
             u = y - tile_slots * psplits
             dseq = u // groups
             dsplit = (u % groups) * waves + fx.Int32(rocdl.readfirstlane(T.i32, wave))
-            dq0 = fx.Int32(fx.memref_load(CuQ, dseq))
-            dqlen = fx.Int32(fx.memref_load(CuQ, dseq + 1)) - dq0
-            dklen = fx.Int32(fx.memref_load(UsedK, dseq))
+            dq0 = fx.memref_load(CuQ, dseq)
+            dqlen = fx.memref_load(CuQ, dseq + 1) - dq0
+            dklen = fx.memref_load(UsedK, dseq)
             log_scale, vscale = descales()
             if dqlen == 1:
                 dlow = dklen - 1 - wleft
@@ -866,7 +854,7 @@ def build_unified_attention_fp8_gfx942_module(
                 def d_page(block):
                     # NK divides the page, so one uniform lookup serves a tile.
                     # Scalar: a vector load would queue behind the K/V loads.
-                    return fx.Int32(fx.memref_load(BT, (dseq, block * NK // page_size)))
+                    return fx.memref_load(BT, (dseq, block * NK // page_size))
 
                 # K is the A tile: the lane holds key dk_key of each 16-key
                 # half, in Q's depth order.
@@ -1217,13 +1205,10 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
         y = fx.Int32(gpu.block_id("y"))
         if const_expr(prefill):
             q0 = fx.Int64(y)
-            valid = y < fx.Int32(fx.memref_load(CuQ, 1))
+            valid = y < fx.memref_load(CuQ, 1)
         else:
             q0 = fx.Int64(fx.memref_load(CuQ, y))
-            valid = (
-                fx.Int32(fx.memref_load(CuQ, y + 1)) - fx.Int32(fx.memref_load(CuQ, y))
-                == 1
-            )
+            valid = fx.memref_load(CuQ, y + 1) - fx.memref_load(CuQ, y) == 1
         trips = valid.select(num_splits, fx.Int32(0))
         part_base = (
             (fx.Int64(y) * num_q_heads + fx.Int64(head)) * fx.Int64(num_splits) * stride

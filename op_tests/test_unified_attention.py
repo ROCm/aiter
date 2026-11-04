@@ -287,7 +287,7 @@ def measure(candidates, case, want, query_lens, kv_lens):
     )
     nbytes = sum(query_lens) * num_heads * head_dim * (1 + case["out"].element_size())
     nbytes += 2 * keys_read * num_kv_heads * head_dim
-    ret = {"gfx": get_gfx_runtime()}
+    ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         got = fn()
         err = compare(want, got, query_lens, name)
