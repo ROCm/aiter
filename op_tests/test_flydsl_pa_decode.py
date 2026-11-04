@@ -1123,6 +1123,10 @@ def test_pa_decode_one_partition_workspace(
             (*scalar_shape, dim), float("nan"), dtype=query_dtype, device=device
         ),
     }
+    # Supplied scratch must remain unused for nonempty direct-output rows too.
+    context.copy_(torch.tensor((0, 1, 257, 1027), dtype=torch.int32, device=device))
+    assert pa.plan_pa_decode(context, heads, plan=plan) is plan
+    output.fill_(float("nan"))
     launch(**workspace)
     check()
     if not direct:
