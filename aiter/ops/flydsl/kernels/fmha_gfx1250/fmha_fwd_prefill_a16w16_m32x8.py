@@ -777,7 +777,6 @@ class _ContiguousKVPolicy:
         self.row_base = row_base
 
     num_state_slots = 0
-    inline_indices = False
 
     def indices(self, tile_idx, carried):
         return None
@@ -839,10 +838,6 @@ class _PagedKVPolicy:
         # while there are few: page_size >= 8 needs <= 4, page_size 1 would need 32.
         self._carry = self._num_pages <= _MAX_CARRIED_PAGE_INDICES
         self.num_state_slots = self._num_pages if self._carry else 0
-        # Too many indices to carry (page_size 1 needs 32 against a 106-SGPR cap), so
-        # they load in-body and the descriptor build waits on them here. The core answers
-        # by issuing that descriptor LATE, which is the only cover available.
-        self.inline_indices = not self._carry
         # Sentinel for dead rows: the sequence's first token, whose page is referenced
         # by construction (pool row 0's may not be, and NaN there reaches O).
         self._sentinel_row = s_buffer_load(
@@ -1568,10 +1563,6 @@ def _attention_core_multi_kv_tiles(
         # oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
         # itself must stay after the barrier.
-        # The index load is the descriptor's only dependency, so on the in-body path the
-        # issue moves to the end of this half's gemm/softmax stretch -- that distance IS
-        # the cover for s_wait_kmcnt. No-op elsewhere, so those traces stay identical.
-        _late_kv_issue = kv_policy.inline_indices
         prefetch_desc = _get_kv_desc(
             write_slot, prefetch_row0, prefetch_valid, prefetch_page_indices
         )
@@ -1718,8 +1709,7 @@ def _attention_core_multi_kv_tiles(
         # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
         if _is_lagging_softmax:
             kv_state_next = kv_policy.advance(prefetch_tile_idx)
-            if not _late_kv_issue:
-                prefetch_desc.async_load()
+            prefetch_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
@@ -1731,8 +1721,6 @@ def _attention_core_multi_kv_tiles(
             # so MachineSink (which ignores sched_barrier) would otherwise sink every
             # v_cvt_pk_bf16_f32 into the gemm and interleave it with the WMMA.
             _keepalive([v for pt in p_list for v in pt])
-            if _late_kv_issue:
-                prefetch_desc.async_load()
             _phase_barrier()
             o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
@@ -1758,8 +1746,7 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
-            if not _late_kv_issue:
-                prefetch_desc.async_load()
+            prefetch_desc.async_load()
             rocdl.sched_barrier(0)
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
@@ -1773,8 +1760,6 @@ def _attention_core_multi_kv_tiles(
                 o_acc_list=o_acc,
                 head=pvqk_head,
             )
-            if _late_kv_issue:
-                prefetch_desc.async_load()
             _phase_barrier()
             # Ahead of softmax: nothing here consumes it, so the whole softmax covers
             # the kmcnt wait the next body's descriptor build opens with.
