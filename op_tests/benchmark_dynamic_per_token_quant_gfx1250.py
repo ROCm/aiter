@@ -157,12 +157,21 @@ def main() -> None:
                 "tdm8x1024"
                 if rows >= 16384 and cols == 1024
                 else (
-                    "rows4x64"
-                    if rows > 4096 and cols == 1024
+                    "tdm2x64"
+                    if (
+                        (rows >= 4096 and cols == 2048)
+                        or (rows >= 8192 and cols == 4096)
+                    )
                     else (
-                        "block128"
-                        if rows >= 1024 and cols <= 2048 and cols % 128 == 0
-                        else "block256"
+                        "rows4x64"
+                        if rows > 4096 and cols == 1024
+                        else (
+                            "block128"
+                            if rows >= 1024
+                            and cols <= 2048
+                            and cols % 128 == 0
+                            else "block256"
+                        )
                     )
                 )
             )
