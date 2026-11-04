@@ -853,13 +853,13 @@ def _sparse_mla_fp8(
     extra_stride: gl.constexpr,
     x_kv_ptr,
     x_ks_ptr,
-    # output epilogue: positions and cos_sin (+ stride) for the inverse RoPE,
-    # E8M0 scales (+ stride) for MXFP8; None when off
+    # output epilogue, positions and cos_sin (+ stride)
+    # for the inverse RoPE, E8M0 scales (+ stride) for MXFP8; None when off
     pos_ptr,
-    cs_ptr,
+    cos_sin_ptr,
     cs_stride: gl.constexpr,
-    osc_ptr,
-    osc_stride: gl.constexpr,
+    out_scale_ptr,
+    os_stride0: gl.constexpr,
     num_queries,
     num_heads: gl.constexpr,
     sm_scale,
@@ -933,5 +933,5 @@ def _sparse_mla_fp8(
     else:
         pgm.finish(
             acc, m_i, l_i, v_scale, sink_ptr, lse_ptr, out_ptr, out_stride0, out_stride1,
-            (pos_ptr, cs_ptr, cs_stride, osc_ptr, osc_stride),
+            (pos_ptr, cos_sin_ptr, cs_stride, out_scale_ptr, os_stride0),
         )  # fmt: skip
