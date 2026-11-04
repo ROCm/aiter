@@ -3,8 +3,8 @@
 //
 // Launchers of the opus MLA sparse prefill kernels, bound to Python through the torch-free
 // ctypes C ABI (aiter_tensor_t* + trailing hipStream_t):
-//   gfx950  -- v4: kernels compiled from opus/mla_v4_prefill_*.hpp;
-//              v4.1: 16mx1_16nx4 compiled from opus/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
+//   gfx950  -- v4: kernels compiled from opus/gfx950/mla_v4_prefill_*.hpp;
+//              v4.1: 16mx1_16nx4 compiled from opus/gfx950/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
 //              16mx4_64nx1 prebuilt code objects in hsa/gfx950/mla_opus/.
 //   gfx1250 -- v4 and v4.1 (a8w8): prebuilt code objects in hsa/gfx1250/mla_opus/.
 
@@ -15,12 +15,12 @@
 #include "aiter_hip_common.h"
 
 #include "../../cpp_itfs/pa/pa_ps.cuh"
-#include "opus/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
-#include "opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
 
 #include <cstddef>
 

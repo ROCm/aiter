@@ -1,16 +1,15 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "mla_prefill_split.h"
-#include "mla_prefill_kargs.h"
+#include "../mla_prefill_split.h"
+#include "../mla_prefill_kargs.h"
 #include "mla_v41_prefill_traits.h"
 #include "mla_global_load.hpp"
 #include <bit>
-#include <cstdint>
 
 using opus::operator""_I;
 
-namespace opus_mla_v41_prefill_a8w4_16mx4_64nx1 {
+namespace opus_mla_v41_prefill_a8w8_16mx4_64nx1 {
 
 __host__ __device__ constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 // ------------------------------------------------------------------------------ shape factors
@@ -300,7 +299,7 @@ __device__ inline auto make_layout_rk_scale(int lane_id) {
 }
 
 template<class T>
-__device__ inline auto make_layout_rv(int lane_id, int swz) {
+__device__ inline auto make_layout_rv(int lane_id) {
     constexpr int lane_per_grp = 16;
     constexpr int lane_lo = 4;
     constexpr int lane_hi = lane_per_grp / lane_lo;
@@ -331,8 +330,7 @@ __device__ inline auto make_layout_rv(int lane_id, int swz) {
         opus::unfold_x_stride(rv_dim, rv_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{},
                                                             opus::number<T::smem_v_row>{},
                                                             1_I}),
-        opus::unfold_p_coord(rv_dim, opus::tuple{grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n,
-                                                 (lane_in_grp % lane_lo) ^ (2 * swz)}));
+        opus::unfold_p_coord(rv_dim, opus::tuple{grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n, lane_in_grp % lane_lo}));
 }
 
 // ------------------------------------------------------------------------------ v dequant
@@ -563,14 +561,14 @@ __device__ inline auto lds_read_b128_v(opus::u32_t addr) {
 }
 
 template<class T, int STEP, int H0 = 0, int H1 = V_TR_PER_TILE<T>, class UV, class VV>
-__device__ inline void load_v_tile(char* smem_v, const UV&, int v_lane_off, VV& v_v) {
+__device__ inline void load_v_tile(char* smem, const UV&, int v_lane_off, VV& v_v) {
     using namespace opus;
     using D_PV = typename T::D_PV;
     constexpr int ks = STEP / PV_DV_TILES<T>;
     constexpr int dt = STEP % PV_DV_TILES<T>;
     constexpr auto imm = layout_imm_offsets_v<remove_cvref_t<UV>, T::VEC_TR_V>;
 
-    auto s_v = make_smem(reinterpret_cast<D_PV*>(smem_v));
+    auto s_v = make_smem(reinterpret_cast<D_PV*>(smem + v_base<T>));
     static_for<H1 - H0>([&](auto hh) {
         constexpr int h = H0 + hh.value;
         constexpr int i = dt % V_N_TILES<T> * V_TR_PER_TILE<T> + h;
@@ -744,10 +742,8 @@ __device__ inline void write_fac(char* smem, typename T::D_ACC fac, int warp_id,
     reinterpret_cast<typename T::D_ACC*>(smem + fac_base<T>)[(lane_id % T::W_M) * PV_GROUPS<T> + warp_id] = fac;
 }
 
-template<class T, bool WAIT_VMEM = true, int HOOK_OPS = SM_PV_OPS<T>, class UV, class VP, class VO, class VV, class SH,
-         class AH, class TH>
-__device__ inline void compute_pv(char* smem, char* smem_v, const UV& u_rv, int v_lane_off, const pv_xchg<T>& xchg,
-                                  int warp_id,
+template<class T, class UV, class VP, class VO, class VV, class SH, class AH, class TH>
+__device__ inline void compute_pv(char* smem, const UV& u_rv, int v_lane_off, const pv_xchg<T>& xchg, int warp_id,
                                   const VP& v_p, VO& v_o, VV& v_v,
                                   const SH& sm_hook, const AH& after_b2, const TH& tail_hook) {
     using namespace opus;
@@ -765,10 +761,10 @@ __device__ inline void compute_pv(char* smem, char* smem_v, const UV& u_rv, int 
     constexpr int B2_STEP = PV_STEPS<T> - 1 - PV_TAIL_STEPS;
     constexpr int P_CHUNK_BYTES = T::WARP_SIZE * T::dwordx4_size;
     constexpr int SM_SLOTS = (B2_STEP + 1) * (PV_GROUPS<T> - 1);
-    static_assert(HOOK_OPS <= 3 * SM_SLOTS);
+    static_assert(SM_PV_OPS<T> <= SM_SLOTS);
 
     const auto fac = __builtin_bit_cast(vector_t<D_ACC, PV_GROUPS<T>>, lds_read_b128_v(xchg.fac));
-    load_v_tile<T, 0>(smem_v, u_rv, v_lane_off, v_v);
+    load_v_tile<T, 0>(smem, u_rv, v_lane_off, v_v);
     p_chunk_t p_oth[PV_GROUPS<T> - 1][T::GEMM1_E_K];
     static_for<PV_GROUPS<T> - 1>([&](auto r) {
         static_for<T::GEMM1_E_K>([&](auto ks) {
@@ -777,7 +773,7 @@ __device__ inline void compute_pv(char* smem, char* smem_v, const UV& u_rv, int 
                 __builtin_bit_cast(p_chunk_t, lds_read_b128_a<ks.value * P_CHUNK_BYTES>(xchg.p[r.value])));
         });
     });
-    load_v_tile<T, 1>(smem_v, u_rv, v_lane_off, v_v);
+    load_v_tile<T, 1>(smem, u_rv, v_lane_off, v_v);
     s_waitcnt_lgkmcnt(number<P_READS<T> + V_TR_PER_TILE<T>>{});
     __builtin_amdgcn_sched_barrier(0);
 
@@ -800,20 +796,20 @@ __device__ inline void compute_pv(char* smem, char* smem_v, const UV& u_rv, int 
         const auto v_op = pin_agpr<V_AGPR_BASE<T> + step % V_SLOTS * V_AGPRS<T>>(v_v[step % V_DEPTH]);
         static_for<PV_GROUPS<T>>([&](auto r) {
             constexpr int ot = r.value * PV_DV_TILES<T> + dt;
-            if constexpr (REFILL && r.value == 0) load_v_tile<T, step + V_DEPTH, 0, 1>(smem_v, u_rv, v_lane_off, v_v);
+            if constexpr (REFILL && r.value == 0) load_v_tile<T, step + V_DEPTH, 0, 1>(smem, u_rv, v_lane_off, v_v);
             const p_chunk_t& p_op = [&]() -> const p_chunk_t& {
                 if constexpr (r.value == 0) return p_own[ks];
                 else return p_oth[r.value - 1][ks];
             }();
             o_tiles[ot] = pin_vgpr<O_VGPR_BASE + ot * ACC_PER_TILE<T>>(mfma_pv(p_op, v_op, o_tiles[ot]));
-            if constexpr (REFILL && r.value == 0) load_v_tile<T, step + V_DEPTH, 1>(smem_v, u_rv, v_lane_off, v_v);
+            if constexpr (REFILL && r.value == 0) load_v_tile<T, step + V_DEPTH, 1>(smem, u_rv, v_lane_off, v_v);
             if constexpr (REFILL && r.value > 0) {
                 constexpr int slot = step * (PV_GROUPS<T> - 1) + r.value - 1;
-                constexpr int op   = (slot * HOOK_OPS + SM_SLOTS - 1) / SM_SLOTS;
-                constexpr int next = ((slot + 1) * HOOK_OPS + SM_SLOTS - 1) / SM_SLOTS;
+                constexpr int op   = (slot * SM_PV_OPS<T> + SM_SLOTS - 1) / SM_SLOTS;
+                constexpr int next = ((slot + 1) * SM_PV_OPS<T> + SM_SLOTS - 1) / SM_SLOTS;
                 if constexpr (op < next) {
                     __builtin_amdgcn_sched_barrier(0);
-                    static_for<next - op>([&](auto j) { sm_hook(number<op + j.value>{}); });
+                    sm_hook(number<op>{});
                     __builtin_amdgcn_sched_barrier(0);
                 }
             }
@@ -826,7 +822,7 @@ __device__ inline void compute_pv(char* smem, char* smem_v, const UV& u_rv, int 
         if constexpr (step == B2_STEP) {
             s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_sched_barrier(0);
-            if constexpr (WAIT_VMEM) s_waitcnt_vmcnt(0_I);
+            s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
             after_b2();
         }
@@ -998,7 +994,7 @@ __device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
     auto u_sk_scale   = make_layout_sk_scale<T>(warp_id);
     auto u_rk         = make_layout_rk<T>(lane_id);
     auto u_rk_scale   = make_layout_rk_scale<T>(lane_id);
-    auto u_rv         = make_layout_rv<T>(lane_id, 0);
+    auto u_rv         = make_layout_rv<T>(lane_id);
     auto u_rv_dequant = make_layout_rv_dequant<T>(warp_id, lane_id);
     auto u_rs_dequant = make_layout_rs_dequant<T>(warp_id, lane_id);
     auto u_sv_dequant = make_layout_sv_dequant<T>(warp_id, lane_id);
@@ -1096,7 +1092,7 @@ __device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
                              ceil_div((t + 1) * (K_DEPTH - 1), PV_TAIL_STEPS)>(smem, u_rk, v_k);
                 if constexpr (t == PV_TAIL_STEPS - 1) deq_prefetch(number<CUR>{});
             };
-            compute_pv<T>(smem, smem + v_base<T>, u_rv, v_lane_off, xchg, warp_id, p_prev, v_o, v_v,
+            compute_pv<T>(smem, u_rv, v_lane_off, xchg, warp_id, p_prev, v_o, v_v,
                           [&](auto k) { sm_op(number<CUR>{}, k); },
                           [&] { scale_k = load_k_scale<T, NXT>(smem, u_rk_scale); }, load_k_part);
         } else {
@@ -1129,8 +1125,7 @@ __device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
         write_fac<T>(smem, softmax_finish<T>(st, m_row, l_row), warp_id, lane_id);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        compute_pv<T>(smem, smem + v_base<T>, u_rv, v_lane_off, xchg, warp_id, p_last, v_o, v_v,
-                      [](auto) {}, [] {}, [](auto) {});
+        compute_pv<T>(smem, u_rv, v_lane_off, xchg, warp_id, p_last, v_o, v_v, [](auto) {}, [] {}, [](auto) {});
     };
 
     load_pages(0);
@@ -1161,291 +1156,16 @@ __device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
     run_last(1 - (tile_idx & 1));
 }
 
+} // namespace opus_mla_v41_prefill_a8w8_16mx4_64nx1
 
-// ------------------------------------------------------------------------------------ prefix (NVFP4)
-
-// The prefix runs QK and PV in bf16 on tiles of dequantized keys, one smem_v_row row per key. Key bits 2 and 3 swap
-// the 16 B halves of each 32 B piece, conflict-free for the dequant writes, the QK row reads and the PV tr reads.
-template<class T, int SLOT> constexpr int tile_base = SLOT * T::smem_v_bytes;
-template<class T> constexpr int PREFIX_STEPS = T::D_HEAD_SIZE / T::W_K_QK_PREFIX;
-template<class T> constexpr int PQK_STEPS    = T::GEMM0_E_N * PREFIX_STEPS<T>;
-
-// Prefix registers: Q in a0.., a ring of K operands above the ones.
-constexpr int PK_AGPRS     = 4;
-constexpr int PK_DEPTH     = 4;
-constexpr int PQ_AGPR_BASE = 0;
-template<class T> constexpr int PK_AGPR_BASE = ONES_AGPR_BASE<T> + PK_AGPRS;
-// A tile's dequant, folded into the PV: per chunk a scale op, 16 pair ops (a store after every 4th) and a reload op.
-constexpr int DQ_PAIRS     = 16;
-constexpr int DQ_CHUNK_OPS = DQ_PAIRS + 2;
-
-template<class T>
-__device__ inline int tile_swz(int lane_id) {
-    const int r = lane_id % T::W_N;
-    return ((r >> 2) ^ (r >> 3)) & 1;
-}
-
-// Wave w owns keys 16w..16w+15 of a tile; keys past the tail repeat the last row.
-template<class T>
-__device__ inline int load_prefix_page(const int* indices, int len, int tile_idx, int warp_id, int lane_id) {
-    auto g_indices = opus::make_gmem(indices, len * sizeof(int));
-    return opus::load(g_indices, min(tile_idx * T::KV_TILE_SIZE + warp_id * T::W_N + lane_id % T::W_N, len - 1))[0];
-}
-
-// Byte (4i + g) * 16 + [0, 16) of the 256 B e2m1 row: chunk c = 4i + g, dims 32c..32c+31.
-template<class T>
-__device__ inline auto make_layout_rk_fp4(int lane_id) {
-    constexpr auto k_shape = opus::make_tuple(
-        opus::number<T::PREFIX_CHUNKS>{},
-        opus::number<T::WARP_SIZE / T::W_N>{},
-        opus::number<T::PREFIX_CHUNK / 2>{});
-
-    constexpr auto k_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        k_shape,
-        opus::unfold_x_stride(k_dim, k_shape, opus::tuple{1_I}),
-        opus::unfold_p_coord(k_dim, opus::tuple{lane_id / T::W_N}));
-}
-
-template<class T>
-__device__ inline auto make_layout_sk_chunk(int warp_id, int lane_id) {
-    constexpr auto sk_shape = opus::make_tuple(
-        opus::number<T::NUM_WARPS>{},
-        opus::number<T::W_N>{},
-        opus::number<T::PREFIX_CHUNKS>{},
-        opus::number<T::WARP_SIZE / T::W_N>{},
-        opus::number<T::PREFIX_CHUNK / T::VEC_KV>{},
-        opus::number<T::VEC_KV>{});
-
-    constexpr auto sk_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        sk_shape,
-        opus::unfold_x_stride(sk_dim, sk_shape, opus::tuple{opus::number<T::smem_v_row>{}, 1_I}),
-        opus::unfold_p_coord(sk_dim, opus::tuple{warp_id, lane_id % T::W_N, lane_id / T::W_N}));
-}
-
-// Q of the wave's 16 heads from its staged fp8 bricks as bf16 MFMA operands: step s takes dims 64(s / 2) + 16g
-// + 8(s % 2) + [0, 8), the order the QK reads K in.
-template<class T, class VQS>
-__device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int warp_id, int lane_id) {
-    using namespace opus;
-    using D_PV = typename T::D_PV;
-    using q_op_t = vector_t<D_PV, T::W_K_QK_PREFIX * T::W_M / T::WARP_SIZE>;
-    const int h  = warp_id * T::W_M + lane_id % T::W_M;
-    const int g  = lane_id / T::W_M;
-    const int ig = h / (T::smem_n_per_wave * T::NUM_WARPS);
-    const int r  = h % (T::smem_n_per_wave * T::NUM_WARPS) / T::NUM_WARPS;
-    const int wq = h % T::NUM_WARPS;
-    auto s_q = make_smem(reinterpret_cast<typename T::D_ATTN*>(smem_q));
-    const auto qs = std::bit_cast<vector_t<u32_t, T::D_SCALE_SIZE / 4>>(q_scale_row);
-    array<q_op_t, PREFIX_STEPS<T>> v_q;
-    static_for<PREFIX_STEPS<T> / 2>([&](auto tt) {
-        constexpr int t = tt.value;
-        const int os = ((ig * T::smem_d_rpt + t / 2) * T::NUM_WARPS + wq) * T::smem_brick + r * T::D_128B_SIZE
-                     + 64 * (t % 2) + 16 * g;
-        const auto w = std::bit_cast<vector_t<u32_t, 4>>(load<16>(s_q, os));
-        const u32_t e_blk = __builtin_amdgcn_ubfe(qs[t / 2], 16 * (t % 2) + 8 * (g / 2), 8);
-        const float sc = std::bit_cast<float>(e_blk << 23);
-        vector_t<D_PV, 16> qb;
-        auto* qb_pk = reinterpret_cast<vector_t<D_PV, 2>*>(&qb);
-        static_for<4>([&](auto d) {
-            qb_pk[2 * d.value + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[d.value], sc, false);
-            qb_pk[2 * d.value + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[d.value], sc, true);
-        });
-        v_q[2 * t]     = pin_agpr<PQ_AGPR_BASE + 2 * t * PK_AGPRS>(slice(qb, number<0>{}, number<8>{}));
-        v_q[2 * t + 1] = pin_agpr<PQ_AGPR_BASE + (2 * t + 1) * PK_AGPRS>(slice(qb, number<8>{}, number<16>{}));
-    });
-    return v_q;
-}
-
-// Stage t: QK(t) on tile CUR, softmax(t), then PV(t) with the dequant of tile t + 1 into tile 1 - CUR folded into its
-// MFMA gaps, each consumed chunk reloaded for tile t + 2; past B2 it prefetches the K operands of QK(t + 1).
-template<class T, class SQ, class VQS>
-__device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int stride_kv_page, int stride_kv_scale_page,
-                               const int* kv_indices, int page_idx_begin, int valid_kv_len, char* smem,
-                               const SQ& stage_q, const VQS& q_scale_row, v_o_t<T>& v_o,
-                               typename T::D_ACC& m_row, typename T::D_ACC& l_row, typename T::D_ACC temperature_scale) {
-    using namespace opus;
-    using D_ATTN = typename T::D_ATTN;
-    using D_PV   = typename T::D_PV;
-    using D_ACC  = typename T::D_ACC;
-    static_assert(PK_AGPR_BASE<T> + PK_DEPTH * PK_AGPRS <= 256);
-
-    const int num_kv_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-    if (num_kv_tiles <= 0) return;
-
-    int lane_id = thread_id_x() % T::WARP_SIZE;
-    asm volatile("" : "+v"(lane_id));
-    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-
-    const auto* p_kv    = reinterpret_cast<const D_ATTN*>(kv_ptr);
-    const auto* p_scale = reinterpret_cast<const D_ATTN*>(kv_scale_ptr);
-    const int* indices  = kv_indices + page_idx_begin;
-    auto page_of = [&](int tile_idx) { return load_prefix_page<T>(indices, valid_kv_len, tile_idx, warp_id, lane_id); };
-
-    auto mfma_qk = make_mfma<D_PV, D_PV, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_QK_PREFIX>{});
-    using k_op_t   = typename decltype(mfma_qk)::vtype_a;
-    using s_tile_t = typename decltype(mfma_qk)::vtype_c;
-
-    const int swz = tile_swz<T>(lane_id);
-    const int g   = lane_id / T::W_N;
-    // The lane's 16 B of chunk 0, so a reload is one row address per page plus an immediate per chunk.
-    const auto* p_kv_g = p_kv + g * T::VEC_KV;
-    const auto u_rk = make_layout_rk_fp4<T>(lane_id);
-    // Dequant stores: the lane's first piece, its two 16 B halves swizzled, plus compile-time piece offsets.
-    const auto u_sk = make_layout_sk_chunk<T>(warp_id, lane_id);
-    constexpr auto sk_imm = layout_imm_offsets_v<decltype(u_sk), T::VEC_KV>;
-    const int sk_base = layout_to_offsets<T::VEC_KV>(u_sk)[0];
-    const int sk_half[2] = {sk_base + 8 * swz, sk_base + 8 * (1 - swz)};
-    const u32_t scale_sel = (2 * g) * 0x0101u | (2 * g + 1) * 0x01010000u;
-    const int k_off[2] = {(lane_id % T::W_N) * T::smem_v_row + 16 * g + 8 * swz,
-                          (lane_id % T::W_N) * T::smem_v_row + 16 * g + 8 * (1 - swz)};
-    // A tr read lane fetches keys 16y + 4(lane / 16) + lane % 16 / 4: key bits 2 and 3 are those of lane / 16.
-    auto u_rv = make_layout_rv<T>(lane_id, (g ^ (g >> 1)) & 1);
-    const int v_lane_off = layout_to_offsets<T::VEC_TR_V>(u_rv)[0] + warp_id * PV_DV<T>;
-    const auto xchg = make_pv_xchg<T>(smem, warp_id, lane_id);
-
-    softmax_state<T> st;
-    static_for<vector_traits<v_v_t<T>>::size()>([&](auto i) { st.ones[i.value] = D_PV(1.0f); });
-    asm volatile("" : "+a"(st.ones));
-    st.ones = pin_agpr<ONES_AGPR_BASE<T>>(st.ones);
-
-    // Raw rows of the tile being dequantized: 4 chunks of 16 B and the 32 B scale row.
-    vector_t<D_ATTN, T::PREFIX_CHUNKS * T::VEC_KV> v_k;
-    vector_t<D_ATTN, T::D_PREFIX_SCALE_SIZE> v_scl;
-    vector_t<float, 2> dq_sc[T::PREFIX_CHUNKS][2];
-    vector_t<D_PV, T::PREFIX_CHUNK> dq_kc[T::PREFIX_CHUNKS];
-    // Dequant op N of the tile into tile SLOT, from chunk N / 18: op 0 forms its two e4m3 block scales as f32 pairs (byte
-    // pairs b0, b0, b1, b1: a v_pk_*_f32 with op_sel:[0,1] can read 0 next to a running MFMA), op 1 + p converts pair p
-    // and stores the 16 B half after every 4th, op 17 reloads the chunk's bytes (and a scale half after chunks 1 and 3)
-    // from page.
-    auto dq_op = [&](auto slot, auto n, int page) {
-        constexpr int SLOT = decltype(slot)::value;
-        constexpr int I    = decltype(n)::value / DQ_CHUNK_OPS;
-        constexpr int J    = decltype(n)::value % DQ_CHUNK_OPS;
-        constexpr int DWORDS = T::PREFIX_CHUNK / 8;
-        constexpr int SCALE_HALF = T::D_PREFIX_SCALE_SIZE / 2;
-        if constexpr (J == 0) {
-            const auto s_w = std::bit_cast<vector_t<u32_t, T::D_PREFIX_SCALE_SIZE / 4>>(v_scl);
-            const int sb = static_cast<int>(__builtin_amdgcn_perm(s_w[2 * I + 1], s_w[2 * I], scale_sel));
-            dq_sc[I][0] = __builtin_amdgcn_cvt_pk_f32_fp8(sb, false);
-            dq_sc[I][1] = __builtin_amdgcn_cvt_pk_f32_fp8(sb, true);
-        } else if constexpr (J <= DQ_PAIRS) {
-            constexpr int P = J - 1;
-            const auto k_w = std::bit_cast<vector_t<u32_t, T::PREFIX_CHUNKS * DWORDS>>(v_k);
-            const auto f = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(k_w[I * DWORDS + P / 4], 1.0f, P % 4);
-            reinterpret_cast<vector_t<D_PV, 2>*>(&dq_kc[I])[P] =
-                __builtin_convertvector(f * dq_sc[I][P / (2 * DWORDS)], vector_t<D_PV, 2>);
-            if constexpr (P % 4 == 3) {
-                constexpr int Q = P / 4;
-                auto s_tile = make_smem(reinterpret_cast<D_PV*>(smem + tile_base<T, SLOT>));
-                constexpr int PIECE = I * (T::PREFIX_CHUNK / T::VEC_KV) + Q / 2;
-                store<8>(s_tile, slice(dq_kc[I], number<8 * Q>{}, number<8 * Q + 8>{}),
-                         sk_half[Q % 2] + (sk_imm[PIECE] - sk_imm[0]));
-            }
-        } else {
-            const auto* row = p_kv_g + static_cast<int64_t>(page) * stride_kv_page;
-            set_slice(v_k, global_load<T::VEC_KV>(row, I * (T::WARP_SIZE / T::W_N) * T::VEC_KV),
-                      number<I * T::VEC_KV>{}, number<(I + 1) * T::VEC_KV>{});
-            if constexpr (I % 2 == 1) {
-                const auto* srow = p_scale + static_cast<int64_t>(page) * stride_kv_scale_page;
-                set_slice(v_scl, global_load<SCALE_HALF>(srow, I / 2 * SCALE_HALF),
-                          number<I / 2 * SCALE_HALF>{}, number<(I / 2 + 1) * SCALE_HALF>{});
-            }
-        }
-    };
-    constexpr int DQ_OPS = T::PREFIX_CHUNKS * DQ_CHUNK_OPS;
-
-    k_op_t v_kop[PK_DEPTH];
-    auto load_kop = [&](auto slot, auto i) {
-        constexpr int SLOT = decltype(slot)::value;
-        constexpr int I    = decltype(i)::value;
-        constexpr int e    = I / PREFIX_STEPS<T>;
-        constexpr int k    = I % PREFIX_STEPS<T>;
-        auto s_tile = make_smem(reinterpret_cast<D_PV*>(smem + tile_base<T, SLOT>));
-        v_kop[I % PK_DEPTH] = pin_agpr<PK_AGPR_BASE<T> + I % PK_DEPTH * PK_AGPRS>(
-            load<8>(s_tile, k_off[k % 2] + e * T::W_N * T::smem_v_row + 64 * (k / 2)));
-    };
-
-    v_s_t<T> v_s;
-    v_p_t<T> v_p;
-    v_v_t<T> v_v[V_DEPTH];
-
-    // Q is staged in tile 1 so that its reads can overlap the dequant of tile 0.
-    stage_q(smem + tile_base<T, 1>);
-    v_k   = global_load<T::VEC_KV>(p_kv + static_cast<int64_t>(page_of(0)) * stride_kv_page, u_rk);
-    v_scl = global_load<T::D_PREFIX_SCALE_SIZE>(p_scale + static_cast<int64_t>(page_of(0)) * stride_kv_scale_page, 0);
-    const int page1 = page_of(1);
-    int kv_page = page_of(2);
-    s_waitcnt_vmcnt(0_I);
-    __builtin_amdgcn_s_barrier();
-    const auto v_q = prefix_read_q<T>(smem + tile_base<T, 1>, q_scale_row, warp_id, lane_id);
-    static_for<DQ_OPS>([&](auto n) { dq_op(0_I, n, page1); });
-    s_waitcnt_lgkmcnt(0_I);
-    __builtin_amdgcn_s_barrier();
-
-    auto run_stage = [&](auto cur, int tile_idx, auto prefetched) {
-        constexpr int CUR = decltype(cur)::value;
-        constexpr int NXT = 1 - CUR;
-        const int next_page = kv_page;
-        kv_page = page_of(tile_idx + 3);
-
-        auto* s_tiles = reinterpret_cast<s_tile_t*>(&v_s);
-        clear(v_s);
-        if constexpr (!decltype(prefetched)::value)
-            static_for<PK_DEPTH - 1>([&](auto i) { load_kop(number<CUR>{}, i); });
-        static_for<PQK_STEPS<T>>([&](auto ii) {
-            constexpr int I = decltype(ii)::value;
-            constexpr int e = I / PREFIX_STEPS<T>;
-            constexpr int k = I % PREFIX_STEPS<T>;
-            if constexpr (I + PK_DEPTH - 1 < PQK_STEPS<T>) load_kop(number<CUR>{}, number<I + PK_DEPTH - 1>{});
-            s_tiles[e] = pin_vgpr<S_VGPR_BASE<T> + e * ACC_PER_TILE<T>>(mfma_qk(v_kop[I % PK_DEPTH], v_q[k], s_tiles[e]));
-            __builtin_amdgcn_sched_barrier(0);
-        });
-
-        const int valid_rows = valid_kv_len - tile_idx * T::KV_TILE_SIZE;
-        if (__builtin_expect(valid_rows < T::KV_TILE_SIZE, 0)) mask_tail_tile<T>(v_s, valid_rows, lane_id);
-        static_for<SM_OPS<T>>([&](auto k) { softmax_op<T, decltype(k)::value>(v_s, v_p, st, m_row, temperature_scale); });
-        write_p<T>(smem, v_p, warp_id, lane_id);
-        write_fac<T>(smem, softmax_finish<T>(st, m_row, l_row), warp_id, lane_id);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
-        compute_pv<T, false, DQ_OPS>(
-            smem, smem + tile_base<T, CUR>, u_rv, v_lane_off, xchg, warp_id, v_p, v_o, v_v,
-            [&](auto n) { dq_op(number<NXT>{}, n, next_page); }, [] {},
-            [&](auto part) {
-                constexpr int t = decltype(part)::value;
-                static_for<ceil_div((t + 1) * (PK_DEPTH - 1), PV_TAIL_STEPS) - ceil_div(t * (PK_DEPTH - 1), PV_TAIL_STEPS)>(
-                    [&](auto i) { load_kop(number<NXT>{}, number<ceil_div(t * (PK_DEPTH - 1), PV_TAIL_STEPS) + i.value>{}); });
-            });
-    };
-
-    run_stage(0_I, 0, false_type{});
-    int tile_idx = 1;
-    #pragma clang loop unroll(disable)
-    for (; tile_idx + 1 < num_kv_tiles; tile_idx += 2) {
-        pin_o<T>(v_o);
-        run_stage(1_I, tile_idx, true_type{});
-        run_stage(0_I, tile_idx + 1, true_type{});
-    }
-    if (tile_idx < num_kv_tiles) run_stage(1_I, tile_idx, true_type{});
-}
-
-} // namespace opus_mla_v41_prefill_a8w4_16mx4_64nx1
-
-// Wrapped by the extern "C" entries in mla_v41_prefill_a8w4_16mx4_64nx1.cu. Args is
+// Wrapped by the extern "C" entries in mla_v41_prefill_a8w8_16mx4_64nx1.cu. Args is
 // opus_mla_v41_prefill_kargs, or its opus_mla_prefill_split_kargs for split-K.
 template<class Traits, class Args>
-__device__ inline void opus_mla_v41_prefill_a8w4_16mx4_64nx1_fwd(Args args) {
+__device__ inline void opus_mla_v41_prefill_a8w8_16mx4_64nx1_fwd(Args args) {
     constexpr bool SPLIT = !__is_same(Args, opus_mla_v41_prefill_kargs);
     const opus_mla_v41_prefill_kargs& kargs = opus_mla_prefill_base(args);
     using namespace opus;
-    using namespace opus_mla_v41_prefill_a8w4_16mx4_64nx1;
+    using namespace opus_mla_v41_prefill_a8w8_16mx4_64nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC  = typename T::D_ACC;
@@ -1476,11 +1196,10 @@ __device__ inline void opus_mla_v41_prefill_a8w4_16mx4_64nx1_fwd(Args args) {
     // retires in order, so an earlier Q would stall that wait.
     v_q_t<T> v_q;
     bool q_pending = true;
-    auto stage_q = [&](char* dst) {
-        async_load<T::VEC_KV>(g_q, dst, make_layout_gq<T>(warp_id, lane_id, kargs.stride_q_h), make_layout_skv<T>(warp_id));
-    };
     auto issue_q = [&] {
-        if (q_pending) stage_q(smem + k_slot_base<T, Q_SLOT>);
+        if (!q_pending) return;
+        async_load<T::VEC_KV>(g_q, smem + k_slot_base<T, Q_SLOT>, make_layout_gq<T>(warp_id, lane_id, kargs.stride_q_h),
+                              make_layout_skv<T>(warp_id));
     };
     // Q must leave its slot before the first QK DMA refills it.
     auto read_q = [&] {
@@ -1513,11 +1232,10 @@ __device__ inline void opus_mla_v41_prefill_a8w4_16mx4_64nx1_fwd(Args args) {
             page_idx_begin += rows.prefix_begin;
             valid_kv_len = rows.prefix_len;
         }
-        const auto q_scale_row = load<T::D_SCALE_SIZE>(g_q_scale, (warp_id * T::W_M + lane_id % T::W_M) * kargs.stride_q_scale_h);
-        prefix_segment<T>(kargs.unified_kv_ptr, kargs.unified_kv_scale_ptr,
-                          kargs.stride_unified_kv_page, kargs.stride_unified_kv_scale_page,
-                          kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, smem,
-                          stage_q, q_scale_row, v_o, m_row, l_row, temperature_scale);
+        attention_segment<T>(kargs.unified_kv_ptr, kargs.unified_kv_scale_ptr,
+                             kargs.stride_unified_kv_page, kargs.stride_unified_kv_scale_page,
+                             kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, smem,
+                             issue_q, read_q, v_q, scale_q, v_o, m_row, l_row, temperature_scale);
     }
     __builtin_amdgcn_s_barrier();
     {
@@ -1527,13 +1245,10 @@ __device__ inline void opus_mla_v41_prefill_a8w4_16mx4_64nx1_fwd(Args args) {
             page_idx_begin += rows.extend_begin;
             valid_kv_len = rows.extend_len;
         }
-        // Keeps O in v0..127 across the segment; the split epilogue spills otherwise.
-        pin_o<T>(v_o);
         attention_segment<T>(kargs.kv_ptr, kargs.kv_scale_ptr,
                              kargs.stride_kv_page, kargs.stride_kv_scale_page,
                              kargs.kv_indices_extend, page_idx_begin, valid_kv_len, smem,
                              issue_q, read_q, v_q, scale_q, v_o, m_row, l_row, temperature_scale);
-        pin_o<T>(v_o);
     }
 
     // Recomputed so that it is not live across the main loop.
