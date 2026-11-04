@@ -776,6 +776,45 @@ def test_k_variance_of_a_block_scaled_k_is_the_dequantized_block_variance():
     assert plain["mean_k_var"] is None and plain["mean_k_var_scale"] is None
 
 
+def _allocated_tail(x):
+    """The bytes of x's allocation past x itself, as uint8."""
+    end = x.storage_offset() * x.element_size() + x.numel() * x.element_size()
+    storage = torch.empty(0, dtype=torch.uint8, device=x.device)
+    storage.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    return storage[end:]
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("kv_tile", [64, SOL_ATTN_TS_KV])
+@pytest.mark.parametrize("seqlen_k", [1023, 2048, 9419])
+def test_pooled_scales_run_zeroed_to_a_whole_scale_tile(seqlen_k, kv_tile, compiled):
+    """The kernels read a pooled E8M0 scale SOL_ATTN_TS_KV rows at a time, at every KV tile.
+
+    At 64x64 a 2048-token K pools to 32 rows, and without the padding the MXFP8 row read 96 rows
+    past the allocation: a memory fault whenever it ended at an unmapped page. The tail is read,
+    never used, so it has to exist and be finite; E8M0 0 is 2^-127.
+    """
+    q, k, v = _operands(1, 512, seqlen_k, 2, 2)
+    k_scale = (
+        122 + torch.randint(0, 6, (*k.shape[:3], k.shape[3] // 32), device="cuda")
+    ).to(torch.uint8)
+    prepare = (
+        torch.compile(sol_prepare, fullgraph=True, dynamic=False)
+        if compiled
+        else sol_prepare
+    )
+    prep = prepare(q, k, v, BETA, 64, kv_tile, k_scale=k_scale, k_variance=True)
+
+    blocks = -(-seqlen_k // kv_tile)
+    for name in ("mean_k_scale", "mean_k_var_scale"):
+        scale = prep[name]
+        assert scale.shape[1] == blocks and scale.is_contiguous(), name
+        tail = _allocated_tail(scale)
+        rows = -(-blocks // SOL_ATTN_TS_KV) * SOL_ATTN_TS_KV - blocks
+        assert tail.numel() >= rows * scale[0, 0].numel(), name
+        assert not tail[: rows * scale[0, 0].numel()].any(), name
+
+
 def test_error_router_compiles_fullgraph_and_matches_eager():
     q, k, v = _operands(1, 9419, 9419, 5, 5)
     scale = torch.tensor([ROUTING_SCALE], device="cuda")

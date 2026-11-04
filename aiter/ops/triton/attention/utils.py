@@ -317,11 +317,38 @@ def _sol_attn_pool_mx(
     # Reconstructed from the requantized pair rather than returning `pooled`: the kernel loads the
     # rounded values, and routing has to see exactly what it will load or a block sitting within
     # rounding distance of the threshold can be selected here and skipped there.
-    result = (mean_data, mean_scale, _e8m0_dequantize(mean_data, mean_scale))
+    result = (
+        mean_data,
+        _sol_attn_pad_scale_rows(mean_scale),
+        _e8m0_dequantize(mean_data, mean_scale),
+    )
     if not variance:
         return result
-    var = _sol_attn_block_variance(dequantized, BLOCK_N)
-    return result + _e8m0_quantize(var, x_quant.dtype)
+    var_data, var_scale = _e8m0_quantize(
+        _sol_attn_block_variance(dequantized, BLOCK_N), x_quant.dtype
+    )
+    return result + (var_data, _sol_attn_pad_scale_rows(var_scale))
+
+
+# The Sol kernels read a pooled E8M0 scale a whole SOL_ATTN_TS_KV rows at a time, whatever the
+# row's own KV tile, so a pooled scale's allocation has to run that far.
+_SOL_ATTN_SCALE_ROW_TILE = SOL_ATTN_TS_KV
+
+
+def _sol_attn_pad_scale_rows(scale: torch.Tensor) -> torch.Tensor:
+    """`scale` as a contiguous view over an allocation zeroed up to a whole scale-row tile.
+
+    The rows past the last pooled block are read but never used, so their value only has to be
+    finite: E8M0 0 is 2^-127, where uninitialized bytes can decode to inf. Only the tail past the
+    last batch is padded, so the view keeps `scale`'s own strides.
+    """
+    pad = (-scale.shape[1] % _SOL_ATTN_SCALE_ROW_TILE) * scale[0, 0].numel()
+    if pad == 0:
+        return scale
+    size = scale.numel()
+    storage = scale.new_zeros(size + pad)
+    storage[:size].copy_(scale.reshape(-1))
+    return storage[:size].view(scale.shape)
 
 
 def _e2m3_decode(code: torch.Tensor) -> torch.Tensor:
