@@ -119,7 +119,7 @@ Notes:
 * All asm rows additionally require `hdim_q % 8 == 0 && hdim_v % 8 == 0`. `hdim_q` is padded up to 64/128/192 internally, and the `hdim_q == 64` bucket has no padded-hdim instance, so a head dim below 64 always falls back to ck.
 * The rows marked `causal_top_left` have no `mask_bottom_right` instance. On gfx942 a bottom-right causal request is remapped to top-left, which is legal because those rows already require `seqlen_q == seqlen_k`; on gfx950 (`hdim_q == 64`, `atomic_f16`) there is no such remap and the bottom-right case falls back to ck.
 * `-v3_bf16_cvt` (0:RTNE, 1:RTNA, 2:RTZ) picks the float→bf16 rounding variant of the bf16 dqdkdv and dq_convert instances. Every gfx942 bf16 instance is rounding-specific; on gfx950 only the `hdim_q == hdim_v == 192` and `hdim_q == hdim_v == 64` dqdkdv instances are, and all the fp16 instances are rounding-agnostic.
-* gfx1250 is also dispatched to asm for `bf16`, `hdim_q == hdim_v == 128` or `hdim_q == 192 && hdim_v == 128`, batch or group mode, `atomic_f32`, any `seqlen_q`/`seqlen_k`, and `no_mask` or `mask_bottom_right`. The two head dims share the `hdim_v == 128` odo instance and differ only in the dqdkdv and dq_convert instances. `mask_top_left` runs on the bottom-right kernels in batch mode when `seqlen_q == seqlen_k` and falls back to ck otherwise. Group mode reads the sequence pointers the same way as on gfx942/gfx950: `seqstart_*` address the rows and, with padding, `cu_seqlen_*` give the real lengths; the asm path does not read `seqlen_q/k_ptr`. It is the only arch with a deterministic asm path: `-deterministic=1` gives every dqdkdv workgroup a private dQ plane and dq_convert folds the planes in a fixed order, so dq/dk/dv are bit-identical from run to run. `mha_bwd_args::det_split` (`-det_split=N` here) sets the plane count; 0 targets one workgroup per CU, and the count is capped at the kv block count. The gfx1250 code objects are assembled from poc_kl `mi400/fmha_bwd_f16/shaders/*.s`, with each kernel symbol renamed to its aiter name.
+* gfx1250 (MI450) has its own `bf16` asm kernels for `hdim_q == hdim_v == 64`, `hdim_q == hdim_v == 128` and `hdim_q == 192 && hdim_v == 128`: batch or group mode, `no_mask` or causal, `atomic_f32`, any `seqlen_q`/`seqlen_k`, and the only deterministic asm path of any arch. The full feature list and the performance are in [gfx1250 (MI450) attention backwards](#gfx1250-mi450-attention-backwards).
 * `bwd.exe` test options: `-s_pad=N` adds N rows of padding after every batch in group mode and passes `cu_seqlen_*` next to the padded `seqstart_*`; `-seqlen_ptr=1` passes the real lengths as `seqlen_q/k_ptr` instead, and is rejected together with `-s_pad`, since the asm path does not read `seqlen_q/k_ptr`; `-dtm_runs=N` reruns the checked call N times and, with `-deterministic=1`, fails on any bit difference in dq/dk/dv.
 
 
@@ -357,4 +357,52 @@ leaves the MI300X backward cells empty on those rows.
 | 8     | 64       | 4         | 10240    | 10240     | 192    | 128    | 1      | 550.55      | 1038.2  | 1383.65     | n/a             | 965.25  | n/a             | 535.29 |
 | 1     | 64       | 8         | 16384    | 16384     | 192    | 128    | 1      | 560.35      | 1143.26 | 1397.76     | n/a             | 993.58  | n/a             | 540.74 |
 | 1     | 64       | 4         | 16384    | 16384     | 192    | 128    | 1      | 566.76      | 1087.91 | 1428.83     | n/a             | 990.67  | n/a             | 545.86 |
+
+
+## gfx1250 (MI450) attention backwards
+
+On gfx1250 the backward runs as three asm kernels: `odo` computes `D = rowsum(O * dO)`, `dqdkdv` computes dK, dV and an fp32 dQ accumulator, and `dq_convert` turns the accumulator into bf16 dQ. The dqdkdv kernels accumulate dQ with CU-scope atomics. A call outside the list below gets no asm kernel; with the asm-only build (`compile.py --api=bwd_v3`, `ENABLE_CK=0`) `mha_bwd` then returns -1 and `bwd.exe` prints `not supported yet`.
+
+* `bf16` with `hdim_q == hdim_v == 64`, `hdim_q == hdim_v == 128` or `hdim_q == 192 && hdim_v == 128`; 192/128 shares the `hdim_v == 128` odo and has its own dqdkdv and dq_convert. There are no padded-hdim instances, so no other head-dim pair is dispatched, not even one that pads up to a supported one (32, 48, 80, 96, ...).
+* Batch and group mode. Group mode addresses the rows through `seqstart_q/k_ptr`; with padding after each batch, `cu_seqlen_q/k_ptr` carry the real lengths. `seqlen_q/k_ptr` are not read.
+* Any `seqlen_q` and `seqlen_k`, including `seqlen_q != seqlen_k` and lengths that are not a multiple of a tile. The non-causal hdim 64 and 128 kernels mask the keys past `seqlen_k` in the last kv tile (border mask). Those keys are zero-filled, so without the mask a row whose LSE is below about -88 would get `P = exp(-LSE) = inf` for them, and dQ would pick up `inf * 0 = NaN`.
+* `no_mask` and causal `mask_bottom_right`. `mask_top_left` runs on the bottom-right kernels in batch mode when `seqlen_q == seqlen_k`; any other top-left case, sliding windows and the generic mask are not dispatched.
+* MHA, GQA and MQA (`nhead_q % nhead_k == 0`); dK and dV are written per query head.
+* bshd and bhsd: the strides are free as long as the head dim is contiguous.
+* dQ is accumulated with fp32 atomics only (`v3_atomic_fp32 = 1`); `v3_bf16_cvt` is ignored.
+* Deterministic mode (`is_deterministic`, `-deterministic=1` in `bwd.exe`): every dqdkdv workgroup owns a private dQ plane and dq_convert sums the planes in a fixed order, so dQ, dK and dV are bit-identical from run to run. `mha_bwd_args::det_split` (`-det_split=N`) sets the number of planes, capped at the kv tile count. 0 aims at one workgroup per CU; under a causal mask, when that would reach the cap and the cap is at least 16, it takes half the cap instead. The planes take `planes * batch * nhead_q * round32(seqlen_q) * hdim_q * 4` bytes of workspace (group mode: `planes * nhead_q * (total_q + 32 * batch) * hdim_q * 4`), and one plane has to stay below 4 GiB.
+* Not supported: fp16, bias, dbias, dropout, alibi, the attention sink and `atomic_f16`.
+
+A dqdkdv workgroup runs 4 waves over 32-row query tiles and covers 256 kv rows at hdim 64 and 128 at hdim 128 and 192/128, so the kv tile count is `ceil(max_seqlen_k / 256)` and `ceil(max_seqlen_k / 128)` respectively. An odo workgroup covers 128 query rows, a dq_convert one 64.
+
+### Performance
+
+Measured with `bwd.exe` from the asm-only build on one gfx1250 (an MI450 engineering sample in the power configuration it boots with): bf16, bhsd, MHA (`h_k == h`), `seqlen_q == seqlen_k`, random inputs (`-init=1`, the default):
+```
+    ./bwd.exe -prec=bf16 -b=$b -h=$h -s=$s -d=64|128 -mask=0|b -mode=0|1 -deterministic=0|1 -iperm=1 -operm=1 -v=0 -warmup=20 -repeat=50
+```
+Each cell is the median of 3 runs of the whole backward (odo + dqdkdv + dq_convert), as ms / TFLOPS. TFLOPS counts `2 * b * h * seqlen_q * seqlen_k * (3 * hdim_q + 2 * hdim_v)`, halved under the causal mask, so hdim 64 does half the FLOPs of hdim 128 on the same shape. The deterministic columns use the default plane count, which comes to 1 plane for the `b * h = 256` shapes, 16 for b=1 h=16 and 8 for b=4 h=8, at both head dims.
+
+| mode  | batch | nheads | seqlen | causal | hdim 64        | hdim 128       | hdim 64, deterministic | hdim 128, deterministic |
+|-------|-------|--------|--------|--------|----------------|----------------|------------------------|-------------------------|
+| batch | 4     | 64     | 8192   | no     | 4.898 / 2245   | 10.526 / 2089  | 6.331 / 1737           | 17.556 / 1253           |
+| batch | 4     | 64     | 8192   | yes    | 2.817 / 1952   | 6.362 / 1728   | 3.263 / 1685           | 8.964 / 1227            |
+| batch | 8     | 32     | 4096   | no     | 1.140 / 2411   | 2.764 / 1989   | 1.316 / 2089           | 4.495 / 1223            |
+| batch | 8     | 32     | 4096   | yes    | 0.648 / 2122   | 1.550 / 1774   | 0.698 / 1969           | 2.215 / 1241            |
+| batch | 16    | 16     | 2048   | no     | 0.320 / 2150   | 0.659 / 2085   | 0.334 / 2060           | 0.889 / 1546            |
+| batch | 16    | 16     | 2048   | yes    | 0.216 / 1591   | 0.440 / 1561   | 0.216 / 1589           | 0.516 / 1332            |
+| batch | 1     | 16     | 16384  | no     | 1.018 / 2699   | 2.545 / 2160   | 1.223 / 2247           | 3.716 / 1479            |
+| batch | 1     | 16     | 16384  | yes    | 0.524 / 2622   | 1.271 / 2163   | 0.621 / 2213           | 1.734 / 1585            |
+| batch | 4     | 8      | 8192   | no     | 0.516 / 2666   | 1.187 / 2316   | 0.581 / 2366           | 1.666 / 1650            |
+| batch | 4     | 8      | 8192   | yes    | 0.292 / 2355   | 0.608 / 2260   | 0.341 / 2014           | 0.794 / 1731            |
+| group | 4     | 64     | 8192   | no     | 5.060 / 2173   | 10.700 / 2056  | 6.481 / 1697           | 17.718 / 1241           |
+| group | 4     | 64     | 8192   | yes    | 2.848 / 1931   | 6.458 / 1703   | 3.305 / 1663           | 9.015 / 1220            |
+| group | 8     | 32     | 4096   | no     | 1.204 / 2285   | 2.832 / 1942   | 1.413 / 1946           | 4.556 / 1207            |
+| group | 8     | 32     | 4096   | yes    | 0.687 / 2002   | 1.569 / 1753   | 0.714 / 1926           | 2.225 / 1236            |
+
+* In group mode `bwd.exe` perturbs each batch's length around `seqlen`, keeping the total at `batch * seqlen`; TFLOPS uses the real lengths.
+* The table was measured with the dqdkdv dQ atomics at device scope, before they moved to CU scope. Timed back to back at b=4 h=64 s=8192 and hdim 128, the CU-scope objects take 0.98x to 1.00x the time of the device-scope ones.
+* bshd (`-iperm=0 -operm=0`) is within 1% of bhsd at b=4 h=64 s=8192.
+* The `-warmup`/`-repeat` window matters on this part, in the opposite direction to MI300X/MI355X: the clocks drop under sustained load, so longer windows read slower. At b=16 h=16 s=2048 without a mask, hdim 64 takes 0.32 ms at 20/50 and 0.37 ms at 1000/1000, and hdim 128 takes 0.66 ms at 20/50 and 0.80 ms at 100/200. The table uses 20/50, the window of the MI300X/MI355X numbers above, so its short shapes run closer to their burst clocks than its long ones.
+* The GPU was shared with other users; a run during which another process held the GPU was thrown away and repeated.
 
