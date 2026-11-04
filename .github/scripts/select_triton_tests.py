@@ -21,6 +21,12 @@ SRC = "aiter/ops/triton/"
 KERNELS = SRC + "_triton_kernels/"
 GLUON_KERNELS = SRC + "_gluon_kernels/"
 CONFIGS = SRC + "configs/"
+SPARSE_MLA_FLYDSL_PATHS = (
+    "aiter/ops/flydsl/sparse_mla_qblock_kernels.py",
+    "aiter/ops/flydsl/kernels/sparse_mla_qblock.py",
+    "op_tests/test_sparse_mla_qblock.py",
+)
+TEST_SPARSE_MLA = "op_tests/triton_tests/attention/test_sparse_mla_qblock.py"
 # Ops whose Triton launch path is only exercised on MI300X (MI35X takes a
 # Gluon branch instead), so a change to them needs the MI300X job even without
 # a gfx942 config or Gluon-kernel change.
@@ -28,6 +34,10 @@ GFX942_LAUNCH_PATHS = (
     SRC + "attention/pa_prefill_sparse.py",
     SRC + "_triton_kernels/attention/sparse_attention_dsv4.py",
     "op_tests/triton_tests/attention/test_pa_prefill_sparse.py",
+    SRC + "attention/pa_decode_sparse.py",
+    TEST_SPARSE_MLA,
+    "op_tests/triton_tests/attention/test_pa_decode_sparse.py",
+    *SPARSE_MLA_FLYDSL_PATHS,
 )
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"
@@ -68,6 +78,7 @@ CONFIG_CATEGORIES = {
 # triton-test.yaml's `paths:` filter before test selection. A dry run runs the
 # full suite exactly when this matches: when the workflow used to run at all.
 LEGACY_PATHS = (
+    *SPARSE_MLA_FLYDSL_PATHS,
     "aiter/ops/triton/**",
     "op_tests/triton_tests/**",
     "op_tests/op_benchmarks/triton/**",
@@ -300,6 +311,12 @@ def select(diff):
     """Select affected test files, raising when a subset cannot be determined."""
     diff = [p for p in diff if not p.endswith(".md") and Path(p).name != ".gitkeep"]
     diff = [p for p in diff if not is_non_triton_config(p)]
+    # These three files have one gfx942 suite outside the Triton import graph.
+    diff = list(
+        dict.fromkeys(
+            TEST_SPARSE_MLA if p in SPARSE_MLA_FLYDSL_PATHS else p for p in diff
+        )
+    )
     if not any(
         p.startswith((SRC, TESTS, "aiter/aot/triton/", "aiter/utility/triton/"))
         or p in CI_FILES

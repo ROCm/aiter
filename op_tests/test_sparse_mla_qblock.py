@@ -89,8 +89,10 @@ def test_sparse_mla_qblock(n_tok, num_heads, head_dim, topk, pool, pattern, dtyp
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
+            tol_err_ratio=0,
             msg=f"{name}: sparse_mla_qblock {pattern}",
         )
+        assert err == 0, f"{name}: sparse MLA {pattern} mismatch fraction {err}"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6

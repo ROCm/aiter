@@ -377,6 +377,14 @@ def pa_decode_sparse(
             _ok = unified_kv.dtype == q.dtype
         if _ok:
             if DEVICE_ARCH == "gfx942":
+                if (
+                    inv_rope_positions is not None
+                    or inv_rope_cos_sin_cache is not None
+                    or out_mxfp8 is not None
+                ):
+                    raise NotImplementedError(
+                        "the output epilogue is gfx950 gluon-only"
+                    )
                 result = _pa_decode_sparse_gfx942_flydsl(
                     q,
                     unified_kv,
@@ -424,7 +432,9 @@ def pa_decode_sparse(
         "the gfx1250 fp8 path"
     )
     assert (
-        inv_rope_positions is None and out_mxfp8 is None
+        inv_rope_positions is None
+        and inv_rope_cos_sin_cache is None
+        and out_mxfp8 is None
     ), "the output epilogue is gfx950 gluon-only"
     if kv_scales is not None:
         raise RuntimeError(
@@ -739,7 +749,12 @@ def _packed_uniform_topk(kv_indices, kv_indptr, n_tok, topk_hint):
         topk = int((kv_indptr[1] - kv_indptr[0]).item())
     else:
         topk = int(topk_hint)
-    if topk <= 0 or topk % 16 != 0 or kv_indices.numel() != n_tok * topk:
+    if (
+        topk <= 0
+        or topk % 16 != 0
+        or kv_indices.numel() != n_tok * topk
+        or n_tok * topk > torch.iinfo(kv_indptr.dtype).max
+    ):
         return None
     expected = torch.arange(n_tok + 1, device=kv_indptr.device, dtype=kv_indptr.dtype)
     if not torch.equal(kv_indptr, expected * topk):
@@ -774,6 +789,7 @@ def _pa_decode_sparse_gfx942_flydsl(
         return None
     if not (
         q.shape[1:] == (16, 512)
+        and 0 < softmax_scale < float("inf")
         and kv_splits == 1
         and not skip_reduce
         and not has_invalid
@@ -789,7 +805,6 @@ def _pa_decode_sparse_gfx942_flydsl(
     topk = _packed_uniform_topk(kv_indices, kv_indptr, q.shape[0], uniform_topk)
     if topk is None:
         return None
-    out = _check_out(out, q, q.dtype)
     if qblock_reuse is True:
         return _pa_decode_sparse_gfx942_qblock(
             q,
@@ -802,9 +817,13 @@ def _pa_decode_sparse_gfx942_flydsl(
             uniform_topk=topk,
         )
     from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
+        _index_span_supported,
         sparse_mla_one_query_fwd_flydsl,
     )
 
+    if not _index_span_supported(q.shape[0], topk):
+        return None
+    out = _check_out(out, q, q.dtype)
     return sparse_mla_one_query_fwd_flydsl(
         q,
         unified_kv,
@@ -841,9 +860,18 @@ def _pa_decode_sparse_gfx942_qblock(
 ):
     """FlyDSL Q-block kernel: one CTA owns neighboring queries and streams unique KV."""
     from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
+        _index_span_supported,
+        pack_qblock_union,
         sparse_mla_qblock_fwd_flydsl,
+        suggest_block_q,
     )
 
+    block_q = suggest_block_q(kv_indices, uniform_topk)
+    packed = pack_qblock_union(kv_indices, q.shape[0], uniform_topk, block_q, 16)
+    unique, n_unique, shared = packed
+    n_rows = unique.shape[0] if shared else q.shape[0]
+    if not _index_span_supported(n_rows, n_unique if shared else uniform_topk):
+        return None
     out = _check_out(out, q, q.dtype)
     return sparse_mla_qblock_fwd_flydsl(
         q,
@@ -851,6 +879,8 @@ def _pa_decode_sparse_gfx942_qblock(
         kv_indices,
         out,
         kv_indptr=kv_indptr,
+        block_q=block_q,
+        packed=packed,
         attn_sink=attn_sink,
         softmax_scale=softmax_scale,
         uniform_topk=uniform_topk,

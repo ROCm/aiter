@@ -10,7 +10,7 @@ import math
 import flydsl.expr as fx
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_mla_qblock import (
     HEAD_DIM,
     NUM_HEADS,
@@ -29,11 +29,17 @@ __all__ = [
 
 
 def _require_gfx942():
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx != "gfx942":
         raise RuntimeError(
             f"FlyDSL sparse_mla_qblock is gfx942-only (64 KiB LDS), got {gfx}"
         )
+
+
+def _index_span_supported(n_rows: int, topk: int) -> bool:
+    # BufferCopy's i32 soffset is in elements; lowering multiplies it by 4
+    # in i32 for int32 indices. Bound the launched view, not the input CSR.
+    return 0 < n_rows * topk * 4 <= 0xFFFFFFFF
 
 
 def _require_contract(q: torch.Tensor, kv: torch.Tensor, out: torch.Tensor):
@@ -100,8 +106,12 @@ def _uniform_topk(
         raise ValueError(
             f"packed topk={topk} requires {n_tok * topk} indices, got {indices.numel()}"
         )
-    if verify_csr and indptr is not None and (
-        indptr.numel() != n_tok + 1 or not _packed_csr(indptr, n_tok, topk)
+    if indptr is not None and n_tok * topk > torch.iinfo(indptr.dtype).max:
+        raise ValueError("packed CSR terminal offset exceeds kv_indptr dtype")
+    if (
+        verify_csr
+        and indptr is not None
+        and (indptr.numel() != n_tok + 1 or not _packed_csr(indptr, n_tok, topk))
     ):
         raise ValueError("FlyDSL sparse MLA requires kv_indptr[t] == t * topk")
     return indices.reshape(-1).contiguous(), topk
@@ -154,9 +164,14 @@ def _launch(
     attn_sink,
     softmax_scale,
 ):
+    if not _index_span_supported(n_tiles, n_unique):
+        raise ValueError("FlyDSL sparse MLA index byte span must fit uint32")
+    scale = 1.0 / math.sqrt(HEAD_DIM) if softmax_scale is None else float(softmax_scale)
+    if not (0 < scale < float("inf")):
+        raise ValueError("FlyDSL sparse MLA softmax_scale must be finite and positive")
     has_sink = attn_sink is not None
     kernel = compile_sparse_mla_qblock(block_q, has_sink)
-    scale = 1.0 / math.sqrt(HEAD_DIM) if softmax_scale is None else float(softmax_scale)
+    idx = idx.to(dtype=torch.int32).contiguous()
     if has_sink:
         attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
         if attn_sink.numel() != NUM_HEADS:
@@ -202,7 +217,7 @@ def sparse_mla_one_query_fwd_flydsl(
     _launch(
         q,
         kv,
-        flat.to(dtype=torch.int32),
+        flat,
         out,
         n_tok,
         topk,
@@ -259,7 +274,7 @@ def sparse_mla_qblock_fwd_flydsl(
     _launch(
         q,
         kv,
-        unique.reshape(-1).to(dtype=torch.int32).contiguous(),
+        unique,
         out,
         n_tok,
         n_unique,

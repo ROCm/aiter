@@ -28,6 +28,11 @@ pytestmark = pytest.mark.skipif(
 H, D = 16, 512
 
 
+def _check_accuracy(ref, out, **kwargs):
+    assertAllclose(ref, out, **kwargs)
+    torch.testing.assert_close(ref, out, rtol=1e-2, atol=1e-2)
+
+
 def _indices(pattern: str, n_tok: int, pool: int, topk: int):
     if pattern == "shared":
         return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(n_tok)
@@ -81,7 +86,7 @@ def test_flydsl_matches_torch(n_tok, pattern, kernel):
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, kv_indptr=indptr)
     ref = _torch_flat(q, kv, indices, topk)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
+    _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("kernel", ["one_q", "qblock"])
@@ -104,7 +109,7 @@ def test_flydsl_attn_sink(kernel):
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, block_q=4, **common)
     ref = _torch_flat(q, kv, indices, topk, sink, scale)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
+    _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("pattern,qblock_reuse", [("shared", False), ("shared", True)])
@@ -148,7 +153,7 @@ def test_pa_decode_sparse_dispatch(pattern, qblock_reuse, monkeypatch):
     else:
         assert calls["one_q"] == 1 and calls["qblock"] == 0
     ref = _torch_flat(q, kv, indices, topk, sink, scale)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
+    _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 def test_pa_decode_sparse_default_splits_skips_flydsl(monkeypatch):
@@ -175,7 +180,7 @@ def test_pa_decode_sparse_default_splits_skips_flydsl(monkeypatch):
         q, kv, indices, _indptr(n_tok, topk), sink, D**-0.5, has_invalid=False
     )
     ref = _torch_flat(q, kv, indices, topk, sink, D**-0.5)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
+    _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
 def test_qblock_probe_requires_every_row():
@@ -217,13 +222,13 @@ def test_unpacked_csr_falls_back():
         kv_splits=1,
         uniform_topk=16,
     )
-    assertAllclose(
+    _check_accuracy(
         _torch_flat(q, kv, rows.reshape(-1), topk, sink, scale).to(dtypes.fp32),
         out.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
     )
-    assertAllclose(
+    _check_accuracy(
         _torch_csr(q, kv, hinted, lying, scale, sink).to(dtypes.fp32),
         out_hint.to(dtypes.fp32),
         rtol=1e-2,
@@ -252,4 +257,178 @@ def test_noncontiguous_q_falls_back():
         kv_splits=1,
     )
     ref = _torch_flat(q.contiguous(), kv, indices, topk, sink, scale)
-    assertAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
+    _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "argument", ["inv_rope_positions", "inv_rope_cos_sin_cache", "out_mxfp8"]
+)
+@pytest.mark.parametrize("block_h", [None, 16])
+def test_gfx942_rejects_output_epilogue(argument, block_h):
+    q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(16, D, dtype=torch.bfloat16, device="cuda")
+    sink = torch.zeros(H, dtype=torch.float32, device="cuda")
+    with pytest.raises((NotImplementedError, AssertionError), match="epilogue"):
+        pa_decode_sparse(
+            q,
+            kv,
+            _indices("shared", 1, 16, 16),
+            _indptr(1, 16),
+            sink,
+            D**-0.5,
+            has_invalid=False,
+            kv_splits=1,
+            block_h=block_h,
+            **{argument: (q, q) if argument == "out_mxfp8" else q},
+        )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "wrapper", [sparse_mla_one_query_fwd_flydsl, sparse_mla_qblock_fwd_flydsl]
+)
+def test_flydsl_rejects_invalid_scale(scale, wrapper):
+    q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(16, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="finite and positive"):
+        wrapper(
+            q,
+            kv,
+            _indices("shared", 1, 16, 16),
+            torch.empty_like(q),
+            softmax_scale=scale,
+        )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0])
+def test_pa_decode_sparse_nonpositive_scale(scale, monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid scale reached FlyDSL")
+
+    monkeypatch.setattr(fly, "sparse_mla_one_query_fwd_flydsl", forbidden)
+    monkeypatch.setattr(fly, "sparse_mla_qblock_fwd_flydsl", forbidden)
+    q = torch.ones(2, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(16, D, dtype=torch.bfloat16, device="cuda")
+    sink = torch.zeros(H, dtype=torch.float32, device="cuda")
+    indices = _indices("shared", 2, 16, 16)
+    out = pa_decode_sparse(
+        q,
+        kv,
+        indices,
+        _indptr(2, 16),
+        sink,
+        scale,
+        has_invalid=False,
+        kv_splits=1,
+        qblock_reuse=True,
+    )
+    torch.testing.assert_close(
+        out.float(),
+        _torch_flat(q, kv, indices, 16, sink, scale).float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_flydsl_runtime_arch_helper(monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setenv("GPU_ARCHS", "gfx950")
+    chip_info.get_gfx_custom_op_core.cache_clear()
+    chip_info.get_gfx.cache_clear()
+    try:
+        assert chip_info.get_gfx() == "gfx950"
+        assert fly.get_gfx_runtime() == "gfx942"
+        fly._require_gfx942()
+    finally:
+        chip_info.get_gfx_custom_op_core.cache_clear()
+        chip_info.get_gfx.cache_clear()
+    monkeypatch.setattr(fly, "get_gfx_runtime", lambda: "gfx950")
+    with pytest.raises(RuntimeError, match="gfx942-only"):
+        fly._require_gfx942()
+
+
+def test_index_span_metadata():
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+
+    assert fly._index_span_supported(1, (1 << 30) - 1)
+    assert not fly._index_span_supported(1, 1 << 30)
+    assert not fly._index_span_supported(16384, 65552)
+    assert fly._index_span_supported(4096, 65552)
+    with pytest.raises(ValueError, match="index byte span"):
+        fly._launch(None, None, None, None, 16384, 65552, 16384, 1, None, None)
+
+
+def test_public_index_span_falls_back(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    pa = importlib.import_module("aiter.ops.triton.attention.pa_decode_sparse")
+    q = SimpleNamespace(shape=(16384, H, D), is_contiguous=lambda: True)
+    kv = SimpleNamespace(shape=(131072, D), ndim=2, is_contiguous=lambda: True)
+    monkeypatch.setattr(pa, "_packed_uniform_topk", lambda *args: 65552)
+    assert (
+        pa._pa_decode_sparse_gfx942_flydsl(
+            q, kv, None, None, D**-0.5, None, kv_splits=1
+        )
+        is None
+    )
+
+
+def test_public_packed_index_span_is_not_overconservative(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+
+    pa = importlib.import_module("aiter.ops.triton.attention.pa_decode_sparse")
+    q = SimpleNamespace(shape=(16384, H, D), dtype=torch.bfloat16)
+    packed = (SimpleNamespace(shape=(4096, 65552)), 65552, True)
+    sentinel = object()
+    monkeypatch.setattr(fly, "suggest_block_q", lambda *args: 4)
+    monkeypatch.setattr(fly, "pack_qblock_union", lambda *args: packed)
+    monkeypatch.setattr(pa, "_check_out", lambda *args: None)
+
+    def launch(*args, **kwargs):
+        assert kwargs["packed"] is packed
+        assert kwargs["block_q"] == 4
+        return sentinel
+
+    monkeypatch.setattr(fly, "sparse_mla_qblock_fwd_flydsl", launch)
+    assert (
+        pa._pa_decode_sparse_gfx942_qblock(
+            q, None, None, None, D**-0.5, None, uniform_topk=65552
+        )
+        is sentinel
+    )
+
+
+def test_csr_terminal_offset_metadata():
+    import importlib
+    from types import SimpleNamespace
+
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+
+    pa = importlib.import_module("aiter.ops.triton.attention.pa_decode_sparse")
+    indices = SimpleNamespace(numel=lambda: 65536 * 65536)
+    indptr = SimpleNamespace(numel=lambda: 65537, dtype=torch.int32)
+    assert pa._packed_uniform_topk(indices, indptr, 65536, 65536) is None
+    with pytest.raises(ValueError, match="terminal offset"):
+        fly._uniform_topk(indices, 65536, indptr, 65536)
+
+
+@pytest.mark.parametrize("block_q", [2, 4])
+def test_flydsl_odd_tail_sink(block_q):
+    torch.manual_seed(1215)
+    n_tok, topk = 7, 2048
+    q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8192, D, dtype=torch.bfloat16, device="cuda")
+    sink = torch.randn(H, dtype=torch.float32, device="cuda")
+    indices = _indices("shared", n_tok, 8192, topk)
+    out = torch.empty_like(q)
+    sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, block_q=block_q, attn_sink=sink)
+    ref = _torch_flat(q, kv, indices, topk, sink)
+    torch.testing.assert_close(ref.float(), out.float(), rtol=1e-2, atol=1e-2)
