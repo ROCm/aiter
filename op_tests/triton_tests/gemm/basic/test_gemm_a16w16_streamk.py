@@ -89,6 +89,7 @@ def get_x_vals():
     x_vals += [(3000, 2880, 2048)]  # M and N both ragged
     x_vals += get_small_k_x_vals()
     x_vals += get_k_tail_x_vals()
+    x_vals += get_narrow_n_x_vals()
     x_vals += get_remainder_x_vals()
     return x_vals
 
@@ -125,6 +126,19 @@ def get_small_k_x_vals():
         (64, 64, 256),  # exactly one K tile
         (256, 256, 64),
         (1024, 1024, 128),
+    ]
+
+
+def get_narrow_n_x_vals():
+    """Shapes whose N is narrower than the bucket tile, so there is one tile column.
+
+    The `any` bucket uses a 1024 wide tile, so an N of 1024 or less gives a single column and
+    the TDM bounds masking carries the rest. These are slow (see Limits in the PR), but they
+    must stay correct.
+    """
+    return [
+        (3072, 1024, 2048),  # N equals the tile width
+        (3072, 512, 2048),  # N is half the tile width
     ]
 
 
