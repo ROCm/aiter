@@ -1,0 +1,115 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""FlyDSL rope_quant_window (DeepSeek V4.1's RoPE / MXFP8 / window seam) against the torch
+port of ATOM's Triton kernel, byte for byte, in every query and KV mode."""
+
+import argparse
+import random
+
+import torch
+
+import aiter
+from aiter.test_common import perftest
+from op_tests.rope_quant_window_ref import (
+    COS,
+    RD,
+    SIN,
+    D,
+    Step,
+    byte_diff,
+    dev,
+    rope_quant_window_ref,
+    sink_kwargs,
+    sinks,
+    with_zeros,
+)
+
+MODES = [
+    "qfp8",
+    "rot",
+    "qfp8+ringb",
+    "rot+ringh",
+    "rot+ringb",
+    "qfp8+rows",
+    "rot+qat+vs",
+    "rot+qat",
+    "qfp8+qat+vs",
+]
+
+
+def flydsl(query, kv, positions, kw):
+    from aiter.ops.flydsl.kernels.rope_quant_window import rope_quant_window
+
+    return rope_quant_window(query, kv, COS, SIN, positions, rope_dim=RD, **kw)
+
+
+run_flydsl = perftest()(flydsl)
+
+
+def test_flydsl_rope_quant_window(mode, tokens, heads, idx64):
+    step = Step(tokens, idx64)
+    query = with_zeros(
+        (torch.randn(tokens, heads, D, device=dev) * 3).to(torch.bfloat16)
+    )
+    # An odd token count also takes kv as a strided slice.
+    width = D + 64 if tokens % 2 else D
+    kv_full = with_zeros(
+        (torch.randn(tokens, width, device=dev) * 3).to(torch.bfloat16)
+    )
+    kv = kv_full[:, 32 : 32 + D] if tokens % 2 else kv_full
+    ref, got = sinks(mode, tokens, heads), sinks(mode, tokens, heads)
+    ref["query"] = query.clone()
+    kw_ref, kw_got = sink_kwargs(ref, step), sink_kwargs(got, step)
+    has_kv = any(k in kw_ref for k in ("ring", "values", "qat"))
+    rope_quant_window_ref(
+        ref["query"], kv if has_kv else None, step.positions, rope_dim=RD, **kw_ref
+    )
+    # The rotate mode works in place, so the timed calls run on a scratch copy and one call
+    # on a fresh copy gives the bytes.
+    _, us = run_flydsl(query.clone(), kv if has_kv else None, step.positions, kw_got)
+    got["query"] = query.clone()
+    flydsl(got["query"], kv if has_kv else None, step.positions, kw_got)
+    torch.cuda.synchronize()
+    bad = byte_diff(ref, got)
+    tag = f"{mode} T={tokens} H={heads} idx64={idx64}"
+    result = f"\033[31mbytes differ {bad}\033[0m" if bad else "byte exact"
+    aiter.logger.info("[result] %s | %.2f us | vs reference: %s", tag, us, result)
+    return not bad
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, description=__doc__
+    )
+    # T * H rows from 512K on take the gfx1250 TDM path.
+    parser.add_argument(
+        "-t", "--token", type=int, nargs="*", default=[1, 5, 13, 128, 1000, 4096, 9000]
+    )
+    parser.add_argument("--heads", type=int, nargs="*", default=[16, 128])
+    parser.add_argument("--mode", type=str, nargs="*", default=MODES, choices=MODES)
+    args = parser.parse_args()
+    if aiter.get_gfx() not in ("gfx950", "gfx1250"):
+        raise SystemExit(
+            f"rope_quant_window needs gfx950 / gfx1250, not {aiter.get_gfx()}"
+        )
+    random.seed(1)
+    torch.manual_seed(1)
+
+    failed = [
+        f"{mode} T={tokens} H={heads} idx64={idx64}"
+        for mode in args.mode
+        for tokens in args.token
+        for heads in args.heads
+        for idx64 in (False, True)
+        if not test_flydsl_rope_quant_window(mode, tokens, heads, idx64)
+    ]
+    # heads == 0: the KV row alone.
+    failed += [
+        f"{mode} T=37 H=0"
+        for mode in ("rows", "qat+vs", "ringb")
+        if not test_flydsl_rope_quant_window(mode, 37, 0, False)
+    ]
+    if failed:
+        raise SystemExit(f"{len(failed)} cases differ: {failed}")
+    aiter.logger.info("rope_quant_window: every case byte exact")
