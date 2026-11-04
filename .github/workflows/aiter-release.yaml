@@ -354,7 +354,7 @@ jobs:
           # Detect ROCm flavor of the builder image to pick a torch index
           # Image tag looks like pytorch/manylinux2_28-builder:rocm10.0
           IMG="${BUILD_DOCKER_IMAGE}"
-          ROCM_TAG="${IMG##*:}"           # rocm7.14 / rocm10.0 / rocm10.1
+          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.14 / rocm10.0 / rocm10.1
           ROCM_NUM="${ROCM_TAG#rocm}"      # 10.0
           # Allow caller to override the torch wheel index (e.g. pin a release
           # to a specific ROCm flavor's PyTorch ABI). Defaults preserve the

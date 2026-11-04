@@ -81,7 +81,7 @@ jobs:
           INPUT_RELEASE_REF: ${{ github.event.inputs.release_ref || 'main' }}
           CREATE_MISSING_REFS: ${{ github.event.inputs.create_missing_refs || true }}
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || false }}
-          EXPECTED_WHEEL_COUNT: '6'
+          EXPECTED_WHEEL_COUNT: '8'
         run: |
           set -euo pipefail
 
@@ -244,6 +244,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - rocm_version: '7.2'
+            torch_index_url: ''
+            torch_pin: ''
           # download.pytorch.org lacks these torch builds for ROCm 7.14+, so take
           # AMD's (7.14 is only on the legacy multi-arch index). Pin exactly:
           # each index serves every ROCm flavor of a torch version.
@@ -316,7 +319,7 @@ jobs:
             exit 1
           fi
 
-          for rocm in rocm7.14 rocm10.0 rocm10.1; do
+          for rocm in rocm7.2 rocm7.14 rocm10.0 rocm10.1; do
             for py in cp310 cp312; do
               count="$(find release-wheels -type f -name "*${RELEASE_VERSION}+${rocm}.manylinux.2.28-*${py}-${py}-*.whl" | wc -l | tr -d ' ')"
               if [ "${count}" -ne 1 ]; then
@@ -354,7 +357,7 @@ jobs:
             echo "## Wheels"
             echo
             echo "Prebuilt manylinux_2_28 wheels, \`GPU_ARCHS=gfx942;gfx950\`:"
-            echo "- ROCm 7.14 / 10.0 / 10.1 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
+            echo "- ROCm 7.2 / 7.14 / 10.0 / 10.1 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
             echo
             echo "Wheel assets are uploaded after the release page is created."
             echo
@@ -430,7 +433,7 @@ jobs:
 
           expected = {
               (rocm, py)
-              for rocm in ("7.14", "10.0", "10.1")
+              for rocm in ("7.2", "7.14", "10.0", "10.1")
               for py in ("cp310", "cp312")
           }
           missing = expected - seen
