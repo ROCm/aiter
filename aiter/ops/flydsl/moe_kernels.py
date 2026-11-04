@@ -3389,7 +3389,9 @@ def flydsl_moe_fused_quant_preshuffle(
     Returns (payload, scale). Pass masked_m to skip padding rows. When
     payload_preshuffled is true, FP4 payload bytes follow the logical
     (M/16, K/128, 4, 16, 32) layout; each final 32-element span is 16 bytes.
-    This mode requires logical K divisible by 1024, with 0 < K <= 16384.
+    Routed input requires logical K divisible by 1024, with 0 < K <= 16384.
+    Already-grouped input uses block quantization and requires positive K
+    divisible by 256.
     With activation=1/2/3, grouped_in contains element-interleaved BF16
     gate/up pairs (2*K columns); activation and quantization share one kernel.
     """
@@ -3455,13 +3457,19 @@ def flydsl_moe_fused_quant_preshuffle(
     if prequantized and quant_mode == "fp4":
         feat_dim *= 2
     if payload_preshuffled:
-        from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
-            validate_apre_k,
-        )
-
         if quant_mode != "fp4":
             raise ValueError("A-preshuffled payload requires MXFP4")
-        validate_apre_k(feat_dim)
+        if topids_to_rows is not None:
+            from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
+                validate_apre_k,
+            )
+
+            validate_apre_k(feat_dim)
+        elif feat_dim <= 0 or feat_dim % 256:
+            raise ValueError(
+                "Grouped A-preshuffle requires positive K divisible by 256, "
+                f"got K={feat_dim}"
+            )
     rows_per_tile = wmma_rep * 16
     assert (
         max_m % rows_per_tile == 0

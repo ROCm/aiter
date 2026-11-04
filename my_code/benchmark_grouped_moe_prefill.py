@@ -153,6 +153,7 @@ def main():
             "row_major_ascale",
             "stage1_act",
             "stage1_quant_out",
+            "quant_payload_preshuffled",
             "quant_wmma_rep",
             "next_stage_prefetch",
             "tdm_b_th",
@@ -165,7 +166,9 @@ def main():
             "m_align",
         )
         record = {name: int(params[name]) for name in fields if name in params}
-        record["stage"] = 1 if params["stage1_act"] else 2
+        # Initial dispatch order also identifies GEMM1 when activation is
+        # performed by the following quantizer instead of the GEMM epilogue.
+        record["stage"] = len(launches) + 1
         assert not record["enable_ep_scatter"]
         if args.a_preshuffle != "csv":
             assert record["a_preshuffled"] == int(args.a_preshuffle)
