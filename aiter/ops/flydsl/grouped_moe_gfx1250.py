@@ -713,7 +713,11 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     _fuse_ep_route_quant = False
     _route_psum_fused = False
+    # Set when a deferred top-k was fused with the routing and the quant.
+    _prepared_a1 = None
     ep_rowmap = None
+    if _compact or _is_ep:
+        resolve_deferred_topk()
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -800,6 +804,40 @@ def _grouped_a8w4_tdm_moe(
     else:
         _fuse_ep_route_quant = False
         ep_rowmap = None
+        # A top-k the caller deferred to here (defer_topk_softmax): at small M
+        # one launch computes it together with the routing below and the
+        # activation quant further down. Anything this path cannot fuse gets
+        # the plain top-k first, so the buffers are filled either way.
+        _deferred = _take_deferred_topk(topk_ids, topk_weight)
+        if _deferred is not None:
+            _quant_mode_early = "fp4" if data_format == "fp4" else "fp8"
+            if (
+                not _compact
+                and a1_scale is None
+                and hidden_states.dim() == 2
+                and fused_topk_route_quant_supported(
+                    _deferred.gating_output,
+                    hidden_states,
+                    topk,
+                    _deferred.renormalize,
+                )
+                and int(E) == _deferred.gating_output.shape[1]
+                and _same_count(_deferred.num_valid_rows, num_local_tokens)
+            ):
+                _prepared_a1 = fused_topk_route_quant(
+                    _deferred.gating_output,
+                    hidden_states,
+                    topk,
+                    align_m=_align_m,
+                    contiguous_m=contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode_early,
+                    num_valid_rows=_deferred.num_valid_rows,
+                    topk_weights=topk_weight,
+                    topk_ids=topk_ids,
+                )
+            else:
+                _deferred.resolve()
         # TP with a per-pass real row count (ATOM's `Context.scheduled_tokens_gpu`):
         # the rows past it are a graph bucket's padding, routed to expert -1 by
         # the top-k. The route kernels drop those routes; the same bounds the EP
@@ -819,7 +857,7 @@ def _grouped_a8w4_tdm_moe(
                     .to(device=device, dtype=torch.int32)
                     .contiguous()
                 )
-            else:
+            elif _prepared_a1 is None:
                 _ep_nvr = (_ep_nvt * int(topk)).contiguous()
         # Small batches (decode): one workgroup routes, scans and remaps, in place
         # of the counter fill, moe_route and contiguous_psum_remap (same outputs).
@@ -827,7 +865,10 @@ def _grouped_a8w4_tdm_moe(
             int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
             and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
         )
-        if _route_psum_fused:
+        if _prepared_a1 is not None:
+            _, _, _masked_m, topids_to_rows, psum, _, _ = _prepared_a1
+            _route_psum_fused = True
+        elif _route_psum_fused:
             # Same alignment as contiguous_psum_remap below.
             _masked_m, topids_to_rows, psum = fused_route_psum_remap(
                 topk_ids, E, max_m, _align_m
@@ -1001,6 +1042,7 @@ def _grouped_a8w4_tdm_moe(
     # dummy topk_ids, so its token count cannot size a per-token scale buffer.
     _compact_ascale = (
         not _compact
+        and _prepared_a1 is None
         and not _prequantized
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
@@ -1023,6 +1065,8 @@ def _grouped_a8w4_tdm_moe(
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
+    elif _prepared_a1 is not None:
+        a1_payload, a1_scale = _prepared_a1[5], _prepared_a1[6]
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
         (
@@ -1901,6 +1945,262 @@ def fused_route_psum_remap(
         stream=torch.cuda.current_stream(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+class _DeferredTopk:
+    """A ``topk_softmax`` whose buffers the grouped MoE fills (see
+    ``defer_topk_softmax``)."""
+
+    __slots__ = (
+        "gating_output",
+        "num_valid_rows",
+        "renormalize",
+        "topk_ids",
+        "topk_weights",
+    )
+
+    def __init__(self, topk_weights, topk_ids, gating_output, renormalize, nvr):
+        self.topk_weights = topk_weights
+        self.topk_ids = topk_ids
+        self.gating_output = gating_output
+        self.renormalize = renormalize
+        self.num_valid_rows = nvr
+
+    def resolve(self):
+        from aiter import topk_softmax
+
+        token_expert_indices = torch.empty_like(self.topk_ids)
+        topk_softmax(
+            self.topk_weights,
+            self.topk_ids,
+            token_expert_indices,
+            self.gating_output,
+            self.renormalize,
+            0,
+            "",
+            self.num_valid_rows,
+        )
+
+
+_deferred_topk_state = threading.local()
+
+
+def defer_topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    num_valid_rows: torch.Tensor | None = None,
+) -> None:
+    """Leave ``topk_softmax(topk_weights, topk_ids, gating_output,
+    renormalize, num_valid_rows=...)`` to the next ``fused_moe`` on these
+    buffers.
+
+    On gfx1250 the TP grouped path then computes the top-k, the routing and the
+    activation quant in one launch (``fused_topk_route_quant``) when it can,
+    and runs the plain top-k first when it cannot; any other path runs the
+    plain top-k before it reads the buffers. Nothing may read them in between,
+    and the next MoE call (or ``resolve_deferred_topk``) must follow: a
+    deferral replaces the previous one only after filling its buffers.
+    """
+    resolve_deferred_topk()
+    _deferred_topk_state.pending = _DeferredTopk(
+        topk_weights, topk_ids, gating_output, renormalize, num_valid_rows
+    )
+
+
+def resolve_deferred_topk() -> None:
+    """Fill a pending deferred top-k's buffers with the plain kernel."""
+    pending = getattr(_deferred_topk_state, "pending", None)
+    if pending is not None:
+        _deferred_topk_state.pending = None
+        pending.resolve()
+
+
+def _take_deferred_topk(topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+    """The pending deferral if it is for these buffers (consumed), else None
+    after filling any other pending one."""
+    pending = getattr(_deferred_topk_state, "pending", None)
+    if pending is None:
+        return None
+    _deferred_topk_state.pending = None
+    if (
+        pending.topk_ids.data_ptr() == topk_ids.data_ptr()
+        and pending.topk_weights.data_ptr() == topk_weights.data_ptr()
+        and pending.topk_ids.shape == topk_ids.shape
+        and topk_weights.dtype == torch.float32
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+    ):
+        return pending
+    pending.resolve()
+    return None
+
+
+def _same_count(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
+    """Whether two optional row-count tensors are the same storage."""
+    if a is None or b is None:
+        return a is None and b is None
+    return a.data_ptr() == b.data_ptr()
+
+
+@functools.cache
+@fast_jit_result
+def _get_compiled_topk_route_quant(
+    experts: int,
+    topk: int,
+    feat_dim: int,
+    wmma_rep: int,
+    align_m: int,
+    quant_mode: str,
+    local: bool,
+):
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant import (
+        build_moe_topk_route_quant_module,
+    )
+
+    return build_moe_topk_route_quant_module(
+        experts=experts,
+        topk=topk,
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        align_m=align_m,
+        quant_mode=quant_mode,
+        local=local,
+    )
+
+
+def fused_topk_route_quant_supported(
+    gating_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> bool:
+    """Whether ``fused_topk_route_quant`` serves this call (gfx1250, bf16, 256
+    routed experts, renormalized top-k, at most ``MAX_ROWS`` rows)."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
+
+    return (
+        renormalize
+        and 1 <= topk <= 16
+        and gating_output.dim() == 2
+        and gating_output.shape[1] == 256
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and hidden_states.dim() == 2
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and 0 < hidden_states.shape[0] <= MAX_ROWS
+        and gating_output.shape[0] == hidden_states.shape[0]
+        and hidden_states.shape[1] % 256 == 0
+        and get_gfx() == "gfx1250"
+    )
+
+
+def fused_topk_route_quant(
+    gating_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk: int,
+    *,
+    align_m: int,
+    contiguous_m: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+    num_valid_rows: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+):
+    """One launch for ``topk_softmax(renormalize)`` + ``fused_route_psum_remap``
+    + ``flydsl_moe_fused_quant_preshuffle(topids_to_rows=...)`` at small M.
+
+    ``gating_output`` is (M, 256) bf16 with unit column stride (any row stride,
+    e.g. the routed columns of a router GEMM that also emits a shared-expert
+    gate column). ``num_valid_rows`` as for ``topk_softmax``: rows at or past it
+    get ids -1 / weights 0, claim no grouped row and are not quantized.
+
+    Returns (topk_weights, topk_ids, masked_m, topids_to_rows, psum, payload,
+    scale), in the layouts the split path produces.
+    """
+    device = hidden_states.device
+    token_num, feat_dim = hidden_states.shape
+    experts = int(gating_output.shape[1])
+    if topk_weights is None:
+        topk_weights = torch.empty(
+            (token_num, topk), dtype=torch.float32, device=device
+        )
+    if topk_ids is None:
+        topk_ids = torch.empty((token_num, topk), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    payload_bytes = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    payload = torch.empty(
+        (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
+    )
+    scale = torch.empty(
+        (1, contiguous_m // wmma_rep, (feat_dim // 32) * wmma_rep),
+        dtype=torch.uint8,
+        device=device,
+    )
+    if num_valid_rows is None:
+        nvr = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        nvr = num_valid_rows.reshape(-1)[:1].to(dtype=torch.int32)
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant import (
+        CLUSTER,
+        LOCAL_MAX_ROWS,
+        topk_route_quant_tokens_per_block,
+    )
+
+    tpb = topk_route_quant_tokens_per_block(feat_dim, quant_mode)
+    local = token_num <= LOCAL_MAX_ROWS
+    if local:
+        grid = -(-token_num // tpb)
+        exchange = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        clusters = -(-token_num // (CLUSTER * tpb))
+        grid = clusters * CLUSTER
+        # Clusters past the first publish their ids here (the first uses
+        # topk_ids); only a cluster's own workgroups ever read its row.
+        exchange = torch.empty(
+            (max(clusters - 1, 0), token_num * topk), dtype=torch.int32, device=device
+        )
+    launch = _get_compiled_topk_route_quant(
+        experts,
+        int(topk),
+        int(feat_dim),
+        int(wmma_rep),
+        int(align_m),
+        quant_mode,
+        local,
+    )
+    launch(
+        ptr_arg(gating_output),
+        ptr_arg(hidden_states),
+        ptr_arg(nvr),
+        ptr_arg(topk_weights),
+        ptr_arg(topk_ids),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(psum),
+        ptr_arg(payload),
+        ptr_arg(scale),
+        ptr_arg(exchange),
+        int(token_num),
+        int(gating_output.stride(0)),
+        int(grid),
+        stream=torch.cuda.current_stream(),
+    )
+    return (
+        topk_weights,
+        topk_ids,
+        masked_m,
+        topids_to_rows.view(token_num, topk),
+        psum,
+        payload,
+        scale,
+    )
 
 
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):

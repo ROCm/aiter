@@ -1191,7 +1191,9 @@ def fused_moe(
                 "is_shuffled=True; re-run the shuffle after tensor copies"
             )
         from aiter.fhmoe import _fhmoe
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import resolve_deferred_topk
 
+        resolve_deferred_topk()
         return _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
@@ -1574,6 +1576,11 @@ def _fused_moe_impl(
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    # A caller's deferred top-k (defer_topk_softmax) is due before anything
+    # below reads the routing.
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import resolve_deferred_topk
+
+    resolve_deferred_topk()
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
