@@ -237,6 +237,11 @@ def kernel_unified_attention_2d(
         not (SPLIT_UNMASKED_LOOP and SLIDING_WINDOW > 0),
         "SPLIT_UNMASKED_LOOP does not support sliding-window attention",
     )
+    # the launcher rejects a window for non-causal calls; keep -O from skipping it
+    tl.static_assert(
+        CAUSAL or SLIDING_WINDOW == 0,
+        "non-causal attention does not support a sliding window",
+    )
 
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -749,6 +754,12 @@ def kernel_unified_attention_3d(
     num_tokens=1,  # int, query tokens: the partials' slot stride (LENGTH_AWARE_SPLIT)
     CAUSAL: tl.constexpr = True,  # bool
 ):
+    # the launcher rejects a window for non-causal calls; keep -O from skipping it
+    tl.static_assert(
+        CAUSAL or SLIDING_WINDOW == 0,
+        "non-causal attention does not support a sliding window",
+    )
+
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
