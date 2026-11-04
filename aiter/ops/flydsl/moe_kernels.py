@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
+    current_stream_arg,
     ptr_arg,
 )
 
@@ -1057,6 +1058,8 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    *,
+    streaming_loads=False,
     skip_dropped=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode.
@@ -1142,6 +1145,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        streaming_loads=streaming_loads,
     )
     _run_compiled(
         reduce_exe,
@@ -2053,6 +2057,7 @@ def _flydsl_moe_stage2_impl(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     skip_dropped_routes: bool = False,
+    use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2128,6 +2133,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            use_valid_token_count=use_valid_token_count,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2382,6 +2388,7 @@ def flydsl_moe_stage2(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     skip_dropped_routes: bool = False,
+    use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2406,6 +2413,8 @@ def flydsl_moe_stage2(
 
     skip_dropped_routes: with mode="reduce", leave out slots whose topk_ids are
         negative (dropped routes), whose per-slot rows the GEMM never writes.
+    use_valid_token_count: atomic a16w-mix only; bound scatter rows by
+        num_valid_ids[1] (the sort's real token count) when out is padded.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2439,6 +2448,7 @@ def flydsl_moe_stage2(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         skip_dropped_routes=skip_dropped_routes,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
@@ -2623,7 +2633,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             int(E),
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return counter, topids_to_rows.view(token_num, topk)
 
@@ -2689,7 +2699,7 @@ def flydsl_moe_topids_to_rows(
             topids_to_rows_kernel,
             *route_args,
             *_ep_tail,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     else:
         from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -2718,7 +2728,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             route_grid,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
     return counter, topids_to_rows.view(token_num, topk)
 
@@ -3548,7 +3558,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         if use_token_multidest:
@@ -3579,7 +3589,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
-                torch.cuda.current_stream(),
+                current_stream_arg(),
             )
             return out_payload, out_scale
         # The M16 scatter consumes a finalized inverse map and K1024 tiles.
@@ -3602,7 +3612,7 @@ def flydsl_moe_fused_quant_preshuffle(
             from aiter.jit.utils.chip_info import get_cu_num
 
             apre_workers = max(1, 4 * (get_cu_num() or 1))
-            stream = torch.cuda.current_stream()
+            stream = current_stream_arg()
             if prequantized:
                 # MoRI already produced packed FP4 and padded E8M0 rows.
                 compact_payload = grouped_in.contiguous()
@@ -3687,7 +3697,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
-            torch.cuda.current_stream(),
+            current_stream_arg(),
         )
         return out_payload, out_scale
 
@@ -3709,6 +3719,6 @@ def flydsl_moe_fused_quant_preshuffle(
         n_rows,
         max_m,
         grid_blocks,
-        torch.cuda.current_stream(),
+        current_stream_arg(),
     )
     return out_payload, out_scale

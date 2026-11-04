@@ -464,6 +464,29 @@ void all_gather(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
+    // the LL kernel reads the input in place: no registered copy, unless the
+    // gather would overwrite the input before publishing it
+    auto fa                = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const size_t row_bytes = dim != 0 ? last_dim_size * inp.element_size() : data_bytes;
+    if(fa->use_ll_ag(data_bytes, row_bytes))
+    {
+        if(!fa->ll_ag_reads_in_place(actual_inp, actual_out, data_bytes, row_bytes))
+        {
+            if(reg_inp_ptr == 0 || data_bytes > reg_inp_bytes)
+                throw std::runtime_error(
+                    "gfx1250 LL all-gather: the output overlaps a registered input");
+            HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                    hipMemcpyDeviceToDevice, stream));
+            actual_inp = (void*)reg_inp_ptr;
+        }
+        fa->allgather_ll<uint8_t>(stream,
+                                  reinterpret_cast<const uint8_t*>(actual_inp),
+                                  reinterpret_cast<uint8_t*>(actual_out),
+                                  data_bytes,
+                                  row_bytes);
+        return;
+    }
+
     if(reg_inp_ptr != 0)
     {
         if(data_bytes > reg_inp_bytes)
