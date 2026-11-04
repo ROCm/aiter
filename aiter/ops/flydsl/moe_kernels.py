@@ -3173,6 +3173,8 @@ def token_multidest_eligible(token_num: int, topk: int) -> bool:
     return (
         1 < int(topk) <= _TOKEN_MULTIDEST_MAX_TOPK
         and int(token_num) >= _TOKEN_MULTIDEST_MIN_TOKENS
+        and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+        in ("1", "true", "True")
     )
 
 
@@ -3454,7 +3456,7 @@ def flydsl_moe_fused_quant_preshuffle(
             not prequantized
             and not remap_rows
             and not fuse_ep_psum
-            and num_valid_routes is None
+            and (num_valid_routes is None or row_to_token is not None)
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
@@ -3479,6 +3481,13 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(out_scale.view(-1)),
                 ptr_arg(topids_to_rows_i32),
                 ptr_arg(row_to_token.reshape(-1)),
+                ptr_arg(
+                    num_valid_routes.reshape(-1)[:1].to(
+                        device=device, dtype=torch.int32
+                    )
+                    if num_valid_routes is not None
+                    else torch.empty(0, dtype=torch.int32, device=device)
+                ),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
                 stream=torch.cuda.current_stream(),

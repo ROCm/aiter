@@ -2643,6 +2643,7 @@ def build_moe_token_multidest_compact_quant_module(
         compact_scale_buf: fx.Pointer,
         topids_to_rows: fx.Pointer,
         row_to_token: fx.Pointer,
+        num_valid_routes: fx.Pointer,
         token_num: Int32,
         grid_blocks: Int32,
     ):
@@ -2669,6 +2670,14 @@ def build_moe_token_multidest_compact_quant_module(
         warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
 
+        # Graph-bucket padding: only the first num_valid_routes / topk tokens are real
+        # (null pointer = all token_num).
+        valid_tokens = fx.Uint32(token_num)
+        if fx.Int64(ptrtoint(num_valid_routes)) != 0:
+            valid_tokens = fx.Uint32(
+                ptr_buf_tensor(num_valid_routes)[c0_i32]
+            ) // fx.Uint32(topk)
+
         hslot = warps_per_block * hidden_chunk_bytes if tdm_hidden_chunks else 0
         h_lds = None
         hidden_lds_idx = None
@@ -2687,7 +2696,7 @@ def build_moe_token_multidest_compact_quant_module(
             token = token0 + warp_in_block
             chunk_prefetch = None
             if const_expr(tdm_hidden_chunks):
-                valid_rows = token_num - fx.Int32(token0)
+                valid_rows = fx.Int32(valid_tokens) - fx.Int32(token0)
                 hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
                     feat_dim * 2
                 )
@@ -2732,7 +2741,7 @@ def build_moe_token_multidest_compact_quant_module(
                             )
                         gpu.barrier()
 
-            valid = token < fx.Uint32(token_num)
+            valid = token < valid_tokens
             token_eff = valid.select(token, fx.Uint32(c0_i32))
             pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
             scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
@@ -2822,7 +2831,7 @@ def build_moe_token_multidest_compact_quant_module(
             _emit_quant_block_loop(qc)
 
         step = fx.Uint32(grid_blocks) * c_wpb
-        for token0 in range(bid * c_wpb, fx.Uint32(token_num), step):
+        for token0 in range(bid * c_wpb, valid_tokens, step):
             _quant_token_group(token0)
 
     @flyc.jit
@@ -2832,6 +2841,7 @@ def build_moe_token_multidest_compact_quant_module(
         compact_scale_buf: fx.Pointer,
         topids_to_rows: fx.Pointer,
         row_to_token: fx.Pointer,
+        num_valid_routes: fx.Pointer,
         token_num: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -2842,6 +2852,7 @@ def build_moe_token_multidest_compact_quant_module(
             compact_scale_buf,
             topids_to_rows,
             row_to_token,
+            num_valid_routes,
             token_num,
             grid_blocks,
         ).launch(

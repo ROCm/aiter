@@ -1044,7 +1044,7 @@ def _grouped_a8w4_tdm_moe(
         not _compact
         and _prepared_a1 is None
         and not _prequantized
-        and _ep_nvr is None
+        and (_ep_nvr is None or not _is_ep)
         and _use_fused_quant_preshuffle(
             model_dim, wmma_rep, _quant_mode, token_num, topk
         )
