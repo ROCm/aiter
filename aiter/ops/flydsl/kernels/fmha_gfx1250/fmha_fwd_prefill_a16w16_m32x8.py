@@ -740,9 +740,12 @@ def _build_managers(
     )
 
 
-# Page indices carried across the loop back edge for the distance-2 index prefetch;
-# one SGPR each, so only worth it while there are few.
-_MAX_CARRIED_PAGE_INDICES = 4
+# Page indices carried across the loop back edge for the distance-2 index prefetch.
+# Not one SGPR each: the lifetimes OVERLAP rather than stack, since a band's indices are
+# dead once its descriptor is built, so carrying the widest case (32, at page_size 1)
+# costs 8 lane-spills -- v_writelane, no scratch -- and buys the lagging half its whole
+# gemm between the load and the s_wait_kmcnt.
+_MAX_CARRIED_PAGE_INDICES = 32
 
 
 class PagedSpec:
