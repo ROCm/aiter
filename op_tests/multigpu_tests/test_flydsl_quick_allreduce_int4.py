@@ -87,6 +87,7 @@ and fails if none does.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import itertools
 import json
@@ -821,6 +822,12 @@ def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group)
     Afterwards, every output is checked against its own fp32 reference, and
     against the other ranks' outputs.
     """
+    from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
+
+    # Cross the 16-bit epoch wrap while peers run at different speeds.
+    for engine in fly._engines():
+        colors = (ctypes.c_int32 * engine.grid)(*([65534] * engine.grid))
+        UncachedIpcHeap.copy_host_to_device(engine._colors, colors, engine.grid * 4)
     drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
     outs = []
     for it in range(RUN_AHEAD_ITERS):
