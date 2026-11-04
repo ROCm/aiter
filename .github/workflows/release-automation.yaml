@@ -244,18 +244,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # download.pytorch.org has no torch<2.13 for ROCm 7.14+, so take AMD's
-          # builds (7.14 is only on the legacy multi-arch index). Pin exactly:
+          # download.pytorch.org lacks these torch builds for ROCm 7.14+, so take
+          # AMD's (7.14 is only on the legacy multi-arch index). Pin exactly:
           # each index serves every ROCm flavor of a torch version.
           - rocm_version: '7.14'
             torch_index_url: 'https://repo.amd.com/rocm/whl-multi-arch/'
             torch_pin: '2.12.0+rocm7.14.1'
           - rocm_version: '10.0'
             torch_index_url: 'https://stable.repo.amd.com/rocm/whl-next/'
-            torch_pin: '2.12.0+rocm10.0.0'
+            torch_pin: '2.13.0+rocm10.0.0'
           - rocm_version: '10.1'
             torch_index_url: 'https://stable.repo.amd.com/rocm/whl-next/'
-            torch_pin: '2.12.0+rocm10.1.0'
+            torch_pin: '2.13.0+rocm10.1.0'
     uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: none
