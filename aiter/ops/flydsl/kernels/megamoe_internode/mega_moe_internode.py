@@ -55,17 +55,30 @@ from .layout import (
 )
 from .mega_moe_internode_config import (
     NUM_QP,
+    STAGE2_SDMA_FRAC_Q64,
+    STAGE2_SDMA_PUT_BYTES,
+    STAGE2_SDMA_RAMP_CHUNKS,
+    STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     lookup_stage2_tune,
+    resolve_gemm2_bm,
     resolve_gemm2_bn,
     resolve_gemm2_cu,
+    resolve_gemm2_dynamic,
+    resolve_sdma_chunk_tiles,
     resolve_stage1_tile,
+    resolve_stage2_fused,
+    resolve_stage2_sdma,
 )
 from .quant import get_rail_record_quant
 from .stage1 import WORKER_BLOCKS, compile_stage1
 from .stage2 import (
+    K1_CLAIM_WORDS,
+    K1_CTAS_PER_CU,
     SCRATCH_WORDS,
+    SDMA_PLAN_WORDS_MAX,
     peer_table_launcher,
     run_mega_moe_stage2,
+    run_stage2_fused,
     run_stage2_node_combine,
 )
 
@@ -91,10 +104,6 @@ _RDMA_STAGE1_REGIONS = (
     "remote_dispatch_rx",
     "remote_chunk_ready",
     "remote_chunk_credit",
-    "sparse_remote_qp_ready",
-    "sparse_remote_credit",
-    "rail_count_inbox",
-    "rail_count_inbox_ready",
 )
 _RDMA_STAGE2_REGIONS = (
     "node_accumulator",
@@ -108,8 +117,8 @@ _K1_EPOCH_PLANES = (
     "h1_output_scale",
     "tile_expert_sorted",
     "num_valid",
-    "tile_row_source_sorted",
-    "tile_row_weight_sorted",
+    "tile_row_source",
+    "tile_row_weight",
 )
 _K2_PARITY_PLANES = (
     "plane_slot_inbox",
@@ -261,6 +270,7 @@ class MegaMoEInternode:
         self.max_routes_per_token_per_rank = int(route_cap)
         self.device = torch.device("cuda", torch.cuda.current_device())
         device_cus = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self._device_cus = device_cus
         # The software grid barriers of the persistent kernels need every CTA
         # resident; one CTA per CU is the conservative prerequisite.
         if device_cus < WORKER_BLOCKS:
@@ -286,6 +296,17 @@ class MegaMoEInternode:
         self._gemm2_bn, _ = resolve_gemm2_bn(s2_tuned or None)
         gemm2_cu, _ = resolve_gemm2_cu(s2_tuned or None)
         self._gemm2_cu = gemm2_cu or WORKER_BLOCKS
+        self._stage2_fused = resolve_stage2_fused(self.mtpr)
+        remote_first = bool(self._stage2_fused and self._s1_tile["split_local"])
+        # SDMA needs the remote-first fused kernel (Stage1's local/remote
+        # split); it is dropped at runtime setup if MORI gives no SDMA queue.
+        self._stage2_sdma = bool(
+            resolve_stage2_sdma(self.mtpr, s2_tuned or None)[0] and remote_first)
+        # GEMM2 M tile (fused remote-first stage2 only; 32 elsewhere).
+        self._s2_tuned = s2_tuned or None
+        self._gemm2_bm, _ = resolve_gemm2_bm(
+            self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
+            fused=remote_first, sdma=self._stage2_sdma)
         # Without a table row: one chunk per rail queue is the balanced
         # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
         # Capped at 512 (the TPR 4096 value): k2 unrolls one ready store per chunk
@@ -457,7 +478,18 @@ class MegaMoEInternode:
             requirements.lsa_barrier_count = 0
             requirements.rail_gda_barrier_count = 0
             requirements.barrier_count = 0
+            if self._stage2_sdma:
+                requirements.sdma_queue_count = 1
             dev_comm = communicator.create_dev_comm(requirements)
+            if self._stage2_sdma and int(getattr(dev_comm, "sdma_num_queue", 0) or 0) <= 0:
+                # Puts on a comm without queues move nothing; keep the xGMI push.
+                logger.warning("MegaMoEInternode: MORI gave no SDMA queue (MORI_ENABLE_SDMA "
+                               "unset?); stage2 keeps the xGMI push")
+                self._stage2_sdma = False
+                # The default M tile follows the path (xGMI stalls at SDMA's 128).
+                self._gemm2_bm, _ = resolve_gemm2_bm(
+                    self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
+                    fused=True, sdma=False)
             _window_view(window.local_ptr, (self.layout.total_bytes,), "|i1").zero_()
             torch.cuda.synchronize(self.device)
             communicator.barrier()
@@ -514,9 +546,8 @@ class MegaMoEInternode:
         # entry because total_m_blocks rounds the row count up.
         tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
         self._k1_trb = torch.arange(tiles + 1, dtype=torch.int32, device=dev) * TILE_M
-        # One i32 per producer row (packed source row, top-k slot).
-        self._k1_arrival_count = torch.zeros(
-            self.world_size * self.mtpr * self.topk, dtype=torch.int32, device=dev)
+        # Kernel1's m-block tickets and done counts (see K1_CLAIM_WORDS).
+        self._k1_arrival_count = torch.zeros(K1_CLAIM_WORDS, dtype=torch.int32, device=dev)
         # Each peer's plane_slot_inbox base for both parities, back to back.
         self._k1_peer_table = torch.zeros(2 * self.world_size, dtype=torch.int64, device=dev)
         fill = peer_table_launcher(GPUS_PER_NODE, self.world_size)
@@ -537,12 +568,15 @@ class MegaMoEInternode:
             "arg_aq": s1_addr("h1_output_q"), "arg_ascale": s1_addr("h1_output_scale"),
             "arg_bq": self._w2.data_ptr(), "arg_bscale": self._w2_scale.data_ptr(),
             "arg_eids": s1_addr("tile_expert_sorted"), "arg_cumsum": s1_addr("num_valid"),
-            "arg_stids": s1_addr("tile_row_source_sorted"),
-            "arg_sweights": s1_addr("tile_row_weight_sorted"),
+            # Read at the physical arena row (a_tile_map), not a sorted copy.
+            "arg_stids": s1_addr("tile_row_source"),
+            "arg_sweights": s1_addr("tile_row_weight"),
             "arg_trb": self._k1_trb.data_ptr(), "arg_p2p": self._k1_peer_table.data_ptr(),
             "arg_arrival_count": self._k1_arrival_count.data_ptr(),
             "arg_generation": base + self._epoch_off, "arg_a_tile_map": base + a_tile_map.offset,
             "row_capacity": s1.max_route_rows,
+            "local_rank": self.rank % GPUS_PER_NODE,
+            "arg_expert_count": s1_addr("expert_count"),
         }
         self._k1_compile = {
             "model_dim": self.model_dim, "inter_dim": self.inter_dim, "experts": self.epr,
@@ -557,7 +591,37 @@ class MegaMoEInternode:
             # DSV4 TPR256: GEMM2 -14~22us).  At G=4 it measured neutral to
             # +12us (K3 TPR512), so G=4 keeps the plain order.
             "m_group": 2 if self._s1_tile["tile_group"] == 2 else 1,
+            "dynamic_claim": resolve_gemm2_dynamic(self.mtpr),
+            "resident_ctas": self._device_cus * K1_CTAS_PER_CU,
+            # Fused stage2 overlaps the rail with GEMM2 by doing the
+            # remote-source m-blocks first (needs Stage1's local/remote split).
+            "remote_first": bool(self._stage2_fused and self._s1_tile["split_local"]),
+            "local_experts": self.epr, "tile_group": int(self._s1_tile["tile_group"]),
+            "expert_count_plane": s1.region("expert_count").nbytes // 2,
+            "gemm2_bm": self._gemm2_bm,
         }
+
+        if self._stage2_sdma:
+            # SDMA stage2 (see compile_mega_moe_stage2): the send buffer, the
+            # plan's per-(ticket, dest) row prefixes (+1 end entry), its words
+            # and the per-chunk done counts (128 B apart).
+            sd_tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
+            sd_rows = int(STAGE2_SDMA_SEND_ROWS_PER_ROUTE * self.mtpr * self.topk)
+            sd_ct = resolve_sdma_chunk_tiles(self.mtpr * self.topk, self._gemm2_bm // TILE_M)
+            sd_chunks = sd_tiles // sd_ct + 2 + 4 * STAGE2_SDMA_RAMP_CHUNKS
+            self._sd_send = torch.empty(sd_rows * self.model_dim * 2, dtype=torch.uint8, device=dev)
+            self._sd_tile_base = torch.zeros((sd_tiles + 1) * 8, dtype=torch.int32, device=dev)
+            self._sd_plan = torch.zeros(SDMA_PLAN_WORDS_MAX, dtype=torch.int32, device=dev)
+            self._sd_cdone = torch.zeros(sd_chunks * 32, dtype=torch.int32, device=dev)
+            self._k1_ptrs.update(
+                arg_sd_send=self._sd_send.data_ptr(), arg_sd_tb=self._sd_tile_base.data_ptr(),
+                arg_sd_plan=self._sd_plan.data_ptr(), arg_sd_cdone=self._sd_cdone.data_ptr())
+            self._k1_compile.update(
+                sdma=True, sdma_chunk_tiles=sd_ct, sdma_send_rows=sd_rows,
+                sdma_frac_q64=STAGE2_SDMA_FRAC_Q64, sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
+                sdma_arrival_woff=s2_off("plane_slot_arrived"),
+                sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks,
+                sdma_ramp_chunks=STAGE2_SDMA_RAMP_CHUNKS)
 
         self._k2_scratch = torch.zeros(SCRATCH_WORDS, dtype=torch.int32, device=dev)
         self._k2_compile = {
@@ -574,7 +638,10 @@ class MegaMoEInternode:
             "consumed_off": s2_off("return_consumed"), "arrival_off": s2_off("plane_slot_arrived"),
             "s2_window_off": layout.stage2_offset, "epoch_off": self._epoch_off,
             "parity_planes": tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
+            **({"sdma": True} if self._stage2_sdma else {}),
         }
+
+
     # forward
 
     def quantize(self, x_bf16: torch.Tensor):
@@ -655,12 +722,21 @@ class MegaMoEInternode:
             self._w1.data_ptr(), self._w1_scale.data_ptr(), self.mtpr,
             stream,
         )
-        run_mega_moe_stage2(**self._k1_ptrs, stream=stream, **self._k1_compile)
-        run_stage2_node_combine(
-            runtime.dev_comm.ptr, window.handle, window.local_ptr,
-            self._output.data_ptr(), self._k2_scratch.data_ptr(), self.mtpr,
-            WORKER_BLOCKS, stream, **self._k2_compile,
-        )
+        if self._stage2_fused:
+            run_stage2_fused(
+                k1_ptrs=self._k1_ptrs, k1_compile=self._k1_compile,
+                dev_comm=runtime.dev_comm.ptr, arena_win=window.handle,
+                arena_ptr=window.local_ptr, arg_output_bf16=self._output.data_ptr(),
+                arg_scratch=self._k2_scratch.data_ptr(), local_tokens=self.mtpr,
+                k2_ctas=WORKER_BLOCKS, stream=stream, k2_compile=self._k2_compile,
+            )
+        else:
+            run_mega_moe_stage2(**self._k1_ptrs, stream=stream, **self._k1_compile)
+            run_stage2_node_combine(
+                runtime.dev_comm.ptr, window.handle, window.local_ptr,
+                self._output.data_ptr(), self._k2_scratch.data_ptr(), self.mtpr,
+                WORKER_BLOCKS, stream, **self._k2_compile,
+            )
         return self._output[: self.mtpr] if slice_output else self._output
     def close(self) -> None:
         if self._closed:

@@ -1024,12 +1024,15 @@ def gemm2_compute_v2(
     INTER_MAX,
     aStages,
     explicit_a_row=None,
+    eids_stride=1,
 ):
     """GEMM2 of one (m_block, n_block): fp4 A (LDS DMA, kStages+1 slots), fp4 B
     streamed through a 2-stage register pipeline with the A-scale carried alongside.
 
     explicit_a_row: A/A-scale rows live at this (physical) row instead of the
     sorted m_row; expert id and the returned m_row stay on the sorted row.
+    eids_stride: entries of ``arg_eids`` per m_block (``arg_eids`` is per
+    32-row tile; a BM = 32*G block reads its first tile's expert).
     """
     assert aStages == kStages + 1
     assert BK == 256, "one 256-K E8M0 scale word per K-tile"
@@ -1060,7 +1063,8 @@ def gemm2_compute_v2(
     m_block_idx = bx_i32 // num_n_blocks
     n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
+    e_idx = m_block_idx if eids_stride == 1 else m_block_idx * fx.Int32(eids_stride)
+    e = rocdl.readfirstlane(T.i32, eids_ptr[e_idx])
     m_row = m_block_idx * BM
     a_row = m_row if explicit_a_row is None else fx.Int32(explicit_a_row)
 

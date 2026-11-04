@@ -190,7 +190,7 @@ def _compile_stage1(
         )
     if worker_blocks == ESSENTIAL_CTAS:
         # Producers retire without rejoining in the chunked full path. With
-        # zero GEMM consumers the finisher would wait forever for h1_compute_done.
+        # zero GEMM consumers nobody would run GMM1.
         raise ValueError(
             "full Stage-1 requires at least one GEMM consumer after progress roles"
         )
@@ -222,12 +222,12 @@ def _compile_stage1(
     #   段 1 在 8 个 local_eos 后封本地组(h1 段基址 0),段 2 在全部 comm_eos 后封远端组。
     #   early_local_gmm:段 1 封好本地组即发布 h1_local_eos + 物理组表
     #   gmm1_group_list[本地组..|远端组..];消费者先用本地头领本地 job(与 rail/fan2/段 2 重叠),
-    #   过全局门后再用远端头领远端 job。每个消费者退出时 h1_compute_done +1。
+    #   过全局门后再用远端头领远端 job。
     #   fan2_shards:每个 dest 只有 fanout_shard < fan2_shards 的 fan CTA 做 fan2(按新步长
     #   分 token),其余 fan CTA 做完 fan1 直接进 GMM1 本地段,把等 rail 的空档让给本地组。
     #   lazy_pad:段 1 不补本地组的尾行就发布 h1_local_eos,改由段 2 的 sealer 补。GMM1 只经
     #   tile_row_input 取 A,且是带界 buffer load;补齐前那些行里是上一代/初值的合法行号,
-    #   算出来的 h1 行只会被 stage2 用 INVALID_SOURCE/权重 0 丢掉,而这两项在 stage1_done 前补齐。
+    #   算出来的 h1 行只会被 stage2 用 INVALID_SOURCE/权重 0 丢掉,而这两项在 stage1 结束前补齐。
     #   extra_consumers:ticket 1..COMPUTE_FIRST-1 里除 finisher 以外的 CTA 做完 fan 也进 GMM1。
     #   consumer_index 仍是 [0, 消费者数) 上的双射:额外的排在原来那段之后。
     # 不 split:
@@ -336,15 +336,6 @@ def _compile_stage1(
             raise ValueError(f"Stage-2 region {name} is not parity indexed")
         return region.nbytes // s2_parity_depth
 
-    # Resolve the shared metadata contract at compile time, not in the hot path.
-    for required in (
-        "node_dest_rank_mask",
-        "source_token_count",
-        "node_expected",
-        "stage1_done",
-    ):
-        stage2_layout.region(required)
-
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_alloc_bytes, 16]
@@ -395,6 +386,7 @@ def _compile_stage1(
         tx = fx.Int32(gpu.thread_id("x"))
         lane = tx & fx.Int32(63)
         wave = rocdl.readfirstlane(T.i32, tx // fx.Int32(64))
+
         # An entry ticket advances on the GPU on every replay. All CTAs in an
         # ordered launch receive tickets from one worker_blocks-sized epoch.
         # Reusing a captured Python generation would accept stale ready flags.
@@ -523,9 +515,6 @@ def _compile_stage1(
             expert_count = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
-            queue_heads = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("h1_queue_head")
-            )
             for item in range(tx, LOCAL_EXPERTS * (2 if split_local else 1), THREADS):
                 buffer_ops.buffer_store(fx.Int32(0), expert_count, item)
             consumed = buffer_ops.create_buffer_resource_from_addr(
@@ -542,17 +531,8 @@ def _compile_stage1(
                 fx.Int32(THREADS),
             ):
                 buffer_ops.buffer_store(fx.Int32(0), consumed, item)
-            if tx < fx.Int32(8):
-                buffer_ops.buffer_store(fx.Int32(0), queue_heads, tx * fx.Int32(16))
             if tx == fx.Int32(0):
-                for name in (
-                    "tile_alloc",
-                    "h1_queue_tail",
-                    "h1_compute_done",
-                    "h1_early_full_tiles",
-                    "h1_gmm_started_before_all_comm_eos",
-                    "h1_gmm_completed_before_all_comm_eos",
-                ):
+                for name in ("tile_alloc",):
                     buffer_ops.buffer_store(
                         fx.Int32(0),
                         buffer_ops.create_buffer_resource_from_addr(local_addr(name)),
@@ -698,9 +678,6 @@ def _compile_stage1(
                 )
             _cta_acquire()
             gpu.barrier()
-            remote_masks = buffer_ops.create_buffer_resource_from_addr(
-                stage2_addr("node_dest_rank_mask")
-            )
             rx_all = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("remote_dispatch_rx")
             )
@@ -708,7 +685,6 @@ def _compile_stage1(
             # THREADS时不能只处理首批256条record。
             for token in range(tx, ntokens, fx.Int32(THREADS)):
                 remote_record_available = fx.Int32(1)
-                remote_mask = fx.Int32(0)
                 remote_slot_mask = fx.Int32(0)
                 if remote_record_available != fx.Int32(0):
                     # token 每 lane 不同:描述符必须是标量,按 token 建描述符会被
@@ -732,20 +708,10 @@ def _compile_stage1(
                         on_node = valid & (
                             (owner // fx.Int32(GPUS_PER_NODE)) == fx.Int32(node)
                         )
-                        remote_mask = on_node.select(
-                            remote_mask
-                            | (fx.Int32(1) << (owner % fx.Int32(GPUS_PER_NODE))),
-                            remote_mask,
-                        )
                         remote_slot_mask = on_node.select(
                             remote_slot_mask | (fx.Int32(1) << fx.Int32(slot)),
                             remote_slot_mask,
                         )
-                buffer_ops.buffer_store(
-                    remote_mask,
-                    remote_masks,
-                    fx.Int32(remote_node * MAX_TOKENS) + token,
-                )
                 buffer_ops.buffer_store(
                     remote_slot_mask,
                     buffer_ops.create_buffer_resource_from_addr(
@@ -758,10 +724,7 @@ def _compile_stage1(
         # into destination expert tiles; there is no rank inbox/sort.
         is_finisher = is_comm & (ticket == fx.Int32(local_rank))
 
-        # 两个 finisher 职责必须分开:封尾 partial tile 属于 dispatch 那一半,
-        # 而「等 h1_compute_done 收满再发 stage1_done」属于 GMM1 那一半。
         is_sealer = is_finisher
-        is_publisher = is_finisher
 
         def _peer_addr(dest, name):
             return (
@@ -957,7 +920,6 @@ def _compile_stage1(
                 # 语义与原 producer 逐字相同)。dest0 的分片合起来恰好覆盖全部 token。
                 # stage2 在 k2 之后跑,流序即可见,不需要 fence。
                 if (dest == fx.Int32(0)) & (slot == fx.Int32(0)) & live:
-                    m_rank = fx.Int32(0)
                     m_lslot = fx.Int32(0)
                     m_err = fx.Int32(0)
                     for s2 in range_constexpr(TOPK):
@@ -966,19 +928,11 @@ def _compile_stage1(
                         )
                         ok = (ex >= fx.Int32(0)) & (ex < fx.Int32(EXPERTS))
                         owner = ok.select(ex // fx.Int32(LOCAL_EXPERTS), fx.Int32(0))
-                        m_rank = ok.select(m_rank | (fx.Int32(1) << owner), m_rank)
                         loc = ok & ((owner // fx.Int32(GPUS_PER_NODE)) == node)
                         m_lslot = loc.select(m_lslot | fx.Int32(1 << s2), m_lslot)
                         m_err = ok.select(m_err, m_err + fx.Int32(1))
                     if m_err != fx.Int32(0):
                         comm.atomic_add_system(error_addr, m_err)
-                    buffer_ops.buffer_store(
-                        (m_rank >> fx.Int32(node * GPUS_PER_NODE)) & fx.Int32(0xFF),
-                        buffer_ops.create_buffer_resource_from_addr(
-                            stage2_addr("node_dest_rank_mask")
-                        ),
-                        fx.Int32(node * MAX_TOKENS) + tok,
-                    )
                     buffer_ops.buffer_store(
                         m_lslot,
                         buffer_ops.create_buffer_resource_from_addr(
@@ -1380,9 +1334,6 @@ def _compile_stage1(
                             counts_res, fx.Int32(bo + e), vec_width=1, dtype=T.i32
                         )
                     )
-            perm_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_dst_of_src")
-            )
             sorted_e_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("tile_expert_sorted")
             )
@@ -1424,13 +1375,6 @@ def _compile_stage1(
                 )
                 # 按组的两张表只在 G>1 的 layout 里有 region;G=1 时连 resource
                 # 都不能建(trace 期就 KeyError),用处也都在 const_expr(G > 1) 里。
-                group_perm_res = (
-                    buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_group_perm")
-                    )
-                    if G > 1
-                    else None
-                )
                 group_e_res = (
                     buffer_ops.create_buffer_resource_from_addr(
                         local_addr("tile_expert_group")
@@ -1459,7 +1403,6 @@ def _compile_stage1(
                             tile_map, map_index, vec_width=1, dtype=T.i32
                         )
                         dst = run_base + j
-                        buffer_ops.buffer_store(dst, perm_res, src)
                         buffer_ops.buffer_store(pe, sorted_e_res, dst)
                         buffer_ops.buffer_store(src, inv_res, dst)
                     if const_expr(G > 1):
@@ -1476,11 +1419,6 @@ def _compile_stage1(
                                 dtype=T.i32,
                             )
                             head_group = head_src // fx.Int32(G)
-                            buffer_ops.buffer_store(
-                                (run_base + j0) // fx.Int32(G),
-                                group_perm_res,
-                                head_group,
-                            )
                             buffer_ops.buffer_store(pe, group_e_res, head_group)
                     run_base = run_base + my_tiles
 
@@ -1882,49 +1820,6 @@ def _compile_stage1(
                     _seal_group_list(LOCAL_EXPERTS, (0,), False)
             else:
                 _seal_perm((0,), (), tiles, False, par=True)
-            perm_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_dst_of_src")
-            )
-            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            gpu.barrier()
-            # Stage2 indexes these two by absolute row, so they follow the
-            # output rather than the source.  Partial-tile padding above has
-            # already settled, so the copy sees final values.  The float32
-            # weights are copied as raw bits.
-            src_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_source")
-            )
-            wts_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_weight")
-            )
-            src_sorted_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_source_sorted")
-            )
-            wts_sorted_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_weight_sorted")
-            )
-            for row in range(
-                tx,
-                fx.Int32(0),
-                fx.Int32(THREADS),
-            ):
-                src_tile = row // fx.Int32(BM)
-                dst_row = (
-                    buffer_ops.buffer_load(perm_res, src_tile, vec_width=1, dtype=T.i32)
-                    * fx.Int32(BM)
-                    + row
-                    - src_tile * fx.Int32(BM)
-                )
-                buffer_ops.buffer_store(
-                    buffer_ops.buffer_load(src_res, row, vec_width=1, dtype=T.i32),
-                    src_sorted_res,
-                    dst_row,
-                )
-                buffer_ops.buffer_store(
-                    buffer_ops.buffer_load(wts_res, row, vec_width=1, dtype=T.i32),
-                    wts_sorted_res,
-                    dst_row,
-                )
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # GMM1 的一个 m_block 覆盖 G 个物理 tile,所以作业数按组算。
@@ -1934,13 +1829,6 @@ def _compile_stage1(
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
-                buffer_ops.buffer_store(
-                    total_jobs,
-                    buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("h1_queue_tail")
-                    ),
-                    fx.Int32(0),
-                )
                 buffer_ops.buffer_store(
                     tiles * fx.Int32(BM),
                     buffer_ops.create_buffer_resource_from_addr(
@@ -1978,11 +1866,7 @@ def _compile_stage1(
                 wave,
                 fx.Int32(layout.source_capacity),
                 fx.Int32(max_route_tiles // G),
-                (
-                    local_addr("tile_group_perm")
-                    if G > 1
-                    else local_addr("tile_dst_of_src")
-                ),
+                fx.Int64(0),  # arg_tile_perm: unused by GMM1
                 nc[0] if nc is not None else fx.Int64(0),
                 local_addr("gmm1_group_list") if nc is not None else fx.Int64(0),
                 nc[1] if nc is not None else fx.Int32(0),
@@ -2475,46 +2359,8 @@ def _compile_stage1(
             # 诊断:消费者在做任何 job 之前要先等 h1_queue_eos(全部 8 个
             # 通信角色 EOS)。这个戳把 flush_post->done 切成
             # 「fanout/等 EOS」与「GMM1 jobs」两段。单一写者:consumer 0 的 tx0。
-            # 原 sealer 的逐行拷贝:每个 m_block 组(GBM 行)由一个消费者拷。
-            # 目的行与 sealer 同一公式(按 tile 的 tile_dst_of_src)。可见性由
-            # 下面本 CTA 的 release + h1_compute_done acq_rel 覆盖,publisher
-            # 等齐全部 job 后才发 stage1_done。
-            sc_perm = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_dst_of_src")
-            )
-            sc_src = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_source")
-            )
-            sc_wts = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_weight")
-            )
-            sc_src_o = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_source_sorted")
-            )
-            sc_wts_o = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("tile_row_weight_sorted")
-            )
-            for sc_g in range(consumer_index, tiles // fx.Int32(G), consumer_count):
-                if tx < fx.Int32(GBM):
-                    sc_row = sc_g * fx.Int32(GBM) + tx
-                    sc_tile = sc_row // fx.Int32(BM)
-                    sc_dst = buffer_ops.buffer_load(
-                        sc_perm, sc_tile, vec_width=1, dtype=T.i32
-                    ) * fx.Int32(BM) + sc_row % fx.Int32(BM)
-                    buffer_ops.buffer_store(
-                        buffer_ops.buffer_load(
-                            sc_src, sc_row, vec_width=1, dtype=T.i32
-                        ),
-                        sc_src_o,
-                        sc_dst,
-                    )
-                    buffer_ops.buffer_store(
-                        buffer_ops.buffer_load(
-                            sc_wts, sc_row, vec_width=1, dtype=T.i32
-                        ),
-                        sc_wts_o,
-                        sc_dst,
-                    )
+            # (sortcopy removed: stage2 reads tile_row_source/weight at the
+            # physical arena row through a_tile_map.)
             # 每 job 一次 s_waitcnt(0)(全流水排空)+ release fence
             # (自带整 L2 写回)+ system acq_rel 原子 —— 这正是 stage2
             # AR57 修掉的簿记粒度(546.8 -> 245.7us),以及
@@ -2532,36 +2378,7 @@ def _compile_stage1(
                 for job in range(consumer_index, total_jobs, consumer_count):
                     _run_gemm1_job(job)
                     gpu.barrier()
-            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            gpu.barrier()
-            if tx == fx.Int32(0):
-                _remaining = total_jobs - consumer_index
-                _my_jobs = (_remaining > fx.Int32(0)).select(
-                    (_remaining + consumer_count - fx.Int32(1)) // consumer_count,
-                    fx.Int32(0),
-                )
-                if const_expr(early_local_gmm):
-                    _my_jobs = fx.Int32(1)
-                comm.fence_system_release()
-                comm.atomic_add_system_acq_rel(local_addr("h1_compute_done"), _my_jobs)
-
-        if (is_publisher) & (tx == fx.Int32(0)):
-            tiles = buffer_ops.buffer_load(
-                buffer_ops.create_buffer_resource_from_addr(local_addr("tile_alloc")),
-                fx.Int32(0),
-                vec_width=1,
-                dtype=T.i32,
-            )
-            expected_jobs = (tiles // fx.Int32(G)) * fx.Int32(GNB)
-            if const_expr(early_local_gmm):
-                # 每个 GMM1 消费者 CTA 退出时 +1。
-                expected_jobs = fx.Int32(N_CONSUMERS)
-            completed = fx.Int32(0)
-            while completed < expected_jobs:
-                completed = fx.Int32(_pl32(local_addr("h1_compute_done")))
-            comm.fence_system_acquire()
-            comm.fence_system_release()
-            comm.store_i64_global_system(stage2_addr("stage1_done"), generation)
+            # Stage2 runs after this kernel on the stream: no completion count.
 
     @flyc.jit
     def launch_stage1(
