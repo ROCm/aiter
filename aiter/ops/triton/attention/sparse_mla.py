@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-import os
 from typing import NamedTuple
 
 import torch
@@ -34,7 +33,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -200,61 +199,8 @@ def _mla_num_splits(
     return max(1, min(cta_cap, tiles, 8))
 
 
-class _Launch(NamedTuple):
-    """How one launch walks its tiles."""
-
-    async_lds: bool
-    block_k: int
-    waves_per_eu: int
-    dbuf: bool
-
-
-_NO_OCCUPANCY_HINT = 0  # what Triton takes for "let the allocator decide"
-
-
-def _staged_launch(block_k, workgroups, use_buffer_load):
-    """Dequantizing families (block-scale fp8, bf16-dot tensor fp8): the copy
-    can't feed the dot, so only the tile hint is left."""
-    waves = 1 if (use_buffer_load and workgroups <= get_num_sms()) else 2
-    return _Launch(False, block_k, waves, False)
-
-
-def _fp8_scalar_launch(num_queries, num_heads, avg_topk, workgroups):
-    """Per-tensor fp8 with fp8 dots. Pinned to 16 heads per program, so each key
-    is re-gathered num_heads / 16 times. None means the staged walk instead."""
-    # Cold decode: the staged walk's register prefetch wins, except at 128
-    # heads (narrow head blocks already re-gather the same keys there).
-    if num_queries < _PREFILL_MIN_ROWS and num_heads < 128:
-        return None
-    # L2 only absorbs the re-reads while the top-k list keeps the pool resident.
-    if num_heads == 64 and avg_topk > 1024:
-        return None
-    return _async_buffers(workgroups, 4)
-
-
-def _bf16_launch(num_queries, num_heads, workgroups):
-    """A bf16 cache: the copy lands the dot operand itself and the walk keeps the
-    wide head program, so it re-gathers nothing."""
-    if num_queries < _PREFILL_MIN_ROWS:
-        if num_heads < 64:
-            return None
-        # Decode can't fill the SIMDs anyway, and 4 waves would spill the tile;
-        # prefill's grid is large enough that waves beat registers.
-        return _Launch(True, 64, _NO_OCCUPANCY_HINT, workgroups < 4 * get_num_sms())
-    return _async_buffers(workgroups, 4)
-
-
-def _async_buffers(workgroups, waves):
-    """Enough workgroups for four waves/SIMD: one tile buffer and that hint.
-    Otherwise the LDS is free, so double-buffer and prefetch a tile ahead."""
-    if workgroups >= 4 * get_num_sms():
-        return _Launch(True, 64, waves, False)
-    return _Launch(True, 64, 2, True)
-
-
 def _async_launch_config(
     fp8_dots: bool,
-    bf16_async_ok: bool,
     has_invalid: bool,
     num_queries: int,
     heads_blocks: int,
@@ -262,31 +208,35 @@ def _async_launch_config(
     avg_topk: float,
     use_buffer_load: bool,
     uni_tile: bool = True,
+    has_extra: bool = False,
     block_k: int = 64,
-    tiles_per_program: float = 1e9,
-    num_heads: int = 0,
-) -> _Launch:
-    """Pick how this launch walks its tiles: bf16 and fp8-dot tensor-fp8 caches
-    hold the dot operand already, so the copy can feed it; everything else
-    dequantizes through registers and takes the staged walk."""
-    workgroups = num_queries * heads_blocks * max(1, num_splits)
-    staged = _staged_launch(block_k, workgroups, use_buffer_load)
-    if (
-        not (fp8_dots or bf16_async_ok)
-        or not uni_tile
-        or has_invalid
-        # The async tiles are sized for gfx950's LDS.
-        or arch_info.get_arch() == "gfx942"
-        # Under a few tiles the launch, the q load and the epilogue dominate.
-        or tiles_per_program < 4
-    ):
-        return staged
-    picked = (
-        _fp8_scalar_launch(num_queries, num_heads, avg_topk, workgroups)
-        if fp8_dots
-        else _bf16_launch(num_queries, num_heads, workgroups)
+) -> tuple[bool, int, int]:
+    """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
+
+    BLOCK_K follows what the grid supplies, not the token count: given enough
+    workgroups to fill four waves/SIMD (prefill) the small tile takes that
+    occupancy; otherwise (decode, where split-K caps the grid near two
+    workgroups/CU) the large tile wins instead, by halving the cross-warp softmax
+    exchange rate per token.
+    """
+    ASYNC_LDS_DEFAULT = True
+    enabled = (
+        ASYNC_LDS_DEFAULT
+        and fp8_dots
+        and uni_tile
+        and not has_invalid
+        and not has_extra
+        # The async tiles below are sized for gfx950's LDS.
+        and arch_info.get_arch() != "gfx942"
     )
-    return picked or staged
+    workgroups = num_queries * heads_blocks * max(1, num_splits)
+    num_sms = get_num_sms()
+    if enabled and workgroups >= 4 * num_sms:
+        return True, 64, 4
+    waves_per_eu = 2
+    if use_buffer_load and workgroups <= num_sms:
+        waves_per_eu = 1
+    return enabled, (128 if enabled else block_k), waves_per_eu
 
 
 def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
@@ -386,6 +336,8 @@ def _fp8_route(
     SWA cache as kv_buffer, the compressed top-k cache as extra_kv), both caches
     in one allocation under one scale are read as one list in one loop, from the
     lower of the two; otherwise in two loops, each from its own cache."""
+    if arch != "gfx950":  # the fp8 kernel is written for gfx950
+        return None
     _, num_heads, row = q.shape
     # the id lists are read with buffer loads (signed 32-bit offsets)
     ids_ok = all(
@@ -394,8 +346,7 @@ def _fp8_route(
         if t is not None
     )
     if not (
-        arch == "gfx950"
-        and fmt == "fp8_scalar"
+        fmt == "fp8_scalar"
         and fp8_dots
         and not skip_reduce
         and not has_invalid
@@ -671,7 +622,7 @@ def _sparse_mla_fp8_launch(
             OUT_MXFP8=mx,
             # a 2-split tile spans two warps; more would hold duplicate lanes
             num_warps=min(4, P),
-            enable_fp_fusion=False,
+            enable_fp_fusion=True,
         )
     return out, lse
 
@@ -1090,6 +1041,11 @@ def sparse_mla_fwd(
             out_mxfp8,
         )
     epilogue = inv_rope_positions is not None or out_mxfp8 is not None
+    if epilogue and (fmt != "fp8_scalar" or arch_info.get_arch() != "gfx950"):
+        raise ValueError(
+            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
+            f"got {fmt}"
+        )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
     _check_fp8_arch(arch, fmt, q.dtype)
@@ -1273,20 +1229,8 @@ def sparse_mla_fwd(
     col_reps = kv_lora_rank // 512
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
-    bf16_async_ok = fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
-    if bf16_async_ok:
-        # 16 heads/program doesn't cover the copy; 64 only pays on decode.
-        bf16_async_ok = (
-            arch == "gfx950"
-            and num_heads >= 32
-            and _staged_block_m(
-                num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
-            )
-            in ((32, 64) if num_queries < _PREFILL_MIN_ROWS else (32,))
-        )
-    async_lds_on, block_k, waves_per_eu, async_dbuf = _async_launch_config(
+    async_lds_on, block_k, waves_per_eu = _async_launch_config(
         fp8_dots,
-        bf16_async_ok,
         has_invalid,
         num_queries,
         heads_blocks,
@@ -1294,12 +1238,8 @@ def sparse_mla_fwd(
         avg_topk,
         use_buffer_load,
         uni_tile=True,
+        has_extra=has_extra,
         block_k=block_k,
-        tiles_per_program=(
-            avg_main / max(1, main_splits) + avg_extra / max(1, num_splits)
-        )
-        / block_k,
-        num_heads=num_heads,
     )
     # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout, and
     # gfx950's rope-free walk (16x16x32, STAGED_K32) pads its own tile.
@@ -1309,11 +1249,9 @@ def sparse_mla_fwd(
     )
     _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
 
-    # The wide head programs and the decode XCD remap below are tuned on gfx950.
-    staged = fmt == "fp8_scalar" or fmt == "bf16"
-    # fp8 keeps the narrow tile when async; bf16 stages nothing in registers.
-    wide_ok = not (async_lds_on and fp8_dots)
-    if arch == "gfx950" and staged and num_heads >= 32 and wide_ok:
+    # The 32/64-head programs and the decode XCD remap below are tuned on gfx950.
+    staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
+    if arch == "gfx950" and staged and num_heads in (32, 64) and not async_lds_on:
         # 32- or 64-head programs (_staged_block_m).
         block_m = _staged_block_m(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
@@ -1323,23 +1261,13 @@ def sparse_mla_fwd(
             head_aligned = num_heads % block_m == 0
             heads_blocks = (num_heads + block_m - 1) // block_m
 
-    if async_lds_on:
-        if fp8_dots:
-            # f32 acc leaves room for 4 waves/SIMD only at 16 heads/program.
-            block_m, num_warps = 16, 4
-            head_aligned = num_heads % block_m == 0
-            heads_blocks = (num_heads + block_m - 1) // block_m
-        grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
-
-    # Gated on rows/CU, not prefill-vs-decode or workgroup count, so spec
-    # decode clears the bar by row count alone.
-    # Output rows per CU above which DEFER_ROW_REDUCE and PV_ORDER pay.
-    _LOOP_BOUND_ROWS_PER_CU = 64
-    rows_per_cu = num_queries * num_heads / max(1, get_num_sms())
-    defer_row_reduce = pv_order = rows_per_cu >= _LOOP_BOUND_ROWS_PER_CU
-
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
+    # Decode keeps neighbouring rows on one XCD: a spec-decode request's rows read
+    # nearly the same KV rows and share its L2. Prefill rows gain nothing from it.
+    xcd_remap = (
+        get_num_xcds() if arch == "gfx950" and num_queries < _PREFILL_MIN_ROWS else 0
+    )
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -1392,11 +1320,10 @@ def sparse_mla_fwd(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
-        # row-contiguous output / partial stores (25% -> 100% line efficiency)
-        STORE_ROWS=os.environ.get("AITER_SPARSE_MLA_STORE_ROWS", "1") != "0",
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,
+        XCD_REMAP=xcd_remap,
         main_num_splits=main_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         DEQ="none",
@@ -1406,9 +1333,6 @@ def sparse_mla_fwd(
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
-        ASYNC_DBUF=async_dbuf,
-        DEFER_ROW_REDUCE=defer_row_reduce,
-        PV_ORDER=pv_order,
         GATHER_CACHE="",
         KV_LDS_PAD=kv_lds_pad,
         q_scl_ptr=q_scale,
@@ -1417,6 +1341,7 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -1450,5 +1375,6 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out, (lse if return_lse else None)

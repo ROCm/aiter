@@ -8,7 +8,6 @@ TODO: add details once API has settled
 """
 
 import functools
-import os
 import math
 
 import torch
@@ -38,7 +37,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -675,16 +674,12 @@ def _dsv4_block_m(num_heads, num_queries, num_splits, row_tiles, has_extra):
 
 
 def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
-    """Heads per program (16, 32 or 64) from 32 heads up, for the staged walks
-    (per-tensor fp8; bf16): 64 without split-K once the 64-head grid is big
-    enough; else 32 from two tiles per program."""
+    """Heads per program (16, 32 or 64) at 32 or 64 heads for the staged walks
+    (per-tensor fp8; bf16 with the rope inside): 64 without split-K once
+    2 x rows > CUs; else 32 from two tiles per program."""
     num_sms = get_num_sms()
-    if num_heads % 64 == 0 and num_splits == 1:
-        # At 64 heads one block/row re-reads no keys, so half-full pays; above
-        # that, rows split into re-reading blocks, so it must fill the CUs first.
-        programs = num_queries * (num_heads // 64)
-        if programs >= (num_sms // 2 + 1 if num_heads == 64 else num_sms):
-            return 64
+    if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
+        return 64
     tiles = row_tiles / num_splits
     if tiles >= 2 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
         return 32
@@ -856,8 +851,8 @@ def _pa_decode_sparse_gfx950_gluon(
     staged_bf16 = (
         not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     )
-    # Wide head programs (8 warps) stage each tile once for all their heads.
-    if num_heads >= 32:
+    # 32- and 64-head programs (8 warps) stage each key tile once for all heads.
+    if num_heads in (32, 64):
         if packed_fp8:
             BLOCK_M = _dsv4_block_m(
                 num_heads, num_queries, num_splits, row_tiles, has_extra
@@ -984,6 +979,18 @@ def _pa_decode_sparse_gfx950_gluon(
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""
 
+    # One XCD (and L2) for programs that read the same KV rows: a row's head blocks,
+    # or neighbouring rows of bf16's 32/64-head programs without split-K. Not for
+    # SWA-only prefill or launches padded past the split count.
+    rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
+    xcd_remap = (
+        get_num_xcds()
+        if rows_share and grid_splits == num_splits and (has_extra or not prefill)
+        else 0
+    )
+
+    # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
+    # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -1038,7 +1045,6 @@ def _pa_decode_sparse_gfx950_gluon(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
-        STORE_ROWS=os.environ.get("AITER_SPARSE_MLA_STORE_ROWS", "1") != "0",
         Q_CACHE=q_cache,
         GRID_ORDER="qsh",
         # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
@@ -1053,6 +1059,7 @@ def _pa_decode_sparse_gfx950_gluon(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
+        XCD_REMAP=xcd_remap,
         # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
         # size.
         DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
@@ -1061,6 +1068,7 @@ def _pa_decode_sparse_gfx950_gluon(
         **prefill_kw,
         # The epilogue runs where the output is written.
         **(epilogue if num_splits == 1 else {}),
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -1094,6 +1102,7 @@ def _pa_decode_sparse_gfx950_gluon(
         **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out
 

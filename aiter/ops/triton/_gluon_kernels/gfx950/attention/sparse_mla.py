@@ -43,13 +43,13 @@ Output: the attention kernel without SPLIT_K, else _sparse_mla_reduce. Either st
 can apply the inverse RoPE + MXFP8 epilogue (_epilogue_store).
 """
 
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 from triton.language.target_info import is_hip_cdna4
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
@@ -335,10 +335,6 @@ class Cfg:
     # stages dequantized values, which pass through registers by definition.
     # Single-buffered, the launcher decides when it is on.
     ASYNC_LDS: gl.constexpr
-    ASYNC_DBUF: gl.constexpr  # two tile buffers, two commit groups in flight
-    PV_ORDER: gl.constexpr  # read V after the p-operand exchange, not before
-    SUMDEFER: gl.constexpr  # row sum kept as a per-thread partial, reduced once
-    LDSRED: gl.constexpr  # row max through red_smem, not gl.reduce
     RELAXED_LOAD: gl.constexpr  # read LDS with the syncedViaAsyncWait hint
     ROPE_VEC: gl.constexpr  # bytes per lane in the rope buffer's copy
     SLOT_U32: gl.constexpr  # pitches < 16 MB; -1 sentinels are clamped before the split
@@ -382,9 +378,6 @@ class Cfg:
         GATHER_CACHE=".cg",
         IDX_CACHE="",
         ASYNC_LDS=False,
-        ASYNC_DBUF=False,
-        DEFER_ROW_REDUCE=False,
-        PV_ORDER=False,
         RELAXED_LOAD=True,
         PAD_INTERVAL=1024,
         SLOT_U32=False,
@@ -420,15 +413,10 @@ class Cfg:
         self.GATHER_CACHE = gl.constexpr(GATHER_CACHE)
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
-        self.ASYNC_DBUF = gl.constexpr(ASYNC_DBUF)
-        self.PV_ORDER = gl.constexpr(PV_ORDER)
-        self.SUMDEFER = gl.constexpr(DEFER_ROW_REDUCE)
-        self.LDSRED = gl.constexpr(DEFER_ROW_REDUCE)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
         self.SLOT_U32 = gl.constexpr(SLOT_U32)
         self.UNPEEL = gl.constexpr(UNPEEL)
-        # 128 bits per lane: 16 one-byte elements, 8 bf16 ones.
-        ROPE_VEC = 16 if FP8_MFMA else 8
+        ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
         # bf16 dots on 16x16x32 (gfx950's full rate) on the dsv4 and STAGED_K32 walks.
         MFMA_K = 32 if FP8_MFMA or DSV4_WALK or STAGED_K32 else 16
@@ -540,7 +528,7 @@ class Cfg:
             )
         )
 
-        AVEC = 16 if FP8_MFMA else 8  # 128-bit LDS-DMA
+        AVEC = 16  # 128-bit LDS-DMA
         ATW = KV_DIM // AVEC
         self.async_l = gl.constexpr(
             gl.BlockedLayout(
@@ -562,11 +550,9 @@ class Cfg:
         self.slot_a_l = gl.constexpr(gl.SliceLayout(1, self.async_l.value))
         self.slot_rope_a_l = gl.constexpr(gl.SliceLayout(1, self.async_rope_l.value))
         if ASYNC_LDS:
-            # Must be a multiple of the warp run, 64 * AVEC.
-            KV_INTERVAL: gl.constexpr = PAD_INTERVAL if FP8_MFMA else 64 * AVEC
             self.kv_shared = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    [[KV_INTERVAL, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                    [[PAD_INTERVAL, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
             # 64 * ROPE_VEC is this buffer's warp run: the smallest legal interval.
@@ -744,9 +730,7 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         else:
             kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
-        if False:
-            val = x_u8.to(gl.uint16).to(gl.bfloat16, bitcast=True)
-        elif fmt.DEQ == "upcast":
+        if fmt.DEQ == "upcast":
             # Upstream fused fp8 x E8M0 -> bf16 upcast; the driver only asks for
             # it when cdna4.scaled_upcast exists, else DEQ="asm" (_scaled_upcast_asm).
             # sc is the raw E8M0 byte, already in x_u8's shape and layout.
@@ -941,7 +925,7 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
             )
         else:
             k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
-        if cfg.ASYNC_LDS and cfg.FP8_MFMA:
+        if cfg.ASYNC_LDS:
             k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
         S = gl.amd.cdna4.mfma(q_dot, k, S)
     if cfg.ROPE_SEPARATE:
@@ -951,7 +935,7 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
             )
         else:
             k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
-        if cfg.ASYNC_LDS and cfg.FP8_MFMA:
+        if cfg.ASYNC_LDS:
             k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
         S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
     return S
@@ -1005,26 +989,6 @@ def _copy_tile(cfg, seg, kv_smem, rope_smem, row_l, row_r, offs_l, offs_r):
 
 
 @gluon.jit
-def _async_copy_at(cfg, seg, kv_smem, rope_smem, k_start, hi, rng_l, rng_r, offs_l, offs_r):
-    """One tile's direct-to-LDS copy at k_start, as its own commit group."""
-    if cfg.ASYNC_DBUF:
-        # Required: the membar pass does not put a WAR barrier before the copy
-        # into the buffer this warp just finished reading, so without this the
-        # copy can land while another warp is still reading it.
-        gl.barrier()
-    _copy_tile(
-        cfg,
-        seg,
-        kv_smem,
-        rope_smem,
-        _tile_rows(cfg, seg, k_start, hi, rng_l, False),
-        _tile_rows(cfg, seg, k_start, hi, rng_r, True),
-        offs_l,
-        offs_r,
-    )
-
-
-@gluon.jit
 def _async_segment(
     cfg,
     seg,
@@ -1040,9 +1004,6 @@ def _async_segment(
     v_scale,
     kv_smem,
     rope_smem,
-    kv_smem2=None,
-    rope_smem2=None,
-    red_smem=None,
 ):
     """Direct-to-LDS tile walk, one LDS buffer.
 
@@ -1050,11 +1011,6 @@ def _async_segment(
     plain load outstanding past the newest copy group would drag wait_group into
     waiting for that copy too. The body has no masked variant: the slot read is
     clamped and the partial tail falls out of the score mask (UNI_TILE).
-
-    ASYNC_DBUF: two buffers and two commit groups in flight. The loop runs
-    tiles in pairs so the buffer parity stays compile-time, and it rounds the
-    tile count up: an over-run tile scores all -inf under UNI_TILE, so it
-    leaves m, l and acc unchanged, and its clamped slot read stays in range.
     """
     BK: gl.constexpr = cfg.BLOCK_K
     offs_l = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.async_l))
@@ -1062,28 +1018,6 @@ def _async_segment(
     rng_l = gl.arange(0, BK, layout=cfg.slot_a_l)
     rng_r = gl.arange(0, BK, layout=cfg.slot_rope_a_l)
     n_full = (hi - lo + BK - 1) // BK
-    if cfg.ASYNC_DBUF:
-        _async_copy_at(cfg, seg, kv_smem, rope_smem, lo, hi, rng_l, rng_r, offs_l, offs_r)
-        for j in range((n_full + 1) // 2):
-            k0 = lo + 2 * j * BK
-            _async_copy_at(
-                cfg, seg, kv_smem2, rope_smem2, k0 + BK, hi, rng_l, rng_r, offs_l, offs_r
-            )
-            gl.amd.cdna4.async_copy.wait_group(1)
-            m_i, l_i, acc = _qkpv_lds(
-                cfg, seg, None, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
-                qk_scale, v_scale, kv_smem, rope_smem, k0, hi, red_smem,
-            )
-            _async_copy_at(
-                cfg, seg, kv_smem, rope_smem, k0 + 2 * BK, hi, rng_l, rng_r, offs_l, offs_r
-            )
-            gl.amd.cdna4.async_copy.wait_group(1)
-            m_i, l_i, acc = _qkpv_lds(
-                cfg, seg, None, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
-                qk_scale, v_scale, kv_smem2, rope_smem2, k0 + BK, hi, red_smem,
-            )
-        gl.amd.cdna4.async_copy.wait_group(0)
-        return m_i, l_i, acc
     for i in range(n_full):
         _copy_tile(
             cfg,
@@ -1112,7 +1046,6 @@ def _async_segment(
             rope_smem,
             lo + i * BK,
             hi,
-            red_smem,
         )
     return m_i, l_i, acc
 
@@ -1301,7 +1234,6 @@ def _qkpv(
     rope_smem,
     k_start=0,
     seg_hi=0,
-    red_smem=None,
 ):
     """Stage a prefetched fp8 tile into LDS, then QK -> softmax -> PV."""
     _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem)
@@ -1321,20 +1253,7 @@ def _qkpv(
         rope_smem,
         k_start,
         seg_hi,
-        red_smem,
     )
-
-
-@gluon.jit
-def _load_v(cfg, kv_smem):
-    """The PV dot's V operand, read out of the tile buffer."""
-    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-        v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
-    else:
-        v = kv_smem.load(cfg.v_layout)
-    if cfg.ASYNC_LDS and cfg.FP8_MFMA:
-        v = v.to(gl.float8e4nv, bitcast=True)
-    return v
 
 
 @gluon.jit
@@ -1405,28 +1324,26 @@ def _qkpv_lds(
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
     p = gl.exp2(S * qk_scale - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
-    if cfg.SUMDEFER:
-        l_new = l_i * alpha[:, None] + p
-    elif red_smem is not None:
+    if red_smem is not None:
         l_new = l_i * alpha + _row_reduce_lds(
             cfg, p, red_smem.slice(cfg.BLOCK_M, cfg.BLOCK_M), False
         )
     else:
         l_new = l_i * alpha + gl.sum(p, axis=1)
+    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
+    else:
+        v = kv_smem.load(cfg.v_layout)
+    if cfg.ASYNC_LDS:
+        v = v.to(gl.float8e4nv, bitcast=True)
     # "fp8_scalar": V was staged as raw fp8 code points; apply the per-tensor scale
     # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
     if seg.fmt.KIND == "fp8_scalar" and not cfg.FP8_MFMA:
         p = p * v_scale
-    # The p-operand exchange is a cross-warp LDS round trip, so the barrier
-    # before it waits on lgkmcnt(0) and throws away any V read issued earlier.
-    if not cfg.PV_ORDER:
-        v = _load_v(cfg, kv_smem)
     if cfg.FP8_MFMA:
         p_dot = gl.convert_layout(p.to(gl.float8e4nv), cfg.p_layout)
     else:
         p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
-    if cfg.PV_ORDER:
-        v = _load_v(cfg, kv_smem)
     alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.pv_layout))
     acc = acc * alpha_pv[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v, acc)
@@ -1601,10 +1518,7 @@ def _decode_tile(
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)  # guard all-masked rows
     p = gl.exp2(S - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
-    if cfg.SUMDEFER:
-        l_new = l_i * alpha[:, None] + p
-    else:
-        l_new = l_i * alpha + gl.sum(p, axis=1)
+    l_new = l_i * alpha + gl.sum(p, axis=1)
 
     v = kv_smem.load(cfg.v_layout)  # [BLOCK_K, KV_DIM]
     if seg.fmt.KIND == "fp8_scalar":
@@ -1632,9 +1546,6 @@ def _staged_segment(
     v_scale,
     kv_smem,
     rope_smem,
-    kv_smem2,
-    rope_smem2,
-    red_smem=None,
 ):
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
@@ -1687,7 +1598,6 @@ def _staged_segment(
                     k_rng_slot,
                     k_rng_rope,
                 )
-                cur_kv, cur_rope = kv_smem, rope_smem
                 m_i, l_i, acc = _qkpv(
                     cfg,
                     seg,
@@ -1703,15 +1613,13 @@ def _staged_segment(
                     head_mask,
                     qk_scale,
                     v_scale,
-                    cur_kv,
-                    cur_rope,
+                    kv_smem,
+                    rope_smem,
                     lo + (i - 1) * cfg.BLOCK_K,
                     hi,
-                    red_smem,
                 )
                 kn, ks, kr, vld = kn2, ks2, kr2, vld2
             if not cfg.UNPEEL:
-                cur_kv, cur_rope = kv_smem, rope_smem
                 m_i, l_i, acc = _qkpv(
                     cfg,
                     seg,
@@ -1727,11 +1635,10 @@ def _staged_segment(
                     head_mask,
                     qk_scale,
                     v_scale,
-                    cur_kv,
-                    cur_rope,
+                    kv_smem,
+                    rope_smem,
                     lo + (n_full - 1) * cfg.BLOCK_K,
                     hi,
-                    red_smem,
                 )
     else:
         for k_start in range(lo, hi_full, cfg.BLOCK_K):
@@ -2067,14 +1974,10 @@ def _segment(
     v_scale,
     kv_smem,
     rope_smem,
-    kv_smem2,
-    rope_smem2,
     red_smem,
     DSV4_PREFETCH: gl.constexpr,
 ):
-    """Walk keys [lo, hi) of one segment with its format's walk. kv_smem2 /
-    rope_smem2 are the direct-to-LDS walk's second tile buffer pair (==
-    kv_smem / rope_smem when it is single-buffered)."""
+    """Walk keys [lo, hi) of one segment with its format's walk."""
     if seg.fmt.KIND == "fp8_dsv4_mla":
         m_i, l_i, acc = _dsv4_segment(
             cfg,
@@ -2110,9 +2013,6 @@ def _segment(
             v_scale,
             kv_smem,
             rope_smem,
-            kv_smem2,
-            rope_smem2,
-            red_smem if cfg.LDSRED else None,
         )
     else:
         m_i, l_i, acc = _staged_segment(
@@ -2130,9 +2030,6 @@ def _segment(
             v_scale,
             kv_smem,
             rope_smem,
-            kv_smem2,
-            rope_smem2,
-            red_smem if cfg.LDSRED else None,
         )
     return m_i, l_i, acc
 
@@ -2223,6 +2120,34 @@ def _epilogue_store(
     )
 
 
+@gluon.jit
+def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.constexpr):
+    """(query, split, head block) of this program, remapped with remap_xcd so
+    the programs that read the same KV rows share an XCD and its L2."""
+    n0 = gl.num_programs(0)
+    n1 = gl.num_programs(1)
+    n2 = gl.num_programs(2)
+    lid = gl.program_id(0) + n0 * (gl.program_id(1) + n1 * gl.program_id(2))
+    w = remap_xcd(lid, n0 * n1 * n2, NUM_XCDS)
+    nh = gl.num_programs(GRID_ORDER.index("h"))
+    ns = gl.num_programs(GRID_ORDER.index("s"))
+    if SPLIT_K:
+        # Rows in blocks of ceil(nq / NUM_XCDS), about one per XCD; split-major
+        # inside a block, head block fastest.
+        nq = gl.num_programs(GRID_ORDER.index("q"))
+        t = (nq + NUM_XCDS - 1) // NUM_XCDS
+        per = t * ns * nh
+        blk = w // per
+        i = w % per
+        rows = gl.minimum(t, nq - blk * t)
+        r = i % (rows * nh)
+        q, s, h = blk * t + r // nh, i // (rows * nh), r % nh
+    else:
+        # One split per row: row-major is the same order.
+        q, s, h = w // (nh * ns), (w // nh) % ns, w % nh
+    return q, s, h
+
+
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
     ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
@@ -2300,7 +2225,6 @@ def _sparse_mla(
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
     PART_STORE_CACHE: gl.constexpr,
-    STORE_ROWS: gl.constexpr,
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     Q_CACHE: gl.constexpr,
@@ -2330,16 +2254,13 @@ def _sparse_mla(
     GATHER_CACHE: gl.constexpr = _CG,
     IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
-    ASYNC_DBUF: gl.constexpr = False,
-    # DEFER_ROW_REDUCE defers the row sum and reduces rows through LDS; both it
-    # and PV_ORDER only pay with enough rows in flight, so the launcher picks them.
-    DEFER_ROW_REDUCE: gl.constexpr = False,
-    PV_ORDER: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     PAD_INTERVAL: gl.constexpr = 1024,
     SLOT_U32: gl.constexpr = False,
     KV_LDS_PAD: gl.constexpr = 0,
     UNPEEL: gl.constexpr = False,
+    # XCD count to remap program ids over (see _xcd_work); 0 keeps grid order.
+    XCD_REMAP: gl.constexpr = 0,
     # fp8_dsv4_mla walk: gather a tile ahead (see _dsv4_segment)
     DSV4_PREFETCH: gl.constexpr = False,
     # Output epilogue (no SPLIT_K; else the reduce's): INV_ROPE un-rotates the
@@ -2419,18 +2340,13 @@ def _sparse_mla(
         or (MAIN_FMT == "fp8_scalar" and (not HAS_EXTRA or EXTRA_FMT == "fp8_scalar")),
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
-    # The copy lands cache bytes in LDS untouched, so the dot operand has to be
-    # the cache's own type. An fp8 cache read with bf16 dots dequantizes, which
-    # goes through registers by definition. The walk also needs the clamped
-    # (branch-free) tail and carries no per-tile validity vector.
+    # The direct-to-LDS path stages raw code points, needs the clamped (branch-free)
+    # tail, and carries no per-tile validity vector.
     # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
-    RAW_LDS: gl.constexpr = FP8_MFMA or (
-        MAIN_FMT == "bf16" and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
-    )
     gl.static_assert(
         (not ASYNC_LDS)
-        or (RAW_LDS and UNI_TILE and not HAS_INVALID),
-        "ASYNC_LDS requires an fp8 dot or a bf16 cache, UNI_TILE and no -1 sentinels",
+        or (FP8_MFMA and UNI_TILE and not HAS_INVALID and not HAS_EXTRA),
+        "ASYNC_LDS requires FP8_MFMA + UNI_TILE, no -1 sentinels, one segment",
     )
     gl.static_assert(
         (not UNPEEL) or UNI_TILE,
@@ -2453,10 +2369,14 @@ def _sparse_mla(
     if CS0_ALIGN > 1:
         main_cs0 = gl.multiple_of(main_cs0, CS0_ALIGN)
         extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
-    # GRID_ORDER names the launch axes in grid-dim order.
-    query_idx = gl.program_id(GRID_ORDER.index("q"))
-    split_id = gl.program_id(GRID_ORDER.index("s"))
-    pid_h = gl.program_id(GRID_ORDER.index("h"))
+    # GRID_ORDER names the launch axes in grid-dim order; dim 0 varies fastest,
+    # which decides XCD/L2 sharing.
+    if XCD_REMAP > 0:
+        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP, SPLIT_K)
+    else:
+        query_idx = gl.program_id(GRID_ORDER.index("q"))
+        split_id = gl.program_id(GRID_ORDER.index("s"))
+        pid_h = gl.program_id(GRID_ORDER.index("h"))
 
     cfg = Cfg(
         BLOCK_M,
@@ -2473,9 +2393,6 @@ def _sparse_mla(
         GATHER_CACHE,
         IDX_CACHE,
         ASYNC_LDS,
-        ASYNC_DBUF,
-        DEFER_ROW_REDUCE,
-        PV_ORDER,
         RELAXED_LOAD,
         PAD_INTERVAL,
         SLOT_U32,
@@ -2545,10 +2462,11 @@ def _sparse_mla(
     offs_d_q = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.blocked_q))
     h_q = h_off + offs_m_q
     h_mask_q = h_q < num_heads
-    q_row_ptr = q_ptr + query_idx.to(gl.int64) * q_stride0  # 32-bit offset would overflow
-    q_off = (h_q[:, None] * q_stride1 + offs_d_q[None, :]).to(gl.int32)
+    q_off = (query_idx * q_stride0 + h_q[:, None] * q_stride1 + offs_d_q[None, :]).to(
+        gl.int32
+    )
     q = gl.amd.cdna4.buffer_load(
-        ptr=q_row_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
+        ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
     )
     if FP8_MFMA and not Q_FP8:
         # bf16 q: quantize here, one e4m3 scale for this program's whole Q tile
@@ -2565,14 +2483,13 @@ def _sparse_mla(
     if ROPE_SEPARATE:
         offs_d_qr = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, cfg.blocked_q))
         qr_off = (
-            h_q[:, None] * q_stride1 + HEAD_SIZE + offs_d_qr[None, :]
+            query_idx * q_stride0
+            + h_q[:, None] * q_stride1
+            + HEAD_SIZE
+            + offs_d_qr[None, :]
         ).to(gl.int32)
         q_rope = gl.amd.cdna4.buffer_load(
-            ptr=q_row_ptr,
-            offsets=qr_off,
-            mask=h_mask_q[:, None],
-            other=0.0,
-            cache=Q_CACHE,
+            ptr=q_ptr, offsets=qr_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
         )
         q_rope_dot = gl.convert_layout(q_rope, cfg.q_layout)
     else:
@@ -2620,18 +2537,14 @@ def _sparse_mla(
     m_i = gl.full(
         [BLOCK_M], float("-inf"), gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout)
     )
-    if cfg.SUMDEFER:
-        l_i = gl.zeros([BLOCK_M, BLOCK_K], gl.float32, layout=cfg.qk_layout)
-    else:
-        l_i = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout))
+    l_i = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout))
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=cfg.pv_layout)
 
     # An fp8 buffer is half the bytes of the bf16 staging it replaces.
     SMEM_DT: gl.constexpr = gl.float8e4nv if FP8_MFMA else gl.bfloat16
-    # The LDS-DMA converts nothing: an fp8 buffer holds the cache's own u8 and
-    # the dot operands bitcast on read (free, layout-preserving); a bf16 cache is
-    # already the operand type.
-    BUF_DT: gl.constexpr = gl.uint8 if (ASYNC_LDS and FP8_MFMA) else SMEM_DT
+    # The LDS-DMA converts nothing, so an async buffer's element type has to be the
+    # cache's own u8; the dot operands bitcast on read (free, layout-preserving).
+    BUF_DT: gl.constexpr = gl.uint8 if ASYNC_LDS else SMEM_DT
     kv_smem = gl.allocate_shared_memory(BUF_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared)
     if ROPE_SEPARATE:
         rope_smem = gl.allocate_shared_memory(
@@ -2639,20 +2552,8 @@ def _sparse_mla(
         )
     else:
         rope_smem = kv_smem  # never read as the rope buffer in this geometry
-    # Second tile buffer, ping-ponged by trip parity. Costs no LDS when off.
-    if ASYNC_DBUF:
-        kv_smem2 = gl.allocate_shared_memory(BUF_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared)
-        if ROPE_SEPARATE:
-            rope_smem2 = gl.allocate_shared_memory(
-                BUF_DT, [BLOCK_K, ROPE_DIM], cfg.rope_shared
-            )
-        else:
-            rope_smem2 = kv_smem2
-    else:
-        kv_smem2 = kv_smem
-        rope_smem2 = rope_smem
     # _dsv4_segment's row max / sum exchange.
-    if DSV4_WALK or cfg.LDSRED:
+    if DSV4_WALK:
         red_smem = gl.allocate_shared_memory(
             gl.float32,
             [2 * BLOCK_M, cfg.N_WARPS],
@@ -2675,7 +2576,7 @@ def _sparse_mla(
         )
         main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
         if split_id >= work_splits:
-            pm_base = query_idx * pm_stride0.to(gl.int64) + split_id * pm_stride_s
+            pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
             gl.amd.cdna4.buffer_store(
                 gl.full(
                     [BLOCK_M],
@@ -2733,8 +2634,6 @@ def _sparse_mla(
         main_v_scale,
         kv_smem,
         rope_smem,
-        kv_smem2,
-        rope_smem2,
         red_smem,
         DSV4_PREFETCH,
     )
@@ -2773,8 +2672,6 @@ def _sparse_mla(
             extra_v_scale,
             kv_smem,
             rope_smem,
-            kv_smem2,
-            rope_smem2,
             red_smem,
             DSV4_PREFETCH,
         )
@@ -2785,8 +2682,6 @@ def _sparse_mla(
         # out = acc*s/l is what the bf16 path computes.
         acc = acc * (extra_v_scale if HAS_EXTRA else main_v_scale)
 
-    if cfg.SUMDEFER:
-        l_i = gl.sum(l_i, axis=1)
     # Move the row reductions into pv-slice space for output/partials.
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
     l_pv = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
@@ -2837,19 +2732,18 @@ def _sparse_mla(
                 OUT_MXFP8,
             )
         else:
-            out_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0  # else overflows
-            if STORE_ROWS:
-                _store_rows(out.to(out_ptr.dtype.element_ty), out_row_ptr, h_off, num_heads,
-                            out_stride1)
-            else:
-                offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-                o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
-                gl.amd.cdna4.buffer_store(
-                    out.to(out_ptr.dtype.element_ty),
-                    ptr=out_row_ptr,
-                    offsets=o_off,
-                    mask=head_mask_pv[:, None],
-                )
+            offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+            o_off = (
+                query_idx * out_stride0
+                + h_pv[:, None] * out_stride1
+                + offs_d_o[None, :]
+            ).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                out.to(out_ptr.dtype.element_ty),
+                ptr=out_ptr,
+                offsets=o_off,
+                mask=head_mask_pv[:, None],
+            )
         if HAS_LSE:
             # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
             # (m + log2 l) * ln2. A fully masked row keeps -inf, not NaN.
@@ -2862,7 +2756,7 @@ def _sparse_mla(
     else:
         # Un-normalized partials for the reduce kernel; m stays in the base-2
         # exponent domain (the triton reduce's convention too).
-        pm_base = query_idx * pm_stride0.to(gl.int64) + split_id * pm_stride_s
+        pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
         gl.amd.cdna4.buffer_store(
             m_pv,
             ptr=part_m_ptr + pm_base,
@@ -2877,47 +2771,17 @@ def _sparse_mla(
             mask=head_mask_pv,
             cache=PART_STORE_CACHE,
         )
-        a_base = query_idx * pa_stride0.to(gl.int64) + split_id * pa_stride_s
+        offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+        a_base = query_idx * pa_stride0 + split_id * pa_stride_s
+        a_off = (a_base + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
         # Follow part_acc's own dtype: bf16 halves the partial HBM traffic.
-        if STORE_ROWS:
-            _store_rows(acc.to(part_acc_ptr.dtype.element_ty), part_acc_ptr + a_base, h_off,
-                        num_heads, pa_stride_h, PART_STORE_CACHE)
-        else:
-            offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-            a_off = (h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
-            gl.amd.cdna4.buffer_store(
-                acc.to(part_acc_ptr.dtype.element_ty),
-                ptr=part_acc_ptr + a_base,
-                offsets=a_off,
-                mask=head_mask_pv[:, None],
-                cache=PART_STORE_CACHE,
-            )
-
-
-@gluon.constexpr_function
-def _row_store_layout(BLOCK_M, HEAD_SIZE, BITS, NUM_WARPS):
-    """16 B per lane along a head row: row-contiguous stores (whole cache lines)."""
-    vec = max(1, 128 // BITS)
-    tpn = max(1, min(64, HEAD_SIZE // vec))
-    return gl.BlockedLayout([1, vec], [64 // tpn, tpn], [NUM_WARPS, 1], [1, 0])
-
-
-@gluon.jit
-def _store_rows(x, ptr, h_off, num_heads, row_stride, cache: gl.constexpr = ""):
-    """Store a [BLOCK_M, HEAD_SIZE] tile (heads h_off.. as rows) through a
-    row-contiguous layout. Stored straight from the MFMA accumulator layout,
-    each lane writes 8 B scattered over 16 cache lines (25% line efficiency,
-    AegisBit); this costs one LDS round trip in the epilogue instead."""
-    BLOCK_M: gl.constexpr = x.shape[0]
-    HEAD_SIZE: gl.constexpr = x.shape[1]
-    ST_L: gl.constexpr = _row_store_layout(BLOCK_M, HEAD_SIZE, x.dtype.primitive_bitwidth,
-                                           gl.num_warps())
-    x = gl.convert_layout(x, ST_L)
-    hs = h_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, ST_L))
-    ds = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, ST_L))
-    gl.amd.cdna4.buffer_store(
-        x, ptr=ptr, offsets=(hs[:, None] * row_stride + ds[None, :]).to(gl.int32),
-        mask=(hs < num_heads)[:, None], cache=cache)
+        gl.amd.cdna4.buffer_store(
+            acc.to(part_acc_ptr.dtype.element_ty),
+            ptr=part_acc_ptr,
+            offsets=a_off,
+            mask=head_mask_pv[:, None],
+            cache=PART_STORE_CACHE,
+        )
 
 
 @gluon.constexpr_function
