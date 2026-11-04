@@ -952,6 +952,141 @@ def _gemm_a8w8_bpreshuffle_into(
         ) from e
 
 
+# Split-K reduction left to the consumer (gfx1250 PTPC bpreshuffle).
+#
+# At decode sizes the tuned gfx1250 GEMM splits K: the 16-row tiles alone would
+# put one workgroup on each of N/tile_n of the 256 CUs. The standalone kernel that
+# then sums the fp32 partials into bf16 moves little data and costs a launch and a
+# memory round trip. A deferred output skips it: the bf16 [M, N] tensor shares its
+# allocation with the unreduced [split_k, M, N] partials, and its consumer, which
+# reads each element once anyway, sums them as gemm_a8w8_splitk_reduce does (fp32,
+# split order, one round-to-nearest-even) and writes the reduced row back, so it
+# sees, and leaves behind, exactly what the two-kernel path produces.
+#
+# data_ptr of a deferred output -> (split_k, M, N, its allocation). The entry holds
+# the allocation, so its address cannot be handed out again until the consumer
+# claims it. An output nobody claims (a forward that skips its consumer) stays
+# until _SPLITK_DEFERRED_MAX newer ones push it out.
+_SPLITK_DEFERRED: dict[int, tuple[int, int, int, Tensor]] = {}
+_SPLITK_DEFERRED_MAX = 64
+
+
+def _splitk_partials_offset(m: int, n: int) -> int:
+    """Byte offset of the partials behind a deferred bf16 [m, n] output."""
+    return -(-m * n * 2 // 256) * 256
+
+
+def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
+    """(kernelName, split_k) when gemm_a8w8_bpreshuffle would run the gfx1250
+    PTPC GEMM with split_k > 1 for this call and M <= max_m, else None."""
+    if XQ.dim() != 2 or WQ.dim() != 2 or dtype != dtypes.bf16:
+        return None
+    m, k = XQ.shape
+    n, w_k = WQ.shape
+    # A padded-K weight takes the padded-XQ path; leave it to gemm_a8w8_bpreshuffle.
+    if not 0 < m <= max_m or w_k != k or get_gfx() != "gfx1250":
+        return None
+    config = get_GEMM_config_with_quant_type(
+        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
+    if config is None or config["libtype"] != "flydsl":
+        return None
+    from .flydsl.bpreshuffle_gemm_gfx1250 import parse_wmma_kernel_name
+
+    name = str(config.get("kernelName", ""))
+    cfg = parse_wmma_kernel_name(name)
+    if cfg is None or cfg["split_k"] not in (2, 4, 8):
+        return None
+    return name, cfg["split_k"]
+
+
+def gemm_a8w8_bpreshuffle_splitk_deferred(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    max_m: int = 64,
+) -> Tensor:
+    """gemm_a8w8_bpreshuffle that may leave its split-K reduction to the consumer.
+
+    When the tuned kernel for this call is the gfx1250 PTPC GEMM with split_k in
+    (2, 4, 8) and M <= max_m, the returned bf16 [M, N] tensor is NOT written yet:
+    its allocation also holds the fp32 partials. Before anything reads it, pass it
+    to a consumer that takes ``splitk_partials(Y)`` (fused_qknorm_idxrqknorm's
+    ``qkv_partials``) or call ``reduce_splitk_partials(Y)``. Any other call returns
+    gemm_a8w8_bpreshuffle's output. Same kernel, same partials either way, so the
+    finished tensor is bitwise what gemm_a8w8_bpreshuffle returns. Eager only: the
+    hand-off is host state, so a graph must capture producer and consumer together.
+    """
+    deferred = _splitk_deferrable(XQ, WQ, dtype, max_m)
+    if deferred is None:
+        Y = gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype=dtype)
+        _SPLITK_DEFERRED.pop(Y.data_ptr(), None)
+        return Y
+    from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
+
+    kernel_name, split_k = deferred
+    m, n = XQ.shape[0], WQ.shape[0]
+    off = _splitk_partials_offset(m, n)
+    nbytes = off + split_k * m * n * 4
+    buf = torch.empty(nbytes, dtype=torch.uint8, device=XQ.device)
+    Y = buf[: m * n * 2].view(dtype).view(m, n)
+    partials = buf[off:].view(torch.float32).view(split_k, m, n)
+    run_gemm_a8w8_bpreshuffle_gfx1250(
+        XQ, WQ, x_scale, w_scale, Y, kernel_name, partials=partials
+    )
+    while len(_SPLITK_DEFERRED) >= _SPLITK_DEFERRED_MAX:
+        _SPLITK_DEFERRED.pop(next(iter(_SPLITK_DEFERRED)))
+    _SPLITK_DEFERRED[Y.data_ptr()] = (split_k, m, n, buf)
+    return Y
+
+
+def splitk_partials(y: Tensor) -> Tensor | None:
+    """Claim the unreduced fp32 [split_k, M, N] partials of ``y``, an output (or a
+    leading row slice of one) of gemm_a8w8_bpreshuffle_splitk_deferred, or None
+    when ``y`` already holds its values. The claimer must leave ``y`` reduced:
+    hand the partials to a consumer that writes the row back, or to
+    reduce_splitk_partials."""
+    entry = _SPLITK_DEFERRED.get(y.data_ptr())
+    if entry is None:
+        return None
+    split_k, m, n, buf = entry
+    storage = y.untyped_storage()
+    if (
+        storage.nbytes() != buf.numel()
+        or storage.data_ptr() != buf.data_ptr()
+        or y.dtype != dtypes.bf16
+        or y.dim() != 2
+        or y.shape[0] > m
+        or y.shape[1] != n
+        or y.stride() != (n, 1)
+    ):
+        return None
+    del _SPLITK_DEFERRED[y.data_ptr()]
+    partials = torch.empty(0, dtype=torch.float32, device=y.device)
+    return partials.set_(
+        storage, _splitk_partials_offset(m, n) // 4, (split_k, m, n), (m * n, n, 1)
+    )
+
+
+def reduce_splitk_partials(y: Tensor, partials: Tensor | None = None) -> Tensor:
+    """Finish a deferred split-K output in place with the standalone reduce kernel
+    (the one gemm_a8w8_bpreshuffle runs); ``partials`` are its claimed partials,
+    claimed here when None. A tensor that holds its values is returned as is."""
+    if partials is None:
+        partials = splitk_partials(y)
+        if partials is None:
+            return y
+    from .flydsl.bpreshuffle_gemm_gfx1250 import reduce_splitk_partials_gfx1250
+
+    _, m, n = partials.shape
+    full = torch.empty(0, dtype=y.dtype, device=y.device)
+    full.set_(y.untyped_storage(), 0, (m, n), (n, 1))
+    reduce_splitk_partials_gfx1250(partials, full)
+    return y
+
+
 # Only ``out`` is written, so it is the only argument declared mutable; the
 # default mutates_args="unknown" would mark every input as written and make
 # torch.compile copy them back. Returning nothing keeps the op free of outputs
