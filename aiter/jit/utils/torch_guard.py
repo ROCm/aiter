@@ -1,12 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 import importlib
+import sys
 import types
 from collections.abc import Callable
 from typing import Any, Union, get_args, get_origin
 
 from packaging import version
 from packaging.version import Version
+
+if "aiter" in sys.modules:
+    # jit/core.py loads this file by path as `torch_guard` and the ops load it
+    # as `aiter.jit.utils.torch_guard`; both copies share one hook registry.
+    from aiter.jit.utils.call_hook import _hooks as _call_hooks
+    from aiter.jit.utils.call_hook import call_with_hooks
+else:  # loaded by path outside the package, e.g. by a build script
+    from call_hook import _hooks as _call_hooks
+    from call_hook import call_with_hooks
 
 aiter_lib = None
 _host_scalar_ops_real = False
@@ -225,6 +235,8 @@ def torch_compile_guard(
         calling_func = calling_func_ if calling_func_ is not None else func
 
         def wrapper(*args, **kwargs):
+            if _call_hooks:
+                return call_with_hooks(calling_func.__name__, func, args, kwargs)
             return func(*args, **kwargs)
 
         try:

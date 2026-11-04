@@ -3,12 +3,24 @@
 
 
 import ctypes
+import sys
 from collections.abc import Callable
 
 import torch
 from torch.library import Library
 
 from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger
+
+
+def _call_hook_registry():
+    """aiter's call hooks (`aiter.jit.utils.call_hook`), the registry the ops
+    `torch_compile_guard` registers share; none for a process that loads this
+    module outside the aiter package, e.g. a build script."""
+    if "aiter" not in sys.modules:
+        return [], None
+    from aiter.jit.utils.call_hook import _hooks, call_with_hooks
+
+    return _hooks, call_with_hooks
 
 
 def log_args(func, *args, **kwargs):
@@ -115,9 +127,13 @@ def direct_register_custom_op(
     """
     import torch.library
 
+    call_hooks, call_with_hooks = _call_hook_registry()
+
     def _op_func(*args, **kwargs):
         if AITER_LOG_MORE >= 2:
             log_args(op_func, *args, **kwargs)
+        if call_hooks:
+            return call_with_hooks(op_name, op_func, args, kwargs)
         return op_func(*args, **kwargs)
 
     if hasattr(torch.library, "infer_schema"):

@@ -16,6 +16,7 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from ..jit.utils.call_hook import observe
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -2958,6 +2959,7 @@ def flash_attn_func(
     )
 
 
+@observe
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3727,6 +3729,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+@observe
 def flash_attn_varlen_func(
     q,
     k,

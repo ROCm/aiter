@@ -28,6 +28,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from ..jit.utils.call_hook import observe
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
@@ -144,6 +145,7 @@ def _pa_fwd_asm(
 ) -> None: ...
 
 
+@observe
 def pa_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -586,6 +588,7 @@ def _attention_ps_reduce_asm(
     """
 
 
+@observe
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]

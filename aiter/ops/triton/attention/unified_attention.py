@@ -5,6 +5,7 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter.jit.utils.call_hook import observe
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
@@ -235,6 +236,7 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     )
 
 
+@observe
 def unified_attention(
     q,
     k,
