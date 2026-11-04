@@ -943,11 +943,11 @@ class Gfx1250Traits:
 
     @property
     def bf16_wave_query_tiles(self):
-        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # Two to four D128 query tiles over BF16 page128 caches: pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
         return (
             self.bf16_page128_packed
-            and self.m_tiles == self.NWARP
+            and 2 <= self.m_tiles <= self.NWARP
             and self.head_dim == 128
         )
 

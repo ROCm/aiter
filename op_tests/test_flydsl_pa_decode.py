@@ -358,6 +358,143 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
     return output.reshape_as(query)
 
 
+@pytest.mark.parametrize("query_length", [2, 3])
+@pytest.mark.parametrize("mode", ["direct", "cluster", "reducer", "last"])
+@pytest.mark.parametrize("pattern", ["constant", "stepped", "random"])
+def test_pa_decode_bf16_wave_large_logits(
+    device, monkeypatch, query_length, mode, pattern
+):
+    """Large finite logits retain normalization with uniform and varied KV.
+
+    A CPU float64 oracle subtracts the maximum before normalizing. Equal
+    logits and repeated maxima expose cancellation in a fused exponent;
+    varied V also checks the attention weights. Eager and captured calls
+    cover each merge path, partial pages and empty sequences.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 BF16 wave tiles")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    from aiter.ops.flydsl.kernels.pa_decode.traits import Gfx1250Traits
+
+    dim, heads, page = 128, 16, 128
+    length = 8192 if mode == "reducer" else 1027
+    lengths = [length, 0, 0, 0] if mode == "last" else [length, length - 3, 0]
+    batch, pages = len(lengths), -(-length // page)
+    generator = torch.Generator().manual_seed(7269)
+    q_cpu = torch.randn(batch * query_length, heads, dim, generator=generator).to(
+        torch.bfloat16
+    )
+    key_cpu = torch.randn(batch * pages, 1, page, dim, generator=generator).to(
+        torch.bfloat16
+    )
+    value_cpu = torch.randn(key_cpu.shape, generator=generator).to(torch.bfloat16)
+    if pattern == "constant":
+        q_cpu.fill_(1)
+        key_cpu.fill_(1)
+        value_cpu.fill_(0.5)
+    elif pattern == "stepped":
+        token = torch.arange(batch * pages * page).reshape(batch * pages, 1, page, 1)
+        key_cpu.copy_((1 + (token % 3) * 0.5).expand_as(key_cpu))
+        channel = torch.arange(dim).reshape(1, 1, 1, dim)
+        value_cpu.copy_(((token * 3 + channel) % 17 - 8) / 16)
+        q_cpu.fill_(1)
+        q_cpu[:, ::2].fill_(-1)
+    key = key_cpu.reshape(batch * pages, 1, page, dim // 8, 8)
+    key = key.permute(0, 1, 3, 2, 4).contiguous().to(device)
+    value = value_cpu.reshape(batch * pages, 1, page // 8, 8, dim)
+    value = value.permute(0, 1, 2, 4, 3).contiguous().to(device)
+    table_cpu = torch.arange(batch * pages, dtype=torch.int32).reshape(batch, pages)
+    table = table_cpu.to(device)
+    context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    cap = {"direct": 1, "cluster": 4, "reducer": 256, "last": 4}[mode]
+    plan = pa.plan_pa_decode(
+        context,
+        1,
+        query_length=query_length,
+        max_partitions=cap,
+        workgroup_budget=1 if mode == "last" else 512,
+    )
+    shape = (1, plan.capacity, query_length * heads)
+    scratch = {
+        "max_logits": torch.empty(shape, device=device),
+        "exp_sums": torch.empty(shape, device=device),
+        "temporary_output": torch.empty(
+            (*shape, dim), dtype=torch.bfloat16, device=device
+        ),
+    }
+    query, output = q_cpu.to(device), torch.empty_like(q_cpu, device=device)
+    compile_original, launches = pa.compile_pa_decode_tile, []
+
+    def compiler(**kwargs):
+        launches.append(kwargs)
+        return compile_original(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", compiler)
+
+    def run():
+        pa.pa_decode(
+            output,
+            query,
+            key,
+            value,
+            context,
+            table,
+            dim**-0.5,
+            query_length,
+            compute_type=torch.bfloat16,
+            work_plan=plan,
+            max_context_length=length,
+            **scratch,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    kwargs = launches[0]
+    traits = Gfx1250Traits(
+        head_dim=dim,
+        query_group_size=heads,
+        block_size=page,
+        softmax_scale=dim**-0.5,
+        query_dtype="bf16",
+        compute_dtype="bf16",
+        per_token_kv=False,
+        sliding_window=0,
+        query_length=query_length,
+        trans_v=True,
+    )
+    assert traits.bf16_wave_query_tiles
+    assert kwargs["direct_output"] == (mode in ("direct", "last"))
+    assert kwargs["cluster_merge"] == (4 if mode == "cluster" else 0)
+    for magnitude in (1.0, 1e10, 1e20, 1e30):
+        scaled_q = (q_cpu.float() * magnitude).to(torch.bfloat16)
+        query.copy_(scaled_q)
+        reference = torch.zeros_like(scaled_q, dtype=torch.float64)
+        for seq, live in enumerate(lengths):
+            k = key_cpu[table_cpu[seq]].reshape(-1, dim)[:live].double()
+            v = value_cpu[table_cpu[seq]].reshape(-1, dim)[:live].double()
+            for position in range(query_length):
+                visible = live - query_length + position + 1
+                if visible <= 0:
+                    continue
+                row = seq * query_length + position
+                scores = scaled_q[row].double() @ k[:visible].T * dim**-0.5
+                assert torch.isfinite(scores).all()
+                assert scores.abs().max() < torch.finfo(torch.float32).max
+                reference[row] = torch.softmax(scores, dim=-1) @ v[:visible]
+        for captured in (False, True):
+            output.fill_(float("nan"))
+            graph.replay() if captured else run()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output.cpu().float(),
+                reference.float(),
+                atol=5e-3,
+                rtol=5e-3,
+            )
+
+
 def _make_inputs(
     query_length,
     kv_heads,
@@ -483,7 +620,53 @@ _COMMON_CASES = [
         },
     ),
 ]
+_WAVE_TILE_CASES = [
+    # BF16 pairs keep softmax and P in registers for two/three query tiles.
+    # Matching FP8 geometries pin the existing fallback path.
+    (
+        "mtp2-g16-page128-wave-direct",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-cluster",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+    (
+        "mtp5-g8-page128-wave-merge",
+        {
+            "query_length": 5,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+]
+
+
 _FP8_CASES = _COMMON_CASES + [
+    *_WAVE_TILE_CASES,
     (
         "packed-mtp4",
         {
@@ -570,6 +753,34 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_WAVE_TILE_CASES,
+    (
+        "mtp3-g16-page128-wave-window-sinks",
+        {
+            "query_length": 3,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65, 300, 1027, 4100),
+            "max_partitions": 4,
+            "window": 700,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+    (
+        "mtp2-g16-page128-wave-fp16-query",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65, 1027, 4100),
+            "max_partitions": 4,
+            "query_dtype": torch.float16,
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
     (
         "mtp",
         {
@@ -874,6 +1085,27 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["wave_tiles"] and arch == "gfx1250":
+        from aiter.ops.flydsl.kernels.pa_decode.traits import Gfx1250Traits
+
+        kwargs = compile_kwargs[-1]
+        traits = Gfx1250Traits(
+            head_dim=kwargs["head_dim"],
+            query_group_size=kwargs["query_group_size"],
+            block_size=kwargs["block_size"],
+            softmax_scale=kwargs["softmax_scale"],
+            query_dtype=kwargs["query_dtype"],
+            per_token_kv=kwargs["per_token_kv"],
+            query_length=kwargs["query_length"],
+            trans_v=kwargs["trans_v"],
+            sliding_window=kwargs["sliding_window"],
+            compute_dtype=kwargs["kv_dtype"],
+        )
+        # New BF16 tiles use the wave layout with explicitly scaled logits;
+        # FP8 retains the parent's fallback until its arithmetic is repaired.
+        assert (
+            traits.bf16_wave_query_tiles if traits.bf16 else not traits.wave_query_tiles
+        )
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
@@ -949,6 +1181,7 @@ def test_pa_decode(case, device, monkeypatch):
             "pipe": False,
             "staged": None,
             "cluster": None,
+            "wave_tiles": False,
         },
         **case,
     )
