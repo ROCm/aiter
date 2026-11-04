@@ -459,12 +459,16 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    use_valid_token_count=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
+    ``use_valid_token_count`` (atomic only): bound scatter rows by
+    min(cumsum[1], M) -- a LocalToken sort pads with token id = real count, which
+    is still < M when M is a padded (cudagraph) row count.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -478,6 +482,7 @@ def compile_gemm2_a16w4_port(
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
     _use_reduce = epilog == "reduce"
+    use_valid_token_count = bool(use_valid_token_count and not _use_reduce)
     _topk = int(topk) if _use_reduce else 1
     if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
@@ -519,6 +524,8 @@ def compile_gemm2_a16w4_port(
         _name += "_persist"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
+    if use_valid_token_count:
+        _name += "_valid_tokens"
 
     @fx.struct
     class SharedStorage:
@@ -545,6 +552,10 @@ def compile_gemm2_a16w4_port(
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
+        row_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = _global_i32_at(arg_cumsum, fx.Int32(1))
+            row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2 locality.
@@ -581,7 +592,7 @@ def compile_gemm2_a16w4_port(
                 tile,
                 lane,
                 wave,
-                i32_M,
+                row_limit,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,

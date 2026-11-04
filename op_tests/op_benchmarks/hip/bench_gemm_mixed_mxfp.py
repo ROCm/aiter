@@ -14,6 +14,7 @@ import torch
 
 import aiter
 from aiter.ops.gemm_op_a4w4 import (
+    _gemm_a4w4_preshuffle,
     gemm_a4w4_asm,
     gemm_a4w4_blockscale,
     get_GEMM_config,
@@ -59,11 +60,20 @@ def _setup_a4w4(x, w, M, N, K):
     config = get_GEMM_config(M, N, K)
     kernel = str(config.get("kernelName", "")) if config is not None else ""
     split_k = int(config.get("splitK", 0) or 0) if config is not None else 0
-    use_ck = bool(config is not None and "_ZN" not in kernel)
+    preshuffle = kernel.startswith(("triton_", "flydsl_"))
+    use_ck = bool(kernel and not preshuffle and not kernel.startswith("_ZN"))
+    backend = kernel.split("_")[0] if preshuffle else "ck" if use_ck else "asm"
     out = torch.empty((_ceil(M, 32), N), dtype=torch.bfloat16, device=x.device)
 
     def run(a, a_scale):
-        if use_ck:
+        if preshuffle:
+            # Keep the fixed output buffer and time the configured kernel directly.
+            result = _gemm_a4w4_preshuffle(
+                a, weight, a_scale, weight_scale, out, kernel
+            )
+            if result is None:
+                raise ValueError(f"Unsupported A4W4 benchmark kernel: {kernel}")
+        elif use_ck:
             gemm_a4w4_blockscale(
                 a,
                 weight,
@@ -90,7 +100,7 @@ def _setup_a4w4(x, w, M, N, K):
         lambda: run(static_a, static_a_scale),
         lambda: run(*quantize(x, quant_dtype=dtypes.fp4x2, shuffle=True)),
         out,
-        f"{'ck' if use_ck else 'asm'}:{kernel or 'heuristic'}",
+        f"{backend}:{kernel or 'heuristic'}",
     )
 
 
