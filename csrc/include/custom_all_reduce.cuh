@@ -5130,6 +5130,12 @@ template <typename T>
 void dispatchAllGather(
     hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
+    // Idle DP-attention groups can have empty shards. There is no payload to exchange,
+    // and launching zero blocks would leave an error for the next operator to report.
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);
