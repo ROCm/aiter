@@ -12,7 +12,7 @@ from gemm_moe_ck2stages_common import (
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "gemm_moe_ck2stages_common{quanttype}.cuh"
+{prelude}#include "gemm_moe_ck2stages_common{quanttype}.cuh"
 
 using A0DataType = {A0DataType};
 using B0DataType = {B0DataType};
@@ -830,11 +830,17 @@ heuristic_dispatch_dict = {
 }
 
 
-def generate_instance_and_lookUpTable_head(working_path):
+def generate_instance_and_lookUpTable_head(working_path, activation=None):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     if os.path.exists(f_lookUpTable):
         os.remove(f_lookUpTable)
     with open(f_lookUpTable, "w") as f_lookup:
+        if activation in ("swiglustep", "silulimit"):
+            # The runtime passes ActivationType::Silu; this module only holds
+            # clamped stage1 instances, so Silu must map to their act value.
+            f_lookup.write(
+                f"#define AITER_CK_MOE_STAGE1_SILU_ACT_OP {ACT_OP_MAP[activation]}\n"
+            )
         f_lookup.write(LOOKUP_head)
 
     f_gemm1_heuristic_dispatch = os.path.join(
@@ -947,6 +953,11 @@ class ck_moe_2stage_gemm_codegen:
                 if not os.path.exists(f_instance):
                     with open(f_instance, "a") as f_ins:
                         stage_instance = STG_INSTANCE_IMPL.format(
+                            prelude=(
+                                "#define AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT 1\n"
+                                if self.activation == "silulimit"
+                                else ""
+                            ),
                             quanttype=quanttype,
                             A0DataType=self.a_dtype,
                             B0DataType=self.b_dtype,
@@ -1099,7 +1110,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu", "gelutanh"],
+        choices=["silu", "gelu", "swiglu", "gelutanh", "swiglustep", "silulimit"],
         help="select activation",
     )
 
@@ -1147,7 +1158,7 @@ if __name__ == "__main__":
         "per_1x128": 4,
     }
 
-    generate_instance_and_lookUpTable_head(args.working_path)
+    generate_instance_and_lookUpTable_head(args.working_path, args.activation)
     # build all
     if args.b_dtype is None:
         # quanted moe

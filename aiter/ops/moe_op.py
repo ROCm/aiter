@@ -2,11 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 
 import torch
 from torch import Tensor
 
-from ..jit.core import AITER_CSRC_DIR, compile_ops
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
 from ..utility import dtypes
 from .enum import ActivationType, QuantType
 
@@ -353,6 +354,9 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
+    swiglustep: bool = False,
+    silulimit: bool = False,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -368,6 +372,8 @@ def cmdGenFunc_ck_moe_stage(
         mul_routed_weight_stage,
         is_shuffled,
         is_splitk,
+        swiglustep,
+        silulimit,
     )
     return {
         "md_name": md_name,
@@ -434,7 +440,79 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
 ) -> None: ...
+
+
+@compile_ops(
+    "module_moe_ck2stages",
+    fc_name="ck_moe_stage1",
+    gen_func=functools.partial(cmdGenFunc_ck_moe_stage, swiglustep=True),
+)
+def ck_moe_stage1_swiglustep(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
+) -> None: ...
+
+
+@compile_ops(
+    "module_moe_ck2stages",
+    fc_name="ck_moe_stage1",
+    gen_func=functools.partial(cmdGenFunc_ck_moe_stage, silulimit=True),
+)
+def ck_moe_stage1_silulimit(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
+) -> None: ...
+
+
+@functools.lru_cache(maxsize=1)
+def ck_moe_has_runtime_swiglu_limit() -> bool:
+    """True when the CK headers take a runtime SiLU clamp (rocm-libraries#13490)."""
+    header = os.path.join(
+        CK_DIR, "include/ck/tensor_operation/gpu/grid/gridwise_moe_gemm.hpp"
+    )
+    try:
+        with open(header) as f:
+            return "RuntimeSwigluLimit" in f.read()
+    except OSError:
+        return False
 
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)
@@ -611,6 +689,8 @@ def get_moe_stage_module(
     mul_routed_weight_stage,
     preshuffle_mode=False,
     is_splitk=False,
+    swiglustep=False,
+    silulimit=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -630,6 +710,13 @@ def get_moe_stage_module(
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
     act = str(activation).split(".")[-1].lower()
+    if swiglustep and silulimit:
+        raise ValueError("swiglustep and silulimit are separate stage1 modules")
+    if swiglustep or silulimit:
+        clamped_act = "swiglustep" if swiglustep else "silulimit"
+        if act != "silu":
+            raise ValueError(f"{clamped_act} requires Silu activation, got {act}")
+        act = clamped_act
     quant_type = str(quant_type).split(".")[-1].lower()
 
     parts = [
@@ -671,8 +758,23 @@ def ck_moe_stage1_fwd(
     splitk: int | None = 1,
     use_non_temporal_load: bool | None = False,
     dst_type: torch.dtype | None = None,
+    swiglustep: bool = False,
+    swiglu_limit: float | None = None,
 ):
-    ck_moe_stage1(
+    extra = {}
+    if swiglu_limit is not None:
+        # A limit selects the silulimit module, the only stage1 that reads it.
+        if swiglustep:
+            raise ValueError("swiglustep has a compile-time limit; do not pass one")
+        if quant_type not in (QuantType.per_Token, QuantType.per_Tensor):
+            raise NotImplementedError(
+                f"CK stage1 has no runtime swiglu_limit epilogue for {quant_type}"
+            )
+        stage1 = ck_moe_stage1_silulimit
+        extra["swiglu_limit"] = float(swiglu_limit)
+    else:
+        stage1 = ck_moe_stage1_swiglustep if swiglustep else ck_moe_stage1
+    stage1(
         hidden_states,
         w1,
         w2,
@@ -692,6 +794,7 @@ def ck_moe_stage1_fwd(
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
+        **extra,
     )
     return out
 
