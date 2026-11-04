@@ -86,14 +86,21 @@ def block_attn_mask_to_lut_kernel(
     lut_start: torch.Tensor,
     lut_count: torch.Tensor,
     kv_block_indices: torch.Tensor,
-    BLOCK_KB: int = 128,
+    BLOCK_KB: int | None = None,
 ):
     """
     Launch the LUT-fill kernel. Caller must ensure block_attn_mask is 4D
     (batch, num_heads, num_q_blocks, num_kv_blocks) and kv_block_indices has
     length lut_count.sum().
+
+    BLOCK_KB, the mask columns scanned per step, defaults to the row length
+    rounded up to a power of two and clamped to [128, 2048]: each step is a
+    serial cumsum, so a long row wants few steps, while a width past the row
+    wastes lanes.
     """
     batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+    if BLOCK_KB is None:
+        BLOCK_KB = min(2048, max(128, triton.next_power_of_2(num_kv_blocks)))
     num_programs = batch * num_heads * num_q_blocks
 
     grid = (num_programs,)
