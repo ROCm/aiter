@@ -609,6 +609,11 @@ def get_wmma_m_rep(
     return tile_m // m_warp // wmma_m
 
 
+@functools.cache
+def _log_tile_fit_once(msg: str) -> None:
+    logger.info("[grouped-moe] default tile narrowed to fit the shape: %s", msg)
+
+
 def _fit_tile_n(n: int, tile_n: int, n_warp: int) -> tuple[int, int]:
     """Halve ``tile_n`` (and ``n_warp`` while its wave tile stays >= 64) until
     it divides ``n``."""
@@ -667,6 +672,7 @@ def _grouped_a8w4_tdm_moe(
     persistent_workers2=0,
     k_waves1=1,
     k_waves2=1,
+    tiles_configured=False,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -745,15 +751,30 @@ def _grouped_a8w4_tdm_moe(
                     f"the compact plan's row alignment {_plan_align}"
                 )
     # The B loads do not clamp N, so a partial last N tile would read the next
-    # expert's rows (and fault past the last one). Narrow such a tile, e.g. the
-    # 256-wide default at inter_dim=576 (N=1152), to one that divides N.
-    tile_n, n_warp = _fit_tile_n(2 * inter_dim, tile_n, n_warp)
-    tile_n2, n_warp2 = _fit_tile_n(model_dim, tile_n2, n_warp2)
-    # A half-k128 K tail (inter_dim % 128 == 64) only runs with a k128 tile.
-    if model_dim % 128:
-        tile_k = 128
-    if inter_dim % 128:
-        tile_k2 = 128
+    # expert's rows (and fault past the last one), and a half-k128 K tail
+    # (K % 128 == 64) only runs with a k128 tile. A tile the caller configured
+    # (CSV row or AITER_TDM_* override) must already fit; only the built-in
+    # default, e.g. 256 wide at inter_dim=576 (N=1152), is narrowed, and the
+    # tile that actually launches is logged.
+    fit_n, fit_nw = _fit_tile_n(2 * inter_dim, tile_n, n_warp)
+    fit_n2, fit_nw2 = _fit_tile_n(model_dim, tile_n2, n_warp2)
+    fit_k = 128 if model_dim % 128 else tile_k
+    fit_k2 = 128 if inter_dim % 128 else tile_k2
+    asked = (tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2)
+    fitted = (fit_n, fit_nw, fit_k, fit_n2, fit_nw2, fit_k2)
+    if fitted != asked:
+        _fit_msg = (
+            f"gemm1 (N={2 * inter_dim}, K={model_dim}) tile_n/n_warp/tile_k "
+            f"{tile_n}/{n_warp}/{tile_k} -> {fit_n}/{fit_nw}/{fit_k}; "
+            f"gemm2 (N={model_dim}, K={inter_dim}) tile_n2/n_warp2/tile_k2 "
+            f"{tile_n2}/{n_warp2}/{tile_k2} -> {fit_n2}/{fit_nw2}/{fit_k2}"
+        )
+        if tiles_configured:
+            raise ValueError(
+                f"[grouped-moe] configured tile does not fit the shape: {_fit_msg}"
+            )
+        _log_tile_fit_once(_fit_msg)
+        tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2 = fitted
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
@@ -1817,10 +1838,12 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
-            # The model_configs/ merge fills a column an older table lacks
-            # (e.g. kimik3tp8) with 0, so a k_waves below 1 means unset.
-            _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("k_waves1"), 1))
-            _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("k_waves2"), 1))
+            # split_k1/split_k2 split each GEMM's K across that many wave groups
+            # inside one workgroup (k_waves); the grid stays the same. Blank or 0
+            # (the model_configs/ merge fills a column an older table lacks with
+            # 0) means unset, i.e. no split.
+            _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
+            _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
@@ -1891,6 +1914,12 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A tile from the CSV row or an AITER_TDM_* override must fit as given;
+        # only the built-in default may be narrowed (see _grouped_a8w4_tdm_moe).
+        _tdm_kw["tiles_configured"] = any(
+            k in _tdm_kw
+            for k in ("tile_n", "tile_k", "n_warp", "tile_n2", "tile_k2", "n_warp2")
+        )
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,

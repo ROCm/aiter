@@ -2250,6 +2250,14 @@ def build_gemm_a8w4_tdm_task(
                                 dst_byte,
                                 mask=is_kgrp0,
                             )
+                            # Half-k128 tail (inter_dim % 128 == 64): one scale
+                            # dword carries the e8m0 of four 32-column MX blocks,
+                            # i.e. one k128 of GEMM2's K, but the last dword only
+                            # has two real blocks. GEMM2 still reads all four
+                            # bytes (against zero A data in the padded half), so
+                            # the lane that writes the last real block also fills
+                            # bytes 2..3 with 0x7F (2^0): a stale 0xFF there is
+                            # NaN, and 0 * NaN poisons the whole output row.
                             buffer_store(
                                 fx.Int16(0x7F7F),
                                 scale_rsrc,
