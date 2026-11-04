@@ -190,7 +190,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(asm_mla_sparse_prefill_v41_fwd,
                          num_splits > 1 ? partial_r->data_ptr() : nullptr,
                          num_splits > 1 ? partial_lse->data_ptr() : nullptr};
     size_t arg_size = sizeof(args);
-    static AiterAsmKernel kernel("mla_v41_fused_cs_v1", "mla_v41/mla_v41_fused_cs_v1.co");
+    static AiterAsmKernel kernel("mla_v41_fused_cs_v1",
+                                 "mla_v41/fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41.co");
     const int s = static_cast<int>(num_splits);
     // Query is grid.y even for S1. S>1 merges within one cluster and one launch.
     kernel.launch_kernel({&args, &arg_size, s, static_cast<int>(n), 1, 128, 1, 1, stream, s, 1, 1});
