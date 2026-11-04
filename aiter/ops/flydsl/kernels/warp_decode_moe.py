@@ -5,11 +5,9 @@
 
 Warp-decode MoE targets very small M (B = 1..4 decode tokens) where a single
 wave (64 lanes) cooperatively computes one output scalar with ``v_dot2_f32_bf16``
-instead of the matrix cores.  This module is being built incrementally:
-
-* Phase 1 (this file): the three low-level primitives the kernels are built
-  from, each wrapped so it can be unit-tested in isolation against a torch
-  reference on real gfx950 hardware:
+instead of the matrix cores. The builders are the FP8, MXFP4, and BF16
+``gate_up`` / ``down_reduce`` kernels, plus a primitive launcher that checks
+the three operations they share:
 
     1. ``dot2_f32_bf16``          -- local ``v_dot2_f32_bf16`` inline-asm helper
                                      (2 bf16 MACs/lane into an f32 accumulator).
@@ -17,13 +15,8 @@ instead of the matrix cores.  This module is being built incrementally:
                                      ``cvt_scalef32_pk_bf16_fp8`` ROCDL op.
     3. 64-lane butterfly reduce   -- ``shuffle_xor`` sum over shifts 1,2,4,8,16,32.
 
-  ``build_warp_decode_primitives_module`` returns a compiled-able launcher that
-  exercises all three so the Phase 1 test can validate correctness before the
-  gate_up / down_reduce kernels are layered on in later phases.
-
 Reference: ``ck_tile/ops/warp_decode/`` (WARP_DECODE_MOE_KERNELS.md and
-``kernel/warp_decode_numeric.hpp``); see ``SILOTIGER-667-plan.md`` for the
-full design notes and phased plan.
+``kernel/warp_decode_numeric.hpp``).
 """
 
 from __future__ import annotations
@@ -33,12 +26,15 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.extras import types as T
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 WARP_SIZE = 64
 # Butterfly-reduce shifts for a full 64-lane wave (low -> high).
@@ -48,22 +44,25 @@ _REDUCE_SHIFTS = (1, 2, 4, 8, 16, 32)
 # -------------------------------------------------------------------------
 # Primitive helpers (raw ir.Value in / out; call inside a @flyc.kernel body)
 # -------------------------------------------------------------------------
-def _ptr_rsrc(ptr):
-    """Turn an ``fx.Pointer`` kernel arg into a buffer resource descriptor."""
-    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(ptr)))
+def _i32_pack(base):
+    """dword / dwordx2 / dwordx4 views of an fx pointer or an i64 byte address.
 
-
-def _ptr_rsrc_off(ptr, byte_off_i64):
-    """Buffer resource whose base is ``ptr`` advanced by an i64 **byte** offset.
-
-    K3 Tier-2 addressing: at DeepSeek E=256 FP8 the per-expert weight base exceeds
-    the i32 byte range (``E*H*I`` >= 2^31 bytes), so the whole-pool element offset
-    times the dtype size wraps a signed i32 and the wave reads garbage. Folding the
-    per-expert base into the descriptor base as i64 keeps the per-lane in-expert
-    element offset i32-safe (an expert spans H*I <= ~1.5e7 bytes).
+    Wide views use ``unit_stride=1`` so a load can start at any dword, matching
+    the element offset ``buffer_load`` used. The i64 address is how Tier-2 folds
+    a per-expert base into the descriptor: at DeepSeek E=256 FP8 the whole-pool
+    byte offset exceeds the i32 range (``E*H*I`` >= 2^31), so the in-expert
+    dword offset has to stay i32-safe (an expert spans H*I <= ~1.5e7 bytes).
     """
-    base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(byte_off_i64)
-    return buffer_ops.create_buffer_resource_from_addr(base)
+    return (
+        ptr_buf_tensor(base, fx.Int32),
+        ptr_buf_tensor(base, fx.Int32, unit_elems=2, unit_stride=1),
+        ptr_buf_tensor(base, fx.Int32, unit_elems=4, unit_stride=1),
+    )
+
+
+def _i32_pack_at(ptr, byte_off_i64):
+    """``_i32_pack`` of ``ptr`` advanced by an i64 **byte** offset."""
+    return _i32_pack(fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(byte_off_i64))
 
 
 def _bf16_out_view(ptr):
@@ -79,6 +78,16 @@ def _f32_view(ptr):
 def _f32_load(t, idx):
     """Scalar f32 load at element ``idx`` (``BufferCopy32b`` / ``fx.copy``)."""
     return buf_copy_load(t, fx.Int32(idx), fx.Float32)
+
+
+def _i8_view(ptr):
+    """Unpacked i8 scale tensor as a buffer-resource view; ``t[i]`` is one byte."""
+    return ptr_buf_tensor(ptr, fx.Int8)
+
+
+def _i8_load(t, idx):
+    """Scalar i8 load at element ``idx`` (``BufferCopy8b`` / ``fx.copy``)."""
+    return buf_copy_load(t, fx.Int32(idx), fx.Int8)
 
 
 def _i32_view(ptr):
@@ -221,8 +230,8 @@ def fp4x2_to_bf16x2(src_i32, scale_f32, *, sel: int):
 def e8m0_byte_to_f32(byte_val):
     """Decode one E8M0 biased-exponent byte to an f32 scale (``shl 23`` + bitcast).
 
-    ``byte_val`` is an i8 ``ir.Value`` (as loaded from a uint8 scale tensor); it
-    is zero-extended, shifted into the f32 exponent field, and reinterpreted.
+    ``byte_val`` is the i8 loaded from a uint8 scale tensor. It is widened,
+    masked to 8 bits, shifted into the f32 exponent field, and reinterpreted.
     Bit-exact vs ``aiter.utility.fp4_utils.e8m0_to_f32`` on the normal exponent
     range (bytes 1..254); the ``0`` / ``0xFF`` specials are never produced for
     real MXFP4 weights.
@@ -236,18 +245,15 @@ def bf16x2_to_i32(pair_vec):
     return fx.Vector(pair_vec).bitcast(fx.Int32)[0].ir_value()
 
 
-def load_i32_words(rsrc, word0, n):
-    """Load ``n`` consecutive i32 dwords starting at element offset ``word0`` using
-    the widest 128-bit/64-bit buffer loads possible, returning a Python list of
-    ``n`` scalar i32 ir.Values.  ``n`` is a compile-time constant (loop unrolled).
+def load_i32_words(pack, word0, n):
+    """Load ``n`` consecutive i32 dwords starting at element offset ``word0``.
 
-    Coalescing the per-word scalar loads into ``vec4``/``vec2`` buffer transactions
-    is the main memory-throughput win for the warp-decode inner loop.
-
-    Packed dword path (weights and K-loop activations / intermediate): stays on
-    ``buffer_ops`` until there is an i64-base ``make_buffer_tensor`` equivalent.
-    Unpacked BF16 **outputs** use :func:`_bf16_out_view` instead.
+    ``pack`` is an :func:`_i32_pack` (dword, dwordx2, dwordx4). ``n`` is a
+    compile-time constant, so the width pick unrolls into ``buffer_load_dword``
+    / ``dwordx2`` / ``dwordx4``. Returns ``n`` scalar i32 ``ir.Value``s for the
+    ``v_dot2`` asm boundary. Unpacked BF16 outputs use :func:`_bf16_out_view`.
     """
+    views = {1: pack[0], 2: pack[1], 4: pack[2]}
     out = []
     i = 0
     while i < n:
@@ -257,12 +263,13 @@ def load_i32_words(rsrc, word0, n):
             w = 2
         else:
             w = 1
-        vec = buffer_ops.buffer_load(rsrc, word0 + i, vec_width=w, dtype=T.i32())
+        loaded = buf_copy_load(views[w], word0 + i, fx.Int32, unit_elems=w)
         if w == 1:
-            out.append(vec)
+            out.append(fx.Int32(loaded).ir_value())
         else:
+            vec = fx.Vector(loaded)
             for j in range(w):
-                out.append(fx.Vector(vec)[j].ir_value())
+                out.append(vec[j].ir_value())
         i += w
     return out
 
@@ -280,22 +287,13 @@ def atomic_add_f32(ptr, elem_off, val_f32):
 
     ``ptr`` is the kernel's ``fx.Pointer`` output arg (an FP32 accumulator the caller
     pre-zeroed); ``elem_off`` is the f32 element index; ``val_f32`` the fx.Float32 to
-    add.  Mirrors the ``llvm.AtomicRMWOp(fadd, ..., syncscope="agent")`` epilogue used
-    by the split-K GEMMs (small_m_hgemm / splitk_hgemm)."""
+    add. Agent scope matches the split-K GEMM epilogues (small_m_hgemm / splitk_hgemm).
+    """
     addr = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(elem_off) * fx.Int64(4)
     ptr_ty = fx.PointerType.get(
         fx.Float32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
     )
-    p = fx.to_llvm_ptr(fx.inttoptr(ptr_ty, addr))
-    p = p._value if hasattr(p, "_value") else p
-    llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.fadd,
-        p,
-        val_f32.ir_value(),
-        llvm.AtomicOrdering.monotonic,
-        syncscope="agent",
-        alignment=4,
-    )
+    fx.atomic_add(fx.inttoptr(ptr_ty, addr), val_f32, syncscope="agent")
 
 
 def _silu_mul(gate_acc, up_acc):
@@ -311,11 +309,11 @@ def _fp8_gate_up_weight_views(
     if use_i64_base:
         ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
         return (
-            _ptr_rsrc_off(wg_ptr, ebase),
-            _ptr_rsrc_off(wu_ptr, ebase),
+            _i32_pack_at(wg_ptr, ebase),
+            _i32_pack_at(wu_ptr, ebase),
             neuron_j * (hidden // 4),
         )
-    return _ptr_rsrc(wg_ptr), _ptr_rsrc(wu_ptr), w_row * (hidden // 4)
+    return _i32_pack(wg_ptr), _i32_pack(wu_ptr), w_row * (hidden // 4)
 
 
 def _fp8_down_weight_view(
@@ -333,7 +331,7 @@ def _fp8_down_weight_view(
     """FP8 down resource + per-output dword bases; i64 per-expert or whole-pool."""
     if use_i64_base:
         ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
-        wd_rsrc_e = _ptr_rsrc_off(wd_ptr, ebase)
+        wd_rsrc_e = _i32_pack_at(wd_ptr, ebase)
         w_word_base = [(out_j0 + h) * (inter // 4) for h in range(kh_per_warp)]
         return wd_rsrc_e, w_word_base
     return wd_rsrc, [w_row[h] * (inter // 4) for h in range(kh_per_warp)]
@@ -376,37 +374,40 @@ def build_warp_decode_primitives_module(*, serialize_dot2: bool = True):
         red_in_ptr: fx.Pointer,
         out_red_ptr: fx.Pointer,
     ):
-        lane = gpu.thread_id("x")
+        lane = fx.thread_idx.x
 
-        a_rsrc = _ptr_rsrc(a_ptr)
-        b_rsrc = _ptr_rsrc(b_ptr)
-        out_dot_rsrc = _ptr_rsrc(out_dot_ptr)
-        f8_rsrc = _ptr_rsrc(f8_ptr)
-        scale_rsrc = _ptr_rsrc(scale_ptr)
-        out_cvt_rsrc = _ptr_rsrc(out_cvt_ptr)
-        red_in_rsrc = _ptr_rsrc(red_in_ptr)
-        out_red_rsrc = _ptr_rsrc(out_red_ptr)
+        a_w = _i32_pack(a_ptr)
+        b_w = _i32_pack(b_ptr)
+        f8_w = _i32_pack(f8_ptr)
+        out_dot_t = _f32_view(out_dot_ptr)
+        scale_t = _f32_view(scale_ptr)
+        # Two bf16 per store; unit_stride=1 so the second pair starts at lane*4+2.
+        out_cvt_t = ptr_buf_tensor(
+            out_cvt_ptr, fx.BFloat16, unit_elems=2, unit_stride=1
+        )
+        red_in_t = _f32_view(red_in_ptr)
+        out_red_t = _f32_view(out_red_ptr)
 
         # 1. dot2 --------------------------------------------------------
-        a_i32 = buffer_ops.buffer_load(a_rsrc, lane, vec_width=1, dtype=T.i32())
-        b_i32 = buffer_ops.buffer_load(b_rsrc, lane, vec_width=1, dtype=T.i32())
+        a_i32 = load_i32_words(a_w, lane, 1)[0]
+        b_i32 = load_i32_words(b_w, lane, 1)[0]
         acc0 = fx.Float32(0.0).ir_value()
         d = dot2_f32_bf16(a_i32, b_i32, acc0, serialize=serialize_dot2)
-        buffer_ops.buffer_store(d, out_dot_rsrc, lane)
+        out_dot_t[lane] = fx.Float32(d)
 
         # 2. scaled fp8 -> bf16 pair convert -----------------------------
-        f8_i32 = buffer_ops.buffer_load(f8_rsrc, lane, vec_width=1, dtype=T.i32())
-        scale = buffer_ops.buffer_load(scale_rsrc, lane, vec_width=1, dtype=T.f32())
+        f8_i32 = load_i32_words(f8_w, lane, 1)[0]
+        # The scaled-convert op takes a raw f32; the view load is a typed scalar.
+        scale = _f32_load(scale_t, lane).ir_value()
         lo = fp8x2_to_bf16x2(f8_i32, scale, hi=False)
         hi = fp8x2_to_bf16x2(f8_i32, scale, hi=True)
         # out_cvt is bf16; each lane writes 4 contiguous bf16 (lo pair, hi pair).
-        buffer_ops.buffer_store(lo, out_cvt_rsrc, lane * 4)
-        buffer_ops.buffer_store(hi, out_cvt_rsrc, lane * 4 + 2)
+        buf_copy_store(out_cvt_t, lane * 4, lo, fx.BFloat16, unit_elems=2)
+        buf_copy_store(out_cvt_t, lane * 4 + 2, hi, fx.BFloat16, unit_elems=2)
 
         # 3. 64-lane butterfly reduce ------------------------------------
-        r = buffer_ops.buffer_load(red_in_rsrc, lane, vec_width=1, dtype=T.f32())
-        total = wave_reduce_add_f32(r)
-        buffer_ops.buffer_store(total, out_red_rsrc, lane)
+        total = wave_reduce_add_f32(_f32_load(red_in_t, lane))
+        out_red_t[lane] = fx.Float32(total)
 
     @flyc.jit
     def _launch(
@@ -522,8 +523,8 @@ def build_gate_up_fp8_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         neuron_j = bid % inter
         d = bid // inter
@@ -534,7 +535,7 @@ def build_gate_up_fp8_module(
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
-        x_rsrc = _ptr_rsrc(x_ptr)
+        x_rsrc = _i32_pack(x_ptr)
         # Tier-2 (E*I*H >= 2^31): fold the per-expert base into the descriptor as
         # i64 and address weights by the i32-safe in-expert dword base; otherwise
         # keep whole-pool addressing (w_word_base carries the full w_row offset).
@@ -732,8 +733,8 @@ def build_gate_up_fp8_act_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         neuron_j = bid % inter
         d = bid // inter
@@ -744,7 +745,7 @@ def build_gate_up_fp8_act_module(
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
-        x_rsrc = _ptr_rsrc(x_ptr)
+        x_rsrc = _i32_pack(x_ptr)
         xs_t = _f32_view(xs_ptr)
         wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
             wg_ptr,
@@ -920,8 +921,8 @@ def build_down_reduce_fp8_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         # Split-K: the low `k_batch` bids share an output but cover disjoint INTER
         # sub-ranges (kb).  For k_batch==1, kb==0 and this is the plain layout.
@@ -931,8 +932,8 @@ def build_down_reduce_fp8_module(
         token_b = rest // n_cols
         out_j0 = col * kh_per_warp  # this wave owns out_j0 .. out_j0+kh_per_warp-1
 
-        inter_rsrc = _ptr_rsrc(inter_ptr)
-        wd_rsrc = _ptr_rsrc(wd_ptr)
+        inter_rsrc = _i32_pack(inter_ptr)
+        wd_rsrc = _i32_pack(wd_ptr)
         wds_t = _f32_view(wds_ptr)
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
@@ -1148,8 +1149,8 @@ def build_gate_up_fp4_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         neuron_j = bid % inter
         d = bid // inter
@@ -1161,11 +1162,11 @@ def build_gate_up_fp4_module(
         w_row = e * inter + neuron_j
         row_blk = w_row // scale_bn
 
-        x_rsrc = _ptr_rsrc(x_ptr)
-        wg_rsrc = _ptr_rsrc(wg_ptr)
-        wu_rsrc = _ptr_rsrc(wu_ptr)
-        wgs_rsrc = _ptr_rsrc(wgs_ptr)
-        wus_rsrc = _ptr_rsrc(wus_ptr)
+        x_rsrc = _i32_pack(x_ptr)
+        wg_rsrc = _i32_pack(wg_ptr)
+        wu_rsrc = _i32_pack(wu_ptr)
+        wgs_t = _i8_view(wgs_ptr)
+        wus_t = _i8_view(wus_ptr)
 
         # E8M0 scale is baked into the converted weights, so a lane's gate/up dot
         # is one long accumulation across iterations.  G7: collect every
@@ -1181,12 +1182,8 @@ def build_gate_up_fp4_module(
             gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
             uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
             sidx = fx.Int32(row_blk * scale_cols + k_base // scale_bk)
-            gs = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
-            us = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wus_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
+            gs = e8m0_byte_to_f32(_i8_load(wgs_t, sidx))
+            us = e8m0_byte_to_f32(_i8_load(wus_t, sidx))
             for ipair in range_constexpr(n_pairs):
                 w_word = ipair // 4
                 sel = ipair % 4
@@ -1321,16 +1318,16 @@ def build_down_reduce_fp4_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         col = bid % n_cols
         token_b = bid // n_cols
         out_j0 = col * kh_per_warp
 
-        inter_rsrc = _ptr_rsrc(inter_ptr)
-        wd_rsrc = _ptr_rsrc(wd_ptr)
-        wds_rsrc = _ptr_rsrc(wds_ptr)
+        inter_rsrc = _i32_pack(inter_ptr)
+        wd_rsrc = _i32_pack(wd_ptr)
+        wds_b = _i8_view(wds_ptr)
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
 
@@ -1371,13 +1368,9 @@ def build_down_reduce_fp4_module(
                     scale_all.append(
                         [
                             e8m0_byte_to_f32(
-                                buffer_ops.buffer_load(
-                                    wds_rsrc,
-                                    fx.Int32(
-                                        w_row[h] // scale_bn * scale_cols + col_blk
-                                    ),
-                                    vec_width=1,
-                                    dtype=T.i8(),
+                                _i8_load(
+                                    wds_b,
+                                    w_row[h] // scale_bn * scale_cols + col_blk,
                                 )
                             )
                             for h in range(kh_per_warp)
@@ -1413,11 +1406,8 @@ def build_down_reduce_fp4_module(
                     for h in range_constexpr(kh_per_warp):
                         # E8M0 block scale for this (weight row, K-block), applied
                         # in the convert; uniform over the lane's chunk this iter.
-                        sidx = fx.Int32(w_row[h] // scale_bn * scale_cols + col_blk)
-                        blk_byte = buffer_ops.buffer_load(
-                            wds_rsrc, sidx, vec_width=1, dtype=T.i8()
-                        )
-                        blk_scale = e8m0_byte_to_f32(blk_byte)
+                        sidx = w_row[h] // scale_bn * scale_cols + col_blk
+                        blk_scale = e8m0_byte_to_f32(_i8_load(wds_b, sidx))
                         for ipair in range_constexpr(n_pairs):
                             w_word = ipair // 4
                             sel = ipair % 4
@@ -1508,8 +1498,8 @@ def build_gate_up_bf16_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         neuron_j = bid % inter
         d = bid // inter
@@ -1520,9 +1510,9 @@ def build_gate_up_bf16_module(
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
-        x_rsrc = _ptr_rsrc(x_ptr)
-        wg_rsrc = _ptr_rsrc(wg_ptr)
-        wu_rsrc = _ptr_rsrc(wu_ptr)
+        x_rsrc = _i32_pack(x_ptr)
+        wg_rsrc = _i32_pack(wg_ptr)
+        wu_rsrc = _i32_pack(wu_ptr)
 
         gate_dot = fx.Float32(0.0).ir_value()
         up_dot = fx.Float32(0.0).ir_value()
@@ -1627,15 +1617,15 @@ def build_down_reduce_bf16_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = gpu.block_id("x")
-        lane = gpu.thread_id("x")
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
 
         col = bid % n_cols
         token_b = bid // n_cols
         out_j0 = col * kh_per_warp
 
-        inter_rsrc = _ptr_rsrc(inter_ptr)
-        wd_rsrc = _ptr_rsrc(wd_ptr)
+        inter_rsrc = _i32_pack(inter_ptr)
+        wd_rsrc = _i32_pack(wd_ptr)
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
 
