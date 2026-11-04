@@ -52,21 +52,9 @@ def find_seq_idx(
     return left - 1
 
 
-# Length-aware KV split (LENGTH_AWARE_SPLIT), for batches with one query block
-# per sequence (decode and short verify queries; the launcher checks max_seqlen_q
-# against BLOCK_Q). A CUDA graph captures the grid with a loose max_seqlen_k, so
-# the grid cannot see the real lengths. Instead the batch's KV tokens are cut into
-# segments of
-#     segment_tokens = cdiv(sum(seq_len), split_budget)
-# and a sequence takes seq_len // segment_tokens of them, at least one and at
-# most NUM_SEGMENTS_PER_SEQ. The counts sum to at most
-# split_budget + num_seqs - 1, so the attention grid is a flat list of that many
-# (sequence, segment) work items per KV head; the reduce recomputes the same
-# count to merge exactly the segments a sequence used.
-# The KV heads of one token share cache lines, so the grid deals each run of
-# ITEM_RUN items out once per KV head: workgroups go round-robin over the XCDs,
-# and a run that is a multiple of the XCD count puts every head of an item on
-# the same XCD (one L2).
+# LENGTH_AWARE_SPLIT: a sequence gets seq_len // cdiv(sum(seq_len), split_budget)
+# segments, clamped to [1, NUM_SEGMENTS_PER_SEQ] and read on the GPU (CUDA-graph safe).
+# When ITEM_RUN is a multiple of the XCD count, all KV heads of an item share one L2.
 
 
 @triton.jit
