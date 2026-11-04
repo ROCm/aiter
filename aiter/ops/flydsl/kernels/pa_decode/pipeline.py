@@ -1999,12 +1999,47 @@ class Gfx1250Pipeline:
                                 pmax[partial_row] = row_max
                                 psum[partial_row] = denom
 
+        def store_quantized():
+            # One query token: lane16 picks its row (GQA head) and warp, half
+            # and vh its D chunk, so this CTA holds all of the token's values.
+            denom = final[1]
+            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+            norm = fx.Vector.from_elements(
+                [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
+                dtype=fx.Float32,
+            ).broadcast_to(8)
+            values, offsets = [], []
+            for vh in range_constexpr(vh_count):
+                values.append((final[2 + vh] * norm).to(t.q_dtype))
+                offsets.append(
+                    self.merge.output_offset(
+                        ctx.lane16, vh * 64 + ctx.warp * 16 + ctx.half * 8
+                    )
+                )
+            ctx.quant.store_cta(
+                self.mem,
+                ctx.planned_seq,
+                ctx.warp,
+                ctx.lane,
+                values,
+                offsets,
+                fx.recast_iter(
+                    t.q_dtype,
+                    ctx.output_ptr if t.merged_output else ctx.pout_ptr,
+                ),
+            )
+
         if const_expr(t.merged_output):
             if ctx.task_count == 1:
-                store(True)
+                if const_expr(t.quant_output):
+                    store_quantized()
+                else:
+                    store(True)
             else:
                 store(False)
                 if const_expr(t.merge_partitions):
                     self.merge.arrive()
+        elif const_expr(t.quant_output):
+            store_quantized()
         else:
             store(t.direct_output)

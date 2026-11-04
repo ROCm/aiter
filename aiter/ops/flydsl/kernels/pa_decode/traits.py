@@ -777,6 +777,8 @@ class Gfx1250Traits:
     cluster_merge: int = 0
     # Emit OCP FP8 plus one FP32 descale per logical query token.
     quant_output: bool = False
+    # With quant_output, False drops the BF16/FP16 store of the final output.
+    store_output: bool = True
 
     WAVE = 32
     NWARP = 4
@@ -992,8 +994,14 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
-    def total_bytes(self):
+    def quant_offset(self):
+        # Four wave maxima of the FP8 output epilogue. No loop stage uses
+        # them, so a wave can publish its maximum while others still read P.
         return self.stats_offset + 576
+
+    @property
+    def total_bytes(self):
+        return self.quant_offset + (16 if self.quant_output else 0)
 
     @property
     def use_tdm(self):
