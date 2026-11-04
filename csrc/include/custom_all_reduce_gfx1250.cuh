@@ -86,8 +86,6 @@ namespace aiter {
 // Constants & data structures
 // ---------------------------------------------------------------------------
 constexpr int kMaxBlocks  = 512;
-constexpr int kArRmsMidSignalBlock   = 0;
-constexpr int kArRmsFinalSignalBlock = 1;
 // kMaxNgpusAr matches DISPATCH_NGPUS_1250, kMaxNgpusAg DISPATCH_AG_NGPUS_1250.
 // kMaxNgpus sizes Signal/RankData/RankSignals; the last two are passed by value
 // on every launch, so widening it costs all world sizes.
@@ -100,10 +98,6 @@ struct Signal
     alignas(128) uint32_t start[kMaxBlocks][kMaxNgpus];
     alignas(128) uint32_t end[kMaxBlocks][kMaxNgpus];
     alignas(128) uint32_t _flag[kMaxBlocks];
-    // Local arrival counter for the two-stage fused AR grids. It is never
-    // polled by a peer; the last local block alone enters the cross-rank
-    // barrier, on a fixed phase-specific signal slot.
-    alignas(128) uint32_t _grid_count;
 };
 
 struct __align__(16) RankData
@@ -379,118 +373,45 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 // ---------------------------------------------------------------------------
 // Synchronisation primitives (ROCm path only)
 // ---------------------------------------------------------------------------
-// RFC 1982-style serial comparison. A rank may observe the next phase because
-// a peer can leave a barrier first, so equality is insufficient. Signed
-// subtraction keeps that "at or after" test correct when the uint32 epoch wraps;
-// barriers keep rank skew far below the required half-range bound.
-DINLINE bool epoch_before(uint32_t observed, uint32_t target)
-{
-    return static_cast<int32_t>(observed - target) < 0;
-}
-
-template <int ngpus>
-DINLINE void start_sync_slot(
-    const RankSignals& sg, Signal* self_sg, int rank, int signal_block)
-{
-    uint32_t flag = self_sg->_flag[signal_block] + 1;
-    if(threadIdx.x < ngpus)
-    {
-        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[signal_block][rank],
-                                flag,
-                                __ATOMIC_RELAXED,
-                                __MEMORY_SCOPE_SYSTEM);
-        while(epoch_before(
-            __scoped_atomic_load_n(&self_sg->start[signal_block][threadIdx.x],
-                                   __ATOMIC_RELAXED,
-                                   __MEMORY_SCOPE_DEVICE),
-            flag))
-            ;
-    }
-    __syncthreads();
-    if(threadIdx.x == 0)
-        self_sg->_flag[signal_block] = flag;
-}
-
 template <int ngpus>
 DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
 {
-    start_sync_slot<ngpus>(sg, self_sg, rank, blockIdx.x);
-}
-
-template <int ngpus, bool final_sync = false>
-DINLINE void end_sync_slot(
-    const RankSignals& sg, Signal* self_sg, int rank, int signal_block)
-{
-    __syncthreads();
-    uint32_t flag = self_sg->_flag[signal_block] + 1;
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if(threadIdx.x < ngpus)
     {
-        // The intermediate barrier publishes payload stores with a system-scope
-        // release to every peer and consumes them with an acquire after polling
-        // this rank's local signal. The final barrier is only a lifetime
-        // rendezvous (no peer payload follows it), so its atomics stay relaxed.
-        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[signal_block][rank],
+        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                                 flag,
-                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED,
                                 __MEMORY_SCOPE_SYSTEM);
-        while(epoch_before(
-            __scoped_atomic_load_n(&self_sg->end[signal_block][threadIdx.x],
-                                   final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                   __MEMORY_SCOPE_DEVICE),
-            flag))
+        while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                     __ATOMIC_RELAXED,
+                                     __MEMORY_SCOPE_DEVICE) < flag)
             ;
     }
     __syncthreads();
     if(threadIdx.x == 0)
-        self_sg->_flag[signal_block] = flag;
+        self_sg->_flag[blockIdx.x] = flag;
 }
 
 template <int ngpus, bool final_sync = false>
 DINLINE void end_sync(const RankSignals& sg, Signal* self_sg, int rank)
 {
-    end_sync_slot<ngpus, final_sync>(sg, self_sg, rank, blockIdx.x);
-}
-
-// Grid completion followed by one cross-rank barrier. Every block first
-// publishes its memory accesses through the workgroup barrier and an agent-
-// scope acq_rel RMW. RMWs read the immediately preceding counter value, so
-// their release/acquire chain makes every block happen-before the last one.
-// The last block then uses end_sync's system release/acquire barrier, preserving
-// the standalone end_sync kernel's visibility guarantee for peer scratch.
-//
-// A last-block protocol is important here: making every block spin on its peer
-// with a per-block barrier can deadlock when ranks schedule block IDs in a
-// different order. Non-last blocks retire and free their CUs; only after every
-// local block has retired can one block wait for the peer ranks. Last block IDs
-// may differ by rank, hence the fixed cross-rank signal slot. The intermediate
-// and final barriers use different slots: otherwise a fast rank's relaxed final
-// signal could overwrite the release signal before a slow rank acquires it.
-template <int ngpus, bool final_sync = false>
-DINLINE void grid_end_sync(
-    const RankSignals& sg, Signal* self_sg, int rank, int signal_block)
-{
     __syncthreads();
-    bool is_last = false;
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+    if(threadIdx.x < ngpus)
+    {
+        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
+                                flag,
+                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                                __MEMORY_SCOPE_SYSTEM);
+        while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_DEVICE) < flag)
+            ;
+    }
+    __syncthreads();
     if(threadIdx.x == 0)
-    {
-        const uint32_t arrived = __hip_atomic_fetch_add(&self_sg->_grid_count,
-                                                        1u,
-                                                        __ATOMIC_ACQ_REL,
-                                                        __HIP_MEMORY_SCOPE_AGENT);
-        is_last = arrived == gridDim.x - 1;
-    }
-    if(__syncthreads_or(is_last))
-    {
-        // No block from the next kernel can arrive before this kernel returns,
-        // and this last block cannot return before the peer barrier completes.
-        // Reset now so eager calls and graph replays reuse the counter safely.
-        if(threadIdx.x == 0)
-            __hip_atomic_store(&self_sg->_grid_count,
-                               0u,
-                               __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-        end_sync_slot<ngpus, final_sync>(sg, self_sg, rank, signal_block);
-    }
+        self_sg->_flag[blockIdx.x] = flag;
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +508,6 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
     RankData* _input_dp,
-    RankSignals sg,
     Signal* self_sg,
     int rank,
     int tokens,
@@ -629,7 +549,6 @@ __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
             reduced[j] = downcast_s<T>(acc[j]);
         scratch[out_idx] = reduced;
     }
-    grid_end_sync<ngpus>(sg, self_sg, rank, kArRmsMidSignalBlock);
 }
 
 // Sum or max over the block; every thread gets the result. Threads past the
@@ -808,9 +727,7 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
                 scale_out[t] = scale;
         }
     }
-    if constexpr(TWO_STAGE)
-        grid_end_sync<ngpus, true>(sg, self_sg, rank, kArRmsFinalSignalBlock);
-    else
+    if constexpr(!TWO_STAGE)
         end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
@@ -1957,7 +1874,7 @@ public:
         const int blocks     = std::min(tokens, kMaxBlocks);
         const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
         // At TP4+, two-stage halves or better the peer traffic of direct-read.
-        // Its extra staging traffic does not amortize at TP2 or narrow rows.
+        // Its three single-block barriers do not amortize at TP2 or narrow rows.
         // Each rank's reduced shard must fit its staging region.
         const bool two_stage =
             !use_1stage && world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
@@ -1968,7 +1885,8 @@ public:
         {                                                                                   \
             start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
             ar_rmsnorm_reduce_scatter_gfx1250<T, NG><<<blocks, 512, 0, stream>>>(           \
-                input_ptrs, sg_, self_sg_, rank_, tokens, hidden / pack_size);              \
+                input_ptrs, self_sg_, rank_, tokens, hidden / pack_size);                   \
+            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
             if(gemma_norm)                                                                  \
                 ar_rmsnorm_gfx1250<T, OutT, NG, true, true>                                 \
                     <<<blocks, threads, 0, stream>>>(                                       \
@@ -1979,6 +1897,7 @@ public:
                     <<<blocks, threads, 0, stream>>>(                                       \
                         nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
                         weight, scale_out, bf16_output, tokens, hidden, eps);                \
+            end_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);                \
         }                                                                                   \
         else if(gemma_norm)                                                                 \
             ar_rmsnorm_gfx1250<T, OutT, NG, true><<<blocks, threads, 0, stream>>>(          \
