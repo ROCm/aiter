@@ -8,10 +8,18 @@ kernels, tiles or activation dtype, and it must be as accurate as the
 default. The deterministic path takes gate/up-interleaved weights and MXFP8
 activations, as the default does from 256 tokens.
 
-Run:
+Run (the checks, then a latency sweep of the default and the deterministic
+path that ends in a markdown table):
+    python3 op_tests/test_moe_mxfp4_deterministic.py
+    python3 op_tests/test_moe_mxfp4_deterministic.py -t 1 256 -s 3072,3072,128,4
     pytest op_tests/test_moe_mxfp4_deterministic.py -q
 """
 
+import argparse
+import itertools
+import sys
+
+import pandas as pd
 import pytest
 import torch
 
@@ -21,21 +29,42 @@ from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_s
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+SUPPORTED_GFX = ["gfx950"]
 
 _SKIP = pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="fused_moe(deterministic=True) requires gfx950"
+    get_gfx() not in SUPPORTED_GFX,
+    reason="fused_moe(deterministic=True) requires gfx950",
 )
 
 # Token counts on both sides of where the default switches the activation dtype
 # (256) and where the deterministic tile height grows (2,048), plus 1,024.
 _PREFIXES = (1, 31, 255, 256, 257, 1024, 1025, 2048, 2049)
 _M = 2304
+# checkAllclose against the bf16-activation torch reference. The MXFP8 activations
+# (e4m3: 3 mantissa bits) put most elements a few percent off, so compare at 10%
+# and allow at most 0.1% of the elements outside (measured on MI350X: <= 0.03%).
+_RTOL = _ATOL = 0.1
+_ERR_MAX = 1e-3
 
 
 def _cos_diff(x, y):
     x, y = x.double(), y.double()
     denom = (x * x + y * y).sum()
     return float(1 - 2 * (x * y).sum() / denom)
+
+
+def _err(ref, out, msg):
+    """checkAllclose mismatch ratio against the torch reference, in fp32."""
+    return checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=_RTOL,
+        atol=_ATOL,
+        tol_err_ratio=_ERR_MAX,
+        msg=f"{msg}: ",
+    )
 
 
 def _problem(M, model_dim, inter_dim, E, topk, bias=True, interleaved=True):
@@ -164,6 +193,8 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk, bias):
     # The default also quantizes the activations to MXFP8 at this token count, so
     # it is the accuracy to match.
     default = _run(p, slice(None), ActivationType.Swiglu, False, swiglu_limit=limit)
+    err = _err(ref, out, "deterministic")
+    assert err <= _ERR_MAX, f"checkAllclose mismatch vs the bf16 reference {err:.3%}"
     ld = _cos_diff(ref.float(), out.float())
     ld_default = _cos_diff(ref.float(), default.float())
     assert (
@@ -189,6 +220,8 @@ def test_deterministic_zero_routing_weights(M):
     kw = {"swiglu_limit": 7.0}
     out = _run(p, slice(None), ActivationType.Swiglu, True, **kw)
     ref = _reference(p, M, *shape, ActivationType.Swiglu, **kw)
+    err = _err(ref, out, f"deterministic, zero routing weights, M={M}")
+    assert err <= _ERR_MAX, f"checkAllclose mismatch {err:.3%}"
     ld = _cos_diff(ref.float(), out.float())
     assert ld < 2e-2, f"cos/logits_diff with zero routing weights: {ld:.3e}"
     for i in range(min(M, 4)):
@@ -323,5 +356,99 @@ def test_deterministic_rejects_unsupported():
         )
 
 
+@benchmark()
+def test_fused_moe_mxfp4(token, model_dim, inter_dim, E, topk):
+    """Latency of the default and the deterministic path (SwiGLU, clamp 7, biases),
+    each checked against the torch reference."""
+    p = _problem(token, model_dim, inter_dim, E, topk)
+    kw = {"swiglu_limit": 7.0}
+    ref = _reference(
+        p, token, model_dim, inter_dim, E, topk, ActivationType.Swiglu, **kw
+    )
+    candidates = {"default": False, "deterministic": True}
+
+    # gate/up and down projections; MXFP4 weights (plus 1/32 E8M0 scales) of the
+    # experts the tokens use, bf16 activations in and out.
+    flops = 2 * token * topk * 3 * model_dim * inter_dim
+    used = p["topk_ids"].unique().numel()
+    nbytes = used * 3 * model_dim * inter_dim * (1 / 2 + 1 / 32) + 2 * (
+        2 * token * model_dim
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, deterministic in candidates.items():
+        # One copy of the arguments: rotating copies of every expert's weights
+        # would not fit, and the weights exceed the caches anyway.
+        out, us = run_perftest(
+            _run,
+            p,
+            slice(None),
+            ActivationType.Swiglu,
+            deterministic,
+            num_rotate_args=1,
+            **kw,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = _err(ref, out, f"{name}: token={token}")
+    return ret
+
+
+test_fused_moe_mxfp4.__test__ = False
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused_moe(deterministic=True) unsupported on %s; skipping", get_gfx()
+        )
+        return 0
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="fused_moe(deterministic=True) for MXFP4 MoE: checks and latency",
+    )
+    parser.add_argument(
+        "-t",
+        "--token",
+        type=int,
+        nargs="*",
+        default=[1, 8, 32, 128, 256, 1024, 4096],
+        help="""Tokens.
+    e.g.: -t 1 256""",
+    )
+    parser.add_argument(
+        "-s",
+        "--shape",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(3072, 3072, 128, 4), (6144, 1536, 129, 5)],
+        help="""model_dim, inter_dim, experts, topk (gpt-oss-120b; MiniMax-M3 at TP2).
+    e.g.: -s 3072,3072,128,4""",
+    )
+    args = parser.parse_args()
+
+    aiter.logger.info("fused_moe deterministic: running correctness checks...")
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
+        aiter.logger.error(
+            "fused_moe deterministic: checks failed (pytest exit %s); skipping perf sweep",
+            int(status),
+        )
+        return 1
+
+    df = []
+    for (model_dim, inter_dim, E, topk), token in itertools.product(
+        args.shape, args.token
+    ):
+        df.append(test_fused_moe_mxfp4(token, model_dim, inter_dim, E, topk))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "fused_moe deterministic summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    sys.exit(main())
