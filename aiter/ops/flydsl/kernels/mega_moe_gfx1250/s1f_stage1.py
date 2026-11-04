@@ -526,6 +526,7 @@ def make_s1f_stage1(
     ctas_per_cu=2,
     tdm_b_th=0,
     tdm_as_in_prologue=0,
+    xcc_queues=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -573,6 +574,14 @@ def make_s1f_stage1(
     tile j; or, for one flag tile of more sources, one lane per source) while
     wave 1 waits on an LDS token and the B / B-scale waves run the weight
     prologue.
+
+    ``xcc_queues``: one GEMM1 queue per XCC instead of the global one. Queue
+    ``x`` holds the m-tiles ``m % 8 == x``, n fastest, so the n-tiles that
+    share an m-tile's A run on one XCC and read it from that XCC's L2 (block
+    ``b`` runs on XCC ``b % 8``). Consumer ``l`` of XCC ``x`` starts on item
+    ``l`` of queue ``x``; a CTA whose queue is exhausted claims from the next
+    queues in turn. Decode m-tiles are one per expert, so B has no reuse to
+    keep; with several m-tiles per expert the global m-major order keeps B's.
 
     ``ticket_span`` (default ``workers``): entry tickets per launch, the same
     for every variant sharing one control block. ``ctas_per_cu``: how many
@@ -633,6 +642,7 @@ def make_s1f_stage1(
     G = int(workers)
     P = int(producers)
     GM = int(group_m)
+    XQ = int(bool(xcc_queues))
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
@@ -825,6 +835,7 @@ def make_s1f_stage1(
             + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
             + f"_poll{POLL}"
             + (f"_ts{SPAN}" if SPAN != G else "")
+            + ("_xq" if XQ else "")
             + f"_{g1_name}"
         )
         # Keep the separate-kernel launcher in this cache key's dependency set.
@@ -1642,16 +1653,32 @@ def make_s1f_stage1(
                 return tinfo_join(tinfo_words(m))
 
             # ---- the GEMM1 work queue ----
-            # One global queue; consumer c = slot_id - P starts on item c
-            # without a claim.
-            SQ = G - P
+            # Global: one queue, consumer c = slot_id - P starts on item c
+            # without a claim. XQ: queue x per XCC, its consumer l starts on
+            # item l of queue x; each queue's first SQ items are static.
+            SQ = CB if XQ else G - P
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
+                if const_expr(XQ):
+                    mx = fx.Int32(
+                        (m_tiles > xq).select(
+                            (m_tiles - xq + fx.Int32(N_XCC - 1))
+                            // fx.Int32(N_XCC),
+                            fx.Int32(0),
+                        )
+                    )
+                    return mx * fx.Int32(NT)
                 return m_tiles * fx.Int32(NT)
 
             def q_code(xq, w):
+                if const_expr(XQ):
+                    # Queue xq: m-tiles xq, xq + 8, ..., n fastest.
+                    j = w // fx.Int32(NT)
+                    return (
+                        (xq + j * fx.Int32(N_XCC)) << fx.Int32(_ITEM_N_BITS)
+                    ) | (w - j * fx.Int32(NT))
                 # m-major in groups of GM m-tiles, m fastest.
                 k = w // fx.Int32(B1)
                 r = w - k * fx.Int32(B1)
@@ -1664,6 +1691,11 @@ def make_s1f_stage1(
                 ) | rq
 
             def q_head_bytes(xq):
+                if const_expr(XQ):
+                    return (
+                        fx.Int32(CTL_XHEAD)
+                        + (par * fx.Int32(N_XCC) + xq) * fx.Int32(32)
+                    ) * fx.Int32(4)
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
 
             def claim_issue(xq):
@@ -1690,11 +1722,29 @@ def make_s1f_stage1(
                     c, xq_c = steal(xq0)
                 return c, xq_c
 
+            def steal_xcc(xq0):
+                """Wave 0, blocking: the next item of the queues after xq0, or
+                code -1 once every queue is exhausted. Each claim follows an
+                empty one (a claim on a live queue takes its item), and an
+                exhausted queue stays exhausted, so one pass decides the end."""
+                code_s = fx.Int32(-2)
+                xq_s = xq0
+                i = fx.Int32(1)
+                while (code_s == fx.Int32(-2)) & (i < fx.Int32(N_XCC)):
+                    xq_c = (xq0 + i) & fx.Int32(N_XCC - 1)
+                    code_s = claim_resolve(xq_c, claim_issue(xq_c))
+                    xq_s = xq_c
+                    i = i + fx.Int32(1)
+                code_s = fx.Int32((code_s == fx.Int32(-2)).select(fx.Int32(-1), code_s))
+                return code_s, xq_s
+
             def steal(xq0):
                 """Wave 0, blocking: the next item from any queue, or code -1
                 once every queue is exhausted. Per-XCC queues: one probe of all
                 heads, then one claim on the queue with the most items left
                 (retried if another CTA drained it first)."""
+                if const_expr(XQ):
+                    return steal_xcc(xq0)
                 code_s = fx.Int32(-2)
                 xq_s = xq0
                 it = fx.Int32(0)
@@ -1837,11 +1887,13 @@ def make_s1f_stage1(
             code = fx.Int32(-1)
             tinfo = fx.Int32(0)
             ready = fx.Int32(0)
-            queue = fx.Int32(0)
+            queue = xcc if const_expr(XQ) else fx.Int32(0)
             static_ok = fx.Int32(0)
             # Consumers only: a producer's first item would wait for its own
             # runs, and those cover the earliest tiles.
-            q0 = slot_id - fx.Int32(P)
+            # XQ: consumer slots are x-major, so XCC x's consumers are
+            # P + x * CB + l, l < CB.
+            q0 = slot_id - fx.Int32(P) - (xcc * fx.Int32(CB) if XQ else fx.Int32(0))
             static_ok = fx.Int32(
                 ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(
                     fx.Int32(1), fx.Int32(0)

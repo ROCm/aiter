@@ -61,6 +61,21 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 _S1F_VARIANTS = {64: (3, 2), 96: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
+#: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m:
+#: decode buckets have one m-tile per expert, so the order only decides how
+#: many XCCs read each m-tile's A. Wider tiles keep the global m-major order,
+#: whose neighbouring m-tiles of one expert share B.
+_S1F_XCC_QUEUE_MAX_TILE_M = 96
+
+
+def _s1f_xcc_queues(tile_m: int) -> int:
+    """``AITER_MEGA_S1F_XCC_QUEUE``: auto (default), 0 or 1."""
+    mode = os.environ.get("AITER_MEGA_S1F_XCC_QUEUE", "auto").strip() or "auto"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"AITER_MEGA_S1F_XCC_QUEUE must be auto, 0 or 1, got {mode!r}")
+    if mode == "auto":
+        return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
+    return int(mode)
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
 # Decode steps have too little expert GEMM to hide the compact plan if the plan
@@ -459,6 +474,7 @@ class _Stage1Fusion:
     ):
         from .s1f_stage1 import make_s1f_stage1
 
+        xcc_queues = _s1f_xcc_queues(tile_m)
         key = (
             tile_m,
             producers,
@@ -468,6 +484,7 @@ class _Stage1Fusion:
             block_runs,
             tdm_b_th,
             tdm_as_in_prologue,
+            xcc_queues,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -476,6 +493,7 @@ class _Stage1Fusion:
             launch = make_s1f_stage1(
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
+                xcc_queues=xcc_queues,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
