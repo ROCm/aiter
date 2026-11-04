@@ -27,7 +27,8 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                             int32_t rope_dim,
                                             int32_t group_size = 32,
                                             bool shuffle_scale = true,
-                                            bool do_rotate_act = true);
+                                            bool do_rotate_act = true,
+                                            bool round_rope    = false);
 
 // rope+hadamard, bf16/fp16 in-place (out shares dtype/stride with input).
 void rope_rotate_activation(aiter_tensor_t& out,

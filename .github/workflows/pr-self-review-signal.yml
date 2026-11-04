@@ -1,0 +1,23 @@
+name: PR Self-Review Signal
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+# Review activity only wakes the privileged evaluator through workflow_run. This workflow
+# deliberately has no write permission and never checks out or executes pull request code.
+permissions:
+  contents: read
+
+jobs:
+  signal:
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Signal review activity
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "Review activity changed on pull request ${PR_NUMBER}."

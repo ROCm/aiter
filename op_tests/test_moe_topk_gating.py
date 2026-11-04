@@ -10,6 +10,8 @@ Usage:
   python test_moe_topk_gating.py --section softmax --topk 8
   python test_moe_topk_gating.py --section sigmoid,softmax --num-tokens 64,1024
   python test_moe_topk_gating.py --section ties,eplb
+  python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
+      --num-tokens 1,8,32,128 --topk 16 --dtype bf16
 """
 
 import argparse
@@ -23,6 +25,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -52,6 +55,9 @@ torch.set_default_device("cuda")
 _TIE_TOL = 1e-4
 
 _WEIGHT_TOL = 1e-4
+# sigmoid of a low-precision logit is computed in fp32 on both sides, but the
+# legacy launcher is allowed bf16/fp16 rounding on the stored weight.
+_SHARED_ATOL = {torch.float16: 2e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
 
 def _renorm_err(topk_weights):
@@ -386,6 +392,63 @@ def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
         ret[f"{name} idx_err"] = checkAllclose(
             ref_idx, ids, tol_err_ratio=0.01, msg=f"{name}: sigmoid indices"
         )
+    return ret
+
+
+@benchmark()
+def bench_biased_grouped_sigmoid(
+    num_experts, num_tokens, topk, dtype, renormalize=True, route_scale=1.0
+):
+    """Compare the gfx1250 caller-owned specialization with its HIP fallback."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    correction_bias = (torch.randn(num_experts) * 0.1).to(torch.bfloat16)
+    triton_weights = torch.empty((num_tokens, topk), dtype=torch.float32)
+    triton_ids = torch.empty((num_tokens, topk), dtype=torch.int32)
+    hip_weights = torch.empty_like(triton_weights)
+    hip_ids = torch.empty_like(triton_ids)
+
+    def run_triton():
+        biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            triton_weights,
+            triton_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return triton_weights, triton_ids
+
+    def run_hip():
+        biased_grouped_topk_hip(
+            gating_output,
+            correction_bias,
+            hip_weights,
+            hip_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return hip_weights, hip_ids
+
+    run_hip()
+    ref_weights = hip_weights.clone()
+    ref_ids = hip_ids.clone()
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_experts * correction_bias.element_size()
+        + num_tokens * topk * 8
+    )
+    ret = {"gfx": get_gfx()}
+    for name, fn in {"triton": run_triton, "hip": run_hip}.items():
+        (weights, ids), us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} weight_err"] = float((weights - ref_weights).abs().max())
+        ret[f"{name} id_err"] = float((ids != ref_ids).float().mean())
     return ret
 
 
@@ -769,6 +832,149 @@ def bench_topk_gating_eplb(
 # ---------------------------------------------------------------------------
 
 
+# Shared-expert suffix: (E, T, topk, num_shared, dtype, renormalize). The E=512
+# rows are the Qwen3.8 FSE launch across the prefill_n gate (T<=1024) and the
+# smem fallback above it. num_shared=1 rows also time the legacy launcher.
+_SHARED_CONFIGS = [
+    (512, T, 10, 1, torch.bfloat16, True) for T in (1, 4, 16, 64, 256, 1024, 2048, 4096)
+] + [
+    (64, 16, 8, 1, torch.bfloat16, True),
+    (128, 1, 8, 1, torch.float32, False),
+    (32, 3, 4, 2, torch.float32, True),
+]
+
+
+@benchmark()
+def bench_topk_gating_shared(
+    num_experts, num_tokens, topk, num_shared, dtype, renormalize
+):
+    """Softmax top-k over the routed prefix plus sigmoid on trailing shared
+    columns, in one launch.
+
+    The shared experts are appended after top-k. A large shared logit must not
+    enter the routed set, and the prefilled shared ids must stay put.
+    Candidates: topk_gating(num_shared_experts=...) and, for one shared expert,
+    the legacy topk_softmax fused-sigmoid launcher that vLLM calls today."""
+    torch.random.manual_seed(0)
+    routed = _make_gating(num_experts, num_tokens, dtype)
+    shared = torch.randn(num_tokens, num_shared, dtype=dtype, device="cuda")
+    shared[0, 0] = torch.tensor(40, dtype=dtype, device="cuda")
+    gating = torch.cat([routed, shared], dim=-1).contiguous()
+    width = topk + num_shared
+    shared_ids = torch.arange(
+        num_experts, num_experts + num_shared, device="cuda", dtype=torch.int32
+    )
+
+    def buffers():
+        ids = torch.full((num_tokens, width), -1, dtype=torch.int32, device="cuda")
+        ids[:, topk:] = shared_ids
+        weights = torch.empty((num_tokens, width), dtype=torch.float32, device="cuda")
+        return weights, ids
+
+    w_fused, ids_fused = buffers()
+    w_legacy, ids_legacy = buffers()
+    token_expert_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+
+    def run_fused():
+        aiter.topk_gating(
+            w_fused,
+            ids_fused[:, :topk],
+            gating,
+            None,
+            need_renorm=renormalize,
+            score_func="softmax",
+            num_shared_experts=num_shared,
+        )
+        return w_fused, ids_fused
+
+    def run_legacy():
+        aiter.topk_softmax(
+            w_legacy,
+            ids_legacy[:, :topk],
+            token_expert_indices,
+            gating,
+            renormalize,
+            num_shared,
+            "sigmoid",
+        )
+        return w_legacy, ids_legacy
+
+    candidates = {"fused": run_fused}
+    if num_shared == 1:
+        candidates["legacy"] = run_legacy
+
+    w_ref, i_ref = ref_softmax(
+        routed, torch.empty(0, device="cuda"), topk, 1.0, renormalize
+    )
+    sel = torch.softmax(routed.float(), dim=-1)
+    shared_ref = torch.sigmoid(shared.float())
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (w, ids), us = run_perftest(fn)
+        n_mism = _count_routing_mismatches(
+            ids[:, :topk],
+            i_ref,
+            sel,
+            topk,
+            label=(
+                f"shared/{name} E={num_experts} T={num_tokens} k={topk} "
+                f"S={num_shared} {dtype} renorm={renormalize}"
+            ),
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} err"] = n_mism / num_tokens
+        ret[f"{name} max_weight_err"] = _max_weight_error(
+            w[:, :topk], ids[:, :topk], w_ref, i_ref
+        )
+        ret[f"{name} shared_err"] = float((w[:, topk:] - shared_ref).abs().max())
+        ret[f"{name} ids_kept"] = bool(
+            torch.equal(ids[:, topk:], shared_ids.expand_as(ids[:, topk:]))
+        )
+    return ret
+
+
+@benchmark()
+def bench_topk_gating_pad_rows(num_experts, num_tokens, topk, score_func, dtype):
+    """num_valid_rows: rows below the count must match an unmasked launch bit
+    for bit; rows at or past it must carry id -1 and weight 0. The count is
+    swept over none, some and all rows of the same launch."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    need_renorm = score_func != "softmax"
+
+    def run(num_valid_rows):
+        weights = torch.full(
+            (num_tokens, topk), float("nan"), dtype=torch.float32, device="cuda"
+        )
+        ids = torch.full((num_tokens, topk), 7, dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            weights,
+            ids,
+            gating_output,
+            bias,
+            need_renorm=need_renorm,
+            routed_scaling_factor=2.5,
+            score_func=score_func,
+            num_valid_rows=num_valid_rows,
+        )
+        return weights, ids
+
+    w_all, ids_all = run(None)
+    bad = 0
+    for n in sorted({0, num_tokens // 2, num_tokens}):
+        count = torch.tensor([n], dtype=torch.int32, device="cuda")
+        w, ids = run(count)
+        bad += not torch.equal(ids[:n], ids_all[:n])
+        bad += not torch.equal(w[:n].view(torch.int32), w_all[:n].view(torch.int32))
+        bad += not bool((ids[n:] == -1).all() and (w[n:] == 0).all())
+    count = torch.tensor([num_tokens // 2], dtype=torch.int32, device="cuda")
+    _, us = run_perftest(run, count)
+    return {"gfx": get_gfx(), "fused us": us, "pad bad": bad}
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("topk_gating unsupported on %s; skipping", get_gfx())
@@ -810,10 +1016,21 @@ def main():
         "--score-func",
         dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=["sigmoid", "softplus", "softmax", "nan", "ties", "eplb"],
+        default=[
+            "sigmoid",
+            "softplus",
+            "softmax",
+            "nan",
+            "ties",
+            "eplb",
+            "shared",
+            "pad-rows",
+        ],
         help="Comma-separated list of sections to run: "
-        "sigmoid,softplus,softmax,nan,ties,eplb (default: all). "
-        "The first three are named after a score function; nan, ties and eplb "
+        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows "
+        "(default: all except biased-sigmoid). "
+        "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
+        "eplb and pad-rows "
         "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
@@ -847,6 +1064,34 @@ def main():
             print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
             print(errors.to_string(index=False))
             failed_sections.append("sigmoid")
+
+    # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
+    if "biased-sigmoid" in sections:
+        biased_configs = list(
+            itertools.product(
+                [e for e in num_experts_list if e in (512, 768, 896, 900, 1024)],
+                num_tokens_list,
+                [k for k in topk_list if k in (4, 8, 16)],
+                [d for d in dtype_list if d == torch.bfloat16],
+                [False, True],
+            )
+        )
+        if not biased_configs:
+            raise ValueError(
+                "biased-sigmoid requires bf16, E in {512,768,896,900,1024}, "
+                "and K in {4,8,16}"
+            )
+        df = [bench_biased_grouped_sigmoid(*cfg) for cfg in biased_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "biased_grouped_topk sigmoid summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[(df["triton weight_err"] > 2e-5) | (df["triton id_err"] != 0.0)]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} biased-sigmoid config(s) mismatched HIP!")
+            print(errors.to_string(index=False))
+            failed_sections.append("biased-sigmoid")
 
     # -- topk_softplus ---------------------------------------------------
     if "softplus" in sections:
@@ -993,6 +1238,48 @@ def main():
                 print(f"\nERROR: {len(errors)} eplb config(s) failed!")
                 print(errors.to_string(index=False))
                 failed_sections.append("eplb")
+
+    # -- shared-expert suffix: topk_gating vs the legacy fused-sigmoid launcher
+    if "shared" in sections:
+        df = pd.DataFrame([bench_topk_gating_shared(*cfg) for cfg in _SHARED_CONFIGS])
+        aiter.logger.info(
+            "topk_gating shared-expert summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["fused max_weight_err"] > _WEIGHT_TOL)
+            | (df["fused shared_err"] > df["dtype"].map(_SHARED_ATOL))
+            | (~df["fused ids_kept"])
+            | (df["legacy err"].fillna(0) > 0.01)
+            | (df["legacy max_weight_err"].fillna(0) > _WEIGHT_TOL)
+            | (~df["legacy ids_kept"].fillna(True).astype(bool))
+        ]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} shared-expert config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("shared")
+
+    # -- num_valid_rows: pad rows routed to -1, real rows untouched ----------
+    if "pad-rows" in sections:
+        pad_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = pd.DataFrame([bench_topk_gating_pad_rows(*cfg) for cfg in pad_configs])
+        aiter.logger.info(
+            "topk_gating pad-rows summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        errors = df[df["pad bad"] > 0]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} pad-rows config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("pad-rows")
 
     if failed_sections:
         print(

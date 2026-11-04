@@ -10,9 +10,25 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
+# rocprofiler-sdk exports these (setenv, so os.environ doesn't see them) when this
+# process initializes the GPU runtime. Spawned workers inherit them, and then the
+# torch profiler there records no GPU kernels, so every candidate times as 0 us.
+_ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TOOLS")
+
+
+def _new_pool(parallel_num, task_start_times, task_pids):
+    for name in _ROCPROFILER_ENV:
+        os.environ.pop(name, None)
+        os.unsetenv(name)
+    return mp.Pool(
+        processes=parallel_num,
+        initializer=_init_task_start_times,
+        initargs=(task_start_times, task_pids),
+    )
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
@@ -25,6 +41,7 @@ def _is_accelerator_error(exc: BaseException) -> bool:
 
 def _init_task_start_times(task_start_times, task_pids=None):
     global _TASK_START_TIMES, _TASK_PIDS
+    configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
 
@@ -93,12 +110,19 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    policy=None,
 ):
     from aiter.test_common import run_perftest
+    from aiter.utility.selection_policy import LATENCY
+    from aiter.utility.tune_result import TuneResult
+
+    policy = LATENCY if policy is None else policy
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
     max_err_ratio = 0.0
+    watts = float("nan")
+    res = None
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -208,10 +232,23 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
-    return info, us, round(max_err_ratio, 4)
+    if us not in (-1, 0) and us != float("inf") and res is not None:
+        watts = policy.measure_timed(
+            func, args, kwargs, device_index=gpu_id, kernel_us=us
+        )
+
+    return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
+def work_group(
+    GPUIDMap,
+    fast_mode,
+    err_ratio,
+    in_data,
+    tasks,
+    verbose=False,
+    policy=None,
+):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
@@ -361,6 +398,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                policy,
             )
 
             # Run worker with explicit GPU ID
@@ -382,8 +421,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
 
 
-def get_pid():
-    time.sleep(3)
+def get_pid(delay=3):
+    if delay:
+        time.sleep(delay)
     return mp.current_process().pid
 
 
@@ -396,6 +436,8 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    policy=None,
+    final_timing=None,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -411,13 +453,32 @@ def mp_tuner(
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
         timeout: Timeout in seconds for each task group (None = no timeout)
+        policy: SelectionPolicy for the run; None uses the one the tuner activated
+        final_timing: whether these times pick the winner (default: not fast_mode).
+            Only a final timing pass is power-sampled.
 
     Returns:
         List of (info, latency, error_ratio) tuples
     """
+    from aiter.utility.selection_policy import LATENCY, active_policy
+
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
+    if policy is None:
+        policy = active_policy()
+    if final_timing is None:
+        # fast_mode is the hipblaslt latency screen. The MoE tuner also sets it,
+        # and passes final_timing because that call is its only timing pass.
+        final_timing = not fast_mode
+    if not final_timing:
+        policy = LATENCY
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
+    if policy.measures_power and mp_num > 1:
+        from aiter.utility.package_power import shared_power_override_rejected
+
+        rejected = shared_power_override_rejected()
+        if rejected:
+            raise ValueError(rejected)
     parallel_num = mp_num
     start_idx = 0
     if not tasks:
@@ -477,6 +538,7 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
+                        policy,
                     ),
                 ),
             )
@@ -486,12 +548,11 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
     task_pids = mp.RawArray("i", len(task_group))
-    pool = mp.Pool(
-        processes=parallel_num,
-        initializer=_init_task_start_times,
-        initargs=(task_start_times, task_pids),
-    )
-    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+    pool = _new_pool(parallel_num, task_start_times, task_pids)
+    pid_delay = 0 if mp_num == 1 else 3
+    pids = [
+        pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
+    ]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code
@@ -678,11 +739,7 @@ def mp_tuner(
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
-            pool = mp.Pool(
-                processes=parallel_num,
-                initializer=_init_task_start_times,
-                initargs=(task_start_times, task_pids),
-            )
+            pool = _new_pool(parallel_num, task_start_times, task_pids)
 
             # Recreate gpu_map for new processes (new PIDs)
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]

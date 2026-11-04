@@ -61,9 +61,9 @@ def _atomic_bf16_epilog(
     lds_base_fptr = lds_typed_ptr(lds_acc_base_i32, T.f32)
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(32)
-    n_lane = tx_i32 % fx.Int32(32)
-    col_start = n_lane * fx.Int32(2)
+    m_lane = tx_i32 // 32
+    n_lane = tx_i32 % 32
+    col_start = n_lane * 2
 
     def _flat_buffer(arg, elem_ty, align):
         ptr = global_typed_ptr(arg, elem_ty, align=align)
@@ -89,7 +89,7 @@ def _atomic_bf16_epilog(
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
         fx.copy(atom, src[None, index], frag)
-        return Vec(frag.load())[0]
+        return frag.load()[0]
 
     packed = []
     weight = []
@@ -121,7 +121,7 @@ def _atomic_bf16_epilog(
                 v2 = Vec(
                     lds_vec_load(
                         lds_acc_base_i32,
-                        idx0 * fx.Int32(4),
+                        idx0 * 4,
                         Vec.make_type(2, fx.Float32),
                         fx.Float32,
                         align=8,
@@ -133,7 +133,7 @@ def _atomic_bf16_epilog(
                 out_off = row_base_addr + fx.Int32(s * 64)
                 if const_expr(is_gfx942):
                     fx.atomic_add(
-                        (out_elems + out_off).llvm_ptr,
+                        fx.recast_iter(out_elems.type, out_elems + out_off),
                         pk,
                         syncscope=fx.rocdl.SyncScope.Agent,
                     )
@@ -178,9 +178,9 @@ def _reduce_bf16_epilog(
     lds_bf16 = lds_typed_ptr(lds_acc_base_i32, T.bf16)
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(32)
-    n_lane = tx_i32 % fx.Int32(32)
-    col_start = n_lane * fx.Int32(2)
+    m_lane = tx_i32 // 32
+    n_lane = tx_i32 % 32
+    col_start = n_lane * 2
 
     def _flat_buffer(arg, elem_ty, align):
         ptr = global_typed_ptr(arg, elem_ty, align=align)
@@ -198,7 +198,7 @@ def _reduce_bf16_epilog(
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
         fx.copy(atom, src[None, index], frag)
-        return Vec(frag.load())[0]
+        return frag.load()[0]
 
     packed = []
     for mr in range_constexpr(M_REPS):
@@ -239,7 +239,7 @@ def _reduce_bf16_epilog(
                 pk = Vec(
                     lds_vec_load(
                         lds_acc_base_i32,
-                        idx0 * fx.Int32(2),
+                        idx0 * 2,
                         Vec.make_type(2, fx.BFloat16),
                         fx.BFloat16,
                         align=4,
@@ -359,7 +359,7 @@ def _gemm2_body_a16w4(
         [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(num_acc_n)]
         for _ in range(m_repeat)
     ]
-    zero4 = Vec.filled(4, 0.0, fx.Float32)
+    zero4 = fx.full(4, 0.0, fx.Float32)
     for mi in range_constexpr(m_repeat):
         for ni in range_constexpr(num_acc_n):
             accm[mi][ni].store(zero4)
@@ -459,12 +459,16 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    use_valid_token_count=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
+    ``use_valid_token_count`` (atomic only): bound scatter rows by
+    min(cumsum[1], M) -- a LocalToken sort pads with token id = real count, which
+    is still < M when M is a padded (cudagraph) row count.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -478,6 +482,7 @@ def compile_gemm2_a16w4_port(
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
     _use_reduce = epilog == "reduce"
+    use_valid_token_count = bool(use_valid_token_count and not _use_reduce)
     _topk = int(topk) if _use_reduce else 1
     if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
@@ -519,6 +524,8 @@ def compile_gemm2_a16w4_port(
         _name += "_persist"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
+    if use_valid_token_count:
+        _name += "_valid_tokens"
 
     @fx.struct
     class SharedStorage:
@@ -540,11 +547,15 @@ def compile_gemm2_a16w4_port(
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
-        lane = tx_i32 % fx.Int32(64)
-        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
+        row_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = _global_i32_at(arg_cumsum, fx.Int32(1))
+            row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2 locality.
@@ -581,7 +592,7 @@ def compile_gemm2_a16w4_port(
                 tile,
                 lane,
                 wave,
-                i32_M,
+                row_limit,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,

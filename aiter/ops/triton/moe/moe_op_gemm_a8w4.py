@@ -278,7 +278,7 @@ def m2bucket(m):
 
 def get_gluon_a8w4_ctas_per_cga(m):
     num_ctas = 1
-    if num_ctas == 1 or get_arch() != "gfx1250":
+    if num_ctas == 1 or get_arch() not in ("gfx1250", "gfx1250-strict"):
         return [1, 1]
     # Decode: shard the cluster along N only.
     if m < 1024:
@@ -395,11 +395,12 @@ def moe_gemm_a8w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250", "gfx1250-strict") else "triton"
     assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
     if backend == "gluon":
-        assert (
-            get_arch() == "gfx1250"
+        assert get_arch() in (
+            "gfx1250",
+            "gfx1250-strict",
         ), f"Gluon backend requires gfx1250, got {get_arch()}"
     use_gluon = backend == "gluon"
     if preshuffled:
@@ -913,7 +914,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:

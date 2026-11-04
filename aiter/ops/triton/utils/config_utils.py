@@ -11,6 +11,7 @@ The per-family loaders build on this module and keep their own files:
 """
 
 import functools
+import itertools
 import json
 import os
 import re
@@ -55,15 +56,42 @@ def load_config_json(fpath: str, required: bool = True) -> dict | None:
 
 def select_leq_config(
     configs: dict,
-    value: int,
+    value: int | None = None,
     *,
     prefix: str = "N_LEQ_",
     fallback_key: str = "any",
+    axes: tuple | None = None,
+    **values,
 ) -> dict:
-    """Copy the smallest prefixed upper-bound config containing ``value``.
+    """Copy the config whose bucket contains the given value.
 
-    Use ``fallback_key`` when no threshold matches.
+    One axis: pass ``value``. The smallest ``<prefix><bound>`` key with
+    ``value <= bound`` wins. Use ``fallback_key`` when no threshold matches.
+
+    Many axes: pass ``axes`` and one keyword value per axis. A key joins one
+    ``<axis>_LEQ_<n>`` or ``<axis>_GEQ_<n>`` part per constrained axis with
+    ``.``, for example ``M_LEQ_32.N_LEQ_1024``. Per axis, in ``axes`` order
+    (leftmost wins ties): LEQ bounds ascending, then GEQ bounds descending,
+    then ``"any"``. The ``"any"`` key is required. ``prefix`` and
+    ``fallback_key`` apply to the one-axis form only.
     """
+    if axes is not None:
+        axes = tuple(axes)
+        if value is not None:
+            raise TypeError("pass either value or axes, not both")
+        missing = [a for a in axes if a not in values]
+        unexpected = [k for k in values if k not in axes]
+        if missing or unexpected:
+            raise TypeError(
+                f"axes {axes}: missing values for {missing}, unexpected {unexpected}"
+            )
+        return _select_by_axes(configs, axes, values)
+    if values:
+        raise TypeError(
+            f"unexpected keyword arguments {sorted(values)}; pass axes= to use them"
+        )
+    if value is None:
+        raise TypeError("select_leq_config needs either value or axes")
     threshold_keys = sorted(
         (key for key in configs if key.startswith(prefix)),
         key=lambda key: int(key[len(prefix) :]),
@@ -94,22 +122,57 @@ _CONFIG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*")
 _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 
+_CU_NUM = None  # the device's CU count, read once per process
+_CU_NUM_READ = False
+
+# resolve_config_dir(cu_num=DEVICE_CU_NUM): the tree of this device's CU count.
+DEVICE_CU_NUM = object()
+
+
+def get_config_cu_num() -> int | None:
+    """CU count of the device, which selects the ``<arch>/<cu_num>cu/`` config
+    trees (configs/AGENTS.md, "CU trees").
+
+    It is ``device_info.get_num_sms()``, that is ``chip_info.get_cu_num()``:
+    the ``CU_NUM`` env override, else the device. The tuned CSV rows are keyed
+    on the same value. The count is read once per process. ``None`` when it
+    cannot be read (no device, no torch); the loaders then use the default
+    tree for the process, and ``CU_NUM`` overrides that.
+    """
+    global _CU_NUM, _CU_NUM_READ
+    if not _CU_NUM_READ:
+        _CU_NUM_READ = True
+        try:
+            from aiter.ops.triton.utils.device_info import get_num_sms
+
+            cu_num = get_num_sms()
+        except Exception:  # noqa: BLE001  no device or no torch: the default tree
+            return None
+        if type(cu_num) is int and cu_num > 0:
+            _CU_NUM = cu_num
+    return _CU_NUM
+
 
 def resolve_config_dir(
     op: str,
     config_name: str,
     backend: str = "triton",
     arch: str | None = None,
+    cu_num=DEVICE_CU_NUM,
 ) -> str:
     """Build the directory that holds one config family's JSON files.
 
-    The nested layout (see configs/CLAUDE.md) keys every family by
+    The nested layout (see configs/AGENTS.md) keys every family by
     architecture, backend, op and family:
     ``<configs>/<arch>/<backend>/<op>/<d_type>``, with the ``<d_type>`` leaf
     derived by ``_dtype_dir()`` (``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``).
-    The path is deterministic: it is built, never probed for, and there is
-    no search across backends, so a family tuned only for the other backend
-    on this arch is never silently borrowed.
+    A family tuned on a CU count other than the arch's default has its own
+    tree, ``<configs>/<arch>/<cu_num>cu/<backend>/<op>/<d_type>``, which is
+    returned instead when ``cu_num`` (by default this device's count) has
+    that tree with a ``DEFAULT.json``. A tree is read whole or not at all.
+    Apart from that one probe the path is deterministic: it is built, never
+    searched for, and there is no search across backends, so a family tuned
+    only for the other backend on this arch is never silently borrowed.
 
     Args:
         op: op directory in the layout -- ``"gemm"``, ``"conv"``, ``"mhc"``,
@@ -128,11 +191,17 @@ def resolve_config_dir(
             -- for loaders that retry under another arch when the running one
             ships no tuned configs (e.g. MHC's documented gfx942 fallback).
             Must match ``[a-z][a-z0-9_]*`` when given.
+        cu_num: the CU count whose ``<arch>/<cu_num>cu/`` tree is returned
+            when it has a ``DEFAULT.json``. Default ``DEVICE_CU_NUM``: this
+            device's count (``get_config_cu_num()``). ``None``: the plain
+            tree, whatever the device. An ``int`` must be positive. Kernels
+            and loaders use the default; the tuning scripts pass a scope.
 
     Returns:
-        The directory path (a plain ``str``). Existence is deliberately not
-        checked here; whether a given file inside it exists is the loader's
-        decision. The family default is ``<dir>/DEFAULT.json``: loading it
+        The directory path (a plain ``str``). Beyond the one ``DEFAULT.json``
+        probe that picks a CU tree, existence is not checked here; whether a
+        given file inside it exists is the loader's decision. The family
+        default is ``<dir>/DEFAULT.json``: loading it
         with ``load_config_json(path)`` raises ``FileNotFoundError`` naming
         this exact path when a required table is missing, while optional
         tables pass ``required=False`` and handle ``None``.
@@ -166,8 +235,80 @@ def resolve_config_dir(
     assert arch is None or (
         isinstance(arch, str) and _ARCH_OVERRIDE_RE.fullmatch(arch)
     ), f"arch override must match [a-z][a-z0-9_]* (e.g. 'gfx942'), got {arch!r}"
+    assert (
+        cu_num is DEVICE_CU_NUM
+        or cu_num is None
+        or (type(cu_num) is int and cu_num > 0)
+    ), f"cu_num must be a positive int, got {cu_num!r}"
     dev = arch if arch is not None else arch_info.get_arch()
     assert isinstance(dev, str) and _ARCH_SAFE_RE.fullmatch(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
-    return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
+    family = f"{backend}/{op}/{_dtype_dir(config_name)}"
+    plain = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"
+    if cu_num is DEVICE_CU_NUM:
+        cu_num = get_config_cu_num()
+    if cu_num is None:
+        return plain
+    cu_tree = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{cu_num}cu/{family}"
+    # a CU tree exists when it has its own DEFAULT.json; it is read whole or not at all
+    if load_config_json(f"{cu_tree}/DEFAULT.json", required=False) is None:
+        return plain
+    return cu_tree
+
+
+def _axis_of(component: str) -> str:
+    """``M_LEQ_32`` -> ``M``."""
+    return component.split("_", 1)[0]
+
+
+def _bound_of(component: str) -> int:
+    return int(component.rsplit("_", 1)[1])
+
+
+def _candidates(axis: str, value, parts: set) -> list:
+    """Components of ``axis`` matching ``value``, most specific first: LEQ
+    bounds ascending, then GEQ bounds descending, then ``"any"``."""
+    leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
+    geq = sorted(
+        (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
+    )
+    return (
+        [c for c in leq if value <= _bound_of(c)]
+        + [c for c in geq if value >= _bound_of(c)]
+        + ["any"]
+    )
+
+
+def _canonical(key: str, axes: tuple) -> tuple:
+    """Expand a bucket key to one slot per axis, ``"any"`` where it says nothing."""
+    slot = dict.fromkeys(axes, "any")
+    if key != "any":
+        for part in key.split("."):
+            slot[_axis_of(part)] = part
+    return tuple(slot[a] for a in axes)
+
+
+@functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
+def _bucket_index(keys: tuple, axes: tuple) -> tuple:
+    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
+    on the key names (all it depends on)."""
+    parts = {a: set() for a in axes}
+    for key in keys:
+        if key != "any":
+            for part in key.split("."):
+                parts[_axis_of(part)].add(part)
+    return {_canonical(k, axes): k for k in keys}, parts
+
+
+def _select_by_axes(table: dict, axes: tuple, values: dict) -> dict:
+    index, parts = _bucket_index(tuple(table), axes)
+    per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
+    for slots in itertools.product(*per_axis):
+        if slots in index:
+            return dict(table[index[slots]])
+    raise KeyError(
+        "no entry for "
+        + " ".join(f"{a}={values[a]!r}" for a in axes)
+        + f"; every table needs an 'any' entry (keys: {sorted(table)[:8]})"
+    )

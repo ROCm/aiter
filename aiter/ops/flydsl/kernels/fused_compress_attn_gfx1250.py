@@ -30,7 +30,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
@@ -157,7 +157,7 @@ def _wave_reduce_max(x, log2_block):
     for sh_exp in range_constexpr(log2_block):
         off = BLOCK_THREADS // (2 << sh_exp)
         peer = _to_raw(fx.Float32(w).shuffle_xor(off, BLOCK_THREADS))
-        w = arith.maximumf(w, peer)
+        w = fx.max(fx.Float32(w), fx.Float32(peer)).ir_value()
     return w
 
 
@@ -391,30 +391,33 @@ def _build_kernel(
                     w_old = w_lane[i]
                     kv_old = kv_lane[i]
 
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
-                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(arith.subf(score, m_new), c_log2e)
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    # Keep the -inf sentinel comparisons outside ambient fastmath.
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
                     if const_expr(score_can_be_neg_inf):
-                        is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
-                        w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
+                        with fastmath(None):
+                            is_pad_score = score_f == neg_inf_f
+                        w_k = is_pad_score.select(c_zero_f32, wk_active)
                     else:
                         w_k = wk_active
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_old, scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_old) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v)
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_old, scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_old) * fx.Float32(scale_v) + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -463,14 +466,10 @@ def _build_kernel(
                 # Slot term already folded into the descriptor base.
                 col_off_fx = fx.Int32(_col_off_for_k(k_i32))
                 base_kv_off = (
-                    fx.Int32(ring) * fx.Int32(kv_state_pos_stride)
-                    + col_off_fx
-                    + tid_x_vec
+                    fx.Int32(ring) * kv_state_pos_stride + col_off_fx + tid_x_vec
                 )
                 base_sc_off = (
-                    fx.Int32(ring) * fx.Int32(score_state_pos_stride)
-                    + col_off_fx
-                    + tid_x_vec
+                    fx.Int32(ring) * score_state_pos_stride + col_off_fx + tid_x_vec
                 )
 
                 kv_v_lane = _load_f32_vec(kv_state_rsrc, base_kv_off, VEC)
@@ -521,14 +520,10 @@ def _build_kernel(
                 col_off, in_row, ape_row = _phase2_offsets(k_i32)
                 col_off_fx = fx.Int32(col_off)
                 base_in_off = (
-                    fx.Int32(in_row) * fx.Int32(kv_in_row_stride)
-                    + col_off_fx
-                    + tid_x_vec
+                    fx.Int32(in_row) * kv_in_row_stride + col_off_fx + tid_x_vec
                 )
                 base_sc_off = (
-                    fx.Int32(in_row) * fx.Int32(score_in_row_stride)
-                    + col_off_fx
-                    + tid_x_vec
+                    fx.Int32(in_row) * score_in_row_stride + col_off_fx + tid_x_vec
                 )
                 base_ape_off = fx.Int32(ape_row) * DIM_FULL + col_off_fx + tid_x_vec
                 kv = _load_bf16_vec_then_f32(kv_in_rsrc, base_in_off, VEC)
@@ -800,8 +795,7 @@ def _build_kernel(
                 # physical_block = block_table[batch_id, block_in_seq]
                 bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
                 bt_off = _to_raw(
-                    fx.Int32(batch_id) * fx.Int32(block_table_seq_stride)
-                    + fx.Int32(block_in_seq)
+                    fx.Int32(batch_id) * block_table_seq_stride + fx.Int32(block_in_seq)
                 )
                 physical_block = buffer_ops.buffer_load(
                     bt_rsrc, bt_off, vec_width=1, dtype=i32
@@ -814,8 +808,7 @@ def _build_kernel(
                     # The block term rides on the descriptor's base, not on
                     # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        fx.Int32(slot_in_block) * fx.Int32(kv_cache_token_stride)
-                        + tid_x_vec
+                        fx.Int32(slot_in_block) * kv_cache_token_stride + tid_x_vec
                     )
                     # Build a per-block GTensor and store VEC bf16 via dword path.
                     # bf16 VEC ? {2, 4, 8, 16} = {4, 8, 16, 32} bytes = {1, 2, 4, 8} dwords.
@@ -862,12 +855,8 @@ def _build_kernel(
                     # as wave64 -- single source of truth). --
                     # The block term rides on each descriptor's base, not on
                     # the 32-bit offset -- see `block_base_bytes_i64`.
-                    _nm_cache_base = fx.Int32(slot_in_block) * fx.Int32(
-                        kv_cache_token_stride
-                    )
-                    _nm_krope_base = fx.Int32(slot_in_block) * fx.Int32(
-                        krope_token_stride
-                    )
+                    _nm_cache_base = fx.Int32(slot_in_block) * kv_cache_token_stride
+                    _nm_krope_base = fx.Int32(slot_in_block) * krope_token_stride
                     emit_group_fp8_nm_asm_scatter(
                         normed_lane=normed_lane,
                         rotated_lane=rotated_lane,
@@ -1186,7 +1175,7 @@ def _build_kernel(
                             ),
                         )
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, e8m0_v),
+                            fx.Uint8(e8m0_v).ir_value(),
                             scale_rsrc,
                             fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
                             + fx.Int32(tid) // NTG,
@@ -1225,7 +1214,6 @@ def _build_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = fx.Index(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -1255,7 +1243,7 @@ def _build_kernel(
             block_table_seq_stride,
         )
         k.launch(
-            grid=(idx_p, 1, 1),
+            grid=(plan_capacity, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -1469,27 +1457,31 @@ def _build_kernel_ksplit(
                 for i in range_constexpr(VEC):
                     m_old = m_lane[i]
                     score = score_lane[i]
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
-                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(arith.subf(score, m_new), c_log2e)
-                    is_pad = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
-                    w_k = arith.select(is_pad, c_zero_f32, wk_active)
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    # Keep the -inf sentinel comparisons outside ambient fastmath.
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
+                    with fastmath(None):
+                        is_pad = score_f == neg_inf_f
+                    w_k = is_pad.select(c_zero_f32, wk_active)
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_lane[i], scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v_lane[i], fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v_lane[i])
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_lane[i], scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -1501,15 +1493,9 @@ def _build_kernel_ksplit(
                 ring = fx.Uint32(s_safe) % state_size
                 col_off_fx = fx.Int32(_col_off_for_k(k_i32))
                 # Slot term already folded into the descriptor base.
-                base_kv = (
-                    fx.Int32(ring) * fx.Int32(kv_state_pos_stride)
-                    + col_off_fx
-                    + lid_x_vec
-                )
+                base_kv = fx.Int32(ring) * kv_state_pos_stride + col_off_fx + lid_x_vec
                 base_sc = (
-                    fx.Int32(ring) * fx.Int32(score_state_pos_stride)
-                    + col_off_fx
-                    + lid_x_vec
+                    fx.Int32(ring) * score_state_pos_stride + col_off_fx + lid_x_vec
                 )
                 kv_v = _load_f32_vec(kv_state_rsrc, base_kv, VEC)
                 sc_v = _load_f32_vec(score_state_rsrc, base_sc, VEC)
@@ -1522,15 +1508,9 @@ def _build_kernel_ksplit(
                 ape_row = fx.Uint32(k_i32) % ratio
                 in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - fx.Int32(k_i32))
                 in_row = fx.max(in_row_raw, fx.Int32(0))
-                base_in = (
-                    fx.Int32(in_row) * fx.Int32(kv_in_row_stride)
-                    + col_off_fx
-                    + lid_x_vec
-                )
+                base_in = fx.Int32(in_row) * kv_in_row_stride + col_off_fx + lid_x_vec
                 base_sc = (
-                    fx.Int32(in_row) * fx.Int32(score_in_row_stride)
-                    + col_off_fx
-                    + lid_x_vec
+                    fx.Int32(in_row) * score_in_row_stride + col_off_fx + lid_x_vec
                 )
                 base_ape = fx.Int32(ape_row) * DIM_FULL + col_off_fx + lid_x_vec
                 kv = _load_bf16_vec_then_f32(kv_in_rsrc, base_in, VEC)
@@ -1731,8 +1711,7 @@ def _build_kernel_ksplit(
                 ci = _to_raw(ci)
                 bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
                 bt_off = _to_raw(
-                    fx.Int32(batch_id) * fx.Int32(block_table_seq_stride)
-                    + fx.Int32(block_in_seq)
+                    fx.Int32(batch_id) * block_table_seq_stride + fx.Int32(block_in_seq)
                 )
                 physical_block = buffer_ops.buffer_load(
                     bt_rsrc, bt_off, vec_width=1, dtype=i32
@@ -1742,8 +1721,7 @@ def _build_kernel_ksplit(
                     # The block term rides on the descriptor's base, not on
                     # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        fx.Int32(slot_in_block) * fx.Int32(kv_cache_token_stride)
-                        + lid_x_vec
+                        fx.Int32(slot_in_block) * kv_cache_token_stride + lid_x_vec
                     )
                     out_vec_t = T.vec(VEC, T.bf16)
                     bf16_vec = fx.Vector.from_elements(
@@ -1887,7 +1865,7 @@ def _build_kernel_ksplit(
                         slot_u = fx.Uint32(slot_in_block)
                         token_tile_id = slot_u // TILE
                         token_in_tile = slot_u % TILE
-                        d_for_tid = fx.Uint32(lid) * VEC
+                        d_for_tid = lid * VEC
                         col_tile_id = d_for_tid // TILE
                         col_in_tile = d_for_tid % TILE
                         in_block_off = _to_raw(
@@ -1994,7 +1972,7 @@ def _build_kernel_ksplit(
                         ),
                     )
                     fp4_byte_off = fx.Int32(slot_in_block) * (D // 2) + (
-                        (fx.Uint32(lid) * VEC) >> 1
+                        (lid * VEC) >> 1
                     )
                     if (fx.Int32(lid) & 1) == 0:
                         buffer_ops.buffer_store(
@@ -2014,7 +1992,7 @@ def _build_kernel_ksplit(
                             ),
                         )
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, e8m0_v),
+                            fx.Uint8(e8m0_v).ir_value(),
                             scale_rsrc,
                             fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
                             + fx.Int32(lid) // NTG,
@@ -2049,7 +2027,6 @@ def _build_kernel_ksplit(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = fx.Index(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -2076,7 +2053,7 @@ def _build_kernel_ksplit(
             block_table_seq_stride,
         )
         k.launch(
-            grid=(idx_p, 1, 1),
+            grid=(plan_capacity, 1, 1),
             block=(BLOCK_TH, 1, 1),
             stream=stream,
         )
