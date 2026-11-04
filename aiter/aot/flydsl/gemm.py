@@ -232,11 +232,13 @@ def _bmm_mfma_job(
     n: int,
     k: int,
     x_scale_transposed: bool = False,
+    blank_block: str = "128x128",
 ) -> dict | None:
     """A gfx950 flydsl batched-GEMM row as a compile job: a batched mxscale
     table row, or a GEMM table's kernelId "bmm" row run with B = 1. M is a
     runtime argument, so one job per kernel, B, N, K, scale block and x_scale
-    layout serves every M bucket."""
+    layout serves every M bucket. A blank w_scale_block cell reads as
+    blank_block, the block the row's table defaults to."""
     params = parse_bmm_kernel_name(kernel_name)
     if params is None:
         # The runtime runs the heuristic's pick for such a row.
@@ -251,9 +253,11 @@ def _bmm_mfma_job(
         "cu_num": 0,  # the gfx column names the arch
         "gfx": row.get("gfx", "").strip(),
         "b": b,
-        # A table from before the column, or a blank / 0 cell, holds 128x128
-        # rows (as the runtime loaders read it).
-        "w_scale_block": mxscale_w_scale_block_cell(row.get("w_scale_block")),
+        # A table from before the column, or a blank / 0 cell, holds the
+        # table's default block (as the runtime loaders read it).
+        "w_scale_block": mxscale_w_scale_block_cell(
+            row.get("w_scale_block"), blank_block
+        ),
         "x_scale_transposed": x_scale_transposed,
         **params,
     }
@@ -374,14 +378,11 @@ def parse_csv(csv_path: str):
         if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
             # Dispatch runs the row with the x_scale block that goes with its
             # w_scale's: 1x128 with 128x128 (column-major, blockscale, read
-            # by the transposed kernel except at M = 1), else 1x32.
-            layouts = (
-                (False, True)
-                if mxscale_w_scale_block_cell(row.get("w_scale_block")) == "128x128"
-                else (False,)
-            )
+            # by the transposed kernel except at M = 1), else 1x32. The mxfp8
+            # table's (1x32) rows run gemm_a8w8_mxfp8_bpreshuffle's B = 1 path.
+            layouts = (False, True) if mxfp8_block == "128x128" else (False,)
             for transposed in layouts:
-                job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
+                job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed, mxfp8_block)
                 if job is None:
                     break
                 if job_identity(job) not in seen:
