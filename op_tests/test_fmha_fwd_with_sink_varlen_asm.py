@@ -597,6 +597,7 @@ _BF16_GATE_CASES = {
     "D192x128 with sink logits": False,
     "head dim 256": False,
     "fp32 descales": False,
+    "zero kv heads": False,
     **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
 }
 
@@ -614,6 +615,8 @@ def test_fmha_fwd_with_sink_varlen_asm_gate(case):
     else:
         d, dv = 192, 128
     q, k, v, _ = make_varlen_packed([2], 4, 4, d, dv)
+    if case == "zero kv heads":
+        k, v = k[:, :0], v[:, :0]
     sink = torch.zeros(4, dtype=dtypes.fp32) if "with sink" in case else None
     descale = torch.ones(1, dtype=dtypes.fp32) if case == "fp32 descales" else None
     mha = aiter.ops.mha
@@ -948,6 +951,10 @@ def check_fp8_against_ref(out, lse, ref, msg, exact=False):
     if lse is not None:
         fin = torch.isfinite(ref[2])
         assert torch.equal(torch.isfinite(lse), fin), f"{msg}: LSE finite mask differs"
+        # a row that sees no key must merge with weight 0: -inf, never NaN / +inf
+        assert bool(
+            (lse[~fin] == float("-inf")).all()
+        ), f"{msg}: LSE of a row without keys is not -inf"
         # distance to the exact log-sum-exp: reported, not checked (see above)
         res["lse err"] = (
             (lse[fin] - ref[2][fin]).abs().max().item() if fin.any() else 0.0
@@ -1202,6 +1209,8 @@ _FP8_GATE_CASES = {
     "k token stride 2^24 B": False,
     "fp32 out": False,
     "sink logits": False,
+    "descale on cpu": False,
+    "zero kv heads": False,
     **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
 }
 
@@ -1229,6 +1238,10 @@ def test_fmha_fwd_fp8_varlen_asm_gate(case):
         out = torch.empty(2, 4, 128, dtype=dtypes.fp32)
     elif case == "sink logits":
         sink = torch.zeros(4, dtype=dtypes.fp32)
+    elif case == "descale on cpu":
+        qd = qd.cpu()
+    elif case == "zero kv heads":
+        k8, v8 = k8[:, :0], v8[:, :0]
     mha = aiter.ops.mha
     routed = mha._GFX1250_VARLEN_ASM_FP8 == mha._select_gfx1250_fmha_fwd_varlen_asm(
         q8,
@@ -1243,6 +1256,31 @@ def test_fmha_fwd_fp8_varlen_asm_gate(case):
     )
     assert routed == _FP8_GATE_CASES[case], f"{case}: gate returned {routed}"
     return {"gfx": get_gfx(), "routed to asm": routed}
+
+
+# name -> the C++ entry's error for a direct call with that operand
+_FP8_OPS_REFUSED_CASES = {
+    "descale on cpu": "must be on the same GPU as q",
+    "zero kv heads": "head counts must be positive",
+}
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm_ops_refused(case):
+    """A direct call with an operand the kernel cannot use must be refused by the
+    C++ entry rather than launched.  Not timed: nothing is launched."""
+    q8, k8, v8, qd, kd, vd, cu_q, cu_k = make_fp8_varlen([2], [2], 4, 4)
+    if case == "descale on cpu":
+        qd = qd.cpu()
+    elif case == "zero kv heads":
+        k8, v8 = k8[:, :0], v8[:, :0]
+    try:
+        aiter.fmha_fwd_fp8_varlen_asm(q8, k8, v8, qd, kd, vd, cu_q, cu_k, 2, 2)
+        refused = False
+    except RuntimeError as e:
+        refused = _FP8_OPS_REFUSED_CASES[case] in str(e)
+    assert refused, f"{case}: the C++ entry did not refuse it"
+    return {"gfx": get_gfx(), "ops refused": refused}
 
 
 @benchmark()
@@ -1505,6 +1543,13 @@ def main():
         summarize(
             "fp8 D192x128 gate",
             [test_fmha_fwd_fp8_varlen_asm_gate(c) for c in _FP8_GATE_CASES],
+        )
+        summarize(
+            "fp8 D192x128 ops refused",
+            [
+                test_fmha_fwd_fp8_varlen_asm_ops_refused(c)
+                for c in _FP8_OPS_REFUSED_CASES
+            ],
         )
         summarize(
             "fp8 D192x128 perf",

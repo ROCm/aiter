@@ -110,10 +110,12 @@ static void check_strided_thd(const aiter_tensor_t* t, const char* name)
                 " B must be in (0, 2^24), head ", hs, " B must be in (0, INT32_MAX])");
 }
 
-static void check_descale(const aiter_tensor_t* t, const char* name)
+static void check_descale(const aiter_tensor_t* t, const char* name, int device_id)
 {
     AITER_CHECK(t->dtype() == AITER_DTYPE_fp32 && t->numel() == 1,
                 "fmha_fwd_fp8_varlen_asm: ", name, " must be a single fp32 value (per-tensor)");
+    AITER_CHECK(t->device_id == device_id,
+                "fmha_fwd_fp8_varlen_asm: ", name, " must be on the same GPU as q");
 }
 
 static int cu_count(int device)
@@ -219,9 +221,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(cu_seqlens_q->dtype() == AITER_DTYPE_i32 &&
                 cu_seqlens_k->dtype() == AITER_DTYPE_i32,
                 "fmha_fwd_fp8_varlen_asm: cu_seqlens_q/k must be int32");
-    check_descale(q_descale, "q_descale");
-    check_descale(k_descale, "k_descale");
-    check_descale(v_descale, "v_descale");
+    check_descale(q_descale, "q_descale", q->device_id);
+    check_descale(k_descale, "k_descale", q->device_id);
+    check_descale(v_descale, "v_descale", q->device_id);
 
     // ---- shape extraction (packed thd) ----------------------------------------
     AITER_CHECK(q->dim() == 3 && k->dim() == 3 && v->dim() == 3,
@@ -240,6 +242,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 qk_head_dim, ",", v_head_dim, ")");
     AITER_CHECK((int)v->size(0) == total_k,     "fmha_fwd_fp8_varlen_asm: v total_k mismatch with k");
     AITER_CHECK((int)v->size(1) == kv_head_num, "fmha_fwd_fp8_varlen_asm: v head_num mismatch with k");
+    AITER_CHECK(q_head_num > 0 && kv_head_num > 0,
+                "fmha_fwd_fp8_varlen_asm: q/kv head counts must be positive");
     AITER_CHECK(q_head_num % kv_head_num == 0,
                 "fmha_fwd_fp8_varlen_asm: q_head_num must be a multiple of kv_head_num");
 
