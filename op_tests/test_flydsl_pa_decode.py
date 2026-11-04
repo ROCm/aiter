@@ -1100,7 +1100,7 @@ def test_pa_decode_one_partition_workspace(
     with monkeypatch.context() as allocation_patch:
         allocation_patch.setattr(torch, "empty", count_empty)
         launch()
-    direct = output_mode != "sinks" and (kv_dtype == "bf16" or output_mode == "direct")
+    direct = output_mode == "direct"
     assert len(allocations) == (0 if direct else 3)
     check()
 
