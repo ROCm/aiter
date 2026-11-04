@@ -48,6 +48,9 @@ def device():
         ("direct", 2517, 1, False),
         ("direct", 4536, 1, False),  # traced sparse-prefill token count
         ("direct", 64, 1, True),  # with empty sequences
+        # More sequences than one cluster wave: no cluster merge, so the quant runs
+        # after the BF16 output with the standalone kernel.
+        ("split", 256, 8, False),
     ],
 )
 def test_sparse_pa_output_quant_matches_separate_kernel(
@@ -68,7 +71,7 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
     )
     context = (
         torch.full((rows,), max_context, dtype=torch.int32, device=device)
-        if mode == "cluster8"
+        if mode in ("cluster8", "split")
         else torch.arange(rows, dtype=torch.int32, device=device)
         .remainder_(max_context)
         .add_(1)
@@ -178,9 +181,16 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
     launch(quantized=True)
     check()
     selected = compile_calls[-1]
-    assert selected["quant_output"] is True
-    assert selected["store_output"] is store_output
-    if mode == "cluster8":
+    if mode == "split":
+        assert "quant_output" not in selected
+        assert selected["cluster_merge"] == 0
+        assert selected["direct_output"] is False
+    else:
+        assert selected["quant_output"] is True
+        assert selected["store_output"] is store_output
+    if mode == "split":
+        pass
+    elif mode == "cluster8":
         assert selected["cluster_merge"] == 8
         assert selected["direct_output"] is False
     else:
