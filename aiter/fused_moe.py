@@ -1670,6 +1670,7 @@ def _fused_moe_impl(
             block_size_M=block_size_M,
             tokens=M,
             model_dim=model_dim,
+            inter_dim=inter_dim,
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             has_bias1=bias1 is not None,
@@ -3641,6 +3642,11 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+# Widest row fused_dynamic_mx_quant_moe_sort quantizes (32 elements per thread,
+# 256 threads; csrc/kernels/quant_kernels.cu).
+_MX_QUANT_SORT_MAX_COLS = 8192
+
+
 def _check_deterministic_supported(
     *,
     dtype,
@@ -3661,6 +3667,7 @@ def _check_deterministic_supported(
     block_size_M,
     tokens,
     model_dim,
+    inter_dim,
     hidden_pad,
     intermediate_pad,
     has_bias1,
@@ -3733,6 +3740,16 @@ def _check_deterministic_supported(
                 # tiles.
                 model_dim % 512 != 0,
                 f"hidden size {model_dim} (a multiple of 512 only)",
+            ),
+            (
+                # Both stages quantize their activations to MXFP8 at every token
+                # count; at small batches that is the fused quantize-and-sort
+                # kernel, which takes at most 8,192 columns.
+                max(model_dim, inter_dim) > _MX_QUANT_SORT_MAX_COLS,
+                (
+                    f"hidden size {model_dim} / intermediate size {inter_dim} "
+                    f"(at most {_MX_QUANT_SORT_MAX_COLS})"
+                ),
             ),
             (
                 # Without a stage-2 bias the padded output columns are not stored

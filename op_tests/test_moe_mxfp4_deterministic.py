@@ -355,6 +355,12 @@ def test_deterministic_rejects_unsupported():
             deterministic=True,
         )
 
+    # Widths the MXFP8 activation quantizer cannot take at small batches.
+    for model_dim, inter_dim in ((8704, 512), (1024, 8704)):
+        q = _problem(8, model_dim, inter_dim, 4, 2, bias=False)
+        with pytest.raises(NotImplementedError, match="at most 8192"):
+            _run(q, slice(None), ActivationType.Swiglu, True)
+
 
 @benchmark()
 def test_fused_moe_mxfp4(token, model_dim, inter_dim, E, topk):
