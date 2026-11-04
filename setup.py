@@ -245,7 +245,8 @@ def prepare_packaging():
     write_install_mode()
 
 
-# Only a run that stages aiter_meta/ removes it at the end; metadata-only and
+# A run that stages aiter_meta/ removes it at the end, and so does `clean`, which
+# also clears one an interrupted build left behind. Other metadata-only and
 # develop runs leave an existing one alone.
 STAGED_AITER_META = False
 if METADATA_ONLY:
@@ -559,7 +560,7 @@ else:
         *FLYDSL_REQUIRES,
     ]
 
-setup(
+dist = setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
     packages=packages,
@@ -599,5 +600,5 @@ setup(
     distclass=ForcePlatlibDistribution,
 )
 
-if STAGED_AITER_META and os.path.isdir("aiter_meta"):
+if (STAGED_AITER_META or "clean" in dist.commands) and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")

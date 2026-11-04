@@ -80,8 +80,16 @@ def test_classifier_falls_back_without_setuptools_base_error(
     assert is_metadata_only(["setup.py", "egg_info"]) is True
 
 
-def test_metadata_only_run_keeps_an_existing_aiter_meta(tmp_path):
-    """egg_info stages nothing, so it must not delete an aiter_meta/ it did not create."""
+@pytest.mark.parametrize(
+    "command, kept",
+    [
+        (["egg_info", "--egg-base", "."], True),
+        # clean removes one an interrupted build left behind, as main did.
+        (["clean"], False),
+    ],
+)
+def test_metadata_only_run_and_an_existing_aiter_meta(tmp_path, command, kept):
+    """egg_info keeps an aiter_meta/ it did not stage; clean removes it."""
     for name in (
         "setup.py",
         "pyproject.toml",
@@ -100,7 +108,7 @@ def test_metadata_only_run_keeps_an_existing_aiter_meta(tmp_path):
         # this copy lacks. Triton-only skips the probe; aiter_meta/ is kept either way.
         env["AITER_TRITON_ONLY"] = "1"
     run = subprocess.run(
-        [sys.executable, "setup.py", "egg_info", "--egg-base", str(tmp_path)],
+        [sys.executable, "setup.py", *command],
         check=False,
         cwd=tmp_path,
         env=env,
@@ -109,4 +117,4 @@ def test_metadata_only_run_keeps_an_existing_aiter_meta(tmp_path):
     )
 
     assert run.returncode == 0, run.stdout + run.stderr
-    assert (tmp_path / "aiter_meta" / "keep").exists()
+    assert (tmp_path / "aiter_meta" / "keep").exists() is kept
