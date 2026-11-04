@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -400,3 +401,100 @@ def test_configure_requires_a_source():
         plugin.configure(enable=["alpha"], source="   ")
     with pytest.raises(TypeError):
         plugin.configure(["alpha"], source="positional-is-rejected")  # type: ignore[misc]
+
+
+class _OpaqueDefault:
+    """A default whose repr cannot be parsed back, like ``dtypes.fp32``."""
+
+    def __repr__(self) -> str:
+        return "<dtype object at 0x...>"
+
+
+_OPAQUE = _OpaqueDefault()
+
+
+def _positional(out, input, weight, epsilon, gemma_norm=False): ...
+def _many_defaults(x, scale=None, scale_dtype=_OPAQUE, quant_dtype=_OPAQUE): ...
+def _keyword_only(x, *, eps=1e-6, out=None): ...
+def _positional_only(x, y, /, z=3): ...
+def _single(x): ...
+def _empty(): ...
+def _var_positional(x, *rest, **options): ...
+
+
+@pytest.mark.parametrize(
+    ("native", "args", "kwargs"),
+    [
+        (_positional, ("o", "i", "w", 1e-6), {}),
+        (_positional, ("o", "i"), {"weight": "w", "epsilon": 1e-6}),
+        (_positional, ("o", "i", "w", 1e-6, True), {}),
+        (_many_defaults, ("x",), {}),
+        (_many_defaults, ("x",), {"quant_dtype": "fp8"}),
+        (_keyword_only, ("x",), {}),
+        (_keyword_only, ("x",), {"eps": 1.0, "out": "o"}),
+        (_positional_only, (1, 2), {}),
+        (_positional_only, (1, 2, 9), {}),
+        (_single, (1,), {}),
+        (_empty, (), {}),
+        (_var_positional, (1, 2, 3), {"flag": True}),
+    ],
+)
+def test_canonicalizer_matches_signature_bind(native, args, kwargs):
+    """The generated binder must be a drop-in for bind() + apply_defaults()."""
+
+    contract = inspect.signature(native)
+    bound = contract.bind(*args, **kwargs)
+    bound.apply_defaults()
+
+    canonicalize = plugin._build_canonicalizer(contract)
+
+    assert canonicalize(*args, **kwargs) == (bound.args, bound.kwargs)
+
+
+@pytest.mark.parametrize(
+    ("native", "args", "kwargs"),
+    [
+        (_positional, ("o",), {}),
+        (_positional, ("o", "i", "w", 1e-6), {"unknown": 1}),
+        (_keyword_only, (), {}),
+        (_positional_only, (1, 2), {"x": 3}),
+        (_empty, (1,), {}),
+    ],
+)
+def test_canonicalizer_rejects_what_signature_bind_rejects(native, args, kwargs):
+    contract = inspect.signature(native)
+    canonicalize = plugin._build_canonicalizer(contract)
+
+    with pytest.raises(TypeError):
+        contract.bind(*args, **kwargs)
+    with pytest.raises(TypeError):
+        canonicalize(*args, **kwargs)
+
+
+def test_var_signatures_fall_back_to_signature_bind():
+    canonicalize = plugin._build_canonicalizer(inspect.signature(_var_positional))
+
+    assert canonicalize.__name__ == "canonicalize"  # the fallback, not generated
+    assert plugin._canonicalizer_source(inspect.signature(_var_positional)) is None
+
+
+def test_a_parameter_named_like_an_injected_default_falls_back():
+    """A parameter name that would collide with an injected default is unsafe."""
+
+    namespace: dict = {}
+    exec(  # noqa: S102 - generating a colliding signature is the point
+        f"def collide({plugin._DEFAULT_PREFIX}x=1): ...", namespace
+    )
+    contract = inspect.signature(namespace["collide"])
+
+    assert plugin._canonicalizer_source(contract) is None
+    assert plugin._build_canonicalizer(contract)(2) == ((2,), {})
+
+
+def test_opaque_defaults_survive_generation():
+    """A default with no parseable repr must still be applied, by identity."""
+
+    canonicalize = plugin._build_canonicalizer(inspect.signature(_many_defaults))
+    args, _ = canonicalize("x")
+
+    assert args[2] is _OPAQUE
