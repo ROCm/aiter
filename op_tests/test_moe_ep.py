@@ -796,7 +796,9 @@ def test_fmoe_ep_mxfp4(
 
     w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
     w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
-    if _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
+    if quant_label == "a4w4_mxfp4" and (
+        _gfx == "gfx1250" or activation == ActivationType.Situv2
+    ):
 
         def _quant_act(x):
             return per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
@@ -910,6 +912,7 @@ def test_fmoe_ep_mxfp4(
         # SiTUv2 ignores the bound above and stays bf16 (a16w4, which rejects
         # expert_mask) unless this opts it into fp8 activations.
         os.environ["AITER_SITUV2_A8W4"] = "1"
+        os.environ.pop("AITER_SITUV2_A4W4", None)
     elif quant_label == "a4w4_mxfp4":
         # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
         # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
@@ -922,6 +925,7 @@ def test_fmoe_ep_mxfp4(
         w2_a.is_shuffled = True
         act = activation
         gate_mode = GateMode.SEPARATED.value
+        os.environ["AITER_SITUV2_A4W4"] = "1"
         os.environ.pop("AITER_SITUV2_A8W4", None)
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
@@ -1029,7 +1033,7 @@ def test_fmoe_ep_mxfp4(
             logits_diff < _logits_diff_tol
         ), f"{_msg}: logits_diff={logits_diff} exceeds {_logits_diff_tol}"
     elif activation == ActivationType.Situv2:
-        # test_moe_2stage's SiTUv2 criterion: the two fp8 activation round trips
+        # test_moe_2stage's SiTUv2 criterion: the two activation round trips
         # push some elements past atol/rtol, so only fail when logits_diff does too.
         err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg, printLog=False)
         _logits_diff_tol = 0.01
