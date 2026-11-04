@@ -1,0 +1,3 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/module_aiter_core.so
+atom bf16 dense-verify-b3-q4-ctx225280                  33.182 us   10.431 logical IO TB/s  reducer
+Saved 1 results to /tmp/pa-main-gpu1-20261104-7cb3db1b/crash-recheck-main.json and /tmp/pa-main-gpu1-20261104-7cb3db1b/crash-recheck-main.csv

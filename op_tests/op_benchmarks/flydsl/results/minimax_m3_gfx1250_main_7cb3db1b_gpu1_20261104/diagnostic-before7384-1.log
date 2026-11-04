@@ -1,0 +1,10 @@
+[aiter] [pid=14898 pname=MainProcess] start build [module_aiter_core] under /tmp/aiter-pa-before-7384-e4973c4b/aiter/jit/build/module_aiter_core
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=14898 pname=MainProcess] [32mfinish build [module_aiter_core], cost 10.6s [0m
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-before-7384-e4973c4b/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b8-q1-ctx8192                     6.309 us    5.329 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.455 us   14.223 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.401 us    9.072 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   12.559 us   10.707 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx225280                  33.324 us   10.387 logical IO TB/s  reducer
+Saved 5 results to /tmp/pa-main-gpu1-20261104-7cb3db1b/diagnostic-before7384-1.json and /tmp/pa-main-gpu1-20261104-7cb3db1b/diagnostic-before7384-1.csv

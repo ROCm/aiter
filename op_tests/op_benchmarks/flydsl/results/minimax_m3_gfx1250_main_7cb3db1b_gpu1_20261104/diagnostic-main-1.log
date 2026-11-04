@@ -1,0 +1,7 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b8-q1-ctx8192                     6.365 us    5.282 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.371 us   14.351 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.364 us    9.118 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   13.115 us   10.254 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx225280                  33.661 us   10.283 logical IO TB/s  reducer
+Saved 5 results to /tmp/pa-main-gpu1-20261104-7cb3db1b/diagnostic-main-1.json and /tmp/pa-main-gpu1-20261104-7cb3db1b/diagnostic-main-1.csv

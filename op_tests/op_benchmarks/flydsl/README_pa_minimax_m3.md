@@ -1,7 +1,7 @@
 # MiniMax-M3 PA benchmark
 
 This benchmark isolates the MiniMax-M3 TP4 attention shapes optimized by
-[PR 7079](https://github.com/ROCm/aiter/pull/7079). Each GPU has 16 query heads,
+[PR 7079](https://github.com/ROCm/aiter/pull/7079), now merged into main. Each GPU has 16 query heads,
 one KV head and head dimension 128. Queries and outputs are BF16; KV is either
 BF16 or E4M3 FP8 with separate FP32 per-token K/V scales. It targets gfx1250 and
 requires the checkout's PyTorch, AITER and FlyDSL dependencies.
@@ -55,7 +55,7 @@ the planner's default partition cap, matching the PR's main performance table.
 Both profiles use the default planner workgroup budget (`2 × CU count`), unless
 `--workgroup-budget` overrides it. `--profile both` runs both configurations.
 For 8192-row prefill, the harness raises the planner's `max_batch_size` to 8192
-when that parameter is available; its default is 4096 on the latest PR head.
+when that parameter is available; its default is 4096 on current main.
 
 ## Run
 
@@ -66,7 +66,7 @@ From the repository root:
 python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py --list
 
 # Full ATOM profile, BF16 and FP8, with correctness checks.
-python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py \
+HIP_VISIBLE_DEVICES=1 python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py \
   --output /tmp/m3-atom.json
 
 # Both profiles, or one selected shape/suite.
@@ -78,7 +78,10 @@ python op_tests/op_benchmarks/flydsl/bench_pa_minimax_m3.py \
   --suite cluster-boundary --output /tmp/m3-clusters.json
 ```
 
-Select a visible PyTorch device with `--device N`. Run comparisons on the same
+`HIP_VISIBLE_DEVICES=1` isolates physical GPU 1; it is then visible PyTorch
+device 0, the harness default. Use `--device N` to select an index within the
+visible devices. The JSON records device visibility and architecture overrides
+alongside the GPU UUID. Run comparisons on the same
 idle GPU, serially, with the same environment and benchmark settings. Small
 differences should be confirmed with alternating baseline/candidate runs.
 
@@ -129,7 +132,10 @@ source checkout when comparing clean revisions.
 
 ## Logical IO throughput
 
-Measured latency and logical IO throughput tables, environment and raw samples are in the
+Current main latency and logical IO throughput tables, with a same-GPU comparison
+against the previously benchmarked implementation, are in the
+[2026-11-04 GPU 1 report](results/minimax_m3_gfx1250_main_7cb3db1b_gpu1_20261104/README.md).
+Historical latency and logical IO throughput tables, environment and raw samples are in the
 [2026-11-03 gfx1250 report](results/minimax_m3_gfx1250_20261103/README.md).
 
 The benchmark also reports logical IO bytes and logical IO throughput in decimal
@@ -157,7 +163,22 @@ results retain the original field name `effective_bandwidth_tb_s`; that field
 has the same logical IO meaning and must not be interpreted as measured HBM
 bandwidth.
 
-## Latest PR regression check
+## Current main benchmark
+
+The [main `7cb3db1b7` GPU 1 report](results/minimax_m3_gfx1250_main_7cb3db1b_gpu1_20261104/README.md)
+uses the latest main fetched on 2026-11-04, including the merged PR 7079,
+MXFP4 integration, gfx1250-strict architecture plumbing and PR 7384's BF16
+pipeline changes. The benchmark branch's PA source matches that main revision.
+Both current main and the previously measured `15214dad7` run the complete
+84-point matrix three times on physical GPU 1. This gives a same-GPU comparison
+across both profiles and KV dtypes, including the cluster boundary cases.
+The report records raw samples, correctness checks and any targeted rechecks.
+Two intermittent GPU memory faults occurred while processing BF16 dense verify
+at batch 3, query length 4 and 225280 context tokens. Completed matrices and
+failed attempts are both preserved; the failure's kernel and cause remain
+unconfirmed. See the report's failure records before drawing stability conclusions.
+
+## Historical PR regression check
 
 The [PR 7079 head `964b5d4d8` regression report](results/minimax_m3_gfx1250_pr7079_964b5d4d_20261103/README.md)
 compares the refreshed PR against the previously measured `15214dad7` on idle

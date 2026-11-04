@@ -1,0 +1,22 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-fly041-base-frozen/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b8-q1-ctx8192                     6.284 us    5.350 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.371 us   14.350 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.326 us    9.165 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   12.489 us   10.768 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx225280                  33.453 us   10.347 logical IO TB/s  reducer
+atom fp8  dense-decode-b8-q1-ctx8192                     5.946 us    2.921 logical IO TB/s  reducer
+atom fp8  dense-decode-b32-q1-ctx8192                    7.909 us    8.783 logical IO TB/s  reducer
+atom fp8  dense-decode-b4-q1-ctx32768                    6.691 us    5.177 logical IO TB/s  reducer
+atom fp8  dense-verify-b8-q4-ctx32768                   11.834 us    5.870 logical IO TB/s  reducer
+atom fp8  dense-verify-b3-q4-ctx225280                  23.393 us    7.631 logical IO TB/s  reducer
+pr   bf16 dense-decode-b8-q1-ctx8192                     5.972 us    5.630 logical IO TB/s  reducer
+pr   bf16 dense-decode-b32-q1-ctx8192                    9.507 us   14.146 logical IO TB/s  reducer
+pr   bf16 dense-decode-b4-q1-ctx32768                    7.411 us    9.060 logical IO TB/s  reducer
+pr   bf16 dense-verify-b8-q4-ctx32768                   12.997 us   10.347 logical IO TB/s  reducer
+pr   bf16 dense-verify-b3-q4-ctx225280                  33.140 us   10.444 logical IO TB/s  reducer
+pr   fp8  dense-decode-b8-q1-ctx8192                     5.837 us    2.976 logical IO TB/s  reducer
+pr   fp8  dense-decode-b32-q1-ctx8192                    7.679 us    9.047 logical IO TB/s  reducer
+pr   fp8  dense-decode-b4-q1-ctx32768                    6.753 us    5.129 logical IO TB/s  reducer
+pr   fp8  dense-verify-b8-q4-ctx32768                   12.102 us    5.740 logical IO TB/s  reducer
+pr   fp8  dense-verify-b3-q4-ctx225280                  23.590 us    7.568 logical IO TB/s  reducer
+Saved 20 results to /tmp/pa-main-gpu1-20261104-7cb3db1b/recheck-previous-2.json and /tmp/pa-main-gpu1-20261104-7cb3db1b/recheck-previous-2.csv

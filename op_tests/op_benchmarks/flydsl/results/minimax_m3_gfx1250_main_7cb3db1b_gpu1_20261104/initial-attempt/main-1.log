@@ -1,0 +1,14 @@
+[aiter] [pid=7836 pname=MainProcess] start build [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/build/module_aiter_core
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=7836 pname=MainProcess] [32mfinish build [module_aiter_core], cost 11.0s [0m
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b1-q1-ctx8192                     5.564 us    0.755 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx8192                     5.933 us    2.833 logical IO TB/s  reducer
+atom bf16 dense-decode-b8-q1-ctx8192                     6.334 us    5.308 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.658 us   13.924 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.373 us    9.106 logical IO TB/s  reducer
+atom bf16 dense-decode-b3-q1-ctx225280                  29.391 us   11.774 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx8192                     7.122 us    1.781 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx32768                    9.155 us    5.509 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   12.527 us   10.735 logical IO TB/s  reducer
+Memory access fault by GPU node-3 (Agent handle: 0x4114eaf0) on address 0x92000. Reason: Page not present or supervisor privilege.

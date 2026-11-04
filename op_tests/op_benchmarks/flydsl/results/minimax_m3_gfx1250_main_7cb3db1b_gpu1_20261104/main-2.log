@@ -1,0 +1,170 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b1-q1-ctx8192                     5.580 us    0.753 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx8192                     5.928 us    2.836 logical IO TB/s  reducer
+atom bf16 dense-decode-b8-q1-ctx8192                     6.362 us    5.285 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.727 us   13.825 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.609 us    8.824 logical IO TB/s  reducer
+atom bf16 dense-decode-b3-q1-ctx225280                  29.302 us   11.810 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx8192                     7.119 us    1.781 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx32768                    9.120 us    5.530 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   12.883 us   10.439 logical IO TB/s  reducer
+atom bf16 dense-verify-b3-q4-ctx225280                  33.458 us   10.345 logical IO TB/s  reducer
+atom bf16 sparse-decode-b4-q1-ctx2048                    4.580 us    0.923 logical IO TB/s  cluster
+atom bf16 sparse-decode-b64-q1-ctx2048                   5.534 us   12.222 logical IO TB/s  cluster
+atom bf16 sparse-decode-b128-q1-ctx2048                  8.032 us   16.841 logical IO TB/s  cluster
+atom bf16 sparse-decode-b256-q1-ctx2048                 14.696 us   18.409 logical IO TB/s  reducer
+atom bf16 sparse-verify-b12-q1-ctx2048                   4.689 us    2.704 logical IO TB/s  cluster
+atom bf16 sparse-prefill-b1024-q1-ctx2048               15.207 us   18.221 logical IO TB/s  direct
+atom bf16 sparse-prefill-b4096-q1-ctx2048              109.962 us   29.604 logical IO TB/s  direct
+atom bf16 sparse-prefill-b8192-q1-ctx2048              253.340 us   29.935 logical IO TB/s  direct
+atom bf16 cluster-boundary-b239-q1-ctx2048              13.621 us   18.542 logical IO TB/s  cluster
+atom bf16 cluster-boundary-b240-q1-ctx2048              13.808 us   18.368 logical IO TB/s  cluster
+atom bf16 cluster-boundary-b241-q1-ctx2048              14.765 us   17.249 logical IO TB/s  reducer
+atom fp8  dense-decode-b1-q1-ctx8192                     5.365 us    0.405 logical IO TB/s  reducer
+atom fp8  dense-decode-b4-q1-ctx8192                     5.773 us    1.504 logical IO TB/s  reducer
+atom fp8  dense-decode-b8-q1-ctx8192                     5.918 us    2.934 logical IO TB/s  reducer
+atom fp8  dense-decode-b32-q1-ctx8192                    7.784 us    8.924 logical IO TB/s  reducer
+atom fp8  dense-decode-b4-q1-ctx32768                    6.795 us    5.097 logical IO TB/s  reducer
+atom fp8  dense-decode-b3-q1-ctx225280                  14.719 us   12.124 logical IO TB/s  reducer
+atom fp8  dense-verify-b3-q4-ctx8192                     7.834 us    0.841 logical IO TB/s  reducer
+atom fp8  dense-verify-b3-q4-ctx32768                    8.818 us    2.954 logical IO TB/s  reducer
+atom fp8  dense-verify-b8-q4-ctx32768                   11.905 us    5.835 logical IO TB/s  reducer
+atom fp8  dense-verify-b3-q4-ctx225280                  23.465 us    7.608 logical IO TB/s  reducer
+atom fp8  sparse-decode-b4-q1-ctx2048                    4.915 us    0.447 logical IO TB/s  cluster
+atom fp8  sparse-decode-b64-q1-ctx2048                   5.633 us    6.236 logical IO TB/s  cluster
+atom fp8  sparse-decode-b128-q1-ctx2048                  7.738 us    9.079 logical IO TB/s  cluster
+atom fp8  sparse-decode-b256-q1-ctx2048                 14.422 us    9.742 logical IO TB/s  reducer
+atom fp8  sparse-verify-b12-q1-ctx2048                   4.927 us    1.337 logical IO TB/s  cluster
+atom fp8  sparse-prefill-b1024-q1-ctx2048               14.446 us   10.172 logical IO TB/s  direct
+atom fp8  sparse-prefill-b4096-q1-ctx2048               72.438 us   23.396 logical IO TB/s  direct
+atom fp8  sparse-prefill-b8192-q1-ctx2048              162.739 us   24.229 logical IO TB/s  direct
+atom fp8  cluster-boundary-b239-q1-ctx2048              13.657 us    9.605 logical IO TB/s  cluster
+atom fp8  cluster-boundary-b240-q1-ctx2048              13.604 us    9.683 logical IO TB/s  cluster
+atom fp8  cluster-boundary-b241-q1-ctx2048              14.631 us    9.041 logical IO TB/s  reducer
+pr   bf16 dense-decode-b1-q1-ctx8192                     5.439 us    0.773 logical IO TB/s  reducer
+pr   bf16 dense-decode-b4-q1-ctx8192                     5.725 us    2.936 logical IO TB/s  reducer
+pr   bf16 dense-decode-b8-q1-ctx8192                     6.116 us    5.497 logical IO TB/s  reducer
+pr   bf16 dense-decode-b32-q1-ctx8192                    9.344 us   14.393 logical IO TB/s  reducer
+pr   bf16 dense-decode-b4-q1-ctx32768                    7.512 us    8.938 logical IO TB/s  reducer
+pr   bf16 dense-decode-b3-q1-ctx225280                  29.239 us   11.835 logical IO TB/s  reducer
+pr   bf16 dense-verify-b3-q4-ctx8192                     6.471 us    1.960 logical IO TB/s  reducer
+pr   bf16 dense-verify-b3-q4-ctx32768                    9.401 us    5.365 logical IO TB/s  reducer
+pr   bf16 dense-verify-b8-q4-ctx32768                   13.525 us    9.943 logical IO TB/s  reducer
+pr   bf16 dense-verify-b3-q4-ctx225280                  33.584 us   10.306 logical IO TB/s  reducer
+pr   bf16 sparse-decode-b4-q1-ctx2048                    4.702 us    0.899 logical IO TB/s  cluster
+pr   bf16 sparse-decode-b64-q1-ctx2048                   5.590 us   12.099 logical IO TB/s  cluster
+pr   bf16 sparse-decode-b128-q1-ctx2048                  9.652 us   14.014 logical IO TB/s  reducer
+pr   bf16 sparse-decode-b256-q1-ctx2048                 14.942 us   18.105 logical IO TB/s  reducer
+pr   bf16 sparse-verify-b12-q1-ctx2048                   4.742 us    2.675 logical IO TB/s  cluster
+pr   bf16 sparse-prefill-b1024-q1-ctx2048               15.204 us   18.225 logical IO TB/s  direct
+pr   bf16 sparse-prefill-b4096-q1-ctx2048              111.925 us   29.085 logical IO TB/s  direct
+pr   bf16 sparse-prefill-b8192-q1-ctx2048              259.086 us   29.271 logical IO TB/s  direct
+pr   bf16 cluster-boundary-b239-q1-ctx2048              13.584 us   18.594 logical IO TB/s  cluster
+pr   bf16 cluster-boundary-b240-q1-ctx2048              13.673 us   18.550 logical IO TB/s  cluster
+pr   bf16 cluster-boundary-b241-q1-ctx2048              14.771 us   17.242 logical IO TB/s  reducer
+pr   fp8  dense-decode-b1-q1-ctx8192                     5.205 us    0.417 logical IO TB/s  reducer
+pr   fp8  dense-decode-b4-q1-ctx8192                     5.466 us    1.589 logical IO TB/s  reducer
+pr   fp8  dense-decode-b8-q1-ctx8192                     5.613 us    3.094 logical IO TB/s  reducer
+pr   fp8  dense-decode-b32-q1-ctx8192                    7.910 us    8.782 logical IO TB/s  reducer
+pr   fp8  dense-decode-b4-q1-ctx32768                    6.792 us    5.100 logical IO TB/s  reducer
+pr   fp8  dense-decode-b3-q1-ctx225280                  14.797 us   12.060 logical IO TB/s  reducer
+pr   fp8  dense-verify-b3-q4-ctx8192                     7.234 us    0.910 logical IO TB/s  reducer
+pr   fp8  dense-verify-b3-q4-ctx32768                    8.829 us    2.950 logical IO TB/s  reducer
+pr   fp8  dense-verify-b8-q4-ctx32768                   11.968 us    5.805 logical IO TB/s  reducer
+pr   fp8  dense-verify-b3-q4-ctx225280                  23.773 us    7.509 logical IO TB/s  reducer
+pr   fp8  sparse-decode-b4-q1-ctx2048                    4.939 us    0.445 logical IO TB/s  cluster
+pr   fp8  sparse-decode-b64-q1-ctx2048                   5.596 us    6.277 logical IO TB/s  cluster
+pr   fp8  sparse-decode-b128-q1-ctx2048                  9.366 us    7.501 logical IO TB/s  reducer
+pr   fp8  sparse-decode-b256-q1-ctx2048                 14.469 us    9.711 logical IO TB/s  reducer
+pr   fp8  sparse-verify-b12-q1-ctx2048                   4.980 us    1.322 logical IO TB/s  cluster
+pr   fp8  sparse-prefill-b1024-q1-ctx2048               13.724 us   10.707 logical IO TB/s  direct
+pr   fp8  sparse-prefill-b4096-q1-ctx2048               72.237 us   23.461 logical IO TB/s  direct
+pr   fp8  sparse-prefill-b8192-q1-ctx2048              163.962 us   24.048 logical IO TB/s  direct
+pr   fp8  cluster-boundary-b239-q1-ctx2048              13.640 us    9.617 logical IO TB/s  cluster
+pr   fp8  cluster-boundary-b240-q1-ctx2048              13.680 us    9.629 logical IO TB/s  cluster
+pr   fp8  cluster-boundary-b241-q1-ctx2048              14.349 us    9.219 logical IO TB/s  reducer
+atom bf16 dense-decode-b1-q1-ctx8192                 0.998x
+atom bf16 dense-decode-b4-q1-ctx8192                 1.002x
+atom bf16 dense-decode-b8-q1-ctx8192                 0.993x
+atom bf16 dense-decode-b32-q1-ctx8192                0.981x
+atom bf16 dense-decode-b4-q1-ctx32768                0.962x
+atom bf16 dense-decode-b3-q1-ctx225280               1.001x
+atom bf16 dense-verify-b3-q4-ctx8192                 0.996x
+atom bf16 dense-verify-b3-q4-ctx32768                0.996x
+atom bf16 dense-verify-b8-q4-ctx32768                0.988x
+atom bf16 dense-verify-b3-q4-ctx225280               1.021x
+atom bf16 sparse-decode-b4-q1-ctx2048                1.003x
+atom bf16 sparse-decode-b64-q1-ctx2048               1.013x
+atom bf16 sparse-decode-b128-q1-ctx2048              1.001x
+atom bf16 sparse-decode-b256-q1-ctx2048              1.013x
+atom bf16 sparse-verify-b12-q1-ctx2048               1.010x
+atom bf16 sparse-prefill-b1024-q1-ctx2048            1.013x
+atom bf16 sparse-prefill-b4096-q1-ctx2048            1.000x
+atom bf16 sparse-prefill-b8192-q1-ctx2048            1.008x
+atom bf16 cluster-boundary-b239-q1-ctx2048           0.996x
+atom bf16 cluster-boundary-b240-q1-ctx2048           0.991x
+atom bf16 cluster-boundary-b241-q1-ctx2048           1.003x
+atom fp8  dense-decode-b1-q1-ctx8192                 1.005x
+atom fp8  dense-decode-b4-q1-ctx8192                 0.990x
+atom fp8  dense-decode-b8-q1-ctx8192                 1.007x
+atom fp8  dense-decode-b32-q1-ctx8192                0.982x
+atom fp8  dense-decode-b4-q1-ctx32768                0.986x
+atom fp8  dense-decode-b3-q1-ctx225280               1.006x
+atom fp8  dense-verify-b3-q4-ctx8192                 1.004x
+atom fp8  dense-verify-b3-q4-ctx32768                0.992x
+atom fp8  dense-verify-b8-q4-ctx32768                1.006x
+atom fp8  dense-verify-b3-q4-ctx225280               1.012x
+atom fp8  sparse-decode-b4-q1-ctx2048                0.980x
+atom fp8  sparse-decode-b64-q1-ctx2048               0.999x
+atom fp8  sparse-decode-b128-q1-ctx2048              1.001x
+atom fp8  sparse-decode-b256-q1-ctx2048              0.992x
+atom fp8  sparse-verify-b12-q1-ctx2048               1.009x
+atom fp8  sparse-prefill-b1024-q1-ctx2048            1.009x
+atom fp8  sparse-prefill-b4096-q1-ctx2048            0.998x
+atom fp8  sparse-prefill-b8192-q1-ctx2048            1.001x
+atom fp8  cluster-boundary-b239-q1-ctx2048           0.991x
+atom fp8  cluster-boundary-b240-q1-ctx2048           0.985x
+atom fp8  cluster-boundary-b241-q1-ctx2048           0.980x
+pr   bf16 dense-decode-b1-q1-ctx8192                 0.999x
+pr   bf16 dense-decode-b4-q1-ctx8192                 0.991x
+pr   bf16 dense-decode-b8-q1-ctx8192                 0.979x
+pr   bf16 dense-decode-b32-q1-ctx8192                0.989x
+pr   bf16 dense-decode-b4-q1-ctx32768                1.001x
+pr   bf16 dense-decode-b3-q1-ctx225280               1.003x
+pr   bf16 dense-verify-b3-q4-ctx8192                 0.999x
+pr   bf16 dense-verify-b3-q4-ctx32768                0.964x
+pr   bf16 dense-verify-b8-q4-ctx32768                0.926x
+pr   bf16 dense-verify-b3-q4-ctx225280               0.998x
+pr   bf16 sparse-decode-b4-q1-ctx2048                0.999x
+pr   bf16 sparse-decode-b64-q1-ctx2048               0.996x
+pr   bf16 sparse-decode-b128-q1-ctx2048              0.962x
+pr   bf16 sparse-decode-b256-q1-ctx2048              0.996x
+pr   bf16 sparse-verify-b12-q1-ctx2048               1.002x
+pr   bf16 sparse-prefill-b1024-q1-ctx2048            0.990x
+pr   bf16 sparse-prefill-b4096-q1-ctx2048            1.004x
+pr   bf16 sparse-prefill-b8192-q1-ctx2048            1.001x
+pr   bf16 cluster-boundary-b239-q1-ctx2048           0.994x
+pr   bf16 cluster-boundary-b240-q1-ctx2048           1.003x
+pr   bf16 cluster-boundary-b241-q1-ctx2048           1.003x
+pr   fp8  dense-decode-b1-q1-ctx8192                 1.001x
+pr   fp8  dense-decode-b4-q1-ctx8192                 0.999x
+pr   fp8  dense-decode-b8-q1-ctx8192                 1.019x
+pr   fp8  dense-decode-b32-q1-ctx8192                0.952x
+pr   fp8  dense-decode-b4-q1-ctx32768                1.029x
+pr   fp8  dense-decode-b3-q1-ctx225280               1.003x
+pr   fp8  dense-verify-b3-q4-ctx8192                 1.003x
+pr   fp8  dense-verify-b3-q4-ctx32768                0.986x
+pr   fp8  dense-verify-b8-q4-ctx32768                0.983x
+pr   fp8  dense-verify-b3-q4-ctx225280               0.995x
+pr   fp8  sparse-decode-b4-q1-ctx2048                0.988x
+pr   fp8  sparse-decode-b64-q1-ctx2048               1.013x
+pr   fp8  sparse-decode-b128-q1-ctx2048              0.984x
+pr   fp8  sparse-decode-b256-q1-ctx2048              0.990x
+pr   fp8  sparse-verify-b12-q1-ctx2048               0.999x
+pr   fp8  sparse-prefill-b1024-q1-ctx2048            0.998x
+pr   fp8  sparse-prefill-b4096-q1-ctx2048            0.996x
+pr   fp8  sparse-prefill-b8192-q1-ctx2048            0.996x
+pr   fp8  cluster-boundary-b239-q1-ctx2048           0.990x
+pr   fp8  cluster-boundary-b240-q1-ctx2048           0.985x
+pr   fp8  cluster-boundary-b241-q1-ctx2048           1.012x
+Saved 84 results to /tmp/pa-main-gpu1-20261104-7cb3db1b/main-2.json and /tmp/pa-main-gpu1-20261104-7cb3db1b/main-2.csv

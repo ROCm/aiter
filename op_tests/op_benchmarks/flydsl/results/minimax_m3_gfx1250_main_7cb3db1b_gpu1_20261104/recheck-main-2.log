@@ -1,0 +1,6 @@
+[aiter] import [module_aiter_core] under /tmp/aiter-pa-main-7cb3db1b/aiter/jit/module_aiter_core.so
+atom bf16 dense-decode-b8-q1-ctx8192                     6.358 us    5.288 logical IO TB/s  reducer
+atom bf16 dense-decode-b32-q1-ctx8192                    9.352 us   14.379 logical IO TB/s  reducer
+atom bf16 dense-decode-b4-q1-ctx32768                    7.524 us    8.924 logical IO TB/s  reducer
+atom bf16 dense-verify-b8-q4-ctx32768                   13.676 us    9.833 logical IO TB/s  reducer
+Memory access fault by GPU node-3 (Agent handle: 0x3628bc60) on address 0xbb000. Reason: Page not present or supervisor privilege.

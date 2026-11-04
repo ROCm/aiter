@@ -546,6 +546,12 @@ def main():
         environment={
             key: os.environ.get(key)
             for key in (
+                "HIP_VISIBLE_DEVICES",
+                "ROCR_VISIBLE_DEVICES",
+                "CUDA_VISIBLE_DEVICES",
+                "AITER_RUNTIME_GPU_ARCH",
+                "FLYDSL_GPU_ARCH",
+                "AITER_USE_SYSTEM_TRITON",
                 "AITER_FLYDSL_KERNARG_PRELOAD",
                 "FLYDSL_AUTOTUNE",
                 "FLYDSL_RUNTIME_CACHE_DIR",

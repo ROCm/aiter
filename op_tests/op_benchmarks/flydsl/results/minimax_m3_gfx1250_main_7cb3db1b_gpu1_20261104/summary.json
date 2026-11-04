@@ -1,0 +1,4642 @@
+{
+  "metadata": {
+    "previous_commit": "15214dad75fc26d13402b1571de080cf56c514f3",
+    "main_commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+    "physical_gpu": 1,
+    "previous_runs": [
+      "previous-1.json",
+      "previous-2.json",
+      "previous-3.json"
+    ],
+    "main_runs": [
+      "main-1.json",
+      "main-2.json",
+      "main-3.json"
+    ],
+    "targeted_recheck_runs": [
+      "recheck-main-1.json",
+      "recheck-main-2.json",
+      "recheck-main-3.json",
+      "recheck-previous-1.json",
+      "recheck-previous-2.json",
+      "recheck-previous-3.json"
+    ],
+    "targeted_aggregate_statistic": "median of completed processes only; counts recorded per row; failed runs retained separately",
+    "targeted_recheck_failures": [
+      {
+        "label": "recheck-main-2",
+        "exit_code": -6,
+        "started_utc": "2026-11-04T06:39:36.892893+00:00",
+        "ended_utc": "2026-11-04T06:39:42.797920+00:00"
+      }
+    ],
+    "diagnostic_processes": [
+      {
+        "label": "diagnostic-before7384-1",
+        "exit_code": 0,
+        "commit": "e4973c4bed57a615068089fa02c88c64d644fd42",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-main-1",
+        "exit_code": 0,
+        "commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-main-2",
+        "exit_code": 0,
+        "commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-before7384-2",
+        "exit_code": 0,
+        "commit": "e4973c4bed57a615068089fa02c88c64d644fd42",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-before7384-3",
+        "exit_code": 0,
+        "commit": "e4973c4bed57a615068089fa02c88c64d644fd42",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-main-3",
+        "exit_code": 0,
+        "commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-main-4",
+        "exit_code": 0,
+        "commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-before7384-4",
+        "exit_code": 0,
+        "commit": "e4973c4bed57a615068089fa02c88c64d644fd42",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-before7384-5",
+        "exit_code": 0,
+        "commit": "e4973c4bed57a615068089fa02c88c64d644fd42",
+        "completed_measurements": 5
+      },
+      {
+        "label": "diagnostic-main-5",
+        "exit_code": 0,
+        "commit": "7cb3db1b762a8c6637609208b6a1d99fb4127515",
+        "completed_measurements": 5
+      }
+    ],
+    "aggregate_statistic": "median of 3 process medians; each process uses median of 5 round minima",
+    "regression_screen_pct": 5,
+    "regressions_above_screen": [],
+    "geomean_latency_change_pct_all_84": 0.2903802018427548,
+    "geomean_latency_change_pct_regular_72": 0.2960728070462215,
+    "regular_groups": [
+      {
+        "profile": "atom",
+        "kv_dtype": "bf16",
+        "shapes": 18,
+        "geomean_latency_change_pct": 0.27083382314037063,
+        "speedup_min": 0.9710899037888557,
+        "speedup_max": 1.0099573508366972
+      },
+      {
+        "profile": "atom",
+        "kv_dtype": "fp8",
+        "shapes": 18,
+        "geomean_latency_change_pct": 0.23115614461324263,
+        "speedup_min": 0.9721559897162364,
+        "speedup_max": 1.010941119653204
+      },
+      {
+        "profile": "pr",
+        "kv_dtype": "bf16",
+        "shapes": 18,
+        "geomean_latency_change_pct": 0.6561888403376015,
+        "speedup_min": 0.967823627309011,
+        "speedup_max": 1.02427376537056
+      },
+      {
+        "profile": "pr",
+        "kv_dtype": "fp8",
+        "shapes": 18,
+        "geomean_latency_change_pct": 0.027142769428611935,
+        "speedup_min": 0.9774116194648762,
+        "speedup_max": 1.0226310530708564
+      }
+    ],
+    "checked_measurements": 658,
+    "initial_attempt_completed_measurements": 94,
+    "initial_attempt_failures": [
+      {
+        "label": "main-1",
+        "exit_code": -6,
+        "started_utc": "2026-11-04T06:35:01.849092+00:00",
+        "ended_utc": "2026-11-04T06:35:23.594002+00:00"
+      }
+    ],
+    "max_fp8_row_relative_l2": 0.03444158658385277
+  },
+  "results": [
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.5707597732543945,
+      "main_us": 5.577980279922485,
+      "latency_change_pct": 0.12961439663503604,
+      "speedup": 0.9987055338481421,
+      "logical_io_bytes": 4202496,
+      "previous_logical_io_throughput_tb_s": 0.754384710713335,
+      "main_logical_io_throughput_tb_s": 0.7534081852398374,
+      "previous_run_medians_us": [
+        5.5707597732543945,
+        5.568339824676514,
+        5.574759840965271
+      ],
+      "main_run_medians_us": [
+        5.57636022567749,
+        5.579559803009033,
+        5.577980279922485
+      ],
+      "previous_run_spread_pct": 0.11524489567078927,
+      "main_run_spread_pct": 0.05736085771151977,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        256
+      ],
+      "main_plan_capacities": [
+        256
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.928879976272583,
+      "main_us": 5.928099751472473,
+      "latency_change_pct": -0.013159733427436926,
+      "speedup": 1.000131614654412,
+      "logical_io_bytes": 16809984,
+      "previous_logical_io_throughput_tb_s": 2.8352714285453016,
+      "main_logical_io_throughput_tb_s": 2.8356445918145337,
+      "previous_run_medians_us": [
+        5.9400999546051025,
+        5.928879976272583,
+        5.912860035896301
+      ],
+      "main_run_medians_us": [
+        6.125180125236511,
+        5.928099751472473,
+        5.9096598625183105
+      ],
+      "previous_run_spread_pct": 0.4594445969190742,
+      "main_run_spread_pct": 3.635570785809869,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 6.315079927444458,
+      "main_us": 6.361539959907532,
+      "latency_change_pct": 0.7356998327315623,
+      "speedup": 0.992696731804582,
+      "logical_io_bytes": 33619968,
+      "previous_logical_io_throughput_tb_s": 5.323759696831753,
+      "main_logical_io_throughput_tb_s": 5.284878851957833,
+      "previous_run_medians_us": [
+        6.315079927444458,
+        6.3038599491119385,
+        6.315860152244568
+      ],
+      "main_run_medians_us": [
+        6.9231802225112915,
+        6.361539959907532,
+        6.347919702529907
+      ],
+      "previous_run_spread_pct": 0.1900245645423771,
+      "main_run_spread_pct": 9.042787180570441,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 9.446160197257996,
+      "main_us": 9.72737967967987,
+      "latency_change_pct": 2.977077209674106,
+      "speedup": 0.9710899037888557,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 14.236458962344978,
+      "main_logical_io_throughput_tb_s": 13.824881564037579,
+      "previous_run_medians_us": [
+        9.547119736671448,
+        9.446160197257996,
+        9.312359690666199
+      ],
+      "main_run_medians_us": [
+        9.735400080680847,
+        9.72737967967987,
+        9.48062002658844
+      ],
+      "previous_run_spread_pct": 2.485243115751885,
+      "main_run_spread_pct": 2.6192054025056013,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.477620244026184,
+      "main_us": 7.47842013835907,
+      "latency_change_pct": 0.010697177802310165,
+      "speedup": 0.9998930396637141,
+      "logical_io_bytes": 67141632,
+      "previous_logical_io_throughput_tb_s": 8.979010675707817,
+      "main_logical_io_throughput_tb_s": 8.97805027770643,
+      "previous_run_medians_us": [
+        7.322180271148682,
+        7.637059688568115,
+        7.477620244026184
+      ],
+      "main_run_medians_us": [
+        7.47842013835907,
+        7.609019875526428,
+        7.4391597509384155
+      ],
+      "previous_run_spread_pct": 4.210957592704557,
+      "main_run_spread_pct": 2.2713370129708137,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 29.28394079208374,
+      "main_us": 29.311978816986084,
+      "latency_change_pct": 0.09574539540773142,
+      "speedup": 0.9990434618871212,
+      "logical_io_bytes": 346054656,
+      "previous_logical_io_throughput_tb_s": 11.817216079522607,
+      "main_logical_io_throughput_tb_s": 11.80591246195442,
+      "previous_run_medians_us": [
+        29.332799911499023,
+        29.275119304656982,
+        29.28394079208374
+      ],
+      "main_run_medians_us": [
+        29.311978816986084,
+        29.302361011505127,
+        29.391300678253174
+      ],
+      "previous_run_spread_pct": 0.19697009788256942,
+      "main_run_spread_pct": 0.3034243007043488,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.0930397510528564,
+      "main_us": 7.160339951515198,
+      "latency_change_pct": 0.9488202917846467,
+      "speedup": 0.9906009769203625,
+      "logical_io_bytes": 12681216,
+      "previous_logical_io_throughput_tb_s": 1.7878394094883878,
+      "main_logical_io_throughput_tb_s": 1.7710354656159213,
+      "previous_run_medians_us": [
+        7.0930397510528564,
+        7.131500244140625,
+        7.070599794387817
+      ],
+      "main_run_medians_us": [
+        7.167540192604065,
+        7.119479775428772,
+        7.160339951515198
+      ],
+      "previous_run_spread_pct": 0.8585945080001539,
+      "main_run_spread_pct": 0.6712030085264725,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 9.082419872283936,
+      "main_us": 9.150540232658386,
+      "latency_change_pct": 0.7500243473914647,
+      "speedup": 0.9925555914030815,
+      "logical_io_bytes": 50429952,
+      "previous_logical_io_throughput_tb_s": 5.552479703552672,
+      "main_logical_io_throughput_tb_s": 5.511144775913329,
+      "previous_run_medians_us": [
+        9.082419872283936,
+        9.063199758529663,
+        9.102460145950317
+      ],
+      "main_run_medians_us": [
+        9.150540232658386,
+        9.12007987499237,
+        9.15693998336792
+      ],
+      "previous_run_spread_pct": 0.43226791948324206,
+      "main_run_spread_pct": 0.40281893132380486,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 12.673399448394775,
+      "main_us": 12.788779735565186,
+      "latency_change_pct": 0.9104130871928406,
+      "speedup": 0.990978006537282,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 10.611191775939277,
+      "main_logical_io_throughput_tb_s": 10.515457673105104,
+      "previous_run_medians_us": [
+        12.725499868392944,
+        12.673399448394775,
+        12.58847951889038
+      ],
+      "main_run_medians_us": [
+        12.51636028289795,
+        12.882540225982666,
+        12.788779735565186
+      ],
+      "previous_run_spread_pct": 1.081164923906179,
+      "main_run_spread_pct": 2.8632907177717835,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 33.556740283966064,
+      "main_us": 33.4581995010376,
+      "latency_change_pct": -0.2936542169906464,
+      "speedup": 1.0029451908470273,
+      "logical_io_bytes": 346128384,
+      "previous_logical_io_throughput_tb_s": 10.314720114974504,
+      "main_logical_io_throughput_tb_s": 10.345098934246774,
+      "previous_run_medians_us": [
+        34.155240058898926,
+        33.42694044113159,
+        33.556740283966064
+      ],
+      "main_run_medians_us": [
+        33.32040071487427,
+        33.4581995010376,
+        33.54791879653931
+      ],
+      "previous_run_spread_pct": 2.170352696967193,
+      "main_run_spread_pct": 0.6800069491425662,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 4.5924800634384155,
+      "main_us": 4.61571991443634,
+      "latency_change_pct": 0.5060414128510216,
+      "speedup": 0.994965064729071,
+      "logical_io_bytes": 4227072,
+      "previous_logical_io_throughput_tb_s": 0.9204333914593344,
+      "main_logical_io_throughput_tb_s": 0.9157990689121349,
+      "previous_run_medians_us": [
+        4.5924800634384155,
+        4.707860052585602,
+        4.588479995727539
+      ],
+      "main_run_medians_us": [
+        4.699060022830963,
+        4.579659998416901,
+        4.61571991443634
+      ],
+      "previous_run_spread_pct": 2.5994681568346802,
+      "main_run_spread_pct": 2.5868126018786675,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        32
+      ],
+      "main_plan_capacities": [
+        32
+      ]
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 5.552340149879456,
+      "main_us": 5.54032027721405,
+      "latency_change_pct": -0.2164830024988018,
+      "speedup": 1.002169526681488,
+      "logical_io_bytes": 67633152,
+      "previous_logical_io_throughput_tb_s": 12.181017404250413,
+      "main_logical_io_throughput_tb_s": 12.207444446516606,
+      "previous_run_medians_us": [
+        5.6036001443862915,
+        5.518680214881897,
+        5.552340149879456
+      ],
+      "main_run_medians_us": [
+        5.8055198192596436,
+        5.533900260925293,
+        5.54032027721405
+      ],
+      "previous_run_spread_pct": 1.5294439319651227,
+      "main_run_spread_pct": 4.902596686539113,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 8.040859699249268,
+      "main_us": 8.032039999961853,
+      "latency_change_pct": -0.10968602384938686,
+      "speedup": 1.001098064661961,
+      "logical_io_bytes": 135266304,
+      "previous_logical_io_throughput_tb_s": 16.822368385886534,
+      "main_logical_io_throughput_tb_s": 16.840840434141565,
+      "previous_run_medians_us": [
+        8.040859699249268,
+        8.194699883460999,
+        8.033639788627625
+      ],
+      "main_run_medians_us": [
+        7.911059856414795,
+        8.032039999961853,
+        8.256379961967468
+      ],
+      "previous_run_spread_pct": 2.003020831819903,
+      "main_run_spread_pct": 4.299282692246471,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        4
+      ],
+      "main_plan_caps": [
+        4
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 14.824639558792114,
+      "main_us": 14.778980016708374,
+      "latency_change_pct": -0.3079976541936258,
+      "speedup": 1.0030894921051465,
+      "logical_io_bytes": 270532608,
+      "previous_logical_io_throughput_tb_s": 18.248848946857127,
+      "main_logical_io_throughput_tb_s": 18.305228621606457,
+      "previous_run_medians_us": [
+        14.886339902877808,
+        14.824639558792114,
+        14.67561960220337
+      ],
+      "main_run_medians_us": [
+        14.897539615631104,
+        14.695639610290527,
+        14.778980016708374
+      ],
+      "previous_run_spread_pct": 1.4214193865473488,
+      "main_run_spread_pct": 1.3661294968415827,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 4.735899865627289,
+      "main_us": 4.762339890003204,
+      "latency_change_pct": 0.5582893457654059,
+      "speedup": 0.9944481021962719,
+      "logical_io_bytes": 12681216,
+      "previous_logical_io_throughput_tb_s": 2.6776782364084726,
+      "main_logical_io_throughput_tb_s": 2.6628120404886655,
+      "previous_run_medians_us": [
+        4.735899865627289,
+        4.6934399008750916,
+        4.7446998953819275
+      ],
+      "main_run_medians_us": [
+        4.762339890003204,
+        4.689419865608215,
+        4.765560030937195
+      ],
+      "previous_run_spread_pct": 1.0823707418071928,
+      "main_run_spread_pct": 1.5987973787592944,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        96
+      ],
+      "main_plan_capacities": [
+        96
+      ]
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 15.35823941230774,
+      "main_us": 15.206819772720337,
+      "latency_change_pct": -0.9859179527183182,
+      "speedup": 1.0099573508366972,
+      "logical_io_bytes": 277086208,
+      "previous_logical_io_throughput_tb_s": 18.041534616132463,
+      "main_logical_io_throughput_tb_s": 18.221180505937713,
+      "previous_run_medians_us": [
+        15.409519672393799,
+        15.35823941230774,
+        15.349420309066772
+      ],
+      "main_run_medians_us": [
+        15.316580533981323,
+        15.206819772720337,
+        15.178780555725098
+      ],
+      "previous_run_spread_pct": 0.3913167500101875,
+      "main_run_spread_pct": 0.9061722326940859,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        1024
+      ],
+      "main_plan_capacities": [
+        1024
+      ]
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 110.26142120361328,
+      "main_us": 109.96177673339844,
+      "latency_change_pct": -0.27175821510726506,
+      "speedup": 1.0027249875285422,
+      "logical_io_bytes": 3255304192,
+      "previous_logical_io_throughput_tb_s": 29.52351018574866,
+      "main_logical_io_throughput_tb_s": 29.60396138280361,
+      "previous_run_medians_us": [
+        109.90728378295898,
+        110.6315803527832,
+        110.26142120361328
+      ],
+      "main_run_medians_us": [
+        109.50827598571777,
+        109.96177673339844,
+        110.50100326538086
+      ],
+      "previous_run_spread_pct": 0.6568902902917448,
+      "main_run_spread_pct": 0.9027930515072945,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        4096
+      ],
+      "main_plan_capacities": [
+        4096
+      ]
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 254.90802764892578,
+      "main_us": 253.66613388061523,
+      "latency_change_pct": -0.48719288276827255,
+      "speedup": 1.0048957807229206,
+      "logical_io_bytes": 7583825920,
+      "previous_logical_io_throughput_tb_s": 29.75122435314155,
+      "main_logical_io_throughput_tb_s": 29.89687982381295,
+      "previous_run_medians_us": [
+        255.27734756469727,
+        254.90802764892578,
+        254.74777221679688
+      ],
+      "main_run_medians_us": [
+        253.66613388061523,
+        253.3400535583496,
+        254.08599853515625
+      ],
+      "previous_run_spread_pct": 0.2077515379899109,
+      "main_run_spread_pct": 0.2940656544865032,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        8192
+      ],
+      "main_plan_capacities": [
+        8192
+      ]
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 13.573160171508789,
+      "main_us": 13.62123966217041,
+      "latency_change_pct": 0.354224735095543,
+      "speedup": 0.996470255875818,
+      "logical_io_bytes": 252567552,
+      "previous_logical_io_throughput_tb_s": 18.607866466510917,
+      "main_logical_io_throughput_tb_s": 18.54218545918719,
+      "previous_run_medians_us": [
+        13.573160171508789,
+        13.500239849090576,
+        13.63163948059082
+      ],
+      "main_run_medians_us": [
+        13.543519973754883,
+        13.62123966217041,
+        13.963340520858765
+      ],
+      "previous_run_spread_pct": 0.9680842916453832,
+      "main_run_spread_pct": 3.082102345426228,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        478
+      ],
+      "main_plan_capacities": [
+        478
+      ]
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 13.681299686431885,
+      "main_us": 13.807899951934814,
+      "latency_change_pct": 0.9253526229564546,
+      "speedup": 0.9908313164243929,
+      "logical_io_bytes": 253624320,
+      "previous_logical_io_throughput_tb_s": 18.53802824387555,
+      "main_logical_io_throughput_tb_s": 18.36805892879179,
+      "previous_run_medians_us": [
+        13.681299686431885,
+        13.634860515594482,
+        13.807120323181152
+      ],
+      "main_run_medians_us": [
+        13.702960014343262,
+        13.807899951934814,
+        13.965760469436646
+      ],
+      "previous_run_spread_pct": 1.2590894983281788,
+      "main_run_spread_pct": 1.9032615821970755,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        480
+      ],
+      "main_plan_capacities": [
+        480
+      ]
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 14.809420108795166,
+      "main_us": 14.810220003128052,
+      "latency_change_pct": 0.005401253573800169,
+      "speedup": 0.9999459903814584,
+      "logical_io_bytes": 254681088,
+      "previous_logical_io_throughput_tb_s": 17.197235687084564,
+      "main_logical_io_throughput_tb_s": 17.196306870945136,
+      "previous_run_medians_us": [
+        14.809420108795166,
+        14.806220531463623,
+        14.820640087127686
+      ],
+      "main_run_medians_us": [
+        14.849480390548706,
+        14.765360355377197,
+        14.810220003128052
+      ],
+      "previous_run_spread_pct": 0.0973674563766266,
+      "main_run_spread_pct": 0.5679863982691808,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        482
+      ],
+      "main_plan_capacities": [
+        482
+      ]
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.392879843711853,
+      "main_us": 5.408120155334473,
+      "latency_change_pct": 0.28260061533522673,
+      "speedup": 0.9971819576516644,
+      "logical_io_bytes": 2170880,
+      "previous_logical_io_throughput_tb_s": 0.40254559028072284,
+      "main_logical_io_throughput_tb_s": 0.40141119976017603,
+      "previous_run_medians_us": [
+        5.393679738044739,
+        5.362439751625061,
+        5.392879843711853
+      ],
+      "main_run_medians_us": [
+        5.408120155334473,
+        5.364840030670166,
+        5.409700274467468
+      ],
+      "previous_run_spread_pct": 0.5792820779440107,
+      "main_run_spread_pct": 0.8294979125612234,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        256
+      ],
+      "main_plan_capacities": [
+        256
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.706959962844849,
+      "main_us": 5.772659778594971,
+      "latency_change_pct": 1.1512226505505652,
+      "speedup": 0.9886187964872385,
+      "logical_io_bytes": 8683520,
+      "previous_logical_io_throughput_tb_s": 1.521566658349461,
+      "main_logical_io_throughput_tb_s": 1.5042493985525534,
+      "previous_run_medians_us": [
+        5.713359713554382,
+        5.676519870758057,
+        5.706959962844849
+      ],
+      "main_run_medians_us": [
+        5.750219821929932,
+        5.772659778594971,
+        5.861600041389465
+      ],
+      "previous_run_spread_pct": 0.6455248159470437,
+      "main_run_spread_pct": 1.9294436833525452,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.962539911270142,
+      "main_us": 5.957739949226379,
+      "latency_change_pct": -0.0805019692143194,
+      "speedup": 1.0008056682709667,
+      "logical_io_bytes": 17367040,
+      "previous_logical_io_throughput_tb_s": 2.912691614386271,
+      "main_logical_io_throughput_tb_s": 2.9150382776030925,
+      "previous_run_medians_us": [
+        5.957739949226379,
+        5.962539911270142,
+        6.401600241661072
+      ],
+      "main_run_medians_us": [
+        5.957739949226379,
+        5.918480157852173,
+        5.962560176849365
+      ],
+      "previous_run_spread_pct": 7.444147947684616,
+      "main_run_spread_pct": 0.7398781983244541,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.66510009765625,
+      "main_us": 7.884640097618103,
+      "latency_change_pct": 2.864150463331616,
+      "speedup": 0.9721559897162364,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 9.062916219612214,
+      "main_logical_io_throughput_tb_s": 8.810568287192446,
+      "previous_run_medians_us": [
+        7.641059756278992,
+        8.028039932250977,
+        7.66510009765625
+      ],
+      "main_run_medians_us": [
+        7.888619899749756,
+        7.784479856491089,
+        7.884640097618103
+      ],
+      "previous_run_spread_pct": 5.048599118624836,
+      "main_run_spread_pct": 1.3207964088319897,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 6.734899878501892,
+      "main_us": 6.794999837875366,
+      "latency_change_pct": 0.892366040441317,
+      "speedup": 0.9911552669893416,
+      "logical_io_bytes": 34635776,
+      "previous_logical_io_throughput_tb_s": 5.142730645567424,
+      "main_logical_io_throughput_tb_s": 5.09724456606165,
+      "previous_run_medians_us": [
+        6.699640154838562,
+        6.802999973297119,
+        6.734899878501892
+      ],
+      "main_run_medians_us": [
+        6.7260801792144775,
+        6.794999837875366,
+        6.807799935340881
+      ],
+      "previous_run_spread_pct": 1.534689755203138,
+      "main_run_spread_pct": 1.2026454463015208,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.879920482635498,
+      "main_us": 14.718879461288452,
+      "latency_change_pct": -1.082270711963662,
+      "speedup": 1.010941119653204,
+      "logical_io_bytes": 178446336,
+      "previous_logical_io_throughput_tb_s": 11.99242537675134,
+      "main_logical_io_throughput_tb_s": 12.123635937730498,
+      "previous_run_medians_us": [
+        14.802999496459961,
+        14.879920482635498,
+        15.030560493469238
+      ],
+      "main_run_medians_us": [
+        14.672399759292603,
+        14.718879461288452,
+        14.758139848709106
+      ],
+      "previous_run_spread_pct": 1.5293159481250955,
+      "main_run_spread_pct": 0.5825177768593428,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.870200276374817,
+      "main_us": 7.834159731864929,
+      "latency_change_pct": -0.45793681538290887,
+      "speedup": 1.004600435240463,
+      "logical_io_bytes": 6586368,
+      "previous_logical_io_throughput_tb_s": 0.8368742558904514,
+      "main_logical_io_throughput_tb_s": 0.8407242417090861,
+      "previous_run_medians_us": [
+        7.864599823951721,
+        7.87742018699646,
+        7.870200276374817
+      ],
+      "main_run_medians_us": [
+        7.786880135536194,
+        7.834159731864929,
+        7.838959693908691
+      ],
+      "previous_run_spread_pct": 0.16289754510089932,
+      "main_run_spread_pct": 0.6647752937774217,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 8.762739896774292,
+      "main_us": 8.818020224571228,
+      "latency_change_pct": 0.6308566549748429,
+      "speedup": 0.9937309819677099,
+      "logical_io_bytes": 26050560,
+      "previous_logical_io_throughput_tb_s": 2.9728783812914084,
+      "main_logical_io_throughput_tb_s": 2.954241353111287,
+      "previous_run_medians_us": [
+        8.749120235443115,
+        8.777179718017578,
+        8.762739896774292
+      ],
+      "main_run_medians_us": [
+        8.716279864311218,
+        8.818020224571228,
+        8.842880129814148
+      ],
+      "previous_run_spread_pct": 0.32021357366537884,
+      "main_run_spread_pct": 1.4356994232124882,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 11.876219511032104,
+      "main_us": 11.905059814453125,
+      "latency_change_pct": 0.24284077432410456,
+      "speedup": 0.9975774751348996,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 5.849349612936117,
+      "main_logical_io_throughput_tb_s": 5.835179418054114,
+      "previous_run_medians_us": [
+        11.973960399627686,
+        11.77206039428711,
+        11.876219511032104
+      ],
+      "main_run_medians_us": [
+        11.689540147781372,
+        11.905059814453125,
+        11.949119567871094
+      ],
+      "previous_run_spread_pct": 1.7000359849615985,
+      "main_run_spread_pct": 2.180412565206803,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 23.44395875930786,
+      "main_us": 23.46479892730713,
+      "latency_change_pct": 0.08889355340209182,
+      "speedup": 0.9991118539705441,
+      "logical_io_bytes": 178520064,
+      "previous_logical_io_throughput_tb_s": 7.614757636831403,
+      "main_logical_io_throughput_tb_s": 7.607994620070983,
+      "previous_run_medians_us": [
+        23.750839233398438,
+        22.37515926361084,
+        23.44395875930786
+      ],
+      "main_run_medians_us": [
+        23.0770206451416,
+        23.46479892730713,
+        23.493659496307373
+      ],
+      "previous_run_spread_pct": 5.867950817996627,
+      "main_run_spread_pct": 1.7755909712096811,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 4.819239974021912,
+      "main_us": 4.818420112133026,
+      "latency_change_pct": -0.017012265280524907,
+      "speedup": 1.0001701515994468,
+      "logical_io_bytes": 2195456,
+      "previous_logical_io_throughput_tb_s": 0.4555606302725314,
+      "main_logical_io_throughput_tb_s": 0.4556381446424172,
+      "previous_run_medians_us": [
+        4.819239974021912,
+        4.919379949569702,
+        4.816820025444031
+      ],
+      "main_run_medians_us": [
+        4.789600074291229,
+        4.915379881858826,
+        4.818420112133026
+      ],
+      "previous_run_spread_pct": 2.1281348237174353,
+      "main_run_spread_pct": 2.61039520507721,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        32
+      ],
+      "main_plan_capacities": [
+        32
+      ]
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.629240274429321,
+      "main_us": 5.633260011672974,
+      "latency_change_pct": 0.07140816607014155,
+      "speedup": 0.9992864278880572,
+      "logical_io_bytes": 35127296,
+      "previous_logical_io_throughput_tb_s": 6.240148632412234,
+      "main_logical_io_throughput_tb_s": 6.2356958363737665,
+      "previous_run_medians_us": [
+        5.629240274429321,
+        5.678920149803162,
+        5.518680214881897
+      ],
+      "main_run_medians_us": [
+        5.569159984588623,
+        5.633260011672974,
+        5.65168023109436
+      ],
+      "previous_run_spread_pct": 2.8465641384886413,
+      "main_run_spread_pct": 1.4648755131973807,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.741199731826782,
+      "main_us": 7.738000154495239,
+      "latency_change_pct": -0.04133180181863372,
+      "speedup": 1.0004134889206076,
+      "logical_io_bytes": 70254592,
+      "previous_logical_io_throughput_tb_s": 9.075413945355107,
+      "main_logical_io_throughput_tb_s": 9.079166528471438,
+      "previous_run_medians_us": [
+        7.748439908027649,
+        7.738800048828125,
+        7.741199731826782
+      ],
+      "main_run_medians_us": [
+        7.7043598890304565,
+        7.738000154495239,
+        7.764440178871155
+      ],
+      "previous_run_spread_pct": 0.12452668234215802,
+      "main_run_spread_pct": 0.7764317477532716,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        4
+      ],
+      "main_plan_caps": [
+        4
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.302259683609009,
+      "main_us": 14.422420263290405,
+      "latency_change_pct": 0.8401510134731005,
+      "speedup": 0.9916684871548749,
+      "logical_io_bytes": 140509184,
+      "previous_logical_io_throughput_tb_s": 9.824264634282192,
+      "main_logical_io_throughput_tb_s": 9.742413647287762,
+      "previous_run_medians_us": [
+        14.302259683609009,
+        14.241379499435425,
+        14.340699911117554
+      ],
+      "main_run_medians_us": [
+        14.269399642944336,
+        14.422420263290405,
+        14.436860084533691
+      ],
+      "previous_run_spread_pct": 0.694438598370258,
+      "main_run_spread_pct": 1.1611119252681532,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 4.9562400579452515,
+      "main_us": 4.946619868278503,
+      "latency_change_pct": -0.1941025768379845,
+      "speedup": 1.0019448006766074,
+      "logical_io_bytes": 6586368,
+      "previous_logical_io_throughput_tb_s": 1.3289041537529083,
+      "main_logical_io_throughput_tb_s": 1.3314886074502736,
+      "previous_run_medians_us": [
+        4.969860017299652,
+        4.946619868278503,
+        4.9562400579452515
+      ],
+      "main_run_medians_us": [
+        4.946619868278503,
+        4.927400052547455,
+        4.970659911632538
+      ],
+      "previous_run_spread_pct": 0.4689068477200343,
+      "main_run_spread_pct": 0.8745337268080411,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        8
+      ],
+      "main_plan_caps": [
+        8
+      ],
+      "previous_plan_capacities": [
+        96
+      ],
+      "main_plan_capacities": [
+        96
+      ]
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.456080198287964,
+      "main_us": 14.44566011428833,
+      "latency_change_pct": -0.07208097808469871,
+      "speedup": 1.000721329722366,
+      "logical_io_bytes": 146935808,
+      "previous_logical_io_throughput_tb_s": 10.164291148398695,
+      "main_logical_io_throughput_tb_s": 10.171622953710816,
+      "previous_run_medians_us": [
+        14.581879377365112,
+        14.44085955619812,
+        14.456080198287964
+      ],
+      "main_run_medians_us": [
+        14.439259767532349,
+        14.44566011428833,
+        14.450479745864868
+      ],
+      "previous_run_spread_pct": 0.9755052492285785,
+      "main_run_spread_pct": 0.0776702362076327,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        1024
+      ],
+      "main_plan_capacities": [
+        1024
+      ]
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 72.32450008392334,
+      "main_us": 71.95755958557129,
+      "latency_change_pct": -0.5073529688089939,
+      "speedup": 1.005099401653772,
+      "logical_io_bytes": 1694769152,
+      "previous_logical_io_throughput_tb_s": 23.432849864616237,
+      "main_logical_io_throughput_tb_s": 23.552343377968448,
+      "previous_run_medians_us": [
+        72.32450008392334,
+        72.12982177734375,
+        72.58170127868652
+      ],
+      "main_run_medians_us": [
+        71.39750003814697,
+        72.43825912475586,
+        71.95755958557129
+      ],
+      "previous_run_spread_pct": 0.6247945036860608,
+      "main_run_spread_pct": 1.446351283455111,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        4096
+      ],
+      "main_plan_capacities": [
+        4096
+      ]
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 162.86993026733398,
+      "main_us": 162.23539352416992,
+      "latency_change_pct": -0.38959723389242473,
+      "speedup": 1.0039112103060885,
+      "logical_io_bytes": 3942916096,
+      "previous_logical_io_throughput_tb_s": 24.208987438799262,
+      "main_logical_io_throughput_tb_s": 24.30367387996986,
+      "previous_run_medians_us": [
+        162.86993026733398,
+        163.2657241821289,
+        162.45412826538086
+      ],
+      "main_run_medians_us": [
+        161.96138381958008,
+        162.73853302001953,
+        162.23539352416992
+      ],
+      "previous_run_spread_pct": 0.4983092430971739,
+      "main_run_spread_pct": 0.47902568210165125,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        1
+      ],
+      "main_plan_caps": [
+        1
+      ],
+      "previous_plan_capacities": [
+        8192
+      ],
+      "main_plan_capacities": [
+        8192
+      ]
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 13.566739559173584,
+      "main_us": 13.657280206680298,
+      "latency_change_pct": 0.6673721944156608,
+      "speedup": 0.9933705213529684,
+      "logical_io_bytes": 131178496,
+      "previous_logical_io_throughput_tb_s": 9.669124657980145,
+      "main_logical_io_throughput_tb_s": 9.605023402524582,
+      "previous_run_medians_us": [
+        13.530700206756592,
+        13.566739559173584,
+        13.628439903259277
+      ],
+      "main_run_medians_us": [
+        13.431340456008911,
+        13.657280206680298,
+        13.67732048034668
+      ],
+      "previous_run_spread_pct": 0.7204361525212278,
+      "main_run_spread_pct": 1.8010908512915356,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        478
+      ],
+      "main_plan_capacities": [
+        478
+      ]
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 13.42494010925293,
+      "main_us": 13.604400157928467,
+      "latency_change_pct": 1.336766102605158,
+      "speedup": 0.9868086761200603,
+      "logical_io_bytes": 131727360,
+      "previous_logical_io_throughput_tb_s": 9.812137628026287,
+      "main_logical_io_throughput_tb_s": 9.682702542620449,
+      "previous_run_medians_us": [
+        13.393700122833252,
+        13.42494010925293,
+        13.698960542678833
+      ],
+      "main_run_medians_us": [
+        13.372859954833984,
+        13.604400157928467,
+        13.673299551010132
+      ],
+      "previous_run_spread_pct": 2.27383077586458,
+      "main_run_spread_pct": 2.2084001697131437,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        480
+      ],
+      "main_plan_capacities": [
+        480
+      ]
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 14.434460401535034,
+      "main_us": 14.415220022201538,
+      "latency_change_pct": -0.13329475988897999,
+      "speedup": 1.001334726719666,
+      "logical_io_bytes": 132276224,
+      "previous_logical_io_throughput_tb_s": 9.163918866404806,
+      "main_logical_io_throughput_tb_s": 9.176150193772648,
+      "previous_run_medians_us": [
+        14.334299564361572,
+        14.434460401535034,
+        14.44648027420044
+      ],
+      "main_run_medians_us": [
+        14.415220022201538,
+        14.630739688873291,
+        14.377579689025879
+      ],
+      "previous_run_spread_pct": 0.7771728676947101,
+      "main_run_spread_pct": 1.756199346645482,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        482
+      ],
+      "main_plan_capacities": [
+        482
+      ]
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.433759689331055,
+      "main_us": 5.438560247421265,
+      "latency_change_pct": 0.08834689726222589,
+      "speedup": 0.999117310855849,
+      "logical_io_bytes": 4202496,
+      "previous_logical_io_throughput_tb_s": 0.7734048320634079,
+      "main_logical_io_throughput_tb_s": 0.7727221560141115,
+      "previous_run_medians_us": [
+        5.433759689331055,
+        5.449780225753784,
+        5.4313600063323975
+      ],
+      "main_run_medians_us": [
+        5.415340065956116,
+        5.438560247421265,
+        5.438560247421265
+      ],
+      "previous_run_spread_pct": 0.3389958421892304,
+      "main_run_spread_pct": 0.42695456901776446,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        256
+      ],
+      "main_plan_capacities": [
+        256
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.670899748802185,
+      "main_us": 5.696539878845215,
+      "latency_change_pct": 0.45213513161550534,
+      "speedup": 0.9954989992893322,
+      "logical_io_bytes": 16809984,
+      "previous_logical_io_throughput_tb_s": 2.9642534244324503,
+      "main_logical_io_throughput_tb_s": 2.9509113176624804,
+      "previous_run_medians_us": [
+        5.670899748802185,
+        5.702139735221863,
+        5.662879943847656
+      ],
+      "main_run_medians_us": [
+        5.696539878845215,
+        5.724579691886902,
+        5.691739916801453
+      ],
+      "previous_run_spread_pct": 0.6923026876378664,
+      "main_run_spread_pct": 0.5764863545922617,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.989779829978943,
+      "main_us": 6.116380095481873,
+      "latency_change_pct": 2.1136046582095336,
+      "speedup": 0.9793014391639184,
+      "logical_io_bytes": 33619968,
+      "previous_logical_io_throughput_tb_s": 5.612888779606143,
+      "main_logical_io_throughput_tb_s": 5.496710059735306,
+      "previous_run_medians_us": [
+        5.989779829978943,
+        5.987380146980286,
+        6.005799770355225
+      ],
+      "main_run_medians_us": [
+        5.944119691848755,
+        6.116380095481873,
+        6.3847798109054565
+      ],
+      "previous_run_spread_pct": 0.3075175365002309,
+      "main_run_spread_pct": 7.204590168982699,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.636059999465942,
+      "main_us": 9.407699704170227,
+      "latency_change_pct": -2.369851322100236,
+      "speedup": 1.02427376537056,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 13.955898158319194,
+      "main_logical_io_throughput_tb_s": 14.294660355749665,
+      "previous_run_medians_us": [
+        9.241859912872314,
+        9.636059999465942,
+        9.696940183639526
+      ],
+      "main_run_medians_us": [
+        9.407699704170227,
+        9.3436199426651,
+        9.620019793510437
+      ],
+      "previous_run_spread_pct": 4.722679920968049,
+      "main_run_spread_pct": 2.9380173638282154,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 7.349439859390259,
+      "main_us": 7.593780159950256,
+      "latency_change_pct": 3.3246111980603343,
+      "speedup": 0.967823627309011,
+      "logical_io_bytes": 67141632,
+      "previous_logical_io_throughput_tb_s": 9.1356121397761,
+      "main_logical_io_throughput_tb_s": 8.84166127880634,
+      "previous_run_medians_us": [
+        7.520080208778381,
+        7.250880002975464,
+        7.349439859390259
+      ],
+      "main_run_medians_us": [
+        7.593780159950256,
+        7.512059807777405,
+        7.612220048904419
+      ],
+      "previous_run_spread_pct": 3.662866979705464,
+      "main_run_spread_pct": 1.318977360646562,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 29.32637929916382,
+      "main_us": 29.449779987335205,
+      "latency_change_pct": 0.42078391918944913,
+      "speedup": 0.9958097925273312,
+      "logical_io_bytes": 346054656,
+      "previous_logical_io_throughput_tb_s": 11.80011526379825,
+      "main_logical_io_throughput_tb_s": 11.750670332641528,
+      "previous_run_medians_us": [
+        29.32637929916382,
+        29.301559925079346,
+        29.55794095993042
+      ],
+      "main_run_medians_us": [
+        29.565160274505615,
+        29.239060878753662,
+        29.449779987335205
+      ],
+      "previous_run_spread_pct": 0.8742335091409815,
+      "main_run_spread_pct": 1.1073067299388697,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 6.464099884033203,
+      "main_us": 6.47130012512207,
+      "latency_change_pct": 0.1113881471208833,
+      "speedup": 0.9988873578802325,
+      "logical_io_bytes": 12681216,
+      "previous_logical_io_throughput_tb_s": 1.9617914678768387,
+      "main_logical_io_throughput_tb_s": 1.9596086960594785,
+      "previous_run_medians_us": [
+        6.464099884033203,
+        6.457679867744446,
+        6.477720141410828
+      ],
+      "main_run_medians_us": [
+        6.408820152282715,
+        6.47130012512207,
+        6.480919718742371
+      ],
+      "previous_run_spread_pct": 0.3100241955710302,
+      "main_run_spread_pct": 1.1141434497800506,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.149739742279053,
+      "main_us": 9.39329981803894,
+      "latency_change_pct": 2.6619344661187094,
+      "speedup": 0.974070871740711,
+      "logical_io_bytes": 50429952,
+      "previous_logical_io_throughput_tb_s": 5.511626933711964,
+      "main_logical_io_throughput_tb_s": 5.368715252030396,
+      "previous_run_medians_us": [
+        9.063199758529663,
+        9.161739945411682,
+        9.149739742279053
+      ],
+      "main_run_medians_us": [
+        9.028739929199219,
+        9.400500059127808,
+        9.39329981803894
+      ],
+      "previous_run_spread_pct": 1.0769725659702127,
+      "main_run_spread_pct": 3.9577160010868475,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 12.534019947052002,
+      "main_us": 12.928199768066406,
+      "latency_change_pct": 3.144879477450613,
+      "speedup": 0.9695100765701302,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 10.729189244000654,
+      "main_logical_io_throughput_tb_s": 10.402057085486494,
+      "previous_run_medians_us": [
+        12.51960039138794,
+        12.534019947052002,
+        12.597299814224243
+      ],
+      "main_run_medians_us": [
+        12.524399757385254,
+        13.525099754333496,
+        12.928199768066406
+      ],
+      "previous_run_spread_pct": 0.6199082430419987,
+      "main_run_spread_pct": 7.740443487112907,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 33.52869987487793,
+      "main_us": 33.58397960662842,
+      "latency_change_pct": 0.1648728759444218,
+      "speedup": 0.9983539850727048,
+      "logical_io_bytes": 346128384,
+      "previous_logical_io_throughput_tb_s": 10.323346425351371,
+      "main_logical_io_throughput_tb_s": 10.306354043035602,
+      "previous_run_medians_us": [
+        33.504700660705566,
+        33.52869987487793,
+        33.69853973388672
+      ],
+      "main_run_medians_us": [
+        33.501460552215576,
+        33.58397960662842,
+        34.120800495147705
+      ],
+      "previous_run_spread_pct": 0.5781288087653833,
+      "main_run_spread_pct": 1.8441529270399233,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 4.697439968585968,
+      "main_us": 4.684619903564453,
+      "latency_change_pct": -0.2729159948237525,
+      "speedup": 1.0027366286455301,
+      "logical_io_bytes": 4227072,
+      "previous_logical_io_throughput_tb_s": 0.8998671677059114,
+      "main_logical_io_throughput_tb_s": 0.9023297699742273,
+      "previous_run_medians_us": [
+        4.697439968585968,
+        4.71668004989624,
+        4.695839881896973
+      ],
+      "main_run_medians_us": [
+        4.634160101413727,
+        4.70225989818573,
+        4.684619903564453
+      ],
+      "previous_run_spread_pct": 0.4436494801133334,
+      "main_run_spread_pct": 1.4536888407998079,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 5.5483198165893555,
+      "main_us": 5.553119778633118,
+      "latency_change_pct": 0.08651199286331401,
+      "speedup": 0.9991356278569334,
+      "logical_io_bytes": 67633152,
+      "previous_logical_io_throughput_tb_s": 12.189843815019161,
+      "main_logical_io_throughput_tb_s": 12.179307253597127,
+      "previous_run_medians_us": [
+        5.566740036010742,
+        5.5483198165893555,
+        5.5178797245025635
+      ],
+      "main_run_medians_us": [
+        5.5299001932144165,
+        5.589979887008667,
+        5.553119778633118
+      ],
+      "previous_run_spread_pct": 0.8806325720822265,
+      "main_run_spread_pct": 1.0819088402418524,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.463779926300049,
+      "main_us": 9.631239771842957,
+      "latency_change_pct": 1.7694816114387057,
+      "speedup": 0.9826128463718161,
+      "logical_io_bytes": 135266304,
+      "previous_logical_io_throughput_tb_s": 14.293052570262335,
+      "main_logical_io_throughput_tb_s": 14.044537069407475,
+      "previous_run_medians_us": [
+        9.283519983291626,
+        9.599199891090393,
+        9.463779926300049
+      ],
+      "main_run_medians_us": [
+        9.631239771842957,
+        9.652079939842224,
+        9.596800208091736
+      ],
+      "previous_run_spread_pct": 3.3356640819751715,
+      "main_run_spread_pct": 0.5739627821549955,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 14.787780046463013,
+      "main_us": 14.942419528961182,
+      "latency_change_pct": 1.0457247944741788,
+      "speedup": 0.9896509743821308,
+      "logical_io_bytes": 270532608,
+      "previous_logical_io_throughput_tb_s": 18.294335400580078,
+      "main_logical_io_throughput_tb_s": 18.10500685485758,
+      "previous_run_medians_us": [
+        14.881540536880493,
+        14.778159856796265,
+        14.787780046463013
+      ],
+      "main_run_medians_us": [
+        14.843039512634277,
+        14.942419528961182,
+        14.959239959716797
+      ],
+      "previous_run_spread_pct": 0.6990953324935032,
+      "main_run_spread_pct": 0.7776548293086103,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 4.73829984664917,
+      "main_us": 4.741500020027161,
+      "latency_change_pct": 0.06753843111582114,
+      "speedup": 0.9993250715249449,
+      "logical_io_bytes": 12681216,
+      "previous_logical_io_throughput_tb_s": 2.676321974213578,
+      "main_logical_io_throughput_tb_s": 2.6745156483047654,
+      "previous_run_medians_us": [
+        4.748719930648804,
+        4.731079936027527,
+        4.73829984664917
+      ],
+      "main_run_medians_us": [
+        4.719060063362122,
+        4.741500020027161,
+        4.7591400146484375
+      ],
+      "previous_run_spread_pct": 0.3722853173538923,
+      "main_run_spread_pct": 0.8453010886222949,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 15.231659412384033,
+      "main_us": 15.20359992980957,
+      "latency_change_pct": -0.18421815913011175,
+      "speedup": 1.0018455814875427,
+      "logical_io_bytes": 277086208,
+      "previous_logical_io_throughput_tb_s": 18.1914655848145,
+      "main_logical_io_throughput_tb_s": 18.225039416929107,
+      "previous_run_medians_us": [
+        15.046579837799072,
+        15.231659412384033,
+        15.361440181732178
+      ],
+      "main_run_medians_us": [
+        15.068999528884888,
+        15.20359992980957,
+        15.253280401229858
+      ],
+      "previous_run_spread_pct": 2.067144067553859,
+      "main_run_spread_pct": 1.2120870925026956,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        1024
+      ],
+      "main_plan_capacities": [
+        1024
+      ]
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 112.53040313720703,
+      "main_us": 111.92471504211426,
+      "latency_change_pct": -0.5382439573723641,
+      "speedup": 1.0054115670061332,
+      "logical_io_bytes": 3255304192,
+      "previous_logical_io_throughput_tb_s": 28.928219407788355,
+      "main_logical_io_throughput_tb_s": 29.084766405481727,
+      "previous_run_medians_us": [
+        112.32370376586914,
+        112.53040313720703,
+        112.58090019226074
+      ],
+      "main_run_medians_us": [
+        111.36945724487305,
+        111.92471504211426,
+        113.73784065246582
+      ],
+      "previous_run_spread_pct": 0.22855727805222995,
+      "main_run_spread_pct": 2.116050424342483,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        4096
+      ],
+      "main_plan_capacities": [
+        4096
+      ]
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 259.23927307128906,
+      "main_us": 258.9781188964844,
+      "latency_change_pct": -0.10073866189744818,
+      "speedup": 1.0010084024701293,
+      "logical_io_bytes": 7583825920,
+      "previous_logical_io_throughput_tb_s": 29.254155167741494,
+      "main_logical_io_throughput_tb_s": 29.283655130074195,
+      "previous_run_medians_us": [
+        259.23927307128906,
+        259.9900245666504,
+        259.12553787231445
+      ],
+      "main_run_medians_us": [
+        258.17529678344727,
+        259.0862846374512,
+        258.9781188964844
+      ],
+      "previous_run_spread_pct": 0.3334705749225772,
+      "main_run_spread_pct": 0.35176248012212774,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        8192
+      ],
+      "main_plan_capacities": [
+        8192
+      ]
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 13.565959930419922,
+      "main_us": 13.583580255508423,
+      "latency_change_pct": 0.1298863123500027,
+      "speedup": 0.998702821733515,
+      "logical_io_bytes": 252567552,
+      "previous_logical_io_throughput_tb_s": 18.617742739579356,
+      "main_logical_io_throughput_tb_s": 18.593592208326566,
+      "previous_run_medians_us": [
+        13.505059480667114,
+        13.565959930419922,
+        13.920880556106567
+      ],
+      "main_run_medians_us": [
+        13.623640537261963,
+        13.583580255508423,
+        13.565959930419922
+      ],
+      "previous_run_spread_pct": 3.0651798882807237,
+      "main_run_spread_pct": 0.424634785211729,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        478
+      ],
+      "main_plan_capacities": [
+        478
+      ]
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 13.781460523605347,
+      "main_us": 13.676519393920898,
+      "latency_change_pct": -0.761465952789997,
+      "speedup": 1.0076730874765618,
+      "logical_io_bytes": 253624320,
+      "previous_logical_io_throughput_tb_s": 18.40329764509239,
+      "main_logical_io_throughput_tb_s": 18.544507757780384,
+      "previous_run_medians_us": [
+        13.70695948600769,
+        13.781460523605347,
+        13.918479681015015
+      ],
+      "main_run_medians_us": [
+        13.676519393920898,
+        13.67251992225647,
+        13.772660493850708
+      ],
+      "previous_run_spread_pct": 1.5348169712856294,
+      "main_run_spread_pct": 0.7322080180630604,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        480
+      ],
+      "main_plan_capacities": [
+        480
+      ]
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 14.75011944770813,
+      "main_us": 14.817420244216919,
+      "latency_change_pct": 0.456272891534093,
+      "speedup": 0.9954579950221054,
+      "logical_io_bytes": 254681088,
+      "previous_logical_io_throughput_tb_s": 17.266374614991495,
+      "main_logical_io_throughput_tb_s": 17.187950655540007,
+      "previous_run_medians_us": [
+        14.821439981460571,
+        14.75011944770813,
+        14.71168041229248
+      ],
+      "main_run_medians_us": [
+        14.817420244216919,
+        14.770959615707397,
+        14.820640087127686
+      ],
+      "previous_run_spread_pct": 0.7441266462770594,
+      "main_run_spread_pct": 0.3352842168303747,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        482
+      ],
+      "main_plan_capacities": [
+        482
+      ]
+    },
+    {
+      "case": "dense-decode-b1-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.211820006370544,
+      "main_us": 5.204600095748901,
+      "latency_change_pct": -0.138529546546462,
+      "speedup": 1.0013872171711213,
+      "logical_io_bytes": 2170880,
+      "previous_logical_io_throughput_tb_s": 0.41653011756861835,
+      "main_logical_io_throughput_tb_s": 0.41710793529999873,
+      "previous_run_medians_us": [
+        5.211820006370544,
+        5.190179944038391,
+        5.223039984703064
+      ],
+      "main_run_medians_us": [
+        5.130900144577026,
+        5.204600095748901,
+        5.228639841079712
+      ],
+      "previous_run_spread_pct": 0.6304907042934553,
+      "main_run_spread_pct": 1.8779482516345296,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        256
+      ],
+      "main_plan_capacities": [
+        256
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.458599925041199,
+      "main_us": 5.458599925041199,
+      "latency_change_pct": 0.0,
+      "speedup": 1.0,
+      "logical_io_bytes": 8683520,
+      "previous_logical_io_throughput_tb_s": 1.5907961966885604,
+      "main_logical_io_throughput_tb_s": 1.5907961966885604,
+      "previous_run_medians_us": [
+        5.459380149841309,
+        5.445759892463684,
+        5.458599925041199
+      ],
+      "main_run_medians_us": [
+        5.413720011711121,
+        5.465779900550842,
+        5.458599925041199
+      ],
+      "previous_run_spread_pct": 0.2495192460458936,
+      "main_run_spread_pct": 0.9537223748693903,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.71977972984314,
+      "main_us": 5.593199729919434,
+      "latency_change_pct": -2.213022282366417,
+      "speedup": 1.0226310530708564,
+      "logical_io_bytes": 17367040,
+      "previous_logical_io_throughput_tb_s": 3.0363127288603255,
+      "main_logical_io_throughput_tb_s": 3.10502768336688,
+      "previous_run_medians_us": [
+        5.71977972984314,
+        5.71977972984314,
+        5.772659778594971
+      ],
+      "main_run_medians_us": [
+        5.575559735298157,
+        5.613219738006592,
+        5.593199729919434
+      ],
+      "previous_run_spread_pct": 0.9245119785981907,
+      "main_run_spread_pct": 0.6733176808791973,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 7.731599807739258,
+      "main_us": 7.910280227661133,
+      "latency_change_pct": 2.311040720744728,
+      "speedup": 0.9774116194648762,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 8.98496581916501,
+      "main_logical_io_throughput_tb_s": 8.782009992146632,
+      "previous_run_medians_us": [
+        7.5304800271987915,
+        7.808520197868347,
+        7.731599807739258
+      ],
+      "main_run_medians_us": [
+        7.673100233078003,
+        7.910280227661133,
+        7.93429970741272
+      ],
+      "previous_run_spread_pct": 3.596153158253743,
+      "main_run_spread_pct": 3.3020255517793053,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 6.857500076293945,
+      "main_us": 6.765360236167908,
+      "latency_change_pct": -1.3436360058465158,
+      "speedup": 1.0136193546107795,
+      "logical_io_bytes": 34635776,
+      "previous_logical_io_throughput_tb_s": 5.050787548619102,
+      "main_logical_io_throughput_tb_s": 5.119576015307455,
+      "previous_run_medians_us": [
+        6.991299986839294,
+        6.857500076293945,
+        6.8470799922943115
+      ],
+      "main_run_medians_us": [
+        6.739699840545654,
+        6.7917799949646,
+        6.765360236167908
+      ],
+      "previous_run_spread_pct": 2.1030986939911913,
+      "main_run_spread_pct": 0.7698060798081757,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-decode-b3-q1-ctx225280",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.8374605178833,
+      "main_us": 14.796580076217651,
+      "latency_change_pct": -0.27552182272955195,
+      "speedup": 1.0027628304280498,
+      "logical_io_bytes": 178446336,
+      "previous_logical_io_throughput_tb_s": 12.02674378037415,
+      "main_logical_io_throughput_tb_s": 12.059971634040926,
+      "previous_run_medians_us": [
+        14.8374605178833,
+        14.816639423370361,
+        14.849480390548706
+      ],
+      "main_run_medians_us": [
+        14.740500450134277,
+        14.796580076217651,
+        14.883120059967041
+      ],
+      "previous_run_spread_pct": 0.22133819421970594,
+      "main_run_spread_pct": 0.9638687392500535,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx8192",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 7.253279685974121,
+      "main_us": 7.222819924354553,
+      "latency_change_pct": -0.4199446724558076,
+      "speedup": 1.0042171564483922,
+      "logical_io_bytes": 6586368,
+      "previous_logical_io_throughput_tb_s": 0.9080537750028104,
+      "main_logical_io_throughput_tb_s": 0.9118831798355505,
+      "previous_run_medians_us": [
+        7.253279685974121,
+        7.2724997997283936,
+        7.242079973220825
+      ],
+      "main_run_medians_us": [
+        7.217220067977905,
+        7.234060168266296,
+        7.222819924354553
+      ],
+      "previous_run_spread_pct": 0.41939409239095066,
+      "main_run_spread_pct": 0.23315132406400096,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 8.729100227355957,
+      "main_us": 8.752319812774658,
+      "latency_change_pct": 0.26600204848070685,
+      "speedup": 0.9973470364525745,
+      "logical_io_bytes": 26050560,
+      "previous_logical_io_throughput_tb_s": 2.9843350770977124,
+      "main_logical_io_throughput_tb_s": 2.976417744924869,
+      "previous_run_medians_us": [
+        8.706660270690918,
+        8.729100227355957,
+        8.967859745025635
+      ],
+      "main_run_medians_us": [
+        8.69704008102417,
+        8.829240202903748,
+        8.752319812774658
+      ],
+      "previous_run_spread_pct": 2.992284055991806,
+      "main_run_spread_pct": 1.5104580809149797,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 11.897059679031372,
+      "main_us": 11.956319808959961,
+      "latency_change_pct": 0.4981073603676611,
+      "speedup": 0.9950436145172212,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 5.8391032636776625,
+      "main_logical_io_throughput_tb_s": 5.810162417029124,
+      "previous_run_medians_us": [
+        11.767239570617676,
+        11.897059679031372,
+        11.933900117874146
+      ],
+      "main_run_medians_us": [
+        11.776859760284424,
+        11.96753978729248,
+        11.956319808959961
+      ],
+      "previous_run_spread_pct": 1.4008549318300032,
+      "main_run_spread_pct": 1.5948053419009645,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 23.51046085357666,
+      "main_us": 23.773279190063477,
+      "latency_change_pct": 1.1178782845800095,
+      "speedup": 0.9889448008250933,
+      "logical_io_bytes": 178520064,
+      "previous_logical_io_throughput_tb_s": 7.59321840230289,
+      "main_logical_io_throughput_tb_s": 7.509273860486864,
+      "previous_run_medians_us": [
+        23.653879165649414,
+        23.51046085357666,
+        23.032140731811523
+      ],
+      "main_run_medians_us": [
+        22.747719287872314,
+        23.773279190063477,
+        23.907060623168945
+      ],
+      "previous_run_spread_pct": 2.6445182751205203,
+      "main_run_spread_pct": 4.876657216818456,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b4-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 4.9202001094818115,
+      "main_us": 4.938600063323975,
+      "latency_change_pct": 0.37396759141370417,
+      "speedup": 0.9962742571566366,
+      "logical_io_bytes": 2195456,
+      "previous_logical_io_throughput_tb_s": 0.4462127456501403,
+      "main_logical_io_throughput_tb_s": 0.4445502717064168,
+      "previous_run_medians_us": [
+        4.876919984817505,
+        4.9202001094818115,
+        4.922580122947693
+      ],
+      "main_run_medians_us": [
+        4.909760057926178,
+        4.938600063323975,
+        4.942600131034851
+      ],
+      "previous_run_spread_pct": 0.9280138432214468,
+      "main_run_spread_pct": 0.6649672516014539,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b64-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.667700171470642,
+      "main_us": 5.63323974609375,
+      "latency_change_pct": -0.6080142621226581,
+      "speedup": 1.0061173369020533,
+      "logical_io_bytes": 35127296,
+      "previous_logical_io_throughput_tb_s": 6.1978042128656305,
+      "main_logical_io_throughput_tb_s": 6.235718269288694,
+      "previous_run_medians_us": [
+        5.669299960136414,
+        5.667700171470642,
+        5.540300011634827
+      ],
+      "main_run_medians_us": [
+        5.63323974609375,
+        5.596399903297424,
+        5.669299960136414
+      ],
+      "previous_run_spread_pct": 2.276054565323174,
+      "main_run_spread_pct": 1.2941053483395633,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b128-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 9.261900186538696,
+      "main_us": 9.287539720535278,
+      "latency_change_pct": 0.2768280102375398,
+      "speedup": 0.9972393621165472,
+      "logical_io_bytes": 70254592,
+      "previous_logical_io_throughput_tb_s": 7.585332446370828,
+      "main_logical_io_throughput_tb_s": 7.564392090260793,
+      "previous_run_medians_us": [
+        9.21783983707428,
+        9.26509976387024,
+        9.261900186538696
+      ],
+      "main_run_medians_us": [
+        9.261099696159363,
+        9.36605989933014,
+        9.287539720535278
+      ],
+      "previous_run_spread_pct": 0.5102616724875457,
+      "main_run_spread_pct": 1.1301184848631483,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-decode-b256-q1-ctx2048",
+      "suite": "sparse-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.323879480361938,
+      "main_us": 14.450479745864868,
+      "latency_change_pct": 0.8838406220640138,
+      "speedup": 0.9912390268192198,
+      "logical_io_bytes": 140509184,
+      "previous_logical_io_throughput_tb_s": 9.809436346671188,
+      "main_logical_io_throughput_tb_s": 9.72349613791943,
+      "previous_run_medians_us": [
+        14.323879480361938,
+        14.239779710769653,
+        14.394400119781494
+      ],
+      "main_run_medians_us": [
+        14.450479745864868,
+        14.468920230865479,
+        14.431259632110596
+      ],
+      "previous_run_spread_pct": 1.079459019630999,
+      "main_run_spread_pct": 0.2606183283683694,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-verify-b12-q1-ctx2048",
+      "suite": "sparse-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 4.973860085010529,
+      "main_us": 4.980280101299286,
+      "latency_change_pct": 0.12907512835163004,
+      "speedup": 0.99871091260769,
+      "logical_io_bytes": 6586368,
+      "previous_logical_io_throughput_tb_s": 1.3241964766658807,
+      "main_logical_io_throughput_tb_s": 1.3224894716828695,
+      "previous_run_medians_us": [
+        4.973059892654419,
+        4.973860085010529,
+        5.019540190696716
+      ],
+      "main_run_medians_us": [
+        4.966659843921661,
+        4.980280101299286,
+        4.998700022697449
+      ],
+      "previous_run_spread_pct": 0.9344914663436693,
+      "main_run_spread_pct": 0.6433408989873585,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ]
+    },
+    {
+      "case": "sparse-prefill-b1024-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.772660493850708,
+      "main_us": 13.723779916763306,
+      "latency_change_pct": -0.35491020133130435,
+      "speedup": 1.0035617430025743,
+      "logical_io_bytes": 146935808,
+      "previous_logical_io_throughput_tb_s": 10.668658249842483,
+      "main_logical_io_throughput_tb_s": 10.706657268710716,
+      "previous_run_medians_us": [
+        13.699740171432495,
+        13.831939697265625,
+        13.772660493850708
+      ],
+      "main_run_medians_us": [
+        13.651679754257202,
+        13.723779916763306,
+        13.791099786758423
+      ],
+      "previous_run_spread_pct": 0.9598691980547625,
+      "main_run_spread_pct": 1.0159011099480115,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        1024
+      ],
+      "main_plan_capacities": [
+        1024
+      ]
+    },
+    {
+      "case": "sparse-prefill-b4096-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 71.93349838256836,
+      "main_us": 71.99520111083984,
+      "latency_change_pct": 0.08577746065308034,
+      "speedup": 0.9991429605401547,
+      "logical_io_bytes": 1694769152,
+      "previous_logical_io_throughput_tb_s": 23.560221456026017,
+      "main_logical_io_throughput_tb_s": 23.540029416555512,
+      "previous_run_medians_us": [
+        71.93349838256836,
+        72.39260196685791,
+        71.87181949615479
+      ],
+      "main_run_medians_us": [
+        71.70917987823486,
+        72.23715782165527,
+        71.99520111083984
+      ],
+      "previous_run_spread_pct": 0.7239776771781841,
+      "main_run_spread_pct": 0.7333515779858222,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        4096
+      ],
+      "main_plan_capacities": [
+        4096
+      ]
+    },
+    {
+      "case": "sparse-prefill-b8192-q1-ctx2048",
+      "suite": "sparse-prefill",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 164.00043487548828,
+      "main_us": 163.96198272705078,
+      "latency_change_pct": -0.023446369801816136,
+      "speedup": 1.0002345186841362,
+      "logical_io_bytes": 3942916096,
+      "previous_logical_io_throughput_tb_s": 24.042107565102032,
+      "main_logical_io_throughput_tb_s": 24.04774588853206,
+      "previous_run_medians_us": [
+        163.33301544189453,
+        164.00043487548828,
+        164.2231559753418
+      ],
+      "main_run_medians_us": [
+        163.58699798583984,
+        163.96198272705078,
+        164.23919677734375
+      ],
+      "previous_run_spread_pct": 0.5427671787108823,
+      "main_run_spread_pct": 0.3977743990749541,
+      "previous_output_modes": [
+        "direct"
+      ],
+      "main_output_modes": [
+        "direct"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        8192
+      ],
+      "main_plan_capacities": [
+        8192
+      ]
+    },
+    {
+      "case": "cluster-boundary-b239-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.581160306930542,
+      "main_us": 13.572360277175903,
+      "latency_change_pct": -0.06479586099980006,
+      "speedup": 1.0006483787325804,
+      "logical_io_bytes": 131178496,
+      "previous_logical_io_throughput_tb_s": 9.658857787950481,
+      "main_logical_io_throughput_tb_s": 9.665120385921204,
+      "previous_run_medians_us": [
+        13.499460220336914,
+        13.629239797592163,
+        13.581160306930542
+      ],
+      "main_run_medians_us": [
+        13.520280122756958,
+        13.639659881591797,
+        13.572360277175903
+      ],
+      "previous_run_spread_pct": 0.9555853426531,
+      "main_run_spread_pct": 0.879579943332296,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        478
+      ],
+      "main_plan_capacities": [
+        478
+      ]
+    },
+    {
+      "case": "cluster-boundary-b240-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 13.480219841003418,
+      "main_us": 13.676519393920898,
+      "latency_change_pct": 1.4562043885989695,
+      "speedup": 0.9856469656303976,
+      "logical_io_bytes": 131727360,
+      "previous_logical_io_throughput_tb_s": 9.771899980393398,
+      "main_logical_io_throughput_tb_s": 9.631643564118495,
+      "previous_run_medians_us": [
+        13.47540020942688,
+        13.480219841003418,
+        13.49545955657959
+      ],
+      "main_run_medians_us": [
+        13.400100469589233,
+        13.679720163345337,
+        13.676519393920898
+      ],
+      "previous_run_spread_pct": 0.1488057864731145,
+      "main_run_spread_pct": 2.044523798068039,
+      "previous_output_modes": [
+        "cluster"
+      ],
+      "main_output_modes": [
+        "cluster"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        480
+      ],
+      "main_plan_capacities": [
+        480
+      ]
+    },
+    {
+      "case": "cluster-boundary-b241-q1-ctx2048",
+      "suite": "cluster-boundary",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 14.53220009803772,
+      "main_us": 14.348739385604858,
+      "latency_change_pct": -1.2624427904597502,
+      "speedup": 1.012785841843146,
+      "logical_io_bytes": 132276224,
+      "previous_logical_io_throughput_tb_s": 9.102284795669805,
+      "main_logical_io_throughput_tb_s": 9.218665169478511,
+      "previous_run_medians_us": [
+        14.524179697036743,
+        14.53220009803772,
+        14.546619653701782
+      ],
+      "main_run_medians_us": [
+        14.427239894866943,
+        14.348739385604858,
+        14.33109998703003
+      ],
+      "previous_run_spread_pct": 0.1544154120756232,
+      "main_run_spread_pct": 0.6700233745506932,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        2
+      ],
+      "main_plan_caps": [
+        2
+      ],
+      "previous_plan_capacities": [
+        482
+      ],
+      "main_plan_capacities": [
+        482
+      ]
+    }
+  ],
+  "targeted_recheck": [
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 6.285439729690552,
+      "main_us": 6.299390196800232,
+      "latency_change_pct": 0.22194894406166732,
+      "speedup": 0.9977854257834724,
+      "logical_io_bytes": 33619968,
+      "previous_logical_io_throughput_tb_s": 5.348864907762817,
+      "main_logical_io_throughput_tb_s": 5.337019449450397,
+      "previous_run_medians_us": [
+        6.285439729690552,
+        6.283720135688782,
+        6.343820095062256
+      ],
+      "main_run_medians_us": [
+        6.2910401821136475,
+        6.307740211486816
+      ],
+      "previous_run_spread_pct": 0.956177482532841,
+      "main_run_spread_pct": 0.2651054919832035,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 9.430140256881714,
+      "main_us": 9.499770104885101,
+      "latency_change_pct": 0.7383755289596561,
+      "speedup": 0.9926703649420335,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 14.260643886167264,
+      "main_logical_io_throughput_tb_s": 14.156118570790037,
+      "previous_run_medians_us": [
+        9.430140256881714,
+        9.371479749679565,
+        9.516500234603882
+      ],
+      "main_run_medians_us": [
+        9.498260021209717,
+        9.501280188560486
+      ],
+      "previous_run_spread_pct": 1.5378401696463277,
+      "main_run_spread_pct": 0.0317920046214168,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 7.326059937477112,
+      "main_us": 7.260419726371765,
+      "latency_change_pct": -0.8959824471208355,
+      "speedup": 1.0090408287095198,
+      "logical_io_bytes": 67141632,
+      "previous_logical_io_throughput_tb_s": 9.164766951541168,
+      "main_logical_io_throughput_tb_s": 9.247624039712722,
+      "previous_run_medians_us": [
+        7.26610004901886,
+        7.326059937477112,
+        7.364519834518433
+      ],
+      "main_run_medians_us": [
+        7.253279685974121,
+        7.267559766769409
+      ],
+      "previous_run_spread_pct": 1.3434204243415697,
+      "main_run_spread_pct": 0.1966839567610541,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 12.641140222549438,
+      "main_us": 12.513459920883179,
+      "latency_change_pct": -1.0100378559087742,
+      "speedup": 1.010203437136773,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 10.638270728151006,
+      "main_logical_io_throughput_tb_s": 10.746817654769668,
+      "previous_run_medians_us": [
+        12.933800220489502,
+        12.488900423049927,
+        12.641140222549438
+      ],
+      "main_run_medians_us": [
+        12.426639795303345,
+        12.600280046463013
+      ],
+      "previous_run_spread_pct": 3.5194593969138706,
+      "main_run_spread_pct": 1.3876278204230883,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "bf16",
+      "previous_us": 33.45278024673462,
+      "main_us": 33.24236989021301,
+      "latency_change_pct": -0.6289771880534367,
+      "speedup": 1.0063295835169548,
+      "logical_io_bytes": 346128384,
+      "previous_logical_io_throughput_tb_s": 10.346774810556626,
+      "main_logical_io_throughput_tb_s": 10.412265585851168,
+      "previous_run_medians_us": [
+        33.09283971786499,
+        33.45278024673462,
+        33.50006103515625
+      ],
+      "main_run_medians_us": [
+        33.00391912460327,
+        33.480820655822754
+      ],
+      "previous_run_spread_pct": 1.217301863366078,
+      "main_run_spread_pct": 1.434619531623371,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 5.9456199407577515,
+      "main_us": 5.931650102138519,
+      "latency_change_pct": -0.23496016829914756,
+      "speedup": 1.0023551353128863,
+      "logical_io_bytes": 17367040,
+      "previous_logical_io_throughput_tb_s": 2.920980515580453,
+      "main_logical_io_throughput_tb_s": 2.927859819940949,
+      "previous_run_medians_us": [
+        5.904060006141663,
+        5.9456199407577515,
+        5.974460244178772
+      ],
+      "main_run_medians_us": [
+        5.941720008850098,
+        5.921580195426941
+      ],
+      "previous_run_spread_pct": 1.1840689236543611,
+      "main_run_spread_pct": 0.3395313795716945,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 7.909340262413025,
+      "main_us": 7.879349887371063,
+      "latency_change_pct": -0.3791766954885367,
+      "speedup": 1.0038061991751412,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 8.783053667589499,
+      "main_logical_io_throughput_tb_s": 8.8164837192143,
+      "previous_run_medians_us": [
+        7.800499796867371,
+        7.909340262413025,
+        7.9165202379226685
+      ],
+      "main_run_medians_us": [
+        7.865399718284607,
+        7.8933000564575195
+      ],
+      "previous_run_spread_pct": 1.4668788698679869,
+      "main_run_spread_pct": 0.3540944185970337,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 6.690719723701477,
+      "main_us": 6.722429990768433,
+      "latency_change_pct": 0.4739440355665092,
+      "speedup": 0.9952829159826876,
+      "logical_io_bytes": 34635776,
+      "previous_logical_io_throughput_tb_s": 5.176689120201049,
+      "main_logical_io_throughput_tb_s": 5.152270242689553,
+      "previous_run_medians_us": [
+        6.659600138664246,
+        6.690719723701477,
+        6.711540222167969
+      ],
+      "main_run_medians_us": [
+        6.698060035705566,
+        6.746799945831299
+      ],
+      "previous_run_spread_pct": 0.7763003929118191,
+      "main_run_spread_pct": 0.7250341051177094,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 11.833540201187134,
+      "main_us": 11.929389834403992,
+      "latency_change_pct": 0.8099827404756121,
+      "speedup": 0.9919652526619231,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 5.870446106485614,
+      "main_logical_io_throughput_tb_s": 5.823278555258205,
+      "previous_run_medians_us": [
+        12.002819776535034,
+        11.833540201187134,
+        11.808700561523438
+      ],
+      "main_run_medians_us": [
+        11.861799955368042,
+        11.996979713439941
+      ],
+      "previous_run_spread_pct": 1.6404153931223622,
+      "main_run_spread_pct": 1.1331657356191442,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "atom",
+      "kv_dtype": "fp8",
+      "previous_us": 23.105878829956055,
+      "main_us": 22.882919311523438,
+      "latency_change_pct": -0.9649471464532988,
+      "speedup": 1.0097434910029306,
+      "logical_io_bytes": 178520064,
+      "previous_logical_io_throughput_tb_s": 7.726175027307521,
+      "main_logical_io_throughput_tb_s": 7.80145494417316,
+      "previous_run_medians_us": [
+        23.105878829956055,
+        23.39305877685547,
+        23.089420795440674
+      ],
+      "main_run_medians_us": [
+        22.35111951828003,
+        23.414719104766846
+      ],
+      "previous_run_spread_pct": 1.314115700378112,
+      "main_run_spread_pct": 4.648006541504546,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 6.106640100479126,
+      "main_us": 5.932460129261017,
+      "latency_change_pct": -2.852304513646431,
+      "speedup": 1.0293604958858453,
+      "logical_io_bytes": 33619968,
+      "previous_logical_io_throughput_tb_s": 5.505477225907285,
+      "main_logical_io_throughput_tb_s": 5.66712076734815,
+      "previous_run_medians_us": [
+        6.36713981628418,
+        5.972059965133667,
+        6.106640100479126
+      ],
+      "main_run_medians_us": [
+        5.940120220184326,
+        5.9248000383377075
+      ],
+      "previous_run_spread_pct": 6.469676362939987,
+      "main_run_spread_pct": 0.2582433174907326,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 9.398900270462036,
+      "main_us": 9.330709874629974,
+      "latency_change_pct": -0.7255146226667009,
+      "speedup": 1.0073081680545517,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 14.308043295515164,
+      "main_logical_io_throughput_tb_s": 14.412608880450591,
+      "previous_run_medians_us": [
+        9.398900270462036,
+        9.50689971446991,
+        9.393919706344604
+      ],
+      "main_run_medians_us": [
+        9.35483992099762,
+        9.306579828262329
+      ],
+      "previous_run_spread_pct": 1.2020556115524272,
+      "main_run_spread_pct": 0.5172178042584822,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 7.55437970161438,
+      "main_us": 7.445110082626343,
+      "latency_change_pct": -1.4464406517015083,
+      "speedup": 1.0146766962174307,
+      "logical_io_bytes": 67141632,
+      "previous_logical_io_throughput_tb_s": 8.887775654916016,
+      "main_logical_io_throughput_tb_s": 9.018218838251894,
+      "previous_run_medians_us": [
+        7.57535994052887,
+        7.410979866981506,
+        7.55437970161438
+      ],
+      "main_run_medians_us": [
+        7.585780024528503,
+        7.304440140724182
+      ],
+      "previous_run_spread_pct": 2.175957259763301,
+      "main_run_spread_pct": 3.778854586191365,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 12.553240060806274,
+      "main_us": 12.48902976512909,
+      "latency_change_pct": -0.5115037660887389,
+      "speedup": 1.0051413357870655,
+      "logical_io_bytes": 134479872,
+      "previous_logical_io_throughput_tb_s": 10.712761912350665,
+      "main_logical_io_throughput_tb_s": 10.767839818548946,
+      "previous_run_medians_us": [
+        12.553240060806274,
+        12.996879816055298,
+        12.457660436630249
+      ],
+      "main_run_medians_us": [
+        12.557239532470703,
+        12.420819997787476
+      ],
+      "previous_run_spread_pct": 4.295459792158357,
+      "main_run_spread_pct": 1.0923149135581989,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "bf16",
+      "previous_us": 33.30755949020386,
+      "main_us": 33.36614966392517,
+      "latency_change_pct": 0.1759065347869404,
+      "speedup": 0.9982440235294916,
+      "logical_io_bytes": 346128384,
+      "previous_logical_io_throughput_tb_s": 10.39188668571771,
+      "main_logical_io_throughput_tb_s": 10.3736387772134,
+      "previous_run_medians_us": [
+        33.30755949020386,
+        33.140320777893066,
+        33.85417938232422
+      ],
+      "main_run_medians_us": [
+        33.30355882644653,
+        33.42874050140381
+      ],
+      "previous_run_spread_pct": 2.143232993822638,
+      "main_run_spread_pct": 0.37517566820908727,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b8-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 5.61631977558136,
+      "main_us": 5.69689005613327,
+      "latency_change_pct": 1.4345743079340556,
+      "speedup": 0.9858571466610685,
+      "logical_io_bytes": 17367040,
+      "previous_logical_io_throughput_tb_s": 3.0922455796602666,
+      "main_logical_io_throughput_tb_s": 3.048512403939172,
+      "previous_run_medians_us": [
+        5.530700087547302,
+        5.836640000343323,
+        5.61631977558136
+      ],
+      "main_run_medians_us": [
+        5.751820206642151,
+        5.64195990562439
+      ],
+      "previous_run_spread_pct": 5.447337847929997,
+      "main_run_spread_pct": 1.9284258592894146,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b32-q1-ctx8192",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 7.749879956245422,
+      "main_us": 7.750360071659088,
+      "latency_change_pct": 0.006195133555308985,
+      "speedup": 0.9999380525021772,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 8.963772392889448,
+      "main_logical_io_throughput_tb_s": 8.963217109618654,
+      "previous_run_medians_us": [
+        7.885439991950989,
+        7.678579688072205,
+        7.749879956245422
+      ],
+      "main_run_medians_us": [
+        7.742019891738892,
+        7.758700251579285
+      ],
+      "previous_run_spread_pct": 2.6692065560587293,
+      "main_run_spread_pct": 0.21522045022641598,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-decode-b4-q1-ctx32768",
+      "suite": "dense-decode",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 6.753219962120056,
+      "main_us": 6.830579936504364,
+      "latency_change_pct": 1.1455272420894502,
+      "speedup": 0.9886744646716048,
+      "logical_io_bytes": 34635776,
+      "previous_logical_io_throughput_tb_s": 5.1287794850868,
+      "main_logical_io_throughput_tb_s": 5.0706933118369,
+      "previous_run_medians_us": [
+        6.657180190086365,
+        6.753219962120056,
+        6.822099685668945
+      ],
+      "main_run_medians_us": [
+        6.766939759254456,
+        6.8942201137542725
+      ],
+      "previous_run_spread_pct": 2.4420868342456146,
+      "main_run_spread_pct": 1.8633901613477675,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b8-q4-ctx32768",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 11.764860153198242,
+      "main_us": 11.892939805984497,
+      "latency_change_pct": 1.0886627730244403,
+      "speedup": 0.9892306145599252,
+      "logical_io_bytes": 69468160,
+      "previous_logical_io_throughput_tb_s": 5.904716171327824,
+      "main_logical_io_throughput_tb_s": 5.8411260069645525,
+      "previous_run_medians_us": [
+        11.764860153198242,
+        12.101939916610718,
+        11.73740029335022
+      ],
+      "main_run_medians_us": [
+        11.891440153121948,
+        11.894439458847046
+      ],
+      "previous_run_spread_pct": 3.098546166410648,
+      "main_run_spread_pct": 0.025219212188296904,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    },
+    {
+      "case": "dense-verify-b3-q4-ctx225280",
+      "suite": "dense-verify",
+      "profile": "pr",
+      "kv_dtype": "fp8",
+      "previous_us": 23.160359859466553,
+      "main_us": 23.36683988571167,
+      "latency_change_pct": 0.8915233938419087,
+      "speedup": 0.9911635451239867,
+      "logical_io_bytes": 178520064,
+      "previous_logical_io_throughput_tb_s": 7.708000440547205,
+      "main_logical_io_throughput_tb_s": 7.6398890424700205,
+      "previous_run_medians_us": [
+        23.160359859466553,
+        23.59015941619873,
+        22.655959129333496
+      ],
+      "main_run_medians_us": [
+        22.867920398712158,
+        23.86575937271118
+      ],
+      "previous_run_spread_pct": 4.03361732086123,
+      "main_run_spread_pct": 4.2703205862645595,
+      "previous_output_modes": [
+        "reducer"
+      ],
+      "main_output_modes": [
+        "reducer"
+      ],
+      "previous_plan_caps": [
+        256
+      ],
+      "main_plan_caps": [
+        256
+      ],
+      "previous_plan_capacities": [
+        512
+      ],
+      "main_plan_capacities": [
+        512
+      ],
+      "previous_completed_processes": 3,
+      "main_completed_processes": 2
+    }
+  ]
+}
