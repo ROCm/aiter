@@ -2,8 +2,10 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // gfx1250 H64 MLA V4.1: FP8 Q/SWA, NVFP4 CSA, fused split-K reduction.
 
-#include "aiter_ctypes_error.h"
 #include "aiter_tensor.h"
+
+// Must follow aiter_tensor.h for the error-bridge definitions.
+#include "aiter_ctypes_error.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
