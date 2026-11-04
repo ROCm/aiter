@@ -98,6 +98,20 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_flydsl_linear_attention.py)
+            # The KDA decode regressions are pytest-only; the script entry point
+            # runs the performance sweep. Run both and fail if either fails.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    rc=0
+                    python3 -m pytest -q "$1" || rc=$?
+                    python3 "$1" || rc=$?
+                    exit $rc
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
