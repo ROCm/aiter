@@ -1,0 +1,35 @@
+{
+    "DEFAULT_FALLBACK": true,
+    "M_LEQ_8": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "K_SPLIT": true
+    },
+    "M_LEQ_16": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "K_SPLIT": true
+    },
+    "M_LEQ_32": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "K_SPLIT": true
+    },
+    "any": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "K_SPLIT": true
+    }
+}
