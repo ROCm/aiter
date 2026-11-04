@@ -5,7 +5,7 @@
 
 #include <opus/opus.hpp>
 #include "mla_v41_prefill_traits.h"
-#include "mla_v41_split.hpp"
+#include "mla_v41_prefill_split_epilogue.hpp"
 #include <cstdint>
 #include <bit>
 
@@ -268,7 +268,7 @@ __device__ __attribute__((always_inline)) void attention(
     using s_window = tdm<D_ATTN, seq<T::D_SCALE_SIZE, T::INDICES_PER_TDM>, tdm_traits::gather<32>, cache_cu>;
     static_assert(k_window::traits::padding_tag::pitch_elements == T::K_ROW_LDS_ELEMS);
 
-    // Wave w gathers tile rows [w * ROWS_PER_WAVE, +ROWS_PER_WAVE). A segment's D#s only take the LDS address and rows per issue.
+    // A segment's D#s only take the LDS address and rows per issue.
     const int wave_part = (warp_id >> 1) * T::PARTITION_BYTES;
     const int wave_row  = (warp_id & 1) * T::ROWS_PER_WAVE;
     const u32_t k_lds   = (u32_t)reinterpret_cast<uintptr_t>(smem + wave_part + wave_row * T::K_ROW_LDS_BYTES);
@@ -694,7 +694,6 @@ __device__ __attribute__((always_inline)) void opus_mla_v41_prefill_a8w8_16mx4_6
         return;
     }
 
-    // O is staged in the free K/V partitions, then each wave stores its own head rows.
     auto s_o = make_smem(reinterpret_cast<D_OUT*>(smem));
     static_for<T::PV_GROUPS * T::PV_DV_TILES>([&](auto i) {
         constexpr int g  = i.value / T::PV_DV_TILES;

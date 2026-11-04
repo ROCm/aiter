@@ -5,7 +5,7 @@
 
 #include <opus/opus.hpp>
 #include "mla_v41_prefill_traits.h"
-#include "mla_v41_split.hpp"
+#include "mla_v41_prefill_split_epilogue.hpp"
 #include <cstdint>
 #include <bit>
 
@@ -96,7 +96,6 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 template<class T> using v_scale_t = opus::vector_t<int, T::D_SCALE_SIZE / 4>;
 template<class T> using v_o_t     = opus::vector_t<typename T::D_ACC, T::W_M * T::PV_DV / T::WARP_SIZE>;
 
-// Per-head values of every wave as [head][wave].
 template<class T> __device__ inline int row_wr_offset(int lane_id, int warp_id) {
     return ((lane_id % T::W_M) * T::NUM_WARPS + warp_id) * (int)sizeof(typename T::D_ACC);
 }
@@ -260,7 +259,7 @@ __device__ __attribute__((always_inline)) void attention(
         store<T::VEC_PV>(s_vw, slice(v_dst, number<T::VEC_PV>{}, number<2 * T::VEC_PV>{}), os + T::VEC_PV);
     };
 
-    // The tile being published: its K, S then P, the row max it was exponentiated against and its V chunks.
+    // The tile being published.
     v_k_t v_k;
     v_scale_t<T> scale_k;
     s_tile_t v_s;

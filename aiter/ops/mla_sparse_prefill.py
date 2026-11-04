@@ -244,11 +244,8 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
     )
 
 
-# Split-K cuts each token's keys over num_kv_splits workgroups and folds them in a second
-# launch. While its workgroups fit in one wave (past it a split loses), a launch takes about
-# one workgroup's walk: a token's keys over the splits, in whole KV tiles. A split adds c0
-# keys for the reduce and c1 keys per partial row, N * H * S of them. Auto takes the count
-# that minimizes the sum.
+# Auto split cost in keys: one workgroup's walk (a token's keys over S splits, in whole KV tiles),
+# plus c0 + c1 * N * H * S to fold when split.
 class _SplitFit(NamedTuple):
     heads_per_wg: int
     kv_tile: int
@@ -262,13 +259,11 @@ class _SplitFit(NamedTuple):
 # The reduce gives each split a lane of one wave, so a wave32 arch caps the count.
 _MAX_KV_SPLITS = 32
 _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
-# Split counts the gfx1250 v4.1 kernels fold in-kernel, with no reduce.
+# Split counts a gfx1250 v4.1 cluster folds in-kernel.
 _CLUSTER_COUNT = (2, 4, 8, 16)
 
-# (arch, kernel) -> fit. gfx950 fit on MI355X over topk 384-4096, N 8-768, H 16-128 and
-# 1-32 splits; gfx1250 over topk 512-4096, N 8-256, H 16-128 and 1-32 splits (v41_a8w8: N 32-256,
-# H 16 and 64 and the cluster counts). v41_a8w4 16mx1_16nx4 reuses the v41_a8w8 fit; its
-# 16mx4_64nx1 is fit over topk 512-4096, N 8-256 and H 32-128.
+# (arch, kernel) -> fit over H 16-128, topk 384-4096 and N 8-768 on gfx950, topk 512-4096 and
+# N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
     ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),

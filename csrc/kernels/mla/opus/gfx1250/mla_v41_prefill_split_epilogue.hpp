@@ -10,7 +10,7 @@
 
 namespace opus_mla_v41_split {
 
-// fp32 O rows [head0, +ROWS) of a split, staged at lds; a cluster reads them back within its SE.
+// A cluster reads the partials back within its SE.
 template<class T, bool CLUSTER, int ROWS>
 OPUS_D void store_partial_o(opus::u32_t lds, const opus_mla_prefill_split_args& split, int token, int split_idx, int H, int head0) {
     using namespace opus;
@@ -21,7 +21,7 @@ OPUS_D void store_partial_o(opus::u32_t lds, const opus_mla_prefill_split_args& 
                         (u32_t)T::D_HEAD_SIZE, (u32_t)H, (u64_t)T::D_HEAD_SIZE, 0u, (u32_t)head0).async_store();
 }
 
-// Split i of a cluster folds heads [i * HEADS / S, +HEADS / S) from its staging: it stores none of them, nor any if empty.
+// Split i of a cluster folds heads [i * HEADS / S, +HEADS / S) from LDS, so it stores none of them, nor any if empty.
 template<class T, bool CLUSTER>
 OPUS_D bool skips_store(int split_idx, int num_splits, int num_valid, int row0, int rows) {
     if constexpr (!CLUSTER) return false;
@@ -29,8 +29,8 @@ OPUS_D bool skips_store(int split_idx, int num_splits, int num_valid, int row0, 
     return split_idx >= num_valid || (row0 >= split_idx * hs && row0 + rows <= (split_idx + 1) * hs);
 }
 
-// O of heads [head_lo, +heads) from splits [0, num_valid), thread t on columns [4t, +4). Slot q is split (own + q) % S,
-// slot 0 in LDS; bounded buffers read empty splits and rows past heads as 0, so the loads issue at once.
+// Slot q is split (own + q) % S, slot 0 from LDS. Bounded buffers read empty splits and rows past heads as 0, so the
+// loads issue at once.
 template<class T, int S, int HS>
 OPUS_D void fold(const opus_mla_prefill_split_args& split, const opus_mla_v41_prefill_kargs& kargs, int token,
                  int head_lo, int heads, int num_valid, int own, const char* own_rows, float* w_lds) {
@@ -87,7 +87,7 @@ OPUS_D void fold(const opus_mla_prefill_split_args& split, const opus_mla_v41_pr
         const int j = r.value * GPR + lj;
         if (j < HS) w_lds[j * S + lq] = scale / (sum > 0.0f ? sum : 1.0f);
     });
-    // Each wave reads back only its own weights.
+    // No barrier: each wave reads back only its own weights.
     auto s_w = make_smem(w_lds);
     f32x4 w[HS * S / 4];
     static_for<HS * S / 4>([&](auto k) { w[k.value] = load<4>(s_w, k.value * 4); });
@@ -101,17 +101,16 @@ OPUS_D void fold(const opus_mla_prefill_split_args& split, const opus_mla_v41_pr
     });
 }
 
-// Publishes the partials to the cluster, then folds this split's share of the block's heads.
 template<class T>
 OPUS_D void cluster_fold(const opus_mla_prefill_split_args& split, const opus_mla_v41_prefill_kargs& kargs, const char* smem,
                          int token, int split_idx, int num_valid, int h_block_start) {
     using namespace opus;
     constexpr int HEADS = T::T_M * T::Q_TILE_SIZE;
-    // The cluster barrier counts workgroups.
     s_wait_tensorcnt(0_I);
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
     __builtin_amdgcn_s_barrier();
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    // The cluster barrier counts workgroups.
     if (warp_id == 0) __builtin_amdgcn_s_barrier_signal(-3);
     __builtin_amdgcn_s_barrier_wait(-3);
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");

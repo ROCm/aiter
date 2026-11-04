@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Split-K for the opus MLA sparse prefill kernels. grid.z cuts each token's prefix rows, then its
-// extend rows, into num_splits chunks of whole KV tiles. A split writes its O normalized by its own
-// sum, its max (natural log units of the scaled scores) and that sum; pa_decode_ps_reduce_hip_kernel
-// folds the splits and the sink, or a gfx1250 v4.1 cluster folds them in-kernel.
+// Split-K for the opus MLA sparse prefill kernels: each token's prefix rows, then extend rows, are
+// cut into num_splits chunks of whole KV tiles. A split stores its O over its own sum, its max and
+// that sum; pa_decode_ps_reduce_hip_kernel or a gfx1250 v4.1 cluster folds them with the sink.
 
 #pragma once
 
@@ -71,7 +70,7 @@ __device__ inline int64_t opus_mla_prefill_split_row(
     const opus_mla_prefill_split_args& split, int token, int split_idx, int H, int head)
 { return (static_cast<int64_t>(token) * split.num_splits + split_idx) * H + head; }
 
-// m in log2 units. A split without keys stores -FLT_MAX, which the reduce skips; -inf would not
+// m in log2 units, stored in natural ones. A split without keys stores -FLT_MAX: -inf would not
 // survive -ffast-math.
 __device__ inline void opus_mla_prefill_split_store_ml(const opus_mla_prefill_split_args& split,
                                                        int64_t row,
