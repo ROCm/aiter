@@ -321,8 +321,11 @@ def stage2_tile(net, tpr):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.flydsl.kernels.megamoe_internode.mega_moe_internode_config import (
         lookup_stage2_tune,
+        resolve_gemm2_bm,
         resolve_gemm2_bn,
         resolve_gemm2_cu,
+        resolve_stage2_fused,
+        resolve_stage2_sdma,
     )
 
     tuned = lookup_stage2_tune(
@@ -341,8 +344,23 @@ def stage2_tile(net, tpr):
         if bn_source == cu_source
         else f"gemm2_bn={bn_source},gemm2_cu={cu_source}"
     )
+    s1 = stage1_tile(net, tpr)
+    remote_first = bool(resolve_stage2_fused(tpr) and s1["split_local"])
+    sdma, comm_source = resolve_stage2_sdma(tpr, tuned)
+    sdma = sdma and remote_first
+    bm, _ = resolve_gemm2_bm(
+        tuned, tile_group=s1["tile_group"], fused=remote_first, sdma=sdma
+    )
     # 0 means kernel1 launches the operator's worker_blocks (256) CTAs.
-    return {"gemm2_bn": bn, "gemm2_cu": cu, "grid": cu or 256, "source": source}
+    return {
+        "gemm2_bm": bm,
+        "gemm2_bn": bn,
+        "gemm2_cu": cu,
+        "grid": cu or 256,
+        "intra_comm": ("sdma" if sdma else "xgmi") if remote_first else "-",
+        "comm_source": comm_source,
+        "source": source,
+    }
 
 
 def tile_fragments(tile):
@@ -374,13 +392,28 @@ def check_fused_config(stage1_name, stage2_names, comm_quant, tile, s2tile):
         problems.append(f"fused_stage1 has {extra}, tile config {tile}")
     if stage2_names is None:
         return problems
+    # A fused stage2 kernel carries both names: megamoe_s2f_<k1>__<k2>.
+    split = []
+    for n in stage2_names:
+        if n.startswith("megamoe_s2f_"):
+            a, _, b = n[len("megamoe_s2f_") :].partition("__")
+            split += ["megamoe_" + a, "megamoe_" + b]
+        else:
+            split.append(n)
+    fused_s2 = len(split) != len(stage2_names)
+    stage2_names = split
     k2 = [n for n in stage2_names if n.startswith("megamoe_k2")]
     if len(k2) != 1:
         problems.append(f"expected one megamoe_k2 kernel, got {k2}")
     elif ("_qr8" in k2[0]) != (comm_quant == "fp8"):
         problems.append(f"k2 rail fp8 mismatch: {k2[0]}")
     k1 = [n for n in stage2_names if n.startswith("megamoe_k1")]
-    want = (f"_t32x{s2tile['gemm2_bn']}x256_", f"_cu{s2tile['grid']}_")
+    want = (
+        f"_t{s2tile['gemm2_bm']}x{s2tile['gemm2_bn']}x256_",
+        f"_cu{s2tile['grid']}_",
+    )
+    if fused_s2:  # the fused grid is the resident CTA count, not the table's
+        want = want[:1]
     if len(k1) != 1:
         problems.append(f"expected one megamoe_k1 kernel, got {k1}")
     elif any(w not in k1[0] for w in want):
@@ -652,6 +685,8 @@ def kernel_class(name):
         return "gemm2"
     if name.startswith("megamoe_k2"):  # fused kernel2: node reduce + rail + combine
         return "k2"
+    if name.startswith("megamoe_s2f_"):  # kernel1 + kernel2 in one launch
+        return "stage2"
     if "quant" in name:
         return "quant"
     return "other"
@@ -911,25 +946,29 @@ class Runner:
             # whole run, so size it for the largest TPR of the run.
             vmm = 40 * 1024**3 if max(self.args.tprs) > 4096 else 16 * 1024**3
             self.comm = PooledCommunicator(self.rank, EP_SIZE, per_rank_vmm=vmm)
-        op = MegaMoEInternode(
-            rank=self.rank,
-            world_size=EP_SIZE,
-            model_dim=shape.hidden,
-            inter_dim=shape.inter,
-            experts=shape.experts,
-            topk=shape.topk,
-            quant="a4w4",
-            w1=w.w1,
-            w1_scale=w.w1_scale,
-            w2=w.w2,
-            w2_scale=w.w2_scale,
-            max_tok_per_rank=tokens,
-            swiglu_limit=self.net["swiglu_limit"],
-            activation=shape.activation,
-            comm_quant=args.comm_quant,
-            communicator=self.comm,
-            max_routes_per_token_per_rank=cap,
-        )
+
+        def make_op():
+            return MegaMoEInternode(
+                rank=self.rank,
+                world_size=EP_SIZE,
+                model_dim=shape.hidden,
+                inter_dim=shape.inter,
+                experts=shape.experts,
+                topk=shape.topk,
+                quant="a4w4",
+                w1=w.w1,
+                w1_scale=w.w1_scale,
+                w2=w.w2,
+                w2_scale=w.w2_scale,
+                max_tok_per_rank=tokens,
+                swiglu_limit=self.net["swiglu_limit"],
+                activation=shape.activation,
+                comm_quant=args.comm_quant,
+                communicator=self.comm,
+                max_routes_per_token_per_rank=cap,
+            )
+
+        op = make_op()
         res = {
             "stage1_kernel": op.stage1_kernel_name,
             "stage1_tile": stage1_tile(self.net, tokens),
@@ -1128,7 +1167,8 @@ def print_case(net, args, rec):
         p(
             f"  tile      stage1 G={t1['tile_group']} (BM={32 * t1['tile_group']}) "
             f"split_local={t1['split_local']} fanout_shards={t1['fanout_shards']} [{t1['source']}]"
-            f" | stage2 BN={t2['gemm2_bn']} grid={t2['grid']} [{t2['source']}]"
+            f" | stage2 BM={t2['gemm2_bm']} BN={t2['gemm2_bn']} grid={t2['grid']} [{t2['source']}]"
+            f" intra={t2.get('intra_comm', '-')} [{t2.get('comm_source', '-')}]"
         )
         p(f"  kernel    {fused['stage1_kernel']}")
         if fused["checks"]:
@@ -1251,6 +1291,9 @@ LAUNCH_ENV_DEFAULT = {
     "MORI_RDMA_DEVICES": "^rocep193s0f0,rocep193s0f1",
     "MORI_IB_GID_INDEX": "1",
     "MORI_SHMEM_HEAP_SIZE": "40G",
+    # SDMA queues for the fused stage2 at max_tok_per_rank >= 2048; without
+    # them the operator keeps the xGMI push.
+    "MORI_ENABLE_SDMA": "1",
 }
 LAUNCH_ENV_FORCED = {
     "OMP_NUM_THREADS": "1",

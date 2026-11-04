@@ -16,8 +16,8 @@ owned expert routes only after receiving the rank-deduplicated record.
 
 Stage2:
 
-Stage-1 writes the per-token routing metadata (``node_dest_slot_mask``,
-``node_expected``) and the ``stage1_done`` gate here.  Stage-2 kernel1
+Stage-1 writes the per-token top-k slot bitmap (``node_dest_slot_mask``)
+here.  Stage-2 kernel1
 (GEMM2 + node push) writes weighted BF16 rows into the node-local
 ``plane_slot_inbox`` of the proxy GPU and publishes ``plane_slot_arrived``;
 kernel2 reduces them into ``node_accumulator``, ships the remote plane over
@@ -366,7 +366,6 @@ class Stage1ArenaLayout:
         max_tiles_per_expert = (
             (_base_tiles + tile_group - 1) // tile_group
         ) * tile_group
-        n_blocks = (2 * inter) // block_n
         # Stage1's grouped payload writers form byte indices in signed i32.
         # Keep each parity-local payload below that boundary instead of
         # allowing a large token/inter configuration to wrap to an earlier row.
@@ -413,7 +412,6 @@ class Stage1ArenaLayout:
                 torch.uint8,
                 256,
             ),
-            ("dispatch_staging_ready", (parity_depth, max_tokens), torch.int64, 64),
             (
                 "remote_dispatch_rx",
                 (parity_depth, max_tokens, wire.record_bytes),
@@ -491,56 +489,27 @@ class Stage1ArenaLayout:
                 torch.uint8,
                 256,
             ),
-            (
-                "h1_ready_queue",
-                (parity_depth, max_route_tiles * n_blocks),
-                torch.int32,
-                64,
-            ),
-            (
-                "h1_ready_queue_generation",
-                (parity_depth, max_route_tiles * n_blocks),
-                torch.int64,
-                64,
-            ),
             # In tile-pipeline mode each contiguous n_blocks batch uses its
             # first generation word as the release-published ready marker.
             # Eight independent consumer heads occupy separate cache lines.
-            ("h1_queue_head", (parity_depth, 8, 16), torch.int32, 64),
-            ("h1_queue_tail", (parity_depth,), torch.int32, 64),
             ("h1_queue_eos", (parity_depth,), torch.int64, 64),
-            ("h1_compute_done", (parity_depth,), torch.int32, 64),
-            ("h1_tile_done", (parity_depth, max_route_tiles), torch.int32, 64),
             # Persistent launch state is intentionally not parity indexed.
             ("entry_count", (1,), torch.int64, 64),
             ("epoch_gate", (1,), torch.int64, 64),
             ("error_count", (1,), torch.int32, 64),
             # 自旋超时标记:每个自旋点一个槽,挂死时由限时自旋写 generation。
-            ("plan_debug", (parity_depth, 128), torch.int64, 64),
             # Diagnostic split-fanout completion flags. Appended so every
             # existing production region keeps its byte offset unchanged.
-            ("fanout_done", (parity_depth, 8, 32), torch.int64, 64),
             # Split diagnostic: second quant CTA publishes one generation flag
             # per token before the metadata-owning first CTA marks staging ready.
-            ("quant_half_done", (parity_depth, max_tokens), torch.int64, 64),
             # Sparse multi-CTA transport. Producer CTAs post token data WQEs
             # without ringing and leave one local 0/1 decision per token in
             # sparse_remote_token_ready.  The fixed CCO CTA ballots 32 decisions
             # into each QP's terminal ready word and flushes that QP once.
-            ("sparse_remote_token_ready", (parity_depth, max_tokens), torch.int64, 64),
-            ("sparse_remote_qp_ready", (parity_depth, num_qp), torch.int64, 64),
-            ("sparse_remote_request", (parity_depth, num_qp), torch.int64, 64),
-            ("sparse_remote_batch_ready", (parity_depth,), torch.int64, 64),
-            ("sparse_remote_credit", (parity_depth,), torch.int64, 64),
-            ("sparse_remote_consumed", (parity_depth,), torch.int32, 64),
-            ("sparse_remote_send_count", (parity_depth,), torch.int32, 64),
             # Optional correctness-only instrumentation for the sparse
             # tile-ready pipeline.  Appending these preserves every pre-v3
             # region offset. Production builds leave the counters at zero so
             # they add no per-tile/job atomic traffic to steady runs.
-            ("h1_early_full_tiles", (parity_depth,), torch.int32, 64),
-            ("h1_gmm_started_before_all_comm_eos", (parity_depth,), torch.int32, 64),
-            ("h1_gmm_completed_before_all_comm_eos", (parity_depth,), torch.int32, 64),
             # Expert-major Stage2 view.  Physical tiles stay in arrival order
             # (that is what keeps dispatch single-pass and compact); these
             # regions carry the permutation to expert-major order plus the two
@@ -548,22 +517,9 @@ class Stage1ArenaLayout:
             # writes h1_output straight to the permuted slot, so no activation
             # is ever copied.  Appended so every existing region keeps its
             # byte offset unchanged.
-            ("tile_dst_of_src", (parity_depth, max_route_tiles), torch.int32, 64),
             ("tile_expert_sorted", (parity_depth, max_route_tiles), torch.int32, 64),
             # h1_phys:tile_dst_of_src 的逆(排序后第 t 个 tile 的物理 tile);stage2 按它读 A。
             ("tile_src_of_dst", (parity_depth, max_route_tiles), torch.int32, 64),
-            (
-                "tile_row_source_sorted",
-                (parity_depth, max_route_rows),
-                torch.int32,
-                64,
-            ),
-            (
-                "tile_row_weight_sorted",
-                (parity_depth, max_route_rows),
-                torch.float32,
-                64,
-            ),
             # early_local_gmm(F5):本地组封好即发布的 generation 字;GMM1 job 领取头
             # (word0 本地/word16 远端,各占一行;每次 launch 由初始化者清零);按「先本地组后远端组」排的物理组号表。
             ("h1_local_eos", (parity_depth,), torch.int64, 64),
@@ -574,7 +530,7 @@ class Stage1ArenaLayout:
         if tile_group > 1:
             # GMM1 以「组」为 m_block,expert-major 的目的地也必须按组给出。
             # 只在开启时追加,默认配置的 arena 偏移逐字节不变。
-            for _gname in ("tile_group_perm", "tile_expert_group"):
+            for _gname in ("tile_expert_group",):
                 specs.append(
                     (
                         _gname,
@@ -594,11 +550,6 @@ class Stage1ArenaLayout:
             "remote_dispatch_rx",
             "remote_chunk_ready",
             "remote_chunk_credit",
-            "sparse_remote_qp_ready",
-            "sparse_remote_credit",
-            "plan_local_hist",
-            "rail_count_inbox",
-            "rail_count_inbox_ready",
         )
         _head = [sp for sp in specs if sp[0] in _rdma_first]
         _tail = [sp for sp in specs if sp[0] not in _rdma_first]
@@ -686,11 +637,6 @@ class TwoKernelArenaLayout:
         )
 
 
-# Words of the retired "timeline" diagnostic region; kept only so the
-# regions after it keep their offsets (see Stage2ArenaLayout.create).
-_TIMELINE_WORDS = 31
-
-
 @dataclass(frozen=True)
 class Stage2NodePartialWire:
     """Fixed-order CCO return format.
@@ -751,17 +697,12 @@ class Stage2ArenaLayout:
     ``source_nodes`` is two for the MI355 EP16 deployment.  On local rank ``l``
     the two source planes represent global source ranks ``l`` and ``8+l``.
 
-    In direct mode, expert ranks add to LSA proxy ``s % 8`` at
-    ``node_accumulator[s // 8, token]``; Stage1's exact ``node_expected``
-    counts routes, not distinct ranks. In rank-local mode, each expert rank
-    owns ``rank_accumulator[s, token]`` and the proxy pulls it after readiness.
-    ``node_dest_rank_mask`` identifies distinct participating local ranks.
+    Kernel1 pushes weighted rows into the proxy GPU's ``plane_slot_inbox``;
+    kernel2 reduces them into ``node_accumulator[plane, token]``.
 
-    Absolute generations guard the two parity slots. Atomic accumulation
-    targets and completion counters must still be reset every generation;
-    fully overwritten payloads can retain old bytes until release-published.
-    In lockstep rank-local mode reducers explicitly write zero node partials
-    for absent-node rows. RAIL's consumed credit guards remote buffer reuse.
+    Absolute generations guard the two parity slots; fully overwritten
+    payloads can retain old bytes until release-published.  RAIL's consumed
+    credit guards remote buffer reuse.
     """
 
     hidden: int
@@ -793,18 +734,11 @@ class Stage2ArenaLayout:
         records_per_group: int = 4,
         rail_record_bytes: int | None = None,
     ) -> Stage2ArenaLayout:
-        """Two-kernel Stage2 window layout.
+        """Stage2 window layout: the regions kernel1 / kernel2 use.
 
-        Only node_accumulator, remote_partial_rx, return_group_ready,
-        return_consumed, node_partial_ready, node_dest_slot_mask,
-        plane_slot_arrived, plane_slot_inbox and the Stage1-written gates are
-        used by the current kernels.  The other regions are left over from
-        the retired single-kernel Stage2; they are kept on purpose so every
-        region keeps its byte offset (adding or removing unused regions has
-        been seen to change relL2, cause not yet understood).
+        Above 4096 tokens the rail regions are sized by the rail row width.
         """
         ready_group_tiles = 2
-        timeline_cta_capacity = 256
         values = {
             "hidden": hidden,
             "topk": topk,
@@ -859,29 +793,8 @@ class Stage2ArenaLayout:
         if ready_groups > 64:
             raise ValueError("ready_group_count exceeds the 64-bit node_ready_mask")
 
-        # name, shape, dtype, alignment. node_expected/masks are Stage-1
-        # outputs. Stage-2 resets its own counters and the selected atomic
-        # accumulation target before opening the compute gate. It must not
-        # erase Stage-1's current-generation metadata.
+        # name, shape, dtype, alignment.  Only what the kernels read or write.
         specs: list[tuple[str, tuple[int, ...], torch.dtype, int]] = [
-            (
-                "node_dest_rank_mask",
-                (parity_depth, source_nodes, max_tokens),
-                torch.int32,
-                64,
-            ),
-            (
-                "source_token_count",
-                (parity_depth, source_nodes),
-                torch.int32,
-                64,
-            ),
-            (
-                "node_expected",
-                (parity_depth, source_nodes, max_tokens, ntiles),
-                torch.int32,
-                64,
-            ),
             (
                 "node_accumulator",
                 # Capacity is FP32; BF16 kernels address a packed prefix using
@@ -896,36 +809,6 @@ class Stage2ArenaLayout:
                 torch.uint8 if wide_rail_rows else torch.float32,
                 256,
             ),
-            (
-                "node_done",
-                (parity_depth, source_nodes, max_tokens, ntiles),
-                torch.int32,
-                64,
-            ),
-            # Second-level completion for whole-token readiness.
-            # The last route for each hidden tile increments
-            # node_token_done; hidden/tile_n completions publish one token flag
-            # (14 at H3584, 28 at H7168). Rank-local uses node_partial_ready.
-            (
-                "node_token_done",
-                # One 64-byte cache line per token avoids false sharing among
-                # tile-completion atomics on MI355. Only lane zero is logical.
-                (parity_depth, source_nodes, max_tokens, 16),
-                torch.int32,
-                64,
-            ),
-            (
-                "node_token_ready",
-                (parity_depth, source_nodes, max_tokens),
-                torch.int64,
-                64,
-            ),
-            (
-                "remote_node_tx",
-                (parity_depth, max_tokens, hidden),
-                torch.bfloat16,
-                256,
-            ),
             # The peer RAIL rank writes its node partial for this rank's local
             # source tokens directly here, in token order.
             (
@@ -938,287 +821,32 @@ class Stage2ArenaLayout:
                 torch.uint8 if wide_rail_rows else torch.bfloat16,
                 256,
             ),
-            (
-                "return_group_ready",
-                (parity_depth, groups),
-                torch.int64,
-                64,
-            ),
-            # Per-QP producer/coordinator epochs for the diagnostic
-            # independent-return schedule. They are unused by lockstep.
-            ("return_count", (parity_depth, num_qp), torch.int64, 64),
-            ("return_count_ready", (parity_depth, num_qp), torch.int64, 64),
+            ("return_group_ready", (parity_depth, groups), torch.int64, 64),
             ("return_consumed", (parity_depth,), torch.int64, 64),
-            # Stage-1 completion and Stage-2 init are LSA-visible node gates.
-            ("stage1_done", (parity_depth,), torch.int64, 64),
-            ("stage2_init", (parity_depth,), torch.int64, 64),
-            # Device wall-clock samples used only by timeline-instrumented
-            # diagnostic builds. Production kernels compile all stores out.
             (
-                "timeline",
-                (parity_depth, _TIMELINE_WORDS),
+                "node_partial_ready",
+                (parity_depth, source_nodes, max_tokens),
                 torch.int64,
                 64,
             ),
-            (
-                "timeline_gmm_worker_done",
-                # Historical name: instrumented kernels now fill every CTA
-                # role; legacy readers still select the GEMM CTA range.
-                # Capacity is allocation geometry, not permission to launch
-                # that many resident CTAs. The cooperative diagnostic checks
-                # the exact HSACO's occupancy separately before any launch.
-                # Default 256 preserves every existing region's byte offset.
-                (parity_depth, timeline_cta_capacity),
-                torch.int64,
-                64,
-            ),
-            # Persistent launch state. Each work-head shard owns a separate
-            # 64-byte line. grid_barrier is monotonic and therefore needs no
-            # hot-path memset when the resident grid geometry is unchanged.
-            ("grid_barrier", (1,), torch.int64, 64),
-            ("gemm_work_head", (8, 16), torch.int32, 64),
-            ("final_work_head", (16,), torch.int32, 64),
-            ("final_done", (1,), torch.int32, 64),
-            # Stage-1 may already have published errors into its own region;
-            # Stage-2 keeps a separate counter so its in-kernel reset cannot
-            # erase dispatch diagnostics.
-            ("stage2_error_count", (1,), torch.int32, 64),
-        ]
-
-        # Optional store/reduce ABIs. Keeping these regions at the end makes
-        # the default direct-atomic layout byte-for-byte identical and also
-        # preserves every existing region offset when the experiment is on.
-        # Within one token, a reducer can load all route slots for one N tile
-        # contiguously before advancing to the next tile.
-
-        # The rank-local experiment first combines all routes owned by one EP
-        # rank in local memory. Token or rank-wide group publication gates
-        # the aligned source proxy's node-local peer pull. The logical source
-        # dimension is the complete EP world because every expert rank can
-        # receive routes from every source rank.
-        specs.extend(
-            (
-                (
-                    "rank_accumulator",
-                    (parity_depth, world_size, max_tokens, hidden),
-                    torch.bfloat16,
-                    256,
-                ),
-                (
-                    "rank_token_pending",
-                    # Token mode: valid routes for this source token times
-                    # N-group count, decremented once per route/group.
-                    # Group-batch does not consume this token counter.
-                    (parity_depth, world_size, max_tokens, 16),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_token_ready",
-                    (parity_depth, world_size, max_tokens),
-                    torch.int64,
-                    64,
-                ),
-                (
-                    "rank_return_tx_slot",
-                    (parity_depth, max_tokens),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_return_rx_slot",
-                    (parity_depth, max_tokens),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_return_count",
-                    # lane 0 = compact TX rows, lane 1 = compact RX rows,
-                    # lane 2 = active local+remote plane-token reducers.
-                    (parity_depth, 16),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_reduce_queue",
-                    (parity_depth, source_nodes * max_tokens),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_reduce_queue_ready",
-                    (parity_depth, source_nodes * max_tokens),
-                    torch.int64,
-                    64,
-                ),
-                (
-                    "rank_reduce_queue_tail",
-                    # One logical counter padded to a cache line.
-                    (parity_depth, 16),
-                    torch.int32,
-                    64,
-                ),
-            )
-        )
-
-        # Both deferred-reduction experiments converge on the same source-proxy
-        # completion protocol. Keep these shared regions single-instanced even
-        # if a diagnostic layout requests both optional payload families.
-        specs.extend(
-            (
-                (
-                    "node_partial_done",
-                    # One cache line per token avoids false sharing among
-                    # independent tile/rank arrivals.
-                    (parity_depth, source_nodes, max_tokens, 16),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "node_partial_ready",
-                    (parity_depth, source_nodes, max_tokens),
-                    torch.int64,
-                    64,
-                ),
-            )
-        )
-
-        # Keep the dynamic reducer cursor last.  In particular, append it after
-        # the shared completion regions above so enabling the new scheduler
-        # does not move any pre-existing rank-partial ABI offset.
-        specs.append(
-            (
-                "rank_reduce_queue_head",
-                # One parity-local logical counter padded to a cache line.
-                (parity_depth, 16),
-                torch.int32,
-                64,
-            )
-        )
-
-        # MORI's Stage2 fp8_blockwise combine uses one FP32 scale per 128
-        # hidden values: H7168 therefore has scale_dim=56.  Append after every
-        # optional legacy ABI so enabling quantization changes no old offset.
-
-        # Rank-group watermark: publish local completion once per
-        # (this rank, N-group) across ALL active tokens, instead of once
-        # per (token, N-group). Every field is single-rank/local (no
-        # world_size or token dimension) because a peer reads it through
-        # its own LSA pointer, exactly like rank_token_ready today; this
-        # keeps sync-event count at ready_groups * peers instead of
-        # scaling with the active token count.
-        specs.extend(
-            (
-                (
-                    "rank_group_pending",
-                    # One 64-byte cache line per group avoids false
-                    # sharing among concurrent GMM-CTA atomic increments.
-                    # Despite the name this is an ARRIVAL count: valid
-                    # routes in old group mode, M tiles in group_batch.
-                    (parity_depth, ready_groups, 16),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "rank_group_ready",
-                    (parity_depth, ready_groups),
-                    torch.int64,
-                    64,
-                ),
-                (
-                    "rank_group_total",
-                    # One logical counter padded to a cache line, matching
-                    # the existing rank_reduce_queue_tail convention.
-                    # Expected arrivals per N group: valid-route count, or
-                    # Stage1 num_valid/BM for group_batch. Match producer units.
-                    (parity_depth, 16),
-                    torch.int32,
-                    64,
-                ),
-                (
-                    "node_ready_mask",
-                    # One bit per completed BN tile. Group reducers use
-                    # this to let the final group publish partial_ready.
-                    (parity_depth, source_nodes * max_tokens),
-                    torch.int64,
-                    64,
-                ),
-                (
-                    "rank_group_consume_ready",
-                    # Reserved ABI slot, currently reset but not published
-                    # or waited on. Each active group CTA acquires its own
-                    # eight peer watermarks before its token loop.
-                    (parity_depth,),
-                    torch.int64,
-                    64,
-                ),
-            )
-        )
-
-        # Each rank writes a disjoint contributor slot on the source proxy.
-        # Payload stays uninitialized until arrival publication; a missing
-        # rank is masked at the local reader, never interpreted as stale zero.
-        specs.extend(
-            (
-                (
-                    "rank_push_inbox",
-                    (
-                        parity_depth,
-                        source_nodes * max_tokens,
-                        ready_groups,
-                        gpus_per_node,
-                        ready_group_tiles * tile_n,
-                    ),
-                    torch.bfloat16,
-                    256,
-                ),
-                (
-                    "rank_push_arrived",
-                    (parity_depth, source_nodes * max_tokens, ready_groups),
-                    torch.int32,
-                    64,
-                ),
-            )
-        )
-
-        # Bit s is set when top-k slot s of this source token routes to an
-        # expert owned by some rank on this node.  Stage-1 writes it from
-        # the same predicate that produces `node_expected`, so
-        # popcount(mask) == node_expected for every live row.
-        specs.append(
+            # Stage1 writes, per (node plane, token), the bitmap of top-k slots
+            # whose expert lives on this node.
             (
                 "node_dest_slot_mask",
                 (parity_depth, source_nodes, max_tokens),
                 torch.int32,
                 64,
-            )
-        )
-        # One word per (token, top-k slot) -- the same key as
-        # plane_slot_inbox's contributor dimension, so the producer
-        # reuses the slot index it already computed for the payload.
-        # A row is written by num_n_blocks producer CTAs; they count
-        # themselves on a rank-private counter and the last arriver
-        # The last of the num_n_blocks contributors stores the current
-        # generation here.  i64 so the consumer can poll it with the
-        # existing wait_ready (monotonic u64, ">= expected"): a word left
-        # over from an earlier generation is smaller, so it never reads as
-        # ready and no pass ever has to clear this region.  A peer-side
-        # contributor counter was measured instead (210.7 vs 209.8us --
-        # no difference) and rejected: it needs clearing, which adds a
-        # two-generation skew assumption this shape does not have.
-        specs.append(
+            ),
+            # One word per (token, top-k slot): the last of the num_n_blocks
+            # contributors stores the generation (i64, polled ">= expected", so
+            # no pass ever clears it).
             (
                 "plane_slot_arrived",
                 (parity_depth, source_nodes * max_tokens, topk),
                 torch.int64,
                 64,
-            )
-        )
-        # Same geometry as rank_push_inbox with the contributor dimension
-        # rekeyed from contributor rank to global top-k slot.  Readiness
-        # keeps using rank_push_arrived, whose word per (token, N group)
-        # now holds a 16-bit slot bitmap instead of an arrival count.
-        specs.append(
+            ),
+            # Contributor payload, keyed by global top-k slot.
             (
                 "plane_slot_inbox",
                 (
@@ -1230,8 +858,8 @@ class Stage2ArenaLayout:
                 ),
                 torch.bfloat16,
                 256,
-            )
-        )
+            ),
+        ]
 
         # rail(RDMA)读写的 region 排在 stage2 最前(源 node_accumulator、目标 remote_partial_rx/
         # return_group_ready/return_consumed),原因见 Stage1ArenaLayout.create 的说明。

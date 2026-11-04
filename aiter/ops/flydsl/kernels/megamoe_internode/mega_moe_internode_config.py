@@ -78,8 +78,12 @@ shape.  The rail queue count was 8 on every measured shape and is the constant
 ``NUM_QP``.
 
 ``gemm2_bn`` is kernel1's GEMM2 N tile (128 or 256) and ``gemm2_cu`` kernel1's
-persistent grid (0 = the operator's worker_blocks).  BM stays 32: kernel1
-requires ``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
+persistent grid (0 = the operator's worker_blocks).  ``gemm2_bm`` (optional
+column; empty = the rule in ``resolve_gemm2_bm``) is the GEMM2 M tile of the
+fused stage2: 32*GS rows = GS consecutive 32-row arena tiles of one Stage1 tile
+group, so GS must divide the shape's Stage1 ``tile_group``.  ``intra_comm``
+(optional column: ``xgmi`` / ``sdma``; empty = the rule in
+``resolve_stage2_sdma``) is how the fused stage2 moves its intra-node rows.
 """
 
 from __future__ import annotations
@@ -98,9 +102,19 @@ class _TuneTable:
     """One CSV tune table: ``$<env>`` or ``aiter/configs/<default_name>``, loaded
     once per path, rows validated at load time (so an error names the CSV row)."""
 
-    def __init__(self, env: str, default_name: str, value_fields: tuple, validate):
+    def __init__(
+        self,
+        env: str,
+        default_name: str,
+        value_fields: tuple,
+        validate,
+        optional_fields: tuple = (),
+    ):
         self.env, self.default_name = env, default_name
         self.value_fields, self.validate = value_fields, validate
+        # (name, default): a table without the column (or with it empty) gets
+        # the default; the value takes the default's type (int or str).
+        self.optional_fields = tuple(optional_fields)
         self._lock = threading.Lock()
         self._cache: dict | None = None
         self._cache_path: str | None = None
@@ -131,6 +145,9 @@ class _TuneTable:
                     for f in _KEY_FIELDS
                 )
                 row = {f: int(raw[f]) for f in self.value_fields}
+                for f, default in self.optional_fields:
+                    v = (raw.get(f) or "").strip()
+                    row[f] = type(default)(v) if v else default
                 self.validate(row, f"{path}:{lineno}")
                 table[key] = row
         return table
@@ -287,9 +304,49 @@ def resolve_stage1_tile(
 # Stage2
 NUM_QP = 8
 GEMM2_BNS = (128, 256)
+GEMM2_BMS = (32, 64, 128)
+# Default GEMM2 M tile of the fused stage2 per intra-node path (46+50, K3 and
+# DSv4.1, TPR 1024..16384): xGMI 64 (-1.4~-10% vs 32; 128 stalls for ms at TPR
+# >= 4096), SDMA 128 (2048: 128 < 64 < 32 monotonically).
+GEMM2_BM_XGMI, GEMM2_BM_SDMA = 64, 128
+STAGE2_INTRA_COMMS = ("xgmi", "sdma")
 DEFAULT_GEMM2_BN = 128
 DEFAULT_GEMM2_CU = 0
 GEMM2_CU_MAX = 2048
+# Kernel1 claims m-blocks dynamically from this max_tok_per_rank up.  Measured
+# on K3 / DSv4.1 EP16: TPR >= 2048 gains 2-14% end to end (static split leaves
+# idle CUs behind the heaviest m-blocks); TPR <= 1024 is even with random
+# routing and 4-5% slower with EPLB (1-2 m-blocks per CTA, the claim is pure cost).
+GEMM2_DYNAMIC_MIN_TPR = 2048
+# Stage2 as one kernel from this max_tok_per_rank up: kernel1 does the
+# remote-source m-blocks first and kernel2's first CTAs reduce and ship the
+# remote plane while the local half is still in GEMM2.  Measured vs two
+# kernels (K3 / DSv4.1 EP16): -5~13% at TPR >= 2048, even to -8% at 1024,
+# +2~6% at 512 (the fused kernel always claims dynamically).
+STAGE2_FUSED_MIN_TPR = 1024
+# From this max_tok_per_rank the fused stage2 ships its intra-node rows with
+# the copy engines (SDMA) instead of xGMI stores from the GEMM2 epilogue.
+STAGE2_SDMA_MIN_TPR = 2048
+# SDMA chunk = tickets (32-row tiles) per engine-side wait.  The waits are all
+# posted up front and each costs ~14us on the queue, serialised, so the chunk
+# grows with the rows to keep ~STAGE2_SDMA_CHUNKS of them (K3 TPR 16384: 128
+# tiles/chunk +9~14% vs xGMI, 512 recovers it).  See resolve_sdma_chunk_tiles.
+STAGE2_SDMA_CHUNKS = 16
+STAGE2_SDMA_CHUNK_TILES_MIN = 128
+# Small chunks (one compute round each) at the head and the tail of each half
+# around the big ones: the head starts the copy engine early, the tail leaves
+# less to ship after the half's last GEMM2 tile (signal and rail start sooner).
+# 0 = uniform chunks.  Measured 2 vs 0 (46+50, 4 MB puts): even at TPR 16384,
+# +1~3% at 4096 (8 more engine waits); the tail is not what holds stage2 back.
+STAGE2_SDMA_RAMP_CHUNKS = 0
+# Send-buffer size in rows per max_tok_per_rank * topk; rows past it go out as
+# xGMI stores.
+# Bytes per peer that build up before the posted SDMA put is cut (the copy
+# engines reach ~55 GB/s per link from ~4 MB; 1 MB puts only ~44).
+STAGE2_SDMA_PUT_BYTES = 4 << 20
+STAGE2_SDMA_SEND_ROWS_PER_ROUTE = 2
+# Share of each peer's rows sent by SDMA, in 1/64 (the rest go as xGMI stores).
+STAGE2_SDMA_FRAC_Q64 = 64
 
 
 def _validate_stage2(row: dict, where: str) -> None:
@@ -304,6 +361,14 @@ def _validate_stage2(row: dict, where: str) -> None:
     cu = row["gemm2_cu"]
     if not 0 <= cu <= GEMM2_CU_MAX:
         raise ValueError(f"{where}: gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu})")
+    bm = row["gemm2_bm"]
+    if bm and bm not in GEMM2_BMS:
+        raise ValueError(f"{where}: gemm2_bm must be one of {GEMM2_BMS} (got {bm})")
+    comm = row["intra_comm"]
+    if comm and comm not in STAGE2_INTRA_COMMS:
+        raise ValueError(
+            f"{where}: intra_comm must be one of {STAGE2_INTRA_COMMS} or empty (got {comm!r})"
+        )
 
 
 STAGE2_TABLE = _TuneTable(
@@ -311,6 +376,8 @@ STAGE2_TABLE = _TuneTable(
     "megamoe_internode_stage2_tuned.csv",
     ("return_chunk_tokens", "gemm2_bn", "gemm2_cu"),
     _validate_stage2,
+    # 0 / "" = the built-in rule
+    optional_fields=(("gemm2_bm", 0), ("intra_comm", "")),
 )
 
 
@@ -357,6 +424,33 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     return bn, source
 
 
+def resolve_gemm2_bm(
+    tuned: dict | None, *, tile_group: int, fused: bool, sdma: bool
+) -> tuple[int, str]:
+    """GEMM2 M tile and its source: table > rule (fused stage2: GEMM2_BM_SDMA
+    or GEMM2_BM_XGMI by the intra-node path, while the tile group holds it) > 32.
+
+    Only the fused remote-first stage2 takes a tile above 32, and it must cover
+    whole 32-row tiles of one Stage1 tile group (``32*tile_group % bm == 0``).
+    """
+    bm = int((tuned or {}).get("gemm2_bm", 0))
+    if not bm:
+        want = GEMM2_BM_SDMA if sdma else GEMM2_BM_XGMI
+        if fused and (32 * int(tile_group)) % want == 0:
+            return want, "default"
+        return 32, "default"
+    if bm == 32:
+        return 32, "table"
+    if not fused:
+        return 32, "table (gemm2_bm needs the fused stage2; using 32)"
+    if bm not in GEMM2_BMS or (32 * int(tile_group)) % bm:
+        raise ValueError(
+            f"gemm2_bm {bm} must be one of {GEMM2_BMS} and divide 32*tile_group "
+            f"(tile_group {tile_group})"
+        )
+    return bm, "table"
+
+
 def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
     """GEMM2 (kernel1) persistent grid and its source: table > 0.
 
@@ -371,3 +465,45 @@ def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
             f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})"
         )
     return cu, source
+
+
+def resolve_gemm2_dynamic(max_tok_per_rank: int) -> bool:
+    """Whether kernel1 claims m-blocks dynamically (see GEMM2_DYNAMIC_MIN_TPR)."""
+    return int(max_tok_per_rank) >= GEMM2_DYNAMIC_MIN_TPR
+
+
+def resolve_stage2_fused(max_tok_per_rank: int) -> bool:
+    """Whether stage2 runs as one fused kernel (see STAGE2_FUSED_MIN_TPR)."""
+    return int(max_tok_per_rank) >= STAGE2_FUSED_MIN_TPR
+
+
+def resolve_stage2_sdma(
+    max_tok_per_rank: int, tuned: dict | None = None
+) -> tuple[bool, str]:
+    """Whether the fused stage2 moves intra-node rows by SDMA, and the source:
+    table ``intra_comm`` > rule (TPR >= STAGE2_SDMA_MIN_TPR).  Only the fused
+    stage2 has the SDMA path; the caller also needs Stage1's local/remote split.
+
+    The best path depends on the model, not just the TPR (46+50, vs xGMI BM64):
+    DSv4.1 TPR >= 2048 gains 5~10% with SDMA, K3 is within +-3% and loses on EPLB.
+    """
+    if not resolve_stage2_fused(max_tok_per_rank):
+        return False, "default"
+    comm = str((tuned or {}).get("intra_comm", "") or "")
+    if comm:
+        return comm == "sdma", "table"
+    return int(max_tok_per_rank) >= STAGE2_SDMA_MIN_TPR, "default"
+
+
+def resolve_sdma_chunk_tiles(rows: int, tile_group_gs: int = 1) -> int:
+    """Tickets per SDMA chunk for ``rows`` GEMM rows (mtpr * topk): about
+    STAGE2_SDMA_CHUNKS chunks, a power of two >= STAGE2_SDMA_CHUNK_TILES_MIN
+    (a multiple of the GEMM2 tile's 32-row tiles, ``tile_group_gs``)."""
+    tiles = -(-int(rows) // 32)
+    want = max(STAGE2_SDMA_CHUNK_TILES_MIN, -(-tiles // STAGE2_SDMA_CHUNKS))
+    ct = 1 << (want - 1).bit_length()
+    if ct % int(tile_group_gs):
+        raise ValueError(
+            f"sdma chunk {ct} tiles is not a multiple of the GEMM2 tile ({tile_group_gs})"
+        )
+    return ct

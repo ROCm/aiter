@@ -7,10 +7,13 @@ protocol needs live here so it does not alter shared kernels.
 
 Rail GDA (``rail``): MORI's public FlyDSL binding (``mori.cco.device.flydsl``,
 ROCm/mori PR 895 and later) with the rail team (``Team.GDA``: ``peer`` is a node
-index) and ``defer_doorbell`` (post WQEs without ringing; the next flush rings
-once per QP). When the installed MORI also has ``posted_before_flush``
-(``ccoGdaOptFlagsPostedBeforeFlush``), deferred posts skip the per-post ready
-mark and its system fence; see ``_PBF``.
+index) and deferred doorbells (post WQEs without ringing; the next flush rings
+once per QP).  Every rail post here is caller-ordered: the flusher knows all
+posts on its QP have returned before it flushes, so posts skip the per-post
+ready mark and its system fence.  MORI with ``GdaDoorbell`` (PR 895 final)
+takes that as the handle mode ``CALLER_ORDERED``; older PR 895 builds take the
+per-call ``defer_doorbell`` (+ ``posted_before_flush`` when present).  See
+``_gda``.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ __all__ = [
     "load_i64_global_system_relaxed",
     "spin_until_ge_i64_sleep_rx",
     "spin_until_ge_i64_system_rx",
+    "store_i32_global_system_relaxed",
     "store_i32_system",
     "store_i64_global_relaxed",
     "store_i64_global_system",
@@ -192,6 +196,17 @@ def store_i64_global_system_relaxed(addr_i64, value):
     )
 
 
+def store_i32_global_system_relaxed(addr_i64, value):
+    """i32 form of :func:`store_i64_global_system_relaxed` (no writeback)."""
+    _llvm_d.StoreOp(
+        fx.Int32(value).ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    )
+
+
 def atomic_add_system_acq_rel(addr_i64, value):
     """System-scope acquire-release fetch-add used by last-arriver logic."""
     return _llvm_d.AtomicRMWOp(
@@ -264,12 +279,46 @@ def _posted_before_flush_supported() -> bool:
     return hasattr(GdaFlags, "POSTED_BEFORE_FLUSH")
 
 
-# Caller-ordered posting (``ccoGdaOptFlagsPostedBeforeFlush``) when this MORI has
-# it. Every rail QP here meets its contract: stage2 k2's flushing wave waits for
-# the WQE_POSTED count before it flushes, and stage1 posts a credit on a QP only
-# after that QP's dispatch request has completed. Without it a deferred post
-# publishes a ready mark behind a system fence and the flush sweeps the marks.
+# Caller-ordered posting.  Every rail QP here meets its contract (all posts on
+# the QP have returned when a flush starts; only these handles touch the rail
+# contexts; fewer WQEs than the SQ between flushes): stage2 k2's flushing wave
+# waits for the WQE_POSTED count before it flushes, and stage1 posts a credit on
+# a QP only after that QP's dispatch request has completed.  Without it a
+# deferred post publishes a ready mark behind a system fence and the flush
+# sweeps the marks.
 _PBF = {"posted_before_flush": True} if _posted_before_flush_supported() else {}
+
+
+def _doorbell_modes():
+    try:
+        from mori.cco.device.ops import GdaDoorbell
+    except ImportError:
+        return None
+    return GdaDoorbell
+
+
+_DOORBELL = _doorbell_modes()
+
+
+def _gda(dev_comm, *, deferred=True):
+    """(handle, extra per-call kwargs) for a rail post or flush.
+
+    New MORI: the doorbell mode is the handle's (CALLER_ORDERED for the
+    deferred posts and their flushes).  Older PR 895: one default handle and the
+    mode as per-call flags."""
+    if _DOORBELL is not None:
+        mode = _DOORBELL.CALLER_ORDERED if deferred else _DOORBELL.IMMEDIATE
+        return cco.DevComm(dev_comm).gda(0, doorbell=mode), {}
+    if not deferred:
+        return cco.DevComm(dev_comm).gda(0), {}
+    return cco.DevComm(dev_comm).gda(0), {"defer_doorbell": True, **_PBF}
+
+
+def _gda_flush(dev_comm):
+    """Handle + kwargs for a flush that releases the caller-ordered posts."""
+    if _DOORBELL is not None:
+        return cco.DevComm(dev_comm).gda(0, doorbell=_DOORBELL.CALLER_ORDERED), {}
+    return cco.DevComm(dev_comm).gda(0), dict(_PBF)
 
 
 class RailGda:
@@ -297,7 +346,8 @@ class RailGda:
         ``aggregate=True`` leaves the doorbell unrung: the transfer is only
         released by a later flush on the same ctx.
         """
-        cco.DevComm(dev_comm).gda(0).put(
+        gda, kw = _gda(dev_comm, deferred=bool(aggregate))
+        gda.put(
             peer,
             dst_win,
             dst_off,
@@ -306,32 +356,30 @@ class RailGda:
             nbytes,
             coop=_WARP,
             team=_GDA,
-            defer_doorbell=bool(aggregate),
             ctx=ctx,
-            **(_PBF if aggregate else {}),
+            **kw,
         )
 
     def put_value(
         self, dev_comm, ctx, peer, dst_win, dst_off, value, *, aggregate=True
     ):
         """Post an inline 8-byte write; same doorbell rule as :meth:`put`."""
-        cco.DevComm(dev_comm).gda(0).put_value(
+        gda, kw = _gda(dev_comm, deferred=bool(aggregate))
+        gda.put_value(
             peer,
             dst_win,
             dst_off,
             value,
             coop=_WARP,
             team=_GDA,
-            defer_doorbell=bool(aggregate),
             ctx=ctx,
-            **(_PBF if aggregate else {}),
+            **kw,
         )
 
     def flush_peer(self, dev_comm, ctx, peer):
         """Ring the doorbell for ctx/peer and poll its CQ to completion."""
-        cco.DevComm(dev_comm).gda(0).flush_peer(
-            peer, coop=_WARP, team=_GDA, ctx=ctx, **_PBF
-        )
+        gda, kw = _gda_flush(dev_comm)
+        gda.flush_peer(peer, coop=_WARP, team=_GDA, ctx=ctx, **kw)
 
     def flush_async(self, dev_comm, ctx, peer):
         """Ring the doorbell and return a request handle for :meth:`wait`.
@@ -339,18 +387,16 @@ class RailGda:
         Only worth the split when real work sits between the two; stage1 does
         interleave a credit request with the original one.
         """
-        return (
-            cco.DevComm(dev_comm)
-            .gda(0)
-            .flush_async(peer, coop=_WARP, team=_GDA, ctx=ctx, **_PBF)
-        )
+        gda, kw = _gda_flush(dev_comm)
+        return gda.flush_async(peer, coop=_WARP, team=_GDA, ctx=ctx, **kw)
 
     def wait(self, dev_comm, ctx, request):
         """Block until the batch named by a :meth:`flush_async` handle lands.
 
         The request names its own QP; ``ctx`` is accepted for symmetry.
         """
-        cco.DevComm(dev_comm).gda(0).wait(request, coop=_WARP)
+        gda, _ = _gda_flush(dev_comm)
+        gda.wait(request, coop=_WARP)
 
 
 rail = RailGda()
