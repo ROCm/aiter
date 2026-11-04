@@ -10,7 +10,8 @@ engine; the oracle is an untimed fp32 NCCL all-reduce / all-gather of the same
 per-rank inputs. INT4 is lossy, so accuracy is NMSE against the exact fp32
 result (plus ``checkAllclose`` with the all-reduce test's tolerances); the
 other checks are exact. Inputs are normal, heavy-tailed (Student-t, 3 degrees
-of freedom) and all zeros:
+of freedom), ranged (rank r's partial is ``4**(r % 4)`` times as large, so that
+the rounding order of the sum shows) and all zeros:
 
 * RS block placement and accuracy: rank r holds rows ``[r*T/W, (r+1)*T/W)`` of
   the sum, NMSE below a bound that a wrong block, offset or store would exceed
@@ -93,7 +94,7 @@ NMSE_MAX = 2e-2
 CLOSE_RTOL = 1e-1
 CLOSE_ATOL = 1e-1
 CLOSE_ERR_RATIO = 0.5
-_FILLS = ("normal", "heavy", "zeros")
+_FILLS = ("normal", "heavy", "ranged", "zeros")
 # Output buffers start as this value, exactly representable in bf16 and far from
 # the data (std 0.1), so a tile the kernel never wrote shows as a huge NMSE.
 _SENTINEL = -7.0
@@ -154,6 +155,14 @@ def _make_inp(
             for _ in range(3)
         )
         z = z / torch.sqrt(chi / 3.0)
+    if fill == "ranged":
+        # Rank r's partial is 4**(r % 4) times as large, up to 64x (the values stay
+        # far below the fp16 maximum). A dequantized product is exact in fp16, and
+        # so is a sum of terms of similar magnitude, which makes the result
+        # independent of the accumulation order for the other fills; terms of
+        # very different magnitude round, so with this one the order (rank order
+        # for every owner) shows in the bits.
+        z = z * 4.0 ** (rank % 4)
     return (z * 0.1).to(device=device, dtype=torch.bfloat16)
 
 
