@@ -22,9 +22,11 @@ from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
 )
+from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
+    "SKINNY_POLICY",
     "SPLIT_K_SEMAPHORE_MAX_LEN",
     "flydsl_hgemm",
     "flydsl_hgemm_kernel_name",
@@ -41,9 +43,15 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti)_"
-    r"(?P<target_gfx>gfx[0-9a-z]+)$"
+    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk)_"
+    r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
+
+# The skinny policy (kernels/gemm_a16w16_skinny_gfx950.py) reuses the HGEMM name
+# fields: t<block_m>x<block_n>x<block_k>x<stages> is its tile and LDS ring depth,
+# w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
+# bias or fp32 output, and runs on gfx950 only.
+SKINNY_POLICY = "sk"
 
 
 def _normalize_dtype_name(dtype: str | torch.dtype) -> str:
@@ -75,7 +83,10 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    policy = "ht" if config["use_half_tile_interleaved"] else "ft"
+    if config.get("policy") == SKINNY_POLICY:
+        policy = SKINNY_POLICY
+    else:
+        policy = "ht" if config["use_half_tile_interleaved"] else "ft"
     name = (
         f"flydsl_hgemm_a{dtype_name}_w{dtype_name}_{out_dtype_name}_"
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
@@ -98,6 +109,18 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     out_dtype = _normalize_dtype_name(match.group("out_dtype"))
     if out_dtype not in (dtype, "fp32"):
         return None
+    policy = match.group("policy")
+    if policy == SKINNY_POLICY and (
+        dtype != "bf16"
+        or out_dtype != "bf16"
+        or match.group("split_k") != "1"
+        or match.group("m_waves") != "1"
+        or match.group("n_waves") != "1"
+        or match.group("has_bias") != "0"
+        or match.group("group_m") != "0"
+        or match.group("target_gfx") != "gfx950"
+    ):
+        return None
 
     return {
         "block_m": int(match.group("block_m")),
@@ -109,7 +132,8 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "n_waves": int(match.group("n_waves")),
         "k_waves": int(match.group("k_waves")),
         "group_m": int(match.group("group_m")),
-        "use_half_tile_interleaved": match.group("policy") in ("ht", "hti"),
+        "use_half_tile_interleaved": policy in ("ht", "hti"),
+        "policy": policy,
         "has_bias": match.group("has_bias") == "1",
         "dtype": dtype,
         "out_dtype": out_dtype,
@@ -155,7 +179,8 @@ def flydsl_hgemm(
     the shape's tuned-table row (else the cost-model fallback), and the set
     ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
     take ``_HGEMM_DEFAULT_TILE``. gfx942 has no main-loop unroll variant, so it
-    validates ``policy`` but ignores it, and does not support ``bias``.
+    ignores the ``ft``/``ht``/``hti`` policies, and does not support ``bias``.
+    The skinny policy is gfx950 only and is rejected on every other arch.
 
     On gfx942, a partial tile override keeps unspecified block dimensions,
     wave counts and ``group_m`` from the selected tuned or fallback config.
@@ -163,7 +188,7 @@ def flydsl_hgemm(
     applying the override.
     """
 
-    if policy not in ("ft", "ht", "hti"):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -187,6 +212,8 @@ def flydsl_hgemm(
         if value is not None
     }
     gfx = get_gfx_runtime()
+    if policy == SKINNY_POLICY and gfx != "gfx950":
+        raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
     if gfx == "gfx942":
         return gemm_a16w16_gfx942(
             a,
@@ -203,7 +230,26 @@ def flydsl_hgemm(
     block_m, block_n, block_k = tile["block_m"], tile["block_n"], tile["block_k"]
     stages, split_k, group_m = tile["stages"], tile["split_k"], tile["group_m"]
     m_waves, n_waves, k_waves = tile["m_waves"], tile["n_waves"], tile["k_waves"]
-    if gfx == "gfx1250":
+    if policy == SKINNY_POLICY:
+        if bias is not None or split_k != 1 or m_waves != 1 or n_waves != 1 or group_m:
+            raise ValueError(
+                "The FlyDSL skinny HGEMM policy requires split_k=1, m_waves=1, "
+                "n_waves=1, group_m=0 and no bias"
+            )
+        if out_dtype not in (None, a.dtype):
+            raise ValueError("The FlyDSL skinny HGEMM policy writes the input dtype")
+        return gemm_a16w16_skinny(
+            a,
+            b,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            stages=stages,
+            k_waves=k_waves,
+            out=out,
+            stream=launch_stream,
+        )
+    if gfx in ("gfx1250", "gfx1250-strict"):
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
         with torch.cuda.stream(launch_stream):
