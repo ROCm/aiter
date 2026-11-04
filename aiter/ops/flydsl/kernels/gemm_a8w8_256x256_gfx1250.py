@@ -63,10 +63,13 @@ def launch_gemm_a8w8_256x256(
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
+    k_tiles_class: Constexpr[int] = 2,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
-    least 512 per split."""
+    least 512 per split. ``k_tiles_class`` buckets the K-tiles per split:
+    0 for <= 16, 1 for <= 64, 2 above; long K loops keep the early merge
+    timeout on A/B and the plain K-loop schedule, which run faster there."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -459,7 +462,7 @@ def launch_gemm_a8w8_256x256(
                 pad_amount=pad,
                 num_warps=1,
                 workgroup_mask=mask,
-                early_timeout=early and owner > 1,
+                early_timeout=early and (owner > 1 or k_tiles_class > 1),
                 oob_outer_bound=bound,
                 oob_inner_bound=inner_bound,
             )
@@ -700,7 +703,11 @@ def launch_gemm_a8w8_256x256(
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
         WAR_SCHED = const_expr(
-            tile_m == 256 and half_m == 4 and half_n == 4 and not mx32
+            k_tiles_class == 0
+            and tile_m == 256
+            and half_m == 4
+            and half_n == 4
+            and not mx32
         )
         # Load windows (first, last WMMA position a load may follow) per quadrant.
         WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
