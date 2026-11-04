@@ -740,14 +740,6 @@ def _build_managers(
     )
 
 
-# Page indices carried across the loop back edge for the distance-2 index prefetch.
-# Not one SGPR each: the lifetimes OVERLAP rather than stack, since a band's indices are
-# dead once its descriptor is built, so carrying the widest case (32, at page_size 1)
-# costs 8 lane-spills -- v_writelane, no scratch -- and buys the lagging half its whole
-# gemm between the load and the s_wait_kmcnt.
-_MAX_CARRIED_PAGE_INDICES = 32
-
-
 class PagedSpec:
     """The paged KV pool as the entry sees it; ``page_size`` compile-time, rest runtime."""
 
@@ -781,7 +773,7 @@ class _ContiguousKVPolicy:
 
     num_state_slots = 0
 
-    def indices(self, tile_idx, carried):
+    def indices(self, carried):
         return None
 
     def advance(self, tile_idx):
@@ -835,12 +827,12 @@ class _PagedKVPolicy:
             num_rows % page_size == 0 or page_size % num_rows == 0
         ), f"band of {num_rows} rows and page_size {page_size}: one must divide the other"
         self._num_pages = max(1, num_rows // page_size)
-        # Distance-2 index prefetch. The descriptor BUILD consumes these, and the build
-        # is hoisted above the drain, so loading them in the same body puts s_wait_kmcnt
-        # right on the dependency. Carrying them costs one SGPR each, which only pays
-        # while there are few: page_size >= 8 needs <= 4, page_size 1 would need 32.
-        self._carry = self._num_pages <= _MAX_CARRIED_PAGE_INDICES
-        self.num_state_slots = self._num_pages if self._carry else 0
+        # Distance-2 index prefetch. The descriptor BUILD consumes these and is hoisted
+        # above the drain, so loading them in the same body would put s_wait_kmcnt right
+        # on the dependency. Carrying widens a live range instead of adding one -- a
+        # band's indices die at its build -- so it stays affordable at the widest case,
+        # num_rows of them at page_size 1.
+        self.num_state_slots = self._num_pages
         # Sentinel for dead rows: the sequence's first token, whose page is referenced
         # by construction (pool row 0's may not be, and NaN there reaches O).
         self._sentinel_row = s_buffer_load(
@@ -859,16 +851,14 @@ class _PagedKVPolicy:
             num_records_bytes=self._num_page_entries * 4,
         )
 
-    def indices(self, tile_idx, carried):
-        """This tile's page indices. ``carried`` was loaded a body ago for this tile."""
-        if not self._carry:
-            return self._load(tile_idx)
+    def indices(self, carried):
+        """This tile's page indices, loaded a body ago."""
         return [fx.Int32(c) for c in carried]
 
     def advance(self, tile_idx):
         """Start the next body's load. Nothing in THIS body consumes it, so the caller
         places it wherever the kmcnt wait is cheapest."""
-        return self._load(tile_idx + fx.Int32(1)) if self._carry else []
+        return self._load(tile_idx + fx.Int32(1))
 
     def indices_for(self, tile_idx):
         """Direct load, for the prologue's own start descriptor -- there is no earlier
@@ -876,7 +866,7 @@ class _PagedKVPolicy:
         return self._load(tile_idx)
 
     def init_state(self, first_tile_idx):
-        return self._load(first_tile_idx) if self._carry else []
+        return self._load(first_tile_idx)
 
     def desc_kwargs(self, page_indices):
         return {
@@ -1560,7 +1550,7 @@ def _attention_core_multi_kv_tiles(
         prefetch_tile_idx = tile_idx + fx.Int32(1)
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
-        prefetch_page_indices = kv_policy.indices(prefetch_tile_idx, kv_state_prev)
+        prefetch_page_indices = kv_policy.indices(kv_state_prev)
 
         # This half's descriptor for the prefetched tile's K (LO) or V (HI) into the
         # oldest slot.
