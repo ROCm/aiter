@@ -433,6 +433,7 @@ def pa_decode(
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    store_output: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -466,6 +467,9 @@ def pa_decode(
     intentionally limited to gfx1250 page16 sparse PA, query_length=1, one KV
     head, GQA16, head_dim=128, and the direct or cluster8 output modes. Calls
     that omit both tensors retain the existing output and dispatch unchanged.
+    With the quantized output, ``store_output=False`` skips the BF16/FP16
+    store: ``output`` then only fixes the layout and its contents are left
+    unspecified.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -556,6 +560,12 @@ def pa_decode(
             "quantized_output and output_scale must either both be provided or both "
             "be None"
         )
+    if not isinstance(store_output, bool):
+        raise TypeError(
+            f"store_output must be a bool, got {type(store_output).__name__}"
+        )
+    if not (store_output or quant_output):
+        raise ValueError("store_output=False requires quantized_output")
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -1096,7 +1106,11 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
-            **({"quant_output": True} if quant_output else {}),
+            **(
+                {"quant_output": True, "store_output": store_output}
+                if quant_output
+                else {}
+            ),
         )
 
     total_rows = query_length * query_group_size
@@ -1180,7 +1194,7 @@ def pa_decode(
             compiled["launch"],
             (
                 ptr_arg(work_plan.reduce_info, fx.Float32)
-                if one_partition_output and not quant_output
+                if one_partition_output
                 else ptr_arg(pmax, fx.Float32)
             ),
             ptr_arg(psum, fx.Float32),

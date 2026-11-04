@@ -35,30 +35,30 @@ def device():
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize("store_output", [True, False])
 @pytest.mark.parametrize(
-    "mode,rows,max_partitions",
+    "mode,rows,max_partitions,mixed",
     [
-        ("cluster8", 1, 8),
-        ("cluster8", 4, 8),
-        ("cluster8", 16, 8),  # bs=4, Eagle3 verifies four tokens per request
-        ("cluster8", 64, 8),
-        ("direct", 2517, 1),
-        ("direct", 4536, 1),  # traced sparse-prefill token count
+        ("cluster8", 1, 8, False),
+        ("cluster8", 4, 8, False),
+        ("cluster8", 16, 8, False),  # bs=4, Eagle3 verifies four tokens per request
+        ("cluster8", 64, 8, False),
+        # Empty, single-task and partially split sequences in one cluster launch.
+        ("cluster8", 16, 8, True),
+        ("direct", 2517, 1, False),
+        ("direct", 4536, 1, False),  # traced sparse-prefill token count
+        ("direct", 64, 1, True),  # with empty sequences
     ],
 )
 def test_sparse_pa_output_quant_matches_separate_kernel(
-    device, monkeypatch, mode, rows, max_partitions
+    device, monkeypatch, mode, rows, max_partitions, mixed, store_output
 ):
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(393)
     page, head_dim, max_context = 16, 128, 2048
     pages = max_context // page
-    query = torch.randn(
-        (rows, 16, head_dim), dtype=torch.bfloat16, device=device
-    )
-    key = torch.randn(
-        (pages, 1, page, head_dim), dtype=torch.bfloat16, device=device
-    )
+    query = torch.randn((rows, 16, head_dim), dtype=torch.bfloat16, device=device)
+    key = torch.randn((pages, 1, page, head_dim), dtype=torch.bfloat16, device=device)
     value = torch.randn_like(key)
     table = (
         torch.arange(pages, dtype=torch.int32, device=device)
@@ -73,6 +73,14 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
         .remainder_(max_context)
         .add_(1)
     )
+    if mixed and mode == "cluster8":
+        # Eight, zero, one, three, one, six, one and two 256-token tasks.
+        pattern = [max_context, 0, 200, 600, 1, 1500, 256, 257]
+        context = torch.tensor(
+            pattern * (rows // len(pattern)), dtype=torch.int32, device=device
+        )
+    elif mixed:
+        context[::5] = 0
     key, key_scale = pertoken_quant(key, quant_dtype=dtypes.fp8)
     value, value_scale = pertoken_quant(value, quant_dtype=dtypes.fp8)
     key_cache = key.reshape(pages, 1, 16, 8, 16).permute(0, 1, 3, 2, 4).contiguous()
@@ -132,6 +140,7 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
                 {
                     "quantized_output": output_fp8,
                     "output_scale": output_scale,
+                    "store_output": store_output,
                 }
                 if quantized
                 else {}
@@ -142,10 +151,15 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
         )
 
     def check():
-        assert torch.equal(output, reference_output)
-        assert torch.isfinite(output).all()
+        if store_output:
+            assert torch.equal(output, reference_output)
+        else:
+            # The skipped store leaves the caller's buffer untouched.
+            assert torch.isnan(output).all()
+        assert torch.isfinite(reference_output).all()
         ref_fp8, ref_scale = get_hip_quant(QuantType.per_Token)(
-            output.view(output.shape[0], -1), quant_dtype=dtypes.fp8
+            reference_output.view(reference_output.shape[0], -1),
+            quant_dtype=dtypes.fp8,
         )
         assert torch.equal(output_scale, ref_scale)
         assert torch.equal(
@@ -160,10 +174,12 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
         )
 
     launch(quantized=False)
+    output.fill_(float("nan"))
     launch(quantized=True)
     check()
     selected = compile_calls[-1]
     assert selected["quant_output"] is True
+    assert selected["store_output"] is store_output
     if mode == "cluster8":
         assert selected["cluster_merge"] == 8
         assert selected["direct_output"] is False
