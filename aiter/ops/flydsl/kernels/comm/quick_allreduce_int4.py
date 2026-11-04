@@ -6,7 +6,7 @@
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
+group-16 signed E5M2 (bias 12) in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``tile_atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4 at
@@ -76,6 +76,7 @@ from .allreduce_shared import (
     make_pack_storage,
 )
 from .quick_allreduce_codec import (
+    SCALE_CODEC_TAG,
     SUPER_TILES,
     SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
@@ -451,7 +452,7 @@ def make_quick_allreduce_int4_kernel(
         # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
-        # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
+        # Four group-16 scale bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
@@ -534,7 +535,7 @@ def make_quick_allreduce_int4_kernel(
             return [_load_atom(tile, atom) for atom in range_constexpr(tile_atoms)]
 
         # One shared divisor. Every read of the input is scaled, so the group
-        # max and E4M3 byte of the first pack see the scaled values, and so
+        # max and scale byte of the first pack see the scaled values, and so
         # does our own share, which stays in registers or is reloaded. The
         # second pack's input is already a scaled sum, so _codec_quant must
         # not scale. A packed fp16 divide expands per element, so multiply by
@@ -850,7 +851,7 @@ def make_quick_allreduce_int4_kernel(
 
             Lockstep stripes of up to 8 sectors cover the rank-tile: at the
             default block INT4 is 8+8+2 (16 nibble sectors then the 2-sector
-            E4M3 tail), fp16 is eight full stripes. ``sector_base`` is the first
+            scale tail), fp16 is eight full stripes. ``sector_base`` is the first
             sector of each stripe.
 
             One quad per (destination, sector) of a stripe; leftover quads sit
@@ -1169,8 +1170,8 @@ def make_quick_allreduce_int4_kernel(
             stream=stream,
         )
 
-    tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
-    tag += f"_{codec}_b{block}"
+    tag = f"{SCALE_CODEC_TAG}_ws{world_size}_r{self_rank}_st{super_tile}_g{grid}"
+    tag += f"_{inbox_memory}_{codec}_b{block}"
     if tile_atoms != DEFAULT_ATOMS:
         tag += f"_a{tile_atoms}"
     if fuse_norm:
