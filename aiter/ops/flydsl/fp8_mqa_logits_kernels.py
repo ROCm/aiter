@@ -87,19 +87,13 @@ class _SplitPolicy:
     cu_oversub : int
         Target total blocks as a multiple of the device CU count. Used only by
         the fixed-oversubscription path (``block_overhead_tiles`` is None, or
-        ``blocks_per_cu`` is unknown).
+        ``blocks_per_cu`` is unknown: a launcher's first call during graph
+        capture, see ``_max_blocks_per_cu``).
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
     block_overhead_tiles : int | None
         Per-block fixed cost, in BKV tiles, of the occupancy-aware cost model
         (``_splits_by_wave_cost``). None keeps the ``cu_oversub`` target.
-    streaming_lowh_cu_oversub : int
-        Oversub target for the streaming, ``num_heads<=32`` regime specifically,
-        used only on the fixed-oversubscription path (``block_overhead_tiles``
-        is None, or ``blocks_per_cu`` is unknown). That regime is
-        MFMA-latency / occupancy-bound, not bandwidth-bound, so it wants an
-        *aggressive* oversub to keep every CU pinned through ramp/tail and
-        hide the dependent ReLU/head-reduce behind resident waves.
     """
 
     min_seq_len_kv: int
@@ -107,7 +101,6 @@ class _SplitPolicy:
     cu_oversub: int
     fallback_cu: int
     block_overhead_tiles: int | None = None
-    streaming_lowh_cu_oversub: int = 0
 
 
 _SPLIT_POLICIES = {
@@ -126,7 +119,6 @@ _SPLIT_POLICIES = {
         cu_oversub=4,
         fallback_cu=256,
         block_overhead_tiles=8,
-        streaming_lowh_cu_oversub=12,
     ),
 }
 
@@ -165,7 +157,11 @@ def _splits_by_wave_cost(grid_x, effective_cus, window_tiles, max_splits, overhe
 
 def _max_blocks_per_cu(launcher, args):
     """Max resident blocks per CU of *launcher*'s kernel, cached on the launcher.
-    None on a first call during graph capture, where HIP cannot load a module."""
+
+    None on a first call during graph capture: FlyDSL's occupancy query loads
+    a scratch copy of the kernel module and unloads it, and HIP rejects
+    ``hipModuleUnload`` during stream capture.
+    """
     if not hasattr(launcher, "_max_blocks_per_cu"):
         if torch.cuda.is_current_stream_capturing():
             return None
@@ -175,10 +171,6 @@ def _max_blocks_per_cu(launcher, args):
     return launcher._max_blocks_per_cu
 
 
-def _is_streaming_lowh(seq_len: int, seq_len_kv: int, num_heads: int) -> bool:
-    return num_heads <= 32 and seq_len_kv > 2 * seq_len
-
-
 def _auto_num_splits(
     seq_len: int,
     seq_len_kv: int,
@@ -186,7 +178,6 @@ def _auto_num_splits(
     block_kv: int,
     device_index: int,
     blocks_per_cu: int | None = None,
-    aggressive: bool = False,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
@@ -201,11 +192,10 @@ def _auto_num_splits(
       the compiled kernel's register and LDS use. With ``blocks_per_cu`` known,
       this path forms ``cu_count * blocks_per_cu`` effective CUs and minimizes
       ``_splits_by_wave_cost`` over them.
-    - Fixed oversubscription (``blocks_per_cu`` unknown): target
+    - Fixed oversubscription (``block_overhead_tiles`` None, or
+      ``blocks_per_cu`` unknown): target
       ``cu_oversub * cu_count`` blocks and return 1 once the row grid alone
-      reaches that. ``aggressive`` raises the target for the streaming H<=32
-      regime (``_is_streaming_lowh``), which is latency/occupancy-bound and
-      benefits from a much deeper block queue.
+      reaches that.
     """
     pol = _split_policy()
     grid_x = (seq_len + rows_per_block - 1) // rows_per_block
@@ -223,9 +213,6 @@ def _auto_num_splits(
             pol.block_overhead_tiles,
         )
     target_blocks = pol.cu_oversub * cu_count
-    if aggressive:
-        # never below the conservative non-streaming target
-        target_blocks = max(target_blocks, pol.streaming_lowh_cu_oversub * cu_count)
     if grid_x >= target_blocks:
         return 1
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
@@ -617,7 +604,6 @@ def _policy_num_splits(
     ``variant``; ``args`` are its launch arguments (for occupancy)."""
     bkv, rows_per_block = _parse_variant(variant)
     pol = _split_policy()
-    aggressive = _is_streaming_lowh(seq_len, seq_len_kv, num_heads)
     blocks_per_cu = None
     if pol.block_overhead_tiles is not None:
         blocks_per_cu = _max_blocks_per_cu(launcher, args)
@@ -628,7 +614,6 @@ def _policy_num_splits(
         bkv,
         device_index,
         blocks_per_cu,
-        aggressive=aggressive,
     )
 
 
