@@ -82,6 +82,7 @@ def test_pa_decode_plan(
     monkeypatch.setattr(planner, "compile_pa_decode_plan", spy_compile)
 
     def check(plan, lengths):
+        window, query_length = plan.sliding_window, plan.query_length
         info = plan.reduce_info.cpu().tolist()
         work = plan.work_info.cpu().tolist()
         ranges = [
@@ -149,32 +150,36 @@ def test_pa_decode_plan(
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
     if bucket > 1:
-        # Change both runtime values inside the same batch/block-size bucket.
+        # Change every runtime value inside the same batch/block-size bucket
+        # and window mode.
         if batch < min(bucket, plan.max_batch_size):
             other_batch = batch + 1
         else:
             other_batch = batch - 1
-        other_budget = max(
-            1,
-            (budget if budget is not None else 2 * properties.multi_processor_count)
-            - 2,
-        )
+        # Move the capacity by one slot within the block size.
+        threads = planner._block_threads(plan.capacity)
+        other_capacity = plan.capacity - 1
+        if (
+            other_capacity < other_batch
+            or planner._block_threads(other_capacity) != threads
+        ):
+            other_capacity = plan.capacity + 1
+        # The smallest partition cap that admits it, so long rows reach the cap.
+        other_parts = max(2, -(-other_capacity // other_batch))
+        assert other_parts != plan.max_partitions
+        other_window = window + 256 if window else 0
         values = [pattern[i % len(pattern)] for i in range(other_batch)]
         other_context = torch.tensor(values, dtype=torch.int32, device=device)
         other_plan = planner.plan_pa_decode(
             other_context,
             2,
-            max_partitions=plan.max_partitions,
+            max_partitions=other_parts,
             max_batch_size=plan.max_batch_size,
-            workgroup_budget=other_budget,
-            sliding_window=window,
-            query_length=query_length,
+            workgroup_budget=2 * other_capacity,
+            sliding_window=other_window,
+            query_length=query_length + 1,
         )
-        assert other_plan.capacity == min(
-            other_batch * plan.max_partitions,
-            max(other_batch, (other_budget + 1) // 2),
-        )
-        assert other_plan.capacity != plan.capacity
+        assert other_plan.capacity == other_capacity
         check(other_plan, values)
         other_config, other_launch = calls[-1]
         assert other_config == config
