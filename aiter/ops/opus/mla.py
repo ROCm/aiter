@@ -78,10 +78,12 @@ def opus_mla_decode_supported(fp8: bool, nhead: int, max_seqlen_q: int) -> int:
 @compile_ops(DECODE_MD_NAME, ffi_type="ctypes")
 def opus_mla_decode_flat_plan(
     kv_indptr: torch.Tensor,  # [B+1] int32, host, rank-local
-    q_len: int,
+    qo_indptr: torch.Tensor | None,  # [B+1] int32, host; None for a uniform q_len batch
+    q_len: int,  # ignored when qo_indptr is given
     num_heads: int,
     num_workers: int,
     balance: bool,
+    bucketed: bool,  # ragged: group an XCD's requests by chunk depth
     num_xcd: int,
     item_cap: int,
     max_units: int,

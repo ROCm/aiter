@@ -72,23 +72,33 @@ struct UnitRange
 
 // balance: only the last worker of an XCD may absorb a remainder of up to one item's cost (see
 // column_end), and every piece is checked to give each of its rows a key.
-int build_plan(const int* kv_indptr,
-               int bs,
-               int q_len,
-               int h,
-               int nwg,
-               bool balance,
-               int nxcd,
-               int item_cap,
-               int max_units,
-               int* plan,
-               int plan_ints,
-               int* out_items,
-               int* out_units)
+//
+// q_indptr gives each request its own query-token count, so a request's rows are
+// q_indptr[b+1]-q_indptr[b] tokens x h heads and its flat row base is q_indptr[b]*h. That is
+// already what the kernel assumes -- it reads the causal span from q_indptr and takes
+// qo_start/qo_end per work item -- so a ragged step needs no kernel change, only this.
+//
+// The layout below sizes its columns by the batch's deepest request and skips the chunks a
+// shallower request does not have, which leaves some column workers idle on a ragged step;
+// build_plan_bucketed_impl groups by depth instead. A uniform q_indptr makes every per-request
+// path here inert, so the plan is bit-for-bit what it was before this argument existed.
+int build_plan_default_impl(const int* kv_indptr,
+                            const int* q_indptr,
+                            int bs,
+                            int h,
+                            int nwg,
+                            bool balance,
+                            int nxcd,
+                            int item_cap,
+                            int max_units,
+                            int* plan,
+                            int plan_ints,
+                            int* out_items,
+                            int* out_units)
 {
     constexpr int slot    = kSlot;
     constexpr int kv_tile = kKvTile;
-    if(!kv_indptr || !plan || !out_items || !out_units || bs < 0 || q_len <= 0 || h <= 0 ||
+    if(!kv_indptr || !q_indptr || !plan || !out_items || !out_units || bs < 0 || h <= 0 ||
        nwg <= 0 || nxcd <= 0 || (nwg % nxcd) != 0)
         return -1;
     const int required = nwg + 1 + item_cap * 8 + max_units * 4;
@@ -101,9 +111,23 @@ int build_plan(const int* kv_indptr,
     if(bs == 0)
         return 0;
 
-    const int nrows = q_len * h;
-    const int nch   = (nrows + slot - 1) / slot;
-    if(nch <= 0 || static_cast<long long>(bs) * nch > max_units)
+    // Per-request rows and chunk depth, plus the chunk-offset prefix sum that indexes the unit
+    // table (it replaces b * nch, which only holds when every request is the same width).
+    std::vector<int> nrows_v(bs), nch_v(bs), coff(bs + 1, 0);
+    for(int b = 0; b < bs; ++b)
+    {
+        const int q_len = q_indptr[b + 1] - q_indptr[b];
+        if(q_len < 0)
+            return -6;
+        nrows_v[b]  = q_len * h;
+        nch_v[b]    = (nrows_v[b] + slot - 1) / slot;
+        coff[b + 1] = coff[b] + nch_v[b];
+    }
+    if(coff[bs] > max_units)
+        return -3;
+    // Columns are laid out to the deepest request; `add` skips chunks a request lacks.
+    const int nch = *std::max_element(nch_v.begin(), nch_v.end());
+    if(nch <= 0)
         return -3;
 
     std::vector<int> tiles(bs);
@@ -191,8 +215,8 @@ int build_plan(const int* kv_indptr,
 
         auto emit = [&](int worker, int b, int chunk, int tile_begin, int tile_end) {
             const int kv_len      = kv_indptr[b + 1] - kv_indptr[b];
-            const int valid_rows  = std::min(slot, nrows - chunk * slot);
-            const int query_begin = b * nrows + slot * chunk;
+            const int valid_rows  = std::min(slot, nrows_v[b] - chunk * slot);
+            const int query_begin = q_indptr[b] * h + slot * chunk;
             per_wg[worker].push_back({b,
                                       0,
                                       query_begin,
@@ -207,6 +231,10 @@ int build_plan(const int* kv_indptr,
         auto add = [&](int worker, int chunk, int lo, int hi) {
             for(const Segment& segment : segments)
             {
+                // A shallower request has no row chunk at this index; emitting one would
+                // describe rows it does not own.
+                if(chunk >= nch_v[segment.request])
+                    continue;
                 const int tile_begin = std::max(lo, segment.begin) - segment.begin + segment.tile0;
                 const int tile_end   = std::min(hi, segment.end) - segment.begin + segment.tile0;
                 if(tile_end > tile_begin)
@@ -304,7 +332,7 @@ int build_plan(const int* kv_indptr,
         std::vector<Piece> tail;
         for(int chunk = 0; chunk < nch; ++chunk)
             for(const Segment& segment : segments)
-                if(segment.end > tail_begin)
+                if(segment.end > tail_begin && chunk < nch_v[segment.request])
                     tail.push_back(
                         {segment.request,
                          chunk,
@@ -342,10 +370,14 @@ int build_plan(const int* kv_indptr,
     if(balance)
     {
         // every row of a piece must see a key: a piece that ends at its request's end must start
-        // at or before L - q_len
+        // at or before L - q_len, with q_len that request's own token count
         for(const PlanItem& item : flat)
-            if(item[5] == kv_indptr[item[0] + 1] && item[4] > kv_indptr[item[0] + 1] - q_len)
+        {
+            const int b     = item[0];
+            const int q_len = q_indptr[b + 1] - q_indptr[b];
+            if(item[5] == kv_indptr[b + 1] && item[4] > kv_indptr[b + 1] - q_len)
                 return -7;
+        }
     }
 
     std::vector<int> order(flat.size());
@@ -370,30 +402,32 @@ int build_plan(const int* kv_indptr,
     for(int item = 0; item < static_cast<int>(flat.size()); ++item)
         std::copy_n(flat[item].begin(), 8, work_items + item * 8);
 
-    std::vector<UnitRange> ranges(bs * nch);
+    // coff[b] + chunk, not b * nch: a request only has nch_v[b] chunks. With one depth
+    // coff[b] == b * nch and the indexing, iteration order and output are unchanged.
+    std::vector<UnitRange> ranges(coff[bs]);
     for(const PlanItem& item : flat)
     {
-        UnitRange& range = ranges[item[0] * nch + item[8]];
+        UnitRange& range = ranges[coff[item[0]] + item[8]];
         range.begin      = std::min(range.begin, item[1]);
         range.end        = std::max(range.end, item[1] + 1);
     }
     // a unit of one piece writes out / lse from stage 1 and is not merged
     int unit_count = 0;
     for(int b = 0; b < bs; ++b)
-        for(int chunk = 0; chunk < nch; ++chunk)
+        for(int chunk = 0; chunk < nch_v[b]; ++chunk)
         {
-            const UnitRange& range = ranges[b * nch + chunk];
+            const UnitRange& range = ranges[coff[b] + chunk];
             if(range.end < 0 || range.end - range.begin == 1)
                 continue;
             unit_info[4 * unit_count]     = range.begin;
             unit_info[4 * unit_count + 1] = range.end;
-            unit_info[4 * unit_count + 2] = b * nrows + slot * chunk;
-            unit_info[4 * unit_count + 3] = std::min(slot, nrows - slot * chunk);
+            unit_info[4 * unit_count + 2] = q_indptr[b] * h + slot * chunk;
+            unit_info[4 * unit_count + 3] = std::min(slot, nrows_v[b] - slot * chunk);
             ++unit_count;
         }
     for(int item = 0; item < static_cast<int>(flat.size()); ++item)
     {
-        const UnitRange& range = ranges[flat[item][0] * nch + flat[item][8]];
+        const UnitRange& range = ranges[coff[flat[item][0]] + flat[item][8]];
         if(range.end - range.begin == 1)
             work_items[item * 8 + 1] = -1;
     }
@@ -401,6 +435,543 @@ int build_plan(const int* kv_indptr,
     *out_items = static_cast<int>(flat.size());
     *out_units = unit_count;
     return 0;
+}
+
+// Depth-bucketed planner: the same columns as build_plan_default_impl, but on a ragged step the
+// requests of each XCD are grouped by chunk depth and the XCD's workers are apportioned to the
+// groups by their real work (nch[b] * tiles[b]), so no worker idles above a shallow request's
+// depth; XCD balance is weighted by depth too. Sizing columns by the batch max instead leaves
+// every worker above a short request's own depth with no items at all, with the critical path
+// pinned at its uniform value however much work the ragged batch removed. A batch with one chunk
+// depth takes the uniform_depth path, which is the default plan byte for byte.
+int build_plan_bucketed_impl(const int* kv_indptr,
+                             const int* q_indptr,
+                             int bs,
+                             int h,
+                             int nwg,
+                             bool balance,
+                             int nxcd,
+                             int item_cap,
+                             int max_units,
+                             int* plan,
+                             int plan_ints,
+                             int* out_items,
+                             int* out_units)
+{
+    constexpr int slot    = kSlot;
+    constexpr int kv_tile = kKvTile;
+    if(!kv_indptr || !q_indptr || !plan || !out_items || !out_units || bs < 0 || h <= 0 ||
+       nwg <= 0 || nxcd <= 0 || (nwg % nxcd) != 0)
+        return -1;
+    const int required = nwg + 1 + item_cap * 8 + max_units * 4;
+    if(plan_ints < required)
+        return -2;
+
+    std::fill(plan, plan + required, 0);
+    *out_items = 0;
+    *out_units = 0;
+    if(bs == 0)
+        return 0;
+
+    std::vector<int> nrows_v(bs), nch_v(bs), coff(bs + 1, 0);
+    for(int b = 0; b < bs; ++b)
+    {
+        const int q_len = q_indptr[b + 1] - q_indptr[b];
+        if(q_len < 0)
+            return -6;
+        nrows_v[b]  = q_len * h;
+        nch_v[b]    = (nrows_v[b] + slot - 1) / slot;
+        coff[b + 1] = coff[b] + nch_v[b];
+    }
+    if(coff[bs] > max_units)
+        return -3;
+    const int nch = *std::max_element(nch_v.begin(), nch_v.end());
+    if(nch <= 0)
+        return -3;
+    bool uniform_depth = true;
+    for(int b = 0; b < bs; ++b)
+        uniform_depth = uniform_depth && nch_v[b] == nch;
+
+    std::vector<int> tiles(bs);
+    for(int b = 0; b < bs; ++b)
+    {
+        const int len = kv_indptr[b + 1] - kv_indptr[b];
+        if(len < 0)
+            return -4;
+        tiles[b] = (len + kv_tile - 1) / kv_tile;
+    }
+
+    // Longest-processing-time first on the real cost. A request verifying one token has depth 1
+    // and costs a fifth of a six-token request with the same KV, so ordering and balancing on
+    // tiles alone mis-sizes the XCDs under ragged. With a uniform depth the factor is constant
+    // and both the order and the argmin are unchanged.
+    std::vector<long long> cost(bs);
+    for(int b = 0; b < bs; ++b)
+        cost[b] = static_cast<long long>(tiles[b]) * (uniform_depth ? 1 : nch_v[b]);
+
+    std::vector<int> request_order(bs);
+    std::iota(request_order.begin(), request_order.end(), 0);
+    std::stable_sort(request_order.begin(), request_order.end(), [&](int a, int b) {
+        return cost[a] > cost[b];
+    });
+
+    std::vector<std::vector<Segment>> xseg(nxcd);
+    std::vector<int> xtiles(nxcd, 0);
+    std::vector<std::vector<std::array<int, 3>>> owners(nxcd); // {request, first tile, end tile}
+    {
+        std::vector<long long> xcd_load(nxcd, 0);
+        for(const int b : request_order)
+        {
+            int x = 0;
+            for(int candidate = 1; candidate < nxcd; ++candidate)
+                if(xcd_load[candidate] < xcd_load[x])
+                    x = candidate;
+            owners[x].push_back({b, 0, tiles[b]});
+            xcd_load[x] += cost[b];
+        }
+        const long long total   = std::accumulate(xcd_load.begin(), xcd_load.end(), 0LL);
+        const long long busiest = *std::max_element(xcd_load.begin(), xcd_load.end());
+        const int min_piece     = static_cast<int>(std::ceil(2.0 * kItemTiles * 64.0 / kv_tile));
+        // Cutting a request across XCDs splits its tile range, which the bucket layout below
+        // cannot express (a bucket's columns span one contiguous tile axis per request), so the
+        // cut is only taken when the batch has a single depth.
+        if(uniform_depth && kXcdSplit >= 0 && busiest * nxcd > total * (1.0 + kXcdSplit) &&
+           busiest - total / nxcd > min_piece)
+        {
+            for(auto& requests : owners)
+                requests.clear();
+            int x         = 0;
+            long long pos = 0;
+            auto bound    = [&](int xcd) {
+                return xcd + 1 == nxcd ? total : total * (xcd + 1) / nxcd;
+            };
+            for(const int b : request_order)
+                for(int t = 0; t < tiles[b];)
+                {
+                    int take = static_cast<int>(std::min<long long>(tiles[b] - t, bound(x) - pos));
+                    if(tiles[b] - t - take < min_piece)
+                        take = tiles[b] - t;
+                    else if(take < min_piece && x + 1 < nxcd)
+                    {
+                        ++x;
+                        continue;
+                    }
+                    owners[x].push_back({b, t, t + take});
+                    t += take;
+                    pos += take;
+                    while(x + 1 < nxcd && pos >= bound(x))
+                        ++x;
+                }
+        }
+    }
+    for(int x = 0; x < nxcd; ++x)
+    {
+        std::sort(owners[x].begin(), owners[x].end());
+        for(const auto& [b, first, end] : owners[x])
+        {
+            xseg[x].push_back({b, xtiles[x], xtiles[x] + end - first, first});
+            xtiles[x] += end - first;
+        }
+    }
+
+    std::vector<std::vector<PlanItem>> per_wg(nwg);
+    const int wg_per_xcd = nwg / nxcd;
+    // One layout pass over a set of equal-depth requests. With a uniform batch this runs once per
+    // XCD over everything it owns, with `depth` the batch depth and `n_workers` all of them,
+    // which is exactly build_plan_default_impl. Under ragged it runs once per depth on the XCD.
+    auto layout = [&](int x,
+                      const std::vector<Segment>& segments,
+                      int total_tiles,
+                      int depth,
+                      int worker_base,
+                      int n_workers) {
+        if(total_tiles == 0 || n_workers <= 0 || depth <= 0)
+            return;
+
+        // The k-th of this group's workers. Two groups share a workgroup only when an XCD owns
+        // more depths than it has workgroups, which costs balance but keeps the plan valid; with
+        // a worker to spare per group the wrap never triggers.
+        auto pick = [&](int k) { return x + nxcd * ((worker_base + k) % wg_per_xcd); };
+
+        auto emit = [&](int worker, int b, int chunk, int tile_begin, int tile_end) {
+            const int kv_len      = kv_indptr[b + 1] - kv_indptr[b];
+            const int valid_rows  = std::min(slot, nrows_v[b] - chunk * slot);
+            const int query_begin = q_indptr[b] * h + slot * chunk;
+            per_wg[worker].push_back({b,
+                                      0,
+                                      query_begin,
+                                      query_begin + valid_rows,
+                                      kv_indptr[b] + kv_tile * tile_begin,
+                                      kv_indptr[b] + std::min(kv_tile * tile_end, kv_len),
+                                      0,
+                                      0,
+                                      chunk,
+                                      tile_begin});
+        };
+        // every request in this group has `depth` chunks, so no chunk index is skipped
+        auto add = [&](int worker, int chunk, int lo, int hi) {
+            for(const Segment& segment : segments)
+            {
+                const int tile_begin = std::max(lo, segment.begin) - segment.begin + segment.tile0;
+                const int tile_end   = std::min(hi, segment.end) - segment.begin + segment.tile0;
+                if(tile_end > tile_begin)
+                    emit(worker, segment.request, chunk, tile_begin, tile_end);
+            }
+        };
+
+        const double item_cost = kItemTiles * 64.0 / kv_tile;
+        auto pieces            = [&](int lo, int hi) {
+            int n = 0;
+            for(const Segment& segment : segments)
+                n += std::min(hi, segment.end) > std::max(lo, segment.begin);
+            return n;
+        };
+        auto column_end = [&](int lo, double cap, bool last) {
+            std::size_t s = 0;
+            while(s < segments.size() && segments[s].end <= lo)
+                ++s;
+            double cost_acc = 0.0;
+            int pos         = lo;
+            for(; s < segments.size(); ++s)
+            {
+                const double room = cap - cost_acc - item_cost;
+                if(room < 1.0)
+                    break;
+                const int avail = segments[s].end - pos;
+                if(avail > room + ((balance && !last) ? 0.0 : item_cost))
+                {
+                    const int take = static_cast<int>(room);
+                    if(balance && avail - take < 2)
+                    {
+                        pos = segments[s].end;
+                        break;
+                    }
+                    pos += take;
+                    break;
+                }
+                cost_acc += avail + item_cost;
+                pos = segments[s].end;
+            }
+            return pos;
+        };
+        auto tail_cost = [&](int lo, int workers) {
+            return static_cast<double>(depth) * (total_tiles - lo) +
+                   item_cost * (depth * pieces(lo, total_tiles) + workers - 1);
+        };
+        auto feasible = [&](double cap, int columns) {
+            int pos           = 0;
+            const int workers = n_workers - columns * depth;
+            for(int column = 0; column < columns; ++column)
+                pos = column_end(pos, cap, workers == 0 && column + 1 == columns);
+            if(workers == 0)
+                return pos == total_tiles;
+            return tail_cost(pos, workers) <= workers * cap;
+        };
+        auto min_cap = [&](int columns) {
+            double lo = 0.0, hi = tail_cost(0, 1) + 1.0;
+            for(int step = 0; step < 48; ++step)
+            {
+                const double mid                   = 0.5 * (lo + hi);
+                (feasible(mid, columns) ? hi : lo) = mid;
+            }
+            return hi;
+        };
+        const int full_columns = std::min(n_workers / depth, total_tiles);
+        const double cap       = min_cap(full_columns);
+
+        const int extra_workers = n_workers - full_columns * depth;
+        int tail_begin          = 0;
+        for(int column = 0; column < full_columns; ++column)
+        {
+            const int column_begin = tail_begin;
+            tail_begin =
+                column_end(column_begin, cap, extra_workers == 0 && column + 1 == full_columns);
+            for(int chunk = 0; chunk < depth; ++chunk)
+                add(pick(column * depth + chunk), chunk, column_begin, tail_begin);
+        }
+
+        struct Piece
+        { int request, chunk, begin, end; };
+        std::vector<Piece> tail;
+        for(int chunk = 0; chunk < depth; ++chunk)
+            for(const Segment& segment : segments)
+                if(segment.end > tail_begin)
+                    tail.push_back(
+                        {segment.request,
+                         chunk,
+                         std::max(tail_begin, segment.begin) - segment.begin + segment.tile0,
+                         segment.end - segment.begin + segment.tile0});
+        std::size_t p = 0;
+        int at        = tail.empty() ? 0 : tail[0].begin;
+        for(int extra = 0; extra < extra_workers && p < tail.size(); ++extra)
+        {
+            const int worker = pick(full_columns * depth + extra);
+            const bool last  = extra + 1 == extra_workers;
+            double cost_acc  = 0.0;
+            while(p < tail.size())
+            {
+                const double room = cap - cost_acc - item_cost;
+                if(!last && room < 1.0)
+                    break;
+                const int avail = tail[p].end - at;
+                const int take = last || avail <= room + item_cost ? avail : static_cast<int>(room);
+                emit(worker, tail[p].request, tail[p].chunk, at, at + take);
+                cost_acc += take + item_cost;
+                at += take;
+                if(at == tail[p].end && ++p < tail.size())
+                    at = tail[p].begin;
+            }
+        }
+    };
+
+    for(int x = 0; x < nxcd; ++x)
+    {
+        if(xtiles[x] == 0)
+            continue;
+        if(uniform_depth)
+        {
+            layout(x, xseg[x], xtiles[x], nch, 0, wg_per_xcd);
+            continue;
+        }
+
+        // A request verifying no token (q_len 0) has depth 0 and owns no rows, so it joins no
+        // group; a depth-0 layout pass would divide by its depth.
+        std::vector<int> depths;
+        for(const Segment& segment : xseg[x])
+            if(nch_v[segment.request] > 0 &&
+               std::find(depths.begin(), depths.end(), nch_v[segment.request]) == depths.end())
+                depths.push_back(nch_v[segment.request]);
+        if(depths.empty())
+            continue;
+        std::sort(depths.begin(), depths.end());
+
+        std::vector<long long> group_work(depths.size(), 0);
+        long long work_sum = 0;
+        for(std::size_t g = 0; g < depths.size(); ++g)
+        {
+            for(const Segment& segment : xseg[x])
+                if(nch_v[segment.request] == depths[g])
+                    group_work[g] +=
+                        static_cast<long long>(segment.end - segment.begin) * depths[g];
+            work_sum += group_work[g];
+        }
+        if(work_sum == 0)
+            continue;
+
+        // Largest-remainder apportionment with at least one worker per non-empty group.
+        std::vector<int> alloc(depths.size(), 0);
+        std::vector<double> exact(depths.size(), 0.0);
+        int handed = 0;
+        for(std::size_t g = 0; g < depths.size(); ++g)
+        {
+            exact[g] = static_cast<double>(wg_per_xcd) * group_work[g] / work_sum;
+            alloc[g] = std::max(1, static_cast<int>(exact[g]));
+            handed += alloc[g];
+        }
+        while(handed > wg_per_xcd)
+        {
+            std::size_t worst = 0;
+            double over       = -1e300;
+            for(std::size_t g = 0; g < depths.size(); ++g)
+                if(alloc[g] > 1 && alloc[g] - exact[g] > over)
+                {
+                    over  = alloc[g] - exact[g];
+                    worst = g;
+                }
+            if(over == -1e300) // every group down to its floor of one
+                break;
+            --alloc[worst];
+            --handed;
+        }
+        while(handed < wg_per_xcd)
+        {
+            std::size_t best = 0;
+            double under     = -1e300;
+            for(std::size_t g = 0; g < depths.size(); ++g)
+                if(exact[g] - alloc[g] > under)
+                {
+                    under = exact[g] - alloc[g];
+                    best  = g;
+                }
+            ++alloc[best];
+            ++handed;
+        }
+
+        int base = 0;
+        for(std::size_t g = 0; g < depths.size(); ++g)
+        {
+            // Re-walk this group's tile axis so its segment offsets start at zero, which is what
+            // the column bisection indexes against.
+            std::vector<Segment> segments;
+            int acc = 0;
+            for(const Segment& segment : xseg[x])
+                if(nch_v[segment.request] == depths[g])
+                {
+                    const int span = segment.end - segment.begin;
+                    segments.push_back({segment.request, acc, acc + span, segment.tile0});
+                    acc += span;
+                }
+            layout(x, segments, acc, depths[g], base, alloc[g]);
+            base += alloc[g];
+        }
+    }
+
+    std::vector<PlanItem> flat;
+    for(const auto& worker_items : per_wg)
+        flat.insert(flat.end(), worker_items.begin(), worker_items.end());
+    if(static_cast<int>(flat.size()) > item_cap)
+        return -5;
+    if(balance)
+    {
+        for(const PlanItem& item : flat)
+        {
+            const int b     = item[0];
+            const int q_len = q_indptr[b + 1] - q_indptr[b];
+            if(item[5] == kv_indptr[b + 1] && item[4] > kv_indptr[b + 1] - q_len)
+                return -7;
+        }
+    }
+
+    std::vector<int> order(flat.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return std::tie(flat[a][0], flat[a][8], flat[a][9]) <
+               std::tie(flat[b][0], flat[b][8], flat[b][9]);
+    });
+    for(int rank = 0; rank < static_cast<int>(order.size()); ++rank)
+        flat[order[rank]][1] = rank;
+
+    int* work_indptr = plan;
+    int* work_items  = plan + nwg + 1;
+    int* unit_info   = work_items + item_cap * 8;
+    int item_offset  = 0;
+    work_indptr[0]   = 0;
+    for(int worker = 0; worker < nwg; ++worker)
+    {
+        item_offset += static_cast<int>(per_wg[worker].size());
+        work_indptr[worker + 1] = item_offset;
+    }
+    for(int item = 0; item < static_cast<int>(flat.size()); ++item)
+        std::copy_n(flat[item].begin(), 8, work_items + item * 8);
+
+    std::vector<UnitRange> ranges(coff[bs]);
+    for(const PlanItem& item : flat)
+    {
+        UnitRange& range = ranges[coff[item[0]] + item[8]];
+        range.begin      = std::min(range.begin, item[1]);
+        range.end        = std::max(range.end, item[1] + 1);
+    }
+    int unit_count = 0;
+    for(int b = 0; b < bs; ++b)
+        for(int chunk = 0; chunk < nch_v[b]; ++chunk)
+        {
+            const UnitRange& range = ranges[coff[b] + chunk];
+            if(range.end < 0 || range.end - range.begin == 1)
+                continue;
+            unit_info[4 * unit_count]     = range.begin;
+            unit_info[4 * unit_count + 1] = range.end;
+            unit_info[4 * unit_count + 2] = q_indptr[b] * h + slot * chunk;
+            unit_info[4 * unit_count + 3] = std::min(slot, nrows_v[b] - slot * chunk);
+            ++unit_count;
+        }
+    for(int item = 0; item < static_cast<int>(flat.size()); ++item)
+    {
+        const UnitRange& range = ranges[coff[flat[item][0]] + flat[item][8]];
+        if(range.end - range.begin == 1)
+            work_items[item * 8 + 1] = -1;
+    }
+
+    *out_items = static_cast<int>(flat.size());
+    *out_units = unit_count;
+    return 0;
+}
+
+// Ragged entry: `bucketed` picks the depth-bucketed layout, otherwise the max-depth columns.
+int build_plan_ragged(const int* kv_indptr,
+                      const int* q_indptr,
+                      int bs,
+                      int h,
+                      int nwg,
+                      bool balance,
+                      bool bucketed,
+                      int nxcd,
+                      int item_cap,
+                      int max_units,
+                      int* plan,
+                      int plan_ints,
+                      int* out_items,
+                      int* out_units)
+{
+    if(bucketed)
+    {
+        const int rc = build_plan_bucketed_impl(kv_indptr,
+                                                q_indptr,
+                                                bs,
+                                                h,
+                                                nwg,
+                                                balance,
+                                                nxcd,
+                                                item_cap,
+                                                max_units,
+                                                plan,
+                                                plan_ints,
+                                                out_items,
+                                                out_units);
+        // More depth groups can mean more work items; past item_cap take the default layout
+        // rather than fail the step (it rewrites the whole plan).
+        if(rc != -5)
+            return rc;
+    }
+    return build_plan_default_impl(kv_indptr,
+                                   q_indptr,
+                                   bs,
+                                   h,
+                                   nwg,
+                                   balance,
+                                   nxcd,
+                                   item_cap,
+                                   max_units,
+                                   plan,
+                                   plan_ints,
+                                   out_items,
+                                   out_units);
+}
+
+// Uniform-width entry, kept so existing callers are unchanged. It always takes the default
+// planner: the bucketed one plans a single depth identically, and this keeps the uniform plan
+// independent of the switch.
+int build_plan(const int* kv_indptr,
+               int bs,
+               int q_len,
+               int h,
+               int nwg,
+               bool balance,
+               int nxcd,
+               int item_cap,
+               int max_units,
+               int* plan,
+               int plan_ints,
+               int* out_items,
+               int* out_units)
+{
+    if(q_len <= 0 || bs < 0)
+        return -1;
+    std::vector<int> q_indptr(static_cast<std::size_t>(bs) + 1);
+    for(int b = 0; b <= bs; ++b)
+        q_indptr[b] = b * q_len;
+    return build_plan_default_impl(kv_indptr,
+                                   q_indptr.data(),
+                                   bs,
+                                   h,
+                                   nwg,
+                                   balance,
+                                   nxcd,
+                                   item_cap,
+                                   max_units,
+                                   plan,
+                                   plan_ints,
+                                   out_items,
+                                   out_units);
 }
 
 const char* plan_error(int rc)
@@ -412,7 +983,9 @@ const char* plan_error(int rc)
     case -3: return "more (request, chunk) units than max_units";
     case -4: return "kv_indptr is not non-decreasing";
     case -5: return "more work items than item_cap";
+    case -6: return "q_indptr is not non-decreasing";
     case -7: return "a piece would have rows that see no key";
+    case -8: return "unknown planner";
     default: return "unknown error";
     }
 }
@@ -625,10 +1198,12 @@ void check_tensor(
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     opus_mla_decode_flat_plan,
     (aiter_tensor_t * kv_indptr, // [B+1] int32, host, rank-local
-     int q_len,                  // query tokens per request
+     aiter_tensor_t* qo_indptr,  // [B+1] int32, host; null for a uniform q_len batch
+     int q_len,                  // query tokens per request, ignored when qo_indptr is given
      int num_heads,              // query heads
      int num_workers,            // stage-1 workgroups (the plan's work indptr has num_workers + 1)
      bool balance,               // only an XCD's last worker absorbs a remainder
+     bool bucketed,              // ragged: group an XCD's requests by chunk depth
      int num_xcd,
      int item_cap,
      int max_units,
@@ -636,10 +1211,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* stats, // int32 [2], host
      hipStream_t stream),
     (kv_indptr,
+     qo_indptr,
      q_len,
      num_heads,
      num_workers,
      balance,
+     bucketed,
      num_xcd,
      item_cap,
      max_units,
@@ -655,19 +1232,41 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     check_tensor(stats, AITER_DTYPE_i32, false, 2, "stats");
     const int bs = static_cast<int>(kv_indptr->numel()) - 1;
     int* st      = static_cast<int*>(stats->data_ptr());
-    const int rc = build_plan(static_cast<const int*>(kv_indptr->data_ptr()),
-                              bs,
-                              q_len,
-                              num_heads,
-                              num_workers,
-                              balance,
-                              num_xcd,
-                              item_cap,
-                              max_units,
-                              static_cast<int*>(plan->data_ptr()),
-                              static_cast<int>(plan->numel()),
-                              st,
-                              st + 1);
+    int rc       = 0;
+    if(qo_indptr != nullptr)
+    {
+        check_tensor(qo_indptr, AITER_DTYPE_i32, false, bs + 1, "qo_indptr");
+        rc = build_plan_ragged(static_cast<const int*>(kv_indptr->data_ptr()),
+                               static_cast<const int*>(qo_indptr->data_ptr()),
+                               bs,
+                               num_heads,
+                               num_workers,
+                               balance,
+                               bucketed,
+                               num_xcd,
+                               item_cap,
+                               max_units,
+                               static_cast<int*>(plan->data_ptr()),
+                               static_cast<int>(plan->numel()),
+                               st,
+                               st + 1);
+    }
+    else
+    {
+        rc = build_plan(static_cast<const int*>(kv_indptr->data_ptr()),
+                        bs,
+                        q_len,
+                        num_heads,
+                        num_workers,
+                        balance,
+                        num_xcd,
+                        item_cap,
+                        max_units,
+                        static_cast<int*>(plan->data_ptr()),
+                        static_cast<int>(plan->numel()),
+                        st,
+                        st + 1);
+    }
     AITER_CHECK(rc == 0,
                 kFn,
                 ": planner failed (",

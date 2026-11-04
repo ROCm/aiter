@@ -10,6 +10,11 @@ round-robin context parallelism (8 ranks, one of them) and at 12 and 16 heads wi
 2-8, for KV mixes from a few tiles per request to long lognormal contexts and contexts ending 1-5
 tokens past a KV tile, with non-unit fp8 descales and a scattered kv_indices. A CUDA graph captured
 on one plan is replayed on another.
+
+Query lengths are either uniform or per-request. A ragged batch is planned by either the default
+column layout or the bucketed one, which groups an XCD's requests by chunk depth; the two must
+agree with the reference and with each other, and a uniform batch must plan identically whichever
+way it is described.
 """
 
 import math
@@ -75,7 +80,7 @@ def _indptr(lens):
     return out
 
 
-def _check_plan(dec, kvp, q_len, nhead, balance):
+def _check_plan(dec, kvp, q_lens, nhead, balance):
     """Plan invariants on the host copy of the last plan."""
     plan = dec._host[(dec._step - 1) & 1].numpy()
     nwg, cap = dec.num_workers, dec.item_cap
@@ -84,23 +89,26 @@ def _check_plan(dec, kvp, q_len, nhead, balance):
     units = plan[nwg + 1 + cap * 8 :].reshape(-1, 4)
     n_items, n_units = dec.last["items"], dec.last["units"]
     bs = len(kvp) - 1
-    nrows = q_len * nhead
-    nch = -(-nrows // SLOT)
+    # a request's rows are its own query tokens x heads, based at its first flat row
+    nrows = [q * nhead for q in q_lens]
+    nch = [-(-n // SLOT) for n in nrows]
+    base = (_indptr(q_lens) * nhead).tolist()
     assert wip[0] == 0 and (np.diff(wip) >= 0).all() and wip[-1] == n_items
     it = items[:n_items]
     assert not items[n_items:].any() and not units[n_units:].any()
     pieces = {}
     for b, slot, q0, q1, k0, k1, _, _ in it.tolist():
-        chunk = (q0 - b * nrows) // SLOT
-        assert q0 == b * nrows + chunk * SLOT and q1 == q0 + min(
-            SLOT, nrows - chunk * SLOT
+        chunk = (q0 - base[b]) // SLOT
+        assert 0 <= chunk < nch[b], "a piece is outside the request's chunks"
+        assert q0 == base[b] + chunk * SLOT and q1 == q0 + min(
+            SLOT, nrows[b] - chunk * SLOT
         )
         assert kvp[b] <= k0 < k1 <= kvp[b + 1]
         if balance and k1 == kvp[b + 1]:
             # the query's first token sees kv_end - q_len + 1 keys of the request
-            assert k0 <= kvp[b + 1] - q_len, "a piece has rows that see no key"
+            assert k0 <= kvp[b + 1] - q_lens[b], "a piece has rows that see no key"
         pieces.setdefault((b, chunk), []).append((k0, k1, slot))
-    assert len(pieces) == bs * nch
+    assert len(pieces) == sum(nch)
     merged = {}
     for (b, chunk), ps in pieces.items():
         ps.sort()
@@ -117,8 +125,9 @@ def _check_plan(dec, kvp, q_len, nhead, balance):
     assert n_units == len(merged)
     got = {}
     for s0, s1, row0, rows in units[:n_units].tolist():
-        b, chunk = row0 // nrows, (row0 % nrows) // SLOT
-        assert rows == min(SLOT, nrows - chunk * SLOT)
+        b = int(np.searchsorted(base, row0, side="right")) - 1
+        chunk = (row0 - base[b]) // SLOT
+        assert rows == min(SLOT, nrows[b] - chunk * SLOT)
         got[(b, chunk)] = (s0, s1)
     assert got == merged
     used = [s for ps in pieces.values() for _, _, s in ps if s >= 0]
@@ -126,12 +135,14 @@ def _check_plan(dec, kvp, q_len, nhead, balance):
     assert all(s < n_items for s in used), "a partial slot is out of range"
 
 
-def _reference(q, kv, q_len, lens, ctxs, cp_rr):
+def _reference(q, kv, q_lens, lens, ctxs, cp_rr):
     """fp32 causal attention over each request's local KV, on global positions with CP."""
     outs, lses = [], []
-    kv_at = 0
+    kv_at, q_at = 0, 0
     for b, n in enumerate(lens):
-        qb = q[b * q_len : (b + 1) * q_len].float() * Q_SCALE
+        q_len = q_lens[b]
+        qb = q[q_at : q_at + q_len].float() * Q_SCALE
+        q_at += q_len
         k = kv[kv_at : kv_at + n].float() * KV_SCALE
         kv_at += n
         s = torch.einsum("thd,ld->thl", qb, k) * DIM**-0.5
@@ -148,12 +159,20 @@ def _reference(q, kv, q_len, lens, ctxs, cp_rr):
 
 
 class _Case:
-    def __init__(self, nhead, q_len, ctxs, cp_rr, seed=7):
-        self.nhead, self.q_len, self.ctxs, self.cp_rr = nhead, q_len, ctxs, cp_rr
+    def __init__(self, nhead, q_len, ctxs, cp_rr, seed=7, bucketed=True):
+        self.nhead, self.ctxs, self.cp_rr, self.bucketed = nhead, ctxs, cp_rr, bucketed
+        # q_len is one token count for the batch or one per request
+        self.q_lens = (
+            [int(q_len)] * len(ctxs)
+            if isinstance(q_len, int)
+            else [int(x) for x in q_len]
+        )
+        self.q_len = q_len
         self.lens = _local_lens(ctxs, cp_rr)
         bs, total = len(ctxs), sum(self.lens)
+        total_q = sum(self.q_lens)
         g = torch.Generator(device="cuda").manual_seed(seed)
-        self.q = torch.randn((bs * q_len, nhead, DIM), generator=g, device="cuda").to(
+        self.q = torch.randn((total_q, nhead, DIM), generator=g, device="cuda").to(
             dtypes.fp8
         )
         self.kv = torch.randn((total, DIM), generator=g, device="cuda").to(dtypes.fp8)
@@ -165,9 +184,9 @@ class _Case:
         self.cache[self.slots.long()] = self.kv
         self.kvp = _indptr(self.lens)
         self.out = torch.full(
-            (bs * q_len, nhead, KV_LORA_RANK), float("nan"), device="cuda"
+            (total_q, nhead, KV_LORA_RANK), float("nan"), device="cuda"
         ).to(torch.bfloat16)
-        self.qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda") * q_len
+        self.qo_indptr = torch.from_numpy(_indptr(self.q_lens)).cuda()
         self.kv_indptr = torch.from_numpy(self.kvp).cuda()
         self.g_kv_indptr = torch.from_numpy(_indptr(ctxs)).cuda() if cp_rr else None
         self.cp = CP_WORLD if cp_rr else 1
@@ -175,7 +194,7 @@ class _Case:
         self.kv_scale = torch.tensor([KV_SCALE], device="cuda")
 
     def plan(self, dec):
-        return dec.plan(self.kvp, self.q_len, self.nhead, self.cp)
+        return dec.plan(self.kvp, self.q_len, self.nhead, self.cp, self.bucketed)
 
     def run(self, dec, lse=None):
         return dec(
@@ -197,7 +216,7 @@ class _Case:
     def check(self, lse):
         torch.cuda.synchronize()
         o_ref, lse_ref = _reference(
-            self.q, self.kv, self.q_len, self.lens, self.ctxs, self.cp_rr
+            self.q, self.kv, self.q_lens, self.lens, self.ctxs, self.cp_rr
         )
         o32 = self.out.float()
         assert not o32.isnan().any(), "some output row is NaN or was never written"
@@ -227,7 +246,7 @@ def test_flat_decode(nhead, cp_rr, q_len, kind):
     dec = _decoder()
     case = _Case(nhead, q_len, _ctxs(kind, seed=5), cp_rr)
     case.plan(dec)
-    _check_plan(dec, case.kvp, q_len, nhead, balance=not cp_rr)
+    _check_plan(dec, case.kvp, case.q_lens, nhead, balance=not cp_rr)
     case.check(case.run(dec))
 
 
@@ -239,7 +258,7 @@ def test_flat_decode_batch(bs, cp_rr):
     dec = _decoder()
     case = _Case(nhead, q_len, _ctxs("mixed", seed=bs, bs=bs), cp_rr)
     case.plan(dec)
-    _check_plan(dec, case.kvp, q_len, nhead, balance=not cp_rr)
+    _check_plan(dec, case.kvp, case.q_lens, nhead, balance=not cp_rr)
     case.check(case.run(dec))
 
 
@@ -286,13 +305,147 @@ def test_flat_decode_graph_replay(cp_rr):
         case.check(lse.clone())
 
 
+def _qlens(kind, bs, seed, hi=8):
+    """Per-request query token counts."""
+    rng = np.random.default_rng(seed)
+    if kind == "spread":
+        return [int(x) for x in rng.integers(1, hi + 1, size=bs)]
+    if kind == "deep-few":
+        # the bucketing's target: a few requests carry the depth, the rest are one token
+        return [hi if i % 8 == 0 else 1 for i in range(bs)]
+    # one request out of step with the rest
+    return [hi if i == bs // 2 else 2 for i in range(bs)]
+
+
+RAGGED = [(96, True, 8), (96, False, 8), (16, False, 8), (12, False, 6)]
+
+
+@pytest.mark.parametrize("bucketed", [True, False], ids=["bucketed", "columns"])
+@pytest.mark.parametrize("kind", ["spread", "deep-few", "odd-one"])
+@pytest.mark.parametrize(
+    "nhead,cp_rr,hi",
+    RAGGED,
+    ids=[f"h{h}-{'cprr' if c else 'local'}-q1_{q}" for h, c, q in RAGGED],
+)
+def test_flat_decode_ragged(nhead, cp_rr, hi, kind, bucketed):
+    """Each request brings its own query length, as adaptive verification produces."""
+    _skip_unless_gfx950()
+    bs = 24
+    dec = _decoder()
+    case = _Case(
+        nhead,
+        _qlens(kind, bs, seed=4, hi=hi),
+        _ctxs("mixed", seed=5, bs=bs),
+        cp_rr,
+        bucketed=bucketed,
+    )
+    case.plan(dec)
+    _check_plan(dec, case.kvp, case.q_lens, nhead, balance=not cp_rr)
+    case.check(case.run(dec))
+
+
+@pytest.mark.parametrize("bucketed", [True, False], ids=["bucketed", "columns"])
+@pytest.mark.parametrize("bs", [1, 2, 3, 7, 32, 64])
+def test_flat_decode_ragged_batch(bs, bucketed):
+    _skip_unless_gfx950()
+    dec = _decoder()
+    case = _Case(
+        96,
+        _qlens("spread", bs, seed=bs),
+        _ctxs("tail", seed=bs, bs=bs),
+        True,
+        bucketed=bucketed,
+    )
+    case.plan(dec)
+    _check_plan(dec, case.kvp, case.q_lens, 96, balance=False)
+    case.check(case.run(dec))
+
+
+@pytest.mark.parametrize("bucketed", [True, False], ids=["bucketed", "columns"])
+def test_flat_decode_ragged_zero_width(bucketed):
+    """A request with no query tokens this step owns no rows and no work."""
+    _skip_unless_gfx950()
+    dec = _decoder()
+    q_lens = [4, 0, 6, 0, 2, 5]
+    case = _Case(
+        16, q_lens, _ctxs("short", seed=2, bs=len(q_lens)), False, bucketed=bucketed
+    )
+    case.plan(dec)
+    _check_plan(dec, case.kvp, case.q_lens, 16, balance=True)
+    case.check(case.run(dec))
+
+
+@pytest.mark.parametrize("q_len", [1, 4, 8])
+def test_flat_decode_uniform_plans_the_same_either_way(q_len):
+    """Describing a uniform batch per request must not change the plan it produces."""
+    _skip_unless_gfx950()
+    kvp = _indptr(_local_lens(_ctxs("mixed", seed=6, bs=32), True))
+    plans = []
+    for q, bucketed in ((q_len, True), ([q_len] * 32, True), ([q_len] * 32, False)):
+        dec = _decoder()
+        dec.plan(kvp, q, 96, CP_WORLD, bucketed)
+        plans.append(
+            (dec.last["items"], dec.last["units"], dec._host[0].numpy().copy())
+        )
+    for items, units, plan in plans[1:]:
+        assert (items, units) == plans[0][:2]
+        assert (plan == plans[0][2]).all(), "the same batch planned two different ways"
+
+
+def test_flat_decode_ragged_graph_replay():
+    """A graph replays ragged plans whose query lengths move between replays."""
+    _skip_unless_gfx950()
+    nhead, bs, total_q = 96, 16, 64
+    dec = _decoder()
+    # one token total and one batch size, three ways of splitting them over the requests
+    splits = [[4] * 16, [8] * 7 + [1] * 8 + [0], [2] * 12 + [10] * 4]
+    assert all(len(s) == bs and sum(s) == total_q for s in splits)
+    cases = [
+        _Case(nhead, s, _ctxs("mixed", seed=i + 1, bs=bs), True, seed=i + 1)
+        for i, s in enumerate(splits)
+    ]
+    rows = max(c.cache.shape[0] for c in cases)
+    g = _Case(nhead, splits[0], cases[0].ctxs, True, seed=1)
+    g.cache = torch.zeros((rows, DIM), device="cuda").to(dtypes.fp8)
+    g.slots = torch.zeros(
+        max(c.slots.numel() for c in cases), dtype=torch.int32, device="cuda"
+    )
+    lse = torch.empty(total_q, nhead, dtype=torch.float32, device="cuda")
+    dec.clear()
+    g.run(dec, lse)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g.run(dec, lse)
+    for case in cases:
+        case.plan(dec)
+        g.q.copy_(case.q)
+        g.cache.zero_()
+        g.cache[: case.cache.shape[0]] = case.cache
+        g.slots.zero_()
+        g.slots[: case.slots.numel()] = case.slots
+        g.kv_indptr.copy_(case.kv_indptr)
+        g.qo_indptr.copy_(case.qo_indptr)
+        g.g_kv_indptr.copy_(case.g_kv_indptr)
+        g.out.fill_(float("nan"))
+        graph.replay()
+        case.out.copy_(g.out)
+        case.check(lse.clone())
+
+
 def test_flat_decode_rejects():
     _skip_unless_gfx950()
     dec = _decoder()
     with pytest.raises(ValueError, match="rows"):
         dec.plan(_indptr([100, 200]), 9, 128)
+    with pytest.raises(ValueError, match="rows"):
+        dec.plan(_indptr([100, 200]), [2, 9], 128)
     with pytest.raises(ValueError, match="max_batch"):
         dec.plan(_indptr([100] * 65), 4, 96, CP_WORLD)
+    with pytest.raises(ValueError, match="entries"):
+        dec.plan(_indptr([100, 200]), [4, 4, 4], 96)
+    with pytest.raises(ValueError, match="negative"):
+        dec.plan(_indptr([100, 200]), [4, -1], 96)
     case = _Case(16, 4, _ctxs("short", seed=3, bs=2), False)
     case.plan(dec)
     case.q = case.q.to(torch.bfloat16)

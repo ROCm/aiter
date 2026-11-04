@@ -18,9 +18,14 @@ Usage, once per decode step (the plan is built on the CPU, outside any CUDA grap
 The plan and partial buffers keep fixed addresses, so a graph captured around ``__call__`` replays
 with every later plan of up to ``max_batch`` requests.
 
+``q_len`` is either one token count for the whole batch or a per-request array, so a step of
+adaptive verification carries each request's own query count instead of a uniform rectangle. The
+kernel already reads the causal span from ``qo_indptr`` and takes its rows from the work item, so
+only the planner distinguishes the two.
+
 Requirements: fp8 Q / KV with per-tensor descales, page_size 1, one KV head, a KV cache below
-4 GiB, causal decode with the same query length for every request, and at most
-``128 * max_chunks`` rows (``q_len * num_heads``) per request.
+4 GiB, causal decode, and at most ``128 * max_chunks`` rows (``q_len * num_heads``) for the widest
+request.
 """
 
 import numpy as np
@@ -107,29 +112,61 @@ class OpusMlaFlatDecode:
     def plan(
         self,
         kv_indptr: np.ndarray | torch.Tensor,
-        q_len: int,
+        q_len: int | np.ndarray | torch.Tensor,
         num_heads: int,
         cp_world_size: int = 1,
+        bucketed: bool = True,
     ) -> dict:
         """Builds this step's plan from the host rank-local ``kv_indptr`` [B+1] and queues its copy
-        to the GPU on the current stream. Returns {bs, items, units}."""
+        to the GPU on the current stream. Returns {bs, items, units}.
+
+        ``q_len`` is either one token count for the whole batch or a per-request [B] array (a [B+1]
+        indptr is also accepted), which is what adaptive verification produces: a decode step then
+        carries per-request query counts instead of a uniform rectangle. ``bucketed`` groups each
+        XCD's requests by chunk depth so no worker idles above a shallow request; it has no effect
+        when every request is the same width.
+        """
         kv = torch.as_tensor(np.asarray(kv_indptr), dtype=torch.int32)
         if not kv.is_contiguous():
             kv = kv.contiguous()
         bs = kv.numel() - 1
         if bs > self.max_batch:
             raise ValueError(f"batch {bs} > max_batch {self.max_batch}")
-        if q_len * num_heads > SLOT_ROWS * self.max_chunks:
+
+        qo, scalar_q = None, 0
+        if isinstance(q_len, (int, np.integer)):
+            scalar_q = int(q_len)
+            max_q = scalar_q
+        else:
+            lens = np.asarray(q_len, dtype=np.int64).ravel()
+            if lens.size == bs + 1 and lens[0] == 0 and np.all(np.diff(lens) >= 0):
+                lens = np.diff(lens)  # already an indptr
+            if lens.size != bs:
+                raise ValueError(f"q_len has {lens.size} entries, batch is {bs}")
+            if np.any(lens < 0):
+                raise ValueError(f"q_len is negative: {lens.tolist()}")
+            if np.all(lens == lens[:1]):
+                scalar_q = int(lens[0])  # uniform: the scalar path plans it identically
+                max_q = scalar_q
+            else:
+                indptr = np.zeros(bs + 1, dtype=np.int32)
+                np.cumsum(lens, out=indptr[1:], dtype=np.int32)
+                qo = torch.from_numpy(indptr)
+                max_q = int(lens.max(initial=0))
+        if max_q * num_heads > SLOT_ROWS * self.max_chunks:
             raise ValueError(
-                f"{q_len} tokens x {num_heads} heads > {SLOT_ROWS * self.max_chunks} rows"
+                f"{max_q} tokens x {num_heads} heads > {SLOT_ROWS * self.max_chunks} rows"
             )
+
         host = self._staging()
         opus_mla_decode_flat_plan(
             kv,
-            q_len,
+            qo,
+            scalar_q,
             num_heads,
             self.num_workers,
             cp_world_size == 1,
+            bucketed,
             NUM_XCD,
             self.item_cap,
             self.max_units,
