@@ -342,13 +342,17 @@ def launch_gemm_a8w8_256x256(
         b_tile_shift = sb_tile_shift = fx.Int32(0)
         if const_expr(c_relocate):
             # The next persistent tile differs only in its N block. Byte deltas are
-            # added unsigned, so they must stay below 4 GiB.
+            # added unsigned, so the drain prefetches that tile only while B's, the
+            # largest, stays below 4 GiB; the shifts below are exact modulo 2**32.
             n_adv = fx.Int32(fx.grid_dim.y) * tile_n
             b_tile_shift = n_adv * i32_k
             if const_expr(mx32):
                 sb_tile_shift = (n_adv // 32) * i32_k
             else:
                 sb_tile_shift = (n_adv // 128) * (i32_k // 128)
+            pref_on = fx.Int64(n_adv) * k64 + (
+                BB_SLOT if BB_OK else C_EARLY_SLOTS - 1
+            ) * B_LDS_ROW < fx.Int64(2**32)
 
         gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_PAIR * tile_k), (A_PAIR * tile_k, 1))
         gB = _gv(
@@ -1323,9 +1327,10 @@ def launch_gemm_a8w8_256x256(
         if const_expr(c_relocate):
             # The drain loads the next tile's first n_pref slots as it frees them,
             # so that tile's prologue skips those loads.
-            has_next_tile = tile_idx < persistent_n_tiles - 1
+            has_next_tile = (tile_idx < persistent_n_tiles - 1) & pref_on
+            had_prev_tile = (tile_idx > 0) & pref_on
             n_pref = (drain_s < C_EARLY_SLOTS).select(drain_s, fx.Int32(C_EARLY_SLOTS))
-            prev_pref = (tile_idx > 0).select(n_pref, fx.Int32(0))
+            prev_pref = had_prev_tile.select(n_pref, fx.Int32(0))
             pref_delta = [
                 (fx.Int32(s) * tdm_global_step < last_delta).select(
                     fx.Int32(s) * tdm_global_step, last_delta
@@ -1341,7 +1346,7 @@ def launch_gemm_a8w8_256x256(
             bb_on = (n_full > 0).select(
                 (drain_s == num_buffers).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
-            defer = (tile_idx > 0).select(bb_on, fx.Int32(0))
+            defer = had_prev_tile.select(bb_on, fx.Int32(0))
             pref_bb = (fx.Int32(wave) == 0).select(
                 fx.Int32(0), has_next_tile.select(bb_on, fx.Int32(0))
             )
