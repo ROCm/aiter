@@ -115,7 +115,7 @@ _FLYDSL_HERD_MIN_M = int(
 )
 _FLYDSL_HERD_MAX_M = int(
     os.environ.get(
-        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
+        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "512")
     )
 )
 
