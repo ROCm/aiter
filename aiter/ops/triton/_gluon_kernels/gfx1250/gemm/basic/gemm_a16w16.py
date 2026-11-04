@@ -464,12 +464,10 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     )
 
 
-@gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
-def _gemm_a16w16_compute_bound_kernel(
+@gluon.jit
+def _compute_bound_accumulate(
     a_ptr,
     b_ptr,
-    c_ptr,
-    bias_ptr,
     M,
     N,
     K,
@@ -477,8 +475,8 @@ def _gemm_a16w16_compute_bound_kernel(
     stride_ak,
     stride_bk,
     stride_bn,
-    stride_cm,
-    stride_cn,
+    pid_m,
+    pid_n,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -489,28 +487,9 @@ def _gemm_a16w16_compute_bound_kernel(
     WMMA_LAYOUT: gl.constexpr,
     OPERAND_LAYOUT_A: gl.constexpr,
     OPERAND_LAYOUT_B: gl.constexpr,
-    activation: gl.constexpr,
-    USE_ACTIVATION: gl.constexpr,
-    ADD_BIAS: gl.constexpr,
-    GATED: gl.constexpr = False,
 ):
-    """Local-load pipelining across K-tiles.
-
-    Manually places load_shared_relaxed for tile i+1 *before* the wmma for
-    tile i so the hardware LDS unit and matrix unit can run in parallel.
-    LLVM fails to schedule this reordering on its own in the bandwidth_bound kernel.
-
-    Requires NUM_BUFFERS >= 2.  With NUM_BUFFERS == 2 the TDM must complete
-    fully before each ds_read batch (async_wait(0)), but the ds_read/wmma
-    overlap is still preserved.  NUM_BUFFERS >= 3 is recommended.
-    """
-    gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
-
-    pid = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
-
+    """The fp32 (BLOCK_M, BLOCK_N) tile (pid_m, pid_n) of A @ B: the K pipeline of
+    `_gemm_a16w16_compute_bound_kernel` (see there), shared with its variants."""
     # Descriptors start at this block's (M, N) offset by biasing the base
     # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
@@ -871,6 +850,80 @@ def _gemm_a16w16_compute_bound_kernel(
 
     # Final WMMA for the last pre-loaded tile
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+    return accumulator
+
+
+@gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
+def _gemm_a16w16_compute_bound_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+    activation: gl.constexpr,
+    USE_ACTIVATION: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    GATED: gl.constexpr = False,
+):
+    """Local-load pipelining across K-tiles.
+
+    Manually places load_shared_relaxed for tile i+1 *before* the wmma for
+    tile i so the hardware LDS unit and matrix unit can run in parallel.
+    LLVM fails to schedule this reordering on its own in the bandwidth_bound kernel.
+
+    Requires NUM_BUFFERS >= 2.  With NUM_BUFFERS == 2 the TDM must complete
+    fully before each ds_read batch (async_wait(0)), but the ds_read/wmma
+    overlap is still preserved.  NUM_BUFFERS >= 3 is recommended.
+    """
+    gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
+
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+
+    accumulator = _compute_bound_accumulate(
+        a_ptr,
+        b_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BUFFERS,
+        LAYOUT,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B,
+        WMMA_LAYOUT,
+        OPERAND_LAYOUT_A,
+        OPERAND_LAYOUT_B,
+    )
 
     # if NUM_BUFFERS > 2:
     #     gl.amd.sched_barrier(0)
