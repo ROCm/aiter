@@ -2733,14 +2733,11 @@ def _sparse_mla(
             )
         else:
             offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-            o_off = (
-                query_idx * out_stride0
-                + h_pv[:, None] * out_stride1
-                + offs_d_o[None, :]
-            ).to(gl.int32)
+            o_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0  # else overflows
+            o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
             gl.amd.cdna4.buffer_store(
                 out.to(out_ptr.dtype.element_ty),
-                ptr=out_ptr,
+                ptr=o_row_ptr,
                 offsets=o_off,
                 mask=head_mask_pv[:, None],
             )
@@ -2772,12 +2769,14 @@ def _sparse_mla(
             cache=PART_STORE_CACHE,
         )
         offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-        a_base = query_idx * pa_stride0 + split_id * pa_stride_s
-        a_off = (a_base + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
+        a_row_ptr = part_acc_ptr + query_idx.to(gl.int64) * pa_stride0  # else overflows
+        a_off = (
+            split_id * pa_stride_s + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]
+        ).to(gl.int32)
         # Follow part_acc's own dtype: bf16 halves the partial HBM traffic.
         gl.amd.cdna4.buffer_store(
             acc.to(part_acc_ptr.dtype.element_ty),
-            ptr=part_acc_ptr,
+            ptr=a_row_ptr,
             offsets=a_off,
             mask=head_mask_pv[:, None],
             cache=PART_STORE_CACHE,
