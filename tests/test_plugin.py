@@ -87,7 +87,10 @@ def test_no_provider_uses_native_path_and_discovers_lazily(monkeypatch):
     assert discovery_calls == 1
     assert native_calls == [(2, 3), (4, 1)]
     assert plugin.last_decision() == plugin.Decision(
-        op=plugin.Op("test.add", 1), route="native", reason="no-provider"
+        op=plugin.Op("test.add", 1),
+        route="native",
+        reason="no-provider",
+        config_source="default-deny",
     )
 
 
@@ -101,7 +104,9 @@ def test_disabled_plugins_do_not_trigger_discovery(monkeypatch):
     add = _route_add([])
 
     assert add(2, 3) == 5
-    assert plugin.last_decision().reason == "plugins-disabled"
+    # The kill switch is a free path: one flag check, straight to native. The
+    # feature is off, so there is nothing to observe and nothing is recorded.
+    assert plugin.last_decision() is None
 
 
 @pytest.mark.parametrize("outcome", [None, RuntimeError("selection failed")])
@@ -146,6 +151,7 @@ def test_selected_candidate_records_provenance(monkeypatch):
         kernel_id="kernel-1",
         artifact_digest="sha256:abc",
         qualification="experimental",
+        config_source="env",
     )
 
 
@@ -364,7 +370,11 @@ def test_disable_layers_union(monkeypatch):
 
     assert _route_add([])(2, 3) == 5
     assert plugin.last_decision().reason == "op-disabled"
-    assert plugin._config().disabled_ops == frozenset({"framework.op", "test.add"})
+    # Union, and each op names the layer that disabled it.
+    assert dict(plugin._config().disabled_ops) == {
+        "framework.op": "configure:framework",
+        "test.add": "env",
+    }
 
 
 def test_generation_bumps_on_change_but_not_on_an_identical_reload(monkeypatch):
@@ -498,3 +508,109 @@ def test_opaque_defaults_survive_generation():
     args, _ = canonicalize("x")
 
     assert args[2] is _OPAQUE
+
+
+class _Broken(_Provider):
+    """A provider that misbehaves before execution."""
+
+    def __init__(self, name, failure):
+        super().__init__(name)
+        self.failure = failure
+
+    def select(self, op, args, kwargs):
+        self.select_calls += 1
+        if isinstance(self.failure, Exception):
+            raise self.failure
+        return self.failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (RuntimeError("select exploded"), "provider-select-error"),
+        (42, "invalid-candidate"),
+    ],
+)
+def test_a_misbehaving_provider_does_not_deny_service_to_the_next(
+    monkeypatch, failure, reason
+):
+    broken = _Broken("broken", failure)
+    good = _Provider("good", _candidate("good", 100))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, good")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("broken", broken), _EntryPoint("good", good)),
+    )
+
+    assert _route_add([])(2, 3) == 100, reason
+    assert broken.select_calls == 1
+    assert good.select_calls == 1
+    assert plugin.last_decision().provider == "good"
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (RuntimeError("select exploded"), "provider-select-error"),
+        (42, "invalid-candidate"),
+    ],
+)
+def test_native_fallback_records_the_first_provider_error(monkeypatch, failure, reason):
+    broken = _Broken("broken", failure)
+    quiet = _Provider("quiet")  # declines
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, quiet")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("broken", broken), _EntryPoint("quiet", quiet)),
+    )
+
+    assert _route_add([])(2, 3) == 5
+    decision = plugin.last_decision()
+    # An error outranks a decline: a decline is normal operation, an error is
+    # something someone must fix.
+    assert (decision.reason, decision.provider) == (reason, "broken")
+
+
+def test_every_provider_declining_is_not_reported_as_an_error(monkeypatch):
+    first, second = _Provider("first"), _Provider("second")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "first, second")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("first", first), _EntryPoint("second", second)),
+    )
+
+    assert _route_add([])(2, 3) == 5
+    assert plugin.last_decision().reason == "provider-declined"
+
+
+def test_per_op_disable_is_still_recorded(monkeypatch):
+    """Unlike the kill switch: the op was routed and deliberately turned off."""
+
+    monkeypatch.setenv("AITER_PLUGIN_DISABLE", "test.add")
+    assert _route_add([])(2, 3) == 5
+
+    decision = plugin.last_decision()
+    assert (decision.reason, decision.config_source) == ("op-disabled", "env")
+
+
+def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert plugin.last_decision().config_source == "default-deny"
+
+    plugin.configure(enable=["aklr"], source="vllm rocm 2026.11")
+    assert add(2, 3) == 100
+    assert plugin.last_decision().config_source == "configure:vllm rocm 2026.11"
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.reload_config()
+    assert add(2, 3) == 100
+    assert plugin.last_decision().config_source == "env"
