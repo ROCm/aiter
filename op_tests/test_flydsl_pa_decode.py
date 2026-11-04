@@ -808,7 +808,7 @@ _INVALID_CASES = [
 
 def _check_output(output, reference):
     assert torch.isfinite(output).all()
-    assert checkAllclose(reference.float(), output.float(), atol=5e-3, rtol=5e-3) == 0
+    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
 
 
 def _check_workspace_contract(launch, workspace):
