@@ -245,7 +245,7 @@ for file in "${sharded_files[@]}"; do
             ;;
         op_tests/test_moe_2stage.py)
             {
-                echo "Running $file with the standard MoE CI profile: representative tokens + no FlyDSL CSV sweep"
+                echo "Running $file with the standard MoE CI profile: representative token sweep (CSV/FlyDSL validation still runs)"
             } | tee -a latest_test.log
             test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
             ;;
