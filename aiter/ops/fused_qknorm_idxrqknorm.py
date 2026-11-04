@@ -61,6 +61,7 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
 ) -> None:
     pass
 
@@ -92,7 +93,13 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
 ) -> None:
+    # qkv_partials: the FP32 [num_splits, >= num_tokens, row] split-K partials of a
+    #   qkv from gemm_a8w8_bpreshuffle_splitk_deferred (aiter.splitk_partials(qkv)).
+    #   The kernel reduces them exactly as gemm_a8w8_splitk_reduce does, writes the
+    #   reduced row back into qkv and goes on from it; bf16 insert mode with every
+    #   slot processed (no skip_index_branch) only.
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
@@ -178,4 +185,5 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        qkv_partials,
     )
