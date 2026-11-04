@@ -942,9 +942,11 @@ class Gfx1250Bf16WavePipeline:
     def _page(self, token_base, begin, end, state, q_operands, uppers, bases, masked):
         """Consume half a page; ``masked`` applies the causal and window bounds."""
         t = self.t
-        # A positive scale commutes with the maximum and fuses into the
-        # exponent; masked scores stay -inf.
-        fused = t.softmax_scale > 0
+        # New two/three-tile shapes must subtract a maximum of the same
+        # rounded, scaled logits. Fusing the product with subtraction of a
+        # separately rounded maximum leaves a large cancellation residual.
+        # Four-tile arithmetic is unchanged by this layout extension.
+        fused = t.softmax_scale > 0 and t.m_tiles == t.NWARP
         scale = fx.Float32(t.softmax_scale * LOG2E)
         buffer = ((token_base - begin) // 128) % 2
         self._wait(token_base, begin, end)
