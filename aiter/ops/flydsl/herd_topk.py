@@ -155,7 +155,9 @@ def herd_route_psum(
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     _run_compiled(
-        build_herd_route_psum_module(topk, experts, num_valid_rows is not None),
+        build_herd_route_psum_module(
+            topk, experts, num_valid_rows is not None, wave_size_of(device.index)
+        ),
         ptr_arg(candidate_ids.contiguous()),
         ptr_arg(candidate_values.contiguous()),
         ptr_arg(weights),
