@@ -860,10 +860,10 @@ def test_topk_smaller_index_wins_ties():
 
 
 def test_compact_selector_keeps_column_order():
-    """Captured padded decode keeps the smaller column when scores tie.
+    """Padded decode keeps the smaller column when scores tie.
 
-    compact=True is the one-workgroup radix used while a graph is being
-    captured and the table is wider than 20000 columns. The first pass
+    compact=True is the one-workgroup radix used for padded decode, eager
+    or captured, when the table is wider than 20000 columns. The first pass
     leaves between 1 and 4096 candidates, owned by more than one wave.
     Ties keep the earlier column, and the indices come back in column order.
     """
@@ -1327,7 +1327,12 @@ def test_indexer_flash_next_set_equality_two_tiles():
 
 
 def test_indexer_flash_next_set_equality_wide_stream():
-    """FlyDSL indexer matches the oracle on 128k rows that take streaming radix."""
+    """FlyDSL indexer matches the oracle on a 128k decode row.
+
+    The packed table is 32768 columns, past the one-workgroup cutoff, so
+    decode selects with the row-bounded radix and stops at the visible
+    length.
+    """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         pytest.skip("unsupported arch")
     idx = FLASH_NEXT_INDEXER
@@ -1495,10 +1500,12 @@ def test_indexer_table_padded_to_max_model_len():
 
     The table is sized to a padded width and zero-filled past each request's
     pages, so the indexer sees tens of thousands of columns no row can see.
-    The table here is 4096 pages of 16 wide, which also crosses into the
-    streaming selector. Every request shares one packed cache and differs in
-    its length. Covers the one-row scorer (decode) and the 16-row scorer
-    (decode mixed with a prefill chunk, two prefill prompts, one request).
+    The table here is 4096 pages of 16. Decode (at most 64 rows) selects
+    with the row-bounded radix on that full width and stops at each row's
+    visible length. Prefill (more than 64 rows) keeps the allocation width.
+    Every request shares one packed cache and differs in its length. Covers
+    the one-row scorer (decode) and the 16-row scorer (decode mixed with a
+    prefill chunk, two prefill prompts, one request).
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         pytest.skip("unsupported arch")
@@ -1693,16 +1700,17 @@ def test_indexer_row_tile_spanning_requests_gathers_each_requests_pages():
 def test_indexer_padded_decode_graph_capture():
     """Decode on a max_model_len table captures into a HIP graph and replays.
 
-    The padded-table width readback is not allowed in that graph. One live
-    row is longer than the compact
-    selector's minimum, so replay finishes the later radix passes from
-    the first-pass candidates. Another row repeats one K vector: the
+    Eager and capture both select with the row-bounded radix on the full
+    width. That radix stops at each row's visible length, so neither path
+    reads the widest row back to the host. One live row is longer than the
+    compact selector's minimum, so replay finishes the later radix passes
+    from the first-pass candidates. Another row repeats one K vector: the
     top-512 cut sits inside a tie wider than that candidate buffer, so
     the same kernel falls back to the full-row passes and keeps the
-    smaller block indexes. Replays twice. The second replay writes new
-    queries, positions, and lengths into the captured buffers, then checks
-    the oracle. The long random row and the exact-tie row stay at the
-    capture length.
+    smaller block indexes. The eager launch is checked, then the graph
+    replays twice. The second replay writes new queries, positions, and
+    lengths into the captured buffers, then checks the oracle. The long
+    random row and the exact-tie row stay at the capture length.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         pytest.skip("unsupported arch")
@@ -1797,6 +1805,17 @@ def test_indexer_padded_decode_graph_capture():
 
     launch()
     torch.cuda.synchronize()
+    varied, tied = oracle()
+    _assert_indexer_block_ids(
+        varied,
+        out[:n_varied],
+        "indexer padded decode eager launch diverged",
+    )
+    _assert_indexer_block_ids(
+        tied,
+        out[n_varied:],
+        "indexer exact-tie eager launch diverged",
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
@@ -1905,9 +1924,11 @@ def test_indexer_drops_invalid_pages_below_budget():
     Emit is the table at 512 columns. The one-row scorer (M=4) and the
     16-row scorer (M=32) see 600 visible blocks with six missing pages, so
     the top-k would otherwise fill the rest from those -inf columns. The
-    20480-column cases keep 480 valid blocks and reach the other selectors:
-    the split decode radix on the packed table, the streaming radix on a
-    padded one, and the compact one-workgroup radix under graph capture.
+    20480-column cases keep 480 valid blocks. That width is past the
+    one-workgroup cutoff, so eager and captured decode both use the
+    row-bounded radix, including when the table is padded out to 2560
+    pages. The radix stops at each row and does not fill the budget from
+    a missing page.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         pytest.skip("unsupported arch")
@@ -1977,21 +1998,27 @@ def test_indexer_drops_invalid_pages_below_budget():
     missing = tuple(range(1, 7))
     run(4, 600, missing, "indexer decode filled the budget from a missing page")
     run(32, 600, missing, "indexer prefill filled the budget from a missing page")
-    # 1280 pages with only the first 30 present: 480 finite scores.
+    # 1280 pages, 20480 columns: past the one-workgroup cutoff, so decode
+    # uses the row-bounded radix. Only the first 30 pages are present.
     wide = tuple(range(30, 1280))
-    run(4, 20480, wide, "indexer split radix filled the budget from a missing page")
     run(
         4,
         20480,
         wide,
-        "indexer streaming radix filled the budget from a missing page",
+        "indexer row-bounded radix filled the budget from a missing page",
+    )
+    run(
+        4,
+        20480,
+        wide,
+        "indexer padded row-bounded radix filled the budget from a missing page",
         table_pages=2560,
     )
     run(
         4,
         20480,
         wide,
-        "indexer captured radix filled the budget from a missing page",
+        "indexer captured row-bounded radix filled the budget from a missing page",
         capture=True,
     )
 
@@ -3821,9 +3848,12 @@ def bench_qsa_flash_next_indexer(
     """Flash-Next FlyDSL indexer vs oracle set equality.
 
     Short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
-    into an fp32 score matrix. Selection is decode radix below 32768 columns
-    and streaming radix at or above that width. Single-request prefill scores
-    16 query rows per workgroup. The FlyDSL column times block ids and then
+    into an fp32 score matrix. Decode on a table wider than 20000 columns
+    selects with the row-bounded radix, which stops at each row's visible
+    length. Prefill (more than 64 rows) keeps the allocation width and
+    uses the stable decode radix. A packed table at or under 20000 columns
+    uses that radix as well. Single-request prefill scores 16 query rows
+    per workgroup. The FlyDSL column times block ids and then
     ``qsa_expand_block_indices``. Set equality stays on block ids. Same
     ``rotate`` on every select column.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
@@ -3831,11 +3861,10 @@ def bench_qsa_flash_next_indexer(
     serving cache span. The layer bench takes the same layout.
 
     When ``M`` is at most 64 and the table is wider than 20000 columns, one
-    more column replays the select under HIP-graph capture. FlyDSL capture
-    selects the one-workgroup radix; the eager FlyDSL column readbacks the
-    live width and streams past 32768 columns. The replay uses one hot
-    buffer set and does not follow ``rotate``. Shorter tables leave the
-    graph column out.
+    more column replays the select under HIP-graph capture. The eager
+    column and the replay both use the row-bounded radix on the full width.
+    The replay uses one hot buffer set and does not follow ``rotate``.
+    Shorter tables leave the graph column out.
     ``--batch 4 16 64 --seq 131072 263424 --page-size 392`` is the long
     decode: 263424 tokens fill 65856 columns, 168 pages of 392. Batches
     above 8 print in the prefill table.
@@ -3898,9 +3927,8 @@ def bench_qsa_flash_next_indexer(
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
-    # Capture takes the one-workgroup radix on a padded decode table.
-    # The eager column above readbacks and streams once the live width
-    # crosses 32768 columns, so the two FlyDSL times are the two selectors.
+    # Padded decode uses the row-bounded radix on the full width, eager
+    # and captured. The graph column times replay of that same selector.
     n_columns = int(index_table.shape[1]) * int(page_size)
     if (
         m <= qsa_paged._DECODE_MAX_ROWS

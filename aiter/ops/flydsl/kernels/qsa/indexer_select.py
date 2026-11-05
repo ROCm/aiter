@@ -8,8 +8,7 @@ budget, packed past any missing page. ``build_qsa_pack_valid_blocks_module``
 does the same for a selector that keeps ``-inf`` columns.
 ``build_qsa_indexer_decode_scores_module`` and
 ``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
-MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
-visible column count. Host dispatch and top-512 selection live in
+MFMA scorers. Host dispatch and top-512 selection live in
 ``aiter.ops.flydsl.qsa_paged``.
 
 Every shape these kernels serve shares one indexer contract. The scorers
@@ -45,9 +44,10 @@ _D = 128
 _R = 4
 _KV_HEADS = 1
 _STREAM_SELECT_MIN_COLUMNS = 32768
-# Above this many rows, qsa_paged selects the stable decode radix at any
-# width. The streaming selector is only a packed table at or above
-# _STREAM_SELECT_MIN_COLUMNS with no more rows than this.
+# Above this many rows, qsa_paged keeps the allocation width and selects
+# the stable decode radix. Decode at or below this many rows, on a table
+# wider than the one-workgroup cutoff, selects with the row-bounded radix
+# and does not read the widest row back to the host.
 _DECODE_MAX_ROWS = 64
 # Columns per workgroup of the 16-row scorer.
 _ROWS_BLOCK_N = 64
@@ -1081,59 +1081,3 @@ def build_qsa_indexer_prefill_scores_module(
         )
 
     return launch_qsa_indexer_prefill_scores
-
-
-def build_qsa_indexer_active_columns_module():
-    """One thread, the widest visible column count, matching the scorers."""
-
-    @flyc.kernel(
-        name="qsa_indexer_active_columns",
-        known_block_size=[1, 1, 1],
-    )
-    def qsa_indexer_active_columns_kernel(
-        token_to_req: fx.Tensor,
-        query_positions: fx.Tensor,
-        context_lens: fx.Tensor,
-        out: fx.Tensor,
-        n_columns: Int32,
-        n_req: Int32,
-        rows: Int32,
-    ):
-        zero = Int32(0)
-        one = Int32(1)
-        for _row, state in range(zero, rows, one, init=[zero]):
-            local = state[0]
-            row = Int32(_row)
-            req = token_to_req[row]
-            valid_req = (req >= zero) & (req < n_req)
-            safe_req = valid_req.select(req, zero)
-            qpos = query_positions[row]
-            slen = valid_req.select(context_lens[safe_req], zero)
-            visible = fx.min(_compressed_span(qpos, slen), n_columns)
-            visible = valid_req.select(visible, zero)
-            local = fx.max(visible, local)
-            results = yield [local]
-        out[zero] = results
-
-    @flyc.jit
-    def launch_qsa_indexer_active_columns(
-        token_to_req: fx.Tensor,
-        query_positions: fx.Tensor,
-        context_lens: fx.Tensor,
-        out: fx.Tensor,
-        n_columns: Int32,
-        n_req: Int32,
-        rows: Int32,
-        stream: fx.Stream,
-    ):
-        qsa_indexer_active_columns_kernel(
-            token_to_req,
-            query_positions,
-            context_lens,
-            out,
-            n_columns,
-            n_req,
-            rows,
-        ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-
-    return launch_qsa_indexer_active_columns

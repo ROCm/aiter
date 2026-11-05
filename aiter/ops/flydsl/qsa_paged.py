@@ -5,8 +5,10 @@
 
 ``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
 compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
-use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix for
-prefill and below 32768 columns, and streaming radix for wider decode rows.
+use tiled BLOCK_N=32 BF16 MFMA scoring. Padded decode (more than 20000
+columns and at most 64 rows) selects with the row-bounded radix on the
+full width. Prefill keeps the allocation width and uses the stable decode
+radix. A packed table at or under 20000 columns uses that radix too.
 Batches averaging at least two query rows per request (prefill, mixed
 prefill and decode, MTP decode) score 16 rows by 64 columns per workgroup,
 and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
@@ -45,7 +47,6 @@ from .kernels.qsa.indexer_select import (
     _SCORE_HEADS,
     _SCORE_SCALE,
     _STREAM_SELECT_MIN_COLUMNS,
-    build_qsa_indexer_active_columns_module,
     build_qsa_indexer_decode_scores_module,
     build_qsa_indexer_emit_module,
     build_qsa_indexer_prefill_scores_module,
@@ -290,8 +291,8 @@ def _indexer_rows_scorer_layout(
 
     Long prefill walks four column tiles per workgroup to reuse Q and the row
     setup. Smaller batches give that reuse up to keep enough independent
-    workgroups on the GPU. A captured padded decode has no host-visible live
-    width, so it conservatively keeps one tile per workgroup.
+    workgroups on the GPU. Padded decode is row-bounded and has no
+    host-visible live width, so it keeps one tile per workgroup.
 
     MTP instead folds four heads into the MFMA M axis: a tile is four rows,
     and one column tile per workgroup keeps the machine full.
@@ -321,44 +322,6 @@ def _indexer_rows_scorer_layout(
     ):
         tiles_per_wg //= 2
     return False, tiles_per_wg
-
-
-@functools.lru_cache(maxsize=1)
-def _active_columns_plan():
-    return build_qsa_indexer_active_columns_module()
-
-
-def _indexer_max_visible_columns(
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    n_columns: int,
-) -> int:
-    """Widest visible column count, using the scorer's per-row formula.
-
-    One device reduction and one 4-byte readback. Callers only pay it for
-    a decode-sized batch whose allocation is wider than the one-workgroup
-    selector, which is the padded ``max_model_len`` table. A packed table
-    at or under that width already dispatches on its real column count,
-    and a prefill keeps the allocation width.
-    """
-    rows = int(token_to_req.shape[0])
-    n_req = int(context_lens.shape[0])
-    if rows == 0 or n_req == 0 or n_columns <= 0:
-        return 0
-    scratch = torch.empty(1, dtype=torch.int32, device=token_to_req.device)
-    _run_compiled(
-        _active_columns_plan(),
-        token_to_req,
-        query_positions,
-        context_lens,
-        scratch,
-        int(n_columns),
-        n_req,
-        rows,
-        torch.cuda.current_stream(token_to_req.device),
-    )
-    return int(scratch.item())
 
 
 def _check_indexer_score_workspace(
@@ -825,24 +788,15 @@ def _write_indexer_block_ids(
     n_columns = page_table.shape[1] * page_size
     # A packed table at or under the one-workgroup cutoff already names its
     # real width, so emit and the selector see it without a readback. A
-    # wider allocation is the padded max_model_len table. Decode (at most
-    # 64 rows) reads the widest visible row and dispatches on that. A
-    # prefill has too many rows for that readback to pay, and its selector
-    # stops at each row's length, so it keeps the allocation width. So
-    # does a graph capture: the readback is not allowed there, and the
-    # graph would replay the width of the capture batch. Decode under
-    # capture selects with the one-workgroup radix on the full width,
-    # which stops at each row's visible length. A row longer than 20000
-    # columns finishes the later radix passes from the first-pass
-    # candidates when those fit in LDS.
-    live_columns = n_columns
-    padded_decode = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
-    row_bounded = padded_decode and torch.cuda.is_current_stream_capturing()
-    if padded_decode and not row_bounded:
-        live_columns = _indexer_max_visible_columns(
-            token_to_req, query_positions, context_lens, n_columns
-        )
-    if live_columns <= _K:
+    # wider allocation with at most 64 rows is padded decode. Eager and
+    # capture both select with the one-workgroup radix on the full width.
+    # That radix stops at each row's visible length, so neither path reads
+    # the widest row back to the host. A row longer than 20000 columns
+    # finishes the later radix passes from the first-pass candidates when
+    # those fit in LDS. Prefill (more than 64 rows) keeps the allocation
+    # width and does not read it back.
+    row_bounded = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
+    if n_columns <= _K:
         _run_compiled(
             _emit_plan(page_size, get_warp_size(arch)),
             token_to_req,
@@ -868,7 +822,7 @@ def _write_indexer_block_ids(
             int(n_columns),
             float(score_scale),
             int(q.shape[1]),
-            live_columns=live_columns,
+            live_columns=int(n_columns),
             row_bounded=row_bounded,
             scores=scores,
         )
@@ -901,9 +855,11 @@ def qsa_indexer_block_ids(
     ``None`` allocates it. Emit does not read it. The buffer is overwritten
     and is not returned. Batches averaging two or more rows per request score 16
     query rows per workgroup, except gfx942 H=8; one-row decode uses one row
-    per workgroup. Selection is the stable decode radix for prefill (more
-    than 64 rows) and, otherwise, below 32768 columns; streaming radix
-    (``tie='low'``) at or above that width.
+    per workgroup. Padded decode (more than 20000 columns and at most 64
+    rows) selects with the one-workgroup radix on the full width and stops
+    at each row's visible length. Prefill (more than 64 rows) keeps the
+    allocation width and uses the stable decode radix. A packed table at
+    or under 20000 columns uses that radix as well.
     Expand+tail is still separate. An empty context, cache, or page table
     writes ``-1`` and does not launch. A page table with fewer request
     rows than ``context_lens`` is rejected.
