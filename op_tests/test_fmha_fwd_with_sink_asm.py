@@ -200,13 +200,14 @@ _PERF_SHAPES = [
 
 @benchmark()
 def test_fmha_fwd_with_sink_asm(
-    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init
+    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init, d64_sink=True
 ):
     torch.manual_seed(0)
     q, k, v = make_qkv_bshd(layout, sq, sk, batch, hq, hk, head_dim, init=init)
     scale = 1.0 / math.sqrt(head_dim)
-    # D64 -> non-zero sink (exercises ENABLE_SINK); D128 -> kernel ignores it.
-    sink = _d64_sink(hq) if head_dim == 64 else None
+    # D64 -> non-zero sink (exercises ENABLE_SINK), or none (the wrapper passes
+    # the kernel a -inf sink); D128 -> kernel ignores it.
+    sink = _d64_sink(hq) if head_dim == 64 and d64_sink else None
 
     ref_out, ref_lse = run_torch(q, k, v, is_causal=is_causal, sink=sink)
 
@@ -214,10 +215,12 @@ def test_fmha_fwd_with_sink_asm(
         batch, hq, hk, sq, sk, head_dim, is_causal, q.element_size()
     )
 
-    # The model calls the public dispatcher (flash_attn_func) → asm path.
+    # The model calls the public dispatcher (flash_attn_func) → asm path.  It
+    # sends D64 without a sink to another backend, so that case calls the ops.
+    via = "public" if head_dim != 64 or d64_sink else "ops"
     candidates = {
         "asm": lambda: run_kernel(
-            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public"
+            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via=via
         )
     }
 
@@ -329,11 +332,21 @@ def main():
         ):
             if not is_causal and sk % 256 != 0:  # mask=0 kernel needs sk%256==0
                 continue
-            df.append(
-                test_fmha_fwd_with_sink_asm(
-                    head_dim, hq, hk, sq, sk, batch, is_causal, layout, init
+            for d64_sink in (True, False) if head_dim == 64 else (True,):
+                df.append(
+                    test_fmha_fwd_with_sink_asm(
+                        head_dim,
+                        hq,
+                        hk,
+                        sq,
+                        sk,
+                        batch,
+                        is_causal,
+                        layout,
+                        init,
+                        d64_sink,
+                    )
                 )
-            )
     df = pd.DataFrame(df)
     aiter.logger.info(
         "fmha_fwd_with_sink_asm correctness summary (markdown):\n%s",
