@@ -17,7 +17,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from ..communication_ops_utils import (
     atomic_add_agent,
@@ -294,7 +294,7 @@ def _get_cached_partials(device, stream_id, rows, columns):
     return _allocate_partials(device, rows, columns)
 
 
-@cache
+@capture_scoped_cache
 def _get_cached_counter(device, stream_id, rows):
     with persistent_alloc(device):
         return torch.zeros((rows,), device=device, dtype=torch.int32)
