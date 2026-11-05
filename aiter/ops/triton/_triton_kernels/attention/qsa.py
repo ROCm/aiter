@@ -218,7 +218,7 @@ def _load_q_row(q_ptr, token, head, stride_q_token, stride_q_head, dims, mask):
 @triton.jit
 def _load_fp4_keys(packed_ptrs, exponent_ptrs, mask, dtype):
     """Low- and high-nibble values of the MXFP4 bytes at `packed_ptrs`, times
-    the group scales at `exponent_ptrs`, in `dtype` (exact)."""
+    the group scales at `exponent_ptrs`, in `dtype` (exact for BF16 / FP32)."""
     packed = tl.load(packed_ptrs, mask=mask, other=0).to(tl.int32)
     exponent = tl.load(exponent_ptrs, mask=mask, other=127).to(tl.int32)
     group_scale = _mxfp4_e8m0_to_fp32(exponent + 14)
