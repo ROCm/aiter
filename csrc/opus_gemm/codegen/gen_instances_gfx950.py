@@ -757,49 +757,17 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         kernel_func,
         fwd_decl_kargs_fnarg,
     )
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int /*splitK*/)   // persistent ignores splitK; shares launch-table signature
-{{{{
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-{k_check}
-    AITER_CHECK(!bias.has_value(),
-        "bias is not supported on a16w16_persistent kid; use a16w16 "
-        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
-
-    {kargs_name} kargs{{{{}}}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = XQ.stride(1);
-    kargs.stride_b = WQ.stride(1);
-    kargs.stride_c = N;
-    kargs.stride_a_batch = XQ.stride(0);
-    kargs.stride_b_batch = WQ.stride(0);
-    kargs.stride_c_batch = M * N;
-{grid_setup}
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx950_persistent_launcher.cuh.j2",
+        preamble=preamble,
+        host_tu_split=host_tu_split,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        k_check=k_check,
+        kargs_name=kargs_name,
+        grid_setup=grid_setup,
+        kernel_func=kernel_func,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
