@@ -135,8 +135,16 @@ jobs:
           # disables cudagraph capture in ATOM, so --level 0 (NO_COMPILATION) is
           # what bypasses the failing backend. The MXFP4 ATOM entry has no -tp,
           # so pin TP2 to match the do-mi350x-2 runner.
+          # gpt-oss-120b's ATOM config (--gpu-memory-utilization 0.5, single
+          # GPU) was tuned against a full-chip SPX GPU's memory. A DPX
+          # partition only has ~144 GiB total, so 0.5 utilization budgets
+          # ~72 GiB -- barely under the model's own ~70 GiB weight footprint,
+          # leaving a negative KV-cache budget (confirmed reproducible:
+          # "available_for_kv=-2.6..-2.7 GB" across two separate runs).
+          # -tp 2 shards the weights across 2 DPX partitions instead.
           model_extra_args_append = {
               "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
+              "gpt-oss-120b": "-tp 2",
           }
 
           def prepare_model(model):
