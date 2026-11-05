@@ -1180,14 +1180,16 @@ def fused_moe(
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
     ``deterministic=True`` gives bitwise the same output for a token whatever the
-    batch, and from run to run: one activation dtype at every token count, the
-    FlyDSL kernels with one K structure for every token count, no split-K, and
-    the non-atomic reduce epilogue in stage 2 (the top-k partials are summed in
-    a fixed order). It is supported on gfx950 for MXFP4 weights
+    batch, and from run to run: the FlyDSL kernels with one K structure for
+    every token count, no split-K, and the non-atomic reduce epilogue in stage 2
+    (the top-k partials are summed in a fixed order). It changes only the order
+    of the sums. Because the default picks the activation dtype by token count,
+    which would make a token's result depend on its batch, the caller chooses
+    one activation dtype with ``quant_dtype_a``, which is required with
+    ``deterministic=True``: today ``dtypes.fp8`` (MXFP8, the precision the
+    default uses from 256 tokens). It is supported on gfx950 for MXFP4 weights
     (``QuantType.per_1x32``, preshuffled gate/up-interleaved) with SwiGLU, bf16
-    output, without expert parallelism. The activations are quantized to MXFP8
-    (the precision the default uses from 256 tokens); MXFP4 activations are not
-    offered because they lose accuracy against the default.
+    output, without expert parallelism.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
@@ -1643,11 +1645,15 @@ def _fused_moe_impl(
     if deterministic:
         # The default picks the activation dtype by token count (bf16, then fp4
         # or fp8 above a bound), which would make results depend on the batch.
-        # Deterministic mode quantizes the activations to one dtype at every
-        # token count, per 1x32 block within a token's row, so a row's result
-        # does not depend on the other rows: MXFP8, which needs gate/up-interleaved
-        # weights.
-        q_dtype_a = quant_dtype_a if quant_dtype_a is not None else dtypes.fp8
+        # The caller fixes one dtype for every token count; it is quantized per
+        # 1x32 block within a token's row, so a row's result does not depend on
+        # the other rows.
+        if quant_dtype_a is None:
+            raise ValueError(
+                "fused_moe(deterministic=True) needs quant_dtype_a: the activation "
+                "dtype for every token count (dtypes.fp8, MXFP8, is supported)"
+            )
+        q_dtype_a = quant_dtype_a
         _check_deterministic_supported(
             dtype=dtype,
             quant_type=quant_type,

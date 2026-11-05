@@ -104,6 +104,9 @@ def _problem(M, model_dim, inter_dim, E, topk, bias=True, interleaved=True):
 
 
 def _run(p, rows, activation, deterministic, **kwargs):
+    if deterministic:
+        # Deterministic mode takes the activation dtype from the caller.
+        kwargs.setdefault("quant_dtype_a", dtypes.fp8)
     return fused_moe(
         p["inp"][rows],
         p["w1"],
@@ -296,6 +299,7 @@ def test_deterministic_rejects_unsupported():
         args = {
             "activation": ActivationType.Swiglu,
             "deterministic": True,
+            "quant_dtype_a": dtypes.fp8,
             "gate_mode": GateMode.INTERLEAVE.value,
         }
         args.update(kw)
@@ -311,6 +315,8 @@ def test_deterministic_rejects_unsupported():
             **args,
         )
 
+    with pytest.raises(ValueError, match="needs quant_dtype_a"):
+        call(quant_dtype_a=None)
     with pytest.raises(NotImplementedError, match="SwiGLU only"):
         call(activation=ActivationType.Silu)
     with pytest.raises(NotImplementedError, match="SwiGLU only"):
@@ -353,6 +359,7 @@ def test_deterministic_rejects_unsupported():
             activation=ActivationType.Swiglu,
             gate_mode=GateMode.INTERLEAVE.value,
             deterministic=True,
+            quant_dtype_a=dtypes.fp8,
         )
 
     # Widths the MXFP8 activation quantizer cannot take at small batches.
