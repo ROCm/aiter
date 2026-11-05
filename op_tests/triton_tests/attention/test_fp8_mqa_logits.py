@@ -250,3 +250,70 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
     assert diff < 1e-4, f"{diff=}"
+
+
+@pytest.mark.parametrize(
+    "s_q, s_k", [(1, 113), (61, 1024), (1024, 1560), (1019, 40000)]
+)
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("clean_logits", [True, False])
+@torch.inference_mode()
+def test_fp8_mqa_logits_into_caller_buffer(
+    s_q: int, s_k: int, num_heads: int, clean_logits: bool
+) -> None:
+    """With `logits=`, the scores land in the caller's view -- bit-identical to
+    the allocating path inside each row's range, -inf outside it with
+    clean_logits -- and nothing past a row's seq_len_kv columns or past the
+    view is written. Without clean_logits the rest of a row is unspecified:
+    a two-row tile walks both rows' ranges."""
+    torch.manual_seed(0)
+    head_dim = 128
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.randint(0, s_k // 2 + 1, (s_q,), dtype=torch.int, device="cuda")
+    span = torch.randint(1, s_k + 1, (s_q,), dtype=torch.int, device="cuda")
+    ke = torch.minimum(ks + span, torch.full_like(ks, s_k))
+    q_fp8 = q.to(e4m3_type)
+    expected = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+
+    pitch = (s_k + 255) // 256 * 256
+    plane = torch.full((s_q * pitch + 4096,), float("nan"), device="cuda")
+    view = plane[: s_q * pitch].view(s_q, pitch)[:, :s_k]
+    logits = fp8_mqa_logits(
+        q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits, logits=view
+    )
+    assert logits.data_ptr() == view.data_ptr()
+    cols = torch.arange(s_k, device="cuda")
+    inside = (cols[None, :] >= ks[:, None]) & (cols[None, :] < ke[:, None])
+    assert torch.equal(logits[inside], expected[inside])
+    if clean_logits:
+        assert torch.isneginf(logits[~inside]).all()
+    assert torch.isnan(plane[s_q * pitch :]).all()
+    assert torch.isnan(plane[: s_q * pitch].view(s_q, pitch)[:, s_k:]).all()
+
+
+@pytest.mark.parametrize("bad", ["shape", "pitch", "column_stride", "dtype"])
+@torch.inference_mode()
+def test_fp8_mqa_logits_refuses_a_malformed_buffer(bad: str) -> None:
+    s_q, s_k, num_heads, head_dim = 4, 300, 32, 128
+    q_fp8 = torch.randn(s_q, num_heads, head_dim, device="cuda").to(e4m3_type)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(
+        torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16), (0,), False
+    )
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+    buffers = {
+        "shape": torch.empty(s_q, s_k + 256, device="cuda")[:, : s_k - 1],
+        "pitch": torch.empty(s_q * s_k, device="cuda").as_strided(
+            (s_q, s_k), (s_k - 1, 1)
+        ),
+        "column_stride": torch.empty(s_k, s_q, device="cuda").t(),
+        "dtype": torch.empty(s_q, s_k, device="cuda", dtype=torch.float16),
+    }
+    with pytest.raises(ValueError):
+        fp8_mqa_logits(
+            q_fp8, kv_fp8, scales, weights, ks, ke, False, logits=buffers[bad]
+        )
