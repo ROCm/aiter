@@ -699,10 +699,13 @@ def _kda_reference(inputs: KdaInputs) -> torch.Tensor:
         device=_KDA_DEVICE,
     )
     dt_bias = inputs.dt_bias.view(_KDA_HEADS, _KDA_DIM)
+    # As in the kernel, negative (PAD_SLOT_ID) and out-of-range slots are
+    # padding: zero output, neither cache touched.
+    num_slots = min(inputs.state.shape[0], inputs.conv_state.shape[0])
 
     for batch_idx in range(batch):
         state_idx = int(inputs.state_indices[batch_idx])
-        if state_idx < 0:
+        if not 0 <= state_idx < num_slots:
             continue
 
         history = inputs.conv_state[state_idx]
@@ -1470,15 +1473,19 @@ def test_flydsl_kda_decode_out_of_range_slots_do_not_modify_caches(
     state_slots = inputs.state.shape[0] - 2
     assert state_slots < inputs.conv_state.shape[0]
     inputs.state = inputs.state[:state_slots]
+    # One live row shows the padding rows do not disturb it either.
+    live_slot = 1
     inputs.state_indices.copy_(
         torch.tensor(
-            [state_slots, state_slots + 1, 2**31 - 1, -1],
+            [state_slots, live_slot, 2**31 - 1, -1],
             dtype=torch.int32,
             device=_KDA_DEVICE,
         )
     )
     conv_before = inputs.conv_state.clone()
     state_before = inputs.state.clone()
+    reference_inputs = _copy_kda_inputs(inputs)
+    reference = _kda_reference(reference_inputs)
 
     if fused_f_b:
         actual = _run_kda_with_f_b(f_a, f_b_weight, inputs)
@@ -1486,9 +1493,16 @@ def test_flydsl_kda_decode_out_of_range_slots_do_not_modify_caches(
         actual = _run_kda(inputs)
     torch.cuda.synchronize()
 
-    assert torch.count_nonzero(actual) == 0
-    assert torch.equal(inputs.conv_state, conv_before)
-    assert torch.equal(inputs.state, state_before)
+    assert torch.count_nonzero(actual[:, [0, 2, 3]]) == 0
+    _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
+    _assert_kda_state_close(reference_inputs.state, inputs.state, "state")
+    assert torch.equal(reference_inputs.conv_state, inputs.conv_state)
+    for cache, before in (
+        (inputs.conv_state, conv_before),
+        (inputs.state, state_before),
+    ):
+        changed = (cache != before).flatten(1).any(dim=1).nonzero().flatten()
+        assert changed.tolist() == [live_slot]
 
 
 def _move_kda_to_large_caches(
