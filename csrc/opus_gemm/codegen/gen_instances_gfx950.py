@@ -1260,247 +1260,9 @@ def _assert_m_align(k, tile_mult):
     )
 
 
-# Body of the a8w8_mxscale BMM flatmm split-K launcher (mmajor layout), a
-# faithful port of opus_bmm_a8w8_mxscale_flatmm_splitk_impl() in
-# opus_bmm.cu. Written with @@TOKEN@@ placeholders + .replace() (NOT an
-# f-string) so the C++ body keeps plain single braces and stays trivially
-# reviewable against the hand-written original.
-#
-# Templated on D_C only to satisfy the codegen host-decl machinery
-# (one <fp32_t> instantiation); the body ignores D_C and branches on Y.dtype()
-# at runtime with native __bf16/float, exactly like the original. The fused
-# reduce path (splitK==2 counter variant) is intentionally NOT ported -- the
-# fused-reduce kid stays monolithic in opus_bmm.cu.
-_BMM_MXSCALE_SPLITK_LAUNCHER_BODY = r"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#ifndef OPUS_BMM_XCD_COUNTERS_DEFINED
-#define OPUS_BMM_XCD_COUNTERS_DEFINED
-#include <cstdlib>
-#include <map>
-#include <mutex>
-// Arrival counters for the same-XCD fused split-K, one int32 per (batch, tile).
-// Like FlyDSL, cache one buffer per (device, stream). Initialization and all
-// eager uses are ordered on that stream; another stream gets its own buffer.
-// The last split re-arms each counter, so subsequent launches need no memset.
-// Keep outgrown buffers alive: in-flight kernels or captured graphs may still
-// reference them. If this stream needs allocation during capture, return nullptr
-// for the workspace + reducer path. Warm up on the capture stream to use fusion.
-// Graphs sharing a buffer must replay in order, even on different replay streams.
-inline int* opus_bmm_xcd_counters(size_t n, hipStream_t stream)
-{
-  static const bool off = std::getenv("OPUS_BMM_NO_XCD_FUSE") != nullptr;
-  if (off) return nullptr;
-  struct Buf { int* p = nullptr; size_t capacity = 0; };
-  static std::mutex mu;
-  static std::map<int, std::map<hipStream_t, Buf>> bufs;
-  int dev = 0;
-  HIP_CALL(hipGetDevice(&dev));
-  std::lock_guard<std::mutex> lock(mu);
-  Buf& b = bufs[dev][stream];
-  if (b.capacity < n) {
-    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture));
-    if (capture != hipStreamCaptureStatusNone) return nullptr;
-    const size_t capacity = n > (size_t(1) << 14) ? n : (size_t(1) << 14);
-    int* p = nullptr;
-    HIP_CALL(hipMalloc(&p, capacity * sizeof(int)));
-    HIP_CALL(hipMemsetAsync(p, 0, capacity * sizeof(int), stream));
-    b.p = p;
-    b.capacity = capacity;
-  }
-  return b.p;
-}
-#endif
-// mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major
-// [batch, N, K]. Caller (opus_bmm.cu switch) does dtype/arch/common checks.
-template <typename D_C>
-void
-@@NAME@@(
-    aiter_tensor_t &O,
-    aiter_tensor_t &wo_a,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int splitK)
-{
-  using Traits = @@NAME@@_Traits;
-  constexpr bool DIRECT_ONLY = @@DIRECT@@;
-  constexpr bool PREFETCH_SCALE = @@PREFETCH@@;
-  constexpr bool PRELOAD_SF_LDS = @@PRELOAD@@;
-  // Whether a scale panel is really staged in LDS, which is what carries the K
-  // bound below. The shuffle_scale layout reads both panels from global and compiles the
-  // panel (and its bound) out, so a shuffle_scale kid runs any K even with PRELOAD_SF_LDS
-  // set -- mirrors SF_LDS_A || SF_LDS_B in the wave8 pipeline.
-  constexpr bool SF_PANEL_IN_LDS = @@PANEL@@;
-  // The workspace (splitK>1) specialization carries its own preload flag: it
-  // normally inherits the kid, but may differ as a per-instance workaround.
-  constexpr bool SPLITK_PRELOAD_SF_LDS = @@SPLITK_PRELOAD@@;
-
-  AITER_CHECK(splitK >= 1, "splitK must be >= 1");
-  if constexpr (DIRECT_ONLY) {
-    AITER_CHECK(splitK == 1, "@@NAME@@ consumer-self-load kernel requires splitK == 1");
-  }
-
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  // No M alignment at any tile size: A and SFA are bounded to the tile's valid row
-  // count, the split_k==1 store bounds C the same way, split_k>1 partials go to a
-  // workspace sized for padded_M, and both reducers touch only rows < M.
-  AITER_CHECK(N % Traits::B_N == 0,
-              "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-
-  const int split_k = splitK;
-  const bool no_split_k = (split_k == 1);
-  const int total_iters = K / Traits::B_K;
-  const int iters_full = (total_iters + split_k - 1) / split_k;
-  const int last_loops = total_iters - (split_k - 1) * iters_full;
-  AITER_CHECK(last_loops >= Traits::prefetch_k_iter,
-              "@@NAME@@ requires every split to have at least ",
-              Traits::prefetch_k_iter, " K-tiles; K=", K,
-              " gives total_iters=", total_iters, ", splitK=", split_k,
-              ", last split loops=", last_loops);
-  if constexpr (SF_PANEL_IN_LDS) {
-    // Mirrors the kernel's own bail-out on the LDS scale panel: past this bound
-    // it returns without writing Y, which a caller cannot tell apart from a
-    // GEMM that produced zeros. iters_full is the largest per-split loop count,
-    // so it is the one that has to fit.
-    //
-    // The shuffled panel has its own, smaller bound: its B half is twice the
-    // plain panel's because shuffle_scale_b duplicates each byte. Checking the
-    // plain bound for a shuffled kid would leave a window where the launcher
-    // passes and the kernel returns zeros.
-    constexpr int SF_K_TILES_MAX = @@PANELMAX@@;
-    AITER_CHECK(iters_full <= SF_K_TILES_MAX,
-                "@@NAME@@ preloads the scale panel into LDS and so takes at "
-                "most ", SF_K_TILES_MAX,
-                " K-tiles per split; K=", K, " with splitK=", split_k,
-                " gives ", iters_full);
-  }
-
-  const int num_tiles_m = (M + Traits::B_M - 1) / Traits::B_M;
-  const int num_tiles_n = (N + Traits::B_N - 1) / Traits::B_N;
-  const int padded_M = num_tiles_m * Traits::B_M;
-  const int padded_N = num_tiles_n * Traits::B_N;
-  const size_t required_numel = (size_t)split_k * (size_t)batch
-                              * (size_t)padded_M * (size_t)padded_N;
-
-  auto stream = aiter::getCurrentHIPStream();
-
-  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr();
-  kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_ws = nullptr;
-  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-  kargs.split_k = split_k;
-  kargs.stride_a = (int)O.stride(0);
-  kargs.stride_b = (int)wo_a.stride(1);
-  kargs.stride_ws = padded_N;
-  kargs.stride_a_batch = (int)O.stride(1);
-  kargs.stride_b_batch = (int)wo_a.stride(0);
-  kargs.stride_ws_batch = padded_M * padded_N;
-  kargs.ptr_sfa = x_scale.data_ptr();
-  kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.stride_sfa = (int)x_scale.stride(0);
-  kargs.stride_sfa_batch = (int)x_scale.stride(1);
-  kargs.stride_sfb = (int)w_scale.stride(1);
-  kargs.stride_sfb_batch = (int)w_scale.stride(0);
-
-  dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
-  dim3 block_main(Traits::BLOCK_SIZE);
-  if (no_split_k) {
-    AITER_CHECK(!workspace.has_value(),
-                "@@NAME@@ splitK == 1 does not use workspace");
-    kargs.ptr_c = Y.data_ptr();
-    kargs.stride_c = (int)Y.stride(0);
-    kargs.stride_c_batch = (int)Y.stride(1);
-    if (Y.dtype() == AITER_DTYPE_bf16) {
-      @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
-          <<<grid_main, block_main, 0, stream>>>(kargs);
-    } else {
-      @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
-          <<<grid_main, block_main, 0, stream>>>(kargs);
-    }
-    return;
-  }
-
-  if constexpr (!DIRECT_ONLY) {
-    AITER_CHECK(workspace.has_value(),
-                "@@NAME@@ splitK > 1 requires workspace");
-    void* workspace_ptr = opus_validate_workspace(
-        workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
-    kargs.ptr_ws = workspace_ptr;
-
-    // Same-XCD fused split-K: the splits reduce among themselves in the main
-    // kernel (see xcd_fused in the pipeline), so there is no reduce launch and
-    // no second pass over the workspace. Launched on the direct-output
-    // specialization, whose D_OUT the last split writes.
-    const size_t n_counters = (size_t)num_tiles_m * num_tiles_n * batch;
-    int* xcd_counters = @@XCD_FUSE@@ ? opus_bmm_xcd_counters(n_counters, stream) : nullptr;
-    if (xcd_counters) {
-      kargs.ptr_xcd_counters = xcd_counters;
-      kargs.ptr_c = Y.data_ptr();
-      kargs.stride_c = (int)Y.stride(0);
-      kargs.stride_c_batch = (int)Y.stride(1);
-      const int tiles_per_batch = num_tiles_m * num_tiles_n;
-      // Either form keeps a tile's splits on one XCD. @@XCD_SPLIT_IN_X@@ puts
-      // them in x, next to each other in dispatch order, the kernel recovering
-      // (tile, split) with divides by its compile-time split count; otherwise
-      // split is y, a whole grid row apart.
-      dim3 grid_xcd = @@XCD_SPLIT_IN_X@@
-          ? dim3((unsigned)((tiles_per_batch + 7) / 8 * 8 * split_k), 1u, (unsigned)batch)
-          : dim3((unsigned)((tiles_per_batch + 7) / 8 * 8), (unsigned)split_k,
-                 (unsigned)batch);
-      if (Y.dtype() == AITER_DTYPE_bf16) {
-        @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
-            <<<grid_xcd, block_main, 0, stream>>>(kargs);
-      } else {
-        @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
-            <<<grid_xcd, block_main, 0, stream>>>(kargs);
-      }
-      return;
-    }
-
-    // Pass all 4 template args explicitly (D_OUT=void: the split-K main kernel
-    // writes an fp32 workspace, so its output dtype is irrelevant; the reduce
-    // kernel casts to the runtime Y dtype). The fused host TU only sees a
-    // no-default forward decl of @@KERNEL@@, so relying on the template's
-    // default args here would fail overload resolution ("no matching function").
-    // The workspace specialization may use a lower-register-pressure scale
-    // path than this kid's tuned splitK=1 direct-output specialization, so it
-    // takes SPLITK_PRELOAD_SF_LDS rather than PRELOAD_SF_LDS. The trailing
-    // @@SFMPACK@@ args are unchanged: they describe the layout, not the split.
-    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, SPLITK_PRELOAD_SF_LDS@@SFMPACK@@>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-
-    constexpr int REDUCE_VEC = 8;
-    constexpr int REDUCE_BS = 128;
-    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
-                     batch * M, 1);
-    dim3 block_reduce(REDUCE_BS);
-    const int y_stride_c = (int)Y.stride(0);
-    const int y_stride_c_batch = (int)Y.stride(1);
-    if (Y.dtype() == AITER_DTYPE_bf16) {
-      opus_bmm_splitk_reduce_kernel<__bf16, REDUCE_VEC, REDUCE_BS>
-          <<<grid_reduce, block_reduce, 0, stream>>>(
-              workspace_ptr, reinterpret_cast<__bf16*>(Y.data_ptr()),
-              split_k, M, N, batch, padded_M, padded_N,
-              y_stride_c, y_stride_c_batch);
-    } else {
-      opus_bmm_splitk_reduce_kernel<float, REDUCE_VEC, REDUCE_BS>
-          <<<grid_reduce, block_reduce, 0, stream>>>(
-              workspace_ptr, reinterpret_cast<float*>(Y.data_ptr()),
-              split_k, M, N, batch, padded_M, padded_N,
-              y_stride_c, y_stride_c_batch);
-    }
-  }
-}
-#endif // launcher only on regular host pass
-"""
+# Body of the a8w8_mxscale BMM flatmm split-K launcher lives in
+# codegen/templates/gfx950_bmm_mxscale_splitk_launcher.cuh.j2, rendered via
+# render_template() in gen_bmm_mxscale_flatmm_splitk_instance.
 
 
 def gen_bmm_mxscale_flatmm_splitk_instance(
@@ -1600,63 +1362,52 @@ __global__ void opus_bmm_splitk_reduce_kernel(
             ", true" if k.sf_shuf_in_lds else ", false"
         )
 
-    launcher = (
-        _BMM_MXSCALE_SPLITK_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace(
-            "@@XCD_FUSE@@",
-            (
-                "Traits::XCD_FUSE"
-                if kernel_func
-                in (
-                    "gemm_a8w8_mxscale_flatmm_splitk_kernel",
-                    "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
-                    "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
-                )
-                else "false"
-            ),
-        )
-        .replace(
-            "@@XCD_SPLIT_IN_X@@",
-            (
-                "true"
-                if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel"
-                else "false"
-            ),
-        )
-        .replace("@@DIRECT@@", "true" if k.direct_only else "false")
-        .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
-        .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
+    launcher = render_template(
+        "gfx950_bmm_mxscale_splitk_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
+        xcd_fuse=(
+            "Traits::XCD_FUSE"
+            if kernel_func
+            in (
+                "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+                "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
+                "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+            )
+            else "false"
+        ),
+        xcd_split_in_x=(
+            "true"
+            if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel"
+            else "false"
+        ),
+        direct="true" if k.direct_only else "false",
+        prefetch="true" if k.prefetch_scale else "false",
+        preload="true" if k.preload_sf else "false",
         # A shuffled kid reads both panels from global and compiles the LDS panel
         # and its K bound out -- unless sf_shuf_in_lds puts it back, which is why
         # that term stands on its own rather than under preload_sf (a flatmm
         # panel kid necessarily has preload_sf False, the two panels being
         # alternative fills of the same LDS). Drop it and the kid skips the bound
         # and returns a fast buffer of zeros.
-        .replace(
-            "@@PANEL@@",
-            (
-                "true"
-                if ((k.preload_sf and not k.shuffle_scale) or k.sf_shuf_in_lds)
-                else "false"
-            ),
-        )
-        .replace(
-            "@@PANELMAX@@",
-            (
-                "Traits::SF_SHUF_K_TILES_MAX"
-                if k.sf_shuf_in_lds
-                else (
-                    "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
-                    if k.preload_sf
-                    # No panel: the bound is compiled out, and the wave1 traits
-                    # carry no panel geometry to name.
-                    else "0"
-                )
-            ),
-        )
-        .replace("@@SFMPACK@@", sfmpack)
-        .replace("@@SPLITK_PRELOAD@@", "true" if workspace_preload_sf else "false")
+        panel=(
+            "true"
+            if ((k.preload_sf and not k.shuffle_scale) or k.sf_shuf_in_lds)
+            else "false"
+        ),
+        panelmax=(
+            "Traits::SF_SHUF_K_TILES_MAX"
+            if k.sf_shuf_in_lds
+            else (
+                "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
+                if k.preload_sf
+                # No panel: the bound is compiled out, and the wave1 traits
+                # carry no panel geometry to name.
+                else "0"
+            )
+        ),
+        sfmpack=sfmpack,
+        splitk_preload="true" if workspace_preload_sf else "false",
     )
 
     INSTANCE_IMPL = (
@@ -1731,85 +1482,8 @@ __global__ void opus_bmm_splitk_reduce_kernel(
         _dev("void", "void", "false", prefetch, splitk_preload)
 
 
-_BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY = r"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-// M-tile interleaved launcher: MI=2 consecutive M tiles per WG share the B
-// stream (requires M % (MI*B_M) == 0). splitK arg is unused (must be 1). mmajor:
-// O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major [batch,N,K].
-// Caller (opus_bmm.cu dispatch) does dtype/arch/common checks.
-template <typename D_C>
-void
-@@NAME@@(
-    aiter_tensor_t &O,
-    aiter_tensor_t &wo_a,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int splitK)
-{
-  using Traits = @@NAME@@_Traits;
-  constexpr bool SKIP_SCALE_WAIT = @@SKIP@@;
-  constexpr int MI = 2;
-  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
-  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
-
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  AITER_CHECK(M % (MI * Traits::B_M) == 0,
-              "@@NAME@@ requires M % ", (MI * Traits::B_M), " == 0, got ", M);
-  AITER_CHECK(N % Traits::B_N == 0,
-              "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-  const int total_iters = K / Traits::B_K;
-  AITER_CHECK(total_iters >= Traits::prefetch_k_iter,
-              "@@NAME@@ requires at least ", Traits::prefetch_k_iter,
-              " K-tiles, got ", total_iters);
-
-  auto stream = aiter::getCurrentHIPStream();
-
-  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr();
-  kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_ws = nullptr;
-  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-  const int num_tiles_m = M / Traits::B_M;
-  const int num_tiles_n = N / Traits::B_N;
-  kargs.split_k = MI;
-  kargs.stride_a = (int)O.stride(0);
-  kargs.stride_b = (int)wo_a.stride(1);
-  kargs.stride_a_batch = (int)O.stride(1);
-  kargs.stride_b_batch = (int)wo_a.stride(0);
-  kargs.ptr_sfa = x_scale.data_ptr();
-  kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.stride_sfa = (int)x_scale.stride(0);
-  kargs.stride_sfa_batch = (int)x_scale.stride(1);
-  kargs.stride_sfb = (int)w_scale.stride(1);
-  kargs.stride_sfb_batch = (int)w_scale.stride(0);
-  kargs.ptr_c = Y.data_ptr();
-  kargs.stride_c = (int)Y.stride(0);
-  kargs.stride_c_batch = (int)Y.stride(1);
-
-  const int split_m = num_tiles_m / MI;          // M-tile groups (WGs along M)
-  constexpr int NUM_XCD = 8;
-  const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
-  kargs.stride_ws = split_m;
-  kargs.stride_ws_batch = m_grp_per_xcd;
-  dim3 grid_main(NUM_XCD * m_grp_per_xcd * num_tiles_n, 1, batch);
-  dim3 block_main(Traits::BLOCK_SIZE);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Traits, __bf16, SKIP_SCALE_WAIT>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<Traits, float, SKIP_SCALE_WAIT>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
+# Body of the a8w8_mxscale BMM M-tile-interleave launcher lives in
+# codegen/templates/gfx950_bmm_mxscale_minterleave_launcher.cuh.j2.
 
 
 def gen_bmm_mxscale_minterleave_instance(
@@ -1861,10 +1535,11 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         fwd_decl_kargs_fnarg,
     )
 
-    launcher = (
-        _BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace("@@SKIP@@", "true" if k.skip_scale_wait else "false")
+    launcher = render_template(
+        "gfx950_bmm_mxscale_minterleave_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
+        skip="true" if k.skip_scale_wait else "false",
     )
 
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"

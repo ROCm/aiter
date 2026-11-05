@@ -1,0 +1,78 @@
+
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+// M-tile interleaved launcher: MI=2 consecutive M tiles per WG share the B
+// stream (requires M % (MI*B_M) == 0). splitK arg is unused (must be 1). mmajor:
+// O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major [batch,N,K].
+// Caller (opus_bmm.cu dispatch) does dtype/arch/common checks.
+template <typename D_C>
+void
+[[ name ]](
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
+{
+  using Traits = [[ name ]]_Traits;
+  constexpr bool SKIP_SCALE_WAIT = [[ skip ]];
+  constexpr int MI = 2;
+  AITER_CHECK(splitK == 1, "[[ name ]] requires splitK == 1");
+  AITER_CHECK(!workspace.has_value(), "[[ name ]] does not use workspace");
+
+  const int M = O.size(0);
+  const int batch = O.size(1);
+  const int N = wo_a.size(1);
+  const int K = O.size(2);
+  AITER_CHECK(M % (MI * Traits::B_M) == 0,
+              "[[ name ]] requires M % ", (MI * Traits::B_M), " == 0, got ", M);
+  AITER_CHECK(N % Traits::B_N == 0,
+              "[[ name ]] requires N % ", Traits::B_N, " == 0, got ", N);
+  AITER_CHECK(K % Traits::B_K == 0,
+              "[[ name ]] requires K % ", Traits::B_K, " == 0, got ", K);
+  const int total_iters = K / Traits::B_K;
+  AITER_CHECK(total_iters >= Traits::prefetch_k_iter,
+              "[[ name ]] requires at least ", Traits::prefetch_k_iter,
+              " K-tiles, got ", total_iters);
+
+  auto stream = aiter::getCurrentHIPStream();
+
+  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
+  kargs.ptr_a = O.data_ptr();
+  kargs.ptr_b = wo_a.data_ptr();
+  kargs.ptr_ws = nullptr;
+  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+  const int num_tiles_m = M / Traits::B_M;
+  const int num_tiles_n = N / Traits::B_N;
+  kargs.split_k = MI;
+  kargs.stride_a = (int)O.stride(0);
+  kargs.stride_b = (int)wo_a.stride(1);
+  kargs.stride_a_batch = (int)O.stride(1);
+  kargs.stride_b_batch = (int)wo_a.stride(0);
+  kargs.ptr_sfa = x_scale.data_ptr();
+  kargs.ptr_sfb = w_scale.data_ptr();
+  kargs.stride_sfa = (int)x_scale.stride(0);
+  kargs.stride_sfa_batch = (int)x_scale.stride(1);
+  kargs.stride_sfb = (int)w_scale.stride(1);
+  kargs.stride_sfb_batch = (int)w_scale.stride(0);
+  kargs.ptr_c = Y.data_ptr();
+  kargs.stride_c = (int)Y.stride(0);
+  kargs.stride_c_batch = (int)Y.stride(1);
+
+  const int split_m = num_tiles_m / MI;          // M-tile groups (WGs along M)
+  constexpr int NUM_XCD = 8;
+  const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
+  kargs.stride_ws = split_m;
+  kargs.stride_ws_batch = m_grp_per_xcd;
+  dim3 grid_main(NUM_XCD * m_grp_per_xcd * num_tiles_n, 1, batch);
+  dim3 block_main(Traits::BLOCK_SIZE);
+  if (Y.dtype() == AITER_DTYPE_bf16) {
+    [[ kernel ]]<Traits, __bf16, SKIP_SCALE_WAIT>
+        <<<grid_main, block_main, 0, stream>>>(kargs);
+  } else {
+    [[ kernel ]]<Traits, float, SKIP_SCALE_WAIT>
+        <<<grid_main, block_main, 0, stream>>>(kargs);
+  }
+}
+#endif // launcher only on regular host pass
