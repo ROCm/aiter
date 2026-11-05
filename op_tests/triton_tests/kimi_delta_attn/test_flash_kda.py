@@ -1568,6 +1568,20 @@ def test_no_targets_take_no_snapshot_path(monkeypatch):
     assert torch.equal(ht, ht_ref)
 
 
+def test_snapshot_out_must_be_contiguous():
+    """A strided `snapshot_out` is rejected, not silently packed into a clone."""
+    args = make_inputs(1, 256, 4)
+    strided = torch.empty(1, 4, K_DIM, 2 * K_DIM, device=device)[..., :K_DIM]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError, match="snapshot_out must be a contiguous"):
+        flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            snapshot_targets=((0, 128),),
+            snapshot_out=strided,
+        )
+
+
 def test_snapshot_arguments_are_checked():
     args = make_inputs(1, 256, 4)
     good = torch.empty(1, 4, K_DIM, K_DIM, device=device)

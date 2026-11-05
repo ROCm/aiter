@@ -1241,7 +1241,7 @@ def _check_paged_state_cache(
         raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
 
 
-@input_guard(skip=("q", "k", "v", "g", "state_cache", "out"))
+@input_guard(skip=("q", "k", "v", "g", "state_cache", "out", "snapshot_out"))
 def flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1310,7 +1310,9 @@ def flash_kda_fwd(
                             Triton, which is the only K2 that stores them.
         snapshot_out:       ``[len(snapshot_targets), H, V, K]`` when
                             ``state_v_first`` else ``[.., H, K, V]``, on the
-                            device of ``q``; row ``i`` receives target ``i``.
+                            device of ``q``, and contiguous: it is written in
+                            place rather than packed by ``input_guard``. Row
+                            ``i`` receives target ``i``.
                             Cast as the final state is, so in ``final_state``'s
                             dtype it holds the bits that a forward ending at
                             ``off`` returns as its final state, when that
