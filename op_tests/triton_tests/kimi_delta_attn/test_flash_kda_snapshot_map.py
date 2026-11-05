@@ -8,7 +8,10 @@ grid. Pass C stores row ``rows[chunk_base + j]`` when it enters chunk ``j`` of
 a segment. These tests walk that loop on the CPU, with the reference
 recurrence moving the state forward one chunk at a time. Then they compare each
 stored state with the reference run over the first ``off`` tokens only. They
-need no GPU, so they test the placement apart from the kernel.
+launch no kernel, so they test the placement apart from it. They still need
+an importable aiter, as on the CI runners: importing the helper runs the
+``kimi_delta_attn`` package, whose ``flash_kda`` reads the GPU architecture at
+import.
 """
 
 import random
