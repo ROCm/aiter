@@ -1605,13 +1605,12 @@ def main() -> None:
         run_csv_scenario(args)
         return
 
-    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
-    # K tiles).
-    if args.model_dim < 512 or args.inter_dim < 512:
+    # The >=256 floor is a FlyDSL grouped-kernel constraint (two K tiles at
+    # tile_k=128; e.g. Kimi-K3 TP8 runs inter_dim=384).
+    if args.model_dim < 256 or args.inter_dim < 256:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
-            "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
-            "least two K tiles)."
+            "at least 256 for the grouped GEMM kernels (two K tiles at tile_k=128)."
         )
 
     set_data_format(args.data_format)
