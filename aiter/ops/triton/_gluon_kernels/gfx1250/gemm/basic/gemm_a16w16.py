@@ -487,9 +487,11 @@ def _compute_bound_accumulate(
     WMMA_LAYOUT: gl.constexpr,
     OPERAND_LAYOUT_A: gl.constexpr,
     OPERAND_LAYOUT_B: gl.constexpr,
+    CACHE_A: gl.constexpr = "",
 ):
     """The fp32 (BLOCK_M, BLOCK_N) tile (pid_m, pid_n) of A @ B: the K pipeline of
-    `_gemm_a16w16_compute_bound_kernel` (see there), shared with its variants."""
+    `_gemm_a16w16_compute_bound_kernel` (see there), shared with its variants.
+    CACHE_A is the cache modifier of the TDM loads of A."""
     # Descriptors start at this block's (M, N) offset by biasing the base
     # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
@@ -563,7 +565,10 @@ def _compute_bound_accumulate(
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc,
+            [0, 0],
+            a_buffer.index(load_idx % NUM_BUFFERS),
+            cache_modifier=CACHE_A,
         )
         gl.amd.gfx1250.tdm.async_load(
             b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
@@ -627,7 +632,10 @@ def _compute_bound_accumulate(
 
     # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
     gl.amd.gfx1250.tdm.async_load(
-        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        a_desc,
+        [0, 0],
+        a_buffer.index(load_idx % NUM_BUFFERS),
+        cache_modifier=CACHE_A,
     )
     gl.amd.gfx1250.tdm.async_load(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
@@ -698,7 +706,10 @@ def _compute_bound_accumulate(
 
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc,
+            [0, 0],
+            a_buffer.index(load_idx % NUM_BUFFERS),
+            cache_modifier=CACHE_A,
         )
         gl.amd.gfx1250.tdm.async_load(
             b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
@@ -784,7 +795,10 @@ def _compute_bound_accumulate(
         )
 
     gl.amd.gfx1250.tdm.async_load(
-        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        a_desc,
+        [0, 0],
+        a_buffer.index(load_idx % NUM_BUFFERS),
+        cache_modifier=CACHE_A,
     )
     gl.amd.gfx1250.tdm.async_load(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
