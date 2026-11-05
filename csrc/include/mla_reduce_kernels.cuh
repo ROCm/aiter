@@ -560,6 +560,9 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
                                       p_lds_lse_scale,
                                       partial_output_seq_byte_offset,
                                       g_final_output);
+
+        // Warp 0 rewrites p_lds_lse_scale for the next row; wait until every warp has read it.
+        __syncthreads();
     }
 }
 
