@@ -812,18 +812,18 @@ def _grouped_a8w4_tdm_moe(
         _deferred = _take_deferred_topk(topk_ids, topk_weight)
         if _deferred is not None:
             _quant_mode_early = "fp4" if data_format == "fp4" else "fp8"
-            if (
+            _fusable = (
                 not _compact
                 and a1_scale is None
                 and hidden_states.dim() == 2
-                and fused_topk_route_quant_supported(
-                    _deferred.gating_output,
-                    hidden_states,
-                    topk,
-                    _deferred.renormalize,
-                )
                 and int(E) == _deferred.gating_output.shape[1]
                 and _same_count(_deferred.num_valid_rows, num_local_tokens)
+            )
+            if _fusable and fused_topk_route_quant_supported(
+                _deferred.gating_output,
+                hidden_states,
+                topk,
+                _deferred.renormalize,
             ):
                 _prepared_a1 = fused_topk_route_quant(
                     _deferred.gating_output,
@@ -833,6 +833,29 @@ def _grouped_a8w4_tdm_moe(
                     contiguous_m=contiguous_m,
                     wmma_rep=wmma_rep,
                     quant_mode=_quant_mode_early,
+                    num_valid_rows=_deferred.num_valid_rows,
+                    topk_weights=topk_weight,
+                    topk_ids=topk_ids,
+                )
+            elif (
+                _fusable
+                and _quant_mode_early == "fp4"
+                and fused_topk_route_quant_prefill_supported(
+                    _deferred.gating_output,
+                    hidden_states,
+                    topk,
+                    _deferred.renormalize,
+                )
+            ):
+                # Prefill sizes: the same outputs from two launches in place of
+                # the eight of the split path below.
+                _prepared_a1 = fused_topk_route_quant_prefill(
+                    _deferred.gating_output,
+                    hidden_states,
+                    topk,
+                    align_m=_align_m,
+                    contiguous_m=contiguous_m,
+                    wmma_rep=wmma_rep,
                     num_valid_rows=_deferred.num_valid_rows,
                     topk_weights=topk_weight,
                     topk_ids=topk_ids,
@@ -2263,6 +2286,230 @@ def fused_topk_route_quant(
         int(token_num),
         int(gating_output.stride(0)),
         int(grid),
+        stream=torch.cuda.current_stream(),
+    )
+    return (
+        topk_weights,
+        topk_ids,
+        masked_m,
+        topids_to_rows.view(token_num, topk),
+        psum,
+        payload,
+        scale,
+    )
+
+
+@functools.cache
+@fast_jit_result
+def _get_compiled_topk_route_quant_prefill(
+    experts: int,
+    topk: int,
+    feat_dim: int,
+    align_m: int,
+    slots: int,
+    waves: int,
+    quant_mode: str,
+):
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
+        build_moe_topk_route_quant_prefill_module,
+    )
+
+    return build_moe_topk_route_quant_prefill_module(
+        experts=experts,
+        topk=topk,
+        feat_dim=feat_dim,
+        align_m=align_m,
+        slots=slots,
+        waves=waves,
+        quant_mode=quant_mode,
+    )
+
+
+@functools.cache
+@fast_jit_result
+def _get_compiled_prefill_scale_preshuffle(row_bytes: int, wmma_rep: int):
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
+        build_moe_prefill_scale_preshuffle_module,
+    )
+
+    return build_moe_prefill_scale_preshuffle_module(row_bytes, wmma_rep)
+
+
+_PREFILL_STATUS: dict[str, torch.Tensor] = {}
+
+
+def _topk_route_quant_prefill_status(device) -> torch.Tensor:
+    """The prefill kernel's status words (per-expert running counts, arrival
+    and departure counters, a sticky timeout flag). Zeroed once here; every
+    launch leaves it zero again (its last workgroup out resets it), so graph
+    replays need no memset. One per device: launches on one device must not
+    overlap (one stream, as the MoE runs)."""
+    key = str(device)
+    buf = _PREFILL_STATUS.get(key)
+    if buf is None:
+        from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
+            status_words,
+        )
+
+        buf = torch.zeros(status_words(256), dtype=torch.int32, device=device)
+        _PREFILL_STATUS[key] = buf
+    return buf
+
+
+def topk_route_quant_prefill_timed_out(device) -> bool:
+    """Whether a prefill launch's arrival wait ever timed out (sticky)."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
+        _status_error,
+    )
+
+    buf = _PREFILL_STATUS.get(str(device))
+    return buf is not None and int(buf[_status_error(256)].item()) != 0
+
+
+@functools.cache
+def _num_cus(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _prefill_geometry(token_num: int, device) -> tuple[int, int, int, int]:
+    """(grid, tokens per workgroup, slots, waves) of the prefill kernel: one
+    workgroup a CU at most, a contiguous run of tokens each, the fewest waves
+    that hold them (a wave launch is not free: 32 waves on every CU take
+    several us to start)."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import WAVE_CHOICES
+
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    grid = max(1, min(_num_cus(idx), int(token_num)))
+    tpw = -(-int(token_num) // grid)
+    grid = -(-int(token_num) // tpw)
+    waves = next((w for w in WAVE_CHOICES if w >= tpw), WAVE_CHOICES[-1])
+    return grid, tpw, -(-tpw // waves), waves
+
+
+def fused_topk_route_quant_prefill_supported(
+    gating_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> bool:
+    """Whether ``fused_topk_route_quant_prefill`` serves this call: the decode
+    kernel's operand rules, more than its ``MAX_ROWS`` rows and at most
+    ``MAX_SLOTS * 32`` a CU."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
+        MAX_SLOTS,
+        WAVE_CHOICES,
+    )
+
+    if not (
+        renormalize
+        and 1 <= topk <= 16
+        and gating_output.dim() == 2
+        and gating_output.shape[1] == 256
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and hidden_states.dim() == 2
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and gating_output.shape[0] == hidden_states.shape[0]
+        and hidden_states.shape[1] % 256 == 0
+        # Two 32-row stages of hidden rows in LDS.
+        and hidden_states.shape[1] * 2 * 32 * 2 <= 300 * 1024
+        and get_gfx() == "gfx1250"
+    ):
+        return False
+    m = int(hidden_states.shape[0])
+    idx = hidden_states.device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    return MAX_ROWS < m <= _num_cus(idx) * MAX_SLOTS * WAVE_CHOICES[-1]
+
+
+def fused_topk_route_quant_prefill(
+    gating_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk: int,
+    *,
+    align_m: int,
+    contiguous_m: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+    num_valid_rows: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+):
+    """Two launches for the prefill front end of the grouped MoE, in place of
+    eight: ``topk_softmax(renormalize)`` + the route/psum/remap + the
+    token-multidest quant (payload to every route's grouped row, compact e8m0
+    rows) in one kernel, then the e8m0 rows into MoE1's WMMA-interleaved
+    layout (``moe_scatter_preshuffle_scale``'s pass, bounded by psum). Same
+    returns and layouts as ``fused_topk_route_quant`` (rows inside an expert in
+    another order). fp4 only (the a8w4 / fp4 MoE's activation format).
+    """
+    if quant_mode != "fp4":
+        raise NotImplementedError("the prefill route/quant writes MXFP4 only")
+    device = hidden_states.device
+    token_num, feat_dim = hidden_states.shape
+    experts = int(gating_output.shape[1])
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import COUNT_BITS
+
+    assert token_num * topk < (1 << COUNT_BITS), "status words count 20-bit routes"
+    if topk_weights is None:
+        topk_weights = torch.empty(
+            (token_num, topk), dtype=torch.float32, device=device
+        )
+    if topk_ids is None:
+        topk_ids = torch.empty((token_num, topk), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    payload_bytes = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    payload = torch.empty(
+        (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
+    )
+    # The kernel writes row_to_token for every route row and -1 on each
+    # expert's tile padding; the preshuffle bounds the rest by psum, so
+    # neither buffer needs a fill.
+    compact = torch.empty((token_num, feat_dim // 32), dtype=torch.uint8, device=device)
+    row_to_token = torch.empty(int(contiguous_m), dtype=torch.int32, device=device)
+    if num_valid_rows is None:
+        nvr = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        nvr = num_valid_rows.reshape(-1)[:1].to(dtype=torch.int32)
+    grid, tpw, slots, waves = _prefill_geometry(token_num, device)
+    _get_compiled_topk_route_quant_prefill(
+        experts, int(topk), int(feat_dim), int(align_m), slots, waves, quant_mode
+    )(
+        ptr_arg(gating_output),
+        ptr_arg(hidden_states),
+        ptr_arg(nvr),
+        ptr_arg(topk_weights),
+        ptr_arg(topk_ids),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(psum),
+        ptr_arg(payload),
+        ptr_arg(compact),
+        ptr_arg(row_to_token),
+        ptr_arg(_topk_route_quant_prefill_status(device)),
+        int(token_num),
+        int(gating_output.stride(0)),
+        int(tpw),
+        int(grid),
+        stream=torch.cuda.current_stream(),
+    )
+    scale_w = feat_dim // 32
+    scale = torch.empty(
+        (1, contiguous_m // wmma_rep, scale_w * wmma_rep),
+        dtype=torch.uint8,
+        device=device,
+    )
+    _get_compiled_prefill_scale_preshuffle(scale_w, int(wmma_rep))(
+        ptr_arg(compact),
+        ptr_arg(scale),
+        ptr_arg(row_to_token),
+        ptr_arg(psum[experts - 1 :]),
+        int(contiguous_m) // (int(wmma_rep) * 16),
         stream=torch.cuda.current_stream(),
     )
     return (
