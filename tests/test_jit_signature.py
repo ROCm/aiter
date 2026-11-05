@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
+from conftest import requires_built_aiter
 
-aiter = pytest.importorskip("aiter", reason="needs a built AITER")
+requires_built_aiter()
 
 
 def test_a_compiled_op_reports_its_own_parameters():

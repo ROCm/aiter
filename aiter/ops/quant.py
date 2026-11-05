@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -61,6 +62,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+@_route(op="pertoken_quant", version=1)
 def pertoken_quant(
     x,
     scale=None,

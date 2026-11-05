@@ -1,1 +1,14 @@
-{}
+{
+  "pertoken_quant": {
+    "fingerprint": "ffb84335bd354c41",
+    "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",
+    "source": "aiter/ops/quant.py",
+    "version": 1
+  },
+  "rmsnorm": {
+    "fingerprint": "3190ea5beaa66c31",
+    "signature": "out:positional:Tensor, input:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, -> None",
+    "source": "aiter/ops/rmsnorm.py",
+    "version": 1
+  }
+}
