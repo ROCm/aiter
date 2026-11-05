@@ -10,5 +10,11 @@
     "signature": "out:positional:Tensor, input:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, -> None",
     "source": "aiter/ops/rmsnorm.py",
     "version": 1
+  },
+  "rmsnorm_with_add": {
+    "fingerprint": "626b013bc0e5008f",
+    "signature": "out:positional:Tensor, input:positional:Tensor, residual_in:positional:Tensor, residual_out:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, use_model_sensitive_rmsnorm:positional:int=0, -> None",
+    "source": "aiter/ops/rmsnorm.py",
+    "version": 1
   }
 }
