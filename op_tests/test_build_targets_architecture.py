@@ -26,23 +26,32 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True):
             self.assertEqual(get_build_targets_env(), [("gfx1250-strict", 256)])
 
-    def test_rdna_offline_build_target_defaults(self):
+    def test_rdna_offline_build_targets_cover_every_listed_cu_count(self):
         targets = {
-            "gfx1100": 96,
-            "gfx1101": 60,
-            "gfx1102": 32,
-            "gfx1103": 12,
-            "gfx1150": 16,
-            "gfx1151": 40,
-            "gfx1200": 32,
-            "gfx1201": 64,
+            "gfx1100": [96],
+            "gfx1101": [60],
+            "gfx1102": [32],
+            "gfx1103": [12],
+            "gfx1150": [16, 12],
+            "gfx1151": [40],
+            "gfx1200": [32, 28],
+            "gfx1201": [64],
         }
-        for gfx, cu_num in targets.items():
+        for gfx, cu_nums in targets.items():
             with (
                 self.subTest(gfx=gfx),
                 mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True),
             ):
-                self.assertEqual(get_build_targets_env(), [(gfx, cu_num)])
+                expected = [(gfx, cu_num) for cu_num in cu_nums]
+                self.assertEqual(get_build_targets_env(), expected)
+
+    def test_zero_cu_override_is_treated_as_unset(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": "gfx1200", "CU_NUM": "0"}, clear=True
+        ):
+            self.assertEqual(
+                get_build_targets_env(), [("gfx1200", 32), ("gfx1200", 28)]
+            )
 
     def test_multi_arch_and_cu_override(self):
         with mock.patch.dict(
@@ -77,7 +86,7 @@ class TestBuildTargetArchitecture(unittest.TestCase):
 class TestArchTablesStayInSync(unittest.TestCase):
     """The arch tables in build_targets.py and core.py must not drift apart.
 
-    Adding a target means editing GFX_MAP, GFX_CU_NUM_MAP and core.py's
+    Adding a target means editing GFX_MAP, GFX_CU_NUMS_MAP and core.py's
     allowed_archs, and nothing ties the three together -- allowed_archs
     carried a duplicate "gfx1250" entry before gfx1250-strict was added,
     which is what that drift looks like.
@@ -103,9 +112,9 @@ class TestArchTablesStayInSync(unittest.TestCase):
             self.assertEqual(GFX_MAP[self.chip_info.get_gfx_custom_op_core()], gfx)
 
     def test_every_offline_target_resolves_through_all_three_tables(self):
-        from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+        from aiter.jit.utils.build_targets import GFX_CU_NUMS_MAP
 
-        for gfx in GFX_CU_NUM_MAP:
+        for gfx in GFX_CU_NUMS_MAP:
             with self.subTest(gfx=gfx):
                 self._resolves_everywhere(gfx)
 

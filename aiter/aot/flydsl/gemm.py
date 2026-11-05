@@ -254,6 +254,21 @@ def _a4w4_mxscale_bpreshuffle(job: dict) -> None:
     )
 
 
+def _a4w4_blockscale(job: dict) -> None:
+    """Preshuffled MXFP4 weights and shuffled per-1x32 scales padded to 256 rows."""
+    from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+    from aiter.utility import dtypes
+
+    m, n, k = job["m"], job["n"], job["k"]
+    gemm_a4w4(
+        _empty(m, k // 2, dtype=dtypes.fp4x2),
+        _empty(n, k // 2, dtype=dtypes.fp4x2),
+        _empty(-(-m // 256) * 256, k // 32, dtype=dtypes.fp8_e8m0),
+        _empty(-(-n // 256) * 256, k // 32, dtype=dtypes.fp8_e8m0),
+        dtype=dtypes.bf16,
+    )
+
+
 @dataclass(frozen=True)
 class Table:
     """One tuned GEMM table: the runtime's name for it (``tuned_file_name``,
@@ -268,9 +283,18 @@ class Table:
     # Replay every row, not only FlyDSL ones: M below a shape's smallest tuned
     # row, or a row the runtime cannot launch, falls back to a FlyDSL kernel.
     all_rows: bool = False
+    # Some tables select by kernelName rather than a libtype column.
+    kernel_prefix: str = ""
 
 
 TABLES = (
+    Table(
+        "a4w4_blockscale_tuned_gemm",
+        "AITER_CONFIG_GEMM_A4W4",
+        ("gfx", "cu_num", "N", "K"),
+        _a4w4_blockscale,
+        kernel_prefix="flydsl_mxpsh_",
+    ),
     Table(
         "a8w8_bpreshuffle_tuned_gemm",
         "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
@@ -381,7 +405,11 @@ def parse_csv(csv_path: str) -> list[dict]:
     jobs = []
     for row in rows:
         kernel_name = _column(row, "kernelName")
-        if not table.all_rows and _column(row, "libtype") != "flydsl":
+        if not table.all_rows and not (
+            kernel_name.startswith(table.kernel_prefix)
+            if table.kernel_prefix
+            else _column(row, "libtype") == "flydsl"
+        ):
             continue
         key = tuple(_column(row, c) for c in table.keys)
         m = _int(_column(row, "M"))

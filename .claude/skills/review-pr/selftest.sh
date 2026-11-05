@@ -267,6 +267,64 @@ echo "[mapping]"
 t "MAPPING.md matches \`triage.py mapping\`" \
   "$(python3 "$S/triage.py" mapping | diff -q - "$S/MAPPING.md" >/dev/null && echo same || echo drift)" "same"
 
+# Rejected validation evidence must degrade the review, not delete it. The regression this
+# pins happened for real on ATOM's first live auto-validation run: the consumer ran under
+# errexit, so one missing optional import aborted fetch.sh and produced no card at all --
+# indistinguishable, to the human waiting on it, from the bot being down. _degrade_test.sh
+# extracts the real consumer region out of fetch.sh by line markers (not a replica of it)
+# and drives it with a report for the wrong head, which must be refused AND survived.
+t "rejected validation evidence degrades instead of aborting" \
+  "$(bash "$S/_degrade_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
+# A fetch that dies must say why, in the log, in terms the runner can act on. The live run
+# this pins happened on ATOM: a spent GitHub API quota ended the log mid-sentence after
+# "fetch..." -- errexit aborted inside the pipeline before the classification could run, and
+# the exit trap wrote a status file while printing nothing. "Check gh auth/token" would also
+# have been the wrong advice: the token was fine and a quota was empty, which resets on a clock.
+t "a dead fetch names the cause the runner can act on" \
+  "$(bash "$S/_fetchfail_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
+# check_citations.py's main() is executed here. The 34 pytest cases covered check(); main()
+# was called by nothing, so a NameError in it survived review and a green gate -- citations.txt
+# carried a traceback, and the publish step read that as "nothing flagged" and anchored freely.
+t "the citation checker runs end to end" \
+  "$(bash "$S/_citations_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
+# check_prompts must work outside a git checkout. It asked git for the repo root, and
+# `git rev-parse --show-toplevel` prints an empty string when there is no repo -- making
+# the SKILL.md path RELATIVE to the caller's cwd, so the drift check died with
+# FileNotFoundError on a `git archive HEAD` export. That export is exactly how a reviewer
+# is told to verify, and every trial that passed had been inside a checkout.
+_drift_outside_a_repo() {
+  # The whole skill tree, at the same depth it sits in the repo, with no .git anywhere --
+  # what `git archive HEAD | tar -x` produces. Checks whose inputs are absent skip and
+  # still exit 0; what must not happen is the crash that an empty repo-root produced.
+  # Reconstruct what the check actually needs -- the skill tree at its repo depth, plus
+  # the workflow it reads -- in a directory with no .git. Deliberately NOT `git archive`:
+  # this suite is itself meant to run from an export, where there is no repo to archive
+  # from, and a guard that only works inside a checkout cannot test leaving one.
+  local t; t=$(mktemp -d)
+  mkdir -p "$t/.claude/skills" "$t/.github/workflows"
+  cp -r "$S" "$t/.claude/skills/review-pr"
+  rm -rf "$t/.claude/skills/review-pr/reports"
+  cp "$S"/../../../.github/workflows/*review-bot.yml "$t/.github/workflows/" 2>/dev/null
+  ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
+  rm -rf "$t"
+}
+t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+
+
+# AITER_AGENT_TIMEOUT and AITER_RUN_BUDGET are coupled and nothing else enforces it. A review
+# runs two agents in series and the budget gate refuses to START one that cannot finish, so
+# raising the per-agent timeout alone leaves the refuter unable to start: the worker runs for
+# an hour, the independent gate reds, the review is withheld, and the failure is reported as a
+# timeout whose named fix makes it worse. Hit for real while re-reviewing ATOM#2762.
+_budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
+  ( AITER_AGENT_TIMEOUT=$1 AITER_RUN_BUDGET=$2 \
+    timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
+}
+t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
+
 echo "[watchdog]"
 # The watchdog is the one guard that cannot be tested by running it: `issue_comment` workflows
 # only ever run from the default branch, so GitHub will not execute that job until this merges.
@@ -326,6 +384,31 @@ ok=$((ok + lok)); bad=$((bad + lbad))
 if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
   why=$(printf '%s\n' "$lr" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
   echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
+fi
+
+echo "[publish]"
+# The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
+# anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
+# the degrade-to-summary fallback. Run them from here so they are not a
+# file nobody executes -- a test suite that only runs when someone remembers it is the same
+# kind of silence this script exists to break. pytest is not part of the runner's baseline,
+# so its absence is reported out loud rather than passed over: a check that did not run is
+# not a check that passed, and it is counted red in neither direction here, it is SAID.
+if python3 -c "import pytest" 2>/dev/null; then
+  pt=$(cd "$S" && python3 -m pytest _publish_test.py -q 2>&1); pt_rc=$?
+  n=$(printf '%s\n' "$pt" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || echo 0)
+  if [ "$pt_rc" -eq 0 ]; then
+    echo "  ✅ _publish_test.py: ${n:-0} passed (--post closure, anchoring + spans + permalinks, degrade-to-summary)"
+    ok=$((ok + 1))
+  else
+    printf '%s\n' "$pt" | grep -E '^(FAILED|ERROR)' | sed 's/^/  ❌ /' || true
+    echo "  ❌ _publish_test.py failed — run: python3 -m pytest $S/_publish_test.py"
+    bad=$((bad + 1))
+  fi
+else
+  echo "  ⏭️  _publish_test.py NOT RUN — no pytest on this box. The --post closure, the"
+  echo "      anchoring rule (spans, permalinks) and the degrade-to-summary fallback are"
+  echo "      unverified here."
 fi
 
 echo "=== $ok green / $bad red ==="
