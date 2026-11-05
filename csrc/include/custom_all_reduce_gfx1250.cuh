@@ -384,8 +384,9 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 // the reduce-scatter slots s = 0..ngpus-1 take chunk_pk lines each, followed by
 // the all-gather slots: 2 * ngpus * chunk_pk <= ngpus * kLLPackCapacity.
 //   1. send packet j of every other chunk c to rank c's reduce-scatter slot[rank]
-//   2. poll the ngpus - 1 contributions to the own chunk, reduce in fp32, write
-//      the own chunk of recvbuff and push it to every peer's all-gather slot[rank]
+//   2. poll the ngpus - 1 contributions to the own chunk, reduce them with the
+//      own one in fp32 in rank order, write the own chunk of recvbuff and push
+//      it to every peer's all-gather slot[rank]
 //   3. poll the other ranks' reduced packets into recvbuff
 // Every rank moves 2 * (ngpus - 1) / ngpus * bytes of payload (LL lines double
 // it) against (ngpus - 1) * bytes for ar_ll_gfx1250, for one more fabric round
@@ -427,8 +428,9 @@ __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
     uint2* out      = reinterpret_cast<uint2*>(recvbuff);
     const LLPackedMsg* myBase = reinterpret_cast<const LLPackedMsg*>(peer_scratch[rank]);
 
-    // Peers are visited as k = 1..ngpus-1, peer (rank + k) % ngpus, so the
-    // register arrays below are indexed at compile time only.
+    // Sends and all-gather polls visit peers as k = 1..ngpus-1, peer
+    // (rank + k) % ngpus; the reduce polls every slot s = 0..ngpus-1. Either
+    // way the register arrays below are indexed at compile time only.
     for(size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < chunk_pk; j += stride)
     {
         uint2 d[ngpus];
@@ -445,36 +447,37 @@ __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
             ll_store_b128(reinterpret_cast<uint32_t*>(dst), d[k].x, flag, d[k].y, flag);
         }
 
+        // Slot s holds rank s's packet j of this rank's chunk. The own slot
+        // carries nothing for this call; it is loaded as well, which keeps the
+        // loads free of branches, but its flags and data go unused.
         uint32_t w[ngpus][4];
         bool ready;
         do
         {
 #pragma unroll
-            for(int k = 1; k < ngpus; ++k)
+            for(int s = 0; s < ngpus; ++s)
                 ll_load_b128(reinterpret_cast<const uint32_t*>(
-                                 myBase + rsOff + (size_t)((rank + ngpus - k) % ngpus) * chunk_pk + j),
-                             w[k][0], w[k][1], w[k][2], w[k][3]);
+                                 myBase + rsOff + (size_t)s * chunk_pk + j),
+                             w[s][0], w[s][1], w[s][2], w[s][3]);
             ready = true;
 #pragma unroll
-            for(int k = 1; k < ngpus; ++k)
-                ready = ready && w[k][1] == flag && w[k][3] == flag;
+            for(int s = 0; s < ngpus; ++s)
+                ready = ready && (s == rank || (w[s][1] == flag && w[s][3] == flag));
         } while(!ready);
 
+        // Sum in rank order with the local value at its own rank, as every other
+        // custom all-reduce does: an element's bits depend neither on which rank
+        // owns its chunk nor on whether this kernel or the one-shot reduced it.
         opus::fp32_t acc[LP];
-        {
-            const PL pv = *reinterpret_cast<const PL*>(&mine);
 #pragma unroll
-            for(int q = 0; q < LP; ++q)
-                acc[q] = upcast_s(pv[q]);
-        }
-#pragma unroll
-        for(int k = 1; k < ngpus; ++k)
+        for(int s = 0; s < ngpus; ++s)
         {
-            const uint32_t pw[2] = {w[k][0], w[k][2]};
+            const uint32_t pw[2] = {s == rank ? mine.x : w[s][0],
+                                    s == rank ? mine.y : w[s][2]};
             const PL pv          = *reinterpret_cast<const PL*>(pw);
 #pragma unroll
             for(int q = 0; q < LP; ++q)
-                acc[q] += upcast_s(pv[q]);
+                acc[q] = s == 0 ? upcast_s(pv[q]) : acc[q] + upcast_s(pv[q]);
         }
         PL ov;
 #pragma unroll
