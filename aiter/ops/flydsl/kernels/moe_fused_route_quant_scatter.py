@@ -120,13 +120,19 @@ class _EpPsumScanStorage:
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
+# Dword offset of a dead destination's scale stores: its byte offset (2 GiB)
+# is past _SCALE_RSRC_MAX_BYTES, and adding a row's largest scale-dword step
+# keeps it under 2**32, so the bounds check always drops the store.
+_DEAD_SCALE_DWORD = 0x20000000
 # TDM staging depth. One chunk is degenerate -- the prologue waits on the whole
 # row with nothing to overlap -- and past four the per-chunk tensor_wait and two
 # CTA barriers outweigh the smaller transfer. Four also divides every shipped
 # model_dim's iteration count, so one depth serves them all.
 _TOKEN_MULTIDEST_TDM_CHUNKS = 4
-# The K-split aims for this many blocks per CU; past that it stops paying.
-_TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
+# The K-split aims for this many blocks per CU. Splitting further only adds
+# blocks that each redo the route setup: at 2048-wide rows on gfx1250 one block
+# per CU picks the fastest split at every decode size from 64 to 1024 tokens.
+_TOKEN_MULTIDEST_BLOCKS_PER_CU = 1
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 
@@ -329,20 +335,30 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
     # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
     payload_bytes_per_row = c.payload_bytes_per_row
-    payload_dests = getattr(c, "payload_dests", c.dests)
-    # A zero-length descriptor is how a dead destination is switched off, so
-    # the quant pass stays one basic block.
-    payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
-    dst_payload = []
-    for dst in payload_dests:
-        row_addr = (
-            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
-        )
-        dst_payload.append(
-            buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_records
+
+    def _payload_rsrcs():
+        payload_dests = getattr(c, "payload_dests", c.dests)
+        # A zero-length descriptor is how a dead destination is switched off, so
+        # the quant pass stays one basic block.
+        payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
+        rsrcs = []
+        for dst in payload_dests:
+            row_addr = (
+                c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
             )
-        )
+            rsrcs.append(
+                buffer_ops.create_buffer_resource_from_addr(
+                    row_addr,
+                    num_records_bytes=getattr(dst, "num_records", payload_records),
+                )
+            )
+        return rsrcs
+
+    # ``make_dests`` defers the destination rows until after the quant pass: the
+    # scalar row loads then complete under the hidden-row loads instead of in
+    # front of them, since nothing before the first load waits on them.
+    make_dests = getattr(c, "make_dests", None)
+    dst_payload = None if make_dests is not None else _payload_rsrcs()
 
     # The hidden/payload SOURCE row stays on the width-agnostic buffer_ops V#
     # (one descriptor per buffer, per-access vec_width). Its pk8 dwordx4 load
@@ -386,8 +402,12 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     chunk_prefetch = getattr(c, "chunk_prefetch", None)
     hidden_lds_load = getattr(c, "hidden_lds_load", None)
 
+    hidden_preloaded = getattr(c, "hidden_preloaded", None)
+
     def _emit_hidden_load(it):
         """This iteration's 8 bf16 (one aligned dwordx4)."""
+        if const_expr(hidden_preloaded is not None):
+            return hidden_preloaded[it]
         col_base = (
             _mx_block_of(it) * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
         )
@@ -541,6 +561,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # putting a per-iteration guard back above would produce invalid IR.
     # One quant result (payload_val + e8m0_scale) is written to every destination
     # row in ``c.dests``.
+    if const_expr(make_dests is not None):
+        c.payload_dests, c.dests = make_dests()
+        dst_payload = _payload_rsrcs()
     for mx_block, payload_val, e8m0_scale in quant_results:
         _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
 
@@ -2051,6 +2074,8 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
+    compact_scale: bool = False,
+    persistent: bool = False,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2059,6 +2084,18 @@ def build_moe_token_multidest_quant_module(
     every destination. What it saves therefore grows with ``topk``, while what
     it costs -- one buffer descriptor per destination held live across the store
     pass -- grows with it too.
+
+    Routes at or past ``num_valid_routes`` (null: every route) and routes whose
+    row is negative (dropped) get no store, as in the route-indexed kernel.
+
+    ``compact_scale``: instead of scattering each route's e8m0 row into the
+    WMMA-interleaved layout -- 4 B into each of ``feat_dim // 128`` cache lines,
+    every one of which 16 *other* tokens also write a piece of, so the lines go
+    out to memory partially written -- write one row-major e8m0 row per token
+    into ``grouped_scale`` (then a ``(token_num, feat_dim // 32)`` buffer) and
+    the route index of every live row into ``row_to_route``.
+    ``build_moe_route_scale_preshuffle_module`` then builds the interleaved
+    layout with whole-line stores.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2109,7 +2146,11 @@ def build_moe_token_multidest_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
+        f"{'_nvr_cs' if compact_scale else '_nvr'}"
+        f"{'_gs' if persistent else ''}"
     )
+    if persistent and (tdm_hidden_chunks or ksplit > 1):
+        raise ValueError("the grid-stride build loads straight to registers, unsplit")
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def token_multidest_kernel(
@@ -2117,7 +2158,10 @@ def build_moe_token_multidest_quant_module(
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,  # (1,) int32, may be null
+        row_to_route: fx.Pointer,  # (rows,) int32 out, written iff compact_scale
         token_num: Int32,
+        token_stride: Int32,  # grid tokens per sweep, read iff persistent
     ):
         i32 = T.i32
         f32 = T.f32
@@ -2207,31 +2251,113 @@ def build_moe_token_multidest_quant_module(
                         tdm_ops.tensor_wait(1 if chunk + 1 < tdm_hidden_chunks else 0)
                     gpu.barrier()
 
-        # CTA-uniform guard (every launched block owns at least one token), so
-        # the TDM staging barriers below are reached by all waves. A warp whose
-        # token is past the end reads token 0 instead and has its destination
-        # descriptors zero-sized, so its stores are dropped by the hardware
-        # bounds check rather than by a branch.
-        valid = token < fx.Uint32(token_num)
-        token_eff = valid.select(token, fx.Uint32(c0_i32))
-        pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
-        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-        scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
-        if token0 < fx.Uint32(token_num):
+        def _emit_token(token, hidden_preloaded=None, rows_preloaded=None):
+            """Quantize one token's row and store it to each of its routes.
+
+            A warp whose token is past the end reads token 0 instead and has its
+            destination descriptors zero-sized, so its stores are dropped by the
+            hardware bounds check rather than by a branch.
+            """
+            valid = token < fx.Uint32(token_num)
+            token_eff = valid.select(token, fx.Uint32(c0_i32))
+            # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+            scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
+            # Routes at or past ``num_valid_routes`` (null: none) are a graph
+            # bucket's or an EP dispatch's dead tail whose rows were never written,
+            # and a negative row is a dropped route: neither gets a store, exactly
+            # as in the route-indexed kernel. Branch- and select-free, so the scalar
+            # load issues beside the row loads and nothing waits on it before the
+            # store pass (a select on the loaded value pins the wait in front of the
+            # first hidden load). A null pointer gets a zero-length descriptor, whose
+            # load returns 0, and the OR supplies the static count instead.
+            def _load_valid_route_count():
+                return _route_bound_count(
+                    num_valid_routes, fx.Uint32(token_num) * fx.Uint32(topk), c0_i32
+                )
+
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            rows = [
-                fx.Uint32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                for k in range_constexpr(topk)
-            ]
-            scales = [
-                _token_multidest_scale_base(
-                    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
-                )
-                for row in rows
-            ]
+            rows_raw = rows_preloaded
+            if const_expr(rows_raw is None):
+                rows_raw = [
+                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                    for k in range_constexpr(topk)
+                ]
+
+            def _make_dests():
+                # Issued here, after the hidden-row loads, so its latency hides
+                # under theirs.
+                valid_route_count = _load_valid_route_count()
+                # A dead destination keeps the store pass branch-free: its
+                # payload descriptor is zero-length and its scale offset lands
+                # past the scale descriptor's bound, so the hardware drops both.
+                dest_ok = [
+                    fx.Boolean(valid)
+                    & (fx.Uint32(route0 + fx.Int32(k)) < valid_route_count)
+                    & (rows_raw[k] >= c0_i32)
+                    for k in range_constexpr(topk)
+                ]
+                rows = [
+                    ok.select(fx.Uint32(r), fx.Uint32(c0_i32))
+                    for ok, r in zip(dest_ok, rows_raw)
+                ]
+                payload_dests = [
+                    SimpleNamespace(
+                        payload_row_i32=row,
+                        num_records=ok.select(
+                            fx.Int32(payload_bytes_per_row), c0_i32
+                        ),
+                    )
+                    for ok, row in zip(dest_ok, rows)
+                ]
+                if const_expr(compact_scale):
+                    # Lane 0 records each live row's route for the rebuild; a dead
+                    # route's store is pushed past the descriptor's bound.
+                    r2r_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                        fx.Int64(ptrtoint(row_to_route)),
+                        num_records_bytes=_SCALE_RSRC_MAX_BYTES,
+                    )
+
+                    def _store_routes():
+                        for k in range_constexpr(topk):
+                            buffer_ops.buffer_store(
+                                fx.Int32(route0 + fx.Int32(k)),
+                                r2r_rsrc,
+                                dest_ok[k].select(
+                                    fx.Uint32(rows[k]), fx.Uint32(_DEAD_SCALE_DWORD)
+                                ),
+                            )
+
+                    @flyc.jit
+                    def _dispatch_routes():
+                        if lane == fx.Uint32(c0_i32):
+                            _store_routes()
+
+                    _dispatch_routes()
+                    # One row-major e8m0 row per token.
+                    return payload_dests, [
+                        SimpleNamespace(
+                            payload_row_i32=token_eff, scale_row_dword_base=c0_i32
+                        )
+                    ]
+                # Scale destinations; the payload keeps its own list above.
+                dests = [
+                    SimpleNamespace(
+                        payload_row_i32=row,
+                        scale_row_dword_base=ok.select(
+                            _token_multidest_scale_base(
+                                row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+                            ),
+                            fx.Uint32(_DEAD_SCALE_DWORD),
+                        ),
+                    )
+                    for ok, row in zip(dest_ok, rows)
+                ]
+                return payload_dests, dests
+
+            _eager_dests = _make_dests() if tdm_hidden_chunks else (None, None)
 
             block_in_wave = lane // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -2244,7 +2370,6 @@ def build_moe_token_multidest_quant_module(
                 hidden_base=fx.Int64(ptrtoint(hidden)),
                 feat_bytes_per_row=feat_dim * 2,
                 feat_row_i32=token_eff,
-                payload_num_records=pay_records,
                 prequantized=False,
                 payload_dwords_per_lane=payload_bytes_per_lane // 4,
                 src_scale_base=fx.Int64(0),
@@ -2270,12 +2395,13 @@ def build_moe_token_multidest_quant_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
-                # Scale destinations; the payload keeps its own list above.
-                dests=[
-                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
-                    for row, sc in zip(rows, scales)
-                ],
+                # Direct loads: build the destinations after the quant pass so
+                # the hidden loads issue first. Under TDM staging the barriers
+                # would pull the scalar row loads behind the last chunk, so
+                # there they are built up front.
+                make_dests=None if tdm_hidden_chunks else _make_dests,
+                payload_dests=_eager_dests[0],
+                dests=_eager_dests[1],
                 # Zero-on-invalid bound: a dead token takes a zero-length
                 # descriptor rather than a branch.
                 scale_t=ptr_buf_tensor(
@@ -2288,12 +2414,15 @@ def build_moe_token_multidest_quant_module(
                     num_records_bytes=scale_records,
                 ),
                 scale_pack_dwords=scale_pack_dwords,
+                compact_scale=compact_scale,
+                c_scale_dwords_per_row=fx.Int32(mx_blocks_per_row // 4),
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
                 hidden_lds_idx=hidden_lds_idx,
                 hidden_lds_row_off=hidden_lds_row_off,
                 hidden_slot_bytes=hslot,
+                hidden_preloaded=hidden_preloaded,
                 mx_group_base=(
                     fx.Uint32(fx.block_idx.y) * fx.Int32(block_iters)
                     if const_expr(ksplit > 1)
@@ -2302,18 +2431,84 @@ def build_moe_token_multidest_quant_module(
             )
             _emit_quant_block_loop(qc)
 
+        def _load_token(tok):
+            """The hidden row's dwordx4s and the route rows of ``tok`` (clamped)."""
+            tok_eff = (tok < fx.Uint32(token_num)).select(tok, fx.Uint32(c0_i32))
+            h_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(hidden)) + fx.Uint64(tok_eff) * (feat_dim * 2),
+                num_records_bytes=feat_dim * 2,
+            )
+            biw = lane // fx.Uint32(c_lanes_per_block)
+            lib = lane - biw * c_lanes_per_block
+            raws = []
+            for it in range_constexpr(block_iters):
+                col = (fx.Int32(it * mx_blocks_per_wave_iter) + biw) * fx.Int32(
+                    32
+                ) + lib * c_elems_per_lane
+                raws.append(
+                    buffer_ops.buffer_load(h_rsrc, col >> c1_i32, vec_width=4, dtype=i32)
+                )
+            rows_t = ptr_buf_tensor(topids_to_rows)
+            rows = [
+                fx.Int32(
+                    buf_scalar_load(rows_t, tok_eff * fx.Int32(topk) + fx.Int32(k))
+                )
+                for k in range_constexpr(topk)
+            ]
+            return raws, rows
+
+        if const_expr(not persistent):
+            # CTA-uniform guard (every launched block owns at least one token),
+            # so the TDM staging barriers are reached by all waves.
+            if token0 < fx.Uint32(token_num):
+                _emit_token(token)
+        else:
+            # Grid-stride over tokens, each iteration loading the next token's
+            # row before it converts and stores this one, so a wave's loads and
+            # stores overlap instead of alternating.
+            stride = fx.Uint32(token_stride)
+            has_work = token < fx.Uint32(token_num)
+            n_iter = has_work.select(
+                (fx.Uint32(token_num) - token + stride - fx.Uint32(1)) // stride,
+                fx.Uint32(c0_i32),
+            )
+            raws0, rows0 = _load_token(token)
+            init = [_raw(v) for v in raws0] + [_raw(r) for r in rows0]
+            for step, state in range(
+                fx.Int32(0), fx.Int32(n_iter), fx.Int32(1), init=init
+            ):
+                cur = token + fx.Uint32(step) * stride
+                raws_n, rows_n = _load_token(cur + stride)
+                _emit_token(
+                    cur,
+                    hidden_preloaded=[state[k] for k in range_constexpr(block_iters)],
+                    rows_preloaded=[
+                        fx.Int32(state[block_iters + k]) for k in range_constexpr(topk)
+                    ],
+                )
+                results = yield [_raw(v) for v in raws_n] + [_raw(r) for r in rows_n]
+
     @flyc.jit
     def launch_token_multidest(
         hidden: fx.Pointer,
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        row_to_route: fx.Pointer,
         token_num: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         token_multidest_kernel(
-            hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            num_valid_routes,
+            row_to_route,
+            token_num,
+            fx.Int32(grid_blocks) * fx.Int32(warps_per_block),
         ).launch(
             grid=(
                 fx.Int64(grid_blocks),
@@ -2331,6 +2526,157 @@ def build_moe_token_multidest_quant_module(
         },
     }
     return launch_token_multidest
+
+
+def _route_bound_count(num_valid_routes, numel, c0_i32):
+    """``min(numel, *num_valid_routes)`` as a scalar; null means ``numel``.
+
+    Branch- and select-free on the loaded value (see the multidest kernel): a
+    null pointer gets a zero-length descriptor, whose scalar load returns 0, and
+    the OR supplies ``numel`` instead.
+    """
+    nvr_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+    nvr_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(ptrtoint(num_valid_routes)),
+        num_records_bytes=nvr_is_set.select(fx.Int32(4), c0_i32),
+    )
+    count = fx.Uint32(
+        buffer_ops.buffer_load(nvr_rsrc, c0_i32, vec_width=1, is_scalar=True)
+    ) | nvr_is_set.select(fx.Uint32(c0_i32), fx.Uint32(numel))
+    numel_u = fx.Uint32(numel)
+    return (count < numel_u).select(count, numel_u)
+
+
+def build_moe_route_scale_preshuffle_module(feat_dim: int, wmma_rep: int, topk: int):
+    """Second half of the compact-scale token-multidest pair.
+
+    Builds the WMMA-interleaved e8m0 layout gemm1 reads, ``(rows // (16*wmma_rep),
+    feat_dim // 128, wmma_rep, 16, 4)``, from the token-major compact rows and
+    the ``row_to_route`` map the quant kernel wrote. One workgroup per row tile,
+    adjacent lanes on adjacent rows, so each store fills whole lines.
+
+    ``row_to_route`` is never initialised: a padding row holds whatever was
+    there before. A row is taken only if its entry names a live route
+    (``< min(numel, num_valid_routes)``) whose ``topids_to_rows`` entry is that
+    same row -- the route -> row map is injective, so a stale entry that passes
+    is the right one anyway. Every other row is left untouched, as the
+    route-indexed kernel leaves it.
+    """
+    assert feat_dim % 512 == 0, f"feat_dim {feat_dim} must be a multiple of 512"
+    src_dwords = feat_dim // 128  # e8m0 dwords per row
+    quads = src_dwords // 4  # dwordx4 loads per row
+    rows_per_tile = wmma_rep * 16
+    units = rows_per_tile * quads
+    n_iter = (units + BLOCK_THREADS - 1) // BLOCK_THREADS
+    module_name = f"moe_route_scale_preshuffle_k{topk}_fd{feat_dim}_r{wmma_rep}"
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def route_scale_preshuffle_kernel(
+        compact_scale: fx.Pointer,  # (token_num, feat_dim // 32) e8m0
+        grouped_scale: fx.Pointer,  # interleaved (rows // wmma_rep, ...) e8m0 out
+        row_to_route: fx.Pointer,  # (rows,) int32, live rows only
+        topids_to_rows: fx.Pointer,  # (numel,) int32
+        num_valid_routes: fx.Pointer,  # (1,) int32, may be null
+        numel: Int32,
+        num_rows: Int32,
+    ):
+        i32 = T.i32
+        c0_i32 = fx.Int32(0)
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile = fx.Uint32(fx.block_idx.x)
+        bound = _route_bound_count(num_valid_routes, numel, c0_i32)
+        r2r_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(row_to_route)),
+            num_records_bytes=fx.Int32(num_rows) * fx.Int32(4),
+        )
+        rows_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(topids_to_rows)),
+            num_records_bytes=fx.Int32(numel) * fx.Int32(4),
+        )
+        src_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(compact_scale)),
+            num_records_bytes=(fx.Int32(numel) // fx.Int32(topk))
+            * fx.Int32(src_dwords * 4),
+        )
+        dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(grouped_scale)),
+            num_records_bytes=_SCALE_RSRC_MAX_BYTES,
+        )
+        tile_base = tile * fx.Uint32(rows_per_tile * src_dwords)
+        for it in range_constexpr(n_iter):
+            u = tid + fx.Uint32(it * BLOCK_THREADS)
+            row_in_tile = u % fx.Uint32(rows_per_tile)
+            q = u // fx.Uint32(rows_per_tile)
+            row = tile * fx.Uint32(rows_per_tile) + row_in_tile
+            # Out-of-range reads come back 0 from the descriptor bounds; the
+            # row check below rejects them.
+            route = fx.Uint32(
+                buffer_ops.buffer_load(r2r_rsrc, row, vec_width=1, dtype=i32)
+            )
+            route_ok = route < bound
+            route_safe = route_ok.select(route, fx.Uint32(c0_i32))
+            back = fx.Int32(
+                buffer_ops.buffer_load(rows_rsrc, route_safe, vec_width=1, dtype=i32)
+            )
+            live = (
+                route_ok
+                & (row < fx.Uint32(num_rows))
+                & (back == fx.Int32(row))
+                & (q < fx.Uint32(quads))
+            )
+            token = route_safe // fx.Uint32(topk)
+            v = buffer_ops.buffer_load(
+                src_rsrc,
+                token * fx.Uint32(src_dwords) + q * fx.Uint32(4),
+                vec_width=4,
+                dtype=i32,
+            )
+            w = row_in_tile // fx.Uint32(16)
+            lane16 = row_in_tile % fx.Uint32(16)
+            for j in range_constexpr(4):
+                sd = q * fx.Uint32(4) + fx.Uint32(j)
+                dst = tile_base + (sd * fx.Uint32(wmma_rep) + w) * fx.Uint32(16) + lane16
+                # A row that is not live keeps its bytes: its store is pushed
+                # past the descriptor's bound.
+                buffer_ops.buffer_store(
+                    fx.Vector(v)[j],
+                    dst_rsrc,
+                    live.select(dst, fx.Uint32(_DEAD_SCALE_DWORD)),
+                )
+
+    @flyc.jit
+    def launch_route_scale_preshuffle(
+        compact_scale: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        row_to_route: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        numel: fx.Int32,
+        num_rows: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_scale_preshuffle_kernel(
+            compact_scale,
+            grouped_scale,
+            row_to_route,
+            topids_to_rows,
+            num_valid_routes,
+            numel,
+            num_rows,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_route_scale_preshuffle.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_route_scale_preshuffle
 
 
 def _emit_prequant_copy_multidest(c: SimpleNamespace) -> None:
