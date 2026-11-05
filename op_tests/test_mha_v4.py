@@ -127,12 +127,15 @@ def _rotate_hd128_reference(value):
 
 # Dynamo caches compiled entries per code object and this file compiles mha_v4 under many format
 # combinations, so a shared cache drifts toward the recompile limit and whichever check compiles
-# last fails under fullgraph. The kv-tile cache is cleared because patched_attr restores get_gfx
-# but not a tile it may have warmed, and a stale tile is wrong mask geometry rather than an error.
-_CHECKS = CheckRegistry(
-    setup=torch._dynamo.reset,
-    teardown=lambda: mha_v4_module.mha_v4_kv_tile.cache_clear(),
-)
+# last fails under fullgraph. The kv-tile caches are cleared because patched_attr restores get_gfx
+# but not a tile it may have warmed, and a stale tile is wrong mask geometry or a wrong kv_splits
+# bound rather than an error.
+def _clear_kv_tile_caches():
+    mha_v4_module.mha_v4_kv_tile.cache_clear()
+    mha_v4_module._mha_v4_dense_kv_tile.cache_clear()
+
+
+_CHECKS = CheckRegistry(setup=torch._dynamo.reset, teardown=_clear_kv_tile_caches)
 
 
 def test_attention_format_ids_are_stable():
@@ -1567,13 +1570,16 @@ def test_mha_v4_kv_splits_follow_the_lse_gate():
         )
 
         assert (
-            mha_v4_module._resolve_kv_splits(
-                "auto", recipe, *bf16[::2], q, q, False, False
-            )
+            mha_v4_module._resolve_kv_splits("auto", recipe, *bf16, q, q, False, False)
             == 1
         )
         with expect_raises(NotImplementedError, match="not validated on gfx942"):
             mha_v4(q, q, q, *bf16, kv_splits=2)
+
+
+def _recipe_operands(*formats):
+    """mha_v4_operands() for a per-tensor recipe in its canonical scale modes and V packing."""
+    return mha_v4_operands(*formats, *scale_modes_for_formats(*formats))
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
@@ -1583,15 +1589,16 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    mask = torch.ones(
-        (1, 1024 // 256, 1024 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
-    )
     formats = (AttentionFormat.MXFP4,) * 3
 
     assert torch.equal(
         mha_v4(q, k, v, *formats, kv_splits="auto"), mha_v4(q, k, v, *formats)
     )
     bf16 = (AttentionFormat.BF16,) * 3
+    kv_tile = mha_v4_kv_tile(_recipe_operands(*bf16), MHA_V4_SPARSE_MODE)
+    mask = torch.ones(
+        (1, 1024 // 256, 1024 // kv_tile), device="cuda", dtype=torch.bool
+    )
     assert torch.equal(
         mha_v4(q, k, v, *bf16, block_mask=mask, kv_splits="auto"),
         mha_v4(q, k, v, *bf16, block_mask=mask),
@@ -1607,14 +1614,21 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
         param(
             {"kv_splits": 1025},
             ValueError,
-            "at least one 128-key tile: at most 8",
+            "at least one 64-key tile: at most 16",
             id="more-than-keys",
         ),
+        # The bound is the recipe's own dense KV tile: 64 keys for BF16, 128 for FP8.
         param(
-            {"kv_splits": 9},
+            {"kv_splits": 17},
+            ValueError,
+            "at least one 64-key tile: at most 16",
+            id="shorter-than-a-bf16-tile",
+        ),
+        param(
+            {"kv_splits": 9, "formats": (AttentionFormat.FP8,) * 3},
             ValueError,
             "at least one 128-key tile: at most 8",
-            id="shorter-than-a-tile",
+            id="shorter-than-an-fp8-tile",
         ),
         param(
             {"kv_splits": 2, "block_mask": torch.ones((1, 4, 8), dtype=torch.bool)},
@@ -1666,7 +1680,7 @@ def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
     torch.manual_seed(67)
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
     bf16 = (AttentionFormat.BF16,) * 3
-    splits = 1024 // mha_v4_kv_tile()
+    splits = 1024 // mha_v4_module._mha_v4_dense_kv_tile(_recipe_operands(*bf16), 128)
 
     out = mha_v4(q, q, q, *bf16, kv_splits=splits)
 
@@ -2967,10 +2981,7 @@ def _i8fp8_sparse_kv_tile():
     """The KV tile of the INT8/FP8 sparse row, which a mask for that recipe has to be cut to."""
     fp8 = native_fp8_format()
     formats = (AttentionFormat.INT8, AttentionFormat.INT8, fp8)
-    return mha_v4_kv_tile(
-        mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
-        MHA_V4_SPARSE_MODE,
-    )
+    return mha_v4_kv_tile(_recipe_operands(*formats), MHA_V4_SPARSE_MODE)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")

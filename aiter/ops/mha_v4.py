@@ -324,6 +324,7 @@ def mha_v4_mx_producers(
 _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
 # find_config(..., mode=1).
+_MHA_V4_DENSE_MODE = 0
 MHA_V4_SPARSE_MODE = 1
 MHA_V4_BLOCK_SPARSE_MODES = (MHA_V4_SPARSE_MODE,)
 
@@ -593,8 +594,7 @@ def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
     mha_v4_kv_tile_for_q_tile.
     """
     gfx = get_gfx()
-    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
-    manifest = os.path.join(asm_dir, gfx, "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    manifest = _mha_v4_manifest_path(gfx)
     by_mode: dict[int, set[tuple[int, ...]]] = {
         mode: set() for mode in MHA_V4_BLOCK_SPARSE_MODES
     }
@@ -632,6 +632,89 @@ def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
             f"{MHA_V4_BLOCK_SPARSE_MODES}"
         )
     return {mode: frozenset(rows) for mode, rows in by_mode.items()}
+
+
+def _mha_v4_manifest_path(gfx: str) -> str:
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    return os.path.join(asm_dir, gfx, "fmha_v4_fwd", "fmha_v4_fwd.csv")
+
+
+@functools.cache
+def _mha_v4_dense_rows_from_manifest() -> frozenset[tuple[int, ...]]:
+    """Dense manifest rows, each as mha_v4_operands() + (hdim_q, ts_kv).
+
+    The head dimension is carried because the hd256 MX rows take the same operands as their hd128
+    rows on a different KV tile.
+    """
+    gfx = get_gfx()
+    manifest = _mha_v4_manifest_path(gfx)
+    rows: set[tuple[int, ...]] = set()
+    try:
+        with open(manifest, newline="") as handle:
+            for row in csv.DictReader(
+                filter(lambda line: not line.startswith("#"), handle)
+            ):
+                if int(row["mode"]) == _MHA_V4_DENSE_MODE:
+                    rows.add(
+                        mha_v4_operands(
+                            row["q_format"],
+                            row["k_format"],
+                            row["v_format"],
+                            row["q_scale_mode"],
+                            row["k_scale_mode"],
+                            row["v_scale_mode"],
+                            row.get("v_pack") or 0,
+                        )
+                        + (int(row["hdim_q"]), int(row["ts_kv"]))
+                    )
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"no MHA v4 manifest for {gfx} at {manifest}; MHA v4 is unavailable on this GPU"
+        ) from error
+    return frozenset(rows)
+
+
+# Behind the guard for the reason _mha_v4_kv_tile_for_q_tile_from_manifest is: mha_v4 reads it
+# while resolving kv_splits, inside a compiled region.
+@torch_compile_guard()
+def _mha_v4_dense_kv_tile_from_manifest(
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    v_pack: int,
+    head_dim: int,
+) -> int:
+    head = (
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+        head_dim,
+    )
+    kv_tiles = {
+        row[-1] for row in _mha_v4_dense_rows_from_manifest() if row[:-1] == head
+    }
+    if len(kv_tiles) > 1:
+        raise ValueError(
+            f"{get_gfx()} has dense rows on KV tiles {sorted(kv_tiles)} for one recipe"
+        )
+    return kv_tiles.pop() if kv_tiles else 0
+
+
+@functools.cache
+def _mha_v4_dense_kv_tile(operands, head_dim: int) -> int:
+    """The KV tile of the dense row for `operands` (mha_v4_operands()) at `head_dim`, or 0.
+
+    Not mha_v4_kv_tile(), which answers for the block-sparse rows: a dense row need not share
+    its recipe's sparse geometry.
+    """
+    return _mha_v4_dense_kv_tile_from_manifest(*operands, head_dim)
 
 
 def _head_major_k_scale(k_descale: Tensor, kv_tile: int) -> Tensor:
@@ -1729,6 +1812,7 @@ def _resolve_kv_splits(
     kv_splits: Union[int, str],  # noqa: UP007
     recipe: _RawRecipePlan,
     q_format: AttentionFormat,
+    k_format: AttentionFormat,
     v_format: AttentionFormat,
     q: Tensor,
     k: Tensor,
@@ -1775,7 +1859,17 @@ def _resolve_kv_splits(
     # A range shorter than a KV tile still costs a whole tile, so splitting past one tile per
     # range adds work-groups and merge traffic without adding parallelism. The merge also unrolls
     # over the count, whose compile time grows steeply with it (13 s cold at 128 on MI355X).
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _mha_v4_dense_kv_tile(
+        mha_v4_operands(
+            q_format, k_format, v_format, *recipe.scale_modes, recipe.v_pack
+        ),
+        q.shape[-1],
+    )
+    if kv_tile == 0:
+        raise NotImplementedError(
+            f"{get_gfx()} has no dense MHA v4 row for Q={q_format.name} "
+            f"K={k_format.name} V={v_format.name} to split"
+        )
     most = max(k.shape[1] // kv_tile, 1)
     if kv_splits > most:
         raise ValueError(
@@ -1964,7 +2058,8 @@ def mha_v4(
     exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
     equal when the count divides the key length; otherwise the last one takes the remainder,
     which needs operands that take per-batch key lengths (all four on gfx950), and any others
-    need a count that divides it. A count is at most ``key_length // mha_v4_kv_tile()``, so
+    need a count that divides it. A count is at most the key length over the KV tile of the
+    operands' dense row (64 for BF16 and BF16/FP8 on gfx950, 128 for INT8/FP8 and FP8/FP8), so
     every range holds at least one KV tile.
     ``"auto"`` minimizes device time, so it is meant for HIP-graph-replayed or torch.compile'd
     callers. A split adds ~35 us of host time per eager call (more with a remainder), mostly the
@@ -1995,7 +2090,15 @@ def mha_v4(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
     splits = _resolve_kv_splits(
-        kv_splits, recipe, q_format, v_format, q, k, sparse, seqlens_k is not None
+        kv_splits,
+        recipe,
+        q_format,
+        k_format,
+        v_format,
+        q,
+        k,
+        sparse,
+        seqlens_k is not None,
     )
 
     # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
