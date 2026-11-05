@@ -56,7 +56,7 @@ TOOL_VERSION = 1
 GOLDEN_REVISION = "4b8888907e2bd3530bfde10eb081bf8cf60d49749aea4cac62ec486211b12ff8"
 GOLDEN_RTOL = 1e-4
 GOLDEN_ATOL = 1e-4
-KERNEL_GIT_REV = "r2e-integrate"
+KERNEL_GIT_REV = "lint-black-ruff"
 #: Profiled kernel (ROUND-R2 4150ad40: P in {4, 8, 16} + decode-group group_rows /
 #: row_mode / wg_waves + draft wg_waves). `emit` refuses any other source so a kernel
 #: change can never silently inherit evidence.
@@ -72,18 +72,25 @@ R2C_KERNEL_SHA256 = "4c45af10831dab674acc596a149ad33f52b0233cac9867c373376245306
 R2D_KERNEL_SHA256 = "685b0f604093a8ac673a016322a3ef2d4da7aa20670adc92f0bce97749960b37"
 #: ROUND-R2E: router defaults only (prefill route presets r2e for bf16 / fp8, draft fp8
 #: wg_waves auto=2, decode-group group_rows=3 'auto' slab 32); every R2D specialization
-#: byte-identical to R2D 685b0f60 (no-device gate base 685b0f60: records/r2e).
-KERNEL_SHA256 = "58051973626d598b36b0c51c4ac89a8830fa05b3a8f78d9628aeadd436c1f0ad"
+#: byte-identical to R2D 685b0f60 (no-device gate base 685b0f60: records/r2e). Every GPU
+#: `gen_profile check` stamp of this profile was recorded on this kernel (a08-1).
+R2E_KERNEL_SHA256 = "58051973626d598b36b0c51c4ac89a8830fa05b3a8f78d9628aeadd436c1f0ad"
+#: AITER-LINT: black + ruff only (RUF059 / F841 unused names -> `_` names, UP033
+#: lru_cache(maxsize=None) -> cache); every R2E default and routable specialization
+#: byte-identical to R2E 58051973 (no-device gate base 58051973: records/integration/lint-isa).
+KERNEL_SHA256 = "c01cf365d7e6cd734bcde6977707c8c4c47c89d0b17c98b811e16dc6e826afbf"
 #: The ISA-identity chain page-4 evidence travels along (each link one no-device gate:
-#: records/page16, records/r2-kernel, records/r2c, records/r2d isa-evidence.json).
+#: records/page16, records/r2-kernel, records/r2c, records/r2d, records/r2e,
+#: records/integration/lint-isa isa-evidence.json).
 ISA_IDENTITY_CHAIN = (
     "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
     "536667d5997670a8b6d8fad54db438b2d958617d2ff5bd9b9edd359c5ea528a1",
     R2_KERNEL_SHA256,
     R2C_KERNEL_SHA256,
     R2D_KERNEL_SHA256,  # R2D: R2C -> R2D
+    R2E_KERNEL_SHA256,  # R2E: R2D -> R2E
     KERNEL_SHA256,
-)  # R2E: R2D -> R2E
+)  # AITER-LINT: R2E -> lint
 #: ROUND-R2B: variants whose default ISA changed on a link (final sha -> vids). Their
 #: page-4 evidence does NOT carry over (pending until the GPU `gen_profile check`); every
 #: other page-4 specialization must still be byte-identical on that link.
@@ -111,11 +118,18 @@ _GATE_TEXT = {
         "ROUND-R2D",
         "every page-4/8/16 specialization incl. the R2C opt-ins",
     ),
-    KERNEL_SHA256: (
+    R2E_KERNEL_SHA256: (
         "ROUND-R2E",
         (
             "every page-4/8/16 bf16+fp8 R2D specialization incl. "
             "the R2D opt-ins; new defaults = R2D opt-in builds"
+        ),
+    ),
+    KERNEL_SHA256: (
+        "AITER-LINT",
+        (
+            "every page-4/8/16 bf16+fp8 default and routable R2E specialization "
+            "(black/ruff only, no generated-code change)"
         ),
     ),
 }

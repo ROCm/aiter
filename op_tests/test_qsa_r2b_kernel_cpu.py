@@ -305,10 +305,11 @@ class PersistFallbackLoop(unittest.TestCase):
             for n in ast.walk(T._builder("_build_wmma_kernel"))
             if isinstance(n, ast.FunctionDef) and n.name == name
         )
-        return [
-            ln.strip()
-            for ln in textwrap.dedent(ast.get_source_segment(T.SRC, node)).splitlines()
-            if ln.strip() and not ln.strip().startswith("#")
+        # AITER-LINT: def line + the AST-unparsed body, one statement header per line
+        # (comment- and formatting-insensitive: the kernel source is black-formatted)
+        body = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        return [f"def {node.name}"] + [
+            ln.strip() for ln in body.splitlines() if ln.strip()
         ]
 
     def test_fbl_is_persist_except_the_fallback_loop(self):

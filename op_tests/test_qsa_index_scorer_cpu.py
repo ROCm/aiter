@@ -275,13 +275,13 @@ class ProfileFormat(unittest.TestCase):
                 self.assertTrue(g.get("kernel_sha256"), r["cell"])
                 if g["kernel_sha256"] != ksha:
                     self.assertTrue(g.get("isa_identity"), r["cell"])
-                    if (
-                        r["cache_dtype"] != "bf16"
-                    ):  # fp8: GPU-restamped on bf492262 only
-                        self.assertEqual(
-                            g["kernel_sha256"], _gen().PAGE4_EVIDENCE_KERNEL_SHA256
-                        )
-                        self.assertIn("ROUND-PAGE16", g["isa_identity"], r["cell"])
+                if g["kernel_sha256"] in _gpu_stamp_kernels(ksha):
+                    _assert_lint_link(self, g, ksha, r["cell"])
+                elif r["cache_dtype"] != "bf16":  # fp8: GPU-restamped on bf492262 only
+                    self.assertEqual(
+                        g["kernel_sha256"], _gen().PAGE4_EVIDENCE_KERNEL_SHA256
+                    )
+                    self.assertIn("ROUND-PAGE16", g["isa_identity"], r["cell"])
             for key in (
                 "arch",
                 "cu",
@@ -315,9 +315,12 @@ class ProfileFormat(unittest.TestCase):
                 if r["cache_dtype"] == "bf16":
                     pending_bf16[r["cell"]] = g
                 continue
-            if g["status"] == "pass" and g["kernel_sha256"] in (ksha, p4sha):
+            gpu = _gpu_stamp_kernels(ksha)
+            if g["status"] == "pass" and g["kernel_sha256"] in (*gpu, p4sha):
                 self.assertTrue(g.get("checked"), r["cell"])  # restamped on GPU
-                if g["kernel_sha256"] != ksha:  # ROUND-PAGE16 identity
+                if g["kernel_sha256"] in gpu:  # AITER-LINT identity
+                    _assert_lint_link(self, g, ksha, r["cell"])
+                else:  # ROUND-PAGE16 identity
                     self.assertIn("ROUND-PAGE16", g["isa_identity"], r["cell"])
                 n_bf16 += r["cache_dtype"] == "bf16"
             elif r["cache_dtype"] == "fp8":
@@ -1282,6 +1285,19 @@ def _gen():
     return gen
 
 
+def _gpu_stamp_kernels(ksha):
+    """Kernels whose GPU stamps count as on the profiled kernel ``ksha``: ``ksha`` itself
+    and (AITER-LINT, black/ruff only) the R2E kernel the GPU check ran on, provided the
+    record carries the AITER-LINT ISA-identity link (see :func:`_assert_lint_link`)."""
+    return (ksha, _gen().R2E_KERNEL_SHA256)
+
+
+def _assert_lint_link(case, g, ksha, label):
+    """A pass stamped on the R2E kernel (not ``ksha``) carries the AITER-LINT link."""
+    if g["kernel_sha256"] != ksha:
+        case.assertIn("AITER-LINT", g.get("isa_identity", ""), label)
+
+
 def _verified_rules(data):
     """Copy of a profile with every rule stamped `pass` (as a GPU check would)."""
     d = json.loads(json.dumps(data))
@@ -1354,8 +1370,9 @@ class Rules(Env):
         gen = _gen()
         ksha = self.data["kernel"]["sha256"]
         # evidence carried to this kernel by the ISA-identity chain (GPU restamps on bf49 for
-        # page 4 bf16, on d438 for page 8/16 and fp8)
-        chain = (ksha, gen.PAGE4_EVIDENCE_KERNEL_SHA256, gen.R2_KERNEL_SHA256)
+        # page 4 bf16, on d438 for page 8/16 and fp8; AITER-LINT: GPU check on R2E 58051973)
+        gpu = _gpu_stamp_kernels(ksha)
+        chain = (*gpu, gen.PAGE4_EVIDENCE_KERNEL_SHA256, gen.R2_KERNEL_SHA256)
         caps = {
             4: gen.capture_shapes(),
             16: gen.capture_shapes_p16(),
@@ -1379,7 +1396,9 @@ class Rules(Env):
             )
             if g["status"] == "pass":
                 self.assertIn(g["kernel_sha256"], chain, r["id"])
-                if g["kernel_sha256"] != ksha:
+                if g["kernel_sha256"] in gpu:
+                    _assert_lint_link(self, g, ksha, r["id"])
+                else:
                     self.assertTrue(g.get("isa_identity"), r["id"])
                     # R2E re-routed / ISA-changed builds and the new fp8 draft wg_waves 2
                     # launch carry no older evidence: pass only on a fresh GPU check

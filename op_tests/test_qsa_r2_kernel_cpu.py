@@ -576,24 +576,31 @@ class SourceShapeR2(unittest.TestCase):
             self.assertIn("8)", body(p16.orelse))  # P = 8 branch
 
     def test_defaults_pass_no_new_keyword(self):
-        src = T.SRC
+        # AITER-LINT: whitespace-insensitive (the kernel source is black-formatted)
+        flat = lambda s: "".join(s.split())
+        src = flat(T.SRC)
         self.assertIn(
-            'dg_kw = (_NO_KW if (dg_rows, dg_mode, dg_waves) == (DECG_ROWS, "base", DECG_WAVES)',
+            flat(
+                'dg_kw = (_NO_KW if (dg_rows, dg_mode, dg_waves) == (DECG_ROWS, "base", '
+                "DECG_WAVES)"
+            ),
             src,
         )
         # ROUND-R2E: per-dtype draft waves ('auto': bf16 4 = no keyword, fp8 2)
         self.assertIn(
-            'dr_kw = _NO_KW if dr_w == DRAFT_WAVES else {"wg_waves": dr_w}', src
+            flat('dr_kw = _NO_KW if dr_w == DRAFT_WAVES else {"wg_waves": dr_w}'), src
         )
         self.assertEqual(T._const("DRAFT_AUTO_WG_WAVES"), {False: 4, True: 2})
-        self.assertIn('_PAGE_KW = {8: {"page_size": 8}, 16: {"page_size": 16}}', src)
+        self.assertIn(
+            flat('_PAGE_KW = {8: {"page_size": 8}, 16: {"page_size": 16}}'), src
+        )
         for env, default in (
             ("QSA_DECG_ROWS3", '"0"'),
             ("QSA_DECG_MODE", '"base"'),
             ("QSA_DECG_WG_WAVES", '"4"'),
             ("QSA_DRAFT_WG_WAVES", '"auto"'),
         ):
-            self.assertIn(f'os.environ.get("{env}", {default})', src, env)
+            self.assertIn(flat(f'os.environ.get("{env}", {default})'), src, env)
 
     def test_draft_wg_waves_coverage(self):
         ns = {"DRAFT_WAVES": 4}
