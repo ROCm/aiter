@@ -11,7 +11,7 @@ they are named for the topology of each lap instead:
 * ``"ring"`` 2(N-1) single-destination hops.
 
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
+INT6 bit-plane pair, both with group-16 E5M2 scales. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
 on ``(arch, link, world_size)`` in ``allreduce_policy``.
@@ -84,9 +84,13 @@ from .kernels.tensor_shim import _run_compiled
 logger = logging.getLogger("aiter")
 
 # The sum is restored in fp16 before the bf16 store, by scaling each group's
-# dequant scale (at least 2**-10) by the divisor; restored values reach
-# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
-# 480 * divisor < 65504.
+# dequant step (group scale * 1/bias) by the divisor. With the E5M2 group
+# scale every fp16 extremum fits at divisor 1, so the divisor is opt-in and the
+# scale range no longer sets these bounds. The smallest step is 2**-15 (INT4
+# and INT6 alike, see Codec.scale_min_e5); at DIVISOR_MIN it is restored as
+# 2**-19, an fp16 subnormal that still holds the 2-bit mantissa exactly
+# (subnormal spacing 2**-24). Inputs are divided by the divisor before the
+# first pack, so restored values keep the input's magnitude at DIVISOR_MAX.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
@@ -190,13 +194,13 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
     ``None`` means "not specified", and the caller is expected to pass it
     whenever it wants the schedule's own default rather than a pinned wire
-    format. That distinction matters at TP8, where the ring's reduce-scatter
+    format. That distinction matters from TP4, where the ring's reduce-scatter
     lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
     downgrade, not a restatement of the default.
 
     A codec the selected schedule cannot build raises. The per-N *default*
     silently narrows to what the schedule supports -- the mesh has no INT6
-    path, so TP8's INT6 reduce-scatter default does not leak into it.
+    path, so the ring's INT6 reduce-scatter default does not leak into it.
 
     The mesh has one wire format for both laps, so there ``rs_codec`` and
     ``ag_codec`` follow each other: give either one and the other takes the
