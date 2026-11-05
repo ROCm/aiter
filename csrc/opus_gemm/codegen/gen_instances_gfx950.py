@@ -1339,9 +1339,9 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     workspace_preload_sf = (
         k.preload_sf if k.workspace_preload_sf is None else k.workspace_preload_sf
     )
-    # @@SFMPACK@@ is an extra trailing template arg rather than its own constexpr
-    # bool so that pipelines that never heard of SFA_MPACK_GLOBAL emit
-    # byte-identical text. The wave8 kernel declares it, and its kids all spell
+    # The `sfmpack` template context is an extra trailing template arg rather than
+    # its own constexpr bool so that pipelines that never heard of SFA_MPACK_GLOBAL
+    # emit byte-identical text. The wave8 kernel declares it, and its kids all spell
     # it out: the fused host TU sees one forward decl per kid, so the parameter
     # cannot carry a default there to fall back on.
     # XCD_WGM rides along the same way, for the same reason.
@@ -1445,7 +1445,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     # The wave8 kernel's four trailing params default, so they are only spelled
     # out when a kid needs them -- and then all of them up to the last one used,
     # since none can be reached positionally without the ones in front of it.
-    # This list must reach at least as far as @@SFMPACK@@ does above, or the
+    # This list must reach at least as far as `sfmpack` does above, or the
     # launcher names a specialisation this TU never instantiated.
     if kernel_func == "gemm_a8w8_mxscale_flatmm_splitk_kernel":
         # Both, always -- see the matching note on `sfmpack` above.
@@ -1662,104 +1662,6 @@ def _emit_bmm_specialized(
         )
 
 
-# Common launcher signature + shared checks/kargs preamble. mmajor: O/Y are
-# [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major. Caller does the
-# dtype/arch/common checks (see opus_bmm.cu dispatch).
-_BMM_SPEC_SIG = r"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-@@NAME@@(
-    aiter_tensor_t &O,
-    aiter_tensor_t &wo_a,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int @@SPLITK_ARG@@)
-{
-  using Traits = @@NAME@@_Traits;
-  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
-"""
-
-_BMM_SPEC_KARGS = r"""
-  auto stream = aiter::getCurrentHIPStream();
-
-  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr();
-  kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_ws = nullptr;
-  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-  kargs.stride_a = (int)O.stride(0);
-  kargs.stride_b = (int)wo_a.stride(1);
-  kargs.stride_ws = N;
-  kargs.stride_a_batch = (int)O.stride(1);
-  kargs.stride_b_batch = (int)wo_a.stride(0);
-  kargs.stride_ws_batch = M * N;
-  kargs.ptr_sfa = x_scale.data_ptr();
-  kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.stride_sfa = (int)x_scale.stride(0);
-  kargs.stride_sfa_batch = (int)x_scale.stride(1);
-  kargs.stride_sfb = (int)w_scale.stride(1);
-  kargs.stride_sfb_batch = (int)w_scale.stride(0);
-  kargs.ptr_c = Y.data_ptr();
-  kargs.stride_c = (int)Y.stride(0);
-  kargs.stride_c_batch = (int)Y.stride(1);
-"""
-
-
-# Compact family: one runtime-dimension path with bounded K segments.
-_BMM_COMPACT_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + r"""  AITER_CHECK(splitK == 0 || splitK == 1, "@@NAME@@ requires splitK <= 1");
-  const int64_t M = O.size(0), batch = O.size(1), N = wo_a.size(1), K = O.size(2);
-  AITER_CHECK(M > 0 && M < 2048 && batch > 0 && batch <= 16 && N > 0 && N <= 2147483647 && K > 0 && K <= 2147483647,
-              "@@NAME@@ requires M in [1,2047], batch in [1,16], positive int32 N and K");
-  AITER_CHECK(N % 128 == 0 && N % Traits::B_N == 0 && K % Traits::B_K == 0,
-              "@@NAME@@ requires N aligned to 128 and B_N, and K aligned to B_K");
-  const int64_t output_bytes = Y.dtype() == AITER_DTYPE_bf16 ? 2 : 4;
-  AITER_CHECK(M*batch*K <= 2147483647 && N*K <= 2147483647 &&
-              M*batch*N*output_bytes <= 2147483647,
-              "@@NAME@@ requires A, each B batch, and Y byte spans to fit signed int32");
-  const int64_t scale_k = K / 128;
-  // Size-one dimensions do not contribute to addresses; contiguous PyTorch
-  // views may retain arbitrary strides on those axes after transpose/clone.
-  AITER_CHECK((M == 1 || O.stride(0) == batch*K) && (batch == 1 || O.stride(1) == K) &&
-              (batch == 1 || wo_a.stride(0) == N*K) && wo_a.stride(1) == K &&
-              (M == 1 || Y.stride(0) == batch*N) && (batch == 1 || Y.stride(1) == N) &&
-              (M == 1 || x_scale.stride(0) == batch*scale_k) && (batch == 1 || x_scale.stride(1) == scale_k) &&
-              (batch == 1 || w_scale.stride(0) == (N/128)*scale_k) && w_scale.stride(1) == scale_k,
-              "@@NAME@@ requires contiguous token-major A/scales/Y and contiguous preshuffled B");
-  AITER_CHECK(reinterpret_cast<uintptr_t>(O.data_ptr()) % 16 == 0 &&
-              reinterpret_cast<uintptr_t>(wo_a.data_ptr()) % 16 == 0 &&
-              reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0 &&
-              reinterpret_cast<uintptr_t>(x_scale.data_ptr()) % 4 == 0 &&
-              reinterpret_cast<uintptr_t>(w_scale.data_ptr()) % 4 == 0,
-              "@@NAME@@ requires 16-byte A/B/Y alignment and 4-byte scale alignment");
-"""
-    + r"""
-  auto stream = aiter::getCurrentHIPStream();
-
-  opus_bmm_compact_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr(); kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_c = Y.data_ptr();
-  kargs.ptr_sfa = x_scale.data_ptr(); kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-"""
-    + r"""
-  const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
-  dim3 grid_main((tiles * batch + 7) / 8 * 8);
-  dim3 block_main(Traits::BLOCK_SIZE);
-  if (Y.dtype() == AITER_DTYPE_bf16)
-    @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
-  else
-    @@KERNEL@@<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
-}
-#endif
-"""
-)
-
-
 def gen_bmm_mxscale_compact_instance(
     cg,
     k,
@@ -1776,8 +1678,10 @@ def gen_bmm_mxscale_compact_instance(
     **_unused,
 ):
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = _BMM_COMPACT_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
-        "@@KERNEL@@", kernel_func
+    launcher = render_template(
+        "gfx950_bmm_mxscale_compact_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
     )
     _emit_bmm_specialized(
         cg,
@@ -1794,44 +1698,6 @@ def gen_bmm_mxscale_compact_instance(
         launcher,
         "",
     )
-
-
-# ---- wave8n2 (kid 132) ----
-_BMM_WAVE8N2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  constexpr int LOGICAL_B_N = Traits::B_N * 2;
-  AITER_CHECK(M % Traits::B_M == 0,
-              "@@NAME@@ requires M % ", Traits::B_M, " == 0, got ", M);
-  AITER_CHECK(N % LOGICAL_B_N == 0,
-              "@@NAME@@ requires N % ", LOGICAL_B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-"""
-    + _BMM_SPEC_KARGS.replace(
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;",
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;\n  kargs.split_k = 1;",
-    )
-    + r"""
-  const int num_tiles_m = M / Traits::B_M;
-  const int num_tiles_n = N / LOGICAL_B_N;
-  dim3 grid_main(num_tiles_m * num_tiles_n, 1, batch);
-  dim3 block_main(512);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Traits, __bf16>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<Traits, float>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
-)
 
 
 def gen_bmm_mxscale_wave8n2_instance(
@@ -1851,8 +1717,10 @@ def gen_bmm_mxscale_wave8n2_instance(
     **_unused,
 ):
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = _BMM_WAVE8N2_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
-        "@@KERNEL@@", kernel_func
+    launcher = render_template(
+        "gfx950_bmm_mxscale_wave8n2_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
     )
     _emit_bmm_specialized(
         cg,
@@ -1873,48 +1741,6 @@ def gen_bmm_mxscale_wave8n2_instance(
 
 def _cppbool(v):
     return "true" if v else "false"
-
-
-# ---- wave4m2_selfload (kids 134/142/148) ----
-_BMM_WAVE4M2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
-  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
-  constexpr bool PACK_SCALE_ON_DEMAND = @@PSOD@@;
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  constexpr int LOGICAL_B_M = Traits::B_M * @@MFAC@@;
-  AITER_CHECK(M % LOGICAL_B_M == 0,
-              "@@NAME@@ requires M % ", LOGICAL_B_M, " == 0, got ", M);
-  AITER_CHECK(N % Traits::B_N == 0,
-              "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-"""
-    + _BMM_SPEC_KARGS.replace(
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;",
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;\n  kargs.split_k = 1;",
-    )
-    + r"""
-  const int num_tiles_m = M / LOGICAL_B_M;
-  const int num_tiles_n = N / Traits::B_N;
-  dim3 grid_main(num_tiles_m * num_tiles_n, 1, batch);
-  dim3 block_main(256);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<
-        Traits, __bf16, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<
-        Traits, float, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
-)
 
 
 def _gen_bmm_mxscale_wave4m2_family_instance(
@@ -1941,12 +1767,13 @@ def _gen_bmm_mxscale_wave4m2_family_instance(
     the four waves split a single tile.
     """
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = (
-        _BMM_WAVE4M2_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
-        .replace("@@PSOD@@", _cppbool(k.pack_scale_on_demand))
-        .replace("@@MFAC@@", str(m_factor))
+    launcher = render_template(
+        "gfx950_bmm_mxscale_wave4m2_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
+        ssw=_cppbool(k.skip_scale_wait),
+        psod=_cppbool(k.pack_scale_on_demand),
+        mfac=str(m_factor),
     )
     suffix = f", {_cppbool(k.skip_scale_wait)}, {_cppbool(k.pack_scale_on_demand)}"
     _emit_bmm_specialized(
@@ -1970,95 +1797,6 @@ def gen_bmm_mxscale_wave4m2_selfload_instance(*args, **kwargs):
     return _gen_bmm_mxscale_wave4m2_family_instance(*args, m_factor=2, **kwargs)
 
 
-# ---- mouter (kids 131/144) + mouter_tunable (kids 160/161) ----
-# Shared persistent-mouter kernel; the two families differ only in how m_per_wg
-# is derived (heuristic vs API-splitK sweep). XCD-aware grid remap is identical.
-_BMM_MOUTER_CHECKS = r"""  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  AITER_CHECK(M % Traits::B_M == 0,
-              "@@NAME@@ requires M % ", Traits::B_M, " == 0, got ", M);
-  AITER_CHECK(N % Traits::B_N == 0,
-              "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-  const int total_iters = K / Traits::B_K;
-  AITER_CHECK(total_iters >= Traits::prefetch_k_iter,
-              "@@NAME@@ requires at least ", Traits::prefetch_k_iter,
-              " K-tiles, got ", total_iters);
-"""
-
-_BMM_MOUTER_KARGS = r"""
-  auto stream = aiter::getCurrentHIPStream();
-
-  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr();
-  kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_ws = nullptr;
-  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-  const int num_tiles_m = M / Traits::B_M;
-  const int num_tiles_n = N / Traits::B_N;
-"""
-
-_BMM_MOUTER_TAIL = r"""  kargs.split_k = m_per_wg;
-  kargs.stride_a = (int)O.stride(0);
-  kargs.stride_b = (int)wo_a.stride(1);
-  kargs.stride_ws = N;
-  kargs.stride_a_batch = (int)O.stride(1);
-  kargs.stride_b_batch = (int)wo_a.stride(0);
-  kargs.stride_ws_batch = M * N;
-  kargs.ptr_sfa = x_scale.data_ptr();
-  kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.stride_sfa = (int)x_scale.stride(0);
-  kargs.stride_sfa_batch = (int)x_scale.stride(1);
-  kargs.stride_sfb = (int)w_scale.stride(1);
-  kargs.stride_sfb_batch = (int)w_scale.stride(0);
-  kargs.ptr_c = Y.data_ptr();
-  kargs.stride_c = (int)Y.stride(0);
-  kargs.stride_c_batch = (int)Y.stride(1);
-
-  const int split_m = (num_tiles_m + m_per_wg - 1) / m_per_wg;
-  constexpr int NUM_XCD = 8;
-  const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
-  kargs.stride_ws = split_m;
-  kargs.stride_ws_batch = m_grp_per_xcd;
-  dim3 grid_main(NUM_XCD * m_grp_per_xcd * num_tiles_n, 1, batch);
-  dim3 block_main(Traits::BLOCK_SIZE);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Traits, __bf16, SKIP_SCALE_WAIT>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<Traits, float, SKIP_SCALE_WAIT>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
-
-_BMM_MOUTER_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + '  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");\n'
-    + _BMM_MOUTER_CHECKS
-    + _BMM_MOUTER_KARGS
-    + "  const int m_per_wg = (num_tiles_m >= 16) ? 2 : 1;\n"
-    + _BMM_MOUTER_TAIL
-)
-
-# Tunable variant: API splitK is repurposed as m_per_wg (clamped to [1,
-# num_tiles_m]); reuses the same mouter kernel.
-_BMM_MOUTER_TUNABLE_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + '  AITER_CHECK(splitK >= 1, "@@NAME@@ requires splitK >= 1");\n'
-    + _BMM_MOUTER_CHECKS
-    + _BMM_MOUTER_KARGS
-    + "  int m_per_wg = splitK;\n"
-    "  if (m_per_wg > num_tiles_m) m_per_wg = num_tiles_m;\n"
-    "  if (m_per_wg < 1) m_per_wg = 1;\n" + _BMM_MOUTER_TAIL
-)
-
-
 def gen_bmm_mxscale_mouter_instance(
     cg,
     k,
@@ -2076,10 +1814,11 @@ def gen_bmm_mxscale_mouter_instance(
     **_unused,
 ):
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = (
-        _BMM_MOUTER_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
+    launcher = render_template(
+        "gfx950_bmm_mxscale_mouter_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
+        ssw=_cppbool(k.skip_scale_wait),
     )
     _emit_bmm_specialized(
         cg,
@@ -2115,10 +1854,11 @@ def gen_bmm_mxscale_mouter_tunable_instance(
     **_unused,
 ):
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = (
-        _BMM_MOUTER_TUNABLE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
+    launcher = render_template(
+        "gfx950_bmm_mxscale_mouter_tunable_launcher.cuh.j2",
+        name=k.name,
+        kernel=kernel_func,
+        ssw=_cppbool(k.skip_scale_wait),
     )
     # host-only: device instantiations are shared with the mouter family.
     _emit_bmm_specialized(
