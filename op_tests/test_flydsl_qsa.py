@@ -3453,7 +3453,12 @@ def test_paged_gqa_empty_cache_or_table_returns_zeros():
 
 
 def test_qsa_layer_empty_indexer_keeps_causal_tail():
-    """An empty indexer skips block-id materialization but still attends its tail."""
+    """An empty indexer writes -1, and the layer still attends its tail.
+
+    The public indexer fills block ids with -1 and does not launch. When
+    the layer owns that buffer it passes zero columns to expand, which
+    still emits the causal tail. A caller-owned buffer is filled with -1.
+    """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         pytest.skip("unsupported arch")
     idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
@@ -3466,7 +3471,7 @@ def test_qsa_layer_empty_indexer_keeps_causal_tail():
     case["qpos"].fill_(5)
     case["slen"].fill_(6)
 
-    blocks, empty = qsa_indexer_block_ids(
+    blocks = qsa_indexer_block_ids(
         case["q_indexer"],
         case["index_cache"],
         case["index_table"],
@@ -3474,10 +3479,9 @@ def test_qsa_layer_empty_indexer_keeps_causal_tail():
         case["qpos"],
         case["slen"],
         heads=(idx.n_heads,),
-        _return_empty_geometry=True,
     )
-    if blocks is not None or not empty:
-        raise AssertionError("empty indexer did not elide block-id materialization")
+    if not torch.equal(blocks, torch.full_like(blocks, -1)):
+        raise AssertionError("empty indexer did not write -1 block ids")
 
     tail = _expand_block_ids(
         torch.empty(1, 0, dtype=dtypes.i32, device=device),
@@ -3493,14 +3497,29 @@ def test_qsa_layer_empty_indexer_keeps_causal_tail():
     if not torch.equal(tail[0, 2:], torch.full_like(tail[0, 2:], -1)):
         raise AssertionError(f"unexpected empty-indexer expansion: {tail[0, :8]}")
 
-    baseline_blocks = torch.empty(1, _K, dtype=dtypes.i32, device=device)
-    baseline = qsa_layer(
-        *_layer_args(case),
-        **_layer_kwargs(idx, block_ids=baseline_blocks),
-    )
-    if not torch.equal(baseline_blocks, torch.full_like(baseline_blocks, -1)):
-        raise AssertionError("empty indexer did not write caller block ids")
-    optimized = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    widths = []
+    original_expand = qsa_paged._expand_block_ids
+
+    def _record_expand(block_ids, *args, **kwargs):
+        widths.append(int(block_ids.shape[1]))
+        return original_expand(block_ids, *args, **kwargs)
+
+    qsa_paged._expand_block_ids = _record_expand
+    try:
+        baseline_blocks = torch.empty(1, _K, dtype=dtypes.i32, device=device)
+        baseline = qsa_layer(
+            *_layer_args(case),
+            **_layer_kwargs(idx, block_ids=baseline_blocks),
+        )
+        if not torch.equal(baseline_blocks, torch.full_like(baseline_blocks, -1)):
+            raise AssertionError("empty indexer did not write caller block ids")
+        optimized = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    finally:
+        qsa_paged._expand_block_ids = original_expand
+    if widths != [_K, 0]:
+        raise AssertionError(
+            f"empty indexer expanded columns {widths}; expected [{_K}, 0]"
+        )
     direct = flydsl_qsa_paged_gqa(
         case["q_gqa"],
         case["k_cache"],

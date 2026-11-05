@@ -706,42 +706,41 @@ def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str
     return None
 
 
-def qsa_indexer_block_ids(
+def _indexer_empty_geometry(
+    m: int,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> bool:
+    """True when every selection is -1 and the indexer must not launch.
+
+    The scorers clamp a missing request or page to 0 and still load it.
+    An empty context, cache, or page table has no such element.
+    """
+    return (
+        m == 0
+        or context_lens.shape[0] == 0
+        or k_cache.shape[0] == 0
+        or page_table.shape[0] == 0
+        or page_table.shape[1] == 0
+    )
+
+
+def _prepare_indexer_launch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
     context_lens: torch.Tensor,
-    out: torch.Tensor | None = None,
-    score_scale: float = _SCORE_SCALE,
-    heads: tuple[int, ...] = _SCORE_HEADS,
-    scores: torch.Tensor | None = None,
-    _return_empty_geometry: bool = False,
-) -> torch.Tensor:
-    """Write indexer ``block_ids [M, 512]`` from paged compressed K.
+    out: torch.Tensor | None,
+    scores: torch.Tensor | None,
+    heads: tuple[int, ...],
+) -> tuple[int, str]:
+    """Host checks for one indexer call. Returns ``(rows, arch)``.
 
-    Rows no wider than 512 use the fused emit path. Longer rows materialize
-    scores with a BLOCK_N=32 MFMA writer. A block on a missing page is
-    dropped and the kept ids stay packed in front of ``-1``, so a short
-    context does not fill the budget with that page: emit and the
-    one-workgroup radix skip it, and a separate pack follows the split
-    and streaming selectors. ``scores`` is an optional fp32
-    ``[M, n_columns]`` workspace for that writer, with a unit column
-    stride. ``n_columns`` is ``page_table.shape[1] * page_size``. When
-    ``M`` is more than one, the row stride is at least ``n_columns``.
-    ``None`` allocates it. Emit does not read it. The buffer is overwritten
-    and is not returned. Batches averaging two or more rows per request score 16
-    query rows per workgroup, except gfx942 H=8; one-row decode uses one row
-    per workgroup. Selection is the stable decode radix for prefill (more
-    than 64 rows) and, otherwise, below 32768 columns; streaming radix
-    (``tie='low'``) at or above that width.
-    Expand+tail is still separate. An empty context, cache, or page table
-    writes ``-1`` and does not launch. A page table with fewer request
-    rows than ``context_lens`` is rejected.
-
-    ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
-    narrow; the ``(4, 8)`` default also admits the 8-head indexer.
+    Empty geometry still prepares successfully. The caller then writes
+    ``-1``, or ``qsa_layer`` passes zero columns to expand.
     """
     reason = qsa_indexer_supported(q, k_cache, page_table, heads)
     if reason is not None:
@@ -775,18 +774,24 @@ def qsa_indexer_block_ids(
         raise ValueError("every tensor must be on the GPU")
     if any(t.device != q.device for t in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
-    arch = _qsa_arch()
-    # The scorers clamp a missing request or page to 0 and still load it.
-    # An empty axis has no such element, and every selection is -1.
-    if (
-        m == 0
-        or context_lens.shape[0] == 0
-        or k_cache.shape[0] == 0
-        or page_table.shape[0] == 0
-        or page_table.shape[1] == 0
-    ):
-        if _return_empty_geometry:
-            return None, True
+    return m, _qsa_arch()
+
+
+def _write_indexer_block_ids(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None,
+    score_scale: float,
+    scores: torch.Tensor | None,
+    m: int,
+    arch: str,
+) -> torch.Tensor:
+    """Write ``block_ids [M, 512]`` after ``_prepare_indexer_launch``."""
+    if _indexer_empty_geometry(m, k_cache, page_table, context_lens):
         if out is None:
             out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
         return out.fill_(-1)
@@ -850,9 +855,69 @@ def qsa_indexer_block_ids(
             row_bounded=row_bounded,
             scores=scores,
         )
-    if _return_empty_geometry:
-        return out, False
     return out
+
+
+def qsa_indexer_block_ids(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None = None,
+    score_scale: float = _SCORE_SCALE,
+    heads: tuple[int, ...] = _SCORE_HEADS,
+    scores: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write indexer ``block_ids [M, 512]`` from paged compressed K.
+
+    Rows no wider than 512 use the fused emit path. Longer rows materialize
+    scores with a BLOCK_N=32 MFMA writer. A block on a missing page is
+    dropped and the kept ids stay packed in front of ``-1``, so a short
+    context does not fill the budget with that page: emit and the
+    one-workgroup radix skip it, and a separate pack follows the split
+    and streaming selectors. ``scores`` is an optional fp32
+    ``[M, n_columns]`` workspace for that writer, with a unit column
+    stride. ``n_columns`` is ``page_table.shape[1] * page_size``. When
+    ``M`` is more than one, the row stride is at least ``n_columns``.
+    ``None`` allocates it. Emit does not read it. The buffer is overwritten
+    and is not returned. Batches averaging two or more rows per request score 16
+    query rows per workgroup, except gfx942 H=8; one-row decode uses one row
+    per workgroup. Selection is the stable decode radix for prefill (more
+    than 64 rows) and, otherwise, below 32768 columns; streaming radix
+    (``tie='low'``) at or above that width.
+    Expand+tail is still separate. An empty context, cache, or page table
+    writes ``-1`` and does not launch. A page table with fewer request
+    rows than ``context_lens`` is rejected.
+
+    ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
+    narrow; the ``(4, 8)`` default also admits the 8-head indexer.
+    """
+    m, arch = _prepare_indexer_launch(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out,
+        scores,
+        heads,
+    )
+    return _write_indexer_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out,
+        score_scale,
+        scores,
+        m,
+        arch,
+    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -1213,36 +1278,39 @@ def qsa_layer(
         extra["heads"] = (int(q_indexer.shape[1]),)
     if score_scale is not None:
         extra["score_scale"] = score_scale
-    if block_ids is None:
-        block_ids, empty_indexer = qsa_indexer_block_ids(
-            q_indexer,
-            index_k_cache,
-            index_page_table,
-            token_to_req,
-            query_positions,
-            context_lens,
-            scores=scores,
-            _return_empty_geometry=True,
-            **extra,
-        )
-    else:
-        empty_indexer = False
-        block_ids = qsa_indexer_block_ids(
-            q_indexer,
-            index_k_cache,
-            index_page_table,
-            token_to_req,
-            query_positions,
-            context_lens,
-            out=block_ids,
-            scores=scores,
-            **extra,
-        )
-    if empty_indexer:
+    heads = extra.get("heads", _SCORE_HEADS)
+    m, arch = _prepare_indexer_launch(
+        q_indexer,
+        index_k_cache,
+        index_page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        block_ids,
+        scores,
+        heads,
+    )
+    if block_ids is None and _indexer_empty_geometry(
+        m, index_k_cache, index_page_table, context_lens
+    ):
         # No compressed group is selected. The expand kernel does not read
         # group ids when this axis is zero, but still emits the causal tail.
         block_ids = torch.empty(
-            (q_indexer.shape[0], 0), dtype=torch.int32, device=q_indexer.device
+            (m, 0), dtype=torch.int32, device=q_indexer.device
+        )
+    else:
+        block_ids = _write_indexer_block_ids(
+            q_indexer,
+            index_k_cache,
+            index_page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            block_ids,
+            extra.get("score_scale", _SCORE_SCALE),
+            scores,
+            m,
+            arch,
         )
     indices = _expand_block_ids(
         block_ids,
