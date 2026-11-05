@@ -1016,7 +1016,9 @@ def build_gemm_a8w4_tdm_task(
                         else:
                             e_ok = e_idx < n_experts
                             end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
-                            psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
+                            psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(
+                                1, 0
+                            )
                     for sh in range_constexpr(int.bit_length(WAVE) - 1):
                         psum_hits = psum_hits + psum_hits.shuffle_xor(
                             fx.Int32(1 << sh), fx.Int32(WAVE)
@@ -1960,12 +1962,12 @@ def build_gemm_a8w4_tdm_task(
             sa_pairs if row_major_ascale or tdm_as_in_prologue else ceildiv(sa_pairs, 2)
         )
         SB_DS = ceildiv(sb_pairs, 2)
-        # Preserve fused quant and native packed-load scheduling. Plain
-        # ordinary outputs retain main's established IGLP hint count; neither
-        # choice changes the LDS reads or their dependency wait counters.
+        # Keep ordinary-input scheduling on the established IGLP count.
+        # Packed inputs use paired-read accounting; these hints do not replace
+        # the dependency waits generated for the actual LDS reads.
         BS_DS = (
             wmma_n_rep * DS_B + SB_DS + SA_DS
-            if a_preshuffled or stage1_quant_out
+            if a_preshuffled
             else wmma_n_rep * 2 + sb_pairs + sa_pairs
         )
         STATE_DS = wmma_m_rep * DS_A + BS_DS
