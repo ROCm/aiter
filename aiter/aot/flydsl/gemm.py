@@ -240,6 +240,19 @@ def _a16w16(job: dict) -> None:
     )
 
 
+def _a16w16_gfx942(job: dict) -> None:
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+    m, n, k = job["m"], job["n"], job["k"]
+    bf16 = _dtype("bfloat16")
+    flydsl_hgemm(
+        _empty(m, k, dtype=bf16),
+        _empty(n, k, dtype=bf16),
+        # The column holds the kernel's name for the dtype, not Torch's.
+        out_dtype=_dtype("float32" if job["out_dtype"] == "fp32" else "bfloat16"),
+    )
+
+
 def _a4w4_mxscale_bpreshuffle(job: dict) -> None:
     from aiter.ops.gemm_op_a4w4 import gemm_a4w4
     from aiter.utility import dtypes
@@ -343,6 +356,14 @@ TABLES = (
         ("gfx", "cu_num", "N", "K", "bias", "dtype", "outdtype", "scaleAB")
         + ("bpreshuffle",),
         _a16w16,
+    ),
+    Table(
+        "flydsl_gemm_a16w16_gfx942_tuned",
+        "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
+        ("gfx", "cu_num", "N", "K", "out_dtype"),
+        _a16w16_gfx942,
+        # Every row is FlyDSL, and the table carries no libtype column to say so.
+        all_rows=True,
     ),
     Table(
         "a4w4_mxscale_bpreshuffle_tuned_gemm",
