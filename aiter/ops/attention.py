@@ -1082,13 +1082,22 @@ def get_pa_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
+        For block_size=16, KV split granularity is overridden internally: page16 uses
+        256-token tiles when fast_mode=True on 256-CU gfx950, causal Q4/GQA16,
+        one KV head, 1-64 requests, max_seqlen_qo=uni_seqlen_qo=4 and the full
+        CU worker budget. Other page16 configurations retain page-granularity
+        planning. Other page sizes use the supplied kv_granularity unchanged,
+        including the original page1024 path when kv_granularity=1024.
+        Tile-aligned splits can change rounding, so attention need not be
+        bit-exact to the original page16 plan.
         Options: Detailed settings for spliting. All of them are optional.
-            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            kv_granularity: default=16. KV split granularity in tokens; overridden for page16 as above.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
-                       with page size 16 (block_size=kv_granularity=16), up to 32768 requests and
+            fast_mode: default=True. In addition to the automatic tile path above, uses parallel
+                       generation for dense, single-Q-tile inputs
+                       with page size 16, up to 32768 requests and
                        the full CU worker budget. False, other page sizes or configurations, or
                        buffers without the extra scratch space (see get_pa_metadata_info_v1) use
                        the serial generator with identical metadata. Valid inputs require consistent
