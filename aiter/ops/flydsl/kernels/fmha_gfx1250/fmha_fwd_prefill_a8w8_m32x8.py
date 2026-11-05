@@ -61,17 +61,21 @@ from ..tensor_shim import _run_compiled
 # depctr covers itself for the plain intrinsics the kernel emits.
 from .fmha_buffer_managers import (
     ENABLE_SCHED_MODE2,
+    KManager16bPaged,
     KManager16bV1,
     KManager16bV2,
     ProducerCtx,
     QManager16bV1,
     QManager16bV2,
+    VManager16bPaged,
     VManager16bV1,
     VManager16bV2,
     _ir,
 )
 from .fmha_utils import (
     _ContiguousKVPolicy,
+    _PagedKVPolicy,
+    PagedSpec,
     BLOCK_SIZE,
     DTYPE_MAP,
     LDS_CHUNK_BYTES,
@@ -91,6 +95,7 @@ from .fmha_utils import (
     _kv_drain_depths,
     _lane_id,
     _load_seqlen_pair,
+    s_buffer_load,
     _load_sink_logit,
     _m_tile_idx,
     _o_manager,
@@ -717,17 +722,47 @@ _PROLOGUE_KEYS = (
     "window_right",
     "q_dtype",
     "kv_dtype",
+    "paged",
 )
 
 
 def _build_managers(
-    *, qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, q_dtype, kv_dtype
+    *,
+    qk_hdim,
+    v_hdim,
+    n_block,
+    gqa_ratio,
+    num_q_tiles_per_wave,
+    q_dtype,
+    kv_dtype,
+    paged=None,
 ):
     """The Q/K/V staging managers both cores use; USE_TDM_LOADER picks the transport.
 
     Pure object construction -- no IR is emitted until a manager method is called, so
     sharing this between the cores cannot move the generated code.
     """
+    if paged is not None:
+        # Q is dense whatever the KV pool looks like; only K/V gather.
+        return (
+            QManager16bV2(
+                qk_hdim=qk_hdim,
+                gqa_ratio=gqa_ratio,
+                num_waves=NUM_WAVES,
+                q_tiles_per_wave=num_q_tiles_per_wave,
+                elem_dtype=q_dtype,
+            ),
+            KManager16bPaged(
+                qk_hdim=qk_hdim,
+                n_block=n_block,
+                elem_dtype=kv_dtype,
+            ),
+            VManager16bPaged(
+                v_hdim=v_hdim,
+                n_block=n_block,
+                elem_dtype=kv_dtype,
+            ),
+        )
     if USE_TDM_LOADER:
         return (
             QManager16bV2(
@@ -796,6 +831,7 @@ def _attention_prologue(
     window_right,
     q_dtype,
     kv_dtype,
+    paged,  # PagedSpec, or None for a dense KV band
     warp_idx,  # runtime fx.Int32 wave index
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
 ):
@@ -822,6 +858,7 @@ def _attention_prologue(
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
     # chunks, O the two slots the loop has finished with -- see the 12-chunk map up top.
     q_mgr, k_mgr, v_mgr = _build_managers(
+        paged=paged,
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
         n_block=n_block,
@@ -973,9 +1010,23 @@ def _attention_prologue(
         num_producer_warps=KV_PRODUCER_WARPS,
         lane_idx=lane_idx,
     )
-    _kv_policy = _ContiguousKVPolicy(
-        tile_row0=_tile_row0, kv_valid=_kv_valid, row_base=kv_start
-    )
+    if paged is None:
+        _kv_policy = _ContiguousKVPolicy(
+            tile_row0=_tile_row0, kv_valid=_kv_valid, row_base=kv_start
+        )
+    else:
+        _kv_policy = _PagedKVPolicy(
+            tile_row0=_tile_row0,
+            kv_valid=_kv_valid,
+            ptr_page_indices=paged.ptr_page_indices,
+            num_page_entries=paged.num_page_entries,
+            page_base=paged.page_base,
+            page_size=paged.page_size,
+            num_pool_rows=paged.num_pool_rows,
+            producer_warp=_producer_warp,
+            num_producer_warps=KV_PRODUCER_WARPS,
+            n_block=n_block,
+        )
 
     def _k_desc(slot, row0, valid):
         """K descriptor for one tile, addressed off the slot's low-half base. Pure until
@@ -1156,6 +1207,7 @@ def _attention_core_multi_kv_tiles(
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     prologue,  # dict from _attention_prologue: managers, LDS map, KV span, Q fragments
+    paged=None,  # consumed by the prologue; here only so one kwarg dict serves both
     q_dtype,  # compile-time Q fragment type; K/V are kv_dtype, P is P_DTYPE, O is O_DTYPE
     kv_dtype,  # compile-time K/V fragment type (may differ from q_dtype; both 8-bit)
 ):
@@ -1801,6 +1853,7 @@ def _attention_core_one_kv_tile(
     lds_base,
     q_dtype,
     kv_dtype,
+    paged=None,  # never paged (paged uses the multi-tile core); here for one kwarg dict
 ):
     """Whole-attention compute for a workgroup whose band fits in ONE KV tile.
 
@@ -2384,13 +2437,18 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     has_sink: bool = False,
     gqa_ratio: int = 1,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
+    page_size: int | None = None,
 ):
     """Build the m32x8 device kernel for a given layout ("thd" varlen or "bshd" batched)
     plus config; every parameter here is compile-time and baked into the trace.
     ``gqa_ratio`` (= ``nheads_q // nheads_kv``) is among them so the per-lane ``% / //``
     fold to shift/and when it is a power of two.
     """
-    assert layout in ("thd", "bshd"), f"layout must be thd|bshd, got {layout!r}"
+    assert layout in (
+        "thd",
+        "bshd",
+        "paged",
+    ), f"layout must be thd|bshd|paged, got {layout!r}"
     # qk_hdim (D_qk) is a WMMA_K multiple; v_hdim (D_v) a WMMA_M multiple. Independent.
     assert (
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim in SUPPORTED_V_HDIM
@@ -2415,11 +2473,195 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     N_BLOCK = int(n_block)
     MASK_LEFT = bool(mask_left)
     MASK_RIGHT = bool(mask_right)
+    PAGE_SIZE = None if page_size is None else int(page_size)
+    if PAGE_SIZE is not None:
+        assert (
+            PAGE_SIZE & (PAGE_SIZE - 1) == 0
+        ), f"page_size must be a power of two, got {PAGE_SIZE}"
+        assert not one_kv_tile, "paged uses the multi-tile core"
+    LOG2_PAGE = None if PAGE_SIZE is None else PAGE_SIZE.bit_length() - 1
     ONE_KV_TILE = bool(one_kv_tile)
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
     NUM_Q_TILES = int(num_q_tiles_per_wave)
+
+    if layout == "paged":
+
+        @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+        def kn_fmha_fwd_prefill_a8w8_m32x8_paged(
+            ptr_O: fx.Pointer,
+            ptr_Q: fx.Pointer,
+            ptr_K: fx.Pointer,
+            ptr_V: fx.Pointer,
+            ptr_LSE: fx.Pointer,
+            ptr_sink: fx.Pointer,
+            ptr_cu_seqlens_q: fx.Pointer,
+            ptr_kv_indptr: fx.Pointer,
+            ptr_kv_page_indices: fx.Pointer,
+            ptr_kv_last_page_lens: fx.Pointer,
+            softmax_scale: fx.Float32,
+            stride_q_seq: fx.Int32,
+            stride_k_seq: fx.Int32,
+            stride_v_seq: fx.Int32,
+            stride_o_seq: fx.Int32,
+            stride_q_head: fx.Int32,
+            stride_k_head: fx.Int32,
+            stride_v_head: fx.Int32,
+            stride_o_head: fx.Int32,
+            stride_lse_seq: fx.Int32,
+            stride_lse_head: fx.Int32,
+            window_left: fx.Int32,
+            window_right: fx.Int32,
+            max_seqlen_q: fx.Int32,
+            max_seqlen_k: fx.Int32,
+            num_page_entries: fx.Int32,
+            num_pool_rows: fx.Int32,
+        ):
+            """Paged entry: Q comes from qo_indptr as in THD, but this batch's KV is a
+            page list, so kv_len is derived from the page count and the last page's
+            fill. Positions stay sequence-relative (kv_start = 0); the page table
+            supplies the pool row."""
+            batch = fx.Int32(gpu.block_id("z"))
+            q_start, q_end = _load_seqlen_pair(ptr_cu_seqlens_q, batch)
+            q_len = q_end - q_start
+            page_lo, page_hi = _load_seqlen_pair(ptr_kv_indptr, batch)
+            num_pages = page_hi - page_lo
+            last_page_len = s_buffer_load(
+                ptr_kv_last_page_lens,
+                batch,
+                1,
+                num_records_bytes=fx.Int32(gpu.grid_dim.z) * fx.Int32(4),
+            )[0]
+            kv_start = fx.Int32(0)
+            kv_len = (num_pages > fx.Int32(0)).select(
+                ((num_pages - fx.Int32(1)) << fx.Int32(LOG2_PAGE)) + last_page_len,
+                fx.Int32(0),
+            )
+
+            # LSE is [nheads_q, total_q]. Bound the buffer resource by the last element
+            # this batch can touch over BOTH axes; a seq-only bound is exact only when
+            # seq is the major axis.
+            num_heads_q = gpu.grid_dim.y * fx.Int32(GQA_RATIO)
+            lse_base_elems = q_start * stride_lse_seq
+            lse_num_records_bytes = (
+                fx.Int64(q_start + q_len - fx.Int32(1)) * fx.Int64(stride_lse_seq)
+                + fx.Int64(num_heads_q - fx.Int32(1)) * fx.Int64(stride_lse_head)
+                + 1
+            ) * 4
+
+            # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
+            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+                _core_kwargs = {
+                    "qk_hdim": QK_HDIM,
+                    "v_hdim": V_HDIM,
+                    "n_block": N_BLOCK,
+                    "mask_left": MASK_LEFT,
+                    "mask_right": MASK_RIGHT,
+                    "return_lse": RET_LSE,
+                    "has_sink": HAS_SINK,
+                    "gqa_ratio": GQA_RATIO,
+                    "num_q_tiles_per_wave": NUM_Q_TILES,
+                    "ptr_O": ptr_O,
+                    "ptr_Q": ptr_Q,
+                    "ptr_K": ptr_K,
+                    "ptr_V": ptr_V,
+                    "ptr_LSE": ptr_LSE,
+                    "ptr_sink": ptr_sink,
+                    "softmax_scale": softmax_scale,
+                    "stride_q_seq": stride_q_seq,
+                    "stride_k_seq": stride_k_seq,
+                    "stride_v_seq": stride_v_seq,
+                    "stride_o_seq": stride_o_seq,
+                    "stride_q_head": stride_q_head,
+                    "stride_k_head": stride_k_head,
+                    "stride_v_head": stride_v_head,
+                    "stride_o_head": stride_o_head,
+                    "stride_lse_seq": stride_lse_seq,
+                    "stride_lse_head": stride_lse_head,
+                    "lse_base_elems": lse_base_elems,
+                    "lse_num_records_bytes": lse_num_records_bytes,
+                    "q_start": q_start,
+                    "q_len": q_len,
+                    "kv_start": kv_start,
+                    "kv_len": kv_len,
+                    "window_left": window_left,
+                    "window_right": window_right,
+                    "q_dtype": Q_ELEM_DTYPE,
+                    "kv_dtype": KV_ELEM_DTYPE,
+                    "paged": PagedSpec(
+                        ptr_page_indices=ptr_kv_page_indices,
+                        num_page_entries=num_page_entries,
+                        page_base=page_lo,
+                        page_size=PAGE_SIZE,
+                        num_pool_rows=num_pool_rows,
+                    ),
+                }
+                # Exactly one core reaches the binary: the host decides from the shape (bshd) or
+                # from max_seqlen_k (thd) whether every WG sees a single KV tile.
+                lds_base = _alloc_lds()
+                warp_idx = _warp_id()
+
+                _epi_state_out = _epi_state_zeros(
+                    num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
+                )
+                if ONE_KV_TILE:
+                    _epi_state_out = _attention_core_one_kv_tile(
+                        warp_idx=warp_idx, lds_base=lds_base, **_core_kwargs
+                    )
+                else:
+                    # One traced copy of Q's load and the first KV tiles, outside the
+                    # warp-type branch; the two halves differ only under its own branches.
+                    _prologue = _attention_prologue(
+                        warp_idx=warp_idx,
+                        lds_base=lds_base,
+                        **{k: _core_kwargs[k] for k in _PROLOGUE_KEYS},
+                    )
+                    # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
+                    if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
+                        _epi_state_out = _attention_core_multi_kv_tiles(
+                            warp_idx=warp_idx,
+                            warp_type=WarpType.LO,
+                            lds_base=lds_base,
+                            prologue=_prologue,
+                            **_core_kwargs,
+                        )
+                    else:
+                        _epi_state_out = _attention_core_multi_kv_tiles(
+                            warp_idx=warp_idx,
+                            warp_type=WarpType.HI,
+                            lds_base=lds_base,
+                            prologue=_prologue,
+                            **_core_kwargs,
+                        )
+                # One traced copy of the O/LSE tail, outside the warp-type branch.
+                _attention_epilogue(
+                    epi_state=_epi_state_out,
+                    rendezvous=not ONE_KV_TILE,
+                    warp_idx=warp_idx,
+                    **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
+                )
+            elif q_len > fx.Int32(0):
+                # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
+                _zero_fill_attention(
+                    v_hdim=V_HDIM,
+                    gqa_ratio=GQA_RATIO,
+                    num_q_tiles_per_wave=NUM_Q_TILES,
+                    return_lse=RET_LSE,
+                    has_sink=HAS_SINK,
+                    ptr_sink=ptr_sink,
+                    ptr_O=ptr_O,
+                    ptr_LSE=ptr_LSE,
+                    stride_o_seq=stride_o_seq,
+                    stride_o_head=stride_o_head,
+                    stride_lse_seq=stride_lse_seq,
+                    stride_lse_head=stride_lse_head,
+                    lse_num_records_bytes=lse_num_records_bytes,
+                    q_start=q_start,
+                    q_len=q_len,
+                )
+
+        return kn_fmha_fwd_prefill_a8w8_m32x8_paged
 
     if layout == "thd":
 
@@ -2507,6 +2749,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     "window_right": window_right,
                     "q_dtype": Q_ELEM_DTYPE,
                     "kv_dtype": KV_ELEM_DTYPE,
+                    "paged": None,
                 }
                 # Exactly one core reaches the binary: the host decides from the shape (bshd) or
                 # from max_seqlen_k (thd) whether every WG sees a single KV tile.
