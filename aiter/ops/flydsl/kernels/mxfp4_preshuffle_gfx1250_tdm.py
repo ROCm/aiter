@@ -597,7 +597,7 @@ def build_gemm_a8w4_tdm_task(
         and k_waves == 1
         and m_warp == 1
         and n_warp == 4
-        and num_buffers == 3
+        and num_buffers in (2, 3)
         and tile_m in (32, 64, 128)
         and tile_n == 256
         and tile_k in (128, 256)
