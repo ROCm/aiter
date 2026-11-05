@@ -86,8 +86,9 @@ def dispatch(monkeypatch):
 
 @pytest.mark.parametrize("ep_quant_bits", [None, 0, 4, 8])
 @pytest.mark.parametrize("use_default_buffers", [False, True])
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
 def test_large_buffers_pack_on_first_and_cached_calls(
-    dispatch, ep_quant_bits, use_default_buffers
+    dispatch, ep_quant_bits, use_default_buffers, a_preshuffled
 ):
     # Meta tensors exercise multi-billion-element dimensions without allocating
     # GPU memory. Arena addresses remain constexprs and are not ABI slots.
@@ -126,6 +127,9 @@ def test_large_buffers_pack_on_first_and_cached_calls(
                 contiguous_m=shape[0] * shape[1],
                 N=7168,
                 K=256,
+                a_is_fp4=a_preshuffled,
+                a_preshuffled=a_preshuffled,
+                num_buffers=2,
                 stream=0,
                 quant_scale=None if use_default_buffers else meta((2**31,)),
                 ep_row_map=(
@@ -136,13 +140,14 @@ def test_large_buffers_pack_on_first_and_cached_calls(
             is out
         )
 
-    # Crossing the Tensor dimension limit changes the ABI. Each separate
-    # callable must still reuse its own address/layout packing on later calls.
-    assert len(compiled) == 2
+    # Packed input changes ABI at the Tensor dimension limit. Ordinary input
+    # keeps Pointer packing, and both policies reuse their own cached calls.
+    assert len(compiled) == (2 if a_preshuffled else 1)
     assert len(launches) == 4
 
 
-def test_output_dimension_boundary_preserves_cached_abis(dispatch):
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
+def test_output_dimension_boundary_preserves_cached_abis(dispatch, a_preshuffled):
     compiled, launches = dispatch
 
     def meta(shape, dtype=torch.uint8):
@@ -161,17 +166,20 @@ def test_output_dimension_boundary_preserves_cached_abis(dispatch):
             contiguous_m=64,
             N=256,
             K=256,
+            a_is_fp4=a_preshuffled,
+            a_preshuffled=a_preshuffled,
+            num_buffers=2,
             stream=0,
             quant_scale=meta((1,)),
             ep_row_map=meta((64,), torch.int32),
         )
         layout = launches[-1]["layout_buffers"].get("arg_c")
-        if elements == 2**31 - 1:
+        if a_preshuffled and elements == 2**31 - 1:
             assert struct.unpack("<i", layout) == (elements,)
         else:
             assert layout is None
         assert (launches[-1]["arg_c"] or 0) == out.data_ptr()
-    assert len(compiled) == 2
+    assert len(compiled) == (2 if a_preshuffled else 1)
     assert len(launches) == 4
 
 
@@ -291,12 +299,7 @@ def test_default_optional_buffers_allow_odd_output_sizes(dispatch, dtype, elemen
         for name in ("arg_c", "arg_quant_scale", "arg_ep_row_map"):
             assert launches[-1][name] == out.data_ptr()
         row_layout = launches[-1]["layout_buffers"].get("arg_ep_row_map")
-        if elements * out.element_size() % 4:
-            assert row_layout is None
-        else:
-            assert struct.unpack("<i", row_layout) == (
-                elements * out.element_size() // 4,
-            )
+        assert row_layout is None
     assert len(compiled) == 1
     assert len(launches) == 2
 
@@ -349,7 +352,8 @@ def test_scale_reinterpretation_packs_flat_sizes_and_byte_offsets(
     assert layouts == (expected if tensor_abi else [])
 
 
-def test_scale_byte_offset_changes_cached_abi(dispatch):
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
+def test_scale_byte_offset_changes_cached_abi(dispatch, a_preshuffled):
     compiled, launches = dispatch
     for offset in (1, 4) * 2:
         storage = torch.empty(256 + offset, dtype=torch.uint8)
@@ -366,10 +370,62 @@ def test_scale_byte_offset_changes_cached_abi(dispatch):
             contiguous_m=64,
             N=256,
             K=256,
+            a_is_fp4=a_preshuffled,
+            a_preshuffled=a_preshuffled,
+            num_buffers=2,
             stream=0,
         )
         assert launches[-1]["arg_scale_a"] == scale_a.data_ptr()
         layout = launches[-1]["layout_buffers"].get("arg_scale_a")
-        assert layout == (struct.pack("<i", 64) if offset == 4 else None)
-    assert len(compiled) == 2
+        assert layout == (
+            struct.pack("<i", 64) if a_preshuffled and offset == 4 else None
+        )
+    assert len(compiled) == (2 if a_preshuffled else 1)
     assert len(launches) == 4
+
+
+@pytest.mark.parametrize("native_quant_output", [False, True])
+def test_quant_output_layout_preserves_size_and_offset_abis(
+    dispatch, native_quant_output
+):
+    compiled, launches = dispatch
+    for _ in range(2):
+        for elements in (2**31 - 1, 2**31):
+            for offset in (1, 4):
+                out = torch.empty(elements, dtype=torch.uint8, device="meta")
+                storage = torch.empty(256 + offset, dtype=torch.uint8)
+                scale_a = storage[offset:]
+                grouped.flydsl_grouped_gemm_a8w4_masked(
+                    out,
+                    torch.empty((64, 256), dtype=torch.uint8, device="meta"),
+                    torch.empty((1, 256, 128), dtype=torch.uint8, device="meta"),
+                    scale_a,
+                    torch.empty(256, dtype=torch.uint8, device="meta"),
+                    torch.empty(1, dtype=torch.int32, device="meta"),
+                    n_experts=1,
+                    contiguous_m=64,
+                    N=256,
+                    K=256,
+                    stream=0,
+                    a_is_fp4=1,
+                    stage1_act=1,
+                    stage1_quant_out=1,
+                    quant_payload_preshuffled=native_quant_output,
+                    quant_scale=torch.empty(512, dtype=torch.uint8, device="meta"),
+                    ep_row_map=torch.empty(64, dtype=torch.int32, device="meta"),
+                )
+                launch = launches[-1]
+                assert (launch["arg_c"] or 0) == out.data_ptr()
+                assert launch["arg_scale_a"] == scale_a.data_ptr()
+                assert launch["layout_buffers"].get("arg_c") == (
+                    struct.pack("<i", elements)
+                    if native_quant_output and elements < 2**31
+                    else None
+                )
+                assert launch["layout_buffers"].get("arg_scale_a") == (
+                    struct.pack("<i", 64)
+                    if native_quant_output and offset == 4
+                    else None
+                )
+    assert len(compiled) == (4 if native_quant_output else 1)
+    assert len(launches) == 8

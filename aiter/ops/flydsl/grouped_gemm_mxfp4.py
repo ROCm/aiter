@@ -384,11 +384,18 @@ def flydsl_grouped_gemm_a8w4_masked(
         # Select by tile geometry and K pipeline length.
         explicit_vgpr_partition = 1
         launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
-    out_arg = _gemm_launch_buffer_arg(out, out_dtype)
-    scale_a_arg = _gemm_launch_buffer_arg(a_scales, fx.Int32)
-    scale_b_arg = _gemm_launch_buffer_arg(w_scales, fx.Int32)
-    quant_scale_arg = _gemm_launch_buffer_arg(quant_scale_tensor)
-    ep_row_map_arg = _gemm_launch_buffer_arg(ep_row_map_tensor, fx.Int32)
+    # Keep the compact Tensor ABI for native input or native quantized output.
+    # Ordinary layouts retain main's Pointer ABI, including fused quant output.
+    buffer_arg = (
+        _gemm_launch_buffer_arg
+        if a_preshuffled or quant_payload_preshuffled
+        else ptr_arg
+    )
+    out_arg = buffer_arg(out, out_dtype)
+    scale_a_arg = buffer_arg(a_scales, fx.Int32)
+    scale_b_arg = buffer_arg(w_scales, fx.Int32)
+    quant_scale_arg = buffer_arg(quant_scale_tensor)
+    ep_row_map_arg = buffer_arg(ep_row_map_tensor, fx.Int32)
     tensor_arg_mask = tuple(
         isinstance(arg, torch.Tensor)
         for arg in (out_arg, scale_a_arg, scale_b_arg, quant_scale_arg, ep_row_map_arg)
