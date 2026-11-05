@@ -3311,6 +3311,26 @@ def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
 
+# Grow-only stage2 scratch, keyed by (device, stream, slot).
+_STAGE2_SCRATCH: dict = {}
+
+
+def _stage2_scratch(slot, shape, dtype, device):
+    """Reusable scatter/reduce target: it is consumed before the wrapper returns,
+    and allocating it per call (~2 GiB at 16K tokens for DeepSeek-R1) can OOM a
+    fragmented, capped caching allocator. Graph capture allocates as before."""
+    if torch.cuda.is_current_stream_capturing():
+        return torch.empty(shape, dtype=dtype, device=device)
+    nbytes = math.prod(shape) * dtype.itemsize
+    key = (device, torch.cuda.current_stream(device).cuda_stream, slot)
+    buf = _STAGE2_SCRATCH.get(key)
+    if buf is None or buf.numel() < nbytes:
+        _STAGE2_SCRATCH.pop(key, None)
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _STAGE2_SCRATCH[key] = buf
+    return buf[:nbytes].view(dtype).view(shape)
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3380,19 +3400,15 @@ def _flydsl_v2_stage2_wrapper(
                 "epilog='scatter' FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
             )
         if _s2_fp4_scatter:
-            target = torch.empty(
-                (max_sorted, model_dim_runtime // 2),
-                dtype=torch.uint8,
-                device=out.device,
+            target = _stage2_scratch(
+                "target", (max_sorted, model_dim_runtime // 2), torch.uint8, out.device
             )
-            target_scale = torch.empty(
-                (max_sorted, model_dim_runtime // 32),
-                dtype=torch.uint8,
-                device=out.device,
+            target_scale = _stage2_scratch(
+                "scale", (max_sorted, model_dim_runtime // 32), torch.uint8, out.device
             )
         else:
-            target = torch.empty(
-                (max_sorted, model_dim_runtime), dtype=out.dtype, device=out.device
+            target = _stage2_scratch(
+                "target", (max_sorted, model_dim_runtime), out.dtype, out.device
             )
     elif epilog == "reduce":
         if _s2_fp8_inter:
@@ -3411,7 +3427,8 @@ def _flydsl_v2_stage2_wrapper(
             _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
             _fp8_pitch_align = FP8OUT_PITCH_ALIGN
 
-            target = torch.empty(
+            target = _stage2_scratch(
+                "target",
                 (
                     token_num * topk,
                     fp8out_row_bytes(
@@ -3420,14 +3437,12 @@ def _flydsl_v2_stage2_wrapper(
                         pitch_align=_fp8_pitch_align,
                     ),
                 ),
-                dtype=torch.uint8,
-                device=out.device,
+                torch.uint8,
+                out.device,
             )
         else:
-            target = torch.empty(
-                (token_num, topk, model_dim_runtime),
-                dtype=out.dtype,
-                device=out.device,
+            target = _stage2_scratch(
+                "target", (token_num, topk, model_dim_runtime), out.dtype, out.device
             )
         if expert_mask is not None:
             # EP sorting omits remote and fake routes, so GEMM2 intentionally

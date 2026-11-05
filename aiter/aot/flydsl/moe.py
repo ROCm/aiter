@@ -459,11 +459,21 @@ def _replay(job: dict) -> None:
 @contextmanager
 def _without_device_queries():
     """Host queries whose C++ side reads the live device; their answers only
-    size buffers of HIP kernels the replay never launches."""
-    import aiter
+    size buffers of HIP kernels the replay never launches. The stage2 scratch
+    cache queries the stream, and would keep FakeTensors across replays."""
+    import torch
 
-    with mock.patch.object(
-        aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+    import aiter
+    from aiter import fused_moe
+
+    def stage2_scratch(_slot, shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    with (
+        mock.patch.object(
+            aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+        ),
+        mock.patch.object(fused_moe, "_stage2_scratch", stage2_scratch),
     ):
         yield
 
