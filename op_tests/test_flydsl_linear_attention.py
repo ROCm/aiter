@@ -1606,6 +1606,9 @@ def test_flydsl_kda_decode_rejects_invalid_input_rank() -> None:
         ("out", (0, _KDA_HEADS * _KDA_DIM, _KDA_DIM - 1, 1)),
         ("out", (0, 0, _KDA_DIM, 1)),
         ("out", (0, (_KDA_HEADS - 1) * (_KDA_DIM + 7) + _KDA_DIM - 1, _KDA_DIM + 7, 1)),
+        ("out", (0, _KDA_DIM, _KDA_DIM, 1)),
+        # Heads-outer, one element short of clearing both batch rows.
+        ("out", (0, _KDA_DIM, 2 * _KDA_DIM - 1, 1)),
     ],
 )
 def test_flydsl_kda_decode_rejects_unsafe_write_layouts(
@@ -1646,21 +1649,31 @@ def test_flydsl_kda_decode_rejects_unsafe_write_layouts(
 @pytest.mark.parametrize("fused_f_b", [False, True])
 @pytest.mark.parametrize("padding", [0, 7])
 @pytest.mark.parametrize("trailing_padding", [0, 17])
+@pytest.mark.parametrize("heads_outer", [False, True])
 def test_flydsl_kda_decode_accepts_non_overlapping_write_layouts(
     fused_f_b: bool,
     padding: int,
     trailing_padding: int,
+    heads_outer: bool,
 ) -> None:
-    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=2)
+    batch = 2
+    f_a, f_b_weight, inputs = _make_kda_fb_inputs(batch=batch)
     if padding == 0:
         inputs.conv_state = inputs.conv_state.contiguous()
         inputs.state = inputs.state.contiguous()
     reference_inputs = _copy_kda_inputs(inputs)
     reference = _kda_reference(reference_inputs)
-    head_stride = _KDA_DIM + padding
-    batch_stride = (_KDA_HEADS - 1) * head_stride + _KDA_DIM + trailing_padding
+    row_stride = _KDA_DIM + padding
+    if heads_outer:
+        # Storage ordered [heads, batch, dim], as a head-major buffer viewed
+        # through transpose(1, 2) gives.
+        batch_stride = row_stride
+        head_stride = (batch - 1) * row_stride + _KDA_DIM + trailing_padding
+    else:
+        head_stride = row_stride
+        batch_stride = (_KDA_HEADS - 1) * row_stride + _KDA_DIM + trailing_padding
     out = torch.empty_strided(
-        (1, 2, _KDA_HEADS, _KDA_DIM),
+        (1, batch, _KDA_HEADS, _KDA_DIM),
         (0, batch_stride, head_stride, 1),
         dtype=torch.bfloat16,
         device=_KDA_DEVICE,

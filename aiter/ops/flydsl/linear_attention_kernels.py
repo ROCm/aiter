@@ -1202,6 +1202,27 @@ def _check_dense_cache_slots(
         raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
 
 
+def _check_disjoint_rows(
+    name: str,
+    tensor: torch.Tensor,
+    row_dims: tuple[int, ...],
+    rows: str,
+) -> None:
+    """Require the rows ``row_dims`` index (each the unit-stride last dim) to be disjoint.
+
+    Any dimension order (batch- or heads-outer) and any padding between rows
+    works: taken by increasing stride, each dimension must step past everything
+    the narrower dimensions span.
+    """
+    span = tensor.shape[-1]
+    for dim in sorted(
+        (dim for dim in row_dims if tensor.shape[dim] > 1), key=tensor.stride
+    ):
+        if tensor.stride(dim) < span:
+            raise ValueError(f"`{name}` must have non-overlapping {rows} rows.")
+        span += (tensor.shape[dim] - 1) * tensor.stride(dim)
+
+
 def _check_i32_addressing(
     name: str,
     tensor: torch.Tensor,
@@ -1403,10 +1424,7 @@ def _validate_kda_inputs(
         inner_strides=(1,),
     )
     _check_i32_addressing("out", out, first_dim=1)
-    # The final head need not include trailing padding in the batch stride.
-    head_span = (_KDA_HEADS - 1) * out.stride(2) + _KDA_DIM
-    if out.stride(2) < _KDA_DIM or (batch > 1 and out.stride(1) < head_span):
-        raise ValueError("`out` must have non-overlapping batch and head rows.")
+    _check_disjoint_rows("out", out, (1, 2), "batch and head")
     if _KDA_SLOT_CHECK:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
@@ -1445,7 +1463,7 @@ def flydsl_kda_decode(
     except cache slot strides, which are rebased in int64.
     Both caches require dense inner dimensions and non-overlapping slots;
     padding between slots is supported. Output batch and head rows must not
-    overlap, but may also be padded.
+    overlap, but may be padded and in either order (batch- or heads-outer).
     Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
     padding: they produce zero output and leave both caches unchanged. Slot
     zero is a live slot, as in the Triton ``fused_kda_decode``. Indices at or
