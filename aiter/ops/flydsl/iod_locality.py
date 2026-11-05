@@ -95,7 +95,7 @@ def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
     key = (w.data_ptr(), w_scales.data_ptr(), n_experts, N, K, tile_n, tile_k)
     hit = _PLACED.get(key)
     if hit is not None:
-        return hit
+        return hit[0]
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("IOD placement must run before CUDA graph capture")
     assert supported(N, K, tile_n, tile_k)
@@ -139,5 +139,7 @@ def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
         f"{npg} pages, weak {weak}",
         flush=True,
     )
-    _PLACED[key] = buf
+    # Holding the sources keeps their addresses, the cache key, from being
+    # reused by another tensor.
+    _PLACED[key] = (buf, w, w_scales)
     return buf
