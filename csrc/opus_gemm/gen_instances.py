@@ -174,14 +174,6 @@ def _kid_name_arch(kid_name):
     return LEGACY_OPUS_ARCH
 
 
-def _own_arch_device_pass_guard(arch):
-    """Admit the host pass and only this kid's owning device pass."""
-    return (
-        f"#if !defined(__HIP_DEVICE_COMPILE__) || defined(__{arch}__)\n",
-        f"#endif // host pass or {arch} device pass\n",
-    )
-
-
 def _splitk_reduce_baseline_instantiations(
     reduce_kernel,
     ws_ptr_type,
@@ -872,7 +864,7 @@ class opus_gemm_codegen:
 
         Both the #include and the instantiations sit behind the kid's own
         arch guard, so a mixed build's other device passes see an empty TU
-        (see _own_arch_device_pass_guard).
+        (see the guard in codegen/templates/device_tu.cu.j2).
         """
         for row in self._device_instantiations:
             name = row["kid_name"]
@@ -947,33 +939,27 @@ class opus_gemm_codegen:
                 reduce_vec, reduce_block = 16, 64
                 reduce_split_ks = (None,)
                 reduce_workspace_types = (None,)
-            guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
-                "#ifndef __HIPCC_RTC__\n"
-                "#define __HIPCC_RTC__ 1\n"
-                "#endif\n"
-                + guard_open
-                + f'#include "{reduce_header}"\n'
-                + "".join(
-                    _splitk_reduce_baseline_instantiations(
-                        reduce_kernel,
-                        ws_ptr_type,
-                        has_oob,
-                        reduce_vec,
-                        reduce_block,
-                        reduce_split_ks,
-                        reduce_workspace_types,
-                    )
-                    for has_oob in reduce_abi["baseline_has_oob"]
+            baseline = "".join(
+                _splitk_reduce_baseline_instantiations(
+                    reduce_kernel,
+                    ws_ptr_type,
+                    has_oob,
+                    reduce_vec,
+                    reduce_block,
+                    reduce_split_ks,
+                    reduce_workspace_types,
                 )
+                for has_oob in reduce_abi["baseline_has_oob"]
             )
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
-            contents += extra_reduce.get("device_instantiations", lambda: "")()
-            contents += guard_close
+            extra = extra_reduce.get("device_instantiations", lambda: "")()
+            contents = render_template(
+                "splitk_reduce_tu.cu.j2",
+                arch=reduce_arch,
+                reduce_header=reduce_header,
+                baseline=baseline,
+                extra=extra,
+            )
             write_if_changed(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
