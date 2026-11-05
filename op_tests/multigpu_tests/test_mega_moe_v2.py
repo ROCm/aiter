@@ -386,11 +386,13 @@ def _check_sdma_exact(moe, x, weights, ids, output, rank, device):
     took the direct P2P path and must match too."""
     tokens = x.shape[0]
     overflow = moe._sdma_stage2.take_overflow_rows()
-    sdma_stage2, moe._sdma_stage2 = moe._sdma_stage2, None
+    # Per-call switching: this call takes the default Stage2, the caller's next one
+    # the SDMA path again.
+    moe.set_stage2_sdma_enabled(False)
     try:
         default = moe(x, weights, ids)[:tokens].clone()
     finally:
-        moe._sdma_stage2 = sdma_stage2
+        moe.set_stage2_sdma_enabled(True)
     _barrier()
     mismatched = torch.tensor(
         int((default != output).any(dim=1).sum()) if tokens else 0,
@@ -410,6 +412,25 @@ def _check_sdma_exact(moe, x, weights, ids, output, rank, device):
             f"[MEGA-V2] bs={tokens} stage2_sdma=EXACT p2p_overflow_rows={int(overflow_t.item())}",
             flush=True,
         )
+
+
+def _preset_sdma_plan_barrier(moe):
+    """Put the SDMA plan's grid-barrier counters where 2^26 + 5 launches leave them.
+
+    Each group counter then holds more than 2^31: an i32 counter would be negative,
+    its launch number too, and the wait on the top counter would pass at once.
+    """
+    from aiter.ops.flydsl.kernels.mega_moe.stage2_sdma import BAR_GROUP, BAR_STRIDE
+
+    stage = moe._sdma_stage2
+    launches = (1 << 26) + 5
+    nblocks = stage.plan_blocks
+    n_groups = (nblocks + BAR_GROUP - 1) // BAR_GROUP
+    bar = stage.plan_bar.view(-1, BAR_STRIDE)
+    for g in range(n_groups):
+        bar[g, 0] = min(BAR_GROUP, nblocks - g * BAR_GROUP) * launches
+    bar[n_groups, 0] = n_groups * launches
+    torch.cuda.synchronize()
 
 
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
@@ -1098,6 +1119,12 @@ def main():
         "byte for byte against the default Stage2 (needs MORI_ENABLE_SDMA=1)",
     )
     parser.add_argument(
+        "--sdma-preset-barrier",
+        action="store_true",
+        help="With --stage2-sdma, start the plan's grid-barrier counters past the "
+        "point an i32 counter wraps",
+    )
+    parser.add_argument(
         "--sdma-send-slack",
         type=float,
         default=None,
@@ -1228,6 +1255,8 @@ def main():
                     raise RuntimeError(
                         "--stage2-sdma: the SDMA Stage2 is unavailable (see the warning)"
                     )
+                if args.sdma_preset_barrier:
+                    _preset_sdma_plan_barrier(shared_moe)
             moe = shared_moe
             _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:

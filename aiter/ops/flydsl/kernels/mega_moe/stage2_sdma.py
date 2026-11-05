@@ -36,7 +36,9 @@ row, counted from the start of ``S`` (``S`` rows ``[0, send_rows)``, ``R`` rows
 so no index travels with the data. ``flags[src]`` says "src's data for call n has
 landed", ``done[dst]`` "dst has finished reading call n" (a sender waits for it
 before overwriting that peer's ``R`` / ``inv``), and ``counter`` is the call number,
-advanced only by the combine.
+advanced only by the combine. All three are i64, as is the copy engine's signal
+counter ``wait_signal`` compares against, so none of them wraps in practice; at
+1200 calls a second an i32 call number would have gone negative in 21 days.
 
 The layout is exact. Prepare all-gathers every rank's per-expert route counts
 (``bigcnt``), so the plan kernel knows how many rows every rank sends every other
@@ -63,9 +65,9 @@ from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Int8, T
 
 from .. import communication_ops_utils as comm_ops
-from ..buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr
 from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
+from . import envs as _envs
 
 __all__ = ["MegaMoESdmaStage2", "sdma_stage2_unsupported_reason"]
 
@@ -81,7 +83,7 @@ INV_P2P = -2
 
 BLOCK = 256
 WAVE = 64
-BAR_STRIDE = 32  # ints per tree_barrier counter: one 128 B cache line
+BAR_STRIDE = 16  # i64 slots per tree_barrier counter: one 128 B cache line
 BAR_GROUP = 32  # blocks per tree_barrier group
 MIN_SBM = 16
 _ALIGN = 128
@@ -89,6 +91,27 @@ _ALIGN = 128
 
 def _align(n):
     return (n + _ALIGN - 1) // _ALIGN * _ALIGN
+
+
+def arena_rows(*, max_tok, topk, hidden, send_slack):
+    """``(send_rows, recv_rows, row_bytes)`` of the window; raises RuntimeError
+    when they do not fit.
+
+    R holds what one rank gets back -- at most its own routes -- so it never
+    overflows. S holds what one rank sends, everything it received; it is
+    ``send_slack`` times the even share, capped so that S and R stay inside the
+    32-bit buffer-resource offset GEMM2 and the combine address them through.
+    """
+    row_bytes = hidden + hidden // 32
+    recv_rows = _align(max_tok * topk)
+    fit = ((1 << 31) - 1 - recv_rows * row_bytes) // row_bytes // _ALIGN * _ALIGN
+    send_rows = min(_align(int(max_tok * topk * send_slack)), fit)
+    if send_rows < _ALIGN:
+        raise RuntimeError(
+            f"max_tok_per_rank={max_tok}: the landing buffer alone "
+            f"({recv_rows * row_bytes} B) leaves no 32-bit room for a send buffer"
+        )
+    return send_rows, recv_rows, row_bytes
 
 
 class ArenaLayout:
@@ -102,24 +125,9 @@ class ArenaLayout:
         self.off_inv = self.off_r + recv_rows * row_bytes
         self.off_sig = self.off_inv + _align(slot_cap * 4)
         self.off_flags = self.off_sig + _align(npes * 4)
-        self.off_done = self.off_flags + _align(npes * 4)
-        self.off_counter = self.off_done + _align(npes * 4)
+        self.off_done = self.off_flags + _align(npes * 8)
+        self.off_counter = self.off_done + _align(npes * 8)
         self.total_bytes = self.off_counter + _ALIGN
-        # GEMM2 and the combine address S and R through one 32-bit buffer-resource offset.
-        if self.off_inv >= 1 << 31:
-            raise ValueError(
-                f"SDMA Stage2 send+landing buffers ({self.off_inv} B) exceed the 32-bit "
-                "buffer-resource range; lower send_slack or max_tok_per_rank"
-            )
-
-    def key(self):
-        return (
-            self.npes,
-            self.send_rows,
-            self.recv_rows,
-            self.row_bytes,
-            self.slot_cap,
-        )
 
 
 def _uniform_i64(x):
@@ -137,16 +145,77 @@ def _decode(p, *, log2_max_tok, recv_cap, topk, npes):
     return valid, dest_pe, dest_lid, s
 
 
-# --- The sender side of the SDMA protocol (called by the GEMM2 comm waves) ------
+# --- Cross-rank waits -----------------------------------------------------------
+
+#: Polls before a cross-rank wait traps instead of hanging (0: wait forever). Read
+#: when a kernel is compiled; a trap aborts the dispatch with the wait's location.
+SPIN_POLLS = int(_envs.AITER_MEGA_SDMA_SPIN_POLLS)
 
 
-def sdma_wait_consumed(w, peer, phase, *, layout, rank):
-    """Block until ``peer`` has finished reading the previous call's data from my sends."""
-    comm_ops.spin_until_ge_i32_system(
-        fx.Int64(w.lsa_ptr(rank, layout.off_done)) + fx.Int64(peer) * fx.Int64(4),
-        phase - fx.Int32(1),
-        acquire=True,
+def load_i64(addr, *, scope, acquire=False):
+    """Volatile i64 load at ``addr`` with ``scope`` visibility, for a spin-wait."""
+    return fx.Int64(
+        fx.generic_load(
+            comm_ops._to_ptr_global(addr, fx.Int64, 8),
+            volatile=True,
+            memory_order=(
+                fx.AtomicOrdering.Acquire if acquire else fx.AtomicOrdering.Monotonic
+            ),
+            syncscope=scope,
+        )
     )
+
+
+@flyc.jit
+def spin_until_ge_i64(addr, val, *, scope, acquire=False):
+    """Spin until the i64 at ``addr`` reaches ``val``; traps after ``SPIN_POLLS`` polls
+    when that is set."""
+    cur = load_i64(addr, scope=scope, acquire=acquire)
+    if const_expr(SPIN_POLLS > 0):
+        polls = fx.Int32(0)
+        while cur < fx.Int64(val):
+            polls = polls + fx.Int32(1)
+            if polls >= fx.Int32(SPIN_POLLS):
+                comm_ops._device_trap()
+            rocdl.s_sleep(1)
+            cur = load_i64(addr, scope=scope, acquire=acquire)
+    else:
+        while cur < fx.Int64(val):
+            rocdl.s_sleep(1)
+            cur = load_i64(addr, scope=scope, acquire=acquire)
+    return cur
+
+
+@flyc.jit
+def spin_until_ge_i32_agent(addr, val):
+    """``comm_ops.spin_until_ge_i32_agent`` with the ``SPIN_POLLS`` trap. For counters
+    that restart from zero every call, so an i32 cannot wrap."""
+    cur = fx.Int32(comm_ops.load_i32_global_agent(addr))
+    if const_expr(SPIN_POLLS > 0):
+        polls = fx.Int32(0)
+        while cur < fx.Int32(val):
+            polls = polls + fx.Int32(1)
+            if polls >= fx.Int32(SPIN_POLLS):
+                comm_ops._device_trap()
+            rocdl.s_sleep(1)
+            cur = fx.Int32(comm_ops.load_i32_global_agent(addr))
+    else:
+        while cur < fx.Int32(val):
+            rocdl.s_sleep(1)
+            cur = fx.Int32(comm_ops.load_i32_global_agent(addr))
+    return cur
+
+
+def call_number(w, *, layout, rank):
+    """The completed-call count (``counter``), as an i64."""
+    return load_i64(fx.Int64(w.lsa_ptr(rank, layout.off_counter)), scope=SYS)
+
+
+SYS = fx.rocdl.SyncScope.OneAs
+AGENT = fx.rocdl.SyncScope.AgentOneAs
+
+
+# --- The sender side of the SDMA protocol (called by the GEMM2 comm waves) ------
 
 
 def sdma_put_run(
@@ -203,8 +272,8 @@ def sdma_signal_peer(sdma, win, peer, queue, *, layout, rank, cco):
 
 def publish_flag(w, peer, phase, *, layout, rank):
     """``flags[rank]`` on ``peer`` = call number (the data itself is covered by the SDMA signal)."""
-    comm_ops.store_i32_global_system_release(
-        fx.Int64(w.lsa_ptr(peer, layout.off_flags)) + fx.Int64(rank * 4), phase
+    comm_ops.store_i64_global_system(
+        fx.Int64(w.lsa_ptr(peer, layout.off_flags)) + fx.Int64(rank * 8), phase
     )
 
 
@@ -217,33 +286,32 @@ def tree_barrier(bar_addr, nblocks, tid, bid):
     Blocks are grouped ``BAR_GROUP`` to a counter; the last block of a group bumps a
     top counter; everyone polls only the top one. Counters are never reset: a
     group's counter advances by its size per launch, so the launch number is
-    ``old // size``. Each counter sits on its own cache line.
+    ``old // size``. They are i64 for that reason: an i32 group counter goes negative
+    after 2^26 launches, and the signed wait on the top counter then passes at once.
+    Each counter sits on its own cache line.
     """
     group = bid // fx.Int32(BAR_GROUP)
     n_groups = (nblocks + fx.Int32(BAR_GROUP - 1)) // fx.Int32(BAR_GROUP)
     size = nblocks - group * fx.Int32(BAR_GROUP)
-    size = (size < fx.Int32(BAR_GROUP)).select(size, fx.Int32(BAR_GROUP))
-    rocdl.s_waitcnt(0)
+    size = fx.Int64((size < fx.Int32(BAR_GROUP)).select(size, fx.Int32(BAR_GROUP)))
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
 
     @flyc.jit
     def arrive_and_wait():
         if tid == fx.Int32(0):
+            top = bar_addr + fx.Int64(n_groups) * fx.Int64(BAR_STRIDE * 8)
             comm_ops.fence_agent_release()
-            old = fx.Int32(
+            old = fx.Int64(
                 comm_ops.atomic_add_agent(
-                    bar_addr + fx.Int64(group) * fx.Int64(BAR_STRIDE * 4), fx.Int32(1)
+                    bar_addr + fx.Int64(group) * fx.Int64(BAR_STRIDE * 8), fx.Int64(1)
                 )
             )
             launch = old // size
-            if old - launch * size == size - fx.Int32(1):
-                comm_ops.atomic_add_agent(
-                    bar_addr + fx.Int64(n_groups) * fx.Int64(BAR_STRIDE * 4),
-                    fx.Int32(1),
-                )
-            comm_ops.spin_until_ge_i32_agent(
-                bar_addr + fx.Int64(n_groups) * fx.Int64(BAR_STRIDE * 4),
-                (launch + fx.Int32(1)) * n_groups,
+            if old - launch * size == size - fx.Int64(1):
+                comm_ops.atomic_add_agent(top, fx.Int64(1))
+            spin_until_ge_i64(
+                top, (launch + fx.Int64(1)) * fx.Int64(n_groups), scope=AGENT
             )
             comm_ops.fence_agent_acquire()
 
@@ -333,12 +401,16 @@ def build_plan(
             """LDS i32 word ``i`` of the block's scratch."""
             return lds_typed_ptr(lds_i32 + i * fx.Int32(4), T.i32, align=4)
 
-        # S and the peers' inv are rewritten from here on: wait until every peer has
-        # read what I sent it last call.
-        consumed = global_typed_ptr(arg_counter, T.i32)[0]
+        # S and the peers' inv and comb_inp are rewritten from here on: wait until
+        # every peer has read what I sent it last call. GEMM2 runs after this kernel
+        # on the same stream, so this covers its comm waves and direct rows too.
+        consumed = load_i64(arg_counter, scope=SYS)
         if (tid < fx.Int32(npes)) & (tid != fx.Int32(rank)):
-            comm_ops.spin_until_ge_i32_system(
-                fx.Int64(arg_done) + fx.Int64(tid) * fx.Int64(4), consumed, acquire=True
+            spin_until_ge_i64(
+                fx.Int64(arg_done) + fx.Int64(tid) * fx.Int64(8),
+                consumed,
+                scope=SYS,
+                acquire=True,
             )
         fx.barrier()
 
@@ -539,20 +611,19 @@ def build_combine(*, layout, rank, hidden, topk):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         w = cco.Window(win)
-        rsrc_counter = create_buffer_resource_from_addr(
-            _uniform_i64(w.lsa_ptr(rank, layout.off_counter))
-        )
+        counter_addr = fx.Int64(w.lsa_ptr(rank, layout.off_counter))
         # Advanced only by the last block below, after every block has read it.
-        phase = fx.Int32(buffer_load(rsrc_counter, 0, vec_width=1, dtype=T.i32)) + fx.Int32(1)
+        phase = call_number(w, layout=layout, rank=rank) + fx.Int64(1)
         flags_base = fx.Int64(w.lsa_ptr(rank, layout.off_flags))
 
         # A. the peers' data has landed
         if (tid < fx.Int32(npes)) & (tid != fx.Int32(rank)):
-            comm_ops.spin_until_ge_i32_system(
-                flags_base + fx.Int64(tid) * fx.Int64(4), phase, acquire=True
+            spin_until_ge_i64(
+                flags_base + fx.Int64(tid) * fx.Int64(8), phase, scope=SYS, acquire=True
             )
-            # The sender's copy engine bumps this once per call when its last put lands.
-            cco.DevComm(arg_dev_comm).sdma().wait_signal(tid, 0, fx.Int64(phase))
+            # The sender's copy engine bumps this u64 once per call when its last put
+            # lands, so the call number is compared at its full width.
+            cco.DevComm(arg_dev_comm).sdma().wait_signal(tid, 0, phase)
             comm_ops.fence_system_acquire()
         fx.barrier()
 
@@ -616,20 +687,25 @@ def build_combine(*, layout, rank, hidden, topk):
             if tid < fx.Int32(topk):
                 inv_buf[tok * fx.Int32(topk) + tid] = fx.Int32(-1)
 
-        # C. the last block out tells the peers this call's data has been consumed
-        rocdl.s_waitcnt(0)
+        # C. the last block out tells the peers this call's data has been consumed.
+        # It also puts the arrival count back to zero: every block of this call has
+        # counted, and none of the next call's can before this kernel ends, so the
+        # count needs no width and no divisibility of 2^32 by the grid.
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         fx.barrier()
         if tid == fx.Int32(0):
             comm_ops.fence_agent_release()
             old = fx.Int32(comm_ops.atomic_add_agent(arg_fin, fx.Int32(1)))
-            if (old + fx.Int32(1)) % i32_nblocks == fx.Int32(0):
+            if old + fx.Int32(1) == i32_nblocks:
+                comm_ops.atomic_add_agent(arg_fin, fx.Int32(0) - i32_nblocks)
                 comm_ops.fence_agent_acquire()
-                buffer_store(phase, rsrc_counter, 0)
+                comm_ops.store_i64_global(counter_addr, phase)
                 comm_ops.fence_system_release()
                 for peer in range_constexpr(npes):
                     if peer != rank:
-                        comm_ops.store_i32_global_system_release(
-                            fx.Int64(w.lsa_ptr(peer, layout.off_done)) + fx.Int64(rank * 4), phase
+                        comm_ops.store_i64_global_system(
+                            fx.Int64(w.lsa_ptr(peer, layout.off_done)) + fx.Int64(rank * 8),
+                            phase,
                         )
 
     # fmt: off
@@ -682,6 +758,15 @@ def sdma_stage2_unsupported_reason(moe):
     ):
         return "needs the fp8_blockwise_1x32 Stage2 P2P format"
     try:
+        arena_rows(
+            max_tok=moe.mtpr,
+            topk=moe.topk,
+            hidden=moe.model_dim,
+            send_slack=float(_envs.AITER_MEGA_SDMA_SEND_SLACK),
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    try:
         import mori.cco.device.flydsl  # noqa: F401
     except ImportError as exc:
         return f"mori cco device API unavailable: {exc}"
@@ -703,7 +788,6 @@ class MegaMoESdmaStage2:
 
     def __init__(self, moe, *, chunk_tiles=16, send_slack=4.0):
         import torch.distributed as dist
-        from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
         if not dist.is_initialized():
             raise RuntimeError(
@@ -719,26 +803,56 @@ class MegaMoESdmaStage2:
         self.chunk_tiles = int(chunk_tiles)
         self.block_m = 256  # GEMM2 tile rows
         self.slot_cap = self.max_tok * self.topk
-        row_bytes = self.hidden + self.hidden // 32
-        # R: what one rank gets back is at most its own routes, so it never overflows.
-        # S: what one rank sends is everything it received; size it by send_slack,
-        # capped so S + R stay in the 32-bit buffer-resource range.
-        recv_rows = _align(self.slot_cap)
-        fit = ((1 << 31) - 1 - recv_rows * row_bytes) // row_bytes // _ALIGN * _ALIGN
-        send_rows = min(_align(int(self.slot_cap * send_slack)), fit)
-        if send_rows < _ALIGN:
-            raise ValueError(
-                f"max_tok_per_rank={self.max_tok} leaves no room for the send buffer"
-            )
+        send_rows, recv_rows, row_bytes = arena_rows(
+            max_tok=self.max_tok,
+            topk=self.topk,
+            hidden=self.hidden,
+            send_slack=send_slack,
+        )
         self.layout = ArenaLayout(
             self.npes, send_rows, recv_rows, row_bytes, self.slot_cap
         )
         self.epr = moe.epr
         self.bigcnt = moe._s1_dispatch_workspace["bigcnt"]
         self.total_segments = self.bigcnt.numel() // self.npes
-        lay = self.layout
-        dev = moe.dev
+        self.comm = None
 
+        # The peers' SDMA handles exist only within a host: a put to a rank on another
+        # node would dereference a null handle. Every rank sees the same list.
+        import socket
+
+        hosts = [None] * self.npes
+        dist.all_gather_object(hosts, socket.gethostname())
+        if len(set(hosts)) != 1:
+            raise RuntimeError(
+                f"needs every rank on one host, got {sorted(set(hosts))}"
+            )
+
+        # Whatever fails on one rank from here on, every rank learns it before the
+        # communicator's barrier, so all of them fall back together instead of the
+        # healthy ones waiting there for the one that left.
+        error = None
+        try:
+            self._connect()
+        except Exception as exc:  # noqa: BLE001 - reported on every rank below
+            error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
+        errors = [None] * self.npes
+        dist.all_gather_object(errors, error)
+        errors = [e for e in errors if e is not None]
+        if errors:
+            self._release()
+            raise RuntimeError("; ".join(errors))
+        self._build_state()
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
+    def _connect(self):
+        """Communicator, window and dev-comm. Raises if no SDMA queue connected: a put
+        on a communicator without one moves no bytes."""
+        import torch.distributed as dist
+        from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
+
+        lay = self.layout
         uid = [Communicator.get_unique_id() if self.rank == 0 else None]
         dist.broadcast_object_list(uid, src=0)
         per_rank_vmm = max(
@@ -758,12 +872,10 @@ class MegaMoESdmaStage2:
         # completion signal must ride the channel the data went out on.
         reqs.sdma_queue_count = 1
         self.dev_comm = self.comm.create_dev_comm(reqs)
-        # A put on a communicator without SDMA queues moves no bytes, so this must hold
-        # before anything is launched. mori before DevCommHandle.sdma_num_queue cannot
-        # tell, and is treated as unsupported.
+        # mori before DevCommHandle.sdma_num_queue cannot tell, and is treated as
+        # unsupported.
         queues = getattr(self.dev_comm, "sdma_num_queue", None)
         if queues is None or queues < 1:
-            self.comm.close_all_resources()
             raise RuntimeError(
                 "mori too old to report its SDMA queues"
                 if queues is None
@@ -771,6 +883,13 @@ class MegaMoESdmaStage2:
                 "MORI_ENABLE_SDMA unset, or no peer reports SDMA)"
             )
 
+    def _release(self):
+        if self.comm is not None:
+            self.comm.close_all_resources()
+            self.comm = None
+
+    def _build_state(self):
+        moe, lay, dev = self.moe, self.layout, self.moe.dev
         nvm = int(moe._s1_nvm)
         self.max_tiles = nvm // MIN_SBM + 2
         i32 = {"dtype": torch.int32, "device": dev}
@@ -781,8 +900,11 @@ class MegaMoESdmaStage2:
         self.cursor = torch.zeros(4 * self.npes + 1, **i32)
         self.cdone = torch.zeros((self.max_tiles + 1) * CDONE_STRIDE, **i32)
         n_cu = torch.cuda.get_device_properties(dev).multi_processor_count
-        # Never-reset counters: the plan's barrier and the combine's last-block count.
-        self.plan_bar = torch.zeros(n_cu * BAR_STRIDE, **i32)
+        # The plan's never-reset barrier counters (i64), and the combine's arrival
+        # count, which its last block puts back to zero.
+        self.plan_bar = torch.zeros(
+            (n_cu // BAR_GROUP + 2) * BAR_STRIDE, dtype=torch.int64, device=dev
+        )
         self.combine_fin = torch.zeros(1, **i32)
         # Rows written through comb_inp because they did not fit in S.
         self.overflow = torch.zeros(1, **i32)
@@ -804,8 +926,6 @@ class MegaMoESdmaStage2:
         self._combine = build_combine(
             layout=lay, rank=self.rank, hidden=self.hidden, topk=self.topk
         )
-        torch.cuda.synchronize()
-        self.comm.barrier()
 
     def _plan_for(self, sbm):
         if sbm < MIN_SBM:
@@ -848,15 +968,10 @@ class MegaMoESdmaStage2:
             )
         return self._gemm2[sbm]
 
-    def run(self, run_tokens, config, stream):
-        """Plan, GEMM2 + SDMA, combine on ``stream`` (a torch stream). Returns the
-        ``[max_tok_per_rank, hidden]`` output; rows ``[0, run_tokens)`` are valid."""
+    def _plan_args(self, s_fx):
         moe, op, lay = self.moe, self.moe._s1_op, self.layout
-        sbm = int(config.stage1.sort_block_m)
-        s_fx = fx.Stream(stream.cuda_stream)
         n_chunks = (self.max_tiles + self.chunk_tiles - 1) // self.chunk_tiles + 1
-        _run_compiled(
-            self._plan_for(sbm),
+        return (
             fx.Int64(op.srcmap_em.data_ptr()),
             fx.Int64(op.tile_row_base.data_ptr()),
             fx.Int64(op.num_valid.data_ptr()),
@@ -878,9 +993,11 @@ class MegaMoESdmaStage2:
             fx.Int32(min(self.cdone.numel(), n_chunks * CDONE_STRIDE)),
             s_fx,
         )
+
+    def _gemm2_args(self, s_fx):
+        moe, op, lay = self.moe, self.moe._s1_op, self.layout
         nvm = int(moe._s1_nvm)
-        _run_compiled(
-            self._gemm2_for(sbm),
+        return (
             moe._s1_out.view(torch.uint8).view(-1),
             moe.w2.view(torch.uint8).view(-1),
             moe._s1_osd.view(-1),
@@ -902,18 +1019,52 @@ class MegaMoESdmaStage2:
             fx.Int64(self.idx_send.data_ptr()),
             s_fx,
         )
-        _run_compiled(
-            self._combine,
+
+    def _combine_args(self, run_tokens, s_fx):
+        return (
             fx.Int64(self.win.handle),
             fx.Int64(self.inv.data_ptr()),
             fx.Int64(self.out.data_ptr()),
-            fx.Int64(moe.comb_op.shmem_comb_inp_tok.data_ptr()),
+            fx.Int64(self.moe.comb_op.shmem_comb_inp_tok.data_ptr()),
             fx.Int64(self.combine_fin.data_ptr()),
             fx.Int64(self.dev_comm.ptr),
             fx.Int32(self.comb_blocks),
             fx.Int32(run_tokens),
             s_fx,
         )
+
+    def preload(self):
+        """Compile every kernel this instance can launch -- the plan and GEMM2 for each
+        sort block of the bundle plan, and the combine -- without dispatching any.
+
+        Otherwise each compiles on the first call that reaches its sort block: a
+        multi-second stall while serving, at a time that differs per rank, possibly
+        inside a CUDA graph capture.
+        """
+        from ..tensor_shim import _preload_compiled
+
+        s_fx = fx.Stream(torch.cuda.current_stream().cuda_stream)
+        for sbm in sorted(
+            {int(e.config.stage1.sort_block_m) for e in self.moe._bundle_plan.entries}
+        ):
+            _preload_compiled(self._plan_for(sbm), *self._plan_args(s_fx))
+            _preload_compiled(self._gemm2_for(sbm), *self._gemm2_args(s_fx))
+        _preload_compiled(self._combine, *self._combine_args(self.max_tok, s_fx))
+
+    def run(self, run_tokens, config, stream):
+        """Plan, GEMM2 + SDMA, combine on ``stream`` (a torch stream). Returns the
+        ``[max_tok_per_rank, hidden]`` output; rows ``[0, run_tokens)`` are valid.
+
+        Reads only ``config.stage1.sort_block_m``: the GEMM2 tile is fixed at 256x256,
+        so ``config.stage2``'s tile and persistence settings do not apply. Top-k slots
+        with id -1 need no mask: they are never dispatched, so they have no row and
+        their ``inv`` stays -1.
+        """
+        sbm = int(config.stage1.sort_block_m)
+        s_fx = fx.Stream(stream.cuda_stream)
+        _run_compiled(self._plan_for(sbm), *self._plan_args(s_fx))
+        _run_compiled(self._gemm2_for(sbm), *self._gemm2_args(s_fx))
+        _run_compiled(self._combine, *self._combine_args(run_tokens, s_fx))
         return self.out
 
     def take_overflow_rows(self):
@@ -931,16 +1082,38 @@ class MegaMoESdmaStage2:
         return rows
 
     def close(self):
-        """Wait until every peer has read what this rank last sent, then free the window."""
+        """Free the window once every peer has read what this rank last sent.
+
+        Collective: every rank must call it, at the same point, after its last call.
+        A rank that freed its window while a peer's copy engine still wrote into it
+        would take a page fault on that peer.
+        """
+        import logging
         import time
 
+        import torch.distributed as dist
+
         torch.cuda.synchronize()
+        dist.barrier()
         lay = self.layout
-        calls = int(_torch_view(self.mem.ptr + lay.off_counter, 4, torch.int32).item())
-        done = _torch_view(self.mem.ptr + lay.off_done, self.npes * 4, torch.int32)
+        calls = int(_torch_view(self.mem.ptr + lay.off_counter, 8, torch.int64).item())
+        done = _torch_view(self.mem.ptr + lay.off_done, self.npes * 8, torch.int64)
         deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            if all(f >= calls for r, f in enumerate(done.tolist()) if r != self.rank):
+        pending = []
+        while True:
+            pending = [
+                r for r, f in enumerate(done.tolist()) if r != self.rank and f < calls
+            ]
+            if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(0.001)
-        self.comm.close_all_resources()
+        if pending:
+            logging.getLogger(__name__).warning(
+                "MegaMoE SDMA Stage2 rank %d: peers %s have not read call %d after 30 s; "
+                "freeing the window anyway",
+                self.rank,
+                pending,
+                calls,
+            )
+        self.comm.barrier()
+        self._release()

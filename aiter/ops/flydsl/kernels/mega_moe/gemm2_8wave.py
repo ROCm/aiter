@@ -41,7 +41,10 @@ from flydsl.expr.typing import Float4E2M1FN, T
 from flydsl.expr.typing import Vector as Vec
 
 from .. import communication_ops_utils as comm_ops
-from ..buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+
+# The S / comb_inp epilogue stores rely on the buffer resource's num_records to drop
+# the writes of invalid rows (their offset is set past the end), hence raw buffer_ops.
+from ..buffer_ops import buffer_store, create_buffer_resource_from_addr
 from ..gemm_a8w8_8wave import (
     G2SLoader,
     S2RLoader,
@@ -54,15 +57,19 @@ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load
 from ..tensor_shim import ptr_buf_tensor
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
+from .quant import _FP8_E4M3_INV_MAX_POS_BITS
 from .stage2_sdma import (
     CDONE_STRIDE,
     INV_P2P,
     OUT_ROW_P2P,
     PUSH_U,
+    _decode,
+    _uniform_i64,
+    call_number,
     publish_flag,
     sdma_put_run,
     sdma_signal_peer,
-    sdma_wait_consumed,
+    spin_until_ge_i32_agent,
 )
 
 __all__ = ["compile_gemm2_8wave_sdma"]
@@ -70,6 +77,12 @@ __all__ = ["compile_gemm2_8wave_sdma"]
 BLOCK_M = 256
 BLOCK_N = 256
 BLOCK_K = 128
+#: Waves per EU the kernel is compiled for (one 8-wave workgroup per CU).
+WAVES_PER_EU = 2
+#: LLVM options for the kernel. The comm role's live ranges lift the function's
+#: register pressure past the threshold of AMDGPU's UnclusteredHighRPReschedule
+#: stage, which then reorders the GEMM role's K loop (ROCm/mori#859).
+LLVM_OPTIONS = {"amdgpu-disable-unclustered-high-rp-reschedule": True}
 LDS_LIMIT_BYTES = 160 * 1024
 #: Send-buffer stores: sc0|sc1, write-through to memory, so retiring them is the
 #: release the copy engine needs (a system-scope release per item would instead
@@ -296,18 +309,15 @@ def opaque_i32(v):
 
 def lds_barrier():
     """Workgroup barrier for LDS only: unlike ``fx.barrier`` it never waits on vmcnt."""
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
-        constraints="",
-        has_side_effects=True,
-    )
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+    rocdl.s_barrier()
 
 
 def e8m0_of(amax):
     """The fp8 1x32 block exponent of a group's absolute max (the default Stage2's rule)."""
-    working_bits = (amax * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(fx.Int32)
+    working_bits = (
+        amax * fx.Int32(_FP8_E4M3_INV_MAX_POS_BITS).bitcast(fx.Float32)
+    ).bitcast(fx.Int32)
     mantissa = working_bits & fx.Int32(0x7FFFFF)
     biased_exp = (working_bits >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
@@ -348,9 +358,9 @@ def epi_quant_half(
                 frags = frags_n1 if h_n else frags_n0
                 v0 = Vec(frags[mfma_idx(ti, 0)])[i] * w
                 v1 = Vec(frags[mfma_idx(ti, 1)])[i] * w
-                amax = fabs_f32(v0).maximumf(fabs_f32(v1))
+                amax = fx.max(fabs_f32(v0), fabs_f32(v1))
                 for sh in (1, 2, 4, 8):
-                    amax = amax.maximumf(amax.shuffle_xor(fx.Int32(sh), fx.Int32(64)))
+                    amax = fx.max(amax, amax.shuffle_xor(fx.Int32(sh), fx.Int32(64)))
                 e8m0 = e8m0_of(amax)
                 block_scale = (e8m0 << 23).bitcast(fx.Float32)
                 pkw = rocdl.cvt_scalef32_pk_fp8_f32(
@@ -388,7 +398,6 @@ def compile_gemm2_8wave_sdma(
     chunk_tiles: int,
     grid_ctas: int,
     comb_bytes: int,
-    waves_per_eu: int = 2,
 ):
     """Build the launcher of the 8-wave GEMM2 + SDMA comm kernel.
 
@@ -704,8 +713,7 @@ def compile_gemm2_8wave_sdma(
             lds_barrier()
 
             send = create_buffer_resource_from_addr(
-                fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(send_base).ir_value())),
-                num_records_bytes=send_nbytes,
+                _uniform_i64(send_base), num_records_bytes=send_nbytes
             )
             orow_p = lds_typed_ptr(orow_lds, T.i32)
             src_p = lds_typed_ptr(src_lds, T.i32)
@@ -799,26 +807,14 @@ def compile_gemm2_8wave_sdma(
         def direct_row(p, payload, scales, mine, row_lead, col, block_n):
             """Store one row's 256 columns into ``comb_inp[slot]`` of its origin rank, as
             the default Stage2 does, and point that rank's ``inv[slot]`` at it."""
-            t = p & fx.Int32(0x00FFFFFF)
-            s = p.shrui(fx.Int32(24)) & fx.Int32(0xFF)
-            dest_pe = t >> fx.Int32(log2_max_tok)
-            slot = (t & fx.Int32(max_tok - 1)) * fx.Int32(topk) + s
-            peer = fx.Int64(
-                rocdl.readfirstlane(
-                    T.i64, global_typed_ptr(p2p, T.i64, align=8)[dest_pe]
-                )
+            _, dest_pe, dest_lid, s = _decode(
+                p, log2_max_tok=log2_max_tok, recv_cap=recv_cap, topk=topk, npes=npes
             )
+            slot = dest_lid * fx.Int32(topk) + s
+            peer = _uniform_i64(global_typed_ptr(p2p, T.i64, align=8)[dest_pe])
+            # The origin rank has read the last call's comb_inp and inv: the plan
+            # waited for its done[] before this kernel started.
             w = cco.Window(win)
-            # Like the comm waves: not before the origin rank has read the last call's
-            # comb_inp and inv (its combine publishes done[] to this rank).
-            if dest_pe != fx.Int32(rank):
-                rsrc_counter = create_buffer_resource_from_addr(
-                    fx.Int64(w.lsa_ptr(rank, layout.off_counter))
-                )
-                phase = fx.Int32(
-                    buffer_load(rsrc_counter, 0, vec_width=1, dtype=T.i32)
-                ) + fx.Int32(1)
-                sdma_wait_consumed(w, dest_pe, phase, layout=layout, rank=rank)
             # Written through like S: retired stores are in the peer's memory before the
             # item publishes, with no system-scope release.
             buf = create_buffer_resource_from_addr(peer, num_records_bytes=comb_bytes)
@@ -870,18 +866,11 @@ def compile_gemm2_8wave_sdma(
             if (peer < fx.Int32(npes)) & (peer != fx.Int32(rank)):
                 w = cco.Window(win)
                 sdma = cco.DevComm(dev_comm).sdma()
-                rsrc_counter = create_buffer_resource_from_addr(
-                    fx.Int64(w.lsa_ptr(rank, lay.off_counter))
-                )
-                # Read-only here: the combine advances it after the call.
-                phase = fx.Int32(
-                    buffer_load(rsrc_counter, 0, vec_width=1, dtype=T.i32)
-                ) + fx.Int32(1)
+                # Read-only here: the combine advances it after the call. The peer has
+                # read the last call's landing rows and inv: the plan waited for that.
+                phase = call_number(w, layout=lay, rank=rank) + fx.Int64(1)
                 tile_base_buf = ptr_buf_tensor(tile_base, fx.Int32)
                 idx_buf = ptr_buf_tensor(idx_send, fx.Int32)
-                # Do not overwrite the peer's landing rows or inv before it has read the last call's.
-                if is_lane0:
-                    sdma_wait_consumed(w, peer, phase, layout=lay, rank=rank)
                 # inv entries go out while the GEMM computes its first chunk; they must be
                 # visible before any put or signal of mine, hence the vmcnt wait.
                 # The plan's exact offsets: rows in my run for peer, the run's base in S,
@@ -919,14 +908,13 @@ def compile_gemm2_8wave_sdma(
                     chunk_tiles
                 )
                 last = n_chunks - fx.Int32(1)
-                for c in range(fx.Int32(0), n_chunks, fx.Int32(1)):
-                    ci = fx.Int32(c)
+                for ci in range(fx.Int32(0), n_chunks, fx.Int32(1)):
                     t0 = ci * fx.Int32(chunk_tiles)
                     t1 = t0 + fx.Int32(chunk_tiles)
                     t1 = (t1 < total_tiles).select(t1, total_tiles)
                     # Every (sort tile, N-block) of this chunk has stored.
                     if is_lane0:
-                        comm_ops.spin_until_ge_i32_agent(
+                        spin_until_ge_i32_agent(
                             fx.Int64(cdone) + fx.Int64(ci) * fx.Int64(CDONE_STRIDE * 4),
                             (t1 - t0) * n_blocks,
                         )
@@ -981,14 +969,14 @@ def compile_gemm2_8wave_sdma(
             tile_table_to_lds(values, tab_lds, lane)
             lds_barrier()
             for w in range(
-                fx.Int32(fx.block_idx.x) - fx.Int32(1),
+                fx.block_idx.x - fx.Int32(1),
                 n_tiles * n_blocks,
                 fx.Int32(gemm_ctas),
             ):
                 fx.barrier()
                 process_tile(w // n_blocks, w % n_blocks, tab_lds)
 
-        if fx.Int32(fx.block_idx.x) == fx.Int32(0):
+        if fx.block_idx.x == fx.Int32(0):
             comm_role()
         else:
             gemm_role()
@@ -1037,9 +1025,12 @@ def compile_gemm2_8wave_sdma(
             cursor,
             idx_send,
             value_attrs={
-                "rocdl.waves_per_eu": waves_per_eu,
+                "rocdl.waves_per_eu": WAVES_PER_EU,
                 "rocdl.flat_work_group_size": "512,512",
             },
         ).launch(grid=(grid_ctas, 1, 1), block=(512, 1, 1), stream=stream)
 
-    return set_slp_vectorize_once_used(launch, False)
+    launch = set_slp_vectorize_once_used(launch, False)
+    # In compile_hints, so they cover the compile the first launch performs.
+    launch.compile_hints.setdefault("llvm_options", {}).update(LLVM_OPTIONS)
+    return launch

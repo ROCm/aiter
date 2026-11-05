@@ -131,10 +131,11 @@ class MegaMoEV2:
         small_m_mtprs: tuple[int, ...] = (256, 512),
         stage2_sdma: bool | None = None):
     # fmt: on
-        """``stage2_sdma``: run Stage2 + combine through the SDMA copy engines
+        """``stage2_sdma``: build Stage2 + combine through the SDMA copy engines
         (``stage2_sdma.MegaMoESdmaStage2``); None reads AITER_MEGA_STAGE2_SDMA. An
-        unsupported configuration, or a mori without SDMA queues, keeps the default
-        Stage2 with a warning."""
+        unsupported configuration, or a mori without SDMA queues on any rank, keeps the
+        default Stage2 on every rank with a warning. ``set_stage2_sdma_enabled``
+        chooses per call; the large-input path, when on, takes precedence."""
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
@@ -216,6 +217,7 @@ class MegaMoEV2:
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
         self._sdma_stage2 = None
+        self._sdma_on = False
         if envs.AITER_MEGA_STAGE2_SDMA if stage2_sdma is None else stage2_sdma:
             self._build_sdma_stage2()
         self._large_m = None
@@ -785,20 +787,46 @@ class MegaMoEV2:
                     send_slack=envs.AITER_MEGA_SDMA_SEND_SLACK,
                 )
             except RuntimeError as exc:
+                # Raised on every rank together: the build agrees across ranks first.
                 reason = str(exc)
         if reason is not None:
             logger.warning("MegaMoEV2: SDMA Stage2 unavailable (%s); using the default Stage2", reason)
+        else:
+            # Not caught: the same compile fails the same way on every rank.
+            self._sdma_stage2.preload()
+        self._sdma_on = self._sdma_stage2 is not None
 
     @property
     def stage2_sdma(self) -> bool:
-        """Whether Stage2 + combine run through the SDMA copy engines."""
+        """Whether the following calls run Stage2 + combine through the SDMA copy engines."""
+        return self._sdma_on
+
+    @property
+    def stage2_sdma_available(self) -> bool:
+        """Whether this instance built the SDMA Stage2."""
         return self._sdma_stage2 is not None
 
+    def set_stage2_sdma_enabled(self, enabled: bool) -> None:
+        """Run the following calls' Stage2 + combine through the SDMA engines (True) or
+        the default Stage2 (False).
+
+        The SDMA path is faster from ~2048 tokens per rank and slower below ~1024, so
+        an instance that also serves decode or small batches should choose per call --
+        from a token count every EP rank agrees on, since the two paths cannot be mixed
+        within a call. Its protocol state advances only on SDMA calls, so switching
+        between calls is safe.
+        """
+        if enabled and self._sdma_stage2 is None:
+            raise RuntimeError("the SDMA Stage2 is not available on this instance")
+        self._sdma_on = bool(enabled)
+
     def close(self):
-        """Release the SDMA Stage2's communicator (after the peers have read its data)."""
+        """Release the SDMA Stage2's communicator once the peers have read its data.
+        Collective: every rank calls it, after its last call."""
         if self._sdma_stage2 is not None:
             self._sdma_stage2.close()
             self._sdma_stage2 = None
+        self._sdma_on = False
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         entry = self._bundle_plan.entry_for_tokens(tokens)
@@ -1054,7 +1082,7 @@ class MegaMoEV2:
         self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
     ):
         """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
-        if self._sdma_stage2 is not None:
+        if self._sdma_on:
             # A -1 slot is never dispatched, so it has no row and adds nothing: the SDMA
             # combine needs no ids.
             out = self._sdma_stage2.run(
