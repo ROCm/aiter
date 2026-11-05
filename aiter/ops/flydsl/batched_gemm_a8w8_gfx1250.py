@@ -373,7 +373,7 @@ def _check_bmm_operands(
     ``Out`` is a 1-byte fp8 buffer. The C staging is still bf16 (what the quant
     reads), so the returned out name stays ``bf16``.
     """
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] batched {tag} requires gfx1250, got {get_gfx()}"
         )
