@@ -8,13 +8,15 @@
       "DT"
     ],
     "attn_3d": [
-      "D"
+      "D",
+      "Q"
     ],
     "reduce": [
       "D"
     ],
     "kv_split": [
       "D",
+      "Q",
       "DT"
     ]
   },
@@ -230,6 +232,12 @@
       "num_stages": 1,
       "waves_per_eu": 2
     },
+    "D_LEQ_128.Q_GEQ_4": {
+      "BLOCK_M": 32,
+      "num_warps": 2,
+      "num_stages": 2,
+      "waves_per_eu": 2
+    },
     "any": {
       "BLOCK_M": 16,
       "num_warps": 2,
@@ -287,6 +295,24 @@
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 4,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_128.Q_GEQ_2": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MIN": 256,
+      "SEGMENT_TILE_MAX": 256,
+      "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
     "D_LEQ_128": {
