@@ -44,6 +44,13 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("lamport_ar_rms_buffer_size", &aiter::lamport_ar_rms_buffer_size,
+          py::arg("world_size"), py::arg("max_bytes"));
+    m.def("init_lamport_ar_rms", &aiter::init_lamport_ar_rms,
+          py::arg("_fa"), py::arg("all_ptrs"), py::arg("max_bytes"));
+    m.def("fused_allreduce_rmsnorm_lamport", &aiter::fused_allreduce_rmsnorm_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     // Default is the max world size, so callers that omit it get a buffer safe
     // for every supported world size.

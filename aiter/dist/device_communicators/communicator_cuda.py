@@ -361,10 +361,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.cpu_group,
                 *self.gluon_ar,
             )
+        ca_comm = self.ca_comm
+        # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
+        # it beats the routes below up to its size cap (see
+        # _LAMPORT_AR_RMS_MAX_BYTES).
+        if (
+            ca_comm is not None
+            and x_pad_to_multiple == 0
+            and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
+        ):
+            return ca_comm.lamport_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm
+            )
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
-        ca_comm = self.ca_comm
         can_use_custom_ar = (
             ca_comm is not None
             and not ca_comm.disabled
