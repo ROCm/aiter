@@ -707,6 +707,11 @@ def build_topk_per_row_decode_one_workgroup_module(
                     & (candidate_count > zero)
                     & (candidate_count <= fx.Int32(_COMPACT_LIMIT))
                 )
+                # Every wave has read histogram[first_threshold] into
+                # use_compact. finish_global clears that bucket before its
+                # own barrier, so a wave that has not read yet would take
+                # finish_compact and the workgroup would barrier at two sites.
+                gpu.barrier()
                 if use_compact:
                     finish_compact(
                         first_threshold,

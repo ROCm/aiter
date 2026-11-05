@@ -22,13 +22,12 @@ collector.
 from __future__ import annotations
 
 import os
-import time
 from contextlib import contextmanager
 
 import torch
 
 from aiter.aot.flydsl import replay as _replay
-from aiter.aot.flydsl.common import compile_only_env, override_env
+from aiter.aot.flydsl.common import compile_only_env
 
 _QSA_ARCHS = ("gfx942", "gfx950")
 
@@ -119,72 +118,29 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
 
 @contextmanager
 def _qsa_compile_device(arch: str, cu_num: int):
-    """Present ``arch`` to the QSA wrappers without allocating a device buffer.
-
-    The wrappers call ``get_gfx_runtime``. This substitutes the job arch for
-    that call, and on gfx942 they also read the CU count. Fake tensors
-    satisfy the CUDA checks. The fake ``gcnArchName`` covers helpers that
-    still read device properties. ``run_topk_launcher`` keys a per-GPU
-    launcher on ``torch._C._cuda_getDevice``; that returns 0, the one fake
-    device. ``COMPILE_ONLY`` never launches, so the stream is only a value
-    the launcher records.
+    """Substitute ``torch._C._cuda_getDevice`` during an AOT replay.
 
     A replay process is already inside ``dry_run``, which installed the
-    same stand-ins for this job's arch. Replacing them would drop the
-    dry run's patches when this context exits. ``dry_run`` does not replace
-    ``_cuda_getDevice``, so that lookup is still substituted here.
+    stand-ins for this job's arch. Replacing them would drop the dry run's
+    patches when this context exits. ``dry_run`` does not replace
+    ``_cuda_getDevice``, so that lookup is still substituted here and
+    restored on exit. ``run_topk_launcher`` keys a per-GPU launcher on it;
+    the substitute returns 0.
+
+    Without ``AITER_AOT_REPLAY=1`` this raises ``RuntimeError`` and does not
+    patch process-wide torch state. ``arch`` and ``cu_num`` name that job.
     """
-    if os.environ.get("AITER_AOT_REPLAY") == "1":
-        saved_get_device = torch._C._cuda_getDevice
-        torch._C._cuda_getDevice = lambda: 0
-        try:
-            yield
-        finally:
-            torch._C._cuda_getDevice = saved_get_device
-        return
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    import aiter.ops.flydsl.qsa_paged as qsa_mod
-    from aiter.jit.utils.chip_info import get_cu_num
-
-    class _Props:
-        gcnArchName = arch
-
-    class _Stream:
-        cuda_stream = 0
-
-    saved_runtime = qsa_mod.get_gfx_runtime
+    if os.environ.get("AITER_AOT_REPLAY") != "1":
+        raise RuntimeError(
+            "QSA AOT compile runs only with AITER_AOT_REPLAY=1; "
+            f"refusing to patch torch for {arch} (cu_num={cu_num})"
+        )
     saved_get_device = torch._C._cuda_getDevice
-    saved = (
-        torch.cuda.get_device_properties,
-        torch.cuda.current_stream,
-        torch.cuda.is_current_stream_capturing,
-    )
+    torch._C._cuda_getDevice = lambda: 0
     try:
-        qsa_mod.get_gfx_runtime = lambda: arch
-        torch._C._cuda_getDevice = lambda: 0
-        torch.cuda.get_device_properties = lambda device=None: _Props()
-        torch.cuda.current_stream = lambda device=None: _Stream()
-        torch.cuda.is_current_stream_capturing = lambda: False
-        with (
-            FakeTensorMode(),
-            override_env("ARCH", arch),
-            override_env("FLYDSL_GPU_ARCH", arch),
-            override_env("CU_NUM", str(cu_num)),
-        ):
-            get_cu_num.cache_clear()
-            try:
-                yield
-            finally:
-                get_cu_num.cache_clear()
+        yield
     finally:
-        qsa_mod.get_gfx_runtime = saved_runtime
         torch._C._cuda_getDevice = saved_get_device
-        (
-            torch.cuda.get_device_properties,
-            torch.cuda.current_stream,
-            torch.cuda.is_current_stream_capturing,
-        ) = saved
 
 
 def collect_jobs(_csv_paths: list[str], _args) -> list:
@@ -255,25 +211,9 @@ def _compile_sparse_gqa(job):
             indices = torch.zeros(rows, width, dtype=i32, device=device)
             indices[:, -1] = -1
             token_to_req = torch.zeros(rows, dtype=i32, device=device)
-            flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, table, token_to_req)
-
-
-def compile_one_config(**job) -> dict:
-    """Compile one Flash-Next launch. ``COMPILE_ONLY`` keeps the wrapper from launching."""
-    result = {**job, "compile_time": None}
-    started = time.time()
-    try:
-        with compile_only_env():
-            if job["op"] == "indexer":
-                _compile_indexer(job)
-            elif job["op"] == "sparse_gqa":
-                _compile_sparse_gqa(job)
-            else:
-                raise ValueError(f"unknown QSA AOT op {job['op']!r}")
-        result["compile_time"] = time.time() - started
-    except Exception as error:  # noqa: BLE001
-        print(f"  [FAIL] {job['kernel_name']}: {error}")
-    return result
+            flydsl_qsa_paged_gqa(
+                q, k_cache, v_cache, indices, table, token_to_req, num_cus=cu_num
+            )
 
 
 def replay(job: dict) -> None:

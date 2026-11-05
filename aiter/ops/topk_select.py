@@ -1547,8 +1547,8 @@ def _dispatch(
             1,
             topk,
             stable=tie == "low" or deterministic,
-            # Same arch the stream budget uses. The wheel harness fakes
-            # gcnArchName, so this does not probe a device.
+            # Same arch the stream budget uses, passed in so this call
+            # does not probe a device.
             arch=_device_arch(input.device.index),
         )
     elif backend == "stream":

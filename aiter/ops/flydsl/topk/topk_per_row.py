@@ -358,9 +358,8 @@ def flydsl_top_k_per_row_decode(
     ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
     width) long; the kernels then read no length tensor, so there is nothing
     for a captured graph to hold an address of.
-    ``arch`` is the GPU this kernel is built for. Callers that already know it
-    pass it: the QSA wheel build has no device to probe. Omitted, it is the
-    live GPU.
+    ``arch`` is the GPU this kernel is built for. A caller that cannot probe
+    the device passes it. Omitted, it is the live GPU.
     ``finite_only`` never selects a nonfinite column (NaN, +inf, or -inf):
     a row with fewer than k finite values returns those in column order,
     then -1. Only the one-workgroup kernel (``plane_width`` up to 20000)
