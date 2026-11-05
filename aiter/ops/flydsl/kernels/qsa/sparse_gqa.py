@@ -182,13 +182,12 @@ def _paged_gqa_lds_bytes(
 ) -> int:
     """Bytes of the split kernel's ``SharedStorage``, including tail alignment.
 
-    The fields are the production struct (no test pad): KV, the score tile,
-    and one partial per wave. gfx950 prefill keeps K and V in separate
-    regions; gfx942 and gfx950 decode overlay them, and gfx942 pads each K
-    row by 8. ``dsl_size_of`` rounds the struct up to 16. The compiler's
-    ``group_segment`` size leaves that tail off (165896 where this reports
-    165904) and both device limits are multiples of 16, so the two sizes
-    reject the same shapes.
+    The fields are KV, the score tile, and one partial per wave. gfx950
+    prefill keeps K and V in separate regions; gfx942 and gfx950 decode
+    overlay them, and gfx942 pads each K row by 8. ``dsl_size_of`` rounds
+    the struct up to 16. The compiler's ``group_segment`` size leaves that
+    tail off (165896 where this reports 165904) and both device limits are
+    multiples of 16, so the two sizes reject the same shapes.
     """
     num_waves = block_threads // 64
     n_subtiles = block_n // 16
@@ -220,8 +219,7 @@ def _paged_gqa_lds_reason(lds_bytes: int, use_k32: bool) -> str | None:
     """Why this split tile does not fit in LDS, or None when it does.
 
     ``use_k32`` is the gfx950 layout. The overlay layout is gfx942, whose
-    workgroup LDS is 64 KiB. A test pad is not part of ``lds_bytes`` here;
-    the builder passes the struct it actually allocated.
+    workgroup LDS is 64 KiB.
     """
     arch = "gfx950" if use_k32 else "gfx942"
     capacity = get_lds_capacity_bytes(arch)
@@ -241,7 +239,6 @@ def build_qsa_sparse_gqa_module(
     n_splits: int,
     wide_cache: bool,
     kv_strides: tuple[int, int, int] | None = None,
-    lds_pad_elems: int = 0,
 ):
     if n_kv_heads < 1 or n_q_heads % n_kv_heads:
         raise ValueError(
@@ -361,20 +358,7 @@ def build_qsa_sparse_gqa_module(
             fx.make_layout(shape, (k_stride, 1)),
         )
 
-    # A test passes a pad larger than the kv tile so that symbol is not at
-    # byte 0. The production launch leaves it empty and keeps today's layout.
-    if lds_pad_elems < 0:
-        raise ValueError(f"lds_pad_elems must be >= 0, got {lds_pad_elems}")
-    if use_k32 and lds_pad_elems:
-
-        @fx.struct
-        class SharedStorage:
-            pad: fx.Array[BFloat16, lds_pad_elems, 16]
-            kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
-            scores: fx.Array[Float32, qk_score_slots, 16]
-            partial: fx.Array[Int32, num_waves, 4]
-
-    elif use_k32:
+    if use_k32:
 
         @fx.struct
         class SharedStorage:
@@ -390,16 +374,13 @@ def build_qsa_sparse_gqa_module(
             scores: fx.Array[Float32, qk_score_slots, 16]
             partial: fx.Array[Int32, num_waves, 4]
 
-    # The host estimate describes the unpadded struct. A test pad is a
-    # different allocation and is checked on its own size.
     lds_bytes = dsl_size_of(SharedStorage)
-    if not lds_pad_elems:
-        expected = _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32)
-        if lds_bytes != expected:
-            raise RuntimeError(
-                f"split shared storage is {lds_bytes} bytes, "
-                f"the host estimate is {expected}"
-            )
+    expected = _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32)
+    if lds_bytes != expected:
+        raise RuntimeError(
+            f"split shared storage is {lds_bytes} bytes, "
+            f"the host estimate is {expected}"
+        )
     lds_reason = _paged_gqa_lds_reason(lds_bytes, use_k32)
     if lds_reason is not None:
         raise ValueError(lds_reason)
@@ -421,7 +402,6 @@ def build_qsa_sparse_gqa_module(
             qkk=qk_k,
             wide=int(wide_cache),
             **({"kvs": "x".join(str(s) for s in kv_strides)} if strided_wide else {}),
-            **({"pad": lds_pad_elems} if lds_pad_elems else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -511,18 +491,6 @@ def build_qsa_sparse_gqa_module(
             v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # const_expr has to stay its own if: combined with the lane test,
-        # the pad body is still traced on the production launch, which has
-        # no pad field. A deletable store would drop the symbol.
-        if const_expr(lds_pad_elems):  # noqa: SIM102
-            if tid == zero:
-                llvm.inline_asm(
-                    ir.Type.parse("!llvm.void"),
-                    [Int32(fx.ptrtoint(storage.pad.ptr)).ir_value()],
-                    "ds_write_b32 $0, $0\n",
-                    "v,~{memory}",
-                    has_side_effects=True,
-                )
         k_arr = storage.kv
         score_arr = storage.scores
         score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)

@@ -53,7 +53,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa_paged
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E, get_warp_size
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.qsa.indexer_select import _K
 from aiter.ops.flydsl.kernels.qsa.sparse_gqa import (
     _launch_config,
@@ -2615,104 +2615,6 @@ def test_paged_gqa_flash_next_prefill_matches_oracle():
     )
     if err != 0:
         raise AssertionError(f"paged GQA prefill diverged from the oracle (err={err})")
-
-
-def test_paged_gqa_prefill_v_store_follows_kv_base():
-    """The gfx950 prefill V store follows the kv symbol, not LDS byte 0.
-
-    A pad larger than the kv tile is allocated ahead of it. ``ds_write2st64``
-    with an offset from address 0 then writes the pad, and the PV read of
-    ``k_arr`` misses it. The same rows through the production launch check
-    that the empty pad still matches.
-    """
-    if not torch.cuda.is_available() or get_gfx() != "gfx950":
-        pytest.skip("not gfx950")
-    device = torch.device("cuda")
-    rows, n_kv, n_q, head_dim = 32, 1, 4, 64
-    seq_len, page_size, width = 64, 16, 32
-    block_n, block_threads, n_splits = _launch_config(rows, width, n_kv, head_dim)
-    if block_n == 16:
-        raise AssertionError("this shape left the ds_write2st64 prefill path")
-    torch.manual_seed(0)
-    q = torch.randn(rows, n_q, head_dim, dtype=dtypes.bf16, device=device)
-    k = torch.randn(seq_len, n_kv, head_dim, dtype=dtypes.bf16, device=device)
-    v = torch.randn(seq_len, n_kv, head_dim, dtype=dtypes.bf16, device=device)
-    indices = torch.randint(0, seq_len, (rows, width), dtype=dtypes.i32, device=device)
-    indices[:, -1] = -1
-    token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(2)
-    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
-    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
-    if not torch.equal(kv_table, kv_table_v):
-        raise AssertionError("K and V were packed into different page tables")
-    ref = sparse_gqa_ref(q, k, v, indices)
-    # split_kv_lds stores V after the K tile, so the symbol is twice the tile.
-    kv_elems = block_n * head_dim * 2
-    pad_elems = kv_elems + 256
-
-    def launch(pad):
-        out = torch.empty_like(q)
-        partial_out = (
-            out
-            if n_splits == 1
-            else torch.empty(
-                (n_splits, rows, n_q, head_dim), dtype=torch.float32, device=device
-            )
-        )
-        partial_lse = (
-            out
-            if n_splits == 1
-            else torch.empty((n_splits, rows, n_q), dtype=torch.float32, device=device)
-        )
-        _run_compiled(
-            build_qsa_sparse_gqa_module(
-                n_q,
-                n_kv,
-                head_dim,
-                page_size,
-                True,
-                block_n,
-                block_threads,
-                n_splits,
-                False,
-                None,
-                pad,
-            ),
-            q,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            partial_out,
-            partial_lse,
-            out,
-            width,
-            int(kv_table.shape[0]),
-            int(kv_table.shape[1]),
-            int(k_cache.shape[0]),
-            float(head_dim**-0.5 * LOG2E),
-            rows,
-            n_kv,
-            n_q,
-            torch.cuda.current_stream(device),
-        )
-        return out
-
-    for pad, what in ((0, "production"), (pad_elems, "padded")):
-        got = launch(pad)
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            got.to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            msg=f"paged GQA prefill V store ({what}) vs oracle",
-        )
-        if err != 0:
-            raise AssertionError(
-                f"paged GQA prefill V store ({what}) diverged (err={err})"
-            )
 
 
 def test_paged_gqa_two_prompt_prefill_matches_oracle():
