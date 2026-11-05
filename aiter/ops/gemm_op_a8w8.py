@@ -1055,6 +1055,14 @@ def gemm_a8w8_bpreshuffle_out(
 _BLOCKSCALE_TRITON_FALLBACK_MIN_M = {"gfx942": 2048, "gfx950": 384}
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_split_k_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale N:{n}, K:{k} has split-K rows, which accumulate in "
+        f"the output dtype; {dtype} output runs them without split-K."
+    )
+
+
 def _blockscale_triton(
     XQ: Tensor,
     WQ: Tensor,
@@ -1272,7 +1280,8 @@ def gemm_a8w8_blockscale(
     Native E8M0 group32 scales (typed tensors or uint8 views) use
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
     FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
-    queried through get_CKGEMM_config before choosing a fallback. Group32
+    queried through get_CKGEMM_config before choosing a fallback. A split-K CK
+    or CK-Tile row runs without split-K for output other than BF16. Group32
     currently supports libtype="triton", also its default on a config miss.
     Triton tile and split-K parameters come from its own tuning tables.
     For native group32 operands, split_k optionally overrides the positive
@@ -1331,6 +1340,9 @@ def gemm_a8w8_blockscale(
         # group32 row must fail instead of reinterpreting its E8M0 bytes.
         assert not is_group32, f"Unsupported libtype {libtype} for group32 GEMM"
         splitK = int(config.get("splitK", 0))
+        if splitK > 0 and dtype != dtypes.bf16 and libtype in ("ck", "cktile"):
+            _warn_blockscale_split_k_row_not_bf16(n, k, dtype)
+            splitK = 0
         kernelName = str(config.get("kernelName", ""))
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
         if libtype == "ck":
@@ -2518,6 +2530,10 @@ def _mxfp8_32_fallback_kernel_name(M: int, N: int, K: int) -> str | None:
 # 32x4-shuffled and gfx950's row-major scale alike), and of a table from before
 # the w_scale_block key column.
 _MXFP8_W_SCALE_BLOCK = "1x32"
+# kernelName prefix of a gfx950 row (kernelId "bmm") that the batched GEMM
+# serves at B = 1 (batched_gemm_a8w8_gfx950.BMM_MFMA_NAME_PREFIX, not imported
+# here so loading this module does not import FlyDSL).
+_BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 _MXFP8_TUNED_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
 
@@ -2540,8 +2556,9 @@ def _get_mxfp8_bpreshuffle_config(
 
     A FlyDSL tuned row wins (exact M, else a padded M, the walk
     get_CKGEMM_config makes); an untuned shape uses the FlyDSL heuristic.
-    gfx950 rows are FlyDSL mxpsh kernels; an untuned gfx950 shape runs the
-    mxpsh heuristic tile.
+    gfx950 rows are FlyDSL mxpsh / 8-wave kernels, or (kernelId "bmm") the
+    batched GEMM at B = 1; an untuned gfx950 shape runs the mxpsh heuristic
+    tile.
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     gfx, cu_num = get_gfx(), get_cu_num()
@@ -2614,7 +2631,8 @@ def gemm_a8w8_mxfp8_bpreshuffle(
 
     * gfx950: x_scale [M, K/32] and w_scale [N, K/32] e8m0, row-major and
       unshuffled. The w_scale block is read off its shape and served by
-      flydsl.gemm_a8w8_mxfp8 (as the batched mxscale GEMM does). The 32x32 and
+      flydsl.gemm_a8w8_mxfp8 (as the batched mxscale GEMM does), or by the
+      batched GEMM at B = 1 where a tuned row (kernelId "bmm") picked it. The 32x32 and
       128x128 blocks go through gemm_a8w8_blockscale_bpreshuffle, whose tuned
       rows pick bmm or these kernels.
     * gfx1250: w_scale [N, K/32] is always 32x4 shuffled. x_scale is
@@ -2637,6 +2655,26 @@ def gemm_a8w8_mxfp8_bpreshuffle(
         w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), N, K)
     _, kernel_name, _ = _get_mxfp8_bpreshuffle_config(M, N, K, w_scale_block)
     if gfx == "gfx950":
+        is_bmm = kernel_name is not None and kernel_name.startswith(
+            f"{_BMM_MFMA_NAME_PREFIX}_"
+        )
+        if is_bmm and Y.dtype != dtypes.bf16:
+            # The gfx950 BMM writes bf16 only; let the mxpsh heuristic pick.
+            kernel_name = None
+        elif is_bmm:
+            # A kernelId "bmm" row: the batched GEMM at B = 1 (tuned against
+            # these kernels by the mxfp8 tuner), on the same row-major scales.
+            from .flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
+
+            run_bmm_a8w8_mxfp8(
+                XQ.view(M, 1, K),
+                WQ.view(1, N, K),
+                x_scale.view(M, 1, x_scale.shape[-1]),
+                w_scale.view(1, *w_scale.shape),
+                Y.view(M, 1, N),
+                kernel_name=kernel_name,
+            )
+            return Y
         from .flydsl.gemm_a8w8_mxfp8 import run_gemm_a8w8_mxfp8
 
         return run_gemm_a8w8_mxfp8(XQ, WQ, x_scale, w_scale, Y, kernel_name)

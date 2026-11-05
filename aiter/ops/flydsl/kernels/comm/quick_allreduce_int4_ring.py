@@ -60,6 +60,7 @@ from .allreduce_shared import (
 )
 from .quick_allreduce_codec import (
     GROUP,
+    SCALE_CODEC_TAG,
     SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
@@ -609,8 +610,8 @@ def make_quick_allreduce_ring_kernel(
         )
 
     tag = (
-        f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
-        f"_{rs_codec}_{ag_codec}"
+        f"{SCALE_CODEC_TAG}_ws{world_size}_r{rank}_st{super_tile}_g{grid}"
+        f"_{inbox_memory}_{rs_codec}_{ag_codec}"
     )
     tag += f"_b{block}"
     launch_quick_allreduce_int4_ring.func.__name__ = (

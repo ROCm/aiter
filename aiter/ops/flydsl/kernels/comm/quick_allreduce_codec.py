@@ -4,7 +4,7 @@
 """INT4, INT6 and FP16 wire codecs for quick-allreduce.
 
 A rank-tile is ``block`` threads x one 16 B atom, quantized in packed fp16 with
-a group-16 signed E4M3 scale. INT4 is one nibble plane; INT6 adds a dense 2-bit
+a group-16 signed 8-bit scale (E5M2, bias 12). INT4 is one nibble plane; INT6 adds a dense 2-bit
 plane, which keeps the nibble plane byte-identical to INT4's and every region
 on the 64 B fabric sector grid. FP16 is a passthrough wire format -- the
 thread's eight fp16 values verbatim, no quantization -- used to test the
@@ -20,11 +20,12 @@ every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
   :func:`_clamp_fp16_overflow`), and a magnitude below fp16's resolution loses
   mantissa bits that bf16 has. The FP16 wire format is therefore not lossless
   for bf16 data outside the fp16 range.
-* The group scale is a signed E4M3 byte, whose largest magnitude is 480
-  (``1.875 * 2**8``). A group whose extremum is above 480 reconstructs with
-  its extremum clipped to about 480. NaN and Inf are not propagated: they
-  become finite values. The ring requantizes the running partial sum at every
-  reduce-scatter hop, so a sum of several values near 300 can also clip.
+* The group scale is a signed E5M2 byte with bias 12, spanning
+  ``[2**-12, 1.75 * 2**19]``, so every fp16 group extremum fits and nothing
+  clips below the fp16 limit above. It has 2 mantissa bits, so the scale
+  rounds to within 1/8 of the extremum. INT6 floors the scale at ``2**-10``
+  (see :attr:`Codec.scale_min_e5`). NaN and Inf are not propagated: they
+  become finite values.
 
 ``block`` is a build parameter: it sets the tile width, and through it how
 many blocks a payload gets.
@@ -34,6 +35,7 @@ Depends on ``allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 """
 
 import functools
+import math
 from dataclasses import dataclass
 
 import flydsl.expr as fx
@@ -44,7 +46,7 @@ from ..kernels_common import ceildiv
 from .allreduce_shared import BLOCK, I32_BYTES, SUPPORTED_BLOCKS, WAVE
 
 SUPER_TILES = (1, 8)
-# Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
+# Two threads (PAIR) share one scale byte; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
 
@@ -86,6 +88,13 @@ _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 # Largest finite fp16. The encode scale is materialised as fp16, so anything
 # above this becomes Inf there; see _codec_quant.
 _FP16_MAX = 65504.0
+# Exponent bias of the E5M2 group scale.
+_SCALE_BIAS = 12
+# Bump whenever the group-scale codec changes. The codec helpers are only
+# called from nested functions, so FlyDSL does not hash them into the disk
+# cache key; the kernels put this tag in their launch names, which is what
+# keeps a warm cache from loading binaries built with an older codec.
+SCALE_CODEC_TAG = "s5m2b12"
 
 
 @dataclass(frozen=True)
@@ -127,6 +136,33 @@ class Codec:
     @property
     def dec_step(self) -> float:
         return -1.0 / self.bias
+
+    @property
+    def scale_min_e5(self) -> int:
+        """Smallest scale exponent field for this codec.
+
+        The encode factor ``1 / (scale * |dec_step|)`` is splat to fp16, so the
+        scale must stay at or above ``1 / (|dec_step| * 65504)``: field 0
+        (``2**-12``) for INT4, field 2 (``2**-10``) for INT6. A group below the
+        floor is quantized against the floor scale.
+        """
+        if not self.has_scale:
+            return 0
+        floor = 1.0 / (abs(self.dec_step) * _FP16_MAX)
+        return max(0, math.ceil(math.log2(floor)) + _SCALE_BIAS)
+
+    @property
+    def scale_rounds_up(self) -> bool:
+        """Round the group scale up to the next E5M2 value, not to nearest.
+
+        Rounding to nearest can round the scale below the extremum, which then
+        clips by up to 1/8. That is about one INT4 step, but four INT6 steps,
+        so INT6 rounds up: no clip, at a step up to 1/4 coarser. On a normal
+        fill that keeps INT6 at E4M3's SQNR (33.5 vs 33.4 dB), where rounding
+        to nearest loses 2.4 dB; INT4 keeps rounding to nearest (21.9 dB, vs
+        21.5 dB rounding up).
+        """
+        return self.bits > 4
 
     @property
     def qmin(self) -> float:
@@ -175,7 +211,7 @@ def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
     block = validate_block(block)
     nibble = block  # one i32 of nibbles per thread
     hi2 = block // PAIR  # INT6's dense 2-bit plane, one i32 per lane pair
-    # One i32 per GROUP threads (4 packed E4M3 bytes), padded to a sector.
+    # One i32 per GROUP threads (4 packed scale bytes), padded to a sector.
     scale = _round_up_to_sector(block // GROUP)
     return {
         c.name: c
@@ -245,7 +281,7 @@ def thread_lane(tid, block: int = BLOCK):
 
 
 def scale_slot_of(tid, block: int = BLOCK):
-    """(scale_slot, pair_in_slot) -- this thread's group-16 E4M3 scale slot,
+    """(scale_slot, pair_in_slot) -- this thread's group-16 scale slot,
     and which half of the ``PAIR`` sharing that slot this thread is.
 
     ``scale_slot`` addresses the i32 the byte lives in; ``pair_in_slot``
@@ -274,7 +310,7 @@ def hi2_slot_of(tid):
 
 
 def _scale_from_word(codec, word, pair_in_slot):
-    """This thread's decoding scale, out of a packed group-16 E4M3 word.
+    """This thread's decoding scale, out of a packed group-16 scale word.
 
     ``None`` for a codec with no scale plane (fp16 passthrough).
     """
@@ -344,42 +380,54 @@ def _atom_f16_to_bf16(atom):
     return fx.Vector(atom).bitcast(fx.Float16).to(fx.BFloat16).bitcast(fx.Int32)
 
 
-def _f32_to_e4m3(x):
-    """Pack f32 to a signed E4M3 byte: 1 sign, 4-bit exp (bias 7), 3-bit mantissa.
+def _f32_to_e4m3(x, min_e5=0, round_up=False):
+    """Pack f32 to a signed 8-bit scale: 1 sign, 5-bit exp (bias 12), 2-bit mantissa.
 
-    Decode is ``±(1 + m/8) * 2**(e - 7)`` for every ``e``, including 0
-    (no OCP denorms), so typical INT4 extrema (~0.1) stay in range after
-    ×−1/8. ``0x7F`` / ``0xFF`` are max finite, not NaN.
+    The scale was E4M3 with bias 7, which spans only ``[2**-7, 480]``: a
+    group whose extremum is above 480 clipped, and the ring, which requantizes
+    the running partial sum at every hop, clipped sums of a few values near
+    300. E5M2 with bias 12 spans ``[2**-12, 1.75 * 2**19]``, so every fp16
+    extremum fits. The byte, the layout and the instruction count are
+    unchanged; the function names keep "e4m3" for a small diff.
 
+    Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
+    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+
+    *min_e5* floors the exponent field (see :attr:`Codec.scale_min_e5`), and
+    *round_up* rounds the mantissa up instead of to nearest (see
+    :attr:`Codec.scale_rounds_up`).
     ``0x00`` is +0 only. Any other value that would land there (positive
-    underflow, or exactly ``2**-7``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-7``). Overflow clamps both exponent
-    and mantissa; saturating the exponent alone would map ``512`` to
-    ``256``.
+    underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
+    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
+    and mantissa.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
     bits = abs(x).bitcast(fx.Int32)
     e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
     mant = bits & fx.Int32(0x7FFFFF)
-    m3 = (mant + fx.Int32(1 << 19)).shrui(fx.Int32(20))
-    carry = m3 == fx.Int32(8)
+    m2 = (mant + fx.Int32((1 << 21) - 1 if round_up else 1 << 20)).shrui(fx.Int32(21))
+    carry = m2 == fx.Int32(4)
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
-    m3 = carry.select(fx.Int32(0), m3)
-    e4 = e + fx.Int32(7)
-    overflow = e4 > fx.Int32(15)
-    m3 = overflow.select(fx.Int32(7), m3)
-    e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(15), e4))
-    byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
+    m2 = carry.select(fx.Int32(0), m2)
+    e5 = e + fx.Int32(_SCALE_BIAS)
+    overflow = e5 > fx.Int32(31)
+    m2 = overflow.select(fx.Int32(3), m2)
+    e5 = (e5 < fx.Int32(min_e5)).select(
+        fx.Int32(min_e5), overflow.select(fx.Int32(31), e5)
+    )
+    byte = sign | (e5 << fx.Int32(2)) | (m2 & fx.Int32(3))
     return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
 
 
 def _e4m3_to_f32(b):
     is_z = b == fx.Int32(0)
     sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e4 = b.shrui(fx.Int32(3)) & fx.Int32(15)
-    m3 = b & fx.Int32(7)
-    mag_bits = ((e4 + fx.Int32(120)) << fx.Int32(23)) | (m3 << fx.Int32(20))
+    e5 = b.shrui(fx.Int32(2)) & fx.Int32(31)
+    m2 = b & fx.Int32(3)
+    mag_bits = ((e5 + fx.Int32(127 - _SCALE_BIAS)) << fx.Int32(23)) | (
+        m2 << fx.Int32(21)
+    )
     mag = mag_bits.bitcast(fx.Float32)
     signed = sign.select(-mag, mag)
     return is_z.select(fx.Float32(0.0), signed)
@@ -395,7 +443,7 @@ def _pack_fields(fields, width, mask=None):
 
 
 def _pack_e4m3_word(e, lane):
-    """Four pair-E4M3 bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
+    """Four pair-scale bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
     base = (lane // GROUP) * GROUP
     src = [base] + [base + fx.Int32(k) for k in range_constexpr(PAIR, GROUP, PAIR)]
     e_pair = [fx.Int32(gpu.shuffle_idx(e, s, WAVE)) for s in src]
@@ -458,7 +506,7 @@ def _expand_hi2(word, tid):
 
 
 def _codec_quant(codec, atom, lane, tid):
-    """Quantize one atom. Returns ``(words, e4m3_word, is_leader)``.
+    """Quantize one atom. Returns ``(words, scale_word, is_leader)``.
 
     ``words`` is this codec's payload i32s in wire order, and is opaque to the
     caller: the ring restages received words verbatim on its all-gather lap and
@@ -470,7 +518,7 @@ def _codec_quant(codec, atom, lane, tid):
     if not codec.has_scale:
         return tuple(atom[i] for i in range_constexpr(4)), None, False
     ext = _pair_signed_ext_f16(atom)
-    e = _f32_to_e4m3(ext)
+    e = _f32_to_e4m3(ext, codec.scale_min_e5, codec.scale_rounds_up)
     d = _e4m3_to_f32(e) * fx.Float32(codec.dec_step)
     # Clamp before the fp16 splat. An all-zero group gives d == 0, so the
     # reciprocal is 1e7 -- Inf once narrowed to fp16, and 0 * Inf is NaN. Only
