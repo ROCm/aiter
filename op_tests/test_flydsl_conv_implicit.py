@@ -30,7 +30,7 @@ import argparse
 import functools
 import itertools
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 
@@ -732,6 +732,33 @@ def _check_output(ref, out, case):
     assert err == 0, f"{case}: {err:.8%} of elements outside {TOL}"
 
 
+def _compile_hook():
+    """(module, name) of the compile entry this device's host path resolves into."""
+    if get_gfx() == "gfx1250":
+        from aiter.ops.flydsl import conv3d_gfx1250
+
+        return conv3d_gfx1250, "compile_conv3d_implicit_gfx1250"
+    return conv_kernels, "compile_conv3d_implicit"
+
+
+def _assert_host_path_gfx1250(case, param):
+    """gfx1250 has no im2col reuse plan: the explicit config must reach the kernel."""
+    if case == "2d_splitk2":
+        assert param.splitk == 2, "splitk=2 must survive host resolution on gfx1250"
+    elif case == "2d_tile_256x96":
+        assert tuple(param.tile) == (256, 96, 4, 1), "explicit tile was not honored"
+    else:
+        assert (
+            tuple(param.tile) == _KH8["tile"] and param.block_rows == _KH8["block_rows"]
+        ), "explicit tile / block_rows were not honored"
+    if case == "2d_block_rows8_static":
+        assert not param.dyn_hw, "static regression must use static input extents"
+    return (
+        f"tile={tuple(param.tile)}, block_rows={param.block_rows}, "
+        f"splitk={param.splitk}, dyn_hw={param.dyn_hw}"
+    )
+
+
 def _assert_host_path(case, param):
     """Inspect the actual runtime compile parameter, not a guessed case name."""
     from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
@@ -772,15 +799,19 @@ def _capture_host_path(case):
     if case not in CI_KW_CASES and case != "2d_block_rows8_static":
         yield notes
         return
-    compile_fn = conv_kernels.compile_conv3d_implicit
+    hook_mod, hook_name = _compile_hook()
+    compile_fn = getattr(hook_mod, hook_name)
+    assert_fn = (
+        _assert_host_path_gfx1250 if get_gfx() == "gfx1250" else _assert_host_path
+    )
 
     def checked_compile(param):
-        note = _assert_host_path(case, param)
+        note = assert_fn(case, param)
         if note not in notes:
             notes.append(note)
         return compile_fn(param)
 
-    with patch.object(conv_kernels, "compile_conv3d_implicit", checked_compile):
+    with patch.object(hook_mod, hook_name, checked_compile):
         yield notes
         assert notes, f"{case}: no implicit compile parameter was observed"
 
@@ -793,7 +824,8 @@ def _capture_tuned_path(required):
         yield notes
         return
     log_fn = conv_kernels._log_tuned_lookup
-    compile_fn = conv_kernels.compile_conv3d_implicit
+    hook_mod, hook_name = _compile_hook()
+    compile_fn = getattr(hook_mod, hook_name)
     hits = []
 
     def checked_lookup(table, dev, key, hit, borrowed=False):
@@ -814,7 +846,7 @@ def _capture_tuned_path(required):
         return compile_fn(param)
 
     with patch.object(conv_kernels, "_log_tuned_lookup", checked_lookup), patch.object(
-        conv_kernels, "compile_conv3d_implicit", checked_compile
+        hook_mod, hook_name, checked_compile
     ):
         yield notes
         assert hits, "production conv_in did not perform a tuned lookup"
@@ -998,7 +1030,13 @@ def test_block_rows_static(dtype, mode="perf"):
     """Force static extents for all calls, restoring the module switch on failure."""
     kw = {"padding": 1, **_KH8}
     case = "2d_block_rows8_static"
-    with patch.object(conv_kernels, "AITER_CONV3D_DYN_HW", 0):
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(conv_kernels, "AITER_CONV3D_DYN_HW", 0))
+        if get_gfx() == "gfx1250":
+            # The gfx1250 host entry reads its own copy of the switch.
+            from aiter.ops.flydsl import conv3d_gfx1250
+
+            stack.enter_context(patch.object(conv3d_gfx1250, "AITER_CONV3D_DYN_HW", 0))
         if mode == "ci":
             return [
                 _execute_ci(

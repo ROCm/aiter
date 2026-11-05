@@ -387,7 +387,7 @@ def run_conv3d_gfx1250(
         chosen_br = (
             max(1, int(block_rows)) if block_rows is not None else DEFAULT_BLOCK_ROWS
         )
-        if chosen_tile[0] % chosen_br:
+        if chosen_tile[0] % chosen_br or (chosen_tile[0] // chosen_br) % 16:
             for br in (8, 4, 2, 1):
                 if chosen_tile[0] % br == 0 and (chosen_tile[0] // br) % 16 == 0:
                     chosen_br = br
