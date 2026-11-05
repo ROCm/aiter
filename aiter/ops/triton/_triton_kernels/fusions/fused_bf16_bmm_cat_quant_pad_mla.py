@@ -59,6 +59,7 @@ def _quant_pad_store(
 def _rope_vllm(
     x,
     pos,
+    max_position,
     cos_sin_ptr,
     stride_cs_pos,
     stride_cs_d,
@@ -69,7 +70,8 @@ def _rope_vllm(
     """RoPE of the rows of x (BLOCK_M, BLOCK_D) at positions pos, bit-exact to
     vLLM's concat_and_cache_mla_rope_fused HIP kernel. For a pair (a, b) it
     computes a' = a*cos - rnd(b*sin) and b' = a*sin + rnd(b*cos): hipcc fuses
-    the products of a into FMAs, so only the products of b round to x.dtype."""
+    the products of a into FMAs, so only the products of b round to x.dtype.
+    Positions are clamped into the max_position rows of the cos/sin cache."""
     BLOCK_D_HALF: tl.constexpr = BLOCK_D // 2
     offs_d = tl.arange(0, BLOCK_D)
     if IS_NEOX:
@@ -80,6 +82,7 @@ def _rope_vllm(
         is_a = offs_d % 2 == 0
         offs_cs = offs_d // 2
         x_rot = _get_gptj_rotated_x(x, is_a[None, :], BLOCK_M, BLOCK_D, BLOCK_D_HALF)
+    pos = tl.minimum(tl.maximum(pos.to(tl.int64), 0), max_position - 1)
     cs_ptrs = (
         cos_sin_ptr + pos[:, None] * stride_cs_pos + offs_cs[None, :] * stride_cs_d
     )
@@ -122,6 +125,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
     K,
     QH,
     cache_block_size,
+    max_position,
     stride_ah,
     stride_am,
     stride_ak,
@@ -279,11 +283,10 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         if ROPE_AND_CACHE:
             pos = tl.load(pos_ptr + offs_om, mask=row_mask, other=0)
             slot = tl.load(slot_ptr + offs_om, mask=row_mask, other=-1)
-            # A padding token's position can be out of the cos/sin cache range.
-            pos = tl.where(slot >= 0, pos, 0)
             roped = _rope_vllm(
                 pe,
                 pos,
+                max_position,
                 cos_sin_ptr,
                 stride_cs_pos,
                 stride_cs_d,
@@ -323,12 +326,10 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             other=0.0,
         )
         k_pe = tl.load(k_pe_ptr + tok * stride_kpe_m + offs_d * stride_kpe_d)
-        valid = tok_slot >= 0
-        # A padding token's position can be out of the cos/sin cache range.
-        tok_pos = tl.where(valid, tl.load(pos_ptr + tok + tl.arange(0, 1)), 0)
         k_pe = _rope_vllm(
             k_pe[None, :],
-            tok_pos,
+            tl.load(pos_ptr + tok + tl.arange(0, 1)),
+            max_position,
             cos_sin_ptr,
             stride_cs_pos,
             stride_cs_d,
@@ -336,6 +337,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             1,
             BLOCK_D_PE,
         )
+        valid = tok_slot >= 0
         cache_dtype = kv_cache_ptr.dtype.element_ty
         entry_ptr = (
             kv_cache_ptr

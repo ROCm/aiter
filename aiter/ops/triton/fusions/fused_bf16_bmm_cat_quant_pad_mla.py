@@ -74,6 +74,7 @@ def _launch(
     rope_and_cache = kv_cache is not None
     if rope_and_cache:
         cache_block_size = kv_cache.shape[1]
+        max_position = cos_sin_cache.shape[0]
         cache_max = torch.finfo(kv_cache.dtype).max
         rope_cache_strides = (
             *cos_sin_cache.stride(),
@@ -83,12 +84,8 @@ def _launch(
         )
         kv_programs = m
     else:
-        cache_block_size, cache_max, rope_cache_strides, kv_programs = (
-            0,
-            0.0,
-            9 * (0,),
-            0,
-        )
+        cache_block_size, max_position, cache_max = 0, 0, 0.0
+        rope_cache_strides, kv_programs = 9 * (0,), 0
 
     if config is None:
         get_config = _get_rope_cache_config if rope_and_cache else _get_config
@@ -116,6 +113,7 @@ def _launch(
         k,
         qh,
         cache_block_size,
+        max_position,
         *q_nope.stride(),
         *w_uk_t.stride(),
         *q_pe.stride(),
@@ -232,6 +230,7 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
             token. A token with a negative slot is padding.
         k_scale (torch.Tensor): Single-element fp32 cache scale.
         positions (torch.Tensor): (M,) contiguous int position of each token.
+            Positions out of [0, max_position) are clamped into it.
         cos_sin_cache (torch.Tensor): (max_position, R) bf16, the cos half then
             the sin half.
         is_neox (bool): NeoX pairs (i, i + R/2) if True, else GPT-J pairs
