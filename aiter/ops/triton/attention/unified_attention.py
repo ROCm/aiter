@@ -225,8 +225,6 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
-        # its non-causal branch is not validated
-        and params.causal
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -347,15 +345,59 @@ def unified_attention(
     and seqused_k[i] keys in the paged cache that block_table addresses. The
     query tokens are the last keys of their sequence. With causal=True, a
     query token attends to the keys up to its own position. With causal=False,
-    it attends to all keys of its sequence. Non-causal attention does not
-    support a sliding window, ALiBi, a query-query bias or an fp4 Q or KV.
-    The result goes into out. With skip_reduce and a split launch, the
-    function returns the unmerged segments instead.
+    it attends to all keys of its sequence.
+
+    Args:
+        q: [num_tokens, num_query_heads, head_size] queries. An fp4 q
+            (torch.uint8) packs two values in each byte.
+        k, v: [num_blocks, block_size, num_kv_heads, head_size] paged key and
+            value caches. With shuffled_kv_cache, k is [num_blocks,
+            num_kv_heads, head_size // x, block_size, x] and v is [num_blocks,
+            num_kv_heads, block_size // x, head_size, x], with x elements in
+            16 bytes. An fp4 cache (torch.uint8) also holds its scales.
+        out: [num_tokens, num_query_heads, head_size_v] output, written in place.
+        cu_seqlens_q: [num_seqs + 1] offsets of the query tokens of each sequence.
+        max_seqlen_q: the largest query length. 1 selects the decode path.
+        seqused_k: [num_seqs] int32 or int64 key count of each sequence.
+        max_seqlen_k: an upper bound of seqused_k, for example the bound that a
+            CUDA graph captures. It selects the kernel and sizes the split.
+        softmax_scale: the scale of the query-key products.
+        causal: if True, mask the keys after each query token.
+        window_size: (left, right). left >= 0 keeps the last left + 1 keys of
+            each query token. (-1, -1) and (-1, 0) have no window. The kernels
+            do not read right.
+        block_table: [num_seqs, max_num_blocks_per_seq] page of each block of
+            keys.
+        softcap: tanh soft cap of the scores. 0 disables it.
+        q_descale, k_descale, v_descale: [1] float32 dequantization scales of
+            an fp8 q, k and v, or None.
+        q_scales: fp8 block scales of an fp4 q. An fp4 q requires them.
+        alibi_slopes: [num_query_heads] float32 ALiBi slopes, or None.
+        output_scale: [1] float32. The kernels divide the output by it, for
+            example to quantize it to fp8. None disables it.
+        qq_bias: [max_seqlen_q, max_seqlen_q] float32 bias that adds to the
+            scores of a query token and the query tokens of its sequence.
+        sinks: [num_query_heads] float32 attention sink logits, or None.
+        shuffled_kv_cache: k and v use the pre-shuffled layout.
+        skip_reduce: return the unmerged split-KV segments.
+        backend: "triton" or "gluon". None selects Gluon where it is available.
+
+    Returns:
+        out. With skip_reduce and a launch that splits the keys into segments,
+        the float32 tuple (segm_output, segm_max, segm_expsum) of shapes
+        [num_tokens, num_query_heads, num_segments, head_size_v padded to a
+        power of 2] and [num_tokens, num_query_heads, num_segments] (twice).
+
+    Limits:
+        Non-causal attention does not support a sliding window, ALiBi, a
+        query-query bias or an fp4 q or cache. The Gluon kernels are
+        causal-only, so non-causal calls run the Triton kernels.
     """
     # Checked before the decode case below turns causal on, so a decode batch
     # rejects them too; raised rather than asserted, so python -O keeps them.
     if not causal:
-        if window_size[0] >= 0 or window_size[1] >= 0:
+        # The kernels read only the left size; (-1, 0) and (-1, -1) have no window.
+        if window_size[0] >= 0:
             raise ValueError("Non-causal attention does not support a sliding window")
         if alibi_slopes is not None or qq_bias is not None:
             raise ValueError(
@@ -380,6 +422,9 @@ def unified_attention(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+    # The Gluon kernels are causal-only, so non-causal calls run the Triton kernels.
+    if not causal:
+        backend = "triton"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -652,10 +697,8 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-        # The gfx1250 Gluon kernels are not validated for non-causal attention.
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
-            and params.causal
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -678,7 +721,6 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
-            and params.causal
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":

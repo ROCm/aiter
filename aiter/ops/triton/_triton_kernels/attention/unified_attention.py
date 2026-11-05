@@ -148,6 +148,19 @@ def key_prefix_len(
 
 
 @triton.jit
+def key_unmasked_len(
+    context_len, q_block_local_idx, seq_len, BLOCK_Q, CAUSAL: tl.constexpr
+):
+    """Keys every query token of the query block sees: the causal prefix of its
+    first query token, or all keys when not causal."""
+    if CAUSAL:
+        unmasked_len = context_len + q_block_local_idx * BLOCK_Q + 1
+    else:
+        unmasked_len = seq_len
+    return unmasked_len
+
+
+@triton.jit
 def key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL: tl.constexpr):
     """[query, key] mask of the keys each query token sees."""
     if CAUSAL:
@@ -423,10 +436,9 @@ def kernel_unified_attention_2d(
 
     masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
-        if CAUSAL:
-            min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
-        else:
-            min_query_key_limit = seq_len
+        min_query_key_limit = key_unmasked_len(
+            context_len, q_block_local_idx, seq_len, BLOCK_Q, CAUSAL
+        )
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
 

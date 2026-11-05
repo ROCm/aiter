@@ -18,6 +18,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import get_unified_attention_config
@@ -1166,7 +1167,6 @@ def test_triton_unified_attn(
             shuffled_kv_cache=shuffled_kv_cache,
             block_size=block_size,
             k_width=16 // kv_dtype.itemsize,
-            causal=True,
         ),
         backend,
     )
@@ -1632,6 +1632,7 @@ def test_unified_attn_non_causal(
         # prefill and mixed batches
         [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
         # max_seqlen_k <= 512 selects the 2D kernel; the batches above take 3D
+        # on a gfx950 with all its CUs
         [(1, 15), (12, 133), (100, 345), (512, 512)],
     ],
 )
@@ -1653,7 +1654,7 @@ def test_unified_attn_non_causal_features(
     monkeypatch,
 ) -> None:
     """Non-causal attention also takes sinks, a softcap and a shuffled KV cache;
-    those run on the Triton kernels, which the gfx950 Gluon gate keeps causal."""
+    those run on the Triton kernels, as the Gluon kernels are causal-only."""
     block_size = 128
     (
         query,
@@ -1741,7 +1742,11 @@ def test_unified_attn_non_causal_features(
     )
 
     if DEVICE_ARCH == "gfx950":
-        kernel = f"_unified_attention_{3 if max_kv_len > 512 else 2}d_triton"
+        # 2D for short KV, and for more than 4 programs per CU in the 2D grid (4
+        # query tokens of a KV head each); a partitioned gfx950 has fewer CUs
+        num_2d_prgms = (query.shape[0] // 4 + len(seq_lens)) * 2
+        use_3d = max_kv_len > 512 and num_2d_prgms <= 4 * get_num_sms()
+        kernel = f"_unified_attention_{3 if use_3d else 2}d_triton"
         assert [name for name, _ in launches] == [kernel], launches
         # the bf16-Q / fp8-KV head-64 verify batch takes the length-aware split
         if kernel.endswith("3d_triton") and max_query_len <= 8:
@@ -1755,17 +1760,94 @@ def test_unified_attn_non_causal_features(
     _assert_request_rel_l2(output, ref_output, seq_lens)
 
 
+# sglang passes (sliding_window_size - 1, 0), which is (-1, 0) without a window
+@pytest.mark.parametrize("window_size", [(-1, -1), (-1, 0)])
+@pytest.mark.parametrize("query_len", [4, 1], ids=["verify", "decode"])
+@torch.inference_mode()
+def test_unified_attn_non_causal_no_window(
+    window_size: tuple[int, int], query_len: int
+) -> None:
+    """Non-causal attention takes both forms of "no window"."""
+    block_size = 128
+    seq_lens = [(query_len, 8704)] * 3 + [(query_len, 40)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        _,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * triton.cdiv(8704, block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+
 @pytest.mark.parametrize(
     "window_size, unsupported, match",
     [
         ((255, 0), None, "sliding window"),
-        ((-1, 0), None, "sliding window"),
         ((-1, -1), "alibi", "ALiBi"),
         ((-1, -1), "qq_bias", "query-query bias"),
         ((-1, -1), "fp4_q", "fp4 Q"),
         ((-1, -1), "fp4_kv", "fp4 Q or KV"),
     ],
-    ids=["left_window", "right_window", "alibi", "qq_bias", "fp4_q", "fp4_kv"],
+    ids=["left_window", "alibi", "qq_bias", "fp4_q", "fp4_kv"],
 )
 # a decode batch runs on the causal kernels, but it must reject them too
 @pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
