@@ -46,7 +46,7 @@ void
     aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
-{
+{{
     static_assert(std::is_same<D_C, fp32_t>::value,
         "cluster_tdm_splitk_ws uses the fp32 launch-dispatch specialization");
 
@@ -75,7 +75,7 @@ void
     const void* ptr_bias_ = nullptr;
     int stride_bias_batch_ = 0;
     bool bias_is_fp32_ = false;
-    if (bias.has_value()) {
+    if (bias.has_value()) {{
         const auto& bt = bias.value();
         AITER_CHECK(bt.is_contiguous(),
             "bias must be contiguous (got non-contiguous tensor)");
@@ -84,22 +84,22 @@ void
             AiterDtype_to_str(bt.dtype()),
             " Y=", AiterDtype_to_str(Y.dtype()), ")");
         bias_is_fp32_ = (bt.dtype() == AITER_DTYPE_fp32);
-        if (bt.dim() == 1) {
+        if (bt.dim() == 1) {{
             AITER_CHECK(bt.size(0) == N,
                 "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
                 " N=", N, ")");
             stride_bias_batch_ = 0;
-        } else if (bt.dim() == 2) {
+        }} else if (bt.dim() == 2) {{
             AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
                 "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
                 bt.size(1), "] vs batch=", batch, " N=", N, ")");
             stride_bias_batch_ = N;
-        } else {
+        }} else {{
             AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
                 bt.dim());
-        }
+        }}
         ptr_bias_ = bt.data_ptr();
-    }
+    }}
 
     using Traits = [[ name ]]_Traits<D_C>;
 
@@ -107,11 +107,11 @@ void
     int k_steps_tot = (K + [[ k.B_K ]] - 1) / [[ k.B_K ]];
     // Clamp split_k so there is no empty trailing split -> n_active == split_k,
     // so the reduce can sum all split_k slices (no garbage from unwritten ones).
-    while (split_k > 1) {
+    while (split_k > 1) {{
         int steps_per = (k_steps_tot + split_k - 1) / split_k;
         if ((split_k - 1) * steps_per < k_steps_tot) break;
         split_k--;
-    }
+    }}
 
     // The reducer uses one logical row per grid.y block. Reject stale tuned
     // rows and explicit kids before either kernel can launch an invalid grid.
@@ -162,7 +162,7 @@ void
     // launch handles the whole gemm -- no host batch loop, no per-batch
     // pointer / bias offsets. The kernels still take stride_*_batch but with
     // batch==1 every batch term collapses (b==0, split_stride==stride_ws_batch).
-    [[ kargs_name ]] kargs{};
+    [[ kargs_name ]] kargs{{}};
     kargs.ptr_a     = XQ.data_ptr();
     kargs.ptr_b     = WQ.data_ptr();
     kargs.ptr_ws    = workspace_ptr_;
@@ -184,37 +184,37 @@ void
     // Reduce reads the exact kid's typed partials (D_WS=[[ workspace_ptr_type ]]),
     // re-accumulates in fp32, folds bias, casts to Y dtype. split_k is dispatched
     // to a compile-time (unrolled) reduce instance by the launch helper.
-    if (Y.dtype() == AITER_DTYPE_bf16) {
+    if (Y.dtype() == AITER_DTYPE_bf16) {{
         __bf16* y_ptr = reinterpret_cast<__bf16*>(Y.data_ptr());
-        if (ptr_bias_ && bias_is_fp32_) {
+        if (ptr_bias_ && bias_is_fp32_) {{
             // fp32 bias + bf16 output: fold the exact fp32 bias in the
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
                 grid_reduce, block_reduce, stream,
                 workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
-        } else if (ptr_bias_) {
+        }} else if (ptr_bias_) {{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
                 grid_reduce, block_reduce, stream,
                 workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
-        } else {
+        }} else {{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
                 grid_reduce, block_reduce, stream,
                 workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
-        }
-    } else {
+        }}
+    }} else {{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
-        if (ptr_bias_) {
+        if (ptr_bias_) {{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
                 grid_reduce, block_reduce, stream,
                 workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
-        } else {
+        }} else {{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
                 grid_reduce, block_reduce, stream,
                 workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
-        }
-    }
-}
+        }}
+    }}
+}}
 #endif // launcher only on regular host pass
