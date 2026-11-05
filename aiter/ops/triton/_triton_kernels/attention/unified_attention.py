@@ -720,7 +720,7 @@ def kernel_unified_attention_3d(
     IS_KV_FP8: tl.constexpr = False,  # bool
     split_budget=1,  # int, segments per KV head the batch shares (LENGTH_AWARE_SPLIT)
     LENGTH_AWARE_SPLIT: tl.constexpr = False,  # bool, grid axis 0 = work items x heads
-    SEQ_BLOCK: tl.constexpr = 256,  # int, sequences per step over seq_lens
+    SEQ_BLOCK: tl.constexpr = 0,  # int, seq_lens read per step (LENGTH_AWARE_SPLIT)
     ITEM_RUN: tl.constexpr = 1,  # int, work items per KV head in a row (LENGTH_AWARE_SPLIT)
     num_tokens=1,  # int, query tokens: the partials' slot stride (LENGTH_AWARE_SPLIT)
 ):
@@ -1153,8 +1153,8 @@ def reduce_segments(
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
     split_budget=1,  # int, as passed to kernel_unified_attention_3d
     LENGTH_AWARE_SPLIT: tl.constexpr = False,  # bool, see seq_num_segments
-    SEQ_BLOCK: tl.constexpr = 256,  # int, sequences per step over seq_lens
-    LENGTH_AWARE_SEGMENT_BLOCK: tl.constexpr = 16,  # int, used slots merged per step
+    SEQ_BLOCK: tl.constexpr = 0,  # int, seq_lens read per step (LENGTH_AWARE_SPLIT)
+    LENGTH_AWARE_SEGMENT_BLOCK: tl.constexpr = 0,  # int, used slots merged per step
     num_tokens=1,  # int, as passed to kernel_unified_attention_3d
     SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
 ):

@@ -747,7 +747,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     launch_3d = module._unified_attention_3d_triton
 
     def spy(params, *args):
-        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, split_budget, seq_block
+        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, length-aware split
         return launch_3d(params, *args)
 
     monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
@@ -776,8 +776,9 @@ def test_triton_unified_attn_3d_length_aware_split(
     # the split is length-aware, and the per-sequence counts (the kernels'
     # seq_num_segments) differ from the cap the grid was sized for
     assert len(launches) == 1, "expected the 3D split-KV path"
-    num_segments, _, split_budget, _ = launches[0]
-    assert num_segments > 1 and split_budget is not None
+    num_segments, _, split = launches[0]
+    assert num_segments > 1 and split is not None
+    split_budget = split.split_budget
     kv = [k for _, k in seq_lens]
     segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
     used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
@@ -934,10 +935,15 @@ def _gfx950_split(**overrides):
 
 def test_length_aware_split_scope(monkeypatch) -> None:
     """The length-aware entry leaves every call it does not split as before."""
+    # _length_aware_split reads the attn_3d and reduce tables; pin them to gfx950
+    # like the rest
+    module = sys.modules[unified_attention.__module__]
+    gfx950_config = functools.partial(get_unified_attention_config, arch="gfx950")
+    monkeypatch.setattr(module, "get_unified_attention_config", gfx950_config)
     config, params = _gfx950_split()
-    _, num_segments, seq_block = _length_aware_split(config, params)
-    assert seq_block == triton.next_power_of_2(params.num_seqs)
-    assert num_segments == config["SPLIT_NUM_SEGMENTS"] > config["NUM_SEGMENTS"]
+    split = _length_aware_split(config, params)
+    assert split.seq_block == triton.next_power_of_2(params.num_seqs)
+    assert split.num_segments == config["SPLIT_NUM_SEGMENTS"] > config["NUM_SEGMENTS"]
     # calls left out keep the uniform split of the head <= 128 entry
     head_128, _ = _gfx950_split(head_size=128, head_size_v=128)
     assert config["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
@@ -990,13 +996,25 @@ def test_length_aware_split_scope(monkeypatch) -> None:
         budget = rng.randint(1, 1024)
         assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
     assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
-    # the query-block guard reads the attn_3d table; pin it to gfx950 like the rest
-    module = sys.modules[unified_attention.__module__]
-    monkeypatch.setattr(
-        module,
-        "get_unified_attention_config",
-        functools.partial(get_unified_attention_config, arch="gfx950"),
-    )
+
+    # an entry without one of the split's keys keeps the uniform split
+    for key in module._LENGTH_AWARE_KV_SPLIT_KEYS:
+        partial = {k: v for k, v in config.items() if k != key}
+        assert _length_aware_split(partial, params) is None, key
+    for section, key in (
+        ("attn_3d", "SPLIT_RUNS_PER_XCD"),
+        ("reduce", "SPLIT_SEGMENT_BLOCK_MIN"),
+    ):
+
+        def without_key(op, *args, section=section, key=key, **kwargs):
+            entry = gfx950_config(op, *args, **kwargs)
+            if op == section:
+                entry.pop(key)
+            return entry
+
+        with monkeypatch.context() as m:
+            m.setattr(module, "get_unified_attention_config", without_key)
+            assert _length_aware_split(config, params) is None, key
 
     def verify(q):
         return SimpleNamespace(
