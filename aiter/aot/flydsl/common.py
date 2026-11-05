@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -511,32 +512,46 @@ def fail_build_on_missing_target_feature():
         )
 
 
-_STRICT_ERRATA_KERNEL_GLOBS = ("*gemm_a4w4*", "*gemm_a8w8_ptpc*", "*mxfp4_tdm_fp4*")
+_STRICT_ERRATA_KERNEL_RE = re.compile(
+    r"@((?:gemm_a4w4|gemm_a8w8_ptpc|mxfp4_tdm_fp4)\w*)"
+)
+_ROCDL_CHIP_RE = re.compile(r'#rocdl\.target<[^>]*chip\s*=\s*"([^"]+)"')
 
 
 def assert_no_strict_errata_products(cache_dir: str) -> None:
     """For a strict build, fail if the cache still holds an errata-family kernel.
 
-    The errata ops (F4 / fp8-16x16x128 WMMA) are gated off a gfx1250-strict build,
-    so its cache must contain none. A stale hollow object left by an earlier build
-    survives in the persisted FlyDSL cache, and the compile-time guard cannot see
-    it (a cache hit recompiles nothing and prints no diagnostic). Audit the cache
-    by kernel name instead -- cheap and immune to cache hits."""
+    A stale hollow object left by an earlier build survives in the persisted
+    FlyDSL cache, and the compile-time guard cannot see it (a cache hit recompiles
+    nothing and prints no diagnostic). Cache paths carry the launcher name and a
+    hash, not the kernel (ptpc shares launch_gemm_a8w8 with mx128, fp4 MoE shares
+    launch_gemm_a8w4_tdm with fp8), so read the kernels inside each object; and
+    judge only objects built for a strict target, so a mixed gfx1250 + strict
+    build keeps its legitimate gfx1250 ones."""
     import glob
+    import pickle
 
     targets = aot_target_archs()
     if not targets or not any(is_strict_identity(t) for t in targets):
         return
     found: list[str] = []
-    for pattern in _STRICT_ERRATA_KERNEL_GLOBS:
-        found += glob.glob(os.path.join(cache_dir, "**", pattern), recursive=True)
+    for path in glob.glob(os.path.join(cache_dir, "*", "*.pkl")):
+        try:
+            with open(path, "rb") as fh:
+                ir = getattr(pickle.load(fh), "_ir_text", "") or ""
+        except Exception:  # noqa: BLE001, S112  not a readable FlyDSL object
+            continue
+        if not any(is_strict_identity(chip) for chip in _ROCDL_CHIP_RE.findall(ir)):
+            continue
+        match = _STRICT_ERRATA_KERNEL_RE.search(ir)
+        if match:
+            found.append(f"{os.path.basename(os.path.dirname(path))}:{match.group(1)}")
     if found:
-        names = sorted({os.path.basename(f) for f in found})
         raise AssertionError(
             f"[aiter] gfx1250-strict AOT cache holds {len(found)} errata-family "
             "kernel object(s) that strict gates off -- likely stale hollow kernels "
             "a cache hit left from an earlier build. Clear the FlyDSL cache before a "
-            f"strict wheel build. Offenders (first 3): {names[:3]}"
+            f"strict wheel build. Offenders (first 3): {sorted(found)[:3]}"
         )
 
 
