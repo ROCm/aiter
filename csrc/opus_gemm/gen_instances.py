@@ -854,99 +854,32 @@ class opus_gemm_codegen:
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
-        MANIFEST_HEAD = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_tensor.h"
-#include <cstdlib>
-#include <optional>
-"""
-        MANIFEST_BLOCKSCALE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale);
-"""
-        MANIFEST_BLOCKSCALE_BPRESHUFFLE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y);
-"""
-        # a8w8 noscale (3 args, no splitK) has its own exact-kid table.
-        MANIFEST_NOSCALE_3ARG = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y);
-"""
-        # Non-workspace a16w16 launchers keep the existing five-argument ABI.
-        MANIFEST_A16W16 = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-"""
-        # External-workspace launchers receive a caller-owned typed tensor.
-        # This covers both two-stage reducers and gfx1250 fused in-cluster
-        # reduction.
-        MANIFEST_A16W16_WORKSPACE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &workspace,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-"""
-        MANIFEST_BMM_MXSCALE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int splitK);
-"""
-        parts = [MANIFEST_HEAD]
-        for k in kernels_dict.values():
-            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
-                parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
-            elif k.kernel_tag in SPLITK_TAGS:
-                parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
-            elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
-                parts.append(MANIFEST_A16W16.format(kernel_name=k.name))
-            elif k.kernel_tag == "a8w8":
-                parts.append(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
-            elif k.kernel_tag == "a8w8_scale":
-                parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
-            elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
-            else:
-                raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        # The ABI arg-lists live in templates/opus_gemm_manifest.h.j2; this selects
+        # one per kernel tag.
+        def _abi_key(tag):
+            if tag.startswith("a8w8_mxscale_bmm_"):
+                return "bmm_mxscale"
+            if tag in SPLITK_TAGS:
+                return "a16w16_workspace"
+            if tag in A16W16_KID_DISPATCH_TAGS:
+                return "a16w16"
+            if tag == "a8w8":
+                return "noscale_3arg"
+            if tag == "a8w8_scale":
+                return "blockscale"
+            if tag in A8W8_BPRESHUFFLE_TAGS:
+                return "blockscale_bpreshuffle"
+            raise ValueError(f"no manifest ABI for kernel tag {tag!r}")
+
+        entries = [
+            {"abi": _abi_key(k.kernel_tag), "name": k.name}
+            for k in kernels_dict.values()
+        ]
         # Every TU includes this header, so rewriting it unconditionally would
         # invalidate the whole build even when the manifest is identical.
         write_if_changed(
-            os.path.join(self.working_path, "opus_gemm_manifest.h"), "".join(parts)
+            os.path.join(self.working_path, "opus_gemm_manifest.h"),
+            render_template("opus_gemm_manifest.h.j2", entries=entries),
         )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
