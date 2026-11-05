@@ -5,7 +5,8 @@
 The LDS, QK/PV MFMA and staggered pipeline come from a dense BM128/BN64 D256
 attention kernel (see sparse_prefill_common). Q/O rows and sparse masks differ.
 On gfx950 the same pipeline runs K32 MFMAs, transposed V reads, native BF16
-conversion and 64-bank K/V swizzles (sparse_prefill_common's gfx950 part).
+conversion and 64-bank K/V swizzles (sparse_prefill_common's gfx950 part), and
+double-buffers K and V in LDS (STAGES950).
 """
 
 import math
@@ -72,6 +73,18 @@ from .sparse_prefill_common import (
 __all__ = ["run"]
 
 BM, BN, D, THREADS, LDS_BYTES = 128, 64, 256, 512, 65536
+# gfx950: k_lds and v_lds hold STAGES950 tiles each, stage t & 1 holding tile t (LDS_BYTES per
+# store, 128 KiB in all). A DMA then never overwrites the tile the previous reads use, so these
+# rendezvous (_body's numbering) keep only their compiler fences there:
+#   prologue 4  K(1) DMA after the K(0) reads of the other group
+#   phase 0     V(t - 1) DMA of waves 4-7 after their V(t - 2) reads
+#   phase 3     K(t + 1) DMA of waves 0-3 after the K(t) keys 32-63 reads of waves 4-7
+#   phase 4     K(t + 1) DMA of waves 4-7 after their K(t) reads
+#   prologue 7, epilogue 0  phase 0 of the phase that follows (or of none)
+STAGES950 = 2
+DROPPED_PROLOGUE950 = (4, 7)
+DROPPED_PHASE950 = (0, 3, 4)
+DROPPED_EPILOGUE950 = (0,)
 
 
 def _read_ids_g2r(blocks, tile, count, offset):
@@ -92,6 +105,21 @@ def _kv_rows(ids, wave, hk, slotted):
             block = block * (4 * hk * D * 2) + (wave >> 2) * 256
         rows.append(fx.Int32(block))
     return fx.Vector.from_elements(rows, fx.Int32)
+
+
+def _plus(immediate, offset):
+    """immediate (a Python int) + offset, a Python int or a runtime Int32."""
+    return immediate + offset if isinstance(offset, int) else offset + immediate
+
+
+def _shift(reads, offset):
+    """A read plan [(slot, address, immediate)] moved by offset bytes: a static offset goes into the immediates, a
+    runtime one into the addresses."""
+    if isinstance(offset, int):
+        return [
+            (slot, address, immediate + offset) for slot, address, immediate in reads
+        ]
+    return [(slot, address + offset, immediate) for slot, address, immediate in reads]
 
 
 def _dma_word(lane, token, is_v, gfx950):
@@ -119,8 +147,10 @@ def _read_packet_g2s(
     reads=(),
     load=_load_lds,
     gfx950=False,
+    lds_offset=0,
 ):
-    """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127.
+    """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127, into storage at lds_offset (the
+    tile's stage).
 
     The LDS reads (storage, address, immediate), issued with load, go just before it.
     """
@@ -162,7 +192,9 @@ def _read_packet_g2s(
     # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
     rocdl.raw_ptr_buffer_load_lds(
         resource,
-        fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
+        fx.to_llvm_ptr(
+            fx.get_iter(storage) + (base_destination + _plus(immediate, lds_offset))
+        ),
         4,
         fx.Int32(voffset),
         soffset,
@@ -292,6 +324,13 @@ def _body(
     GFX950 swaps the per-arch pieces (sparse_prefill_common's gfx950 part): half the MFMAs
     (K32), 32 transposed V reads per half (two before each DMA packet), native BF16 and
     the K/V swizzles of its LDS DMA and reads. Stages, waits and data flow are unchanged.
+
+    GFX950 also double-buffers K and V: tile t sits in stage t & 1 of k_lds / v_lds. Each
+    stage end is a rendezvous of all eight waves; waves 4-7 reach rendezvous r one stage
+    later than waves 0-3 (prologue: stage k ends at r = k, plus one past the staggered
+    rendezvous 1 for waves 4-7; phase: stage s ends at r = (s + lag) % 8; epilogue: stage k
+    at r = k + lag). With two stages the rendezvous in DROPPED_*950 order no LDS producer and
+    consumer (module comment), and keep only their compiler fences.
     """
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -395,6 +434,22 @@ def _body(
             2,
         )
     cross_addresses = tuple((lane ^ offset) * 4 for offset in (16, 32, 48))
+    # gfx950 double buffer: byte offset of stage 1 in k_lds / v_lds, and the rendezvous it
+    # makes redundant (gfx942: one stage, every rendezvous kept). lag: waves 4-7 run one behind.
+    stage = (LDS_BYTES // 2) * int(GFX950)
+    dropped_prologue, dropped_phase, dropped_epilogue = (
+        ((), (), ()),
+        (DROPPED_PROLOGUE950, DROPPED_PHASE950, DROPPED_EPILOGUE950),
+    )[int(GFX950)]
+    lag = int(STAGGER)
+
+    def stage_end(rendezvous, dropped):
+        """_stage_end at rendezvous; one the double buffer made redundant keeps only its fences."""
+        if fx.const_expr(rendezvous in dropped):
+            rocdl.sched_barrier(0)
+            rocdl.sched_barrier(0)
+        else:
+            _stage_end()
 
     # g = global, s = LDS, r = registers; reads only issue, the stages place the waits.
     def read_ids_g2r(tile):
@@ -406,15 +461,15 @@ def _body(
     def kv_rows(ids):
         return _kv_rows(ids, wave, HK, SLOTTED)
 
-    def k_s2r(half, lower_first=False):
-        """Read plan of K keys 32 * half .. 32 * half + 31."""
-        return k_lds, k_reads(k_s2r_base, half, lower_first), _load_lds
+    def k_s2r(half, lower_first=False, offset=0):
+        """Read plan of K keys 32 * half .. 32 * half + 31 of the K stage at byte offset."""
+        return k_lds, _shift(k_reads(k_s2r_base, half, lower_first), offset), _load_lds
 
-    def v_s2r(half):
-        """Read plan of V dims 128 * half .. 128 * half + 127."""
-        return v_lds, v_reads(v_s2r_base, half), v_load
+    def v_s2r(half, offset=0):
+        """Read plan of V dims 128 * half .. 128 * half + 127 of the V stage at byte offset."""
+        return v_lds, _shift(v_reads(v_s2r_base, half), offset), v_load
 
-    def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile):
+    def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile, offset):
         # 16 LDS-DMA packets; the s2r plan's reads go in plan order, an equal share (one, or
         # two on gfx950) just before each packet.
         reads, load = (), _load_lds
@@ -440,6 +495,7 @@ def _body(
                 [(s2r[0], address, immediate) for _, address, immediate in batch],
                 load,
                 GFX950,
+                offset,
             )
             for i in fx.range_constexpr(share):
                 parts[batch[i][0]] = data[i]
@@ -447,11 +503,11 @@ def _body(
             return None
         return _lds_words(parts), lgkm.issue(len(reads))
 
-    def read_k_g2s(rows, s2r=None, lgkm=None):
-        return read_tile_g2s(gk, k_lds, rows, False, s2r, lgkm, None)
+    def read_k_g2s(rows, s2r=None, lgkm=None, offset=0):
+        return read_tile_g2s(gk, k_lds, rows, False, s2r, lgkm, None, offset)
 
-    def read_v_g2s(rows, s2r=None, lgkm=None, tail_tile=None):
-        return read_tile_g2s(gv, v_lds, rows, True, s2r, lgkm, tail_tile)
+    def read_v_g2s(rows, s2r=None, lgkm=None, tail_tile=None, offset=0):
+        return read_tile_g2s(gv, v_lds, rows, True, s2r, lgkm, tail_tile, offset)
 
     def qk(k):
         return qk_mfma(q, k_operands(k))
@@ -464,27 +520,27 @@ def _body(
         ids_2 = read_ids_g2r(_min(fx.Int32(2), last_tile))
         mask_0 = read_mask_g2r(fx.Int32(0))
         rows_0 = kv_rows(ids_0)
-        # Memory: K(0) g2s.
+        # Memory: K(0) g2s (stage 0).
         read_k_g2s(rows_0)
         lgkm.wait(vmcnt=0)
-        _stage_end()
+        stage_end(0, dropped_prologue)
         if fx.const_expr(STAGGER):
             # Waves 4-7 fall one stage behind.
-            _stage_end()
+            stage_end(1, dropped_prologue)
         # Memory: K(0) keys 0-31 s2r.
         k_lo, _ = _read_s2r(k_s2r(0), lgkm)
         lgkm.wait()
-        _stage_end()
+        stage_end(1 + lag, dropped_prologue)
         # Compute: QK S(0) keys 0-31; O = 0.
         s_lo = qk(k_lo)
         o_lo = _pin(fx.Vector.filled(32, 0.0, fx.Float32))
         o_hi = _pin(fx.Vector.filled(32, 0.0, fx.Float32))
         _schedule(*qk_schedule, 5)
-        _stage_end()
+        stage_end(2 + lag, dropped_prologue)
         # Memory: K(0) keys 32-63 s2r.
         k_hi, _ = _read_s2r(k_s2r(1), lgkm)
         lgkm.wait()
-        _stage_end()
+        stage_end(3 + lag, dropped_prologue)
         # Compute: QK S(0) keys 32-63 and mask(0); softmax m and S'(0).
         s_hi = qk(k_hi)
         s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * scale
@@ -493,21 +549,25 @@ def _body(
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
         row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
-        _stage_end()
-        # Memory: K(1) g2s; no compute.
+        stage_end(4 + lag, dropped_prologue)
+        # Memory: K(1) g2s (stage 1 on gfx950); no compute.
         rows_1, rows_2 = kv_rows(ids_1), kv_rows(ids_2)
-        read_k_g2s(rows_1)
+        read_k_g2s(rows_1, offset=stage)
         lgkm.wait(vmcnt=0)
-        _stage_end()
-        _stage_end()
+        stage_end(5 + lag, dropped_prologue)
+        stage_end(6 + lag, dropped_prologue)
         return s_0, row_max, row_sum, o_lo, o_hi, rows_0, rows_1, rows_2
 
     @flyc.jit
-    def phase(s_prev, row_max, row_sum, o_lo, o_hi, rows_prev, rows_cur, rows_next, t):
+    def phase(
+        s_prev, row_max, row_sum, o_lo, o_hi, rows_prev, rows_cur, rows_next, t, odd
+    ):
         """Phase t: QK and row max of key tile t; exp, row sum and PV of tile t - 1.
 
-        rows_prev, rows_cur and rows_next are the DMA rows of tiles t - 1, t and t + 1.
-        k_lds holds K(t) up to step 1 and K(t + 1) from step 2; v_lds holds V(t - 1).
+        rows_prev, rows_cur and rows_next are the DMA rows of tiles t - 1, t and t + 1; odd is
+        t & 1, a Python int (the loop runs odd and even phases in pairs).
+        k_lds holds K(t) up to step 1 and K(t + 1) from step 2; v_lds holds V(t - 1). On gfx950
+        K(t) sits in stage odd, K(t + 1) and V(t - 1) in stage 1 - odd.
         S' = S * scale; m tracks the row max of S' lazily (S' - m <= 7).
 
         step  memory stage                              compute stage
@@ -530,25 +590,28 @@ def _body(
         rows_cur, rows_next = fx.Vector(rows_cur), fx.Vector(rows_next)
         # Each phase ends with every LDS op retired, so the ledger starts empty.
         lgkm = _LdsQueue()
+        cur, other = stage * odd, stage * (1 - odd)
 
         # Step 0 memory.
         mask_t = read_mask_g2r(t)
         ids_next2 = read_ids_g2r(_min(t + 2, last_tile))
-        k_lo, _ = read_v_g2s(rows_prev, s2r=k_s2r(0), lgkm=lgkm)
-        _stage_end()
+        k_lo, _ = read_v_g2s(
+            rows_prev, s2r=k_s2r(0, offset=cur), lgkm=lgkm, offset=other
+        )
+        stage_end(lag, dropped_phase)
         # Step 0 compute.
         lgkm.wait()
         s_lo = qk(k_lo)
         p_prev = _exps(s_prev, row_max)
         _schedule_exps(16, 1, exp_mfmas)
-        _stage_end()
+        stage_end(1 + lag, dropped_phase)
 
         # Step 1 memory.
-        k_hi, ready = _read_s2r(k_s2r(1, lower_first=STAGGER), lgkm)
+        k_hi, ready = _read_s2r(k_s2r(1, lower_first=STAGGER, offset=cur), lgkm)
         rocdl.s_waitcnt(vmcnt=0)
         if fx.const_expr(STAGGER):
             ready(8)
-        _stage_end()
+        stage_end(2 + lag, dropped_phase)
         # Step 1 compute.
         lgkm.wait()
         s_hi = qk(k_hi)
@@ -557,13 +620,15 @@ def _body(
         # ids(t+2) landed at the vmcnt(0) above; only the SGPR rows cross iterations.
         rows_next2 = kv_rows(ids_next2)
         _schedule(*mask_schedule, 2)
-        _stage_end()
+        stage_end(3 + lag, dropped_phase)
 
         # Step 2 memory.
         sum_others = _cross(sum_prev, cross_addresses, lgkm)
-        v_lo, ready = read_k_g2s(rows_next, s2r=v_s2r(0), lgkm=lgkm)
+        v_lo, ready = read_k_g2s(
+            rows_next, s2r=v_s2r(0, other), lgkm=lgkm, offset=other
+        )
         v_ops = v_operands(v_lo, 0, ready)
-        _stage_end()
+        stage_end(4 + lag, dropped_phase)
         # Step 2 compute.
         o_lo, row_sum, max_cur = pv(
             p_bf16,
@@ -574,14 +639,14 @@ def _body(
             sum_max=(s_cur, sum_prev, sum_others, row_sum),
         )
         _schedule(*pv_schedule, 3)
-        _stage_end()
+        stage_end(5 + lag, dropped_phase)
 
         # Step 3 memory.
         max_others = _cross(max_cur, cross_addresses, lgkm)
         rocdl.s_waitcnt(vmcnt=0)
-        v_hi, ready = _read_s2r(v_s2r(1), lgkm)
+        v_hi, ready = _read_s2r(v_s2r(1, other), lgkm)
         v_ops = v_operands(v_hi, 0, ready)
-        _stage_end()
+        stage_end(6 + lag, dropped_phase)
         # Step 3 compute.
         o_hi, s_cur, new_max, ballot = pv(
             p_bf16,
@@ -593,15 +658,20 @@ def _body(
         )
         _schedule(*pv_schedule, 4)
         o_lo, o_hi, row_sum = _rescale(o_lo, o_hi, row_sum, row_max, new_max, ballot)
-        _stage_end()
+        stage_end((7 + lag) % 8, dropped_phase)
         return s_cur, new_max, row_sum, o_lo, o_hi, rows_cur, rows_next, rows_next2
 
     def epilogue(state):
         """V(last) g2s, keys past the list read 0; exp, row sum and PV of the last tile."""
         s_last, row_max, row_sum, o_lo, o_hi, rows_last, _, _ = state
         lgkm = _LdsQueue()
+        # V(last) goes to stage last & 1 (gfx950), not the stage V(last - 1) was read from.
+        if fx.const_expr(GFX950):
+            v_stage = (last_tile & 1) * stage
+        else:
+            v_stage = 0
         # Memory: V(last) g2s, with P(last) and l computed while it lands.
-        read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile)
+        read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile, offset=v_stage)
         p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         sum_last = _sum(p_last)
         sum_last = sum_last + sum_last.shuffle_xor(16, 64)
@@ -609,33 +679,33 @@ def _body(
         row_sum = fx.Float32(row_sum) + sum_last
         p_bf16 = pack_bf16(p_last).bitcast(fx.BFloat16)
         lgkm.wait(vmcnt=0)
-        _stage_end()
-        _stage_end()
+        stage_end(lag, dropped_epilogue)
+        stage_end(1 + lag, dropped_epilogue)
         # Memory: V(last) dims 0-127 s2r.  Compute: PV O dims 0-127.
-        v_lo, _ = _read_s2r(v_s2r(0), lgkm)
+        v_lo, _ = _read_s2r(v_s2r(0, v_stage), lgkm)
         lgkm.wait()
-        _stage_end()
+        stage_end(2 + lag, dropped_epilogue)
         o_lo = pv(p_bf16, v_lo, o_lo)
-        _stage_end()
+        stage_end(3 + lag, dropped_epilogue)
         # Memory: V(last) dims 128-255 s2r.  Compute: PV O dims 128-255.
-        v_hi, _ = _read_s2r(v_s2r(1), lgkm)
+        v_hi, _ = _read_s2r(v_s2r(1, v_stage), lgkm)
         lgkm.wait()
-        _stage_end()
+        stage_end(4 + lag, dropped_epilogue)
         o_hi = pv(p_bf16, v_hi, o_hi)
-        _stage_end()
+        stage_end(5 + lag, dropped_epilogue)
         if fx.const_expr(not STAGGER):
             # Waves 0-3 wait one stage for waves 4-7.
-            _stage_end()
+            stage_end(6, dropped_epilogue)
         return o_lo, o_hi, row_sum
 
     # Block ids run two tiles ahead of QK and K one tile ahead; PV runs one tile behind.
     state = prologue()
     # Two phases per trip swap the max registers; one phase copies it after its barrier.
     for t in range(fx.Int32(1), key_tiles - 1, fx.Int32(2)):
-        state = phase(*state, t)
-        state = phase(*state, fx.Int32(t) + 1)
+        state = phase(*state, t, 1)
+        state = phase(*state, fx.Int32(t) + 1, 0)
     if (key_tiles > 1) & ((key_tiles & 1) == 0):
-        state = phase(*state, key_tiles - 1)
+        state = phase(*state, key_tiles - 1, 1)
     o_lo, o_hi, row_sum = epilogue(state)
     inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0))
     out = rocdl.make_buffer_tensor(
@@ -682,10 +752,12 @@ def _kernel(
 ):
     body = _body
     allocator = fx.SharedAllocator()
+    # gfx950: two stages of each (K/V double buffer); gfx942: one.
+    store = (LDS_BYTES // 2) * (STAGES950 if GFX950 else 1)
     k_lds, v_lds = (
-        allocator.allocate(fx.Array[fx.Int8, LDS_BYTES // 2, 16])
+        allocator.allocate(fx.Array[fx.Int8, store, 16])
         .peek()
-        .view(fx.make_layout(LDS_BYTES // 2, 1))
+        .view(fx.make_layout(store, 1))
         for _ in range(2)
     )
     work = fx.block_idx.x
