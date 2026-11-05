@@ -10,7 +10,12 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
+from aiter.ops.flydsl.kernels.act import (
+    clamp_gate_up,
+    gate_up_act,
+    silu_mul_batch,
+    situ_params,
+)
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
@@ -151,7 +156,7 @@ def _gemm1_body_a16w4(
         # (~116k tokens at K=9216). Pre-existing on gfx950; newly reachable on gfx942
         # (#5519).
         fused = fx.Int32(_global_i32_at(arg_mind, bx_m + row_local))
-        return (fused & fx.Int32(0x00FFFFFF)) * fx.Int32(c_k_div4)
+        return (fused & 0x00FFFFFF) * fx.Int32(c_k_div4)
 
     # Per-k-group base byte offset into the A-LDS region (zero at k_wave=1).
     if const_expr(k_wave > 1):
@@ -170,7 +175,7 @@ def _gemm1_body_a16w4(
         lane_mod_16=lane_mod_16,
         swizzle=False,
         a_ptr=arg_x,
-        a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
+        a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * 4,
         a_load_threads=a_load_threads,
         row_base_dwords=_a_row_base_dwords,
         dma_cache_mod=2,
@@ -225,7 +230,7 @@ def _gemm1_body_a16w4(
         [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(num_acc_n)]
         for _ in range(m_repeat)
     ]
-    zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
+    zero4 = fx.full(4, 0.0, fx.Float32)
     for mi in range_constexpr(m_repeat):
         for ni in range_constexpr(num_acc_n):
             acc_gate[mi][ni].store(zero4)
@@ -347,7 +352,7 @@ def _gemm1_body_a16w4(
         _reduce_round(acc_gate)
         _reduce_round(acc_up)
 
-    # ---- epilogue: SiLU(gate)*up -> bf16 intermediate [sorted_size, inter] -----
+    # ---- epilogue: act(gate)*up -> bf16 intermediate [sorted_size, inter] -----
     # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
     # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
     if const_expr(k_wave > 1):
@@ -357,7 +362,7 @@ def _gemm1_body_a16w4(
             row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
             sorted_row = bx_m + row_in_tile
             fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-            token = fused & fx.Int32(0x00FFFFFF)
+            token = fused & 0x00FFFFFF
             valid = token < i32_ntok
             if const_expr(k_wave > 1):
                 valid = valid & _is_primary
@@ -367,7 +372,13 @@ def _gemm1_body_a16w4(
                 if const_expr(activation_bf16):
                     g = g.to(fx.BFloat16).to(fx.Float32)
                     u = u.to(fx.BFloat16).to(fx.Float32)
-                y = gate_up_act(act, [g], [u], situ)[0]
+                # mixed_moe clamps SiLU before the shared unclamped helper.
+                # Do not clamp inside silu_mul_batch (that helper is shared).
+                if const_expr(act == "silu"):
+                    g, u = clamp_gate_up(g, u, situ.neg_clamp_limit)
+                    y = silu_mul_batch([g], [u])[0]
+                else:
+                    y = gate_up_act(act, [g], [u], situ)[0]
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
                 buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
@@ -520,8 +531,8 @@ def compile_gemm1_a16w4_port(
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
-        lane = tx_i32 % fx.Int32(64)
-        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
@@ -552,17 +563,15 @@ def compile_gemm1_a16w4_port(
                 _tile = _xcd(bx_i32)
             else:
                 _tile = bx_i32
-            # Runtime activation scalars; plain silu ignores them.
-            if const_expr(act in ("swiglu", "situv2", "silu_clamped")):
-                _situ = situ_params(
-                    fx.Float32(f32_situ_beta),
-                    fx.Float32(f32_situ_beta_rcp),
-                    fx.Float32(f32_situ_linbeta),
-                    fx.Float32(f32_situ_linbeta_rcp),
-                    fx.Float32(f32_swiglu_limit),
-                )
-            else:
-                _situ = None
+            # Runtime activation scalars. SiLU uses only neg_clamp_limit
+            # (+inf is a no-op, matching runtime_swiglu_limit).
+            _situ = situ_params(
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
+            )
             _gemm1_body_a16w4(
                 lds_raw_ptr,
                 arg_x,

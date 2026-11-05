@@ -55,7 +55,7 @@ def bq_view(
         T.i32, address_space=fx.AddressSpace.Global, alignment=16
     )
     off_i64 = fx.Int64(col_base)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * fx.Int64(4))
+    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * 4)
     # i32 strides: klane[0,4)->64, nlane[0,16)->4,
     # K_tile->K_HALVES*256, half->256, kpack4->1.
     shape = (4, 16, K_TILES_TOTAL, K_HALVES, 4)
@@ -97,7 +97,7 @@ def scale_view(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
     off_i64 = fx.Int64(base_dw)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * fx.Int64(4))
+    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * 4)
     shape = (4, 16, K_TILES_TOTAL, 1)
     stride = (16, 1, k0_stride_dw, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, stride)))
@@ -286,7 +286,7 @@ def gemm2_body_v2(
     # Contraction K = inter_dim (i32_inter); the K-loop is unrolled over INTER_MAX // BK tiles, so i32_inter must equal INTER_MAX.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = _udiv(K_rt, fx.Int32(a_pack))
-    kc_rt = _udiv(K_rt + fx.Int32(255), fx.Int32(256))
+    kc_rt = _udiv(K_rt + 255, fx.Int32(256))
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
@@ -399,7 +399,7 @@ def gemm2_body_v2(
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
-        nrec = asc_num - fx.Int64(base_dw) * fx.Int64(4)
+        nrec = asc_num - fx.Int64(base_dw) * 4
         return scale_view(
             arg_ascale,
             base_dw,
@@ -491,8 +491,8 @@ def gemm2_body_v2(
                 bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
                 hi,
             )
-            lo_v = Vec(fx.memref_load_vec(lo))
-            hi_v = Vec(fx.memref_load_vec(hi))
+            lo_v = fx.memref_load_vec(lo)
+            hi_v = fx.memref_load_vec(hi)
             dst.store(lo_v.shuffle(hi_v, list(range(B_NDW))))
         else:
             fx.copy(
@@ -582,7 +582,7 @@ def gemm2_body_v2(
             interleave[numAccN - 1]()
 
     # C accumulator: register fragments, zeroed then accumulated in place.
-    zero4 = Vec.filled(4, 0.0, Float32)
+    zero4 = fx.full(4, 0.0, Float32)
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
         for _ in range_constexpr(kMChunks)
@@ -639,7 +639,7 @@ def gemm2_body_v2(
             sorted_pos = m_row + mr * EPI_ROWS + m_lane
             frag = fx.make_rmem_tensor(1, Int32)
             fx.copy(load_i32, stids[None, sorted_pos], frag)
-            packed.append(Vec(frag.load())[0])
+            packed.append(frag.load()[0])
         return packed
 
     g2_interleave = const_expr(g2_bf16_lds and not nonatomic and output_width is None)
@@ -965,7 +965,7 @@ def atomic_bf16_epilog(
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
         fx.copy(atom, src[None, index], frag)
-        return Vec(frag.load())[0]
+        return frag.load()[0]
 
     def load_bias(col):
         return load_scalar(
@@ -1104,7 +1104,7 @@ def atomic_bf16_epilog(
                                 val = val + load_bias(global_col + q)
                             vals.append(val * weight[mr])
                     if const_expr(bf16_src):
-                        msk = Vec.filled([2], 0x7FFF, Int16)
+                        msk = fx.full([2], 0x7FFF, Int16)
                         acc = None
                         for h in range_constexpr(route_vec // 2):
                             p = (
@@ -1139,7 +1139,7 @@ def atomic_bf16_epilog(
                     pk_ty = T.vec(2, T.i16)
 
                     def pk_seed():
-                        return _raw(Vec.filled([2], 0, fx.Int16))
+                        return _raw(fx.full([2], 0, fx.Int16))
 
                     words = []
                     for d in range_constexpr(route_vec // 4):
@@ -1435,7 +1435,7 @@ def nonatomic_mxfp4_epilog(
             + fx.Int64(global_col // 8)
         )
         q_frag = fx.make_rmem_tensor(1, Int32)
-        q_frag.store(Vec.from_elements([fx.Int32(packed)], Int32))
+        q_frag.store(Vec.from_elements([packed], Int32))
         fx.copy(store_q_nt, q_frag, out_q[None, q_idx])
         s_off = (
             s_row0

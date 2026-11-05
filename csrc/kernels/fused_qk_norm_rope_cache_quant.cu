@@ -32,6 +32,7 @@
 #include "opus/opus.hpp"
 #include "aiter_opus_plus.h"
 #include "quant_utils.cuh"
+#include "quant_amax_floor.h"
 #include "mx_quant_utils.h"  // fp_f32_to_e8m0_scale (MX RoundUp E8M0 block scale)
 #include "rope/rope_common.h"
 
@@ -95,10 +96,6 @@ activation_strides_logical_3d(const aiter_tensor_t& t, int64_t num_heads, int64_
 
 namespace {
 using mrope_utils::vec_t;
-
-// Minimum absmax used when computing FP8 KV scales to avoid division by zero when
-// activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
-static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
 // Per-wave LDS scratch the coarse Q path uses to gather a head's e8m0 scale run
 // into the one lane that carries it, so the inline scale rides in the same store
@@ -402,7 +399,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
         float k_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            float const warp_max_safe = fmaxf(warp_max, aiter::kAmaxFloor);
             k_scale_val               = warp_max_safe / dtype_max;
             int64_t scale_offset =
                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
@@ -431,7 +428,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
         float v_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            float const warp_max_safe = fmaxf(warp_max, aiter::kAmaxFloor);
             v_scale_val               = warp_max_safe / dtype_max;
             int64_t scale_offset =
                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
@@ -788,7 +785,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            float const block_max_safe = fmaxf(block_max, aiter::kAmaxFloor);
             k_scale_val                = block_max_safe / dtype_max;
             inv_scale_val              = dtype_max / block_max_safe;
             int64_t scale_offset       = block_idx * num_heads_k + headIdx;
@@ -832,7 +829,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
                 else
                 {
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / fmaxf(k_scale_global, kFp8KvQuantAbsmaxFloorF32);
+                    inv_scale_val = 1.0f / fmaxf(k_scale_global, aiter::kAmaxFloor);
                 }
             }
             else
@@ -874,7 +871,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            float const block_max_safe = fmaxf(block_max, aiter::kAmaxFloor);
             v_scale_val                = block_max_safe / dtype_max;
             inv_scale_val              = dtype_max / block_max_safe;
             int64_t scale_offset       = block_idx * num_heads_k + headIdx;
@@ -941,7 +938,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
                 else
                 {
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / fmaxf(v_scale_global, kFp8KvQuantAbsmaxFloorF32);
+                    inv_scale_val = 1.0f / fmaxf(v_scale_global, aiter::kAmaxFloor);
                 }
             }
             else
@@ -2700,7 +2697,7 @@ __global__ void qk_partial_amax_to_perhead_scale_kernel(
     {
         constexpr float fp8_max = 240.0f;
         float* out             = is_q ? q_scale : k_scale;
-        out[b * H + h]         = fmaxf(sm[0], 1e-8f) / fp8_max;
+        out[b * H + h]         = fmaxf(sm[0], aiter::kAmaxFloor) / fp8_max;
     }
 }
 
@@ -4066,7 +4063,7 @@ __global__ void v_amax_to_descale_kernel(const float* __restrict__ v_amax,
     if(idx >= num_heads) return;
     constexpr float fp8_max = 240.0f;
     v_descale[b * num_heads + idx] =
-        fmaxf(v_amax[b * num_heads + idx], 1e-8f) / fp8_max;
+        fmaxf(v_amax[b * num_heads + idx], aiter::kAmaxFloor) / fp8_max;
 }
 
 template <typename T, int TILE_T, int HEAD_SIZE>
@@ -4733,7 +4730,7 @@ namespace aiter {
       // group max is always >= floor. Guards the e8m0 scale against a zero/near-zero
       // group amax (zero activations under CG warmup / pad / invalid slots) with no
       // extra op at the scale call site.
-      float thread_max = kFp8KvQuantAbsmaxFloorF32;
+      float thread_max = aiter::kAmaxFloor;
       if (is_nope_thread) {
         if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
           #pragma unroll
@@ -5077,7 +5074,7 @@ namespace aiter {
       // in the coarse kernel's dynamic LDS, which only the TDM build allocates, so
       // this is off wherever the ring is off.
       constexpr bool kMergeQScaleStoreOk =
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
           Q_TDM_DEPTH > 0 && (nope_dim % vec_size_o) == 0
           && (static_cast<int32_t>(nope_vec) + kScaleCarrierSlots) <= WARP_SIZE
           && static_cast<size_t>(kScaleCarrierSlots) * vec_size_o <= kQScaleGatherBytes;
@@ -5129,7 +5126,7 @@ namespace aiter {
       // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
       // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
       [[maybe_unused]] uint16_t* q_scale_lds = nullptr;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
       extern __shared__ char fqk_coarse_lds[];
       if constexpr (Q_TDM_DEPTH > 0) {
         const int32_t wave_in_blk = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
@@ -5250,7 +5247,7 @@ namespace aiter {
         // Ring slot this head reads. Carried out of the block below so the refill
         // site, which runs after the reduce, can hand it to the next head.
         [[maybe_unused]] int32_t q_read_slot = 0;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr (Q_TDM_DEPTH > 0) {
           const int32_t slot = q_slot;
           q_read_slot = slot;
@@ -5323,7 +5320,7 @@ namespace aiter {
         const float amax_raw = fmaxf(amax2.x, amax2.y);
         (void)amax_raw;
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr (Q_TDM_DEPTH > 0) {
           // Refill the slot the PREVIOUS head read, not the one just read.
           //
@@ -5408,7 +5405,7 @@ namespace aiter {
           // rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
           // Floor applied after the rescale, which is where it was when the amax was
           // taken on the normalized vector.
-          float thread_max = fmaxf(amax_raw * q_rms_scale, kFp8KvQuantAbsmaxFloorF32);
+          float thread_max = fmaxf(amax_raw * q_rms_scale, aiter::kAmaxFloor);
           // Group-amax over the Q_REDUCE-lane group. DPP, not __shfl_xor: on gfx1250
           // __shfl_xor lowers to ds_bpermute_b32 through the LDS crossbar plus an
           // s_wait_dscnt, while the DPP form folds the lane move into the v_max
@@ -5803,7 +5800,7 @@ namespace aiter {
             // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
             const E8m0BlockScale s =
                 fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(
-                    fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
+                    fmaxf(amax_norm, aiter::kAmaxFloor));
             // Every lane of a group writes it, not just lane 0 of the group.
             // amax_raw is butterfly-reduced over `off < reduce_thread_size`, so
             // s.byte is group-uniform, and group_id = tid/reduce_thread_size is
@@ -5981,7 +5978,7 @@ namespace aiter {
         // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
         const E8m0BlockScale qs_scale =
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(
-                fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
+                fmaxf(amax_norm, aiter::kAmaxFloor));
         const float factor = q_rms_scale * qs_scale.inv_scale();  // x_in -> fp8 (rstd folded)
 
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
@@ -6566,7 +6563,7 @@ void fused_qk_norm_rope_group_quant(
   //    also keys on H is the likely next refinement, but that needs more shapes
   //    than this change was measured against.
   const std::string gpu_arch = get_gpu_arch();
-  const bool has_tdm = gpu_arch == "gfx1250";
+  const bool has_tdm = (gpu_arch == "gfx1250" || gpu_arch == "gfx1250-strict");
   const int LARGE_PREFILL_THRESHOLD =
       has_tdm ? 16 : 48;  // med -> large (blocks/CU)
   // large -> xlarge at 64 blocks/CU, not 300.

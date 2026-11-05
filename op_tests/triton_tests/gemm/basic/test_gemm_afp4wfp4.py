@@ -21,8 +21,13 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 
+# Mirrors the arch gate in gemm_afp4wfp4_(): archs with software-emulated FP4
+# run only the unshuffled Triton path.
+UNSHUFFLED_TRITON_ONLY = arch_info.is_sw_emulated_fp4_avail()
+
 pytestmark = pytest.mark.skipif(
-    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+    not arch_info.is_any_fp4_avail(),
+    reason="MXFP4 not supported on this architecture",
 )
 
 
@@ -51,11 +56,11 @@ def generate_gemm_afp4wfp4_inputs(
 
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
-        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
-        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
 
     if layout[1] == "N":
         w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
@@ -64,10 +69,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
         w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
 
-    x = (
-        x_high << 4 | x_low
-    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
-    x = x.to(device="cuda")
+    x = x_high << 4 | x_low
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
@@ -108,7 +110,7 @@ def generate_gemm_afp4wfp4_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -135,6 +137,7 @@ def get_x_vals():
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 7168, 16384), (2304, 24576, 1536)]
     x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
+    x_vals += [(v, 96, 5120) for v in (32, 128, 192, 256, 8000)]
     return x_vals
 
 
@@ -209,6 +212,9 @@ def test_gemm_afp4_wfp4(
     if impl == "gluon" and shuffle_weight_scales:
         pytest.skip("Gluon kernel does not have a preshuffled implementation.")
 
+    if UNSHUFFLED_TRITON_ONLY and (impl != "triton" or shuffle_weight_scales):
+        pytest.skip(f"Only the unshuffled Triton path is supported on {DEVICE_ARCH}.")
+
     if shuffle_weight_scales:
         if N % 32 > 0:
             pytest.skip(
@@ -272,11 +278,20 @@ def test_gemm_afp4_wfp4(
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
 
-    triton.testing.assert_close(torch_out, triton_out)
+    if UNSHUFFLED_TRITON_ONLY:
+        # The emulated dot_scaled result can differ from the reference by one
+        # ULP of the output dtype after rounding.
+        triton.testing.assert_close(
+            torch_out, triton_out, atol=1e-2, rtol=torch.finfo(dtype).eps
+        )
+    else:
+        triton.testing.assert_close(torch_out, triton_out)
 
 
 @pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
 def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
+    if UNSHUFFLED_TRITON_ONLY:
+        pytest.skip(f"Preshuffled MXFP4 GEMM is not supported on {DEVICE_ARCH}.")
     dtype = torch.bfloat16
     (
         x,
