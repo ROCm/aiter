@@ -273,7 +273,9 @@ def _ring_num_prefetch(num_ld, ring, ring_lag):
     return ring - 2 * ring_lag
 
 
-def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
+def _ring_drive(
+    *, widths, emit, consume, ring, ring_lag, head=None, dies=None, tap=None
+):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
     ``widths[i]`` is how many ds_loads fragment ``i`` is built from -- 2 where one load
@@ -284,6 +286,10 @@ def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
     fragments ago -- trading pipeline depth for WAR distance at fixed VGPR cost. Refills
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
     wmma->ds_load issue bubble a burst-everything prefetch avoids.
+
+    ``tap(i)`` is called once per fragment, after its refill and before its wmma, for a
+    caller that wants its own copies spread through the ring instead of clumped ahead of
+    it. Placement is by source order, so it costs the ring no fence or wait depth.
 
     ``head`` optionally adopts an already-issued NP-deep prefetch (the PV case hoists it
     above softmax so the LDS latency hides under the softmax VALU). A tile of at most
@@ -364,6 +370,8 @@ def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
         _release(i)
         refilling = issued < num_ld
         _refill(starts[i + 1] + num_prefetch)
+        if tap is not None:
+            tap(i)
         parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
         consume(i, *parts)

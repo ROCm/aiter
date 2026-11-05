@@ -264,6 +264,11 @@ class BufferOpDescriptor:
     def async_load(self):
         raise NotImplementedError
 
+    def async_load_one(self, index):
+        """Issue just copy ``index`` of this descriptor's batch, for callers that want
+        the batch spread through surrounding work instead of issued as one clump."""
+        raise NotImplementedError
+
 
 class AsyncCopyDescriptor(BufferOpDescriptor):
     """A batch of ``cluster_load_async_to_lds_b128`` (V1 transport); on ``asynccnt``."""
@@ -298,6 +303,9 @@ class TdmCopyDescriptor(BufferOpDescriptor):
         for view in self.views:
             fx.copy(*view)
 
+    def async_load_one(self, index):
+        fx.copy(*self.views[index])
+
 
 GATHER_ROWS = {32: 8, 16: 16}  # row indices per issue, by index width in bits
 GATHER_INDEX_BITS = 32
@@ -316,6 +324,9 @@ class TdmGatherCopyDescriptor(BufferOpDescriptor):
     def async_load(self):
         for desc in self.descs:
             tdm_ops.tensor_load_gather(desc)
+
+    def async_load_one(self, index):
+        tdm_ops.tensor_load_gather(self.descs[index])
 
 
 def _warp_band(*, bases, n_block, padded_row_bytes, producer_warp, num_producer_warps):

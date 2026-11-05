@@ -503,6 +503,7 @@ def _pv_qk_gemm(
     ring_lag=PVQK_LAG,
     vld_per_frag=2,
     phase="pvqk",
+    tap=None,
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
     fragment streams, for all num_q_tiles q-WMMA-tiles this wave owns.
@@ -623,6 +624,7 @@ def _pv_qk_gemm(
         ring_lag=ring_lag,
         head=head,
         dies=dies,
+        tap=tap,
     )
     rocdl.s_setprio(0 if warp_type.is_lo else 1)
     return out_list, s_acc_list
