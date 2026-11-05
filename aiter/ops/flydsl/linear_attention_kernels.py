@@ -1485,6 +1485,10 @@ def flydsl_kda_decode(
     ``state`` may be stored as FP32 or BF16. The recurrence always computes
     in FP32: a BF16 state is widened on load and rounded to nearest-even BF16
     on store, so it does not reproduce an FP32 state bit-for-bit.
+    ``conv_weight``, ``A_log`` and ``dt_bias`` must be FP32, and ``norm_weight``
+    and every activation BF16. This is narrower than the Triton
+    ``fused_kda_decode``, which also takes BF16 ``conv_weight`` and FP32
+    ``norm_weight``; cast such weights once at load time.
     Strides and byte spans must fit non-negative int32 buffer addressing,
     except cache slot strides, which are rebased in int64.
     Both caches require dense inner dimensions and non-overlapping slots;
