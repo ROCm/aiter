@@ -2123,9 +2123,7 @@ def flydsl_kda_verify_with_f_b(
         inner_strides=(1,),
     )
     _check_i32_addressing("out", out, first_dim=1)
-    head_span = (_KDA_HEADS - 1) * out.stride(2) + _KDA_DIM
-    if out.stride(2) < _KDA_DIM or (tokens > 1 and out.stride(1) < head_span):
-        raise ValueError("`out` must have non-overlapping token and head rows.")
+    _check_disjoint_rows("out", out, (1, 2), "token and head")
     num_slots = min(num_slots, _INT32_MAX)
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
     if _KDA_SLOT_CHECK:
@@ -2140,8 +2138,11 @@ def flydsl_kda_verify_with_f_b(
                     & (intermediate_indices >= 0)
                     & (intermediate_indices < num_inter_lines)
                 )
+                # The reserved padding slot may repeat, as in the decode check.
                 _check_unique_live_slots(
-                    torch.where(live, cache_indices, -1), num_slots, "cache_indices"
+                    _mask_padding_slot(torch.where(live, cache_indices, -1)),
+                    num_slots,
+                    "cache_indices",
                 )
                 _check_unique_live_slots(
                     torch.where(live, intermediate_indices, -1),
