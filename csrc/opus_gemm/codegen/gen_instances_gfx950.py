@@ -13,6 +13,7 @@ from codegen.common import (
     splitk_workspace_type,
     write_if_changed,
 )
+from codegen.template_env import render as render_template
 
 # ---------------- gfx950 arch-override maps ----------------
 
@@ -1115,47 +1116,23 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         kernel_func,
         fwd_decl_kargs_fnarg,
     )
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y{extra_param})
-{{{{
-{shape_preamble}
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-{k_check}
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = XQ.stride(1);
-    kargs.stride_b = WQ.stride(1);
-    kargs.stride_c = N;
-    kargs.stride_a_batch = XQ.stride(0);
-    kargs.stride_b_batch = WQ.stride(0);
-    kargs.stride_c_batch = M * N;
-{kargs_init_extra}{bias_kargs_block}
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-{launch_block}
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx950_noscale_launcher.cuh.j2",
+        preamble=preamble,
+        host_tu_split=host_tu_split,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        extra_param=extra_param,
+        shape_preamble=shape_preamble,
+        k_check=k_check,
+        kargs_name=kargs_name,
+        kargs_init_extra=kargs_init_extra,
+        bias_kargs_block=bias_kargs_block,
+        B_M=k.B_M,
+        B_N=k.B_N,
+        BLOCK_SIZE=k.BLOCK_SIZE,
+        launch_block=launch_block,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
