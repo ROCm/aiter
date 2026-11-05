@@ -1371,16 +1371,12 @@ def fused_moe_fake(
     return torch.empty((M, model_dim), dtype=dtype, device=device)
 
 
-_BF16_G1U1_GFX1201_TRITON_CU_NUM = 64
-_BF16_G1U1_GFX1201_TRITON_POLICY_KEY = "bf16_g1u1_large_m"
-
-
 @functools.lru_cache(maxsize=1)
 def _get_bf16_g1u1_gfx1201_triton_policy() -> dict:
     from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
     dispatch = get_moe_dispatch("MOE-BF16-G1U1-POLICY", get_gfx_runtime(), "triton")
-    policy = dispatch.get(_BF16_G1U1_GFX1201_TRITON_POLICY_KEY, {})
+    policy = dispatch.get("bf16_g1u1_large_m", {})
     return dict(policy)
 
 
@@ -1445,7 +1441,8 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
     except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return False
     return (
-        policy_cu_num == _BF16_G1U1_GFX1201_TRITON_CU_NUM
+        policy_arch == "gfx1201"
+        and policy_cu_num == 64
         and policy.get("activation_dtype") == "bf16"
         and policy.get("weight_dtype") == "bf16"
         and policy.get("quant_type") == "none"
