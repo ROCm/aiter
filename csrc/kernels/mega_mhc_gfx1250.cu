@@ -201,6 +201,9 @@ __device__ __host__ constexpr int row_offset(int r)
     return r * C::KC + r / C::PAD_ROWS * PAD;
 }
 
+// Multi-arch builds also parse this file for other device targets. Keep
+// gfx1250-only intrinsics out of those passes and the host pass.
+#if defined(__gfx1250__)
 // MXFP8 output of the normalized rows. Codes are [T][H] E4M3. By default E8M0
 // scales use the gfx1250 MXFP8 GEMM A-scale layout (m32k4, the bytes of
 // aiter.ops.shuffle.shuffle_mxfp8fp4_scale): byte (m / 32) * H + (g / 4) * 128
@@ -335,6 +338,8 @@ struct Mxfp8Out
         }
     }
 };
+
+#endif // defined(__gfx1250__)
 
 // LDS of one tile body. The tensor ring is dead after the main loop; the
 // cross-wave reduction and the staged norm weight reuse its storage.
