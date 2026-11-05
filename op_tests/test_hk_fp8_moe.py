@@ -14,7 +14,7 @@ import sys
 import torch
 
 import aiter
-from aiter.ops.hk_fp8_moe import hk_fp8_moe
+from aiter.ops.hk_fp8_moe import _hk_fp8_moe_workspace_units, hk_fp8_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import perftest
 from op_tests.hk_fp8_moe_utils import dequant, make_routing, make_weights, reference
@@ -46,7 +46,17 @@ def test_case(T, E, limit, weights):
         x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], limit
     )
     err = ((out[rows].float() - ref).norm() / ref.norm()).item()
-    ok = err < TOL and not torch.isnan(out).any()
+    ok = err < TOL and torch.isfinite(out).all().item()
+    if limit == 1.0:
+        unclamped = reference(
+            x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], 0.0
+        )
+        # A disabled clamp must fail this case even within the FP8 error tolerance.
+        clamp_effect = ((unclamped - ref).norm() / ref.norm()).item()
+        ok = ok and clamp_effect > 2 * TOL
+        aiter.logger.info(
+            f"hk_fp8_moe active clamp relative effect: {clamp_effect:.4f}"
+        )
     aiter.logger.info(
         f"hk_fp8_moe T={T:6d} experts={E} topk={ids.shape[1]} limit={limit:4.1f}: rel err {err:.4f} "
         f"{us:8.1f} us  {'ok' if ok else 'FAIL'}"
@@ -70,11 +80,11 @@ def test_routing_replay(weights, topk=None):
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            hk_fp8_moe(*args, swiglu_limit=10.0)
+            hk_fp8_moe(*args, swiglu_limit=1.0)
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            out = hk_fp8_moe(*args, swiglu_limit=10.0)
+            out = hk_fp8_moe(*args, swiglu_limit=1.0)
         rows = torch.arange(0, T, max(1, T // 32), device=x.device)
         # Revisit random routing after all-invalid routing to catch stale counters.
         for routing in (
@@ -103,7 +113,7 @@ def test_routing_replay(weights, topk=None):
             graph.replay()
             first = out.clone()
             graph.replay()
-            ref = reference(x[rows], W13, W2, tw[rows], ids[rows], 10.0)
+            ref = reference(x[rows], W13, W2, tw[rows], ids[rows], 1.0)
             err = (
                 (out[rows].float() - ref).norm() / ref.norm().clamp_min(1e-12)
             ).item()
@@ -186,6 +196,15 @@ def test_int64_ids_and_empty(weights):
     return ok
 
 
+def test_small_workspace():
+    """One token must not allocate padding for hundreds of unused experts."""
+    for E in (288, 1024):
+        for topk in (8, 9):
+            size = _hk_fp8_moe_workspace_units(1, topk, E) * 256
+            assert size < 24 * 1024**2, (E, topk, size)
+    aiter.logger.info("hk_fp8_moe one-token workspace: below 24 MiB")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -204,11 +223,12 @@ if __name__ == "__main__":
         sys.exit(0)
 
     tokens = args.tokens or [1, 1024, 4096, 6144, 16384]
+    test_small_workspace()
     results = []
     for E in (288, 289):
         weights = make_weights(E)
         for T in ([] if args.routing_only else tokens):
-            for limit in (0.0, 10.0):
+            for limit in (0.0, 1.0, 10.0):
                 results.append(test_case(T, E, limit, weights))
         results.append(test_routing_replay(weights))
         results.append(test_rejects(weights))

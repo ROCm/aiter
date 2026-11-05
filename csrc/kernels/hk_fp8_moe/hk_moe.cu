@@ -24,10 +24,12 @@ struct precomputed_addresses
 // Pinned registers per wave: a0:a255 accumulators, v128:v255 operands, v0:v127 temporaries.
 // Accumulator (I,J) starts at a[(2*I+J)*64]; I/J select 128-row/column blocks.
 // ART indices >= 256 address AGPRs. amdgpu_num_vgpr(128) does not protect the pinned
-// ranges with all AGPRs occupied: verify compiler output with test_hk_fp8_moe_codegen.py.
+// ranges with all AGPRs occupied. The JIT audits device assembly before installing the module.
 // Weights are MFMA operand A. Subtile (m,n) starts at base+(n*4+m)*4;
 // lane l holds C[n*16+l%16][m*16+4*(l/16) .. +3].
 
+constexpr int NUM_WARPS = 4;
+#if defined(__gfx950__)
 namespace pin {
 using namespace kittens;
 
@@ -143,8 +145,7 @@ __device__ __forceinline__ void store_acc_rows(const i32x4 rsrc,
 // Tile loads: four 16-byte transfers per thread fill a 128x128 FP8 LDS tile.
 // Sources are contiguous subtiles, shuffled weights, or gathered token rows.
 
-constexpr int NUM_WARPS = 4;
-using G                 = kittens::group<NUM_WARPS>;
+using G = kittens::group<NUM_WARPS>;
 
 namespace pin {
 
@@ -368,6 +369,7 @@ do_interleaved_cluster(LOAD ld, const ST& src, const uint32_t pa, const uint32_t
 #undef PIN_SMMA
 
 } // namespace pin
+#endif
 
 // Persistent grouped GEMM: 256x256 tiles, four waves, expert rows padded to 256.
 // tile_expert[n_mtiles] holds the used-tile count. Workgroups advance by gridDim.x;
@@ -380,6 +382,7 @@ do_interleaved_cluster(LOAD ld, const ST& src, const uint32_t pa, const uint32_t
 
 constexpr int MOE_ROWS_MAX = 1 << 21; // Layout extent; only strides are used.
 
+#if defined(__gfx950__)
 namespace pin {
 __device__ __forceinline__ float lane_max16(float m)
 { // Max across four 16-lane rows.
@@ -498,6 +501,7 @@ __device__ __forceinline__ void epilogue_silu_quant(const int br,
     }(std::make_integer_sequence<int, 8>{});
 }
 } // namespace pin
+#endif
 
 // HALF_SKIP omits MFMAs for an empty second half; use only for small expert batches.
 template <int NTOT, int K, bool GATE_UP, bool HALF_SKIP = false>
@@ -516,6 +520,7 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
     const int* __restrict__ ecnt,
     const int* __restrict__ eoff)
 {
+#if defined(__gfx950__)
     using namespace pin;
     constexpr int WARPS_COL = 2, WARPS_ROW = 2, BLOCK_SIZE_ROW = 256, BLOCK_SIZE_COL = 256,
                   BLOCK_K = 128, k_step = BLOCK_K;
@@ -876,6 +881,9 @@ __global__ __launch_bounds__(256, 1) __attribute__((amdgpu_num_vgpr(128))) void 
         half1_empty = half_empty(br, ex);
     }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); // Drain unused LDS prefetches before exit.
+#else
+    __builtin_trap(); // Unsupported target; the host entrypoint rejects it before launch.
+#endif
 }
 
 // Routing: expert e owns [off[e], off[e]+roundup(cnt[e],TM)).
@@ -948,6 +956,7 @@ __global__ void moe_scan(const int* __restrict__ cnt,
                          int* __restrict__ tok,
                          float* __restrict__ w)
 {
+#if defined(__gfx950__)
     __shared__ int s_off[SORT_EMAX + 1];
     const int e = threadIdx.x;
     const int c = e < E ? cnt[e] : 0, pc = (c + TM - 1) / TM * TM;
@@ -988,6 +997,9 @@ __global__ void moe_scan(const int* __restrict__ cnt,
         if(t >= s_off[E] / TM)
             tile_e[t] = -1;
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 __global__ void moe_scatter(const int* __restrict__ tk_e,
@@ -1000,6 +1012,7 @@ __global__ void moe_scatter(const int* __restrict__ tk_e,
                             float* __restrict__ w,
                             int* __restrict__ pos)
 {
+#if defined(__gfx950__)
     if(E > SORT_STRIPED_EMAX)
     {
         const int b = blockIdx.x * SORT_PER_BLOCK;
@@ -1083,6 +1096,9 @@ __global__ void moe_scatter(const int* __restrict__ tk_e,
         w[r]          = ok ? tk_w[i] : 0.f;
         pos[i]        = r;
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 // Weighted sum of each token's S expert outputs.
@@ -1092,6 +1108,7 @@ __global__ void moe_reduce_w(const bf16* __restrict__ cw,
                              const float* __restrict__ row_w,
                              bf16* __restrict__ out)
 {
+#if defined(__gfx950__)
     const int t = blockIdx.x, c = threadIdx.x * 8;
     float acc[8] = {0};
 #pragma unroll
@@ -1114,6 +1131,9 @@ __global__ void moe_reduce_w(const bf16* __restrict__ cw,
     for(int i = 0; i < 8; i++)
         ob[i] = bf16(acc[i]);
     *reinterpret_cast<uint4*>(out + (size_t)t * D + c) = o;
+#else
+    __builtin_trap();
+#endif
 }
 
 // Activation quantization and gather tables.
@@ -1124,6 +1144,7 @@ template <int D>
 __device__ __forceinline__ void quant_tok16_block(
     int blk, const bf16* __restrict__ x, int T, fp8e4m3* __restrict__ q, float* __restrict__ s)
 {
+#if defined(__gfx950__)
     const int t = blk * (blockDim.x / 64) + threadIdx.x / 64, lane = threadIdx.x % 64;
     if(t >= T)
         return;
@@ -1161,6 +1182,9 @@ __device__ __forceinline__ void quant_tok16_block(
         if((lane & 7) == 0)
             s[(size_t)kb * T + t] = sc;
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 // Fuse independent counting and quantization grids; finish counting before moe_scan.
@@ -1175,10 +1199,14 @@ __global__ void count_and_quant(const int* __restrict__ tk_e,
                                 fp8e4m3* __restrict__ q,
                                 float* __restrict__ s)
 {
+#if defined(__gfx950__)
     if((int)blockIdx.x < count_blocks)
         moe_count_block(blockIdx.x, tk_e, n, E, cnt);
     else
         quant_tok16_block<D>(blockIdx.x - count_blocks, x, T, q, s);
+#else
+    __builtin_trap();
+#endif
 }
 
 namespace pin {
@@ -1225,6 +1253,7 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
                                     uint32_t* __restrict__ aoff,
                                     uint32_t* __restrict__ pa)
 {
+#if defined(__gfx950__)
     using ST_A     = st_fp8e4m3<128, 128, st_16x128_s>;
     const int tile = blockIdx.x;
     // Unused tiles have uninitialized token IDs; do not read them.
@@ -1262,6 +1291,9 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
     uint4* p = reinterpret_cast<uint4*>(aoff + ((size_t)tile * 256 + threadIdx.x) * 8);
     p[0]     = {o[0], o[1], o[2], o[3]};
     p[1]     = {o[4], o[5], o[6], o[7]};
+#else
+    __builtin_trap();
+#endif
 }
 
 // Host launch and workspace.
@@ -1269,10 +1301,12 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
 namespace {
 constexpr int D = 4096, I = 1024, KB1 = D / 128, KB2 = I / 128, TM = 256;
 inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
-// At most TM-1 padding rows per expert.
+// Only nonempty experts need padding; at most min(E, T*S) can receive a selection.
 inline int rowmax(int T, int S, int E)
 {
-    return (int)((((size_t)T * S + (size_t)E * (TM - 1)) + 255) / 256 * 256);
+    const size_t selections = (size_t)T * S;
+    const size_t nonempty   = std::min((size_t)E, selections);
+    return (int)((selections + nonempty * (TM - 1) + TM - 1) / TM * TM);
 }
 
 struct Workspace
@@ -1441,6 +1475,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(aiter_hk_fp8_moe_fwd,
                 "hk_fp8_moe: expert count must be in [1, 1024]");
     if(num_tokens == 0)
         return;
+    AITER_CHECK(get_gpu_arch() == "gfx950", "hk_fp8_moe: requires gfx950");
     const int T = num_tokens, S = topk, E = num_experts;
     Workspace ws;
     AITER_CHECK(workspace_bytes >= 0 && carve(reinterpret_cast<char*>(workspace), T, S, E, &ws) <=

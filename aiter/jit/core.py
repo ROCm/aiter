@@ -32,6 +32,7 @@ from jit_cache import (
     snapshot_compiled_kids,
     stage_blob_sources,
 )
+from third_party import checkout_path
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -808,6 +809,9 @@ def get_user_jit_dir() -> str:
 
 
 bd_dir = f"{get_user_jit_dir()}/build"
+HIP_KITTENS_DIR = checkout_path(
+    HIP_KITTENS_DIR, bd_dir, user_override="HIP_KITTENS_DIR" in os.environ
+)
 # copy ck to build, thus hippify under bd_dir
 if multiprocessing.current_process().name == "MainProcess":
     os.makedirs(bd_dir, exist_ok=True)
@@ -1134,113 +1138,14 @@ rebuilded_list = []
 
 def clone_3rdparty(third_party: str) -> None:
     def MainFunc():
-        if not os.path.exists(dir_path):
-            import subprocess
+        from third_party import ensure_pinned_checkout
 
-            def check_git_version(required_major, required_minor):
-                try:
-                    output = subprocess.check_output(
-                        ["git", "--version"], text=True
-                    ).strip()
-                    import re
-
-                    m = re.search(r"(\d+)\.(\d+)", output)
-                    if m:
-                        major, minor = int(m.group(1)), int(m.group(2))
-                        return (major > required_major) or (
-                            major == required_major and minor >= required_minor
-                        )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Failed to check git version: {e}")
-                return False
-
-            logger.info(f"Cloning 3rdparty {third_party} to {dir_path}")
-            # Check git version for --revision flag support (>=2.49)
-            if not check_git_version(2, 49):
-                logger.warning(
-                    "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "clone",
-                        "-q",
-                        third_party_info["url"],
-                        dir_path,
-                    ]
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "-C",
-                        dir_path,
-                        "reset",
-                        "-q",
-                        "--hard",
-                        third_party_info["commit"],
-                    ]
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "-C",
-                        dir_path,
-                        "submodule",
-                        "update",
-                        "-q",
-                        "--init",
-                        "--recursive",
-                    ]
-                )
-            else:
-                # Save current git config value for advice.detachedHead, set to false
-                prev_detached_head = None
-                try:
-                    try:
-                        prev_detached_head = subprocess.check_output(
-                            ["git", "config", "--get", "advice.detachedHead"], text=True
-                        ).strip()
-                    except subprocess.CalledProcessError:
-                        prev_detached_head = None  # not set before
-                    # Set to false before clone
-                    subprocess.call(
-                        ["git", "config", "--global", "advice.detachedHead", "false"]
-                    )
-
-                    subprocess.call(
-                        [
-                            "git",
-                            "clone",
-                            "-q",
-                            f"--revision={third_party_info['commit']}",
-                            "--depth=1",
-                            "--recurse-submodules",
-                            third_party_info["url"],
-                            dir_path,
-                        ]
-                    )
-                finally:
-                    # Restore config after clone
-                    if prev_detached_head is not None:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "advice.detachedHead",
-                                prev_detached_head,
-                            ]
-                        )
-                    else:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "--unset",
-                                "advice.detachedHead",
-                            ]
-                        )
+        ensure_pinned_checkout(
+            dir_path,
+            third_party_info["url"],
+            third_party_info["commit"],
+            user_override="HIP_KITTENS_DIR" in os.environ,
+        )
 
     if third_party == "HipKittens":
         dir_path = HIP_KITTENS_DIR
@@ -1525,6 +1430,20 @@ def build_module(
                 # dependencies and retry failures, not the Python loader cache.
                 use_versioner=False,
             )
+            if any(os.path.basename(source) == "hk_moe.cu" for source in sources):
+                from pathlib import Path
+
+                from hk_fp8_moe_codegen import audit_build
+
+                # Inspect the built targets so GPU_ARCHS=native cannot bypass
+                # the audit, including on hosts with multiple GPU architectures.
+                built_archs = _so_offload_archs(f"{opbd_dir}/{target_name}")
+                if not built_archs:
+                    raise RuntimeError("Cannot verify HipKittens MoE build targets")
+                if "gfx950" in built_archs:
+                    # Fail before publishing the module, including experimental
+                    # prebuilds that aggregate this source into a larger module.
+                    audit_build(Path(opbd_dir))
             validate_generation()
             if is_python_module and not is_standalone:
                 artifact_path = f"{get_user_jit_dir()}/{target_name}"

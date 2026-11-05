@@ -16,7 +16,9 @@ tiles. FP8 scales are applied with `V_MFMA_SCALE`.
 | SwiGLU | `silu(min(gate, L)) * clamp(up, -L, L)` when `swiglu_limit` L > 0; otherwise `silu(gate) * up` |
 
 Weights with arbitrary block scales must be requantized before calling the operator. The Python
-wrapper allocates the workspace through PyTorch's caching allocator. All work runs on the current
+wrapper allocates the workspace through PyTorch's caching allocator. Padding is bounded by
+`min(E, T * topk)` nonempty experts, so a one-token top-8 call uses about 18 MiB of workspace
+even with 1024 experts. All work runs on the current
 stream and supports graph capture after JIT warmup. All tensors must be on the same gfx950 device.
 Weights and an explicit output buffer must have 16-byte-aligned base pointers.
 
@@ -47,7 +49,12 @@ The kernels, launch sequence, workspace query, and AITER ctypes entrypoints are 
 ## Build and test
 
 AITER JIT-builds `module_hk_fp8_moe` on first use. HipKittens headers come from `HIP_KITTENS_DIR`
-when set; otherwise AITER fetches the pinned revision.
+when set; otherwise AITER fetches the pinned revision and updates an older clean managed checkout.
+A modified managed checkout fails with an actionable error; an explicit `HIP_KITTENS_DIR` is never
+rewritten. Bundled headers without Git metadata are preserved; AITER fetches a verifiable checkout
+in the JIT cache instead. The module is experimental and excluded from aggregate prebuilds unless
+`AITER_ENABLE_EXPERIMENTAL=1`. Device implementations are guarded for gfx950; the host entrypoint
+rejects unsupported devices before launching kernels.
 
 Run from the repository root on gfx950:
 
@@ -58,8 +65,10 @@ python3 op_tests/test_hk_fp8_moe_codegen.py
 ```
 
 The default suite checks an FP32 reference and reports timings for 1 to 16384 tokens, top-k 8 and 9,
-and SwiGLU with and without clamping. Top-k 9 includes a shared expert selected by every token.
-Graph replay checks change inputs and exercise random, concentrated, bank-aliasing, partially invalid,
+and SwiGLU limits 0, 1, and 10. The limit-1 cases assert that clamping changes the FP32 reference
+by more than twice the error tolerance, so bypassing the clamp cannot pass. Top-k 9 includes a
+shared expert selected by every token. Graph replay uses an active limit of 1 and checks changed
+inputs with random, concentrated, bank-aliasing, partially invalid,
 and all-invalid routing around block boundaries. Both top-k values also cover 1, 304, 305, and 1024
 experts, including the routing implementation boundary. Use `--tokens` to select token counts for the
 main sweep; `--routing-only` runs routing replay and unsupported-shape checks.
@@ -68,10 +77,13 @@ main sweep; `--routing-only` runs routing replay and unsupported-shape checks.
 
 The GEMM reserves v128-v255 for operand tiles and all 256 AGPRs for accumulators. With this AGPR
 allocation, `amdgpu_num_vgpr(128)` does not keep compiler-generated instructions out of v128-v255.
-Changes that increase register pressure can therefore corrupt operand tiles.
+Changes that increase register pressure can therefore corrupt operand tiles. Every JIT build containing
+`hk_moe.cu` for gfx950 emits device assembly using the actual Ninja compile command and audits it
+before publishing the shared library. This also applies to experimental aggregate prebuilds. An audit
+failure prevents installation; compiler upgrades cannot silently bypass the check.
 
-After kernel or compiler changes, run the correctness suite with a fresh JIT cache, then check its
-compiler configuration for VGPR spills and instructions that touch pinned registers. Run from the
+After kernel or compiler changes, run the correctness suite with a fresh JIT cache. The standalone
+audit can also retain assembly for inspection. Run from the
 repository root:
 
 ```bash
@@ -85,9 +97,20 @@ python3 op_tests/test_hk_fp8_moe_codegen.py \
 With no arguments, the code-generation test builds and audits on gfx950, skipping other devices.
 Explicit `--build-dir` or `--assembly` checks also work without a GPU. The test obtains the
 `hk_moe.cu` compile command from `ninja -t compdb`, preserving
-the JIT flags and changing only the output to device assembly. All four grouped GEMM variants must
-avoid compiler instructions that touch pinned registers, and all VGPR spill counts must be zero.
-Inline assembly implementing HipKittens tiles is excluded from the register check.
+the gfx950 JIT flags and changing the output to device assembly (other targets are removed
+when auditing a multiarchitecture build). All four grouped GEMM variants must
+avoid instructions that touch pinned registers except for the four explicit HipKittens tile forms:
+LDS operand reads, scaled FP8 MFMA, accumulator reads, and accumulator writes. Their
+compiler-selected address, scale, and copy operands must still be below v128. Other inline assembly
+is checked too, including BF16 conversion. Decimal and hexadecimal register notation are recognized.
+Every GEMM must have zero VGPR spills, zero private-segment bytes, no dynamic stack, and no scratch
+instructions. SGPR-to-VGPR lane spills are allowed only within the checked temporary registers.
+
+CPU regression coverage for the audit and dependency upgrades runs with:
+
+```bash
+python3 -S op_tests/test_hk_fp8_moe_build.py
+```
 
 To check saved assembly without PyTorch, a GPU, or the HIP compiler:
 
