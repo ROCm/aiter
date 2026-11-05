@@ -27,6 +27,7 @@ from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.ops.topk_select import _choose as topk_select_backend_for
 from aiter.ops.topk_select import topk_select
 from aiter.test_common import benchmark, perftest
+from aiter.utility.graph_alloc import persistent_alloc
 
 
 def create_random_logits(
@@ -1275,6 +1276,207 @@ def test_adaptive_control_concurrent_replays(card):
     )
 
 
+def _scratch_harness(width, top_k):
+    """Inputs, a forced-adaptive decode and an exact check, for the candidate buffer
+    tests. Every row is `width` long, so every launch reaches the compact path."""
+
+    def inputs(m, seed, data="random"):
+        torch.manual_seed(seed)
+        if data == "ties":
+            logits = torch.randint(0, 50, (m, width), device="cuda").float()
+        else:
+            logits = torch.randn(m, width, device="cuda")
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out, stable=False):
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            logits.shape[0],
+            width,
+            1,
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(case, what, stable=False):
+        torch.cuda.synchronize()
+        logits, _, out = case
+        if stable:
+            ok = torch.equal(out.long(), stable_reference(logits, top_k))
+        else:
+            want = logits.topk(top_k, dim=-1)[1].sort(dim=-1)[0]
+            ok = torch.equal(out.long().sort(dim=-1)[0], want)
+        assert ok, what
+
+    return inputs, decode, check
+
+
+def _compact_slots(card, rows, width, top_k, stable=False):
+    cfg = adaptive_kernel.decode_adaptive_config(
+        rows, width, top_k, ordered=stable, cu_count=card[1]
+    )
+    assert cfg.compact, f"{rows} rows of {width} do not compact"
+    return cfg.scratch_slots
+
+
+def test_adaptive_scratch_reused(card):
+    """Eager compact launches on a stream share one candidate buffer, grown to the
+    largest launch and never shrunk, so a repeat allocates nothing; a capture takes
+    its own and leaves that one alone. Growing releases the old buffer while a launch
+    may still be using it, and the freed block is at once taken again on the stream.
+    Every row stays exact throughout."""
+    top_k, width = 2048, 1 << 20
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    # A stream id can be reused, so start from no buffer for this stream.
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    stream = torch.cuda.Stream()
+    key = (device, stream.cuda_stream)
+    slots = {m: _compact_slots(card, m, width, top_k) for m in (4, 8)}
+
+    def held():
+        return flydsl_decode_host._adaptive_scratch.get(key)
+
+    small, large = inputs(4, 50), inputs(8, 51)
+    with torch.cuda.stream(stream):
+        decode(*small)
+    check(small, "first eager launch")
+    first = held()
+    assert first is not None and first.numel() == slots[4], "no buffer kept"
+
+    with torch.cuda.stream(stream):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+        base = torch.cuda.memory_allocated(device)
+        decode(*small)
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated(device) - base
+    check(small, "repeat eager launch")
+    assert held() is first, "repeat launch replaced the buffer"
+    assert extra < slots[4] * 4, f"repeat launch allocated {extra} B"
+
+    in_flight = inputs(4, 53)
+    with torch.cuda.stream(stream):
+        decode(*in_flight)
+        decode(*large)
+        with persistent_alloc(device):
+            taker = torch.full((slots[4],), -1, dtype=torch.int32, device=device)
+        decode(*small)
+    check(in_flight, "launch whose buffer was released and taken again behind it")
+    check(large, "eager launch that grows the buffer")
+    check(small, "smaller launch after the buffer grew")
+    del taker
+    grown = held()
+    assert grown.numel() == slots[8], "buffer did not grow to the larger launch"
+
+    graph = torch.cuda.CUDAGraph()
+    captured = inputs(4, 52)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream):
+        decode(*captured)
+    assert held() is grown, "capture touched the eager buffer"
+    captured[2].fill_(-7)
+    with torch.cuda.stream(stream):
+        graph.replay()
+        decode(*small)
+    check(captured, "replay")
+    check(small, "eager launch after a replay")
+
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    assert held() is None, "clear kept the buffer"
+    print(
+        f"[adaptive_scratch_reused] PASS: rows 4 and 8, width {width}, k {top_k}, "
+        f"slots {slots[4]} -> {slots[8]}"
+    )
+
+
+def test_adaptive_scratch_poisoned(card):
+    """Whatever an eager candidate buffer holds when a launch starts, -1, random words
+    or another batch's candidates, the result is exact, stable and unstable: a launch
+    reads only the entries it wrote itself."""
+    top_k, width, rows = 2048, 1 << 20, 4
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    stream = torch.cuda.Stream()
+    key = (device, stream.cuda_stream)
+    seen = []
+    for stable, data in ((False, "random"), (True, "random"), (True, "ties")):
+        _compact_slots(card, rows, width, top_k, stable)
+        case, other = inputs(rows, 60, data), inputs(rows, 61, data)
+        with torch.cuda.stream(stream):
+            decode(*case, stable=stable)
+        check(case, f"stable={stable} {data}, warm-up", stable)
+        buf = flydsl_decode_host._adaptive_scratch[key]
+        for poison in ("minus one", "random words", "another batch"):
+            with torch.cuda.stream(stream):
+                if poison == "minus one":
+                    buf.fill_(-1)
+                elif poison == "random words":
+                    buf.copy_(
+                        torch.randint(
+                            -(2**31),
+                            2**31 - 1,
+                            buf.shape,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                    )
+                else:
+                    decode(*other, stable=stable)
+                case[2].fill_(-7)
+                decode(*case, stable=stable)
+            check(case, f"stable={stable} {data}, buffer held {poison}", stable)
+            assert flydsl_decode_host._adaptive_scratch[key] is buf
+        seen.append(f"{'stable' if stable else 'unstable'} {data}")
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    print(
+        f"[adaptive_scratch_poisoned] PASS: {', '.join(seen)}, rows {rows}, "
+        f"width {width}, k {top_k}"
+    )
+
+
+def test_adaptive_scratch_two_streams(card):
+    """Eager compact launches on two streams at once use two candidate buffers, so
+    neither overwrites the other's candidates: every row of every round is exact."""
+    top_k, width, rounds = 2048, 1 << 20, 10
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    for m in (8, 4):
+        _compact_slots(card, m, width, top_k)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    a = [inputs(8, 70 + r) for r in range(rounds)]
+    b = [inputs(4, 80 + r) for r in range(rounds)]
+    for stream in (s1, s2):
+        stream.wait_stream(torch.cuda.current_stream())
+    for r in range(rounds):
+        with torch.cuda.stream(s1):
+            decode(*a[r])
+        with torch.cuda.stream(s2):
+            decode(*b[r])
+    for r in range(rounds):
+        check(a[r], f"stream 1, round {r}")
+        check(b[r], f"stream 2, round {r}")
+    one = flydsl_decode_host._adaptive_scratch[(device, s1.cuda_stream)]
+    two = flydsl_decode_host._adaptive_scratch[(device, s2.cuda_stream)]
+    lo, hi = sorted((one, two), key=lambda t: t.data_ptr())
+    assert lo.data_ptr() + lo.numel() * 4 <= hi.data_ptr(), "streams share a buffer"
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    print(
+        f"[adaptive_scratch_two_streams] PASS: 8 and 4 rows, width {width}, "
+        f"k {top_k}, {rounds} rounds"
+    )
+
+
 def test_adaptive_row_past_width(card):
     """A `seq_lens` entry past the buffer width reads the row to its width, as the
     other decode kernels do, and not into the outranking padding behind it."""
@@ -2424,6 +2626,9 @@ def run_adaptive():
     test_adaptive_control_stays_zero(card)
     test_adaptive_control_per_capture(card)
     test_adaptive_control_concurrent_replays(card)
+    test_adaptive_scratch_reused(card)
+    test_adaptive_scratch_poisoned(card)
+    test_adaptive_scratch_two_streams(card)
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)

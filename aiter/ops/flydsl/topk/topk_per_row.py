@@ -51,6 +51,11 @@ _adaptive_control: dict[tuple[torch.device, int], torch.Tensor] = {}
 # Keyed (device, stream, capture). The zeroing is a node of the graph, so it runs at
 # every replay; a capture that has ended is dropped and its buffer returns to the pool.
 _captured_adaptive_control: dict[tuple[torch.device, int, int], torch.Tensor] = {}
+# Compact candidate buffers of eager launches, per (device, stream). Every entry is
+# written before it is read, so they need no zeroing. Kept rather than allocated per
+# call, so a stack that profiles memory and then empties the allocator's cache still
+# counts them. A capture takes its own from the graph's pool, as its control does.
+_adaptive_scratch: dict[tuple[torch.device, int], torch.Tensor] = {}
 _hip_stream_get_capture_info = None
 
 
@@ -75,6 +80,16 @@ def _capture_id(stream_id: int) -> int | None:
     return capture.value if status.value != 0 else None
 
 
+def _adaptive_capture(device: torch.device, stream_id: int) -> int | None:
+    """Id of the capture a launch on `stream_id` of `device` is recorded into, or None."""
+    if (
+        device.index == torch.cuda.current_device()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    return _capture_id(stream_id)
+
+
 def _get_adaptive_control(
     device: torch.device, stream_id: int, rows: int
 ) -> torch.Tensor:
@@ -85,12 +100,7 @@ def _get_adaptive_control(
     `clear_topk_per_row_decode_workspace_cache()`.
     """
     need = _adaptive.decode_control_slots(rows)
-    capture = (
-        None
-        if device.index == torch.cuda.current_device()
-        and not torch.cuda.is_current_stream_capturing()
-        else _capture_id(stream_id)
-    )
+    capture = _adaptive_capture(device, stream_id)
     if capture is None:
         key = (device, stream_id)
         buf = _adaptive_control.get(key)
@@ -113,11 +123,36 @@ def _get_adaptive_control(
     return buf
 
 
+def _get_adaptive_scratch(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    """The compact candidate buffer, `slots` int32 or more, on the current stream of
+    `device`.
+
+    Eager buffers grow to the largest launch seen on their stream and stay until
+    `clear_topk_per_row_decode_workspace_cache()`. A capture allocates from the
+    graph's pool, so graphs replayed at once never share one.
+    """
+    if _adaptive_capture(device, stream_id) is not None:
+        return torch.empty(slots, device=device, dtype=torch.int32)
+    key = (device, stream_id)
+    buf = _adaptive_scratch.get(key)
+    if buf is None or buf.numel() < slots:
+        # Released before the larger one is taken, so growing never holds both.
+        _adaptive_scratch.pop(key, None)
+        buf = None
+        with persistent_alloc(device):
+            buf = torch.empty(slots, device=device, dtype=torch.int32)
+        _adaptive_scratch[key] = buf
+    return buf
+
+
 def clear_topk_per_row_decode_workspace_cache() -> None:
     """Free the cached workspaces; no graph captured over them may replay after."""
     _clear_split_workspace_cache()
     _adaptive_control.clear()
     _captured_adaptive_control.clear()
+    _adaptive_scratch.clear()
 
 
 @lru_cache(maxsize=128)
@@ -467,7 +502,7 @@ def _run_adaptive(
     )
     control = _get_adaptive_control(logits.device, stream.cuda_stream, rows)
     scratch = (
-        torch.empty(cfg.scratch_slots, device=logits.device, dtype=torch.int32)
+        _get_adaptive_scratch(logits.device, stream.cuda_stream, cfg.scratch_slots)
         if cfg.scratch_slots
         else control  # unread without compact
     )
@@ -517,6 +552,8 @@ def flydsl_top_k_per_row_decode(
     length tensor, so a captured graph holds no address for one.
     Before CUDAGraph capture, warm up on the capture stream so the split and
     adaptive paths find their stream-local counters already allocated and zeroed.
+    Eager compact launches keep their candidate buffer at the largest batch seen on
+    the stream, so a memory profile that runs the largest batch counts it.
 
     `row_starts` [rows] i32: row r's scores start at element row_starts[r]
     of `logits`' first row (a packed buffer viewed with stride0 0), the
