@@ -39,7 +39,7 @@ void
     aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
-{
+{{
     static_assert(std::is_same<D_C, fp32_t>::value,
         "splitk_fuse uses the fp32 workspace-dispatch specialization");
     (void)splitK;  // SplitK is compile-time ([[ split_k ]]) for this exact kid.
@@ -74,7 +74,7 @@ void
     // #4246 round-1 bias contract: contiguous bf16 [N].
     const void* ptr_bias_ = nullptr;
     int stride_bias_batch_ = 0;
-    if (bias.has_value()) {
+    if (bias.has_value()) {{
         const auto& bt = bias.value();
         AITER_CHECK(bt.is_contiguous(), "splitk_fuse bias must be contiguous");
         AITER_CHECK(bt.dtype() == AITER_DTYPE_bf16,
@@ -82,7 +82,7 @@ void
         AITER_CHECK(bt.dim() == 1 && bt.size(0) == N,
             "splitk_fuse bias must have shape [N]; got dim=", bt.dim());
         ptr_bias_ = bt.data_ptr();
-    }
+    }}
 
     // Physical layout: [num_tiles_m, num_tiles_n, SplitK-1, B_M, B_N].
     const size_t tile_numel = opus_checked_extent_product(
@@ -100,7 +100,7 @@ void
     using Traits = [[ name ]]_Traits<D_C>;
     auto stream = aiter::getCurrentHIPStream();
 
-    [[ kargs_name ]] kargs{};
+    [[ kargs_name ]] kargs{{}};
     kargs.ptr_a = XQ.data_ptr();
     kargs.ptr_b = WQ.data_ptr();
     kargs.ptr_ws = workspace_ptr_;
@@ -121,12 +121,12 @@ void
     // cluster = (SplitK, N peers, 1); M tiles occupy grid.z.
     dim3 grid_main([[ split_k ]], num_tiles_n, num_tiles_m);
     dim3 block_main([[ k.BLOCK_SIZE ]]);
-    if (Y.dtype() == AITER_DTYPE_bf16) {
+    if (Y.dtype() == AITER_DTYPE_bf16) {{
         [[ kernel_func ]]<Traits, [[ split_k ]], [[ workspace_ptr_type ]], [[ n_cluster ]], __bf16>
             <<<grid_main, block_main, 0, stream>>>(kargs);
-    } else {
+    }} else {{
         [[ kernel_func ]]<Traits, [[ split_k ]], [[ workspace_ptr_type ]], [[ n_cluster ]], float>
             <<<grid_main, block_main, 0, stream>>>(kargs);
-    }
-}
+    }}
+}}
 #endif
