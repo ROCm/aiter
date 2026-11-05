@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import itertools
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -1073,6 +1074,45 @@ def test_flydsl_kda_decode_exports() -> None:
     assert flydsl_ops.is_flydsl_kda_decode_supported is is_flydsl_kda_decode_supported
     assert is_flydsl_kda_decode_supported(torch.cuda.current_device())
     assert not is_flydsl_kda_decode_supported("cpu")
+
+
+@_requires_kda
+def test_flydsl_kda_decode_supported_checks_each_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    cached = linear_attention_kernels._is_kda_device_supported
+    device = torch.cuda.current_device()
+    get_properties = torch.cuda.get_device_properties
+    gfx942 = SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+    try:
+        cached.cache_clear()
+        with monkeypatch.context() as patch:
+            # The arch of the device asked about, not of the first GPU.
+            patch.setattr(torch.cuda, "get_device_properties", lambda index: gfx942)
+            assert not is_flydsl_kda_decode_supported(device)
+        cached.cache_clear()
+        with monkeypatch.context() as patch:
+            # A gfx950 device, but FlyDSL builds for another arch.
+            patch.setattr(linear_attention_kernels, "GDR_GPU_ARCH", "gfx942")
+            assert not is_flydsl_kda_decode_supported(device)
+        cached.cache_clear()
+        calls = []
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                torch.cuda,
+                "get_device_properties",
+                lambda index: calls.append(index) or get_properties(index),
+            )
+            assert is_flydsl_kda_decode_supported(device)
+            assert is_flydsl_kda_decode_supported(f"cuda:{device}")
+            assert is_flydsl_kda_decode_supported(torch.device("cuda"))
+        # Queried once per device, then memoized.
+        assert calls == [device]
+        assert not is_flydsl_kda_decode_supported(torch.cuda.device_count())
+    finally:
+        cached.cache_clear()
 
 
 @_requires_kda
