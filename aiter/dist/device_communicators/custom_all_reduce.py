@@ -20,7 +20,7 @@ import functools
 import os
 import pickle
 from contextlib import contextmanager
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -268,19 +268,71 @@ def _runtime_gfx() -> str | None:
         return None
 
 
-# Default custom-AR size cutoff (bytes): inputs at or below this run on the
-# custom kernels, larger ones fall back to RCCL. 64 MiB == 8192*8192, matching
-# the historical decode threshold.
+# Per-op size cutoffs (bytes). Each collective runs on the custom kernels for
+# inputs at or below its cutoff and falls back to RCCL above it; 0 turns that op
+# off. The three are independent: an unset one takes its own default, never
+# another op's value.
+#
+#   AITER_CUSTOM_AR_MAX_SIZE  all-reduce input bytes.       Default 64 MiB.
+#   AITER_CUSTOM_AG_MAX_SIZE  all-gather per-rank input.    Default
+#                             max_size / (2 * world_size), i.e. 128 MiB at
+#                             world_size 4 with the default 1 GiB max_size.
+#   AITER_CUSTOM_RS_MAX_SIZE  reduce-scatter input bytes.   Default 64 MiB.
+#
+# All three ops stage their input in the registered input pool on the copy-in
+# path, so none can exceed the pool. How that pool is sized depends on the arch
+# (see _resolve_custom_sizes):
+#
+#   gfx1250: the pool grows to max(max_size, the cutoffs set in the env),
+#            rounded up to 2 MiB. Its kernels are 1-stage with no tmp region,
+#            so the cost is exactly the pool, once per rank. The cutoffs are
+#            first capped at what the kernels can index with int32 (see
+#            _gfx1250_kernel_caps), so the pool never grows for a size no
+#            kernel takes.
+#   gfx9:    the pool stays at max_size (1 GiB by default) whatever the env
+#            says. The old-arch meta buffer also carries a 2 * max_size tmp
+#            region (see _init_ipc), so a pool of N would cost about 3N per
+#            rank (16 GiB -> ~48 GiB). A cutoff above what the pool holds is
+#            capped there, and inputs above the cap fall back to RCCL.
 _DEFAULT_CAR_MAX_SIZE = 8192 * 8192
-
-# Env var to override the custom-AR size cutoff (in bytes). See
-# _resolve_car_max_size for the semantics.
+_DEFAULT_CRS_MAX_SIZE = 8192 * 8192
 _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
+_CAG_MAX_SIZE_ENV = "AITER_CUSTOM_AG_MAX_SIZE"
+_CRS_MAX_SIZE_ENV = "AITER_CUSTOM_RS_MAX_SIZE"
 
-# Custom-AR lower size bound (bytes). Inputs at or below this run on RCCL
-# instead of the custom kernels; only inputs strictly above it are routed to
-# custom AR. Default 0 (no lower bound) — unchanged behavior. Together with
-# _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR runs.
+# gfx1250 rounds a pool grown from the env up to this, the coarse-grained
+# allocation granularity (see _init_ipc). VMMBuffer rounds to its own
+# granularity on top.
+_POOL_ALIGN = 2 * 1024 * 1024
+
+_INT32_MAX = (1 << 31) - 1
+
+
+def _gfx1250_kernel_caps(world_size: int) -> tuple[int, int, int]:
+    """Largest AR / AG / RS input (bytes) the gfx1250 kernels can index.
+
+    They index with int32, and these caps are the C++ checks restated in
+    bytes. Keep them in sync with custom_all_reduce_gfx1250.cuh, or the size
+    gates admit inputs the kernels then reject with an exception instead of
+    falling back to RCCL.
+
+    * AG: allgather_packs counts the output in 16-byte packs, so the output
+      can be up to 16 * INT32_MAX bytes whatever the dtype. Per rank that is
+      16 * (INT32_MAX // world_size).
+    * AR / RS: allreduce() and reduce_scatter() take the element count as
+      int, and the kernels' index arithmetic stays within it. 2 bytes is the
+      narrowest dtype they take (fp16 / bf16), so 2 * INT32_MAX bytes keeps
+      the element count in range for every dtype.
+    """
+    ar_rs = 2 * _INT32_MAX
+    return ar_rs, 16 * (_INT32_MAX // world_size), ar_rs
+
+
+# Custom-AR lower size bound (bytes), all-reduce only. Inputs at or below this
+# run on RCCL instead of the custom kernels; only inputs strictly above it are
+# routed to custom AR. Default 0 (no lower bound) — unchanged behavior. Together
+# with _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR
+# runs. All-gather and reduce-scatter ignore it.
 _DEFAULT_CAR_MIN_SIZE = 0
 
 # Env var to override the custom-AR lower size bound (in bytes). See
@@ -288,66 +340,115 @@ _DEFAULT_CAR_MIN_SIZE = 0
 _CAR_MIN_SIZE_ENV = "AITER_CUSTOM_AR_MIN_SIZE"
 
 
-def _resolve_car_max_size(pool_size: int) -> int:
-    """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
+def _read_size_env(name: str, default: int) -> tuple[int, bool]:
+    """Read a byte count from env var *name*.
 
-    Semantics:
-      * unset / empty / unparyable  -> default (64 MiB), i.e. unchanged behavior.
-      * 0                           -> 0: custom AR disabled, everything uses RCCL.
-      * 0 < v <= pool_size          -> v: custom AR used up to v bytes.
-      * v > pool_size               -> too large: the registered pool cannot hold
-                                       it. Raise (then catch), warn, and fall back
-                                       to the 64 MiB default.
-
-    ``pool_size`` is the registered input-buffer size (``CustomAllreduce.max_size``).
+    Returns ``(value, from_env)``. Unset or empty gives ``(default, False)``. A
+    value that is not an integer, or is negative, warns and also gives
+    ``(default, False)``.
     """
-    raw = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+    raw = os.environ.get(name, "").strip()
     if raw == "":
-        return _DEFAULT_CAR_MAX_SIZE
+        return default, False
     try:
         v = int(raw)
     except ValueError:
         logger.warning(
-            "%s=%r is not an integer; using default %d bytes.",
-            _CAR_MAX_SIZE_ENV,
-            raw,
-            _DEFAULT_CAR_MAX_SIZE,
+            "%s=%r is not an integer; using default %d bytes.", name, raw, default
         )
-        return _DEFAULT_CAR_MAX_SIZE
+        return default, False
     if v < 0:
-        logger.warning(
-            "%s=%d is negative; using default %d bytes.",
-            _CAR_MAX_SIZE_ENV,
-            v,
-            _DEFAULT_CAR_MAX_SIZE,
+        logger.warning("%s=%d is negative; using default %d bytes.", name, v, default)
+        return default, False
+    return v, True
+
+
+class _CustomSizes(NamedTuple):
+    """Pool size and per-op cutoffs (bytes) resolved by _resolve_custom_sizes."""
+
+    pool: int
+    ar: int
+    ar_prefill: int
+    ag: int
+    rs: int
+
+
+def _resolve_custom_sizes(
+    is_gfx1250: bool, world_size: int, max_size: int
+) -> _CustomSizes:
+    """Resolve the input-pool size and the AR / AG / RS cutoffs from the env.
+
+    ``max_size`` is the constructor's pool size. On gfx1250 it is the floor
+    that the env can only raise; on gfx9 it is the pool size, period. See the
+    comment above _DEFAULT_CAR_MAX_SIZE for the env vars and the reasoning.
+
+    Every cutoff is capped at what the pool can hold. On gfx1250 each is
+    first capped at what its kernel can index (_gfx1250_kernel_caps), before
+    the pool is sized from them. The AR prefill cutoff is capped further on
+    gfx9, whose 2-stage write mode needs the 2x tmp region, to half the pool,
+    as before. gfx1250 has no tmp region and no such cap.
+    """
+    ar, ar_set = _read_size_env(_CAR_MAX_SIZE_ENV, _DEFAULT_CAR_MAX_SIZE)
+    ag, ag_set = _read_size_env(_CAG_MAX_SIZE_ENV, max_size // (2 * world_size))
+    rs, rs_set = _read_size_env(_CRS_MAX_SIZE_ENV, _DEFAULT_CRS_MAX_SIZE)
+    requested = [
+        (name, v)
+        for name, v, is_set in (
+            (_CAR_MAX_SIZE_ENV, ar, ar_set),
+            (_CAG_MAX_SIZE_ENV, ag, ag_set),
+            (_CRS_MAX_SIZE_ENV, rs, rs_set),
         )
-        return _DEFAULT_CAR_MAX_SIZE
-    if v == 0:
-        logger.info(
-            "%s=0: custom allreduce disabled; all sizes fall back to RCCL.",
-            _CAR_MAX_SIZE_ENV,
-        )
-        return 0
-    try:
-        if v > pool_size:
-            raise ValueError(
-                f"{_CAR_MAX_SIZE_ENV}={v} exceeds the custom-AR pool size "
-                f"({pool_size} bytes); the registered buffer cannot hold inputs "
-                f"that large."
-            )
-    except ValueError as e:
-        logger.warning(
-            "%s Falling back to the default %d bytes (64 MiB).",
-            e,
-            _DEFAULT_CAR_MAX_SIZE,
-        )
-        return _DEFAULT_CAR_MAX_SIZE
-    logger.info(
-        "Custom allreduce size cutoff overridden to %d bytes via %s.",
-        v,
-        _CAR_MAX_SIZE_ENV,
-    )
-    return v
+        if is_set
+    ]
+
+    pool = max_size
+    if is_gfx1250:
+        ar_cap, ag_cap, rs_cap = _gfx1250_kernel_caps(world_size)
+        caps = {
+            _CAR_MAX_SIZE_ENV: ar_cap,
+            _CAG_MAX_SIZE_ENV: ag_cap,
+            _CRS_MAX_SIZE_ENV: rs_cap,
+        }
+        for name, v in requested:
+            if v > caps[name]:
+                logger.warning(
+                    "%s=%d is more than the gfx1250 kernels can index with "
+                    "int32 at world_size %d; capped at %d bytes. Inputs above "
+                    "it fall back to RCCL.",
+                    name,
+                    v,
+                    world_size,
+                    caps[name],
+                )
+        ar, ag, rs = min(ar, ar_cap), min(ag, ag_cap), min(rs, rs_cap)
+        requested = [(name, min(v, caps[name])) for name, v in requested]
+        # Grow only for the cutoffs that were set, so with none set the pool
+        # stays exactly max_size.
+        want = max((v for _, v in requested), default=0)
+        if want > pool:
+            pool = (want + _POOL_ALIGN - 1) // _POOL_ALIGN * _POOL_ALIGN
+    else:
+        for name, v in requested:
+            if v > pool:
+                logger.warning(
+                    "%s=%d exceeds the %d-byte custom allreduce pool, which is "
+                    "not grown on this arch (its 2x tmp region would cost "
+                    "about 3x the pool per rank). Inputs above %d bytes fall "
+                    "back to RCCL.",
+                    name,
+                    v,
+                    pool,
+                    pool,
+                )
+
+    ar = min(ar, pool)
+    ag = min(ag, pool)
+    rs = min(rs, pool)
+    ar_prefill = ar if is_gfx1250 else min(ar, pool // 2)
+    for name, v in requested:
+        if v == 0:
+            logger.info("%s=0: that op always falls back to RCCL.", name)
+    return _CustomSizes(pool, ar, ar_prefill, ag, rs)
 
 
 def _resolve_car_min_size() -> int:
@@ -1090,12 +1191,11 @@ class CustomAllreduce:
             self._ops_get_graph_buffer_ptrs = None
             self._ops_register_graph_buffers = ops.register_graph_buffers
 
-    # max_size: max supported allreduce size
     def __init__(
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=1024 * 1024 * 1024,  # 2GB bf16/half
+        max_size=1024 * 1024 * 1024,
         enable_register_for_capturing: bool = True,
     ) -> None:
         """
@@ -1104,6 +1204,10 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bind to f"cuda:{local_rank}".
+            max_size: registered input pool size in bytes. On gfx1250 the
+                pool grows past it when AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE asks
+                for more; on gfx9 it is the pool size. See
+                _resolve_custom_sizes.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -1270,11 +1374,26 @@ class CustomAllreduce:
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
-        self.max_size = max_size
-        # Custom-AR size cutoff (bytes): inputs at or below this run on the
-        # custom kernels; larger ones fall back to RCCL. Overridable via
-        # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
-        self._car_max_size = _resolve_car_max_size(max_size)
+        # Input pool size and per-op cutoffs (bytes). Inputs at or below an
+        # op's cutoff run on the custom kernels; larger ones fall back to RCCL.
+        # Set by AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE; on gfx1250 the pool grows to
+        # hold the largest one set. See _resolve_custom_sizes.
+        sizes = _resolve_custom_sizes(self._is_gfx1250, world_size, max_size)
+        self.max_size = sizes.pool
+        self._car_max_size = sizes.ar
+        self._car_prefill_max_size = sizes.ar_prefill
+        self._cag_max_size = sizes.ag
+        self._crs_max_size = sizes.rs
+        logger.info(
+            "Custom allreduce rank %d: input pool %d bytes; cutoffs AR %d "
+            "(prefill %d), AG %d, RS %d bytes.",
+            rank,
+            sizes.pool,
+            sizes.ar,
+            sizes.ar_prefill,
+            sizes.ag,
+            sizes.rs,
+        )
         # Custom-AR lower size bound (bytes): inputs at or below this fall back
         # to RCCL. Default 0 (no lower bound). Overridable via
         # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
@@ -1287,11 +1406,11 @@ class CustomAllreduce:
         # symm_mem is there, so failing now means a broken setup, not an
         # unsupported one, and it raises.
         if self._use_symm_mem:
-            self._init_symm_mem(rank, world_size, max_size)
+            self._init_symm_mem(rank, world_size, self.max_size)
         elif self._use_vmm:
-            self._init_gfx1250(rank, world_size, max_size)
+            self._init_gfx1250(rank, world_size, self.max_size)
         else:
-            self._init_ipc(rank, world_size, max_size)
+            self._init_ipc(rank, world_size, self.max_size)
 
         self._fly_oneshot = None
         self._fly_window = None
@@ -1916,35 +2035,38 @@ class CustomAllreduce:
             or self.world_size in CustomAllreduce._GATHER_SCATTER_WORLD_SIZES
         )
 
-    def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
+    def _fits_custom_size(
+        self, inp: torch.Tensor, max_bytes: int, min_bytes: int = 0
+    ) -> bool:
+        """Size gate shared by all-reduce and reduce-scatter: custom kernels
+        take inputs in (min_bytes, max_bytes]. max_bytes 0 turns the op off."""
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
-        # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
-        if self._car_max_size <= 0:
+        if max_bytes <= 0:
             return False
         # gfx1250 groups above 8 ranks are allgather-only.
         if self.world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
             return False
-        # AITER_CUSTOM_AR_MIN_SIZE lower bound: inputs at or below it fall back
-        # to RCCL (custom AR runs only in the (min, max] window). Default 0 keeps
-        # the historical behavior of accepting all sizes down to 16 bytes.
-        if inp_size <= self._car_min_size:
+        if inp_size <= min_bytes:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            # decode: env-controlled cutoff (default 64 MiB).
-            if not prefill_support:
-                return inp_size <= self._car_max_size
-            # prefill: also bounded by the 2x tmp buffer (max_size / 2).
-            else:
-                return inp_size <= min(self._car_max_size, self.max_size / 2)
+            return inp_size <= max_bytes
         return False
+
+    def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
+        # AITER_CUSTOM_AR_MAX_SIZE / AITER_CUSTOM_AR_MIN_SIZE window. Prefill
+        # is also bounded by half the pool on gfx9, where the 2-stage write
+        # mode uses the 2x tmp region (see _resolve_custom_sizes).
+        max_bytes = (
+            self._car_prefill_max_size if prefill_support else self._car_max_size
+        )
+        return self._fits_custom_size(inp, max_bytes, self._car_min_size)
 
     def _should_fly_oneshot(
         self, inp: torch.Tensor, use_new: bool, open_fp8_quant: bool
@@ -2042,10 +2164,13 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # all_gather output = input * world_size, so the per-rank input
-        # must fit within max_size / world_size
+        # AITER_CUSTOM_AG_MAX_SIZE caps the per-rank input; 0 turns custom
+        # all-gather off. The default, max_size / (2 * world_size), predates
+        # the env var and is kept as is.
+        if self._cag_max_size <= 0:
+            return False
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / (self.world_size * 2))
+            return inp_size <= self._cag_max_size
         return False
 
     def all_reduce(
@@ -2220,7 +2345,8 @@ class CustomAllreduce:
         """Return True iff the custom reduce_scatter kernel can handle
         (inp, dim). Mirrors the C++ dispatch's hard requirements:
 
-          - all the should_custom_ar gates (size cap, contiguous, etc.)
+          - the custom size gates, with AITER_CUSTOM_RS_MAX_SIZE as the cap,
+            and a weak-contiguous input
           - inp.shape[dim_normalized] % world_size == 0
           - for dim == 0 (first-dim split) the flattened input must be
             vectorizable: numel % (world_size * pack_size) == 0; there is
@@ -2228,7 +2354,12 @@ class CustomAllreduce:
             expected to route to an external lib in that case.
             (last/mid-dim kernels have naive fallbacks built in.)
         """
-        if not self._has_gather_scatter_kernel() or not self.should_custom_ar(inp):
+        if not self._has_gather_scatter_kernel():
+            return False
+        # AITER_CUSTOM_RS_MAX_SIZE; the AR cutoffs do not apply.
+        if not self._fits_custom_size(inp, self._crs_max_size):
+            return False
+        if not is_weak_contiguous(inp):
             return False
         ndim = inp.dim()
         if dim < 0:
@@ -3232,7 +3363,7 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
-        # Free the meta + input (max_size, up to 1 GB) buffers deterministically
+        # Free the meta + input (max_size) buffers deterministically
         # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
         pool = getattr(self, "_pool", None)
         if pool is not None and hasattr(pool, "close"):
