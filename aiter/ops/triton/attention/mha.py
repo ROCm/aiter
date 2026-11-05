@@ -1194,7 +1194,8 @@ def flash_attn_func(
     ):
         if _resolve_backend(backend) == "gluon":
             raise ValueError("MXFP8 attention is supported on the triton backend only.")
-        if implementation == "dao_ai":
+        # Resolve first: it applies the mha_set_impl default and rejects unknown values.
+        if _resolve_implementation(implementation) == "dao_ai":
             raise ValueError(
                 "MXFP8 attention is not supported by the dao_ai implementation."
             )

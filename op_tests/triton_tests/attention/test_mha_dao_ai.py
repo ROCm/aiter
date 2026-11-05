@@ -308,6 +308,35 @@ def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
     torch.testing.assert_close(lse, ref_lse.float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "default, implementation, message",
+    [
+        ("dao_ai", None, "not supported by the dao_ai"),
+        ("default", "dao_ai", "not supported by the dao_ai"),
+        ("default", "unknown", "Unknown MHA implementation"),
+    ],
+)
+def test_mha_dao_ai_mxfp8_selector(default, implementation, message):
+    """MXFP8 resolves the selector before its forward: the dao_ai default and an
+    unknown selector are refused like an explicit dao_ai."""
+    q = torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    mha_set_impl(default)
+    try:
+        with pytest.raises(ValueError, match=message):
+            flash_attn_func(
+                q,
+                q,
+                q,
+                q_mx_scale=scale,
+                k_mx_scale=scale,
+                v_mx_scale=scale,
+                implementation=implementation,
+            )
+    finally:
+        mha_set_impl("default")
+
+
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 def test_mha_dao_ai_dropout_backward(varlen, causal):
