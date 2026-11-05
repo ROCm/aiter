@@ -188,7 +188,7 @@ for file in "${sharded_files[@]}"; do
                 bash -c '
                     set -euo pipefail
                     python3 "$1" -w 2 4 8 --heads 8 40
-                    python3 "$1" -w 4 8 --heads 8 --sequences 1184 \
+                    python3 "$1" -w 2 4 8 --heads 8 --sequences 1184 \
                         --inbox-memory finegrained
                 '
                 _ "$file"

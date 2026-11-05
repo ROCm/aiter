@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Uncached HIP IPC memory shared across ranks by the FlyDSL comm kernels."""
+"""HIP IPC memory shared across ranks by the FlyDSL comm kernels."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import ctypes
 import os
 
 
-class UncachedIpcHeap:
-    """Allocate uncached device memory and share it across ranks via HIP IPC."""
+class IpcHeap:
+    """Allocate uncached or fine-grained device memory and share it across ranks via HIP IPC."""
 
     _HIP_IPC_HANDLE_BYTES = 64
     _HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1

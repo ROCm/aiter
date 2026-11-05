@@ -8,8 +8,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from .comm_collectives_host_shared import _resolve_inbox_flags
-from .ipc_heap import UncachedIpcHeap
+from .comm_collectives_host_shared import resolve_inbox_flags
+from .ipc_heap import IpcHeap
 
 
 def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
@@ -103,7 +103,11 @@ class IpcSymmetricHeap:
     """
 
     def __init__(self, *, rank, world_size, device, group, memory):
-        self._flags, self.memory = _resolve_inbox_flags(memory, world_size)
+        if memory not in ("uncached", "finegrained"):
+            raise ValueError(
+                f"IpcSymmetricHeap needs a resolved memory type, got {memory!r}"
+            )
+        self._flags, self.memory = resolve_inbox_flags(memory, world_size)
         self.rank, self.world_size, self.device = rank, world_size, device
         self.group = group
         self._local = []
@@ -115,7 +119,7 @@ class IpcSymmetricHeap:
     def create_tensor(self, shape, dtype):
         nbytes = torch.Size(shape).numel() * dtype.itemsize
         with torch.cuda.device(self.device):
-            ptr = UncachedIpcHeap.alloc(max(nbytes, 1), self._flags)
+            ptr = IpcHeap.alloc(max(nbytes, 1), self._flags)
         self._local.append(ptr)
         self._peer_ptrs.append(None)
         tensor = torch.as_tensor(_DeviceBuffer(ptr, nbytes), device=self.device)
@@ -128,9 +132,7 @@ class IpcSymmetricHeap:
         )
         error = None
         try:
-            handles = [
-                UncachedIpcHeap.get_mem_handle_bytes(p) for p in self._local[start:]
-            ]
+            handles = [IpcHeap.get_mem_handle_bytes(p) for p in self._local[start:]]
         except Exception as exc:  # noqa: BLE001
             error, handles = exc, None
         # Every rank joins both collectives, and a failure on one rank raises on
@@ -148,7 +150,7 @@ class IpcSymmetricHeap:
                         if peer == self.rank:
                             ptrs.append(ptr)
                         else:
-                            base = UncachedIpcHeap.open_mem_handle(peer_handles[i])
+                            base = IpcHeap.open_mem_handle(peer_handles[i])
                             self._opened.append(base)
                             ptrs.append(base)
                     self._peer_ptrs[start + i] = ptrs
@@ -181,12 +183,12 @@ class IpcSymmetricHeap:
         torch.cuda.synchronize(self.device)
         for base in self._opened:
             try:
-                UncachedIpcHeap.close_mem_handle(base)
+                IpcHeap.close_mem_handle(base)
             except RuntimeError:
                 pass
         for ptr in self._local:
             try:
-                UncachedIpcHeap.free_device_mem(ptr)
+                IpcHeap.free_device_mem(ptr)
             except RuntimeError:
                 pass
         self._opened, self._local, self._peer_ptrs = [], [], []

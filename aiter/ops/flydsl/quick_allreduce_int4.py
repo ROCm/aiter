@@ -40,7 +40,6 @@ from .allreduce_policy import (
 )
 from .comm_collectives_host_shared import (
     _cuda_index,
-    _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
     check_payload,
@@ -50,6 +49,7 @@ from .comm_collectives_host_shared import (
     payload_probes,
     preload_launcher,
     require_arch,
+    resolve_inbox_flags,
 )
 from .kernels.comm.allreduce_shared import (
     BLOCK,
@@ -323,7 +323,7 @@ class QuickAllReduceInt4:
             )
         if norm_ladder is not None and not norm_ladder:
             raise ValueError("norm_ladder must have at least one rung")
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+        inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
         self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")

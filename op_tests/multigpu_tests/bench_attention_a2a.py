@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 
 # Requested global shapes (B, S, H, D); S is padded up to a multiple of world * 32.
 _SHAPES = {
@@ -536,7 +537,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=15)
     parser.add_argument(
         "--inbox-memory",
-        choices=("auto", "uncached", "finegrained"),
+        choices=INBOX_MEMORY_MODES,
         default="auto",
         help="memory type of the peer-written buffers (auto: uncached on xGMI, "
         "fine-grained on PCIe); only uncached needs MoRI",
@@ -565,10 +566,11 @@ def main():
         )
         return 0
     from aiter.ops.flydsl.allreduce_policy import detect_link
-    from aiter.ops.flydsl.comm_collectives_host_shared import _resolve_inbox_flags
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
 
-    args.link = detect_link()
-    args.resolved_inbox = _resolve_inbox_flags(
+    # Only auto depends on the link; a named mode must not fail without it.
+    args.link = detect_link() if args.inbox_memory == "auto" else "n/a"
+    args.resolved_inbox = resolve_inbox_flags(
         args.inbox_memory, args.world_size, args.link
     )[1]
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)

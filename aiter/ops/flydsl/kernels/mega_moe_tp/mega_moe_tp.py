@@ -15,7 +15,7 @@ import torch.distributed as dist
 
 from aiter.jit.core import AITER_CONFIGS
 
-from ...ipc_heap import UncachedIpcHeap as _Ipc
+from ...ipc_heap import IpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import device_key, nearest, tuned_rows

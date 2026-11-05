@@ -21,7 +21,7 @@ from aiter.ops.mha_v4_quant import (
     mxfp6_v_tiles,
 )
 
-from .comm_collectives_host_shared import _resolve_inbox_flags
+from .comm_collectives_host_shared import resolve_inbox_flags
 from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,
@@ -417,18 +417,7 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
-        self.inbox_memory = _resolve_inbox_flags(inbox_memory, world_size)[1]
-        # The MoRI heap checks rank against MoRI's PE here; the IPC heap is
-        # local until publish().
-        heap = make_symmetric_heap(
-            memory=self.inbox_memory,
-            rank=rank,
-            world_size=world_size,
-            device=self.device,
-            group=group,
-        )
-        # Owned from here, so a failed construction still frees it in __del__.
-        self._heap = heap
+        self.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
         # Must run before any symmetric allocation: mismatched configs
         # would otherwise hang in the shmem barrier instead of raising.
         if group.size() != world_size:
@@ -458,6 +447,17 @@ class AttentionA2AIntraNodeOp:
             raise ValueError(
                 f"ranks disagree on AttentionA2AIntraNodeOp config: {configs}"
             )
+        # After the agreement check: the MoRI heap checks rank against MoRI's
+        # PE, and a rank failing that alone would leave its peers in the gather.
+        heap = make_symmetric_heap(
+            memory=self.inbox_memory,
+            rank=rank,
+            world_size=world_size,
+            device=self.device,
+            group=group,
+        )
+        # Owned from here, so a failed construction still frees it in __del__.
+        self._heap = heap
         role_sequences = (seq_full, valid_kv_len, valid_kv_len)
         role_numels = tuple(
             sequence * heads_local * shape[3] for sequence in role_sequences

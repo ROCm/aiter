@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import _f32_to_floatx_unpacked, e8m0_to_f32
@@ -688,19 +689,23 @@ def _check_valid_kv_rejections(rank, world_size, op_cls):
 def _check_group_disagreement(rank, world_size, op_cls):
     """Differing configs must raise ValueError on every rank before any allocation."""
     failure = None
-    try:
-        op_cls(
-            rank=rank,
-            world_size=world_size,
-            shape=(1, 64, 8, 128),
-            block_num=64 if rank == 0 else _DEFAULT_BLOCKS,
-        )
-        failure = "accepted a config that differs across ranks"
-    except ValueError as exc:
-        if "disagree" not in str(exc):
-            failure = f"wrong ValueError: {exc}"
-    except Exception as exc:  # noqa: BLE001
-        failure = f"{type(exc).__name__}: {exc}"
+    # Each case differs on rank 0 only. The inbox_memory one must raise before
+    # the heap exists, even where one rank would fail its MoRI check.
+    cases = (
+        {"block_num": 64 if rank == 0 else _DEFAULT_BLOCKS},
+        {"inbox_memory": "uncached" if rank == 0 else "finegrained"},
+    )
+    for case in cases:
+        try:
+            op_cls(rank=rank, world_size=world_size, shape=(1, 64, 8, 128), **case)
+            failure = f"accepted a config that differs across ranks: {case}"
+        except ValueError as exc:
+            if "disagree" not in str(exc):
+                failure = f"wrong ValueError: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            failure = f"{type(exc).__name__}: {exc}"
+        if failure is not None:
+            break
     # Report cross-rank so one rank's failure is seen by all, not just itself.
     flags = torch.zeros(world_size, dtype=torch.int32)
     flags[rank] = failure is not None
@@ -1355,10 +1360,10 @@ def _run_rank(
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
-    from aiter.ops.flydsl.comm_collectives_host_shared import _resolve_inbox_flags
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
 
     # Only the uncached (MoRI heap) path needs MoRI.
-    _CTX.inbox_memory = _resolve_inbox_flags(inbox_memory, world_size)[1]
+    _CTX.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
     ms = None
     if _CTX.inbox_memory == "uncached":
         import mori.shmem as ms
@@ -1506,7 +1511,7 @@ def main():
     )
     parser.add_argument(
         "--inbox-memory",
-        choices=("auto", "uncached", "finegrained"),
+        choices=INBOX_MEMORY_MODES,
         default="auto",
         help="memory type of the peer-written buffers (auto: uncached on xGMI,\n"
         "fine-grained on PCIe); only uncached needs MoRI",
