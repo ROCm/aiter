@@ -592,3 +592,146 @@ def _wg_kv_span(
     else:
         kv_len_wg = kv_len
     return m_tile_idx, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))
+
+
+# ============================================================================
+# KV addressing policies -- where a tile's rows come from. Dtype-agnostic, so the
+# a16w16 and a8w8 cores share them.
+# ============================================================================
+
+
+class PagedSpec:
+    """The paged KV pool as the entry sees it; ``page_size`` compile-time, rest runtime."""
+
+    __slots__ = (
+        "ptr_page_indices",
+        "num_page_entries",
+        "page_base",
+        "page_size",
+        "num_pool_rows",
+    )
+
+    def __init__(
+        self, *, ptr_page_indices, num_page_entries, page_base, page_size, num_pool_rows
+    ):
+        self.ptr_page_indices = ptr_page_indices
+        self.num_page_entries = num_page_entries
+        self.page_base = page_base
+        self.page_size = page_size
+        self.num_pool_rows = num_pool_rows
+
+
+class _ContiguousKVPolicy:
+    """Tile index -> K/V descriptor for a dense band. The core reads tile positions
+    through this so paging can swap it out; softmax positions, masking and the slot
+    rotation stay addressing-agnostic."""
+
+    def __init__(self, *, tile_row0, kv_valid, row_base):
+        self.tile_row0 = tile_row0
+        self.kv_valid = kv_valid
+        self.row_base = row_base
+
+    num_state_slots = 0
+
+    def indices(self, carried):
+        return None
+
+    def advance(self, tile_idx):
+        return []
+
+    def indices_for(self, tile_idx):
+        return None
+
+    def init_state(self, first_tile_idx):
+        return []
+
+    def desc_kwargs(self, page_indices):
+        return {}
+
+
+class _PagedKVPolicy:
+    """Tile index -> K/V descriptor for a PAGED pool. ``row_base`` is 0: positions stay
+    sequence-relative and the page table supplies the pool row. ``prepare`` is the one
+    memory op (the SGPR load of this band's pages); the descriptor build stays pure."""
+
+    def __init__(
+        self,
+        *,
+        tile_row0,
+        kv_valid,
+        ptr_page_indices,
+        num_page_entries,
+        page_base,
+        page_size,
+        num_pool_rows,
+        producer_warp,
+        num_producer_warps,
+        n_block,
+    ):
+        self.tile_row0 = tile_row0
+        self.kv_valid = kv_valid
+        # sequence-relative: the page table supplies the pool row
+        self.row_base = fx.Int32(0)
+        self._ptr_page_indices = ptr_page_indices
+        self._num_page_entries = num_page_entries
+        self._page_base = page_base
+        self._page_size = page_size
+        self._num_pool_rows = num_pool_rows
+        self._producer_warp = producer_warp
+        num_rows = n_block // num_producer_warps
+        assert page_size & (page_size - 1) == 0, "page_size must be a power of two"
+        self._num_rows = num_rows
+        self._log2_page = page_size.bit_length() - 1
+        # bands start at a multiple of num_rows, so this keeps them from straddling
+        assert (
+            num_rows % page_size == 0 or page_size % num_rows == 0
+        ), f"band of {num_rows} rows and page_size {page_size}: one must divide the other"
+        self._num_pages = max(1, num_rows // page_size)
+        # Distance-2 index prefetch. The descriptor BUILD consumes these and is hoisted
+        # above the drain, so loading them in the same body would put s_wait_kmcnt right
+        # on the dependency. Carrying widens a live range instead of adding one -- a
+        # band's indices die at its build -- so it stays affordable at the widest case,
+        # num_rows of them at page_size 1.
+        self.num_state_slots = self._num_pages
+        # Sentinel for dead rows: the sequence's first token, whose page is referenced
+        # by construction (pool row 0's may not be, and NaN there reaches O).
+        self._sentinel_row = s_buffer_load(
+            ptr_page_indices, page_base, 1, num_records_bytes=num_page_entries * 4
+        )[0] * fx.Int32(page_size)
+
+    def _load(self, tile_idx):
+        band_tok0 = self.tile_row0(tile_idx) + self._producer_warp * fx.Int32(
+            self._num_rows
+        )
+        slot0 = self._page_base + (band_tok0 >> fx.Int32(self._log2_page))
+        return s_buffer_load(
+            self._ptr_page_indices,
+            slot0,
+            self._num_pages,
+            num_records_bytes=self._num_page_entries * 4,
+        )
+
+    def indices(self, carried):
+        """This tile's page indices, loaded a body ago."""
+        return [fx.Int32(c) for c in carried]
+
+    def advance(self, tile_idx):
+        """Start the next body's load. Nothing in THIS body consumes it, so the caller
+        places it wherever the kmcnt wait is cheapest."""
+        return self._load(tile_idx + fx.Int32(1))
+
+    def indices_for(self, tile_idx):
+        """Direct load, for the prologue's own start descriptor -- there is no earlier
+        body to have carried it."""
+        return self._load(tile_idx)
+
+    def init_state(self, first_tile_idx):
+        return self._load(first_tile_idx)
+
+    def desc_kwargs(self, page_indices):
+        return {
+            "page_indices": page_indices,
+            "page_size": self._page_size,
+            "num_pool_rows": self._num_pool_rows,
+            "sentinel_row": self._sentinel_row,
+        }
