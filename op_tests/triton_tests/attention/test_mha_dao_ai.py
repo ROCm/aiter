@@ -410,28 +410,41 @@ def test_mha_dao_ai_dropout_backward(varlen, causal):
     scores = scores[:, :, :seqlen, :seqlen]
     pad = (0, seqlen - scores.shape[3], 0, seqlen - scores.shape[2])
     dropout_mask = torch.nn.functional.pad(scores, pad, value=-1.0) >= 0
-    ref_out, ref_grads, (fwd_atol, fwd_rtol), bwd_tols = attention_ref_with_tol(
-        q,
-        k,
-        v,
-        do,
-        dropout_p=dropout_p,
-        dropout_mask=dropout_mask,
-        causal=causal,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-    )
-    torch.testing.assert_close(out, ref_out, atol=fwd_atol, rtol=fwd_rtol)
-    for got, ref, (atol, rtol), name in zip(
-        grads, ref_grads, bwd_tols, ("dq", "dk", "dv")
-    ):
-        torch.testing.assert_close(
-            got,
-            ref,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda m, name=name: f"dao_ai dropout bwd {name} mismatch\n\n{m}\n",
+
+    def reference(mask, upcast=True):
+        """Output and gradients of the reference with this dropout mask."""
+        q_, k_, v_ = (x.detach().clone().requires_grad_() for x in (q, k, v))
+        ref, _, _ = attention_ref(
+            q_,
+            k_,
+            v_,
+            query_padding_mask,
+            key_padding_mask,
+            dropout_p=dropout_p,
+            dropout_mask=mask,
+            causal=causal,
+            upcast=upcast,
+            reorder_ops=not upcast,
         )
+        return (ref, *torch.autograd.grad(ref, (q_, k_, v_), do))
+
+    # FA's criterion: error against fp32 at most 2x (output) or 3x (gradients) PyTorch's.
+    ref = reference(dropout_mask)
+    bound = [
+        factor * (pt - r).abs().max().item()
+        for factor, pt, r in zip(
+            (2, 3, 3, 3), reference(dropout_mask, upcast=False), ref
+        )
+    ]
+    errors = [(got - r).abs().max().item() for got, r in zip((out, *grads), ref)]
+    for name, err, limit in zip(("out", "dq", "dk", "dv"), errors, bound):
+        assert err <= limit, f"dao_ai dropout {name} error {err} > {limit}"
+
+    # The bound rejects gradients from another dropout pattern, such as a backward that
+    # lost the forward's RNG state.
+    wrong = reference(torch.roll(dropout_mask, shifts=1, dims=-1))
+    wrong_errors = [(got - r).abs().max().item() for got, r in zip(grads, wrong[1:])]
+    assert any(err > limit for err, limit in zip(wrong_errors, bound[1:]))
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
