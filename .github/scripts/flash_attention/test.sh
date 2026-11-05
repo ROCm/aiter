@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run the Flash Attention Triton tests of aiter CI. CI and a local container run the same lines.
 #
 # Usage: test.sh <v2-pr | v2-pr-rdna3 | v2-full | v3-pr | v3-full>
@@ -7,7 +7,7 @@
 # Each pytest line is its own process. A failure or abort does not stop the next line, and the
 # script fails if a line fails. Skip a known failure with a --deselect line under its test.
 # A --deselect ID is relative to pytest's rootdir: tests/ for v2 (tests/pyproject.toml).
-set -u
+set -euo pipefail
 cd /flash-attention || exit 2
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
 export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0

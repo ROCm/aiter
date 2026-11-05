@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run the Flash Attention benchmarks of aiter CI. CI and a local container run the same lines.
 #
 # Usage: bench.sh <fa | mha> [out-dir]
@@ -6,7 +6,7 @@
 #   mha   aiter's MHA benchmark of the Dao-AI implementation, as a CSV in out-dir
 #         (default /tmp/bench_dao_ai)
 #   Run it in a container that has aiter at /aiter and flash-attention at /flash-attention.
-set -u
+set -euo pipefail
 
 case "${1:-}" in
 fa)
