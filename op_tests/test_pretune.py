@@ -8,13 +8,15 @@ logic only.  Run with:
     python op_tests/test_pretune.py
 """
 
+import contextlib
+import io
 import json
 import logging
 import os
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -498,9 +500,10 @@ def test_inference_modules():
 class _FakeCore:
     """Stands in for aiter.jit.core: records rebuilds instead of compiling."""
 
-    def __init__(self, config_attr: str, csv_path: str):
-        self.AITER_CONFIGS = SimpleNamespace(**{config_attr: csv_path})
-        setattr(self, config_attr.removesuffix("_FILE"), csv_path)
+    def __init__(self, csv_paths: dict[str, str]):
+        self.AITER_CONFIGS = SimpleNamespace(**csv_paths)
+        for config_attr, csv_path in csv_paths.items():
+            setattr(self, config_attr.removesuffix("_FILE"), csv_path)
         self.removed: list[str] = []
         self.built: list[str] = []
 
@@ -526,16 +529,18 @@ class _FakeCore:
         self.built.append(md_name)
 
 
-def _with_tuner_exit(returncode: int, fn):
-    """Run fn() with every tuner subprocess reporting returncode."""
-    real_run = pretune.subprocess.run
-    pretune.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
-        cmd, returncode
-    )
-    try:
+def _with_tuner_exit(returncode, fn):
+    """Run fn() with every tuner subprocess reporting returncode.
+
+    returncode is an int, or a callable that takes the tuner command and
+    returns the exit code for it.
+    """
+    exit_for = returncode if callable(returncode) else lambda cmd: returncode
+    with patch(
+        "utility.pretune.subprocess.run",
+        side_effect=lambda cmd, **kw: subprocess.CompletedProcess(cmd, exit_for(cmd)),
+    ):
         return fn()
-    finally:
-        pretune.subprocess.run = real_run
 
 
 def _shape_csv() -> str:
@@ -550,7 +555,7 @@ def test_run_pretune_tuner_failure():
     module = "module_gemm_a8w8_bpreshuffle_cktile_tune"
     attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
     csv_path = _shape_csv()
-    core = _FakeCore(attr, csv_path)
+    core = _FakeCore({attr: csv_path})
     try:
         raised = False
         try:
@@ -572,7 +577,7 @@ def test_run_pretune_rebuilds_cktile():
     module = "module_gemm_a8w8_bpreshuffle_cktile_tune"
     attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
     csv_path = _shape_csv()
-    core = _FakeCore(attr, csv_path)
+    core = _FakeCore({attr: csv_path})
     try:
         _with_tuner_exit(0, lambda: run_pretune(module, CFG, core, CSRC_DIR, REPO_DIR))
         expected = {
@@ -594,19 +599,30 @@ def test_run_pretune_rebuilds_cktile():
 
 
 def test_run_pretune_modules_reports_failures():
-    """run_pretune_modules tries every module, then raises naming the failures."""
+    """run_pretune_modules keeps going after a failed module, then raises naming
+    only the failures."""
     print("\n=== test_run_pretune_modules_reports_failures ===")
-    attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
+    failing = "module_gemm_a8w8_bpreshuffle_tune"
+    passing = "module_gemm_a8w8_blockscale_tune"
+    failing_script, failing_attr = _resolve(failing, CFG, CSRC_DIR)
+    passing_script, passing_attr = _resolve(passing, CFG, CSRC_DIR)
+    passing_inf = _inference_modules(passing_attr, CFG)
     csv_path = _shape_csv()
-    core = _FakeCore(attr, csv_path)
+    core = _FakeCore({failing_attr: csv_path, passing_attr: csv_path})
     built: list[str] = []
+    tuned: list[str] = []
+
+    def tuner_exit(cmd):
+        tuned.append(cmd[1])
+        return 1 if cmd[1] == failing_script else 0
+
     try:
         message = ""
         try:
             _with_tuner_exit(
-                1,
+                tuner_exit,
                 lambda: run_pretune_modules(
-                    "module_gemm_a8w8_bpreshuffle_tune",
+                    f"{failing},{passing}",
                     CFG,
                     core,
                     lambda args: built.append(args["md_name"]),
@@ -617,17 +633,72 @@ def test_run_pretune_modules_reports_failures():
         except RuntimeError as exc:
             message = str(exc)
         check(
-            "raises naming the failed module",
-            "module_gemm_a8w8_bpreshuffle_tune" in message,
+            "both tuners run, the failing one first",
+            tuned == [failing_script, passing_script],
+            f"got {tuned}",
+        )
+        check(
+            "raises naming only the failed module",
+            message == f"[pretune] failed modules: {failing}",
             f"got {message!r}",
         )
         check(
-            "tune module built under its own name",
-            built == ["module_gemm_a8w8_bpreshuffle_tune"],
+            "only the passing module's inference modules are rebuilt",
+            core.removed == passing_inf,
+            f"got {core.removed}",
+        )
+        check(
+            "tune modules and passing inference modules built under their own names",
+            built == [failing, passing, *passing_inf],
             f"got {built}",
         )
     finally:
         os.unlink(csv_path)
+
+
+def test_main_exits_nonzero_on_failure():
+    """_main keeps going after a failed module and exits 1 naming it; with no
+    failure it returns normally."""
+    print("\n=== test_main_exits_nonzero_on_failure ===")
+    failing = "module_gemm_a8w8_bpreshuffle_tune"
+    passing = "module_gemm_a8w8_blockscale_tune"
+    # _main imports jit.core, which needs torch; run_pretune is faked, so any
+    # object will do.
+    fake_jit = ModuleType("jit")
+    fake_jit.core = object()
+    calls: list[str] = []
+
+    def fake_run_pretune(mod, *args, **kwargs):
+        calls.append(mod)
+        if mod == failing:
+            raise RuntimeError("tuner exited 1")
+
+    for modules, expected_calls, expected_code in (
+        (f"{failing},{passing}", [failing, passing], 1),
+        (passing, [passing], None),
+    ):
+        calls.clear()
+        code = None
+        out = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["pretune.py", modules]),
+            patch.object(sys, "path", list(sys.path)),
+            patch.dict(sys.modules, {"jit": fake_jit}),
+            patch.object(pretune, "run_pretune", fake_run_pretune),
+            contextlib.redirect_stdout(out),
+        ):
+            try:
+                pretune._main()
+            except SystemExit as exc:
+                code = exc.code
+        check(f"{modules}: runs every module", calls == expected_calls, f"got {calls}")
+        check(f"{modules}: exit code", code == expected_code, f"got {code!r}")
+        named = f"[pretune] failed modules: {failing}" in out.getvalue()
+        check(
+            f"{modules}: failed modules listed only on failure",
+            named == (expected_code == 1),
+            f"output: {out.getvalue()!r}",
+        )
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -647,6 +718,7 @@ if __name__ == "__main__":
     test_run_pretune_tuner_failure()
     test_run_pretune_rebuilds_cktile()
     test_run_pretune_modules_reports_failures()
+    test_main_exits_nonzero_on_failure()
 
     print(f"\n{'='*50}")
     print(f"Results: {_passed} passed, {_failed} failed")
