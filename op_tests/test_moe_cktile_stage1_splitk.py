@@ -6,11 +6,17 @@ bf16 activations with MXFP4 weights run stage 1 on the CK-Tile split-k kernel
 (split_k >= 2 for SwiGLU). The kernel runs whole K tiles per split without
 masking, so a split of model_dim that is not a multiple of 256 (model_dim=256,
 768, 1280, ...) used to return silently wrong results or fault.
+
+Run this file directly for the numerical/performance sweep and Markdown table;
+use pytest for the numerical, selector and expected-error regression checks.
 """
 
 import inspect
+import itertools
+from functools import partial
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 import torch
 
@@ -27,6 +33,7 @@ from aiter.fused_moe import (
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 # gfx942 also builds the bf16 CK-Tile instances, but like test_moe_2stage.py
@@ -37,6 +44,7 @@ _SKIP = pytest.mark.skipif(
 
 INTER_DIM = 256
 MAX_REL_L2 = 0.02
+MAX_ERR_RATIO = 0.05
 
 
 @pytest.mark.parametrize(
@@ -120,7 +128,7 @@ def _make(model_dim, E, topk, token, hidden_pad=0, bias=False):
     )
 
 
-def _ref(x, topk_weight, topk_ids, w1_ref, w2_ref, activation, b1=None, b2=None):
+def run_torch(x, topk_weight, topk_ids, w1_ref, w2_ref, activation, b1=None, b2=None):
     out = torch.zeros(x.shape, device=x.device, dtype=torch.float64)
     for m in range(x.shape[0]):
         for k in range(topk_ids.shape[1]):
@@ -144,29 +152,16 @@ def _ref(x, topk_weight, topk_ids, w1_ref, w2_ref, activation, b1=None, b2=None)
     return out
 
 
-def _run_fused_moe(
-    monkeypatch, model_dim, E, topk, token, activation, hidden_pad=0, bias=False
+@benchmark()
+def benchmark_fused_moe(
+    model_dim, E, topk, token, activation, hidden_pad=0, bias=False, split_k=0
 ):
     x, topk_weight, topk_ids, w1, w2, (b1, b2) = _make(
         model_dim, E, topk, token, hidden_pad, bias
     )
-    launched = []
-    gemm1 = aiter.moe_cktile2stages_gemm1
-    sig = inspect.signature(gemm1)
-
-    def spy(*args, **kwargs):
-        bound = sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        launched.append(bound.arguments["split_k"])
-        return gemm1(*args, **kwargs)
-
-    monkeypatch.setattr(aiter, "moe_cktile2stages_gemm1", spy)
-    # Keep these cases on the CK-Tile route even if FlyDSL learns the shapes.
-    monkeypatch.setenv("AITER_FLYDSL_FORCE", "0")
-    fused_moe_module.get_ksplit.cache_clear()
-    fused_moe_module.get_2stage_cfgs.cache_clear()
-    try:
-        out = fused_moe(
+    candidates = {
+        "cktile": partial(
+            fused_moe,
             x,
             w1[0],
             w2[0],
@@ -180,54 +175,101 @@ def _run_fused_moe(
             bias1=b1,
             bias2=b2,
         )
+    }
+    launched = []
+    gemm1 = aiter.moe_cktile2stages_gemm1
+    sig = inspect.signature(gemm1)
+
+    def spy(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        launched.append(bound.arguments["split_k"])
+        return gemm1(*args, **kwargs)
+
+    fused_moe_module.get_ksplit.cache_clear()
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            # Keep these cases on CK-Tile even if FlyDSL learns the shapes.
+            patch.setenv("AITER_FLYDSL_FORCE", "0")
+            patch.setenv("AITER_KSPLIT", str(split_k))
+            requested = max(
+                fused_moe_module.get_ksplit(token, topk, E, INTER_DIM, model_dim), 2
+            )
+            want = _cktile_gemm1_k_batch(model_dim, requested, hidden_pad // 128 * 128)
+            # Three GEMMs: gate, up and down. TB/s is a logical I/O lower
+            # bound: read each routed expert's packed weights/scales/bias once,
+            # plus activations, routing inputs and output (excludes scratch).
+            flops = 6 * token * topk * model_dim * INTER_DIM
+            active_experts = topk_ids.unique().numel()
+            expert_tensors = [w1[0], w1[1], w2[0], w2[1]]
+            if bias:
+                expert_tensors.extend([b1, b2])
+            nbytes = sum(t.numel() * t.element_size() for t in expert_tensors)
+            nbytes = nbytes // E * active_experts
+            nbytes += sum(
+                t.numel() * t.element_size() for t in (x, x, topk_weight, topk_ids)
+            )
+            ret = {"gfx": get_gfx()}
+            for name, fn in candidates.items():
+                # Inspect one untimed call; signature binding/list appends must
+                # not add host overhead to the measured candidate.
+                launched.clear()
+                with pytest.MonkeyPatch.context() as launch_patch:
+                    launch_patch.setattr(aiter, "moe_cktile2stages_gemm1", spy)
+                    fn()
+                assert launched == [want], f"unexpected CK-Tile launches: {launched}"
+                ref = run_torch(
+                    x, topk_weight, topk_ids, w1[2], w2[2], activation, b1, b2
+                )
+                out, us = run_perftest(fn)
+                err = checkAllclose(
+                    ref.to(dtypes.fp32),
+                    out.to(dtypes.fp32),
+                    rtol=1e-2,
+                    atol=1e-2,
+                    tol_err_ratio=MAX_ERR_RATIO,
+                    msg=f"{name}: bf16 MXFP4 MoE split-k",
+                )
+                # checkAllclose logs/returns the mismatch ratio; make a bad
+                # result fail both pytest and the standalone sweep.
+                assert err <= MAX_ERR_RATIO
+                # Retain the original global-error guard as well, so a large
+                # error in a few lanes cannot hide below the mismatch budget.
+                rel_l2 = ((out.double() - ref).norm() / ref.norm()).item()
+                assert rel_l2 < MAX_REL_L2
+                ret[f"{name} us"] = us
+                ret[f"{name} TFLOPS"] = flops / us / 1e6
+                ret[f"{name} TB/s"] = nbytes / us / 1e6
+                ret[f"{name} err"] = err
+                ret["k_batch"] = launched[0]
+            return ret
     finally:
         fused_moe_module.get_ksplit.cache_clear()
         fused_moe_module.get_2stage_cfgs.cache_clear()
-    assert launched, "fused_moe did not route stage 1 to CK-Tile"
-    ref = _ref(x, topk_weight, topk_ids, w1[2], w2[2], activation, b1, b2)
-    rel_l2 = ((out.double() - ref).norm() / ref.norm()).item()
-    return launched, rel_l2
-
-
-def _swiglu_k_batch(model_dim, E, topk, token, hidden_pad=0):
-    # SwiGLU forces split_k >= 2 on top of the CU-count based ksplit.
-    requested = max(
-        fused_moe_module.get_ksplit(token, topk, E, INTER_DIM, model_dim), 2
-    )
-    return _cktile_gemm1_k_batch(model_dim, requested, hidden_pad // 128 * 128)
 
 
 @_SKIP
 @pytest.mark.parametrize("model_dim", [256, 512, 768, 1024, 1280, 6144])
 @pytest.mark.parametrize(("E", "topk", "token"), [(4, 2, 4), (128, 4, 16)])
-def test_bf16_swiglu_cktile_stage1_split_alignment(
-    monkeypatch, model_dim, E, topk, token
-):
-    launched, rel_l2 = _run_fused_moe(
-        monkeypatch, model_dim, E, topk, token, ActivationType.Swiglu
-    )
-    assert launched == [_swiglu_k_batch(model_dim, E, topk, token)]
-    assert rel_l2 < MAX_REL_L2
+def test_bf16_swiglu_cktile_stage1_split_alignment(model_dim, E, topk, token):
+    benchmark_fused_moe(model_dim, E, topk, token, ActivationType.Swiglu)
 
 
 @_SKIP
 @pytest.mark.parametrize("hidden_pad", [192, 256])
-def test_bf16_swiglu_cktile_stage1_padded_k_does_not_split(monkeypatch, hidden_pad):
+def test_bf16_swiglu_cktile_stage1_padded_k_does_not_split(hidden_pad):
     # The CK-Tile pipeline skips the k_padded_zeros tail in every split.
-    launched, rel_l2 = _run_fused_moe(
-        monkeypatch, 1024, 4, 2, 4, ActivationType.Swiglu, hidden_pad
-    )
-    assert launched == [1]
-    assert rel_l2 < MAX_REL_L2
+    ret = benchmark_fused_moe(1024, 4, 2, 4, ActivationType.Swiglu, hidden_pad)
+    assert ret["k_batch"] == 1
 
 
 @_SKIP
 @pytest.mark.parametrize("hidden_pad", [0, 192])
-def test_bf16_swiglu_cktile_stage1_gptoss_bias(monkeypatch, hidden_pad):
+def test_bf16_swiglu_cktile_stage1_gptoss_bias(hidden_pad):
     # gpt-oss: hidden 2880 padded to 3072, with stage 1 and stage 2 biases.
     E, topk, token = 32, 4, 16
-    launched, rel_l2 = _run_fused_moe(
-        monkeypatch,
+    ret = benchmark_fused_moe(
         3072,
         E,
         topk,
@@ -236,16 +278,14 @@ def test_bf16_swiglu_cktile_stage1_gptoss_bias(monkeypatch, hidden_pad):
         hidden_pad,
         bias=True,
     )
-    assert launched == [_swiglu_k_batch(3072, E, topk, token, hidden_pad)]
     # Unpadded D=3072 keeps the forced split; the padding disables it.
-    assert (launched[0] == 1) == bool(hidden_pad)
-    assert rel_l2 < MAX_REL_L2
+    assert (ret["k_batch"] == 1) == bool(hidden_pad)
 
 
 @_SKIP
-def test_bf16_swiglu_cktile_stage1_rejects_partial_k_tile(monkeypatch):
+def test_bf16_swiglu_cktile_stage1_rejects_partial_k_tile():
     with pytest.raises(NotImplementedError, match="model_dim.*multiple of 256"):
-        _run_fused_moe(monkeypatch, 384, 4, 2, 4, ActivationType.Swiglu)
+        benchmark_fused_moe(384, 4, 2, 4, ActivationType.Swiglu)
 
 
 _GEMM1_NAME = "moe_cktile2stages_gemm1_256x16x128x256_1x4_16x16x32_1perCU_1x32_swiglu"
@@ -386,15 +426,49 @@ def test_cktile_gemm2_rejects_split_k():
 @pytest.mark.parametrize(
     ("model_dim", "split_k", "k_batch"), [(512, 4, 2), (768, 2, 1), (1024, 4, 4)]
 )
-def test_silu_cktile_stage1_forced_split(monkeypatch, model_dim, split_k, k_batch):
+def test_silu_cktile_stage1_forced_split(model_dim, split_k, k_batch):
     # Silu reaches the same kernel through the ksplit > 1 branch.
-    monkeypatch.setenv("AITER_KSPLIT", str(split_k))
-    launched, rel_l2 = _run_fused_moe(
-        monkeypatch, model_dim, 128, 4, 1, ActivationType.Silu
+    ret = benchmark_fused_moe(
+        model_dim, 128, 4, 1, ActivationType.Silu, split_k=split_k
     )
-    assert launched == [k_batch]
-    assert rel_l2 < MAX_REL_L2
+    assert ret["k_batch"] == k_batch
+
+
+def main():
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "MXFP4 MoE split-k sweep unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    rows = []
+    for model_dim, (E, topk, token) in itertools.product(
+        [256, 512, 768, 1024, 1280, 6144], [(4, 2, 4), (128, 4, 16)]
+    ):
+        rows.append(
+            benchmark_fused_moe(model_dim, E, topk, token, ActivationType.Swiglu)
+        )
+    for hidden_pad in [192, 256]:
+        rows.append(
+            benchmark_fused_moe(1024, 4, 2, 4, ActivationType.Swiglu, hidden_pad)
+        )
+    for hidden_pad in [0, 192]:
+        rows.append(
+            benchmark_fused_moe(
+                3072, 32, 4, 16, ActivationType.Swiglu, hidden_pad, bias=True
+            )
+        )
+    for model_dim, split_k in [(512, 4), (768, 2), (1024, 4)]:
+        rows.append(
+            benchmark_fused_moe(
+                model_dim, 128, 4, 1, ActivationType.Silu, split_k=split_k
+            )
+        )
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "CK-Tile MXFP4 MoE split-k summary (markdown):\n%s", df.to_markdown(index=False)
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    main()
