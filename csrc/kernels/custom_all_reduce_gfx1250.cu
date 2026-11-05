@@ -323,17 +323,11 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
 
-    // The allgather kernels index their output with int, and that index scales
-    // with world_size. Checked here while numel is still int64_t, which covers
-    // all four kernels plus the narrowing below. Needed because all_gather_reg
-    // and custom_all_gather never consult should_custom_ag.
-    const int64_t out_numel = numel * fa->world_size_;
-    if(out_numel > std::numeric_limits<int>::max())
-        throw std::runtime_error(
-            "gfx1250 allgather: output element count " + std::to_string(out_numel) +
-            " (numel " + std::to_string(numel) + " x world_size " +
-            std::to_string(fa->world_size_) + ") exceeds the int32 index range; "
-            "route this size through should_custom_ag / RCCL instead");
+    // numel stays int64_t down to the launchers. Each checks the int32 index
+    // range of its own kernel (per element for allgather_scalar, per 16-byte
+    // pack for the others; see allgather_packs) before narrowing. Needed
+    // because all_gather_reg and custom_all_gather never consult
+    // should_custom_ag.
 
 #define AG_DISPATCH_DIM0(T)                                         \
     do {                                                            \
