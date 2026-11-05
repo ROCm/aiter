@@ -527,6 +527,7 @@ def make_s1f_stage1(
     tdm_b_th=0,
     tdm_as_in_prologue=0,
     xcc_queues=0,
+    iod_loc=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -643,9 +644,13 @@ def make_s1f_stage1(
     P = int(producers)
     GM = int(group_m)
     XQ = int(bool(xcc_queues))
+    LOC = int(bool(iod_loc))
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
+    # IOD-placed W1 (iod_locality.placed_w1): XCC x is on IOD domain
+    # ((x + 3) % 8) >= 4, which holds n-tiles of that parity.
+    assert not LOC or (XQ and NT % 2 == 0), "iod_loc needs xcc_queues, even NT"
     if NT > _ITEM_N_MASK + 1:
         raise ValueError(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
@@ -769,6 +774,7 @@ def make_s1f_stage1(
             raw_drain=True,
             defer_c_wait=True,
             tdm_snop=True,
+            b_placed=LOC,
         )
 
     def _g1_asprol():
@@ -836,6 +842,7 @@ def make_s1f_stage1(
             + f"_poll{POLL}"
             + (f"_ts{SPAN}" if SPAN != G else "")
             + ("_xq" if XQ else "")
+            + ("_loc" if LOC else "")
             + f"_{g1_name}"
         )
         # Keep the separate-kernel launcher in this cache key's dependency set.
@@ -1661,6 +1668,16 @@ def make_s1f_stage1(
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
+                if const_expr(LOC):
+                    # Queue xq: the m-tiles of its rank r among the 4 queues of
+                    # its domain d, the n-tiles of parity d.
+                    r = ((xq + fx.Int32(3)) & fx.Int32(N_XCC - 1)) & fx.Int32(3)
+                    mx = fx.Int32(
+                        (m_tiles > r).select(
+                            (m_tiles - r + fx.Int32(3)) // fx.Int32(4), fx.Int32(0)
+                        )
+                    )
+                    return mx * fx.Int32(NT // 2)
                 if const_expr(XQ):
                     mx = fx.Int32(
                         (m_tiles > xq).select(
@@ -1673,6 +1690,13 @@ def make_s1f_stage1(
                 return m_tiles * fx.Int32(NT)
 
             def q_code(xq, w):
+                if const_expr(LOC):
+                    xr = (xq + fx.Int32(3)) & fx.Int32(N_XCC - 1)
+                    j = w // fx.Int32(NT // 2)
+                    n = (w - j * fx.Int32(NT // 2)) * fx.Int32(2) + (xr >> fx.Int32(2))
+                    return (
+                        ((xr & fx.Int32(3)) + j * fx.Int32(4)) << fx.Int32(_ITEM_N_BITS)
+                    ) | n
                 if const_expr(XQ):
                     # Queue xq: m-tiles xq, xq + 8, ..., n fastest.
                     j = w // fx.Int32(NT)
@@ -1732,6 +1756,12 @@ def make_s1f_stage1(
                 i = fx.Int32(1)
                 while (code_s == fx.Int32(-2)) & (i < fx.Int32(N_XCC)):
                     xq_c = (xq0 + i) & fx.Int32(N_XCC - 1)
+                    if const_expr(LOC):
+                        # Same-domain queues first, then the other domain's.
+                        xr0 = (xq0 + fx.Int32(3)) & fx.Int32(N_XCC - 1)
+                        d_c = (xr0 >> fx.Int32(2)) ^ (i >> fx.Int32(2))
+                        xr_c = d_c * fx.Int32(4) + (((xr0 & fx.Int32(3)) + i) & fx.Int32(3))
+                        xq_c = (xr_c + fx.Int32(5)) & fx.Int32(N_XCC - 1)
                     code_s = claim_resolve(xq_c, claim_issue(xq_c))
                     xq_s = xq_c
                     i = i + fx.Int32(1)

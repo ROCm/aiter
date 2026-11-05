@@ -79,6 +79,17 @@ def gran_per_unit(K: int, tile_k: int) -> int:
     return 2 * kt + (kt + 7) // 8
 
 
+def supported(N, K, tile_n, tile_k) -> bool:
+    """Whether ``placed_w1`` / ``b_placed`` cover this GEMM1 tiling."""
+    return (
+        tile_n * tile_k == 4 * GRAN
+        and tile_n % 64 == 0
+        and N % (2 * tile_n) == 0
+        and K % tile_k == 0
+        and gran_per_unit(K, tile_k) <= LOCAL_PER_PAGE
+    )
+
+
 def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
     """Placed copy of (w, w_scales) for ``b_placed`` GEMM1, built once per weight."""
     key = (w.data_ptr(), w_scales.data_ptr(), n_experts, N, K, tile_n, tile_k)
@@ -87,9 +98,8 @@ def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
         return hit
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("IOD placement must run before CUDA graph capture")
+    assert supported(N, K, tile_n, tile_k)
     E, nt, kt = n_experts, N // tile_n, K // tile_k
-    assert N % tile_n == 0 and K % tile_k == 0 and nt % 2 == 0
-    assert tile_n * tile_k == 4 * GRAN
     bstage, sstage = tile_n * tile_k // 2, tile_n * tile_k // 32
     gpu = gran_per_unit(K, tile_k)
     nsg = gpu - 2 * kt

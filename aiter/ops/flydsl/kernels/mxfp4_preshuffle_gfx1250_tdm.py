@@ -354,8 +354,7 @@ def build_gemm_a8w4_tdm_task(
         # One wave's B half of a k-tile is one granule; 8 k-tiles of B scales
         # fill one more.
         assert tile_n * tile_k == 4 * LOC_GRAN and tile_n % 64 == 0
-        assert num_waves_per_tensor_tdm == 2 and m_warp * n_warp == 4
-        assert not tdm_as_in_prologue and cluster_n == 1 and cluster_m == 1
+        assert m_warp * n_warp == 4 and cluster_n == 1 and cluster_m == 1
         assert not HAS_K_TAIL and GPU_LOC <= 64
     if enable_ep_scatter:
         if stage1_act != 0:
@@ -883,6 +882,8 @@ def build_gemm_a8w4_tdm_task(
             waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
+        if const_expr(b_placed):
+            assert len(waves[1]) == 2, "placed B needs two B owner waves"
         nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 

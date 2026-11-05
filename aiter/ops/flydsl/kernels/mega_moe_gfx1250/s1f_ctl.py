@@ -76,6 +76,11 @@ def _s1f_xcc_queues(tile_m: int) -> int:
     if mode == "auto":
         return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
     return int(mode)
+
+
+def _s1f_iod_loc() -> int:
+    """``AITER_MOE_LOC=1``: IOD-placed W1 on per-XCC queues (``iod_locality``)."""
+    return int(os.environ.get("AITER_MOE_LOC", "0").strip() == "1")
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
 # Decode steps have too little expert GEMM to hide the compact plan if the plan
@@ -474,7 +479,8 @@ class _Stage1Fusion:
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        xcc_queues = _s1f_xcc_queues(tile_m)
+        iod_loc = _s1f_iod_loc()
+        xcc_queues = 1 if iod_loc else _s1f_xcc_queues(tile_m)
         key = (
             tile_m,
             producers,
@@ -485,6 +491,7 @@ class _Stage1Fusion:
             tdm_b_th,
             tdm_as_in_prologue,
             xcc_queues,
+            iod_loc,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -494,6 +501,7 @@ class _Stage1Fusion:
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
                 xcc_queues=xcc_queues,
+                iod_loc=iod_loc,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
@@ -657,6 +665,11 @@ class _Stage1Fusion:
         bufs = {**self.d._slot_bufs(step["slot"])}
         if stream is None:
             stream = torch.cuda.current_stream()
+        if _s1f_iod_loc():
+            from aiter.ops.flydsl.iod_locality import placed_w1
+
+            w = placed_w1(w, w_scales, n_experts, N, K, 256, 256)
+            w_scales = w
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
             return (
