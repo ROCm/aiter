@@ -85,6 +85,10 @@ def herd_route_psum(
     topk = width - 1
     experts = int(experts)
     device = candidate_ids.device
+    # ptr_arg keeps only the address: a cast or contiguous copy must stay
+    # referenced until the launch is enqueued.
+    candidate_ids = candidate_ids.to(torch.int32).contiguous()
+    candidate_values = candidate_values.to(torch.float32).contiguous()
     if num_valid_rows is not None:
         num_valid_rows = (
             num_valid_rows.reshape(-1)[:1].to(device=device, dtype=torch.int32)
@@ -98,8 +102,8 @@ def herd_route_psum(
         build_herd_route_psum_module(
             topk, experts, num_valid_rows is not None, wave_size_of(device.index)
         ),
-        ptr_arg(candidate_ids.to(torch.int32).contiguous()),
-        ptr_arg(candidate_values.to(torch.float32).contiguous()),
+        ptr_arg(candidate_ids),
+        ptr_arg(candidate_values),
         ptr_arg(weights),
         ptr_arg(ids),
         ptr_arg(topids_to_rows),
