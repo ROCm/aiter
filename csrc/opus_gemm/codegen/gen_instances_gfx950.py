@@ -1051,89 +1051,26 @@ def gen_mono_tile_instance(
     **_unused,
 ):
     """gfx950 a16w16_mono_tile launcher emit."""
-    traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>>;
-"""
     min_k = 2 * k.B_K
-    k_check = f"""
-    int loops_ = K / {k.B_K};
-    AITER_CHECK(K % {k.B_K} == 0,
-        "mono-tile requires K divisible by B_K={k.B_K}; got K=", K);
-    AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K)");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-    AITER_CHECK(batch >= 1, "batch must be >= 1");
-    AITER_CHECK(N % {k.B_N} == 0,
-        "mono-tile requires N divisible by B_N={k.B_N}; got N=", N);
-"""
-    INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"
-#include <optional>
-#endif
-// See _gen_noscale_instance for the rationale of the host/device pass split.
-#ifdef OPUS_FUSED_HOST_TU
-#include "{traits_header}"
-template<typename Traits>
-__global__ void {kernel_func}({kargs_name} kargs);
-#else
-#include "{pipeline_header}"
-#endif
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int /*splitK*/)
-{{{{
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-{k_check}
-    AITER_CHECK(!bias.has_value(),
-        "bias is not supported on a16w16_mono_tile kid; use a16w16 "
-        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
-
-    {kargs_name} kargs{{{{}}}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = XQ.stride(1);
-    kargs.stride_b = WQ.stride(1);
-    kargs.stride_c = N;
-    kargs.stride_a_batch = XQ.stride(0);
-    kargs.stride_b_batch = WQ.stride(0);
-    kargs.stride_c_batch = M * N;
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx950_mono_tile_launcher.cuh.j2",
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        kernel_func=kernel_func,
+        kargs_name=kargs_name,
+        name=k.name,
+        traits_name=traits_name,
+        BLOCK_SIZE=k.BLOCK_SIZE,
+        B_M=k.B_M,
+        B_N=k.B_N,
+        B_K=k.B_K,
+        VEC_A=k.VEC_A,
+        VEC_B=k.VEC_B,
+        VEC_C=k.VEC_C,
+        da=da,
+        db=db,
+        min_k=min_k,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     for CDtype in k.output_dtypes:
