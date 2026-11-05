@@ -587,6 +587,22 @@ def build_gemm_a8w4_tdm_task(
         == (64, 256, 256, 1, 4, 3)
         and callable(getattr(rocdl, "sched_vgpr", None))
     )
+    # Ordinary short tiles have the same exact expert-end bound. One M wave
+    # makes the partial-M choice workgroup-uniform; retain the full TDM and
+    # output protocol while omitting only wholly out-of-bound M16 operands.
+    ordinary_short_row_skip = bool(
+        a_is_fp4
+        and not a_preshuffled
+        and not persistent_workers
+        and not enable_ep_scatter
+        and k_waves == 1
+        and m_warp == 1
+        and n_warp == 4
+        and num_buffers == 3
+        and tile_m in (32, 64, 128)
+        and tile_n == 256
+        and tile_k in (128, 256)
+    )
     # Plain native GEMM2 uses the same operand layout and K dependency
     # as fused GEMM1. Keep EP scatter on its existing output protocol.
     plain_gemm_prefill = (
@@ -2760,9 +2776,9 @@ def build_gemm_a8w4_tdm_task(
             # full descriptor and output layouts while skipping only M16 rows
             # wholly beyond the expert's live rows. Other row counts use the
             # complete original body, including ragged K and activation logic.
-            if const_expr(narrow_stage1_row_skip):
-                if mn_oob <= 2 * M_ROW_STEP:
-                    run_mainloop(bool(interleaved_lds_load_on), m_reps=2)
+            if const_expr(narrow_stage1_row_skip or ordinary_short_row_skip):
+                if mn_oob <= front_wm * M_ROW_STEP:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=front_wm)
                 else:
                     run_mainloop(bool(interleaved_lds_load_on))
             # Place the six/seven-row bodies together and emit the output tail once.
