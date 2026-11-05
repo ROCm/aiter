@@ -3,6 +3,7 @@
 
 import argparse
 import functools
+import hashlib
 import math
 import os
 import re
@@ -164,38 +165,72 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
 
 
+def _balanced_topk_ids(token, global_e, topk, seed, device):
+    """Balanced routing of amd_moe_bench_share/bench_moe.py make_input().
+
+    Tokens take ``topk`` experts at a time from a stream of random permutations
+    of the ``global_e`` experts, so every token picks distinct experts and the
+    global expert loads differ by at most one. When ``global_e % topk == 0``
+    the ids equal the bench's for the same ``seed``; otherwise a token spanning
+    two permutations takes the rest of one and the first experts of the next
+    that it does not already hold.
+    """
+    if topk > global_e:
+        raise ValueError(f"topk={topk} exceeds the {global_e} global experts")
+    text = f"routes|{seed}|{global_e}|{topk}|{token}"
+    digest = hashlib.sha256(text.encode()).digest()[:8]
+    route_seed = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+    gen = torch.Generator(device=device).manual_seed(route_seed)
+    ids = torch.empty((token, topk), dtype=dtypes.i32, device=device)
+    slots = torch.arange(topk, device=device)[None, :]
+    carry = slots.new_empty(0)
+    start = 0
+    while start < token:
+        perm = torch.randperm(global_e, generator=gen, device=device)
+        if carry.numel():
+            held = torch.isin(perm, carry)
+            perm = torch.cat((perm[~held], perm[held]))
+            head = topk - carry.numel()
+            ids[start] = torch.cat((carry, perm[:head]))
+            perm = perm[head:]
+            start += 1
+        count = min(perm.numel() // topk, token - start)
+        block = perm[: count * topk].reshape(count, topk)
+        offsets = torch.randint(0, topk, (count, 1), generator=gen, device=device)
+        ids[start : start + count] = torch.gather(block, 1, (slots + offsets) % topk)
+        start += count
+        carry = perm[count * topk :]
+    return ids
+
+
 def _ep_route(inp, expert, topk, ep, seed=0):
-    """Routing of one rank after EP dispatch, as op_tests/test_moe_ep.py
-    --ep-mode real builds it.
+    """Routing of EP rank 0 after dispatch.
 
     ``inp.shape[0]`` is the dispatch buffer row count, which equals the global
-    source token count. Each source token picks ``topk`` of ``expert * ep``
-    global experts; the last rank receives the tokens that own at least one of
-    its ``expert`` local experts into its first ``total_recv`` rows, and the
-    remaining rows are dead padding skipped through ``num_local_tokens``.
+    source token count. The source tokens route over the ``expert * ep`` global
+    experts as amd_moe_bench_share/bench_moe.py does (_balanced_topk_ids, route
+    weights 1/topk), and rank 0 owns global experts [0, expert). As in
+    op_tests/test_moe_ep.py --ep-mode real, the tokens that own at least one
+    local expert fill the first ``total_recv`` rows, and the remaining rows are
+    dead padding skipped through ``num_local_tokens``.
     The routing depends only on the row count and ``seed``.
     """
     device = inp.device
     token = inp.shape[0]
     global_e = expert * ep
-    local_start = (ep - 1) * expert
     # One extra masked slot, so moe_sorting sees the runtime's global expert count.
     expert_mask = torch.zeros(global_e + 1, dtype=dtypes.i32, device=device)
-    expert_mask[local_start : local_start + expert] = 1
-    gen = torch.Generator(device=device).manual_seed(seed)
-    score = torch.randn(
-        (token, global_e), dtype=dtypes.bf16, device=device, generator=gen
-    )
-    src_weights, src_ids = fused_topk(inp, score, topk, True)
+    expert_mask[:expert] = 1
+    src_ids = _balanced_topk_ids(token, global_e, topk, seed, device)
     recv = expert_mask[src_ids.long()].bool().any(dim=1)
     total_recv = int(recv.sum().item())
-    topk_ids = torch.zeros_like(src_ids)
-    topk_weights = torch.zeros_like(src_weights)
+    # Padding routes to the masked slot; id 0 would be rank 0's local expert 0.
+    topk_ids = torch.full_like(src_ids, global_e)
     topk_ids[:total_recv] = src_ids[recv]
-    topk_weights[:total_recv] = src_weights[recv]
-    is_local = (topk_ids >= local_start) & (topk_ids < local_start + expert)
-    is_local[total_recv:] = False
-    local_topk_ids = torch.where(is_local, topk_ids - local_start, -1)
+    topk_weights = torch.zeros((token, topk), dtype=dtypes.fp32, device=device)
+    topk_weights[:total_recv] = 1.0 / topk
+    is_local = expert_mask[topk_ids.long()].bool()
+    local_topk_ids = torch.where(is_local, topk_ids, -1)
     num_local_tokens = torch.tensor([total_recv], dtype=dtypes.i32, device=device)
     return topk_weights, topk_ids, local_topk_ids, expert_mask, num_local_tokens
 
@@ -210,31 +245,6 @@ def _ep_route_stats(token, expert, topk, ep, seed):
         int(local.numel()),
         int(torch.unique(local).numel()),
     )
-
-
-def _find_ep_route_seed(token, expert, topk, ep, target, max_tries=200000):
-    """First seed whose _ep_route_stats equal ``target``."""
-    for seed in range(max_tries):
-        if _ep_route_stats(token, expert, topk, ep, seed) == target:
-            return seed
-    raise RuntimeError(
-        f"no EP routing seed below {max_tries} matches "
-        f"(total_recv, local_routes, active_experts)={target} at token={token}"
-    )
-
-
-def _parse_ep_route_match(value):
-    """'TOKEN:RECV:ROUTES:ACTIVE,...' -> {token: (recv, routes, active)}."""
-    match = {}
-    for item in filter(None, (s.strip() for s in value.split(","))):
-        fields = item.split(":")
-        if len(fields) != 4:
-            raise ArgumentTypeError(
-                f"--ep-route-match item {item!r} is not TOKEN:RECV:ROUTES:ACTIVE"
-            )
-        token, *target = (int(f) for f in fields)
-        match[token] = tuple(target)
-    return match
 
 
 def _v2_gen_ep(
@@ -1009,21 +1019,21 @@ class FmoeTuner(TunerCommon):
             "--ep-size",
             type=int,
             default=0,
-            help="Tune every row on EP real-mode data (op_tests/test_moe_ep.py "
-            "--ep-mode real): token is the dispatch buffer row count (global "
-            "tokens), expert the local expert count, routes span expert * "
-            "ep-size global experts and only the last rank's local routes are "
-            "computed. Tunes flydslv2 only, or with --mxfp4-flydsl MXMOE GEMM1 "
+            help="Tune every row on EP data: token is the dispatch buffer row "
+            "count (global tokens), expert the local expert count; routes span "
+            "expert * ep-size global experts with the balanced routing of "
+            "amd_moe_bench_share/bench_moe.py, and only rank 0's local routes "
+            "are computed, laid out as op_tests/test_moe_ep.py --ep-mode real "
+            "does. Tunes flydslv2 only, or with --mxfp4-flydsl MXMOE GEMM1 "
             "with atomic/reduce layout GEMM2. 0 (default) keeps the dense data.",
         )
         self.parser.add_argument(
-            "--ep-route-match",
-            type=_parse_ep_route_match,
-            default={},
-            help="With --ep-size: TOKEN:RECV:ROUTES:ACTIVE[,...]. For each listed "
-            "token, use the first routing seed whose (total_recv, local_routes, "
-            "active_experts) equal the given values, e.g. the counts a "
-            "test_moe_ep.py run printed; other tokens use seed 0.",
+            "--ep-seed",
+            type=int,
+            default=0,
+            help="With --ep-size: routing seed, as bench_moe.py --seed. With "
+            "the same seed, global expert count, topk and token, the routes "
+            "equal the bench's when the global expert count is a multiple of topk.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -1054,11 +1064,11 @@ class FmoeTuner(TunerCommon):
             if "_tag" not in self.columns:
                 self.columns = self.columns + ["_tag"]
         args.ep_size = getattr(args, "ep_size", 0)
-        args.ep_route_match = getattr(args, "ep_route_match", {})
+        args.ep_seed = getattr(args, "ep_seed", 0)
         if args.ep_size < 0:
             self.parser.error("--ep-size must be >= 0")
-        if args.ep_route_match and not args.ep_size:
-            self.parser.error("--ep-route-match requires --ep-size")
+        if args.ep_seed and not args.ep_size:
+            self.parser.error("--ep-seed requires --ep-size")
         if args.ep_size and (args.grouped_gemm or args.e2e_tune):
             self.parser.error(
                 "--ep-size applies to the default fmoe tuner and --mxfp4-flydsl "
@@ -5815,11 +5825,7 @@ class FmoeTuner(TunerCommon):
                         f"are a positive multiple of {ep}"
                     )
                     continue
-                ep_seed = 0
-                if token in args.ep_route_match:
-                    ep_seed = _find_ep_route_seed(
-                        token, expert, topk, ep, args.ep_route_match[token]
-                    )
+                ep_seed = args.ep_seed
                 recv, routes, active = _ep_route_stats(token, expert, topk, ep, ep_seed)
                 print(
                     f"[ep] token={token} seed={ep_seed}: total_recv={recv} "
@@ -7589,7 +7595,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self._require_distinct_input_output(args)
         self._configuration = self._capture_configuration()
         self._configuration["ep_size"] = args.ep_size
-        self._configuration["ep_route_match"] = args.ep_route_match
+        self._configuration["ep_seed"] = args.ep_seed
         args.mxfp4_configuration = self._configuration
         return args
 
@@ -7656,15 +7662,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         ep = self._ep_size()
         if not ep:
             return 0, 0
-        token = int(row["token"])
-        target = self._invocation_configuration().get("ep_route_match", {}).get(token)
-        if target is None:
-            return ep, 0
-        key = (token, int(row["expert"]), int(row["topk"]), ep, tuple(target))
-        seeds = self.__dict__.setdefault("_ep_seeds", {})
-        if key not in seeds:
-            seeds[key] = _find_ep_route_seed(*key)
-        return ep, seeds[key]
+        return ep, int(self._invocation_configuration().get("ep_seed", 0) or 0)
 
     @staticmethod
     def _names_kernel(tunedf: "pd.DataFrame") -> "pd.Series":
