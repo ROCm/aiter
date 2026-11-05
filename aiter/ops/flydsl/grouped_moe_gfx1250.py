@@ -18,6 +18,7 @@ import flydsl.expr as fx
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -173,6 +174,11 @@ def _find_grouped_config(
         "ep_fused": "1" if ep_fused else "0",
     }
     rows = _load_grouped_config_rows()
+    # A0 bring-up: reuse gfx1250 family rows when strict has none of its own.
+    if base_gfx_arch(keys["gfx"]) != keys["gfx"] and keys["gfx"] not in {
+        str(r.get("gfx") or "").strip() for r in rows
+    }:
+        keys["gfx"] = base_gfx_arch(keys["gfx"])
 
     # Hardware is locked by (gfx, cu_num): gfx (architecture) is always a hard
     # constraint, while cu_num can be relaxed as a fallback. Columns missing from

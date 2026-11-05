@@ -210,8 +210,9 @@ def build_gemm_a8w4_tdm_task(
     - ``tile_meta`` (S1F, explicit_tile): a one-element list the caller fills
       with ``(expert, rows)`` (wave-uniform i32) before calling the body: the
       tile's expert and its valid rows (``min(tile_m, expert end - blk_m)``).
-      Replaces the psum reads (has_work, expert bisect, mn_oob), i.e. 10
-      dependent global loads per tile; the caller only names populated tiles.
+      Replaces the psum reads (has_work, expert lookup, mn_oob), i.e. three
+      dependent rounds of global loads per tile; the caller only names
+      populated tiles.
     - ``item_hooks`` (S1F): a one-element list holding a dict of callables the
       body calls on every wave: ``drain_start`` after the steady k-loop,
       before the drain fences; ``epi_start`` after the drain's last fence,
@@ -673,30 +674,37 @@ def build_gemm_a8w4_tdm_task(
             has_work = True
             expert = fx.Int32(tile_meta[0][0])
         else:
-            # psum is sorted, so the owning expert is the count of experts that
-            # end at or before blk_m. Every lane loads a strided slice in one
-            # round trip instead of a bisect's log2(E) dependent loads (the bulk
-            # of a decode tile's prologue latency).
-            psum_hits = fx.Int32(0)
-            for i in range_constexpr(ceildiv(n_experts, WAVE)):
-                e_idx = lane + i * WAVE
-                if const_expr((i + 1) * WAVE <= n_experts):
-                    end_e = tile_map[e_idx]
-                    psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
-                else:
-                    e_ok = e_idx < n_experts
-                    end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
-                    psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
-            for sh in range_constexpr(int.bit_length(WAVE) - 1):
-                psum_hits = psum_hits + psum_hits.shuffle_xor(
-                    fx.Int32(1 << sh), fx.Int32(WAVE)
-                )
-            expert = rocdl.readfirstlane(T.i32, psum_hits)
-            has_work = expert < n_experts
+            # One load rejects the padded tail (most tiles under EP), so those
+            # workgroups quit early without the expert lookup below.
+            has_work = blk_m < tile_map[n_experts - 1]
+
+            # Seed the result with the padding sentinel so it remains defined
+            # outside the dynamic branch and the existing main-body guard
+            # stays valid.
+            expert = blk_m * 0 + n_experts
+            if has_work:
+                # psum is sorted, so the owning expert is the count of experts
+                # ending at or before blk_m. Every lane loads a strided slice in
+                # one round trip instead of a dependent log2(E) bisect.
+                psum_hits = fx.Int32(0)
+                for i in range_constexpr(ceildiv(n_experts, WAVE)):
+                    e_idx = lane + i * WAVE
+                    if const_expr((i + 1) * WAVE <= n_experts):
+                        end_e = tile_map[e_idx]
+                        psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
+                    else:
+                        e_ok = e_idx < n_experts
+                        end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
+                        psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
+                for sh in range_constexpr(int.bit_length(WAVE) - 1):
+                    psum_hits = psum_hits + psum_hits.shuffle_xor(
+                        fx.Int32(1 << sh), fx.Int32(WAVE)
+                    )
+                expert = rocdl.readfirstlane(T.i32, psum_hits)
         if const_expr(m_align):
             # tile_map holds unpadded expert ends while experts start on
             # m_align boundaries; a tile narrower than m_align can start in the
-            # previous expert's padding, which the bisect hands to this expert.
+            # previous expert's padding, which the lookup hands to this expert.
             prev = (expert > 0).select(expert - 1, 0)
             start = (tile_map[prev] + (m_align - 1)) // m_align * m_align
             start = (expert > 0).select(start, 0)
