@@ -1,6 +1,6 @@
 """
 Benchmark the fused MLA decode query prep (fused_bf16_bmm_cat_quant_pad_mla)
-against the unfused path vLLM runs ahead of the padded asm MLA decode:
+against the unfused path that runs ahead of the padded asm MLA decode:
 torch.bmm (W_UK absorb), the compiled cat + static fp8 quant, and
 repeat_interleave.
 
@@ -45,9 +45,9 @@ from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import 
     KV_LORA,
     cat_quant_fp8,
     compiled_cat_quant_fp8,
+    fp8_quant_max,
     generate_inputs,
     generate_rope_cache_inputs,
-    vllm_fp8_max,
 )
 
 PROVIDERS = ["unfused", "fused"]
@@ -92,7 +92,7 @@ def make_input_gen(M, provider, args):
 
 
 def make_fn(M, provider, args, cat_quant):
-    fp8_max = vllm_fp8_max()
+    fp8_max = fp8_quant_max()
     dup = args.padded_heads // args.qh
     config = None
     if args.config:
@@ -201,8 +201,8 @@ def make_fn(M, provider, args, cat_quant):
 
 
 def print_kernels(M, args, cat_quant, calls=4):
-    """Kernels each provider launches over a few calls, to compare with the vLLM
-    trace names. Every kernel should show up once per call."""
+    """Kernels each provider launches over a few calls, to compare with the
+    kernel names in a model trace. Every kernel should show up once per call."""
     for provider in args.providers:
         inputs = run_input_generator(make_input_gen(M, provider, args), fields(args))
         fn = make_fn(M, provider, args, cat_quant)

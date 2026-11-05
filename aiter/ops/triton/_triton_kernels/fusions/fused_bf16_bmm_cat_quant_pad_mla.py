@@ -56,7 +56,7 @@ def _quant_pad_store(
 
 
 @triton.jit
-def _rope_vllm(
+def _rope_bf16_fma(
     x,
     pos,
     max_position,
@@ -67,11 +67,12 @@ def _rope_vllm(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """RoPE of the rows of x (BLOCK_M, BLOCK_D) at positions pos, bit-exact to
-    vLLM's concat_and_cache_mla_rope_fused HIP kernel. For a pair (a, b) it
-    computes a' = a*cos - rnd(b*sin) and b' = a*sin + rnd(b*cos): hipcc fuses
-    the products of a into FMAs, so only the products of b round to x.dtype.
-    Positions are clamped into the max_position rows of the cos/sin cache."""
+    """RoPE of the rows of x (BLOCK_M, BLOCK_D) at positions pos. For a pair
+    (a, b) it computes a' = a*cos - rnd(b*sin) and b' = a*sin + rnd(b*cos): the
+    products of a stay exact, as in an FMA, and only the products of b round to
+    x.dtype. This is bit-exact to a bf16 HIP RoPE that hipcc compiles with FMA
+    contraction. Positions are clamped into the max_position rows of the cos/sin
+    cache."""
     BLOCK_D_HALF: tl.constexpr = BLOCK_D // 2
     offs_d = tl.arange(0, BLOCK_D)
     if IS_NEOX:
@@ -98,8 +99,8 @@ def _rope_vllm(
 
 @triton.jit
 def _cache_fp8(x, k_scale, CACHE_MAX: tl.constexpr, cache_dtype: tl.constexpr):
-    """vLLM's fp8 KV-cache conversion: correctly rounded x / k_scale, then a
-    saturating cast."""
+    """fp8 KV-cache conversion: correctly rounded x / k_scale, then a saturating
+    cast."""
     x = x.to(tl.float32)
     x = tl.math.div_rn(x, tl.zeros_like(x) + k_scale)
     return tl.clamp(x, -CACHE_MAX, CACHE_MAX).to(cache_dtype)
@@ -174,9 +175,8 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
       what repeat_interleave(DUP, dim=1) of the concatenated query produces.
 
     With ROPE_AND_CACHE, pe is not roped yet. The kernel ropes q_pe and k_pe and
-    writes fp8([kv_c[m] | k_pe[m]] / k_scale) to the cache slot of token m, as
-    vLLM's concat_and_cache_mla_rope_fused does. Tokens with slot < 0 keep their
-    q_pe unroped and do not write the cache.
+    writes fp8([kv_c[m] | k_pe[m]] / k_scale) to the cache slot of token m.
+    Tokens with slot < 0 keep their q_pe unroped and do not write the cache.
 
     Grid: the first QH * cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N) programs
     run the BMM tiles. The next QH * cdiv(M, BLOCK_SIZE_M) programs each write
@@ -283,7 +283,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         if ROPE_AND_CACHE:
             pos = tl.load(pos_ptr + offs_om, mask=row_mask, other=0)
             slot = tl.load(slot_ptr + offs_om, mask=row_mask, other=-1)
-            roped = _rope_vllm(
+            roped = _rope_bf16_fma(
                 pe,
                 pos,
                 max_position,
@@ -326,7 +326,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
             other=0.0,
         )
         k_pe = tl.load(k_pe_ptr + tok * stride_kpe_m + offs_d * stride_kpe_d)
-        k_pe = _rope_vllm(
+        k_pe = _rope_bf16_fma(
             k_pe[None, :],
             tl.load(pos_ptr + tok + tl.arange(0, 1)),
             max_position,

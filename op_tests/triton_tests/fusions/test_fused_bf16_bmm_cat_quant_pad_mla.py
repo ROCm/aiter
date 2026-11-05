@@ -15,8 +15,8 @@ KV_LORA, D_NOPE, D_ROPE, D_V = 512, 128, 64, 128
 SUPPORTED_ARCHS = ("gfx950",)
 
 
-def vllm_fp8_max() -> float:
-    """vLLM's static fp8 quant clamp bound (get_fp8_min_max)."""
+def fp8_quant_max() -> float:
+    """The static fp8 quant clamp bound: 224 on fnuz, else the dtype max."""
     fp8 = get_fp8_e4m3_dtype()
     return 224.0 if fp8 == torch.float8_e4m3fnuz else torch.finfo(fp8).max
 
@@ -30,9 +30,9 @@ def generate_inputs(
     d_v: int = D_V,
     dtype=torch.bfloat16,
 ):
-    """q_nope, W_UK^T and q_pe as the strided views vLLM's MLA decode passes:
-    q_nope/q_pe split from the q_b_proj output, W_UK^T from split_kv_b_proj on a
-    bf16 kv_b_proj weight."""
+    """q_nope, W_UK^T and q_pe as strided views, as an MLA decode passes them:
+    q_nope/q_pe split from the q_b_proj output, W_UK^T split from a bf16
+    kv_b_proj weight."""
     q = torch.randn((M, QH, d_nope + d_rope), dtype=dtype, device="cuda")
     q_nope, q_pe = q.split((d_nope, d_rope), dim=-1)
     kv_b = torch.randn((QH * (d_nope + d_v), kv_lora), dtype=dtype, device="cuda")
@@ -43,7 +43,7 @@ def generate_inputs(
 
 
 def cat_quant_fp8(ql_nope, q_pe, q_scale, fp8_max: float):
-    """vLLM's _DecodeConcatQuantFP8 on its QuantFP8.forward_native path."""
+    """Concat of ql_nope and q_pe, then static per-tensor fp8 quantization."""
     q = torch.cat((ql_nope, q_pe), dim=-1)
     q_flat = q.reshape(q.shape[0], -1)
     out = q_flat.to(torch.float32) * q_scale.to(torch.float32).reciprocal()
@@ -51,14 +51,14 @@ def cat_quant_fp8(ql_nope, q_pe, q_scale, fp8_max: float):
     return out.view(q.shape)
 
 
-# vLLM compiles the op standalone with a dynamic token dim; the default
-# automatic-dynamic mode reaches the same symbolic-M inductor kernel.
+# Compiled with a dynamic token dim, as a serving engine compiles the op; the
+# default automatic-dynamic mode reaches the same symbolic-M inductor kernel.
 compiled_cat_quant_fp8 = torch.compile(cat_quant_fp8)
 
 
 def ref_bmm_cat_quant_pad(q_nope, w_uk_t, q_pe, q_scale, num_padded_heads, fp8_max):
-    """The unfused vLLM sequence: torch.bmm into a token-major buffer, the
-    compiled cat + static fp8 quant, then get_mla_padded_q's repeat_interleave."""
+    """The unfused sequence: torch.bmm into a token-major buffer, the compiled
+    cat + static fp8 quant, then repeat_interleave for the head padding."""
     qh, m, _ = q_nope.shape
     ql_nope = q_nope.new_empty((m, qh, w_uk_t.shape[-1]))
     torch.bmm(q_nope, w_uk_t, out=ql_nope.transpose(0, 1))
@@ -97,7 +97,7 @@ def generate_rope_cache_inputs(
     max_pos: int = 4096,
 ):
     """kv_c and the unroped k_pe as strided views of one (M, kv_lora + d_rope)
-    buffer, as vLLM's MLA passes them, a bf16 cos | sin cache, and slots in a
+    buffer, as an MLA layer passes them, a bf16 cos | sin cache, and slots in a
     paged cache with every 5th token from token 1 on padded (slot -1)."""
     kv_lora_out = torch.randn(
         (M, kv_lora + d_rope), dtype=torch.bfloat16, device="cuda"
@@ -119,10 +119,10 @@ def generate_rope_cache_inputs(
     return kv_c, k_pe, cos_sin_cache, positions, slot_mapping, kv_cache
 
 
-def rope_vllm(x, positions, cos_sin_cache, is_neox):
-    """vLLM's concat_and_cache_mla_rope_fused RoPE numerics. For a pair (a, b):
+def rope_bf16_fma(x, positions, cos_sin_cache, is_neox):
+    """bf16 RoPE as hipcc compiles it with FMA contraction. For a pair (a, b):
     a' = a*cos - bf16(b*sin), b' = a*sin + bf16(b*cos). The a products stay
-    exact in fp32 because hipcc fuses them into FMAs."""
+    exact in fp32, as in an FMA."""
     half = x.shape[-1] // 2
     cs = cos_sin_cache[positions].float()
     cos, sin = cs[:, None, :half], cs[:, None, half:]
@@ -151,15 +151,18 @@ def ref_rope_cache(
     cos_sin_cache,
     is_neox,
 ):
-    """vLLM's concat_and_cache_mla_rope_fused on a uint8 fp8 cache: ropes q_pe
-    and k_pe and writes fp8([kv_c | k_pe] / k_scale) to the slot. Tokens with
-    slot < 0 keep q_pe unroped and do not write the cache."""
+    """RoPE and cache write on a uint8 fp8 cache: ropes q_pe and k_pe and writes
+    fp8([kv_c | k_pe] / k_scale) to the slot. Positions are clamped into the
+    cos/sin cache. Tokens with slot < 0 keep q_pe unroped and do not write the
+    cache."""
     valid = slot_mapping >= 0
     positions = positions.clamp(0, cos_sin_cache.shape[0] - 1)
     q_pe = torch.where(
-        valid[:, None, None], rope_vllm(q_pe, positions, cos_sin_cache, is_neox), q_pe
+        valid[:, None, None],
+        rope_bf16_fma(q_pe, positions, cos_sin_cache, is_neox),
+        q_pe,
     )
-    k_pe = rope_vllm(k_pe, positions, cos_sin_cache, is_neox)
+    k_pe = rope_bf16_fma(k_pe, positions, cos_sin_cache, is_neox)
     fp8 = get_fp8_e4m3_dtype()
     entry = torch.cat((kv_c, k_pe), dim=-1).float() / k_scale
     entry = entry.clamp(-torch.finfo(fp8).max, torch.finfo(fp8).max).to(fp8)
@@ -180,7 +183,7 @@ def test_fused_bf16_bmm_cat_quant_pad_mla(M, QH, num_padded_heads, scale, d_nope
     torch.manual_seed(0)
     q_nope, w_uk_t, q_pe = generate_inputs(M, QH, d_nope=d_nope)
     q_scale = torch.tensor(scale, dtype=torch.float32, device="cuda")
-    fp8_max = vllm_fp8_max()
+    fp8_max = fp8_quant_max()
 
     out = fused_bf16_bmm_cat_quant_pad_mla(
         q_nope,
@@ -220,7 +223,7 @@ def test_fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     positions[0] = 2**40
     q_scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
     k_scale = torch.tensor(k_scale, dtype=torch.float32, device="cuda")
-    fp8_max = vllm_fp8_max()
+    fp8_max = fp8_quant_max()
     fp8 = get_fp8_e4m3_dtype()
     ref_cache = kv_cache.clone()
 

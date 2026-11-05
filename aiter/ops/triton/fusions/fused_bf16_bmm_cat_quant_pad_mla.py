@@ -163,8 +163,9 @@ def fused_bf16_bmm_cat_quant_pad_mla(
             QH. Defaults to QH (no padding).
         out (Optional[torch.Tensor]): Pre-allocated (M, num_padded_heads, L + R)
             fp8 e4m3 output.
-        fp8_max (Optional[float]): Clamp bound. Defaults to the max of out.dtype;
-            vLLM clamps fnuz at 224, so pass its bound to match it.
+        fp8_max (Optional[float]): Clamp bound. Defaults to the max of out.dtype.
+            Pass a lower bound, for example 224 on fnuz, to match a caller that
+            clamps below the dtype max.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M/N/K,
             GROUP_SIZE_M, num_warps, num_stages, waves_per_eu,
             matrix_instr_nonkdim, cache_modifier). Defaults to the
@@ -206,14 +207,15 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     """
     MLA decode query prep and KV-cache write in one launch. It is
     fused_bf16_bmm_cat_quant_pad_mla with the RoPE of q_pe and k_pe and the fp8
-    cache write of vLLM's concat_and_cache_mla_rope_fused added:
+    cache write added:
 
         q_pe, k_pe = rope(positions, q_pe, k_pe)       # only tokens with slot >= 0
         kv_cache[slot] = fp8([kv_c | k_pe] / k_scale)  # only tokens with slot >= 0
         return fused_bf16_bmm_cat_quant_pad_mla(q_nope, w_uk_t, q_pe, ...)
 
-    The RoPE output is bit-exact to the vLLM HIP kernel. The roped q_pe and k_pe
-    are not written back. All tokens must be decode tokens. Tuned configs exist
+    The RoPE is bf16 with the a*cos and a*sin products of each pair (a, b) kept
+    exact, as a bf16 HIP RoPE that hipcc compiles with FMA contraction computes
+    it. The roped q_pe and k_pe are not written back. All tokens must be decode tokens. Tuned configs exist
     only for gfx950. On other archs, pass config.
 
     Args:

@@ -273,8 +273,8 @@ def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
     )
     from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
     from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        fp8_quant_max,
         generate_inputs,
-        vllm_fp8_max,
     )
 
     B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
@@ -287,7 +287,7 @@ def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
         dtype=get_fp8_e4m3_dtype(),
         device="cuda",
     )
-    fp8_max = vllm_fp8_max()
+    fp8_max = fp8_quant_max()
 
     def call(config, q_nope, w_uk_t, q_pe, q_scale, out):
         return fused(
@@ -323,9 +323,9 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(shape, backend):
     )
     from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
     from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        fp8_quant_max,
         generate_inputs,
         generate_rope_cache_inputs,
-        vllm_fp8_max,
     )
 
     B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
@@ -340,7 +340,7 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(shape, backend):
     # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
     padded_heads = math.lcm(B, 16)
     out = torch.empty((M, padded_heads, N + q_pe.shape[-1]), dtype=fp8, device="cuda")
-    fp8_max = vllm_fp8_max()
+    fp8_max = fp8_quant_max()
 
     # The cache write is idempotent, so the timed calls need no reset.
     def call(config, q_nope, w_uk_t, q_pe, q_scale, out, kv_c, k_pe, kv_cache):
