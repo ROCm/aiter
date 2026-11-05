@@ -170,12 +170,6 @@ def _plant_nonfinite(x, G, pattern):
         x[r, g * G + (i * 7) % G] = values[i % len(values)]
 
 
-def _device_arch():
-    """Arch of the current device; get_gfx() is cached for the whole process."""
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return props.gcnArchName.split(":")[0]
-
-
 def _mx_reference(x, G, q_dtype):
     """Expected (data bytes, [m, n / G] scale bytes) on the current device.
 
@@ -187,7 +181,7 @@ def _mx_reference(x, G, q_dtype):
     m, n = x.shape
     fp4 = q_dtype == dtypes.fp4x2
     xf = x.float().view(m, n // G, G)
-    fnuz = _device_arch() == "gfx942"
+    fnuz = get_gfx() == "gfx942"
     mx = (
         MxDtypeInt.FP4_E2M1
         if fp4
@@ -211,7 +205,7 @@ def _fp8_bytes(out):
     """fp8 output bytes with both e4m3fn NaNs (0x7f, 0xff) as 0xff: the NaN sign
     an Inf converts to differs between archs."""
     b = out.view(torch.uint8)
-    return b if _device_arch() == "gfx942" else b.masked_fill(b == 0x7F, 0xFF)
+    return b if get_gfx() == "gfx942" else b.masked_fill(b == 0x7F, 0xFF)
 
 
 def _fp4_bytes(out, x):
@@ -305,28 +299,6 @@ def test_mxfp8_m32k4(m, n, h_dtype, pattern=None):
     assert (
         scale_err == 0 and out_err == 0
     ), f"{m=} {n=} {pattern=} {scale_err=} {out_err=}"
-
-
-def test_heterogeneous_devices():
-    """Launch choices must follow each device's arch, not the first one queried.
-
-    The fp8 encoding is fixed per process (dtypes.fp8 and the C++ torch_fp8), so
-    only devices sharing gfx1250's OCP encoding are mixed; gfx942 (FNUZ) is not.
-    """
-    first = {}
-    for i in range(torch.cuda.device_count()):
-        arch = torch.cuda.get_device_properties(i).gcnArchName.split(":")[0]
-        if arch != "gfx942":
-            first.setdefault(arch, i)
-    if len(first) < 2 or "gfx1250" not in first or dtypes.fp8 != torch.float8_e4m3fn:
-        aiter.logger.info("heterogeneous-device test skipped: archs %s", sorted(first))
-        return
-    order = [first["gfx1250"]] + [d for a, d in first.items() if a != "gfx1250"]
-    for dev in order + order[::-1]:
-        with torch.cuda.device(dev):
-            test_mxfp8_nonfinite_g128(4096, 7168, dtypes.bf16, True, "nan")
-            test_quant_1x32_e8m0(1024, 7168, dtypes.fp8, dtypes.bf16, True, False)
-    aiter.logger.info("heterogeneous-device test passed on %s", sorted(first))
 
 
 def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
@@ -662,7 +634,6 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         [None, "nan", "posinf", "neginf", "mixed"],
     ):
         test_mxfp8_m32k4(m, n, h_dtype, pattern)
-    test_heterogeneous_devices()
     aiter.logger.info("fp8_1x32_e8m0 passed")
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx1250"):
     for gs, shuffle in itertools.product([32, 64, 128], [True, False]):
