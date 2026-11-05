@@ -318,6 +318,58 @@ def make_q_nope(
     raise ValueError(f"Unsupported q_nope_layout: {q_nope_layout}")
 
 
+def check_fused_rope_fp8_saturates(device: str, kv_lora_rank: int, is_neox: bool):
+    """FP8 q_out and KV cache clamp to the fp8 range in the rope part as in the
+    nope part; a bare cast turned rope values past it into NaN. kv_lora_rank 512
+    runs the head-grouped kernel; other ranks run the per-head and general ones."""
+    tokens, heads = 4, 16
+    fp8_max = torch.finfo(dtypes.fp8).max
+    q_nope = torch.randn(tokens, heads, kv_lora_rank, dtype=dtypes.bf16, device=device)
+    q_pe = torch.randn(tokens, heads, 64, dtype=dtypes.bf16, device=device)
+    kv_c = torch.randn(tokens, kv_lora_rank, dtype=dtypes.bf16, device=device)
+    k_pe = torch.randn(tokens, 64, dtype=dtypes.bf16, device=device)
+    for t in (q_nope, q_pe, kv_c, k_pe):
+        # Both ends of the row, so the rope part's x and y lanes both saturate
+        # in the neox (halves) and GPT-J (interleaved) layouts.
+        for cols, sign in ((slice(0, 2), 1), (slice(2, 4), -1), (slice(-4, -2), 1)):
+            t.view(-1, t.shape[-1])[:, cols] = sign * 4 * fp8_max
+        t.view(-1, t.shape[-1])[:, -2:] = -4 * fp8_max
+    kv_cache = torch.zeros(
+        tokens, 1, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
+    )
+    q_out = torch.empty(
+        tokens, heads, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
+    )
+    one = torch.ones(1, dtype=torch.float32, device=device)
+    # One identity rope row: rope leaves the values as they are.
+    cos = torch.ones(1, 32, dtype=dtypes.bf16, device=device)
+    sin = torch.zeros(1, 32, dtype=dtypes.bf16, device=device)
+    aiter.fused_qk_rope_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        torch.arange(tokens, dtype=torch.long, device=device),
+        one,
+        one,
+        torch.zeros(tokens, dtype=torch.long, device=device),
+        cos,
+        sin,
+        is_neox,
+        True,
+    )
+    torch.cuda.synchronize()
+    expect_q = torch.cat((q_nope, q_pe), -1).float().clamp(-fp8_max, fp8_max)
+    expect_k = torch.cat((kv_c, k_pe), -1).float().clamp(-fp8_max, fp8_max)
+    torch.testing.assert_close(q_out.float(), expect_q.to(dtypes.fp8).float())
+    torch.testing.assert_close(
+        kv_cache.view(tokens, kv_lora_rank + 64).float(),
+        expect_k.to(dtypes.fp8).float(),
+    )
+
+
 @benchmark()
 def test_fused_rope_concat_and_cache_mla(
     kv_lora_rank: int,
@@ -817,6 +869,9 @@ if "normal" in args.case:
 
 
 if "fused_qk" in args.case:
+    for kv_lora_rank in (512, 256, 128):
+        for is_neox in (True, False):
+            check_fused_rope_fp8_saturates(args.device, kv_lora_rank, is_neox)
     df = []
     for num_token in args.token:
         num_blocks = num_token // args.block_size
