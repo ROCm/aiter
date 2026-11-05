@@ -18,6 +18,7 @@ _MXMOE_G1_FLAG_TOKENS = {
     "SWIGLU",
     "BIAS",
     "W2",
+    "HK",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -124,6 +125,7 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "enable_bias": "BIAS" in flags,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
+        "half_k_pipeline": "HK" in flags,
     }
 
 

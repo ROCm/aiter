@@ -2815,6 +2815,9 @@ def _mxfp4_a4w4_stage1(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=_xcd1,
+        half_k_pipeline=_parse_mxfp4_g1_kname(kernelName1).get(
+            "half_k_pipeline", False
+        ),
         native_scale_layout=native_scale_layout,
         a_dtype=a_dtype,
         out_dtype=out_dtype,

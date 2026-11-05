@@ -415,6 +415,10 @@ A8W4_MASKED_ID = ROUTED_EXPERTS
 A8W4_TOPK = ROUTED_TOPK + 1
 
 A8W4_CASES = {
+    "bm64_half_k": (
+        "flydsl_mxmoe_g1_a8w4_64x256x256_fp8out_situv2_hk",
+        "flydsl_moe2_layout_afp8_wfp4_bf16_t64x256x128_atomic_sbm64",
+    ),
     "bm32_atomic": (
         "flydsl_mxmoe_g1_a8w4_32x256x256_fp8out_situv2",
         "flydsl_moe2_layout_afp8_wfp4_bf16_t32x256x256_atomic_nt_sbm32",

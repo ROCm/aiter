@@ -95,6 +95,7 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    half_k_pipeline=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -119,15 +120,15 @@ def _gemm1_body(
     kUnroll = K_TILES_PER_WAVE - k_stages
 
     k_split = (
-        a_dtype == "fp4"
+        (a_dtype == "fp4" or half_k_pipeline)
         and not inline_quant
-        and BM == 128
+        and (BM == 128 or half_k_pipeline)
         and BN == 256
         and num_waves == 4
         and kMChunks > 1
         and kUnroll >= 1
     )
-    a_reg_depth = min(2, kUnroll) if k_split else 0
+    a_reg_depth = min(1 if a_dtype == "fp8" else 2, kUnroll) if k_split else 0
 
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
@@ -376,34 +377,67 @@ def _gemm1_body(
         regs = []
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            mask = _lds_swizzle_mask(lds_row + lane_div_8)
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                sub
-            ] * fx.Int32(A_ROW_BYTES)
-            r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
-            fx.copy(
-                aq_reg_atom,
-                fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
-                r,
-                soffset=fx.Int32(kt * KH_TILE) // 4,
-            )
-            regs.append(r)
+            if const_expr(a_dtype == "fp8"):
+                pair = []
+                for row_group in range_constexpr(2):
+                    row = lds_row + fx.Int32(row_group * 4) + lane_div_16
+                    mask = _lds_swizzle_mask(row)
+                    voffset = ((lane_mod_16 * fx.Int32(16)) ^ mask) + cached_actual_row[
+                        sub
+                    ][row_group] * fx.Int32(A_ROW_BYTES)
+                    r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                    fx.copy(
+                        aq_reg_atom,
+                        fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                        r,
+                        soffset=fx.Int32(kt * KH_TILE) // 4,
+                    )
+                    pair.append(r)
+                regs.append(pair)
+            else:
+                mask = _lds_swizzle_mask(lds_row + lane_div_8)
+                voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
+                    sub
+                ] * fx.Int32(A_ROW_BYTES)
+                r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                fx.copy(
+                    aq_reg_atom,
+                    fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                    r,
+                    soffset=fx.Int32(kt * KH_TILE) // 4,
+                )
+                regs.append(r)
         return regs
 
     def a_reg_write_lds(slot, regs):
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            dst = (
-                aq_group_base
-                + fx.Int32(slot * (BM * KH_TILE))
-                + (lds_row + lane_div_8) * fx.Int32(KH_TILE)
-                + lane_mod_8 * fx.Int32(16)
-            )
-            fx.copy(
-                i32x4_copy_atom,
-                regs[sub],
-                fx.slice(s_aq_i32x4_tiles, (None, dst // fx.Int32(16))),
-            )
+            if const_expr(a_dtype == "fp8"):
+                for row_group in range_constexpr(2):
+                    row = lds_row + fx.Int32(row_group * 4) + lane_div_16
+                    dst = (
+                        aq_group_base
+                        + fx.Int32(slot * BM * KH_TILE)
+                        + row * fx.Int32(KH_TILE)
+                        + lane_mod_16 * fx.Int32(16)
+                    )
+                    fx.copy(
+                        i32x4_copy_atom,
+                        regs[sub][row_group],
+                        fx.slice(s_aq_i32x4_tiles, (None, dst // fx.Int32(16))),
+                    )
+            else:
+                dst = (
+                    aq_group_base
+                    + fx.Int32(slot * (BM * KH_TILE))
+                    + (lds_row + lane_div_8) * fx.Int32(KH_TILE)
+                    + lane_mod_8 * fx.Int32(16)
+                )
+                fx.copy(
+                    i32x4_copy_atom,
+                    regs[sub],
+                    fx.slice(s_aq_i32x4_tiles, (None, dst // fx.Int32(16))),
+                )
 
     def _lds_i32x4_frag(tile_idx):
         # ds_read_b128 straight into an i32[4] register fragment (kept as a tensor
@@ -1517,6 +1551,7 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    half_k_pipeline=False,
 ):
     """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
@@ -1537,6 +1572,11 @@ def compile_gemm1_a4w4_port(
         raise AssertionError("hidden prefetch requires inline quantization")
     assert num_waves in (2, 4), f"num_waves must be 2 or 4, got {num_waves}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
+    if half_k_pipeline:
+        assert (
+            a_dtype == "fp8" and BM == 64 and BN == 256 and not inline_quant
+        ), "half-K FP8 pipeline requires BM64, BN256 and prequantized activations"
+        assert num_waves == 4 and k_wave == 1
 
     assert (
         BN in (64, 128, 256) and BK == 256
@@ -1639,6 +1679,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if half_k_pipeline:
+        name_suffix += "_hk"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1737,6 +1779,7 @@ def compile_gemm1_a4w4_port(
                 k_wave=k_wave,
                 epi_splits=epi_splits,
                 k_stages=k_stages,
+                half_k_pipeline=half_k_pipeline,
             )
 
     @flyc.jit
