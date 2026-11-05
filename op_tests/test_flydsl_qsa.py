@@ -71,7 +71,17 @@ from aiter.ops.flydsl.qsa_paged import (
     qsa_layer,
     span_bytes,
 )
-from aiter.ops.qsa import qsa_expand_block_indices
+from aiter.ops.qsa import (
+    DEFAULT_LOGITS_WORKSPACE_BYTES,
+    qsa_expand_block_indices,
+    qsa_paged_mqa_logits,
+    qsa_select_paged_tokens,
+    qsa_sparse_paged_gqa,
+)
+from aiter.ops.topk import top_k_per_row_prefill
+from aiter.ops.triton.attention.qsa import (
+    qsa_sparse_paged_gqa as triton_qsa_sparse_paged_gqa,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -4759,6 +4769,198 @@ def test_qsa_layer_decode_graph_replays():
     )
     if err != 0:
         raise AssertionError(f"graph replay diverged from the oracle (err={err})")
+
+
+def test_qsa_ops_dispatch_flash_next_matches_oracle(monkeypatch):
+    """Supported Flash-Next shapes from ``aiter.ops.qsa`` match the fp32 oracle.
+
+    ``qsa_select_paged_tokens`` goes through ``qsa_indexer_block_ids``. The
+    indexer does not promise oracle column order, so the token ids are
+    compared as sets. ``qsa_sparse_paged_gqa`` goes through
+    ``flydsl_qsa_paged_gqa``. ``token_to_request`` is int64 there; FlyDSL
+    receives a contiguous int32 copy.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        pytest.skip("unsupported arch")
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
+    entered = {"indexer": False, "gqa": False}
+    indexer = qsa_paged.qsa_indexer_block_ids
+    paged_gqa = qsa_paged.flydsl_qsa_paged_gqa
+
+    def _enter_indexer(*args, **kwargs):
+        entered["indexer"] = True
+        return indexer(*args, **kwargs)
+
+    def _enter_gqa(*args, **kwargs):
+        entered["gqa"] = True
+        return paged_gqa(*args, **kwargs)
+
+    monkeypatch.setattr(qsa_paged, "qsa_indexer_block_ids", _enter_indexer)
+    monkeypatch.setattr(qsa_paged, "flydsl_qsa_paged_gqa", _enter_gqa)
+
+    selected = qsa_select_paged_tokens(
+        case["q_indexer"],
+        case["index_cache"],
+        case["index_table"],
+        case["token_to_req"],
+        case["qpos"],
+        case["slen"],
+        idx.token_budget,
+        idx.compress_ratio,
+    )
+    if not entered["indexer"]:
+        raise AssertionError(
+            "supported indexer shape did not enter qsa_indexer_block_ids"
+        )
+    if _set_mismatch_ratio(case["ref"].indices, selected) != 0.0:
+        raise AssertionError(
+            "qsa_select_paged_tokens diverged from the oracle indices"
+        )
+
+    out = qsa_sparse_paged_gqa(
+        case["q_gqa"],
+        case["k_cache"],
+        case["v_cache"],
+        case["ref"].indices,
+        case["kv_table"],
+        case["token_to_req"].to(dtypes.i64),
+    )
+    if not entered["gqa"]:
+        raise AssertionError(
+            "supported sparse GQA shape did not enter flydsl_qsa_paged_gqa"
+        )
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="dispatched sparse GQA vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(
+            f"dispatched sparse GQA diverged from the oracle (err={err})"
+        )
+
+
+def _logits_select_paged_tokens(
+    q,
+    compressed_k_cache,
+    page_table,
+    token_to_request,
+    query_positions,
+    context_lens,
+    token_topk,
+    compress_ratio=4,
+):
+    """Logits, top-k, and expand, the path used when the indexer gate rejects."""
+    rows = q.shape[0]
+    columns = page_table.shape[1] * compressed_k_cache.shape[1]
+    block_topk = min(token_topk // compress_ratio, columns)
+    output_width = block_topk * compress_ratio + compress_ratio - 1
+    out = torch.empty((rows, output_width), dtype=dtypes.i32, device=q.device)
+    rows_per_chunk = max(1, DEFAULT_LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+    for row_start in range(0, rows, rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, rows)
+        row_slice = slice(row_start, row_end)
+        row_starts = torch.empty(row_end - row_start, dtype=dtypes.i32, device=q.device)
+        logits, visible_groups = qsa_paged_mqa_logits(
+            q[row_slice],
+            compressed_k_cache,
+            page_table,
+            token_to_request[row_slice],
+            query_positions[row_slice],
+            context_lens,
+            compress_ratio,
+            max_columns=columns,
+            row_starts=row_starts,
+            allow_flydsl=False,
+        )
+        selected_groups = torch.empty(
+            (row_end - row_start, block_topk), dtype=dtypes.i32, device=q.device
+        )
+        top_k_per_row_prefill(
+            logits,
+            row_starts,
+            visible_groups,
+            selected_groups,
+            None,
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            block_topk,
+            stable=True,
+        )
+        qsa_expand_block_indices(
+            selected_groups,
+            query_positions[row_slice],
+            context_lens,
+            token_to_request[row_slice],
+            compress_ratio,
+            token_topk,
+            out[row_slice],
+            output_width=output_width,
+        )
+    return out
+
+
+def test_qsa_ops_dispatch_keeps_the_existing_backend(monkeypatch):
+    """A dtype the support gates reject never enters the FlyDSL launchers.
+
+    fp16 is rejected for both the indexer and sparse GQA. Selection still
+    matches the logits path, and sparse GQA still matches the Triton kernel.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        pytest.skip("unsupported arch")
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("FlyDSL launcher was entered")
+
+    monkeypatch.setattr(qsa_paged, "qsa_indexer_block_ids", _forbidden)
+    monkeypatch.setattr(qsa_paged, "flydsl_qsa_paged_gqa", _forbidden)
+
+    device = torch.device("cuda")
+    rows, pages, page = 2, 4, 16
+    torch.manual_seed(0)
+    q_index = torch.randn(rows, 4, 128, dtype=dtypes.fp16, device=device)
+    compressed = torch.randn(pages, page, 1, 128, dtype=dtypes.fp16, device=device)
+    index_table = torch.arange(pages, dtype=dtypes.i32, device=device).reshape(1, pages)
+    requests = torch.zeros(rows, dtype=dtypes.i32, device=device)
+    positions = torch.arange(rows, dtype=dtypes.i32, device=device)
+    lengths = torch.tensor([rows * page], dtype=dtypes.i32, device=device)
+    selected = qsa_select_paged_tokens(
+        q_index,
+        compressed,
+        index_table,
+        requests,
+        positions,
+        lengths,
+        FLASH_NEXT_INDEXER.token_budget,
+        FLASH_NEXT_INDEXER.compress_ratio,
+    )
+    existing = _logits_select_paged_tokens(
+        q_index,
+        compressed,
+        index_table,
+        requests,
+        positions,
+        lengths,
+        FLASH_NEXT_INDEXER.token_budget,
+        FLASH_NEXT_INDEXER.compress_ratio,
+    )
+    if not torch.equal(selected, existing):
+        raise AssertionError("rejected indexer shape left the logits path")
+
+    q = torch.randn(rows, 24, 256, dtype=dtypes.fp16, device=device)
+    k_cache = torch.randn(pages, page, 2, 256, dtype=dtypes.fp16, device=device)
+    v_cache = torch.randn_like(k_cache)
+    indices = torch.randint(0, pages * page, (rows, 8), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    kv_table = index_table
+    got = qsa_sparse_paged_gqa(q, k_cache, v_cache, indices, kv_table, requests)
+    ref = triton_qsa_sparse_paged_gqa(q, k_cache, v_cache, indices, kv_table, requests)
+    if not torch.equal(got, ref):
+        raise AssertionError("rejected sparse GQA shape left the Triton kernel")
 
 
 def _e2e_counts(case, idx, gqa, dtype):
