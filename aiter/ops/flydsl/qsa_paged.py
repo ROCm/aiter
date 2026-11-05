@@ -20,9 +20,6 @@ once the grid alone fills the machine. Softmax is online in log2 space and the
 split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
-The fp32 reference, the paged-cache fixtures, and the concrete shapes
-live in ``op_tests/qsa_ref.py``.
-
 ``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer,
 ``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
 from the measured table logs once. A query that is not rank 3 is not a
