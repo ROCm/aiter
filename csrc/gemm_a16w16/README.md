@@ -13,7 +13,10 @@ For hipblaslt-only tuning, use `gradlib/gradlib/gemm_tuner.py` instead.
     |-----|-----|-----|--------|---------|------------|-----------|---------------|
     |1    |7168 |2048 |False   |torch.bfloat16|torch.bfloat16|False  |False          |
 
-   Or capture shapes automatically by running your workload with `AITER_TUNE_GEMM=1`.
+   Or capture shapes automatically with a model/run-specific output directory:
+   `AITER_TUNE_GEMM=1 AITER_TUNE_GEMM_DIR=/tuning/<model-or-run> python <workload>`.
+   Each worker writes a `bf16_untuned_gemm.<shard-id>.csv` shard; set
+   `AITER_TUNE_GEMM_SHARD_ID` to your rank or pod ID when needed.
 
 3. Start tuning:
 
