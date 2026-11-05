@@ -9,6 +9,31 @@ from packaging import version
 from packaging.version import Version
 
 aiter_lib = None
+_host_scalar_ops_real = False
+
+
+def run_host_scalar_ops_for_real(enabled: bool) -> bool:
+    """Make scalar-returning custom ops run their implementation instead of
+    dispatching, so they still answer under FakeTensorMode, whose fakes carry no
+    value. Returns the previous setting."""
+    global _host_scalar_ops_real
+    previous = _host_scalar_ops_real
+    _host_scalar_ops_real = enabled
+    return previous
+
+
+_python_ops_real = False
+
+
+def run_python_ops_for_real(enabled: bool) -> bool:
+    """Make ops with a Python body (not bound C++ functions) run that body
+    instead of dispatching, so under FakeTensorMode the host code picking and
+    launching kernels runs while the C++ ops it calls still dispatch to their
+    fakes. Returns the previous setting."""
+    global _python_ops_real
+    previous = _python_ops_real
+    _python_ops_real = enabled
+    return previous
 
 
 def is_torch_equal_or_newer(target: str) -> bool:
@@ -90,6 +115,9 @@ NONE_WRAPPED_OP = [
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",
+    "get_mla_decode_head_plan_v1",
+    "mla_metadata_cluster_multiplier_v1",
+    "mla_reduce_v1_supports",
 ]
 
 
@@ -125,6 +153,8 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
+        elif param_type == (int | None):
+            type_str = "SymInt?"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
         elif param_type == (torch.Generator | None):
@@ -289,8 +319,12 @@ def torch_compile_guard(
         schema = f"{new_input} -> {output_part}".strip()
 
         loadName = calling_func.__name__
+        # A bound C++ function arrives through calling_func_; its func is a stub.
+        python_body = calling_func_ is None
 
         def wrapper_custom(*args, **kwargs):
+            if python_body and _python_ops_real:
+                return func(*args, **kwargs)
             result = (
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
                 if input_is_tensor
@@ -299,6 +333,14 @@ def torch_compile_guard(
                 )
             )
             return result[1] if return_non_tensor else result
+
+        if return_non_tensor:
+            dispatch_custom = wrapper_custom
+
+            def wrapper_custom(*args, **kwargs):
+                if _host_scalar_ops_real:
+                    return func(*args, **kwargs)
+                return dispatch_custom(*args, **kwargs)
 
         if hasattr(torch.ops.aiter, loadName):
             return wrapper_custom
@@ -354,6 +396,11 @@ def torch_compile_guard(
             aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CUDA")
             aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
+            # The op dispatches to this very body, so a caller already running
+            # inside another aiter custom op may call it directly and skip the
+            # second torch.ops dispatch. Set only when this decorator registered
+            # the op: a pre-existing registration may run a different body.
+            wrapper_custom._eager_body = func
 
         return wrapper_custom
 

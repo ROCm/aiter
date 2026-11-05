@@ -675,7 +675,9 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
     nope = D - rope  # NoPE dim, stored fp8 e4m3 OCP
     nb = triton.cdiv(num_tokens, block)
     if dtype == "bf16":
-        cache = (torch.randn(nb, block, D, device=device) * 0.4).to(torch.bfloat16)
+        cache = (
+            torch.randn(nb, block, D, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
 
     if layout == "trailer":
@@ -688,13 +690,13 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
         flat = cache.view(nb, block * row_bytes)
         data = flat[:, : block * data_bytes].view(nb, block, data_bytes)
         scales_region = flat[:, block * data_bytes :].view(nb, block, scale_bytes)
-        nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
-            torch.float8_e4m3fn
-        )
+        nope_fp8 = (
+            torch.randn(nb, block, nope, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.float8_e4m3fn)
         data[:, :, :nope] = nope_fp8.view(torch.uint8)
-        rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(
-            torch.bfloat16
-        )
+        rope_bf16 = (
+            torch.randn(nb, block, rope, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.bfloat16)
         data[:, :, nope:data_bytes] = rope_bf16.view(torch.uint8).view(
             nb, block, rope * 2
         )
@@ -718,11 +720,13 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
     sc_off = nope
     rope_off = 512
     cache = torch.zeros(nb, block, row_bytes, dtype=torch.uint8, device=device)
-    nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
-        torch.float8_e4m3fn
-    )
+    nope_fp8 = (
+        torch.randn(nb, block, nope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.float8_e4m3fn)
     cache[:, :, :nope] = nope_fp8.view(torch.uint8)
-    rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(torch.bfloat16)
+    rope_bf16 = (
+        torch.randn(nb, block, rope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.bfloat16)
     cache[:, :, rope_off:] = rope_bf16.view(torch.uint8).view(nb, block, rope * 2)
     num_groups = nope // 64
     exps = torch.randint(
@@ -970,7 +974,7 @@ def test_pa_decode_sparse_global_gather(T, has_invalid):
     indptr[1:] = lens.cumsum(0)
     idx = torch.randperm(int(lens.sum()), device=device).to(torch.int32)
     if has_invalid:
-        drop = torch.rand(idx.shape, device=device) < 0.2
+        drop = torch.rand(idx.shape, device=device, dtype=torch.float32) < 0.2
         drop[indptr[:-1].long()] = False  # every row keeps a key
         idx[drop] = -1
 
@@ -1025,7 +1029,7 @@ def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
     extra_indptr = torch.arange(
         0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
     )
-    ang = torch.rand(4096, 32, device=device) * 6.2831853
+    ang = torch.rand(4096, 32, device=device, dtype=torch.float32) * 6.2831853
     cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).contiguous()
     pos = torch.randint(0, 4096, (T,), device=device)
 

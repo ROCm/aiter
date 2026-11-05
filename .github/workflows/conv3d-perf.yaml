@@ -1,0 +1,374 @@
+name: Conv3d Manual Perf
+
+on:
+  workflow_dispatch:
+    inputs:
+      physical_gpu:
+        description: 'Physical ROCm SMI GPU index (not a container logical index)'
+        type: string
+        required: true
+        default: '0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conv3d-perf-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch_policy:
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.policy.outputs.allowed }}
+    steps:
+      - name: Restrict GPU execution to the trusted upstream default branch
+        id: policy
+        env:
+          ALLOWED: ${{ github.repository == 'ROCm/aiter' && !github.event.repository.fork && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+        run: |
+          set -euo pipefail
+          [[ "$PHYSICAL_GPU" =~ ^(0|[1-9][0-9]*)$ ]] || { echo '::error::physical_gpu must be a non-negative integer'; exit 1; }
+          echo "allowed=$ALLOWED" >> "$GITHUB_OUTPUT"
+          if [[ "$ALLOWED" != true ]]; then
+            echo 'GPU execution is disabled for forks and non-default branches. Merge reviewed code into the upstream default branch before dispatching.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  ci_config:
+    needs: dispatch_policy
+    if: needs.dispatch_policy.outputs.allowed == 'true'
+    uses: ./.github/workflows/ci-config.yaml
+
+  perf:
+    needs: [dispatch_policy, ci_config]
+    if: needs.dispatch_policy.outputs.allowed == 'true'
+    runs-on: linux-aiter-mi35x-1
+    timeout-minutes: 120
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+      SOURCE_DIR: ${{ github.workspace }}/conv3d-perf-src-${{ github.run_id }}-${{ github.run_attempt }}
+      OWNER: conv3d-perf-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Initialize isolated logs and registry configuration
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d "$RUNNER_TEMP/conv3d-perf-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX")
+          mkdir -p "$root/logs" "$root/scripts" "$root/registry"
+          echo "RUN_ROOT=$root" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$root/registry" >> "$GITHUB_ENV"
+          printf 'commit=%s\nref=%s\nphysical_gpu=%s\nimage=%s\ncache=cold, container-local; no shared cache restore/save\ncommand=python op_tests/test_flydsl_conv_implicit.py --mode perf\n' \
+            "$GITHUB_SHA" "$GITHUB_REF" "$PHYSICAL_GPU" "$DOCKER_IMAGE" > "$root/logs/dispatch.txt"
+
+      - name: Checkout the dispatched commit without persistent credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: conv3d-perf-src-${{ github.run_id }}-${{ github.run_attempt }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Authenticate using the existing CI registry secrets when available
+        timeout-minutes: 5
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$DOCKER_USERNAME" && -n "$DOCKER_PASSWORD" ]]; then
+            printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          else
+            echo 'No registry credentials supplied; using the public CI image.'
+          fi
+
+      - name: Write workflow-local read-only GPU sampler and workload
+        run: |
+          set -euo pipefail
+          cat > "$RUN_ROOT/scripts/smi.py" <<'PY'
+          import contextlib
+          import ctypes as C
+          import importlib
+          import json
+          import pathlib
+          import sys
+
+          # Use the bindings shipped with ROCm, not a copied ABI or CLI text parser.
+          for directory in ("/opt/rocm/libexec/rocm_smi", "/opt/rocm/bin"):
+              if (pathlib.Path(directory) / "rsmiBindings.py").is_file():
+                  sys.path.insert(0, directory)
+                  break
+          with contextlib.redirect_stdout(sys.stderr):
+              bindings = importlib.import_module("rsmiBindings")
+          smi = bindings.rocmsmi
+
+          def check(name, *args):
+              status = getattr(smi, name)(*args)
+              if status != 0:
+                  raise RuntimeError(f"{name} failed with ROCm SMI status {status}")
+
+          gpu = int(sys.argv[1])
+          check("rsmi_init", C.c_uint64(0))
+          try:
+              total = C.c_uint32()
+              check("rsmi_num_monitor_devices", C.byref(total))
+              if gpu >= total.value:
+                  raise RuntimeError(f"Physical GPU {gpu} is not in the ROCm SMI inventory")
+              busy, pci, uid = C.c_uint32(), C.c_uint64(), C.c_uint64()
+              check("rsmi_dev_busy_percent_get", gpu, C.byref(busy))
+              check("rsmi_dev_pci_id_get", gpu, C.byref(pci))
+              check("rsmi_dev_unique_id_get", gpu, C.byref(uid))
+              if uid.value == 0 or busy.value > 100:
+                  raise RuntimeError("Invalid GPU identity or utilization")
+              bdf = f"{pci.value >> 32:04x}:{(pci.value >> 8) & 255:02x}:{(pci.value >> 3) & 31:02x}.{pci.value & 7:x}"
+              count = C.c_uint32()
+              check("rsmi_compute_process_info_get", None, C.byref(count))
+              capacity = count.value + 32
+              processes = (bindings.rsmi_process_info_t * capacity)()
+              count.value = capacity
+              check("rsmi_compute_process_info_get", processes, C.byref(count))
+              selected = []
+              for process in processes[:count.value]:
+                  devices_count = C.c_uint32()
+                  check("rsmi_compute_process_gpus_get", process.process_id, None, C.byref(devices_count))
+                  devices = (C.c_uint32 * max(1, devices_count.value))()
+                  check("rsmi_compute_process_gpus_get", process.process_id, devices, C.byref(devices_count))
+                  if gpu in devices[:devices_count.value]:
+                      selected.append({"pid": process.process_id, "vram_bytes": process.vram_usage})
+              print(json.dumps({"gpu": gpu, "busy_percent": busy.value, "bdf": bdf,
+                                "uuid": f"GPU-{uid.value:016x}", "processes": selected}))
+          finally:
+              check("rsmi_shut_down")
+          PY
+          cat > "$RUN_ROOT/scripts/workload.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          import ctypes as C
+          import importlib.metadata as metadata
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import torch
+
+          hip = C.CDLL("/opt/rocm/lib/libamdhip64.so")
+          bus = C.create_string_buffer(32)
+          hip.hipDeviceGetPCIBusId.argtypes = [C.c_char_p, C.c_int, C.c_int]
+          status = hip.hipDeviceGetPCIBusId(bus, len(bus), 0)
+          if status != 0 or bus.value.decode().lower() != os.environ["EXPECTED_BDF"]:
+              raise RuntimeError("Selected HIP device does not match the physical ROCm SMI PCI address")
+          if torch.cuda.device_count() != 1:
+              raise RuntimeError("Conv3d perf requires exactly one visible HIP device")
+          properties = torch.cuda.get_device_properties(0)
+          arch = properties.gcnArchName.split(":")[0]
+          if arch != "gfx950":
+              raise RuntimeError(f"Expected gfx950, got {arch}")
+          required = next(ast.literal_eval(node.value) for node in ast.parse(pathlib.Path("setup.py").read_text()).body
+                          if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "FLYDSL_VERSION" for t in node.targets))
+          actual = metadata.version("flydsl")
+          if required != f"flydsl=={actual}":
+              raise RuntimeError(f"FlyDSL mismatch: setup.py requires {required}, installed flydsl=={actual}")
+          data = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                  "architecture": arch, "device": properties.name, "pci_bus": bus.value.decode(),
+                  "torch": torch.__version__, "hip": torch.version.hip, "flydsl": actual,
+                  "rocr_visible_devices": os.environ["ROCR_VISIBLE_DEVICES"],
+                  "hip_visible_devices": os.environ["HIP_VISIBLE_DEVICES"],
+                  "cache_policy": "cold, container-local; no restore/save",
+                  "cache_paths": {key: os.environ[key] for key in ("FLYDSL_RUNTIME_CACHE_DIR", "TRITON_CACHE_DIR", "AITER_JIT_DIR")},
+                  "command": "python op_tests/test_flydsl_conv_implicit.py --mode perf"}
+          pathlib.Path("/conv3d-logs/toolchain.json").write_text(json.dumps(data, indent=2) + "\n")
+          print(json.dumps(data, indent=2), flush=True)
+          PY
+          /opt/rocm/bin/hipcc --version
+          python -m pip show flydsl torch triton amd-aiter
+          exec timeout --signal=TERM --kill-after=30s 60m python -u op_tests/test_flydsl_conv_implicit.py --mode perf
+          SH
+
+      - name: Start only this run's bounded container using the CI device convention
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          device_flags=(--device /dev/dri)
+          if [[ -f /etc/podinfo/gha-render-devices ]]; then
+            read -r -a device_flags <<< "$(tr '\n' ' ' < /etc/podinfo/gha-render-devices)"
+            [[ ${#device_flags[@]} -gt 0 ]] || { echo '::error::Empty assigned render-device list'; exit 1; }
+          fi
+          groups=()
+          for group in render video; do
+            gid=$(getent group "$group" | cut -d: -f3)
+            [[ -z "$gid" ]] || groups+=(--group-add "$gid")
+          done
+          docker pull "$DOCKER_IMAGE"
+          docker image inspect "$DOCKER_IMAGE" --format '{{json .RepoDigests}}' > "$RUN_ROOT/logs/image-digests.json"
+          cid=$(docker run -d --name "$OWNER" --label "aiter.conv3d-perf.owner=$OWNER" \
+            --device=/dev/kfd "${device_flags[@]}" "${groups[@]}" \
+            --cap-drop=ALL --security-opt=no-new-privileges --shm-size=16G \
+            -e GPU_ARCHS=gfx950 -e AITER_MAX_JOBS=8 -e MAX_JOBS=8 \
+            -e FLYDSL_RUNTIME_CACHE_DIR=/conv3d-cache/flydsl \
+            -e TRITON_CACHE_DIR=/conv3d-cache/triton -e AITER_JIT_DIR=/conv3d-cache/aiter \
+            -v "$SOURCE_DIR:/workspace" -v "$RUN_ROOT/scripts:/conv3d-ci:ro" \
+            -v "$RUN_ROOT/logs:/conv3d-logs" -w /workspace \
+            "$DOCKER_IMAGE" bash -lc 'exec timeout --signal=TERM --kill-after=30s 105m sleep infinity')
+          echo "CONTAINER_ID=$cid" >> "$GITHUB_ENV"
+
+      - name: Setup Aiter inside the disposable container without GPU visibility
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          set +e
+          docker exec -e HIP_VISIBLE_DEVICES=-1 -e ROCR_VISIBLE_DEVICES=-1 -e CUDA_VISIBLE_DEVICES=-1 \
+            "$CONTAINER_ID" bash -lc 'set -euo pipefail; git config --global --add safe.directory /workspace; python -m pip install -r requirements.txt; python -m pip install tabulate; python -m pip install --no-build-isolation -e .' \
+            2>&1 | tee "$RUN_ROOT/logs/setup.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          printf 'setup_exit=%s\nsetup_wall_seconds=%s\n' "$status" "$(( $(date +%s) - start ))" > "$RUN_ROOT/logs/setup-status.txt"
+          exit "$status"
+
+      - name: Require 30 seconds of idle GPU and monitor external processes during perf
+        timeout-minutes: 80
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import signal
+          import subprocess
+          import time
+
+          cid, owner = os.environ["CONTAINER_ID"], os.environ["OWNER"]
+          logs = pathlib.Path(os.environ["RUN_ROOT"]) / "logs"
+          physical = os.environ["PHYSICAL_GPU"]
+          started = time.monotonic()
+          result = {"command": "python op_tests/test_flydsl_conv_implicit.py --mode perf", "valid_perf": False}
+          workload = None
+          perf_start = None
+
+          def command(*args, timeout=5):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
+
+          def owned():
+              return command("docker", "inspect", "--format", '{{index .Config.Labels "aiter.conv3d-perf.owner"}}', cid) == owner
+
+          def sample():
+              data = json.loads(command("docker", "exec", cid, "python", "/conv3d-ci/smi.py", physical))
+              data["timestamp"] = time.time()
+              top = command("docker", "top", cid, "-eo", "pid")
+              own_pids = {int(line.strip()) for line in top.splitlines()[1:]}
+              data["external"] = [p for p in data["processes"] if p["pid"] not in own_pids]
+              with (logs / "gpu-monitor.jsonl").open("a") as handle:
+                  handle.write(json.dumps(data) + "\n")
+              print(json.dumps(data), flush=True)
+              return data
+
+          def interrupted(signum, frame):
+              raise InterruptedError(f"Workflow interrupted by signal {signum}")
+
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+          try:
+              if not owned():
+                  raise RuntimeError("Container ownership label mismatch")
+              idle_since = None
+              deadline = time.monotonic() + 600
+              while True:
+                  snapshot = sample()
+                  now = time.monotonic()
+                  if snapshot["busy_percent"] == 0 and not snapshot["processes"]:
+                      idle_since = now if idle_since is None else idle_since
+                      if now - idle_since >= 30:
+                          break
+                  else:
+                      idle_since = None
+                  if now >= deadline:
+                      raise RuntimeError("GPU did not remain idle for 30 seconds within the 10-minute gate")
+                  time.sleep(5)
+              args = ["docker", "exec", "-e", f'ROCR_VISIBLE_DEVICES={snapshot["uuid"]}',
+                      "-e", "HIP_VISIBLE_DEVICES=0", "-e", "CUDA_VISIBLE_DEVICES=0",
+                      "-e", f'EXPECTED_BDF={snapshot["bdf"]}', cid, "bash", "/conv3d-ci/workload.sh"]
+              result["physical_gpu"] = snapshot["gpu"]
+              result["uuid"] = snapshot["uuid"]
+              perf_start = time.monotonic()
+              with (logs / "perf.log").open("w") as output:
+                  workload = subprocess.Popen(args, stdout=output, stderr=subprocess.STDOUT)
+                  while workload.poll() is None:
+                      snapshot = sample()
+                      if snapshot["external"]:
+                          raise RuntimeError("External target-GPU process detected; yielding this run's container and invalidating the entire perf run")
+                      if time.monotonic() - perf_start > 3660:
+                          raise TimeoutError("Perf watchdog exceeded 61 minutes")
+                      time.sleep(5)
+                  # A final sample also invalidates a collision at process exit.
+                  snapshot = sample()
+                  if snapshot["external"]:
+                      raise RuntimeError("External target-GPU process detected at perf completion")
+              result["perf_wall_seconds"] = round(time.monotonic() - perf_start, 3)
+              result["exit_code"] = workload.returncode
+              if workload.returncode != 0:
+                  raise RuntimeError(f"Perf command exited with status {workload.returncode}")
+              result["valid_perf"] = True
+          except BaseException as exc:
+              result["error"] = str(exc)
+              raise
+          finally:
+              result["guard_wall_seconds"] = round(time.monotonic() - started, 3)
+              if perf_start is not None:
+                  result["perf_wall_seconds"] = round(time.monotonic() - perf_start, 3)
+              (logs / "status.json").write_text(json.dumps(result, indent=2) + "\n")
+              # Stop only the verified owned container, never a host/external PID.
+              if owned():
+                  subprocess.run(["docker", "stop", "--time", "10", cid], check=True, timeout=30)
+              if workload is not None:
+                  workload.wait(timeout=15)
+          PY
+
+      - name: Collect status and remove only the owned container
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if [[ -n "${CONTAINER_ID:-}" ]] && \
+             [[ "$(docker inspect --format '{{index .Config.Labels "aiter.conv3d-perf.owner"}}' "$CONTAINER_ID" 2>/dev/null)" == "$OWNER" ]]; then
+            docker logs "$CONTAINER_ID" > "$RUN_ROOT/logs/container.log" 2>&1 || true
+            # SIGKILL, if needed, is confined to this container's processes.
+            docker rm -f "$CONTAINER_ID"
+          fi
+          if [[ -n "${RUN_ROOT:-}" ]]; then
+            {
+              echo '## Conv3d manual perf'
+              echo "- Commit: $GITHUB_SHA"
+              echo "- Physical GPU: $PHYSICAL_GPU (gfx950 required)"
+              echo '- Command: `python op_tests/test_flydsl_conv_implicit.py --mode perf`'
+              echo '- Cache: cold, container-local; setup/JIT wall is not kernel latency.'
+              if [[ -f "$RUN_ROOT/logs/status.json" ]]; then
+                echo '```json'
+                cat "$RUN_ROOT/logs/status.json"
+                echo '```'
+              else
+                echo '- No perf status was generated; inspect setup/dispatch logs.'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload isolated Conv3d logs even on failure
+        if: ${{ always() && env.RUN_ROOT != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conv3d-perf-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RUN_ROOT }}/logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove only this run's temporary registry credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUN_ROOT:-}" && "${DOCKER_CONFIG:-}" == "${RUN_ROOT:-}/registry" && \
+                "${RUN_ROOT:-}" == "$RUNNER_TEMP/conv3d-perf-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}."* ]]; then
+            # Do not log out or change another job's Docker configuration.
+            rm -f -- "$DOCKER_CONFIG/config.json"
+            rmdir -- "$DOCKER_CONFIG" || true
+          fi
