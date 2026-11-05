@@ -124,25 +124,18 @@ def opus_kernel_name(kid, *, cu_num):
 
 
 _OPUS_B_DEFAULTS = (None,) * 4 + tuple(
-    map(str, (0, "false", 7168, 4, 1, 0, 2, 0, 256, "false", "false", "false", 0))
+    map(str, (0, "false", 64, 4, 1, 0, 0, 256, "false", "false", "false"))
 )
 _OPUS_TRAIT_DEFAULTS = {
     "prefetch_b_vgpr": _OPUS_B_DEFAULTS,
     "prefetch_b_vgpr_overlap": (*_OPUS_B_DEFAULTS, "0"),
-    "pingpong_lds": tuple(
-        map(str, (192, 256, 128, 0, 4, 0, 0, 0, "false", "false", "false", 0, 8))
-    ),
-    "wave_interleave": tuple(map(str, (256, 0, 4, "true", 0, 0, 4))),
+    "pingpong_lds": tuple(map(str, (192, 256, 128, 4, 0, 0, 0, "false", "false", 8))),
 }
 
 
 @lru_cache(maxsize=65536)
 def _opus_kernel_profile(geometry, traits, wg, threads):
-    """Return effective traits, fixed LDS bytes, and A-scale LDS alignment.
-
-    Shape-dependent A-scale storage is added by opus_candidates. Cache keys
-    contain immutable kernel metadata, so this work is reused across shapes.
-    """
+    """Return effective traits and LDS bytes, reused across shapes."""
     pipeline, bm, bn, bk, wm, wn = geometry
     match = re.fullmatch(r"\s*\w+\s*<([^<>]*)>\s*", traits)
     if not match:
@@ -155,10 +148,11 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
         arg is None or not re.fullmatch(r"-?\d+|true|false", arg) for arg in args
     ):
         raise ValueError(f"Incomplete OPUS traits: {traits}")
-    profile, scale_alignment = list(args), 0
+    profile = list(args)
     if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        lds = int(profile[2]) * bm * bk + threads * 4
-        scale_alignment = threads * 16
+        alignment = threads * 16
+        scale_bytes = math.ceil(bm * int(profile[6]) / alignment) * alignment
+        lds = int(profile[2]) * bm * bk + scale_bytes + threads * 4
         stages, distance = int(profile[2]), int(profile[3])
         mr, nr = bm // 16, bn // (wn * 16)
         room = (256 if wg == 2 else 512) - mr * nr * 4 - (bk // 128) * mr * 8 - 48
@@ -169,19 +163,16 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
             not rotate
             and bk == 128
             and nr >= 4
-            and profile[14] == "true"
-            and int(profile[6]) >= 1536
+            and (
+                profile[13] == "true" or (profile[14] == "false" and mr * nr * 4 >= 128)
+            )
         ):
             ahead = 3
         profile[3] = f"ahead{min(distance * (bk // 128) * nr, ahead)}"
     elif pipeline == "pingpong_lds":
         packs = math.ceil((bm // (wm * 16)) / 4)
         lds = 264 * (bm + bn) + int(profile[2]) * (packs * wm * 64 + 4)
-    else:
-        rows = threads // 8
-        a_slot = math.ceil((bm // 2) / rows) * rows * 128
-        lds = 2 * (2 * a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
-    return tuple(profile), lds, scale_alignment
+    return tuple(profile), lds
 
 
 def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mode):
@@ -198,16 +189,16 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
     for kid in sorted(kids):
         profile = kernel_profiles[kid]
         if pipeline == "pingpong_lds" and (
-            int(profile[5]) > 0 or n // bn < 256 or m <= bm
+            int(profile[4]) > 0 or n // bn < 256 or m <= bm
         ):
             # GroupM overrides GroupN; narrow-N and single-M-tile routes ignore it.
-            profile = (*profile[:12], "inactive")
+            profile = (*profile[:9], "inactive")
         unique.setdefault(profile, kid)
     profiles = {kid: profile for profile, kid in unique.items()}
     if mode == "primary":
         routes = list(profiles)
         if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-            routes = [kid for kid in routes if profiles[kid][11] == "0"]
+            routes = [kid for kid in routes if profiles[kid][10] == "0"]
             if routes:
                 aheads = {kid: int(profiles[kid][3][5:]) for kid in routes}
                 # Retain the queue level nearest to or above the full-A live set.
@@ -217,17 +208,14 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
                     default=max(aheads.values()),
                 )
                 routes = [kid for kid in routes if aheads[kid] <= bound]
-        elif pipeline in ("pingpong_lds", "wave_interleave"):
-            if pipeline == "pingpong_lds":
-                em = bm // (wm * 16)
-                if not (wm * wn == 8 and 3 <= em <= 4):
-                    # Include each variant's scale panel in two-block residency.
-                    resident = {kid for kid in kids if footprints[kid] <= 80 * 1024}
-                    if resident:
-                        routes = [kid for kid in routes if kid in resident]
-                group_index = 5
-            else:
-                group_index = 2
+        elif pipeline == "pingpong_lds":
+            em = bm // (wm * 16)
+            if not (wm * wn == 8 and 3 <= em <= 4):
+                # Include each variant's scale panel in two-block residency.
+                resident = {kid for kid in kids if footprints[kid] <= 80 * 1024}
+                if resident:
+                    routes = [kid for kid in routes if kid in resident]
+            group_index = 4
             smallest = min(
                 (
                     int(profiles[kid][group_index])
@@ -243,7 +231,7 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
             ]
         selected.update(routes)
     elif pipeline == "prefetch_b_vgpr_overlap":
-        publications = sorted({int(profile[17]) for profile in profiles.values()})
+        publications = sorted({int(profile[15]) for profile in profiles.values()})
         if len(publications) > 3:
             midpoint = (publications[0] + publications[-1]) / 2
             middle = min(publications, key=lambda value: abs(value - midpoint))
@@ -251,21 +239,19 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
             profiles = {
                 kid: profile
                 for kid, profile in profiles.items()
-                if int(profile[17]) in retained
+                if int(profile[15]) in retained
             }
 
     # Cover individual trait values and resource/execution-route combinations.
     indices = [(index,) for index in range(len(next(iter(profiles.values()))))]
     if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        # stage/ahead/WG, A/B cache, store/output, contiguous/pins, XCD/groupM
-        indices += [(2, 3, 8), (4, 9), (10, 11), (13, 14, 15), (5, 16)]
+        # stage/ahead/WG, A/B cache, contiguous/pins
+        indices += [(2, 3, 8), (4, 9), (12, 13, 14)]
         if pipeline == "prefetch_b_vgpr_overlap":
-            indices += [(2, 17), (11, 17)]
+            indices += [(2, 15), (10, 15)]
     elif pipeline == "pingpong_lds":
-        # panel/fixedK, fragments/cache/guard, launch groups
-        indices += [(2, 3), (3, 8), (6, 7, 8, 10), (5, 12), (5, 9)]
-    elif pipeline == "wave_interleave":
-        indices += [(2, 3), (4, 5)]
+        # fragments/cache/guard, launch groups
+        indices += [(5, 6, 7, 8), (4, 9)]
     modes = {
         kid: {
             (positions, tuple(profile[index] for index in positions))
@@ -286,7 +272,36 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
     return selected
 
 
-def opus_candidates(m, n, k, *, cu_num):
+def opus_seed_names(tunedf, *, gfx, cu_num):
+    """Return current OPUS kernel names for each matching 128x128 shape."""
+    columns = {"libtype", "gfx", "cu_num", "M", "N", "K", "w_scale_block", "kernelName"}
+    if tunedf is None or tunedf.empty or not columns.issubset(tunedf.columns):
+        return {}
+    numbers = tunedf[["cu_num", "M", "N", "K"]].apply(pd.to_numeric, errors="coerce")
+    shapes = numbers[["M", "N", "K"]]
+    selected = (
+        tunedf["libtype"].astype(str).str.strip().str.lower().eq("opus")
+        & tunedf["gfx"].astype(str).str.strip().eq(gfx)
+        & numbers["cu_num"].eq(cu_num)
+        & tunedf["w_scale_block"].astype(str).str.strip().eq("128x128")
+        & shapes.gt(0).all(axis=1)
+        & shapes.mod(1).eq(0).all(axis=1)
+    )
+    names = defaultdict(set)
+    for dimensions, value in zip(
+        shapes[selected].itertuples(index=False, name=None),
+        tunedf.loc[selected, "kernelName"],
+    ):
+        if pd.isna(value):
+            continue
+        name = str(value).strip()
+        if name and name.lower() not in ("nan", "none"):
+            shape = tuple(map(int, dimensions))
+            names[shape].add(name)
+    return {shape: tuple(sorted(values)) for shape, values in names.items()}
+
+
+def opus_candidates(m, n, k, *, cu_num, seed_names=()):
     """Calculate tile ranges and variants from shape and cached kernel resources."""
     from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
 
@@ -294,8 +309,13 @@ def opus_candidates(m, n, k, *, cu_num):
     legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
     if not legal:
         return []
-    selected = {kid for kid in legal if registry[kid].bpreshuffle_co is not None}
-    co_count = len(selected)
+    seed_names = frozenset(seed_names)
+    selected = {
+        kid
+        for kid in legal
+        if registry[kid].bpreshuffle_co is not None or registry[kid].name in seed_names
+    }
+    co_count = sum(registry[kid].bpreshuffle_co is not None for kid in legal)
     groups, profiles, footprints = defaultdict(list), {}, {}
     for kid in legal:
         instance = registry[kid]
@@ -310,15 +330,13 @@ def opus_candidates(m, n, k, *, cu_num):
             instance.T_N,
         )
         groups[geometry].append(kid)
-        profile, lds, alignment = _opus_kernel_profile(
+        profile, lds = _opus_kernel_profile(
             geometry,
             instance.bpreshuffle_entry["traits"],
             instance.WG_PER_CU,
             instance.BLOCK_SIZE,
         )
         profiles[kid] = profile
-        if alignment:
-            lds += math.ceil(instance.B_M * (k // 128) / alignment) * alignment
         footprints[kid] = lds
 
     # Compute each tile's grid, relative cost, and minimum LDS once.
@@ -397,9 +415,6 @@ def opus_candidates(m, n, k, *, cu_num):
                     max_area = max(g[1] * g[2] for g in resident)
                     chosen = {g for g in resident if g[1] * g[2] == max_area}
                     (primary if underfilled else secondary).update(chosen)
-        elif pipeline == "wave_interleave":
-            for geometry in ranked:
-                (primary if geometry[4] * geometry[5] == 8 else secondary).add(geometry)
         else:
             secondary.update(tiles)
         if not (primary | secondary).intersection(tiles):
@@ -630,6 +645,18 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         self._mxscale_table = args.mxscale_table
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
+        self._opus_seed_names = {}
+        if (
+            self._mxscale_table
+            and args.libtype != "flydsl"
+            and self.get_gfx() == "gfx950"
+        ):
+            # Retuning removes requested shapes from tunedf; retain their names first.
+            self._opus_seed_names = opus_seed_names(
+                self.get_tuned_gemm_list(args.tune_file),
+                gfx=self.get_gfx(),
+                cu_num=self.get_cu_num(),
+            )
         super().pre_process(args)
 
     def _bmm_seeds_mxfp8(self):
@@ -747,12 +774,20 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         seeds_nk, seed_pool = self._bmm_seeds_mxfp8() if self._bmm_1x32 else ({}, [])
         opus_by_shape = {}
         if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
+            opus_seeds = {
+                shape: set(names)
+                for shape, names in getattr(self, "_opus_seed_names", {}).items()
+            }
+            for shape, names in opus_seed_names(tunedf, gfx=gfx, cu_num=cu_num).items():
+                opus_seeds.setdefault(shape, set()).update(names)
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
             for row in untunedf.itertuples():
                 if row.w_scale_block == "128x128":
                     shape = (int(row.M), int(row.N), int(row.K))
-                    opus_by_shape[shape] = opus_candidates(*shape, cu_num=cu_num)
+                    opus_by_shape[shape] = opus_candidates(
+                        *shape, cu_num=cu_num, seed_names=opus_seeds.get(shape, ())
+                    )
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
         for i in range(len(untunedf)):

@@ -6,10 +6,9 @@
 #include <opus/opus.hpp>
 
 // M repeats share an A fragment ring, B fragments, and two LDS matrix stages.
-template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0,
+template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128,
     int WaveM = 4, int GroupM = 0, int CacheA = 0, int CacheB = 0,
-    bool FragmentArrays = false,
-    bool XcdOrder = false, bool BoundedOutput = false, int PublishM = 0, int GroupN = 8>
+    bool FragmentArrays = false, bool BoundedOutput = false, int GroupN = 8>
 struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     // Wave64 topology and block/MFMA tile dimensions.
     static constexpr int BLOCK_SIZE = WaveM * 2 * 64;
@@ -45,8 +44,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
 
     static_assert(E_M >= 2 && B_N >= NUM_WAVES * 16);
 
-    // K specialization, tile grouping, and matrix cache policies.
-    static constexpr int FIXED_K = FixedK;
+    // Tile grouping and matrix cache policies.
     static constexpr int GROUPED_M = GroupM;
     static constexpr int CACHE_A = CacheA;
     static constexpr int CACHE_B = CacheB;
@@ -58,12 +56,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     // Keep fragments in separate arrays when requested by the JIT configuration.
     static constexpr bool FRAGMENT_ARRAYS = FragmentArrays;
 
-    static constexpr bool XCD_ORDER = XcdOrder;
     static constexpr bool BOUNDED_OUTPUT = BoundedOutput;
-    static constexpr int PUBLISH_M = PublishM;
-
-    // The publication index excludes the final M repeat.
-    static_assert(PublishM >= 0 && PublishM < BlockM / (WaveM * 16) - 1);
 
     // Vector widths and K128 block-scale groups.
     static constexpr int VEC_A = 16;
@@ -75,7 +68,6 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int A_CHUNKS_PER_FRAGMENT = W_M * W_K / (WARP_SIZE * VEC_A);
     static constexpr int B_CHUNKS_PER_FRAGMENT = W_N * W_K / (WARP_SIZE * VEC_B);
 
-    static constexpr int GROUP_M = 1;
     static constexpr int GROUP_N = 128;
     static constexpr int GROUP_K = 128;
     static constexpr int SCALE_N_HALVES = (B_N + GROUP_N - 1) / GROUP_N;
@@ -88,7 +80,6 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int SWIZZLE_MAX_N = 2048;
     static constexpr int SWIZZLE_MIN_M = 4096;
 
-    static constexpr int MAX_K = ScalePanel * GROUP_K;
     static constexpr int LOOP_UNROLL = 2;
 
     // Padded matrix LDS rows and two ping-pong stages.
@@ -119,7 +110,6 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     // Scale-panel passes must cover the K columns and M rows.
     static_assert(BLOCK_SIZE % SCALE_PANEL == 0);
     static_assert(W_M == VEC_SCALE_A && WARP_SIZE % SFA_M_VECTORS == 0);
-    static_assert(FIXED_K == 0 || (FIXED_K % B_K == 0 && FIXED_K <= MAX_K));
     static_assert(SFA_PASSES_PER_CACHE_PANEL * SFA_K_COLUMNS_PER_PASS >= SCALE_PANEL);
 
     static constexpr int B_SCALE_PACKS = 1;

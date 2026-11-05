@@ -3232,8 +3232,6 @@ def gen_mxscale_bpreshuffle_instance(
         ]
         if k.max_k is not None:
             conditions.append(f"k <= {k.max_k}")
-        if k.bpreshuffle_fixed_k:
-            conditions.append(f"k == {k.bpreshuffle_fixed_k}")
         if entry.get("wide_output"):
             conditions.append(
                 f"2 * (((m < {k.B_M} ? m : {k.B_M}) - 1) * n + {k.B_N}) <= {limit}"
@@ -3253,6 +3251,11 @@ def gen_mxscale_bpreshuffle_instance(
         preamble = instance_impl_preamble(
             '\n#include <climits>\n#include <type_traits>\n#include "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"'
         )
+        kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");'
+        if entry.get("short_symbol"):
+            kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{entry['image']}");
+    static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{entry['image']}");
+    AiterAsmKernelFast& kernel = k <= {entry['short_max_k']} ? short_k : normal;"""
         source = f"""{preamble}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "gfx950/opus_co_launch_gfx950.cuh"
@@ -3262,7 +3265,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     static_assert(std::is_same_v<D_C, opus::bf16_t>);
 {_BPRESHUFFLE_ARGUMENTS}
     {grid_setup}
-    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");
+    {kernel_select}
     opus_co_launch_gfx950(kernel, grid, block, args, aiter::getCurrentHIPStream(), dynamic_lds);
 }}
 #endif
@@ -3281,6 +3284,19 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
             else "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
         )
         abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
+        b_pipeline = entry["pipeline"] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap")
+        template_params = ", bool Short" if b_pipeline else ""
+        launch = f"{kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);"
+        device_decl = f"template __global__ void {kernel}<{alias}>({abi});\n"
+        if b_pipeline:
+            launch = f"""if (k <= (Traits::SCALE_COLS < 16 ? Traits::SCALE_COLS : 16) * Traits::GROUP_K)
+        {kernel}<{alias}, true><<<{grid}, dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);
+    else
+        {kernel}<{alias}, false><<<{grid}, dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);"""
+            device_decl = "".join(
+                f"template __global__ void {kernel}<{alias}, {short}>({abi});\n"
+                for short in ("false", "true")
+            )
         checks = [
             f"m % {k.m_align} == 0",
             "n % 128 == 0",
@@ -3289,8 +3305,6 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         ]
         if k.max_k is not None:
             checks.append(f"k <= {k.max_k}")
-        if k.bpreshuffle_fixed_k:
-            checks.append(f"k == {k.bpreshuffle_fixed_k}")
         checks.append(f"k / {k.B_K} >= 1")
         checks.append(f"2ULL * (m < {k.B_M} ? m : {k.B_M}) * n <= INT32_MAX")
         input_limit = min(2147483647, k.max_tensor_bytes)
@@ -3312,7 +3326,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         source = f"""{preamble}
 #include "{traits_header}"
 #ifdef OPUS_FUSED_HOST_TU
-template<class Traits> __global__ void {kernel}({abi});
+template<class Traits{template_params}> __global__ void {kernel}({abi});
 #else
 #include "{header}"
 #endif
@@ -3327,7 +3341,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     using Traits = {alias};
     const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
     const unsigned tiles_n = n / Traits::B_N, tiles = tiles_m * tiles_n;
-    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);
+    {launch}
 }}
 #endif
 """
@@ -3345,7 +3359,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
             {
                 "kid_name": k.name,
                 "dtype": "bf16_t",
-                "device_decl": f"template __global__ void {kernel}<{alias}>({abi});\n",
+                "device_decl": device_decl,
             }
         )
 

@@ -361,15 +361,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     int block_m = block_id_y();
     int block_n = block_id_x();
     int tile_linear = block_m * tile_gn + block_n;
-    if constexpr (T::XCD_ORDER) {
-        const int tile_gm = (kargs.m + T::B_M - 1) / T::B_M;
-        const int tile_count = tile_gm * tile_gn;
-        const int partition = tile_linear % 8;
-        const int remainder = tile_count % 8;
-        tile_linear = partition * (tile_count / 8) + (partition < remainder ? partition : remainder) + tile_linear / 8;
-        block_m = tile_linear / tile_gn;
-        block_n = tile_linear % tile_gn;
-    }
     if (kargs.n / T::B_N >= T::SWIZZLE_MIN_N_TILES && kargs.m > T::B_M) {
         // Keep the M tiles for a small panel of B close in the launch order.
         const int grid_m = 1 + (kargs.m - 1) / T::B_M;
@@ -407,7 +398,8 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     const int row = block_m * T::B_M;
     const int col = block_n * T::B_N;
     const int batch_id = block_id_z();
-    const int loops = T::FIXED_K ? T::FIXED_K / T::B_K : kargs.k / T::B_K;
+    using LoopCount = std::conditional_t<T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32, unsigned, int>;
+    const LoopCount loops = static_cast<LoopCount>(kargs.k) / T::B_K;
 
     // Matrix and scale global-memory views.
     auto g_a = make_gmem(
@@ -420,9 +412,13 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         reinterpret_cast<D_C*>(kargs.ptr_c) + static_cast<int64_t>(batch_id) * kargs.stride_c_batch +
             static_cast<int64_t>(row) * kargs.stride_c + col,
         static_cast<unsigned>((static_cast<int64_t>(valid_rows - 1) * kargs.stride_c + T::B_N) * sizeof(D_C)));
-    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + batch_id * kargs.stride_sfa_batch + row);
+    constexpr bool bounded_scale_panel = (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32)
+        || (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::E_N == 4 && T::SCALE_PANEL == 64 && T::T_M == 2);
+    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + batch_id * kargs.stride_sfa_batch + row,
+        bounded_scale_panel ? static_cast<unsigned>((kargs.k / T::GROUP_K) * kargs.stride_sfa - row) : 0xffffffffu);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) +
-        batch_id * kargs.stride_sfb_batch + (col / T::GROUP_N) * kargs.stride_sfb);
+        batch_id * kargs.stride_sfb_batch + (col / T::GROUP_N) * kargs.stride_sfb,
+        bounded_scale_panel ? static_cast<unsigned>((T::SCALE_N_HALVES - 1) * kargs.stride_sfb + kargs.k / T::GROUP_K) : 0xffffffffu);
 
     // Matrix and scale layouts: global -> LDS -> registers.
     const auto u_ga = make_layout_ga_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
@@ -468,6 +464,15 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     CFragments v_c{};
     if constexpr (!T::FRAGMENT_ARRAYS)
         clear(v_c);
+    if constexpr (!T::FRAGMENT_ARRAYS && T::E_M == 3 && T::SCALE_PANEL <= 32) {
+        static_for<T::E_M * T::E_N>([&](auto c_i) {
+            constexpr int ci = decltype(c_i)::value;
+            auto c = slice(v_c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+            asm volatile("" : "+v"(c));
+            set_slice(v_c, c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+        });
+    }
+
 
     // C output layout; BF16 fragments are first staged in LDS.
     const auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);
@@ -498,7 +503,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         async_load<T::VEC_B>(g_b, s_b.ptr, u_gb, u_sb + sb_offset(stage), gb_offset(tile_k),
             opus::number<0>{}, opus::number<T::CACHE_B>{});
     };
-    const int scale_k_groups = T::FIXED_K ? T::FIXED_K / T::GROUP_K : kargs.k / T::GROUP_K;
+    const int scale_k_groups = kargs.k / T::GROUP_K;
     const auto sfa_gmem_offsets = layout_to_offsets<T::VEC_SCALE_A>(u_gsfa);
     const auto sfa_smem_offsets = layout_to_offsets<T::VEC_SF>(u_ssfa);
     const auto sfb_gmem_offsets = layout_to_offsets<1>(u_gsfb);
@@ -523,7 +528,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             const int k_group = panel_k_begin + local_k_group;
             sfa_panel_raw[pass] = {};
             if (lane_k < T::SFA_K_COLUMNS_PER_WAVE && k_group < T::SCALE_PANEL
-                && k_group < scale_k_groups && m_repeat < T::E_M && row + local_row < kargs.m)
+                && (bounded_scale_panel || k_group < scale_k_groups) && m_repeat < T::E_M && row + local_row < kargs.m)
                 sfa_panel_raw[pass] = load<T::VEC_SCALE_A>(g_sfa, sfa_gmem_offsets[pass] + gsfa_offset(panel_k_begin));
         });
     };
@@ -544,7 +549,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             const int lane_k = lane_id / T::SFA_M_VECTORS;
             const int k_group = panel_k_begin + pass * T::SFA_K_COLUMNS_PER_PASS
                 + wave_id * T::SFA_K_COLUMNS_PER_WAVE + lane_k;
-            if (lane_k < T::SFA_K_COLUMNS_PER_WAVE && k_group < T::SCALE_PANEL && k_group < scale_k_groups) {
+            if (lane_k < T::SFA_K_COLUMNS_PER_WAVE && k_group < T::SCALE_PANEL && (bounded_scale_panel || k_group < scale_k_groups)) {
                 const auto raw_words = __builtin_bit_cast(vector_t<D_SF_PACK, T::VEC_SCALE_A / T::VEC_SF>, sfa_panel_raw[pass]);
                 static_for<T::VEC_SCALE_A / T::VEC_SF>([&](auto word_i) {
                     constexpr int word = decltype(word_i)::value;
@@ -559,7 +564,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     // Scale B global memory -> VGPR packing -> LDS.
     auto load_sfb_panel = [&](int panel_k_begin) {
         const int k_group = panel_k_begin + wave_id * T::WARP_SIZE + lane_id;
-        if (k_group < scale_k_groups) {
+        if (bounded_scale_panel ? k_group < T::SCALE_PANEL : k_group < scale_k_groups) {
             const unsigned lo = load<1>(g_sfb, sfb_gmem_offsets[0] + gsfb_offset(panel_k_begin))[0];
             unsigned hi = 0;
             if constexpr (T::SCALE_N_HALVES == 2)
@@ -639,9 +644,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         }
     };
 
-    // Long fixed-K fragment tiles can overlap K+2 publication with the last
+    // Large-panel fragment tiles can overlap K+2 publication with the last
     // current MFMAs; defer waiting for the next LDS stage until its first read.
-    constexpr bool defer_next_stage_wait = T::FIXED_K == 16384 &&
+    constexpr bool defer_next_stage_wait = T::SCALE_PANEL >= 128 &&
         T::FRAGMENT_ARRAYS && T::E_M == 4 && T::E_N == 8;
     auto advance_tile = [&](auto stage_i, int tile_k) {
         constexpr int stage = decltype(stage_i)::value;
@@ -706,7 +711,8 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
 
     const int output_thread_id = wave_id * T::WARP_SIZE + lane_id;
     auto copy_output_bf16 = [&](int copy_index) {
-        const int linear = output_thread_id * T::VEC_OUTPUT + copy_index * T::BLOCK_SIZE * T::VEC_OUTPUT;
+        const unsigned linear = static_cast<unsigned>(output_thread_id) * T::VEC_OUTPUT
+            + static_cast<unsigned>(copy_index) * T::BLOCK_SIZE * T::VEC_OUTPUT;
         const int output_row = linear / T::B_N;
         const int output_col = linear % T::B_N;
         const auto value = load<T::VEC_OUTPUT>(s_c, c_offset(output_row, output_col));
@@ -718,11 +724,22 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
 
     // ===== Prologue =====
     // Publish scales and the first matrix tile, then prefetch K+1.
-    issue_matrix_prefetch(number<0>{}, 0);
-    __builtin_amdgcn_sched_barrier(0);
-
-    load_sfa_panel(0);
-    load_sfb_panel(0);
+    if constexpr ((((!T::FRAGMENT_ARRAYS && (T::E_M == 3 || T::E_M == 4))
+        || (T::FRAGMENT_ARRAYS && T::E_M == 2)) && T::SCALE_PANEL <= 32)
+        || (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::E_N == 4 && T::SCALE_PANEL == 64 && T::T_M == 2)) {
+        // Publish scales while the first matrix tile is still in flight.
+        load_sfa_panel(0);
+        load_sfb_panel(0);
+        if constexpr (T::E_M == 3)
+            __builtin_amdgcn_sched_barrier(0);
+        issue_matrix_prefetch(number<0>{}, 0);
+        __builtin_amdgcn_sched_barrier(0);
+    } else {
+        issue_matrix_prefetch(number<0>{}, 0);
+        __builtin_amdgcn_sched_barrier(0);
+        load_sfa_panel(0);
+        load_sfb_panel(0);
+    }
     publish_sfa_panel(0);
     __builtin_amdgcn_sched_barrier(0);
     if (loops > 1) {
@@ -739,6 +756,24 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     static_for<T::E_N>([&](auto n_i) { load_b_fragment(n_i, number<0>{}); });
     s_waitcnt_lgkmcnt(0_I);
 
+    if constexpr (T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32) {
+        static_for<T::E_M * T::E_N>([&](auto c_i) {
+            auto c = v_c[decltype(c_i)::value];
+            asm volatile("" : "+v"(c));
+            v_c[decltype(c_i)::value] = c;
+        });
+    }
+
+    if constexpr (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32) {
+        static_for<T::E_M * T::E_N>([&](auto c_i) {
+            constexpr int ci = decltype(c_i)::value;
+            auto c = slice(v_c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+            asm volatile("" : "+v"(c));
+            set_slice(v_c, c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+        });
+    }
+
+
     // ===== Main loop =====
     // Alternate LDS tiles while the A fragment ring rolls across M repeats.
 #pragma nounroll
@@ -750,12 +785,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     }
 
     // ===== Epilogue =====
-    if constexpr (T::FRAGMENT_ARRAYS || (T::FIXED_K == 0 && T::E_M >= 3)) {
+    if constexpr (T::FRAGMENT_ARRAYS || T::E_M >= 3) {
         // One final MFMA site shortens live ranges when the final LDS stage
         // is selected at runtime.
         finish_tile((loops - 1) % 2);
     } else {
-        // Fixed-K and small packed-fragment tiles retain their constant LDS offsets.
+        // Small packed-fragment tiles retain their constant LDS offsets.
         if ((loops - 1) % 2 == 0)
             finish_tile(0_I);
         else
