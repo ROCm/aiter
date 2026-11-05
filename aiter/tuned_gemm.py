@@ -671,13 +671,19 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
+    skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
     fused_bias = None
     if (
-        bias is not None
+        not skinny
+        and bias is not None
         and (otype is None or otype == inp.dtype)
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
+    if skinny:
+        policy = flydsl_gemm_kernels.SKINNY_POLICY
+    else:
+        policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
     result = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
@@ -692,8 +698,8 @@ def flydsl_gemm(
         k_waves=flydsl_config["k_waves"],
         stages=flydsl_config["stages"],
         group_m=flydsl_config["group_m"],
-        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
-        out_dtype=otype,
+        policy=policy,
+        out_dtype=None if skinny else otype,
     )
 
     if bias is not None and fused_bias is None:

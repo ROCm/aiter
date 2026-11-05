@@ -12,6 +12,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -411,6 +412,82 @@ def test_intra_batch_kv_coverage():
     )
 
 
+def plan_mtp_decode(qlens, kv_lens, nhead, dtype, uni_seqlen_qo, cp_rr):
+    """fast_mode plan for a decode batch with qlens[b] query tokens per request."""
+    batch_size, max_qlen = len(qlens), max(qlens)
+    qo_indptr = torch.tensor([0, *itertools.accumulate(qlens)], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, *itertools.accumulate(kv_lens)], dtype=torch.int32)
+    info = aiter.get_mla_metadata_info_v1(
+        batch_size, max_qlen, nhead, dtype, dtype, is_sparse=False, fast_mode=True
+    )
+    names = ("work_meta_data", "work_indptr", "work_info_set")
+    names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
+    outs = {name: torch.zeros(size, dtype=t) for name, (size, t) in zip(names, info)}
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        torch.ones(batch_size, dtype=torch.int32),
+        nhead // KIMI_NHEAD_KV,
+        KIMI_NHEAD_KV,
+        IS_CAUSAL,
+        outs["work_meta_data"],
+        outs["work_info_set"],
+        outs["work_indptr"],
+        outs["reduce_indptr"],
+        outs["reduce_final_map"],
+        outs["reduce_partial_map"],
+        page_size=PAGE_SIZE,
+        kv_granularity=KV_GRANULARITY,
+        max_seqlen_qo=max_qlen,
+        uni_seqlen_qo=uni_seqlen_qo,
+        fast_mode=True,
+        max_split_per_batch=-1,
+        is_cp_round_robin=cp_rr,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=dtype,
+    )
+    torch.cuda.synchronize()
+    # work_meta_data holds the buffers' addresses, which differ between calls.
+    outs.pop("work_meta_data")
+    return outs
+
+
+def check_varlen_qo_matches_uniform():
+    """uni_seqlen_qo=-1 on a batch whose query lengths are all equal must plan
+    exactly what uni_seqlen_qo=qlen plans: the varlen path only reads the same
+    lengths from qo_indptr instead of the constant.
+
+    Returns the number of shapes compared and the ones whose plans differ.
+    """
+    ran, bad = 0, []
+    for nhead, dtype, qlen, batch_size, cp_rr in itertools.product(
+        (96, 128), (dtypes.fp8, dtypes.bf16), (3, 5, 6), (1, 8, 33, 128), (0, 1)
+    ):
+        s = get_mla_decode_shape_support(nhead, qlen, dtype, dtype)
+        if not (s.natively_supported and s.native and s.kernel_num_heads == nhead):
+            continue
+        rng = random.Random(batch_size)
+        kv_lens = [rng.randint(64, 16384) for _ in range(batch_size)]
+        qlens = [qlen] * batch_size
+        uniform = plan_mtp_decode(qlens, kv_lens, nhead, dtype, qlen, bool(cp_rr))
+        varlen = plan_mtp_decode(qlens, kv_lens, nhead, dtype, -1, bool(cp_rr))
+        ran += 1
+        if any(not torch.equal(uniform[k], varlen[k]) for k in uniform):
+            bad.append((nhead, str(dtype), qlen, batch_size, cp_rr))
+    return ran, bad
+
+
+def test_varlen_qo_matches_uniform():
+    if get_gfx() not in SUPPORTED_GFX:
+        return
+    ran, bad = check_varlen_qo_matches_uniform()
+    assert ran, "no native multi-token decode shape on this card"
+    assert not bad, (
+        f"uni_seqlen_qo=-1 plans differ from uni_seqlen_qo=qlen for "
+        f"(nhead, dtype, qlen, batch, cp_rr) in {bad}"
+    )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -514,6 +591,7 @@ def main():
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
 
     test_intra_batch_kv_coverage()
+    test_varlen_qo_matches_uniform()
 
 
 if __name__ == "__main__":
