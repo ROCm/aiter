@@ -20,11 +20,7 @@ _TOPK_ALIGN_SCRATCH = {}
 def _max_tiles(route_count: int, num_experts: int, block_m: int) -> int:
     if route_count <= num_experts:
         return route_count
-    return (
-        triton.cdiv(max(route_count - num_experts + 1, 0), block_m)
-        + num_experts
-        - 1
-    )
+    return triton.cdiv(max(route_count - num_experts + 1, 0), block_m) + num_experts - 1
 
 
 def get_topk_align_config():

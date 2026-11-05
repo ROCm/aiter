@@ -1,5 +1,5 @@
 {
-  "qwen3_6_35b_a3b_bf16_g1u1_large_m": {
+  "bf16_g1u1_large_m": {
     "arch": "gfx1201",
     "cu_num": 64,
     "activation_dtype": "bf16",
@@ -11,16 +11,7 @@
     "num_experts": 256,
     "topk": 8,
     "gate_mode": "separated",
-    "routing_config": "any",
-    "stage1_config": "any",
-    "stage2_config": "any",
     "m_ranges": [
-      [
-        1024,
-        4096
-      ]
-    ],
-    "performance_preferred_m_ranges": [
       [
         1024,
         4096

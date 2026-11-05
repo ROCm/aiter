@@ -16,7 +16,6 @@ from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.moe_sorting_opus import moe_sorting_opus_get_workspace_size
 from aiter.ops.shuffle import shuffle_weight
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BF16_G1U1_FMOE_CONFIG = (
     _REPO_ROOT
@@ -68,9 +67,7 @@ def test_bf16_g1u1_fmoe_rows_cover_padded_m_4096():
     assert tokens_by_inter_dim[256] == {32, 64, 128, 256, 512, 1024, 2048}
 
     row_4096 = [
-        row
-        for row in rows
-        if row["inter_dim"] == "128" and row["token"] == "4096"
+        row for row in rows if row["inter_dim"] == "128" and row["token"] == "4096"
     ]
     assert len(row_4096) == 1
     assert row_4096[0]["kernelName1"]
@@ -125,15 +122,11 @@ def test_bf16_g1u1_ck2stage_4096_bucket_runs():
     assert metadata.stage1.keywords["kernelName"].startswith("moe_ck2stages_gemm1_")
     assert metadata.stage2.keywords["kernelName"].startswith("moe_ck2stages_gemm2_")
 
-    hidden_states = torch.randn(
-        (token, model_dim), dtype=dtypes.bf16, device="cuda"
-    )
+    hidden_states = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
     w1 = torch.randn(
         (expert, inter_dim * 2, model_dim), dtype=dtypes.bf16, device="cuda"
     )
-    w2 = torch.randn(
-        (expert, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda"
-    )
+    w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
     topk_ids, topk_weight = _make_balanced_topk(token, topk, expert)
 
     actual = fused_moe(

@@ -7,7 +7,7 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w16 import (
     _moe_gemm_a16w16,
 )
-from aiter.ops.triton.moe.moe_routing.routing import ExptData, RoutingData
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.moe_routing.topk_align import (
     align_topk_ids,
     get_topk_align_config,
@@ -30,10 +30,11 @@ def build_routing_from_topk(
 
 
 def _config(block_m: int, n: int, k: int):
-    config = dict(get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton")["any"])
-    block_k = config["block_k_even"] if k % config["block_k_even"] == 0 else config[
-        "block_k_default"
-    ]
+    key = f"bm{block_m}_n{n}_k{k}"
+    dispatch = get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton")
+    if key not in dispatch:
+        raise NotImplementedError(f"MOE-GEMM-A16W16 config is not available for {key}")
+    config = dict(dispatch[key])
     w_cache_modifier = (
         config["w_cache_modifier"]
         if block_m <= config["w_cache_modifier_block_m_leq"]
@@ -42,7 +43,7 @@ def _config(block_m: int, n: int, k: int):
     return {
         "block_m": block_m,
         "block_n": config["block_n"],
-        "block_k": block_k,
+        "block_k": config["block_k"],
         "group_m": config["group_m"],
         "xcd_swizzle": config["xcd_swizzle"],
         "w_cache_modifier": w_cache_modifier,
@@ -82,7 +83,9 @@ def moe_gemm_a16w16(
     out_n = n // reduction_n
     y = torch.empty((1, num_rows, out_n), dtype=out_dtype, device=x.device)
     y_final = (
-        validate_reduce_out(y_out, (num_rows // routing_data.n_expts_act, out_n), out_dtype, x.device)
+        validate_reduce_out(
+            y_out, (num_rows // routing_data.n_expts_act, out_n), out_dtype, x.device
+        )
         if scatter_indx is not None
         else None
     )

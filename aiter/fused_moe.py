@@ -1372,7 +1372,7 @@ def fused_moe_fake(
 
 
 _BF16_G1U1_GFX1201_TRITON_CU_NUM = 64
-_BF16_G1U1_GFX1201_TRITON_POLICY_KEY = "qwen3_6_35b_a3b_bf16_g1u1_large_m"
+_BF16_G1U1_GFX1201_TRITON_POLICY_KEY = "bf16_g1u1_large_m"
 _BF16_G1U1_GFX1201_TRITON_DISABLE_ENV = "AITER_DISABLE_GFX1201_BF16_G1U1_TRITON"
 
 
@@ -1389,8 +1389,7 @@ def _bf16_g1u1_gfx1201_triton_disabled() -> bool:
     return os.environ.get(_BF16_G1U1_GFX1201_TRITON_DISABLE_ENV, "0") == "1"
 
 
-def _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens: int) -> bool:
-    policy = _get_bf16_g1u1_gfx1201_triton_policy()
+def _bf16_g1u1_gfx1201_triton_policy_contains_m(policy: dict, tokens: int) -> bool:
     for start, end in policy.get("m_ranges", ()):
         if int(start) <= tokens <= int(end):
             return True
@@ -1429,11 +1428,27 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
     stage2_scatter: Stage2ScatterContext | None = None,
 ) -> bool:
     tokens = topk_ids.shape[0]
+    policy = _get_bf16_g1u1_gfx1201_triton_policy()
+    try:
+        policy_arch = policy["arch"]
+        policy_cu_num = int(policy["cu_num"])
+        policy_model_dim = int(policy["model_dim"])
+        policy_inter_dim = int(policy["inter_dim"])
+        policy_num_experts = int(policy["num_experts"])
+        policy_topk = int(policy["topk"])
+    except (KeyError, TypeError, ValueError):
+        return False
     return (
         not _bf16_g1u1_gfx1201_triton_disabled()
-        and get_gfx_runtime() == "gfx1201"
-        and get_cu_num() == _BF16_G1U1_GFX1201_TRITON_CU_NUM
-        and _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens)
+        and policy_cu_num == _BF16_G1U1_GFX1201_TRITON_CU_NUM
+        and policy.get("activation_dtype") == "bf16"
+        and policy.get("weight_dtype") == "bf16"
+        and policy.get("quant_type") == "none"
+        and policy.get("activation") == "silu"
+        and policy.get("gate_mode") == GateMode.SEPARATED.value
+        and get_gfx_runtime() == policy_arch
+        and get_cu_num() == policy_cu_num
+        and _bf16_g1u1_gfx1201_triton_policy_contains_m(policy, tokens)
         and hidden_states.is_cuda
         and w1.is_cuda
         and w2.is_cuda
@@ -1450,7 +1465,7 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
         and topk_weight.dtype == dtypes.fp32
         and topk_ids.ndim == 2
         and topk_weight.shape == topk_ids.shape
-        and topk_ids.shape[1] == 8
+        and topk_ids.shape[1] == policy_topk
         and quant_type == QuantType.No
         and activation == ActivationType.Silu
         and dtype == dtypes.bf16
@@ -1458,9 +1473,9 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
         and q_dtype_w == dtypes.bf16
         and is_g1u1
         and not doweight_stage1
-        and w1.shape[0] == 256
-        and w2.shape[1] == 2048
-        and w2.shape[2] == 128
+        and w1.shape[0] == policy_num_experts
+        and w2.shape[1] == policy_model_dim
+        and w2.shape[2] == policy_inter_dim
         and w1.shape[1] == 2 * w2.shape[2]
         and w1.shape[2] == w2.shape[1]
         and expert_mask is None

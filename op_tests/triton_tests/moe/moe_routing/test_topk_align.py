@@ -31,9 +31,7 @@ def _reference_offsets(hist: torch.Tensor, block_m: int):
     raw_offsets[1:] = torch.cumsum(hist, dim=0)
 
     tile_counts = torch.div(hist + block_m - 1, block_m, rounding_mode="floor")
-    tile_offsets = torch.empty(
-        hist.numel() + 1, dtype=torch.int32, device=hist.device
-    )
+    tile_offsets = torch.empty(hist.numel() + 1, dtype=torch.int32, device=hist.device)
     tile_offsets[0] = 0
     tile_offsets[1:] = torch.cumsum(tile_counts, dim=0)
     return raw_offsets, tile_offsets
@@ -47,9 +45,7 @@ def _reference_block_pid_map(
     tile_offsets: torch.Tensor,
 ):
     max_blocks = _max_tiles(route_count, num_experts, block_m)
-    expected = torch.full(
-        (max_blocks,), -1, dtype=torch.int32, device=hist.device
-    )
+    expected = torch.full((max_blocks,), -1, dtype=torch.int32, device=hist.device)
     for expert in range(num_experts):
         count = int(hist[expert].item())
         for block_id in range((count + block_m - 1) // block_m):
