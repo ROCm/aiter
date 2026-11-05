@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest import mock
 
 sys.path.insert(
@@ -26,23 +29,32 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True):
             self.assertEqual(get_build_targets_env(), [("gfx1250-strict", 256)])
 
-    def test_rdna_offline_build_target_defaults(self):
+    def test_rdna_offline_build_targets_cover_every_listed_cu_count(self):
         targets = {
-            "gfx1100": 96,
-            "gfx1101": 60,
-            "gfx1102": 32,
-            "gfx1103": 12,
-            "gfx1150": 16,
-            "gfx1151": 40,
-            "gfx1200": 32,
-            "gfx1201": 64,
+            "gfx1100": [96],
+            "gfx1101": [60],
+            "gfx1102": [32],
+            "gfx1103": [12],
+            "gfx1150": [16, 12],
+            "gfx1151": [40],
+            "gfx1200": [32, 28],
+            "gfx1201": [64],
         }
-        for gfx, cu_num in targets.items():
+        for gfx, cu_nums in targets.items():
             with (
                 self.subTest(gfx=gfx),
                 mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True),
             ):
-                self.assertEqual(get_build_targets_env(), [(gfx, cu_num)])
+                expected = [(gfx, cu_num) for cu_num in cu_nums]
+                self.assertEqual(get_build_targets_env(), expected)
+
+    def test_zero_cu_override_is_treated_as_unset(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": "gfx1200", "CU_NUM": "0"}, clear=True
+        ):
+            self.assertEqual(
+                get_build_targets_env(), [("gfx1200", 32), ("gfx1200", 28)]
+            )
 
     def test_multi_arch_and_cu_override(self):
         with mock.patch.dict(
@@ -77,7 +89,7 @@ class TestBuildTargetArchitecture(unittest.TestCase):
 class TestArchTablesStayInSync(unittest.TestCase):
     """The arch tables in build_targets.py and core.py must not drift apart.
 
-    Adding a target means editing GFX_MAP, GFX_CU_NUM_MAP and core.py's
+    Adding a target means editing GFX_MAP, GFX_CU_NUMS_MAP and core.py's
     allowed_archs, and nothing ties the three together -- allowed_archs
     carried a duplicate "gfx1250" entry before gfx1250-strict was added,
     which is what that drift looks like.
@@ -103,9 +115,9 @@ class TestArchTablesStayInSync(unittest.TestCase):
             self.assertEqual(GFX_MAP[self.chip_info.get_gfx_custom_op_core()], gfx)
 
     def test_every_offline_target_resolves_through_all_three_tables(self):
-        from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+        from aiter.jit.utils.build_targets import GFX_CU_NUMS_MAP
 
-        for gfx in GFX_CU_NUM_MAP:
+        for gfx in GFX_CU_NUMS_MAP:
             with self.subTest(gfx=gfx):
                 self._resolves_everywhere(gfx)
 
@@ -165,6 +177,124 @@ class TestClusterLaunchBuildArchs(unittest.TestCase):
     def test_detected_strict_device_enables_cluster_launch(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
+
+
+class TestMegaMhcBuildTargets(unittest.TestCase):
+    """Check sources and flags reaching the compiler from JIT and prebuild."""
+
+    def setUp(self):
+        from aiter.jit import core
+
+        self.core = core
+        self.modules = (
+            "module_mega_mhc_stream_h5120",
+            "module_mega_mhc_stream_h7168",
+            "module_mega_mhc_stream_generic",
+        )
+        with open(os.path.join(core.this_dir, "optCompilerConfig.json")) as f:
+            self.exclude = [name for name in json.load(f) if name not in self.modules]
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        build_dir = stack.enter_context(tempfile.TemporaryDirectory())
+        stack.enter_context(mock.patch.object(core, "bd_dir", build_dir))
+        stack.enter_context(mock.patch.object(core, "AITER_REBUILD", 0))
+        stack.enter_context(
+            mock.patch.object(core, "check_LLVM_MAIN_REVISION", return_value=0)
+        )
+        stack.enter_context(
+            mock.patch.object(core, "get_hip_version", return_value="7.1.1")
+        )
+        stack.enter_context(
+            mock.patch.object(core, "hip_flag_checker", return_value=True)
+        )
+        stack.enter_context(
+            mock.patch.object(core, "validate_and_update_archs", return_value=[])
+        )
+        stack.enter_context(
+            mock.patch.object(
+                core, "rename_cpp_to_cu", side_effect=lambda srcs, *args: list(srcs)
+            )
+        )
+        stack.enter_context(mock.patch.object(core, "atomic_copy"))
+        self.compile = stack.enter_context(mock.patch.object(core, "_jit_compile"))
+
+    def _check_recipes(self, enabled):
+        jit_args = [
+            dict(self.core.get_args_of_build(name), md_name=name)
+            for name in self.modules
+        ]
+        prebuild_args, _ = self.core.get_args_of_build("all", exclude=self.exclude)
+        self.assertEqual({args["md_name"] for args in prebuild_args}, set(self.modules))
+        expected_sources = {"mega_mhc_pybind.cu", "mega_mhc.cu"}
+        if enabled:
+            expected_sources.add("mega_mhc_gfx1250.cu")
+        for args in jit_args + prebuild_args:
+            original_srcs = list(args["srcs"])
+            original_flags = list(args["flags_extra_hip"])
+            self.core.build_module(
+                md_name=args["md_name"],
+                srcs=args["srcs"],
+                flags_extra_cc=args["flags_extra_cc"],
+                flags_extra_hip=args["flags_extra_hip"],
+                blob_gen_cmd=args["blob_gen_cmd"],
+                extra_include=args["extra_include"],
+                extra_ldflags=args["extra_ldflags"],
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=args["torch_exclude"],
+                third_party=args["third_party"],
+            )
+            self.compile.assert_called_once()
+            call = self.compile.call_args
+            self.assertEqual(
+                {os.path.basename(src) for src in call.args[1]}, expected_sources
+            )
+            self.assertEqual(
+                [
+                    flag
+                    for flag in call.kwargs["extra_cuda_cflags"]
+                    if flag.startswith("-DAITER_MHC_GFX1250=")
+                ],
+                [f"-DAITER_MHC_GFX1250={int(enabled)}"],
+            )
+            self.assertEqual(args["srcs"], original_srcs)
+            self.assertEqual(args["flags_extra_hip"], original_flags)
+            self.compile.reset_mock()
+
+    def test_explicit_targets_override_local_gpu(self):
+        cases = (
+            ("gfx950", False),
+            ("gfx942;gfx950", False),
+            ("gfx1250", True),
+            ("gfx1250-strict", True),
+            ("gfx1250;gfx950", True),
+            ("gfx950;gfx1250", True),
+            ("gfx1250-strict;gfx950", True),
+            (" gfx950 ; gfx1250-strict ", True),
+        )
+        for targets, enabled in cases:
+            with (
+                self.subTest(targets=targets),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": targets}, clear=True),
+                mock.patch.object(
+                    self.core,
+                    "get_gfx",
+                    return_value="gfx950" if enabled else "gfx1250",
+                ),
+            ):
+                self._check_recipes(enabled)
+
+    def test_native_targets_follow_detected_gpu(self):
+        for target in (None, "native", "", " "):
+            for detected in ("gfx950", "gfx1250", "gfx1250-strict"):
+                env = {} if target is None else {"GPU_ARCHS": target}
+                with (
+                    self.subTest(target=target, detected=detected),
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(self.core, "get_gfx", return_value=detected),
+                ):
+                    self._check_recipes(detected != "gfx950")
 
 
 class TestRuntimeArchitecture(unittest.TestCase):

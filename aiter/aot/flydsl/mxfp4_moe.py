@@ -26,7 +26,13 @@ import sys
 import time
 from contextlib import nullcontext
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
+from aiter.aot.flydsl.common import (
+    aot_target_archs,
+    collect_aot_jobs,
+    compile_only_env,
+    override_env,
+    resolve_target_arch,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
@@ -596,6 +602,16 @@ def main():
         "Use the same limit and stage2 environment as tuning and production.",
     )
     args = parser.parse_args()
+
+    # mxfp4/layout-v2 FlyDSL MoE is gfx950-only (FLYDSL_GPU_ARCH is pinned to
+    # gfx950). Skip when GPU_ARCHS omits that family, e.g. a gfx1250-strict wheel.
+    targets = aot_target_archs()
+    if targets and resolve_target_arch("gfx950", targets) is None:
+        print(
+            "[aiter] FlyDSL mxfp4 MoE AOT: skipped, GPU_ARCHS omits gfx950",
+            flush=True,
+        )
+        return
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
     for csv_path in csv_paths:

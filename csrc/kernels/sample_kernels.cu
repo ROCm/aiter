@@ -53,9 +53,13 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
 
     int k          = threadIdx.x * vec_size_i;
     int vec_stride = BlockSize * vec_size_i;
+    // A thread whose first element is already past N never loads, so its
+    // registers stay undefined and `k` is never advanced; the tail below must
+    // not run for it (`k - vec_stride` would be negative and pass the check).
+    const bool has_pre = k < N;
     vec_i vec_inp_pre;
     vec_f vec_exp_pre;
-    if(k < N)
+    if(has_pre)
     {
         vec_inp_pre = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
         vec_exp_pre = load_vector_nbytes<float, vec_size_i, load_chunk_bytes>(buffer_e, k);
@@ -65,11 +69,20 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
     temperature = 1.0f / temperature;
 
     auto loop = [&]() {
+        // Elements this call covers are `base .. base + vec_size_i - 1`; the
+        // last vector of the row is partial when N % vec_size_i != 0. What a
+        // lane past N reads is not a fixed value -- `buffer_e` ends exactly at
+        // N so it yields 0, while `buffer_i`'s extent is rounded up to a dword
+        // (`oob_i`), so for a 2-byte dtype the first lane past an odd N still
+        // reads real memory. Neither must reach the running max or the argmax.
+        const int base = k - vec_stride;
         vec_f vec_cur_f;
         float new_max_softmax = max_softmax;
         for(int i = 0; i < vec_size_i; i++)
         {
-            vec_cur_f[i]    = opus::cast<float>(vec_inp_pre[i]) * temperature;
+            vec_cur_f[i]    = (base + i) < N
+                                  ? opus::cast<float>(vec_inp_pre[i]) * temperature
+                                  : -FLT_MAX;
             new_max_softmax = max(new_max_softmax, vec_cur_f[i]);
         }
         for(int i = 0; i < vec_size_i; i++)
@@ -93,9 +106,9 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
         {
             vec_exp_pre[i] += eps;
             vec_cur_f[i] = vec_cur_f[i] / vec_exp_pre[i];
-            if(vec_cur_f[i] > thread_kvp.value)
+            if((base + i) < N && vec_cur_f[i] > thread_kvp.value)
             {
-                thread_kvp.key   = k - vec_stride + i;
+                thread_kvp.key   = base + i;
                 thread_kvp.value = vec_cur_f[i];
             }
         }
@@ -110,7 +123,7 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
         vec_exp_pre = vec_exp_cur;
     }
     // tail
-    if((k - vec_stride) < N)
+    if(has_pre && (k - vec_stride) < N)
     {
         loop();
     }
@@ -191,8 +204,10 @@ __device__ void random_sample_impl(const DTYPE_I* input,
 
     int k          = threadIdx.x * vec_size_i;
     int vec_stride = BlockSize * vec_size_i;
+    // See the matching comment in random_sample_outer_exponential_impl.
+    const bool has_pre = k < N;
     vec_i vec_pre;
-    if(k < N)
+    if(has_pre)
     {
         vec_pre = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
         k += vec_stride;
@@ -201,13 +216,16 @@ __device__ void random_sample_impl(const DTYPE_I* input,
     temperature = 1.0f / temperature;
 
     auto loop = [&]() {
-        auto rand     = dist_func(&state);
-        vec_i vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
+        const int base = k - vec_stride;
+        auto rand      = dist_func(&state);
+        vec_i vec_cur  = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
         vec_f vec_cur_f;
         float new_max_softmax = max_softmax;
         for(int i = 0; i < vec_size_i; i++)
         {
-            vec_cur_f[i]    = opus::cast<float>(vec_pre[i]) * temperature;
+            vec_cur_f[i]    = (base + i) < N
+                                  ? opus::cast<float>(vec_pre[i]) * temperature
+                                  : -FLT_MAX;
             new_max_softmax = max(new_max_softmax, vec_cur_f[i]);
         }
         for(int i = 0; i < vec_size_i; i++)
@@ -231,9 +249,9 @@ __device__ void random_sample_impl(const DTYPE_I* input,
         {
             float u      = transform_func((&rand.x)[i]) + eps;
             vec_cur_f[i] = vec_cur_f[i] / u;
-            if(vec_cur_f[i] > thread_kvp.value)
+            if((base + i) < N && vec_cur_f[i] > thread_kvp.value)
             {
-                thread_kvp.key   = k - vec_stride + i;
+                thread_kvp.key   = base + i;
                 thread_kvp.value = vec_cur_f[i];
             }
         }
@@ -245,7 +263,7 @@ __device__ void random_sample_impl(const DTYPE_I* input,
         vec_pre = loop();
     }
     // tail
-    if((k - vec_stride) < N)
+    if(has_pre && (k - vec_stride) < N)
     {
         loop();
     }
@@ -296,37 +314,56 @@ __device__ void argmax_impl(const DTYPE_I* input, int* output, int m_idx, int N,
 
     using kvp = aiter::KeyValuePair<int, float>;
     aiter::ArgMax arg_max;
-    kvp thread_kvp{0, -FLT_MAX};
+    // -INFINITY, not -FLT_MAX: this compares raw logits, so -FLT_MAX is a value
+    // the input can actually take. A row whose only finite logit is -FLT_MAX
+    // would tie with the sentinel and lose it on ArgMax's smaller-key rule,
+    // returning token 0. Only a genuine -inf ties now, and token 0 is the
+    // documented answer for an all--inf row. The sampling impls keep -FLT_MAX:
+    // their candidates are exp(..)/u >= 0, so no real value can reach it, and
+    // -inf there would turn `thread_kvp.value * ratio` into NaN when the
+    // running-max rescale underflows ratio to 0.
+    kvp thread_kvp{0, -INFINITY};
     int k          = threadIdx.x * vec_size_i;
     int vec_stride = BlockSize * vec_size_i;
+    // See the matching comment in random_sample_outer_exponential_impl.
+    const bool has_pre = k < N;
     vec_i vec_pre;
-    if(k < N)
+    if(has_pre)
     {
         vec_pre = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
         k += vec_stride;
     }
-    for(; k < N; k += vec_stride)
-    {
-        kvp tmp_kvp{k - vec_stride - 1, -FLT_MAX};
-        vec_i vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
+    // A lane past N reads whatever the bounded descriptor yields there, which
+    // wins the argmax whenever every real logit in the row is negative.
+    // Neutralise those lanes rather than shortening the loop: the trip count
+    // has to stay a compile-time constant or the vec_size_i-wide body stops
+    // being unrolled. Both halves of the pair are neutralised, so no key at or
+    // past N is ever handed to the reduction.
+    // The per-lane select costs greedy_sample ~3-4% at small M (16-wide body).
+    // Branching the whole-vector case around it -- only the row's last vector
+    // can straddle N -- was measured slower still (10.97 vs 10.36 us at M=1),
+    // so the straight-line select is what ships.
+    auto scan = [&](int base) {
+        kvp tmp_kvp{0, -INFINITY};
         for(int i = 0; i < vec_size_i; i++)
         {
-            tmp_kvp.key += 1;
-            tmp_kvp.value = opus::cast<float>(vec_pre[i]);
+            const bool in_range = (base + i) < N;
+            tmp_kvp.key         = in_range ? base + i : 0;
+            tmp_kvp.value = in_range ? opus::cast<float>(vec_pre[i]) : -INFINITY;
             thread_kvp    = arg_max(thread_kvp, tmp_kvp);
         }
+    };
+
+    for(; k < N; k += vec_stride)
+    {
+        vec_i vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, k);
+        scan(k - vec_stride);
         vec_pre = vec_cur;
     }
     // tail
-    if((k - vec_stride) < N)
+    if(has_pre && (k - vec_stride) < N)
     {
-        kvp tmp_kvp{k - vec_stride - 1, -FLT_MAX};
-        for(int i = 0; i < vec_size_i; i++)
-        {
-            tmp_kvp.key += 1;
-            tmp_kvp.value = opus::cast<float>(vec_pre[i]);
-            thread_kvp    = arg_max(thread_kvp, tmp_kvp);
-        }
+        scan(k - vec_stride);
     }
 
     thread_kvp = block_reduce<kvp, aiter::ArgMax, BlockSize, true>(thread_kvp, arg_max);
@@ -721,7 +758,23 @@ __global__ void exponential_kernel(DTYPE_O* output,
             float u    = transform_func((&rand.x)[i]) + eps;
             vec_cur[i] = opus::cast<DTYPE_O>(u);
         }
-        store_vector<DTYPE_O, DTYPE_O, vec_size_o, RT, false>(buffer_o, vec_cur, k, 1.0f);
+        if(k + vec_size_o <= N)
+        {
+            store_vector<DTYPE_O, DTYPE_O, vec_size_o, RT, false>(buffer_o, vec_cur, k, 1.0f);
+        }
+        else
+        {
+            // Partial last vector. The descriptor cannot mask it: `oob_o`
+            // rounds the extent up to a dword because the buffer bound is
+            // enforced per dword, so at a 2-byte dtype element N-1 and element
+            // N share one and the hardware can only keep or drop both. Keeping
+            // both writes past the row; dropping both loses a real element.
+            // Only one thread per row ever lands here, once.
+            for(int i = 0; k + i < N; i++)
+            {
+                ptr_o[k + i] = vec_cur[i];
+            }
+        }
     }
 }
 
