@@ -7,6 +7,7 @@ import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -32,6 +33,13 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
 # bias, y); the kernels take the (possibly shuffled) weight as `w`, and the plain
 # `weight` return value is unused here.
 _OUT_VALS_KEYS = ["x", "_", "w", "x_scale", "w_scale", "bias", "y"]
+
+
+def gemm_a8w8_bpreshuffle(x, w, *args, **kwargs):
+    # gfx1201: the shuffled (N/16, 16*K) buffer is the (N, K) FP8 weight shuffled in place.
+    return triton_gemm_a8w8(
+        x, w.reshape(-1, x.shape[1]), *args, b_preshuffled=True, **kwargs
+    )
 
 
 def bench_gemm_fn(
@@ -171,7 +179,9 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     backend = "gluon" if args.gluon else "triton"
-    if args.shuffle:
+    if args.shuffle and get_arch() == "gfx1201":
+        impl = gemm_a8w8_bpreshuffle
+    elif args.shuffle:
         impl = functools.partial(gemm_a8w8_preshuffle, backend=backend)
     elif args.gluon:
         impl = functools.partial(triton_gemm_a8w8, backend="gluon")

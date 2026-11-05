@@ -598,6 +598,46 @@ def gemm_a8w8(shape, backend):
     return call, (x, w, x_scale, w_scale, y), None
 
 
+@kernel("GEMM-A8W8_BPRESHUFFLE", bits=(8, 8))
+def gemm_a8w8_bpreshuffle(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as gemm
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+        generate_gemm_a8w8_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    _, fp8 = get_fp8_dtypes()
+    x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
+        M,
+        N,
+        K,
+        in_dtype=fp8,
+        out_dtype=torch.bfloat16,
+        layout="TN",
+        output=True,
+        shuffle=True,
+    )
+    w = w.reshape(N, K)  # the generator's (N/16, 16*K) view of the same shuffled bytes
+
+    def call(config, x, w, x_scale, w_scale, y):
+        # the wrapper derives the split-K parameters for b_preshuffled configs itself
+        return gemm(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            dtype=torch.bfloat16,
+            y=y,
+            config=config,
+            b_preshuffled=True,
+        )
+
+    return call, (x, w, x_scale, w_scale, y), None
+
+
 @kernel(
     "GEMM-A8W8_BLOCKSCALE",
     bits=(8, 8),
