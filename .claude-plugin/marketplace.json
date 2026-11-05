@@ -1,0 +1,15 @@
+{
+  "name": "rocm-aiter",
+  "description": "Claude Code plugins for ROCm/aiter development.",
+  "owner": {
+    "name": "AMD ROCm AITER team"
+  },
+  "plugins": [
+    {
+      "name": "aiter",
+      "source": "./plugins/aiter",
+      "description": "Agent skills for developing ROCm/aiter: op tests, tuned-config shapes, OPUS kernels, PR review, kernel PR validation and review-ready PR creation.",
+      "category": "development"
+    }
+  ]
+}

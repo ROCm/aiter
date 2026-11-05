@@ -1,0 +1,13 @@
+{
+  "name": "aiter",
+  "displayName": "AITER",
+  "description": "Agent skills for developing ROCm/aiter: op tests, tuned-config shapes, OPUS kernels, PR review, kernel PR validation and review-ready PR creation.",
+  "version": "0.1.0",
+  "author": {
+    "name": "AMD ROCm AITER team"
+  },
+  "homepage": "https://github.com/ROCm/aiter",
+  "repository": "https://github.com/ROCm/aiter",
+  "license": "MIT",
+  "keywords": ["rocm", "amd", "gpu", "kernels", "aiter"]
+}
