@@ -74,7 +74,9 @@ from .pa_decode.op_merge import (
 from .pa_decode.pipeline import (
     Gfx1250Bf16Pipeline,
     Gfx1250Bf16WavePipeline,
+    Gfx1250CooperativeWavePipeline,
     Gfx1250Pipeline,
+    Gfx1250QueryWavePipeline,
     Gfx1250WavePipeline,
     PaDecodePipeline,
 )
@@ -925,6 +927,10 @@ def compile_gfx1250_pa_decode(
                 Gfx1250Bf16Pipeline(ctx).run()
             elif const_expr(t.wave_query_tiles):
                 Gfx1250WavePipeline(ctx).run()
+            elif const_expr(t.query_wave_tiles):
+                Gfx1250QueryWavePipeline(ctx).run()
+            elif const_expr(t.cooperative_wave_query_tiles):
+                Gfx1250CooperativeWavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):

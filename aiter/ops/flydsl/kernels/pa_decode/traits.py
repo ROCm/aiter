@@ -1033,6 +1033,9 @@ class Gfx1250Traits:
 
     @property
     def q_tiles(self):
+        if self.query_wave_tiles:
+            # All four wave-local Q operands and scales need initialized rows.
+            return self.NWARP
         # The widest BF16 MTP tile fits by staging one query tile at a time.
         full = self.m_tiles * 16 * self.q_stride
         return (
@@ -1105,7 +1108,8 @@ class Gfx1250Traits:
 
     @property
     def p_bytes(self):
-        return 16 * self.v_stride
+        tiles = self.m_tiles if self.cooperative_wave_query_tiles else 1
+        return tiles * 16 * self.v_stride
 
     @property
     def wave_query_tiles(self):
@@ -1113,6 +1117,22 @@ class Gfx1250Traits:
         # registers: softmax needs no cross-wave exchange until the pair merge.
         # fp8_multi_tile bounds four query tiles to D128.
         return self.fp8_multi_tile and self.m_tiles == self.NWARP and self.async_page
+
+    @property
+    def query_wave_tiles(self):
+        # Three query tiles: one tile per wave keeps scores, P and output in
+        # registers; the fourth wave only joins page DMA and barriers.
+        return self.fp8_multi_tile and self.m_tiles == 3 and self.async_page
+
+    @property
+    def cooperative_wave_query_tiles(self):
+        # Two query tiles share P/statistics within pairs of the four waves.
+        return (
+            self.fp8_multi_tile
+            and self.head_dim == 128
+            and self.m_tiles == 2
+            and self.async_page
+        )
 
     @property
     def bf16_wave_query_tiles(self):

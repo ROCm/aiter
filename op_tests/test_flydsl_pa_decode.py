@@ -533,6 +533,88 @@ def _reference(
     return output.reshape_as(query).float()
 
 
+@pytest.mark.parametrize("query_length,group_size", [(3, 16), (5, 8)])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("cap,budget", [(1, 512), (4, 512), (4, 1)])
+def test_pa_decode_fp8_three_tiles_large_logits(
+    device, query_length, group_size, per_token, cap, budget
+):
+    """Finite constant logits keep V=0.5 across direct, cluster and arrival paths."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 FP8 wave tiles")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query = torch.ones(
+        (4 * query_length, group_size, 128), dtype=torch.bfloat16, device=device
+    )
+    output = torch.empty_like(query)
+    key = torch.full(
+        (8, 1, 8, 128, 16), 448.0, dtype=torch.float8_e4m3fn, device=device
+    )
+    value = torch.full_like(key, 224.0)
+    shape = (8, 1, 128, 1) if per_token else (1,)
+    key_scale = torch.ones(shape, dtype=torch.float32, device=device)
+    value_scale = torch.full_like(key_scale, 0.5 / 224.0)
+    lengths = torch.tensor([0, 0, 0, 1024], dtype=torch.int32, device=device)
+    table = torch.arange(8, dtype=torch.int32, device=device).repeat(4, 1)
+    plan = pa.plan_pa_decode(
+        lengths,
+        1,
+        query_length=query_length,
+        max_partitions=cap,
+        workgroup_budget=budget,
+    )
+
+    def call():
+        pa.pa_decode(
+            output,
+            query,
+            key,
+            value,
+            lengths,
+            table,
+            128**-0.5,
+            query_length,
+            work_plan=plan,
+            max_context_length=1024,
+            compute_type=key.dtype,
+            key_scale=key_scale,
+            value_scale=value_scale,
+        )
+
+    expected = torch.zeros_like(query, dtype=torch.float32)
+    expected[-query_length:] = 0.5
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for magnitude, scale in (
+        (1.0, 1.0),
+        (1.0, 1e30),
+        (1.0, 1e32),
+        (1e10, 1.0),
+        (1e30, 1.0),
+        (0.0, 1e32),
+    ):
+        query.fill_(magnitude)
+        key_scale.fill_(scale)
+        for replay in (False, True):
+            output.fill_(float("nan"))
+            graph.replay() if replay else call()
+            error = checkAllclose(
+                output.float(),
+                expected,
+                atol=5e-3,
+                rtol=5e-3,
+                tol_err_ratio=0,
+                msg=(
+                    f"FP8 three tiles: qlen={query_length} group={group_size} "
+                    f"token_scales={per_token} cap={cap} budget={budget} "
+                    f"q={magnitude} kscale={scale} replay={replay}"
+                ),
+            )
+            assert error == 0
+
+
 def _make_inputs(
     query_length,
     kv_heads,
@@ -905,6 +987,202 @@ _FP8_CASES = _COMMON_CASES + [
             "max_partitions": 16,
             "cluster": 9,
             "cluster_runs": True,
+        },
+    ),
+    # Two 16-row tiles share each page across wave pairs. Short one-hot rows
+    # check causal/page bounds without the known FP8-P error on short random
+    # rows; long varied rows check per-token scaling and changed-Q replays.
+    (
+        "qtiles2-short-direct",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257),
+            "pattern": "one_hot",
+        },
+    ),
+    (
+        "qtiles2-short-cluster",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 4,
+            "lengths": (0, 1, 65, 129, 257, 1025),
+            "pattern": "one_hot",
+            "cluster": 4,
+        },
+    ),
+    (
+        "qtiles2-varied-reducer",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (0, 1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-varied-last-arriver",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 8,
+            "budget": 1,
+            "max_context": None,
+            "lengths": (0, 0, 0, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-mixed-task-lengths",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (6400,) * 64,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "qtiles2-partial-mtp3",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-partial-decode",
+        {
+            "group_size": 17,
+            "block_size": 128,
+            "lengths": (0, 1, 63, 65, 129, 257),
+            "pattern": "one_hot",
+        },
+    ),
+    (
+        "qtiles2-decode-g32",
+        {
+            "group_size": 32,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-direct",
+        {
+            "query_length": 3,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-cluster",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            # Longer random rows check the cluster's partials; the separate
+            # one-hot case checks short causal edges without FP8 Q/P error.
+            "lengths": (257, 513, 1027, 4100),
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-short-edges",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 1, 2, 3, 65, 129, 257, 1027),
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "one_hot_token",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp6-g8-page128-wave-direct",
+        {
+            "query_length": 6,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (257, 1027),
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g12-page128-wave-merge",
+        {
+            "query_length": 3,
+            "group_size": 12,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp5-g8-page128-wave-merge",
+        {
+            "query_length": 5,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-sinks",
+        {
+            "query_length": 3,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 65, 257, 1027),
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
         },
     ),
     (
@@ -1692,6 +1970,23 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case.get("fp8_three_tiles") and arch in ("gfx1250", "gfx1250-strict"):
+        from aiter.ops.flydsl.kernels.pa_decode.traits import Gfx1250Traits
+
+        kw = compile_kwargs[-1]
+        traits = Gfx1250Traits(
+            head_dim=kw["head_dim"],
+            query_group_size=kw["query_group_size"],
+            block_size=kw["block_size"],
+            softmax_scale=kw["softmax_scale"],
+            query_dtype=kw["query_dtype"],
+            per_token_kv=kw["per_token_kv"],
+            query_length=kw["query_length"],
+            trans_v=kw["trans_v"],
+            sliding_window=kw["sliding_window"],
+        )
+        assert traits.m_tiles == 3 and traits.query_wave_tiles
+        assert traits.q_tiles == 4 and traits.BLOCK_THREADS == 128
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
