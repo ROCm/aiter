@@ -97,7 +97,7 @@ from aiter import (
 from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight_iod, shuffle_weight
 from aiter.utility import fp4_utils
 
 try:
@@ -283,6 +283,7 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         gate_up=True,
     )
     w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
+    moe_shuffle_weight_iod(w1_a, w1_ss, n_experts)
     if spec["key"] == "a4w4_mxfp4":
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)

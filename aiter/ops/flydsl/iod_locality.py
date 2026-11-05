@@ -5,11 +5,11 @@
 
 A 16 KiB granule at ``addr`` is homed on IOD domain
 ``a14 ^ a17 ^ a20 ^ phase[addr >> 21]``; the per-2 MiB-page phase is
-physical, so it is probed once per allocation (``iod_loc_probe.cpp``, built
-with hipcc on first use). Workgroup b
-runs on domain ``((b + 3) % 8) >= 4``.
+physical, so it is probed once per allocation (``kernels/iod_loc_probe``).
+Workgroup b runs on domain ``((b + 3) % 8) >= 4``.
 
-``placed_w1`` re-lays the preshuffled W1 ([E, N/16, K/2*16] bytes) and its
+``place_w13`` (``aiter.ops.shuffle.moe_shuffle_weight_iod``, at weight-load
+time) re-lays the preshuffled W1 ([E, N/16, K/2*16] bytes) and its
 n32k4 scales ([E, N/32, K] bytes) into one buffer:
 page 0 holds the int32 phase of every granule page (plus one pad entry),
 then for unit (expert e, n-tile nt) on domain nt % 2, local index
@@ -18,60 +18,26 @@ j < 2 KT: B rows [8 (j % 2), 8 (j % 2) + 8) x 2048 B of k-tile j / 2,
 j >= 2 KT: the 2 KiB B-scale stages of k-tiles 8 (j - 2 KT) ... + 7.
 """
 
-import ctypes
+import logging
 import os
-import subprocess
 
 import numpy as np
 import torch
+
+logger = logging.getLogger("aiter")
 
 GRAN = 16384
 PAGE = 2 << 20
 LOCAL_PER_PAGE = PAGE // GRAN // 2
 
-_lib = None
 _PLACED = {}
 
 
-def _lib_path() -> str:
-    path = os.environ.get("AITER_IOD_LOC_LIB")
-    if path:
-        return path
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iod_loc_probe.cpp")
-    out_dir = os.path.join(
-        os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "aiter"
-    )
-    path = os.path.join(out_dir, "libiod_loc_probe.so")
-    if not os.path.exists(path) or os.path.getmtime(path) < os.path.getmtime(src):
-        os.makedirs(out_dir, exist_ok=True)
-        tmp = f"{path}.{os.getpid()}"
-        subprocess.run(
-            ["hipcc", "-O3", "--offload-arch=gfx1250", "-shared", "-fPIC", src, "-o", tmp],
-            check=True,
-        )
-        os.replace(tmp, path)
-    return path
+def _probe(buf: torch.Tensor, npass: int = 4):
+    from .kernels.iod_loc_probe import probe_phase
 
-
-def _probe(buf: torch.Tensor, npass: int = 4) -> np.ndarray:
-    global _lib
-    if _lib is None:
-        _lib = ctypes.CDLL(_lib_path())
-        _lib.loc_probe.restype = ctypes.c_int
-        _lib.loc_probe.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-    assert buf.data_ptr() % PAGE == 0
-    npg = buf.numel() // PAGE
-    phase = np.zeros(npg, dtype=np.uint8)
     torch.cuda.synchronize()
-    weak = _lib.loc_probe(ctypes.c_void_p(buf.data_ptr()), npg, phase.ctypes.data, npass)
-    if weak < 0:
-        raise RuntimeError(f"IOD phase probe failed ({weak})")
-    return phase, weak
+    return probe_phase(buf, npass)
 
 
 def gran_per_unit(K: int, tile_k: int) -> int:
@@ -90,16 +56,9 @@ def supported(N, K, tile_n, tile_k) -> bool:
     )
 
 
-def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
-    """Placed copy of (w, w_scales) for ``b_placed`` GEMM1, built once per weight."""
-    key = (w.data_ptr(), w_scales.data_ptr(), n_experts, N, K, tile_n, tile_k)
-    hit = _PLACED.get(key)
-    if hit is not None:
-        return hit[0]
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("IOD placement must run before CUDA graph capture")
+def _place(w, w_scales, E, N, K, tile_n, tile_k):
     assert supported(N, K, tile_n, tile_k)
-    E, nt, kt = n_experts, N // tile_n, K // tile_k
+    nt, kt = N // tile_n, K // tile_k
     bstage, sstage = tile_n * tile_k // 2, tile_n * tile_k // 32
     gpu = gran_per_unit(K, tile_k)
     nsg = gpu - 2 * kt
@@ -134,12 +93,64 @@ def placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k):
     del b, s, sp
     torch.cuda.synchronize()
     buf._iod_raw = raw
-    print(
-        f"[iod_locality] placed W1 {tuple(w.shape)}: {buf.numel() / 1e9:.3f} GB, "
-        f"{npg} pages, weak {weak}",
-        flush=True,
+    logger.info(
+        "[iod_locality] placed W1 %s: %.3f GB, %d pages, weak %d",
+        tuple(w.shape),
+        buf.numel() / 1e9,
+        npg,
+        weak,
     )
-    # Holding the sources keeps their addresses, the cache key, from being
-    # reused by another tensor.
-    _PLACED[key] = (buf, w, w_scales)
     return buf
+
+
+# The one tiling the placed layout serves (``b_placed``): every 16 KiB
+# granule is one wave's B half of a k-tile.
+PLACED_TILE_N = 256
+PLACED_TILE_K = 256
+
+
+def enabled() -> bool:
+    """``AITER_MOE_LOC=1`` on gfx1250."""
+    if os.environ.get("AITER_MOE_LOC", "0").strip() != "1":
+        return False
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx1250"
+
+
+def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None):
+    """Build and register the IOD-placed copy of a shuffled GEMM1 weight.
+
+    ``w13`` / ``w13_scale`` are the outputs of ``moe_shuffle_weight`` /
+    ``moe_shuffle_scale`` (GUGU, gate_up), which stay valid and in use: tilings
+    other than 256 x 256 keep reading them. Call once per layer at weight-load
+    time, outside CUDA graph capture. Returns the placed buffer, or None when
+    the shape has no placed layout.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("IOD placement must run before CUDA graph capture")
+    E = int(experts_cnt or w13.shape[0])
+    N = int(w13.shape[-2])
+    K = int(w13.shape[-1]) * 2
+    if not supported(N, K, PLACED_TILE_N, PLACED_TILE_K):
+        return None
+    w = w13.detach().contiguous().view(torch.uint8)
+    sc = w13_scale.detach().contiguous().reshape(-1).view(torch.int32)
+    key = (w.data_ptr(), sc.data_ptr())
+    hit = _PLACED.get(key)
+    if hit is not None:
+        return hit[0]
+    buf = _place(w, sc, E, N, K, PLACED_TILE_N, PLACED_TILE_K)
+    # Holding the sources keeps their addresses, the key, from being reused.
+    _PLACED[key] = (buf, w, sc, N, K)
+    return buf
+
+
+def lookup(w, w_scales, N, K, tile_n, tile_k):
+    """The placed buffer registered for (w, w_scales), or None."""
+    if not _PLACED or tile_n != PLACED_TILE_N or tile_k != PLACED_TILE_K:
+        return None
+    hit = _PLACED.get((w.data_ptr(), w_scales.data_ptr()))
+    if hit is None or hit[3] != N or hit[4] != K:
+        return None
+    return hit[0]
