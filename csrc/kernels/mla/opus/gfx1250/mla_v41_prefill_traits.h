@@ -9,7 +9,7 @@
 
 #include <opus/dtypes.hpp>
 
-#include "../mla_v41_prefill_kargs.h"
+#include "../mla_prefill_kargs.h"
 
 using bf16_t = opus::dtypes::bf16;
 using fp8_t  = _BitInt(8);
@@ -98,6 +98,9 @@ struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr int O_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_OUT);
     static constexpr int O_ROW_LDS_BYTES = O_ROW_LDS_ELEMS * sizeof(D_OUT);
     static_assert(NUM_WARPS * Q_TILE_SIZE * O_ROW_LDS_BYTES <= XCHG_OFF, "O staging reuses partitions 0 and 1");
+    static constexpr int PO_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_ACC);
+    static constexpr int PO_ROW_LDS_BYTES = PO_ROW_LDS_ELEMS * sizeof(D_ACC);
+    static_assert(NUM_WARPS * Q_TILE_SIZE * PO_ROW_LDS_BYTES <= XCHG_OFF, "fp32 O staging must not overlap the exchange");
 
     static constexpr size_t smem_size_bytes() { return (size_t)(FAC_OFF + FAC_BYTES); }
     static_assert(FAC_OFF + FAC_BYTES <= 5 * PARTITION_BYTES);
@@ -176,6 +179,9 @@ struct opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int O_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_OUT);
     static constexpr int O_ROW_LDS_BYTES = O_ROW_LDS_ELEMS * sizeof(D_OUT);
     static_assert(Q_TILE_SIZE * O_ROW_LDS_BYTES <= V_OFF, "O staging reuses the K buffers");
+    static constexpr int PO_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_ACC);
+    static constexpr int PO_ROW_LDS_BYTES = PO_ROW_LDS_ELEMS * sizeof(D_ACC);
+    static_assert(Q_TILE_SIZE * PO_ROW_LDS_BYTES <= V_OFF, "fp32 O staging reuses the K buffers");
 
     static constexpr size_t smem_size_bytes() { return (size_t)(Q_OFF + Q_TILE_BYTES); }
     static_assert(Q_OFF + Q_TILE_BYTES <= 160 * 1024, "two workgroups per CU");

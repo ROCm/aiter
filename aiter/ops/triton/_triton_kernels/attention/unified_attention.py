@@ -368,7 +368,7 @@ def kernel_unified_attention_2d(
                 is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
                 qq_bias = tl.load(
                     qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=is_query_key[None, :],
+                    mask=query_mask_0[:, None] & is_query_key[None, :],
                     other=0.0,
                 )
                 S += qq_bias * RCP_LN2
@@ -506,7 +506,8 @@ def kernel_unified_attention_2d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -720,7 +721,10 @@ def kernel_unified_attention_3d(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-    query_mask_0 = query_pos < cur_batch_query_len
+    # Rows past BLOCK_Q tokens belong to the next q block, which stores them.
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m // num_queries_per_kv < BLOCK_Q
+    )
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -929,7 +933,8 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
