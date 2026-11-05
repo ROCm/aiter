@@ -370,6 +370,7 @@ def _compile_stage1(job):
         inter_sorted_quant=d,
         inter_sorted_shuffled_scale=d,
         hidden_states=d,
+        hidden_row_stride_bytes=job["D_HIDDEN"] * 2,
         n_tokens=job["n_tokens"],
         BM=job["BM"],
         BN=job["BN"],

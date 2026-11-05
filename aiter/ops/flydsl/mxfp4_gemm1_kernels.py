@@ -205,6 +205,7 @@ def flydsl_mxfp4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
+    hidden_row_stride_bytes=None,
     BN=256,
     BK=256,
     interleave=False,
@@ -242,6 +243,9 @@ def flydsl_mxfp4_gemm1(
         k_wave=k_wave,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
+
+    if hidden_row_stride_bytes is None:
+        hidden_row_stride_bytes = hidden_states.stride(0) * hidden_states.element_size()
 
     launch = _get_compiled_mxfp4_gemm1_port(
         BM,
@@ -282,6 +286,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            int(hidden_row_stride_bytes),
             0 if bias is None else bias.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
         ),
