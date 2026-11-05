@@ -422,6 +422,209 @@ def _quantize_mxfp4_by_expert(weight):
     return packed.view(dtypes.fp4x2), scales.flatten(0, 1).view(dtypes.fp8_e8m0)
 
 
+@pytest.mark.parametrize("token", [1, 16, 32])
+@pytest.mark.parametrize("situ_beta,situ_linear_beta", [(1.0, 1.0), (4.0, 25.0)])
+@pytest.mark.parametrize(
+    "shuffled,both_shuffled", [(False, False), (True, True), (True, False)]
+)
+@pytest.mark.parametrize(
+    "kernel,flat",
+    [
+        ("_ZN5aiter46fmoe_bf16_pertokenMXfp4_g1u1_flat_situv2_16x32E", 1),
+        ("_ZN5aiter52fmoe_bf16_pertokenMXfp4_g1u1_emsort_vs_situv2_16x128E", 2),
+    ],
+)
+def test_situv2_tuned_asm_weight_layout(
+    monkeypatch,
+    token,
+    situ_beta,
+    situ_linear_beta,
+    shuffled,
+    both_shuffled,
+    kernel,
+    flat,
+):
+    import aiter.fused_moe as moe
+
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "0")
+    monkeypatch.setattr(moe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(moe, "get_cu_num", lambda: 256)
+    key = (
+        "gfx950",
+        256,
+        token,
+        3584,
+        384,
+        896,
+        16,
+        str(ActivationType.Situv2),
+        str(dtypes.bf16),
+        str(dtypes.bf16),
+        str(dtypes.fp4x2),
+        str(QuantType.per_1x32),
+        True,
+        False,
+    )
+    monkeypatch.setattr(
+        moe,
+        "cfg_2stages",
+        (
+            {
+                key: {
+                    "block_m": 16,
+                    "ksplit": 0,
+                    "kernelName1": kernel,
+                    "kernelName2": "",
+                    "run_1stage": True,
+                    "xbf16": 1,
+                    "flat": flat,
+                }
+            },
+            {},
+        ),
+    )
+    moe.get_2stage_cfgs.cache_clear()
+    try:
+        dispatch = functools.partial(
+            moe.get_2stage_cfgs,
+            token,
+            3584,
+            384,
+            896,
+            16,
+            dtypes.bf16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Situv2,
+            False,
+            0,
+            0,
+            is_shuffled=shuffled,
+            opus_weights_shuffled=both_shuffled,
+            gate_mode=GateMode.SEPARATED.value,
+            gate_up_interleave=False if shuffled else None,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        if shuffled and not both_shuffled:
+            with pytest.raises(ValueError, match="both w1 and w2"):
+                dispatch()
+            return
+        if not shuffled and (situ_beta, situ_linear_beta) != (4.0, 25.0):
+            with pytest.raises(ValueError, match="fixed beta"):
+                dispatch()
+            return
+        selected = dispatch()
+        if shuffled:
+            assert selected.run_1stage is False
+            assert selected.stage1.func is moe._flydsl_stage1_wrapper
+            assert selected.stage2.func is moe._flydsl_stage2_wrapper
+            assert selected.stage1.keywords["activation"] == ActivationType.Situv2
+            assert "abf16_wfp4" in selected.stage1.keywords["kernelName"]
+            for options in (
+                {"gate_mode": GateMode.INTERLEAVE.value},
+                {"gate_up_interleave": True},
+            ):
+                with pytest.raises(ValueError, match="separated"):
+                    dispatch(**options)
+        else:
+            assert selected.run_1stage
+            assert selected.stage1.func is moe.fused_moe_1stage
+            assert selected.stage1.keywords["kernelName"] == kernel
+    finally:
+        moe.get_2stage_cfgs.cache_clear()
+
+
+@pytest.mark.parametrize("token", [1, 16, 32, 64, 128])
+@pytest.mark.parametrize("inter_dim", [384, 512])
+def test_situv2_real_csv_preserves_compatible_rows(monkeypatch, token, inter_dim):
+    from pathlib import Path
+
+    import aiter.fused_moe as moe
+
+    path = (
+        Path(moe.__file__).parent / "configs/model_configs/kimik3_a16w4_tuned_fmoe.csv"
+    )
+    monkeypatch.setenv("AITER_CONFIG_FMOE", str(path))
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "0")
+    monkeypatch.setattr(moe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(moe, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(moe, "cfg_2stages", None)
+    moe.get_2stage_cfgs.cache_clear()
+    try:
+        selected = moe.get_2stage_cfgs(
+            token,
+            3584,
+            inter_dim,
+            896,
+            16,
+            dtypes.bf16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Situv2,
+            False,
+            0,
+            0,
+            is_shuffled=True,
+            opus_weights_shuffled=True,
+            gate_mode=GateMode.SEPARATED.value,
+            gate_up_interleave=False,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        assert not selected.run_1stage
+        assert selected.stage1.func is moe._flydsl_stage1_wrapper
+        assert selected.stage2.func is moe._flydsl_stage2_wrapper
+        if token >= 64 or inter_dim == 512:
+            rows = pd.read_csv(path)
+            row = rows[
+                (rows["token"] == token) & (rows["inter_dim"] == inter_dim)
+            ].iloc[0]
+            assert selected.stage1.keywords["kernelName"] == row["kernelName1"]
+            assert selected.stage2.keywords["kernelName"] == row["kernelName2"]
+            assert selected.block_m == row["block_m"]
+    finally:
+        moe.get_2stage_cfgs.cache_clear()
+
+
+@pytest.mark.parametrize("situ_beta,situ_linear_beta", [(1.0, 1.0), (4.0, 25.0)])
+def test_situv2_runtime_betas_reach_a16w4(monkeypatch, situ_beta, situ_linear_beta):
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels import moe_2stage_a16wmix
+
+    captured = {}
+    monkeypatch.setattr(
+        moe_2stage_a16wmix,
+        "flydsl_a16w4_gemm1",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    moe_kernels.flydsl_moe_stage1(
+        a=torch.empty((1, 256), dtype=torch.bfloat16, device="cpu"),
+        w1=torch.empty((2, 256, 128), dtype=torch.uint8, device="cpu"),
+        sorted_token_ids=torch.zeros(32, dtype=torch.int32, device="cpu"),
+        sorted_expert_ids=torch.zeros(1, dtype=torch.int32, device="cpu"),
+        num_valid_ids=torch.ones(1, dtype=torch.int32, device="cpu"),
+        tile_m=32,
+        tile_n=128,
+        tile_k=256,
+        a_dtype="bf16",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="situv2",
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    assert captured["act"] == "situv2"
+    assert captured["situ_beta"] == situ_beta
+    assert captured["situ_linear_beta"] == situ_linear_beta
+
+
 @_SKIP
 def test_mxfp4_reference_chunking_is_exact():
     torch.manual_seed(31)
@@ -444,18 +647,9 @@ def test_mxfp4_reference_chunking_is_exact():
 # adds no extra kernel compiles).
 @pytest.mark.parametrize("situ_beta,situ_linear_beta", [(1.0, 1.0), (4.0, 25.0)])
 def test_flydsl_a16wfp4_situv2_e2e(
-    model_dim, inter_dim, token, situ_beta, situ_linear_beta, request
+    model_dim, inter_dim, token, situ_beta, situ_linear_beta
 ):
     """a16w4 SiTUv2 SEPARATED end-to-end through fused_moe vs a bf16 SiTUv2 ref."""
-    if get_gfx() == "gfx950" and inter_dim == 384 and token <= 32:
-        request.applymarker(
-            pytest.mark.xfail(
-                reason="kimik3_a16w4_tuned_fmoe.csv sends these gfx950 shapes to "
-                "1-stage ASM SiTUv2 kernels that its tuner checks with unshuffled "
-                "weights and scales, not the shuffle_weight_a16w4 layout used here",
-                strict=False,
-            )
-        )
     E, topk = 896, 16
     dtype = dtypes.bf16
     torch.manual_seed(0)
@@ -509,6 +703,34 @@ def test_flydsl_a16wfp4_situv2_e2e(
     w2_gui = shuffle_weight_a16w4(w2_qt, 16, False)
     w1_scale_gui = shuffle_scale_a16w4(w1_scale, E, False)
     w2_scale_gui = shuffle_scale_a16w4(w2_scale, E, False)
+
+    import aiter.fused_moe as moe
+
+    metadata = moe.get_2stage_cfgs(
+        moe.get_padded_M(token),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Situv2,
+        False,
+        0,
+        0,
+        is_shuffled=True,
+        opus_weights_shuffled=True,
+        gate_mode=GateMode.SEPARATED.value,
+        gate_up_interleave=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    assert not metadata.run_1stage
+    assert metadata.stage1.func is moe._flydsl_stage1_wrapper
+    assert metadata.stage2 is not None
 
     out = fused_moe(
         inp,
