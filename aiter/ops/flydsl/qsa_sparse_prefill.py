@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""QSA sparse prefill on gfx942: BF16 D256 sparse attention over packed K/V.
+"""QSA sparse prefill on gfx942 and gfx950: BF16 D256 sparse attention over packed K/V.
 
 Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
 recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
@@ -297,7 +297,7 @@ def flydsl_qsa_sparse_prefill(
     ):
         raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
     if q.device.type != "cuda" or torch.version.hip is None:
-        raise ValueError("QSA sparse attention requires ROCm gfx942")
+        raise ValueError("QSA sparse attention requires ROCm gfx942 or gfx950")
     for tensor in (q, k, v):
         if (
             tensor.dtype != torch.bfloat16
@@ -327,8 +327,8 @@ def flydsl_qsa_sparse_prefill(
     span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
     if span * q.element_size() > _MAX_SPAN:
         raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
-    if get_gfx_runtime() != "gfx942":
-        raise ValueError("QSA sparse attention requires gfx942")
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        raise ValueError("QSA sparse attention requires gfx942 or gfx950")
     topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0
     if (
         indices.shape != (q.shape[0], 4 * topk + 3)
