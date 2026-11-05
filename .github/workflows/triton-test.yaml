@@ -111,6 +111,7 @@ jobs:
         dpx_runner:
           - { label: "linux-aiter-vultr-mi325-1", arch: "MI325X" }
           - { label: "amd-dpx-linux.aiter.gpu.gfx950.1", arch: "MI350X" }
+          - { label: "linux-aiter-do-mi350x-1", arch: "MI350X-DO" }
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
       TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
