@@ -4,17 +4,21 @@
 """Kimi-K3 KDA speculative verify (flydsl_kda_verify_with_f_b) against FP32 references."""
 
 import argparse
+import dataclasses
 import itertools
+import re
 from dataclasses import dataclass
 
 import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import linear_attention_kernels
 from aiter.ops.flydsl.linear_attention_kernels import (
     flydsl_kda_decode_with_f_b,
     flydsl_kda_verify_with_f_b,
@@ -31,11 +35,15 @@ pytestmark = pytest.mark.skipif(
 _H = 12
 _D = 128
 _C = 3 * _H * _D
+_HDD = _H * _D * _D
+# Elements of one step's [4608, 3] conv window.
+_WINDOW_STEP = 3 * _C
 _LOWER_BOUND = -5.0
 _NORM_EPS = 1e-5
 _DEVICE = "cuda"
 # Output errors are BF16 roundings of the gated RMSNorm (|out| up to ~4).
 _OUT_TOL = {"atol": 2e-2, "rtol": 2e-2}
+_RING_PARTS = ("raw_v", "raw_k", "g", "beta")
 
 
 @dataclass
@@ -121,31 +129,54 @@ def _make_inputs(
     )
 
 
+def _kwargs(inp, num_tokens):
+    return {
+        "f_a": inp.f_a,
+        "f_b_weight": inp.f_b_weight,
+        "x": inp.x,
+        "conv_weight": inp.conv_weight,
+        "conv_bias": None,
+        "conv_state": inp.conv_state,
+        "raw_beta": inp.raw_beta,
+        "A_log": inp.A_log,
+        "dt_bias": inp.dt_bias,
+        "lower_bound": _LOWER_BOUND,
+        "state": inp.state,
+        "cache_indices": inp.cache_indices,
+        "intermediate_indices": inp.inter_indices,
+        "intermediate_conv_window": inp.window,
+        "output_gate": inp.output_gate,
+        "norm_weight": inp.norm_weight,
+        "norm_eps": _NORM_EPS,
+        "num_tokens": num_tokens,
+        "intermediate_states": inp.inter_states,
+        "replay_ring": inp.ring,
+    }
+
+
 def _run(
-    inp: VerifyInputs, num_tokens: int, out: torch.Tensor | None = None
+    inp: VerifyInputs,
+    num_tokens: int,
+    out: torch.Tensor | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     return flydsl_kda_verify_with_f_b(
-        f_a=inp.f_a,
-        f_b_weight=inp.f_b_weight,
-        x=inp.x,
-        conv_weight=inp.conv_weight,
-        conv_bias=None,
-        conv_state=inp.conv_state,
-        raw_beta=inp.raw_beta,
-        A_log=inp.A_log,
-        dt_bias=inp.dt_bias,
-        lower_bound=_LOWER_BOUND,
-        state=inp.state,
-        cache_indices=inp.cache_indices,
-        intermediate_indices=inp.inter_indices,
-        intermediate_conv_window=inp.window,
-        output_gate=inp.output_gate,
-        norm_weight=inp.norm_weight,
-        norm_eps=_NORM_EPS,
-        num_tokens=num_tokens,
-        intermediate_states=inp.inter_states,
-        replay_ring=inp.ring,
-        out=out,
+        **_kwargs(inp, num_tokens), out=out, num_warps=num_warps
+    )
+
+
+def _copy_inputs(inp: VerifyInputs) -> VerifyInputs:
+    """Clone every tensor; dense layouts (e.g. transposed caches) keep their strides."""
+
+    def copy(value):
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        if isinstance(value, tuple):
+            return tuple(t.clone() for t in value)
+        return value
+
+    return VerifyInputs(
+        **{f.name: copy(getattr(inp, f.name)) for f in dataclasses.fields(inp)}
     )
 
 
@@ -176,7 +207,9 @@ def _reference(inp: VerifyInputs, num_tokens: int):
             window[line, t] = hist.to(torch.bfloat16)
             qkv = F.silu(conv).to(torch.bfloat16).view(3, _H, _D)
             q, k, v = (t_.float() for t_ in qkv.unbind(0))
-            proj = torch.einsum("k,hok->ho", inp.f_a[tok].float(), inp.f_b_weight.float())
+            proj = torch.einsum(
+                "k,hok->ho", inp.f_a[tok].float(), inp.f_b_weight.float()
+            )
             proj = proj.to(torch.bfloat16).float()
             log_decay = _LOWER_BOUND * torch.sigmoid((proj + dt) * a)  # [H, K]
             beta = torch.sigmoid(inp.raw_beta[0, tok].float())  # [H]
@@ -210,15 +243,9 @@ def _assert_close(ref, act, msg, atol, rtol, max_bad=0.0):
     )
 
 
-def _check(inp, num_tokens, max_bad=1e-3):
-    conv_before = inp.conv_state.clone()
-    state_before = inp.state.clone()
-    ref_out, ref_window, ref_states, ref_ring = _reference(inp, num_tokens)
-    out = _run(inp, num_tokens)
-    torch.cuda.synchronize()
-    # Verify never advances the caches.
-    assert torch.equal(inp.conv_state, conv_before)
-    assert torch.equal(inp.state, state_before)
+def _assert_matches(inp, out, refs, max_bad=1e-3):
+    """Check the output and every verify write against :func:`_reference`."""
+    ref_out, ref_window, ref_states, ref_ring = refs
     assert torch.equal(inp.window, ref_window), "conv windows differ"
     _assert_close(ref_out, out, "output", **_OUT_TOL, max_bad=max_bad)
     if ref_states is not None:
@@ -229,20 +256,90 @@ def _check(inp, num_tokens, max_bad=1e-3):
         _assert_close(ref_ring[1], inp.ring[1], "ring k", 1e-2, 1e-2, max_bad)
         _assert_close(ref_ring[2], inp.ring[2], "ring g", 1e-4, 1e-3, max_bad)
         _assert_close(ref_ring[3], inp.ring[3], "ring beta", 1e-5, 1e-4, 0.0)
+
+
+def _check(inp, num_tokens, max_bad=1e-3, num_warps=None):
+    conv_before = inp.conv_state.clone()
+    state_before = inp.state.clone()
+    refs = _reference(inp, num_tokens)
+    out = _run(inp, num_tokens, num_warps=num_warps)
+    torch.cuda.synchronize()
+    # Verify never advances the caches.
+    assert torch.equal(inp.conv_state, conv_before)
+    assert torch.equal(inp.state, state_before)
+    _assert_matches(inp, out, refs, max_bad)
     return out
 
 
+def _verify_writes(inp):
+    """Every buffer the kernel writes, other than ``out``."""
+    written = [inp.window]
+    written += [inp.inter_states] if inp.ring is None else list(inp.ring)
+    return written
+
+
+def _bits_equal(a, b):
+    return torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
+
+
+@pytest.mark.parametrize("num_warps", flydsl_kda_verify_with_f_b.num_warps)
 @pytest.mark.parametrize("ring", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 6, 8])
 @pytest.mark.parametrize("batch", [1, 3, 17])
-def test_kda_verify_matches_reference(batch, num_tokens, state_dtype, ring):
-    _check(_make_inputs(batch, num_tokens, state_dtype, ring), num_tokens)
+def test_kda_verify_matches_reference(batch, num_tokens, state_dtype, ring, num_warps):
+    _check(
+        _make_inputs(batch, num_tokens, state_dtype, ring),
+        num_tokens,
+        num_warps=num_warps,
+    )
+
+
+def test_kda_verify_advertises_num_warps():
+    """The tag lists exactly the wave counts the automatic policy picks, so a
+    caller that pre-builds each one before graph capture covers every batch."""
+    picks = {
+        linear_attention_kernels._kda_verify_num_warps(batch) for batch in range(1, 257)
+    }
+    assert picks == set(flydsl_kda_verify_with_f_b.num_warps)
 
 
 def test_kda_verify_channel_major_conv_and_longer_scratch():
     inp = _make_inputs(4, 5, torch.bfloat16, False, steps=8, sglang_layout=False)
     _check(inp, 5)
+
+
+def _pad_slots(tensor, pools):
+    """Copy a dense slot-major ``tensor`` into every other slot of a zeroed pool,
+    as a [slots, 2, ...] pool sliced on its second axis would give."""
+    slot = tensor.stride(0)
+    pool = torch.zeros(
+        2 * tensor.shape[0] * slot, dtype=tensor.dtype, device=tensor.device
+    )
+    view = pool.as_strided(tensor.shape, (2 * slot, *tensor.stride()[1:]))
+    view.copy_(tensor)
+    pools.append((pool, tensor.shape[0]))
+    return view
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_kda_verify_accepts_padded_pool_slices(ring):
+    """Caches and scratch whose slot stride exceeds one slot are accepted, and
+    the padding between slots is never written."""
+    inp = _make_inputs(4, 5, torch.float32, ring)
+    pools = []
+    inp.conv_state = _pad_slots(inp.conv_state, pools)
+    inp.state = _pad_slots(inp.state, pools)
+    inp.window = _pad_slots(inp.window, pools)
+    if ring:
+        inp.ring = tuple(_pad_slots(t, pools) for t in inp.ring)
+    else:
+        inp.inter_states = _pad_slots(inp.inter_states, pools)
+    _check(inp, 5)
+    for pool, slots in pools:
+        assert torch.count_nonzero(pool.view(slots, 2, -1)[:, 1]) == 0
 
 
 @pytest.mark.parametrize("ring", [False, True])
@@ -290,7 +387,158 @@ def test_kda_verify_token_zero_matches_fused_decode(state_dtype):
         )
 
 
-def test_kda_verify_rejects_bad_arguments():
+@pytest.mark.parametrize("ring", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kda_verify_graph_replay(state_dtype, ring):
+    """A captured verify matches eager bit for bit across replays: it reads the
+    draft tokens and the committed caches written before each replay."""
+    batch, num_tokens = 4, 6
+    seed = _make_inputs(batch, num_tokens, state_dtype, ring)
+    # Compile outside the capture on a throwaway copy, so capture records launches only.
+    _run(_copy_inputs(seed), num_tokens)
+    torch.cuda.synchronize()
+
+    graph_inputs, eager_inputs = _copy_inputs(seed), _copy_inputs(seed)
+    out = torch.empty(
+        (1, batch * num_tokens, _H, _D), dtype=torch.bfloat16, device=_DEVICE
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(graph_inputs, num_tokens, out=out)
+
+    for step in range(3):
+        # New draft tokens and a newly committed state, as between two verifies.
+        fresh = _make_inputs(batch, num_tokens, state_dtype, ring, seed=101 + step)
+        for inputs in (graph_inputs, eager_inputs):
+            for name in ("f_a", "x", "raw_beta", "output_gate", "conv_state", "state"):
+                getattr(inputs, name).copy_(getattr(fresh, name))
+        refs = _reference(graph_inputs, num_tokens)
+
+        graph.replay()
+        eager = _run(eager_inputs, num_tokens)
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), f"replay {step} output differs from eager"
+        for graph_write, eager_write in zip(
+            _verify_writes(graph_inputs), _verify_writes(eager_inputs)
+        ):
+            assert _bits_equal(
+                graph_write, eager_write
+            ), f"replay {step} scratch differs from eager"
+        _assert_matches(graph_inputs, out, refs)
+
+
+# Byte distance from slot 0 to slot 1 of every cache in the large-offset test.
+# It passes 2**32, so a 32-bit byte offset would wrap into the zeroed gap below.
+_HIGH_SLOT_BYTES = (1 << 32) + (1 << 24)
+
+
+@pytest.mark.parametrize("ring", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kda_verify_large_cache_slot_offsets(state_dtype, ring):
+    """Slot and line 1 of every cache sit 4 GiB past slot 0, which only the
+    kernel's 64-bit rebase reaches. All caches are strided two-slot views of
+    one ~4.3 GB buffer, so the test stays small."""
+    num_tokens = 5
+    seed = _make_inputs(2, num_tokens, state_dtype, ring)
+    caches = {"conv_state": seed.conv_state, "state": seed.state}
+    caches["window"] = seed.window
+    if ring:
+        caches.update(zip(_RING_PARTS, seed.ring))
+    else:
+        caches["inter_states"] = seed.inter_states
+    # Sequence 0 uses cache slot 1 and line 0; sequence 1 slot 0 and line 1.
+    cache_indices, inter_indices = (1, 0), (0, 1)
+
+    offsets, low_bytes = {}, 0
+    for name, tensor in caches.items():
+        offsets[name] = low_bytes
+        slot_bytes = tensor[0].numel() * tensor.element_size()
+        low_bytes += -(-slot_bytes // 256) * 256
+    assert low_bytes < 1 << 24
+    storage = torch.zeros(
+        _HIGH_SLOT_BYTES + low_bytes, dtype=torch.uint8, device=_DEVICE
+    )
+    large = {}
+    for name, tensor in caches.items():
+        elem = tensor.element_size()
+        view = storage.view(tensor.dtype).as_strided(
+            (2, *tensor.shape[1:]),
+            (_HIGH_SLOT_BYTES // elem, *tensor.stride()[1:]),
+            offsets[name] // elem,
+        )
+        by_line = name in ("window", "inter_states")
+        old = seed.inter_indices if by_line else seed.cache_indices
+        new = inter_indices if by_line else cache_indices
+        for b in range(2):
+            view[new[b]].copy_(tensor[int(old[b])])
+        large[name] = view
+    actual = dataclasses.replace(
+        seed,
+        conv_state=large["conv_state"],
+        state=large["state"],
+        window=large["window"],
+        inter_states=large.get("inter_states"),
+        ring=tuple(large[name] for name in _RING_PARTS) if ring else None,
+        cache_indices=torch.tensor(cache_indices, dtype=torch.int32, device=_DEVICE),
+        inter_indices=torch.tensor(inter_indices, dtype=torch.int32, device=_DEVICE),
+    )
+    # The reference runs on dense copies of the same two slots.
+    expected = _copy_inputs(actual)
+    refs = _reference(expected, num_tokens)
+
+    out = _run(actual, num_tokens)
+    torch.cuda.synchronize()
+    assert torch.equal(actual.conv_state, expected.conv_state)
+    assert torch.equal(actual.state, expected.state)
+    _assert_matches(actual, out, refs)
+    # Nothing outside the addressed slots may be touched by wrapped offsets.
+    for view in large.values():
+        view.zero_()
+    assert torch.count_nonzero(storage.view(torch.int64)) == 0
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring):
+    # AITER_KDA_DECODE_SLOT_CHECK is read at import; patch the flag it sets.
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+    inp = _make_inputs(4, 5, torch.bfloat16, ring)
+
+    def set_indices(cache, inter):
+        inp.cache_indices.copy_(torch.tensor(cache, dtype=torch.int32))
+        inp.inter_indices.copy_(torch.tensor(inter, dtype=torch.int32))
+
+    # Padding may repeat either index, also a live slot or line paired with a
+    # padding index in the other array.
+    set_indices([-1, -1, 2, 2], [0, 0, -1, 3])
+    _check(inp, 5)
+
+    for cache, inter, name, duplicate in (
+        ([3, -1, 0, 3], [0, 1, 2, 4], "cache_indices", 3),
+        ([1, 2, 3, 4], [5, 2, 2, -1], "intermediate_indices", 2),
+    ):
+        set_indices(cache, inter)
+        before = [t.clone() for t in _verify_writes(inp)]
+        with pytest.raises(
+            ValueError, match=rf"`{name}`.*duplicated slots: \[{duplicate}\]"
+        ):
+            _run(inp, 5)
+        torch.cuda.synchronize()
+        # The check runs before launch, so no scratch is written.
+        for written, original in zip(_verify_writes(inp), before):
+            assert torch.equal(written, original)
+
+
+def _reject_compile(monkeypatch):
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Invalid arguments must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(
+        linear_attention_kernels, "create_kda_verify_kernel", unexpected_compile
+    )
+
+
+def test_kda_verify_rejects_bad_arguments(monkeypatch):
+    _reject_compile(monkeypatch)
     inp = _make_inputs(2, 5, torch.bfloat16, False)
     with pytest.raises(ValueError, match="exactly one"):
         flydsl_kda_verify_with_f_b(
@@ -302,31 +550,125 @@ def test_kda_verify_rejects_bad_arguments():
         flydsl_kda_verify_with_f_b(
             **{**_kwargs(inp, 5), "intermediate_states": inp.inter_states.float()}
         )
+    with pytest.raises(ValueError, match="num_warps"):
+        _run(inp, 5, num_warps=16)
 
 
-def _kwargs(inp, num_tokens):
-    return dict(
-        f_a=inp.f_a,
-        f_b_weight=inp.f_b_weight,
-        x=inp.x,
-        conv_weight=inp.conv_weight,
-        conv_bias=None,
-        conv_state=inp.conv_state,
-        raw_beta=inp.raw_beta,
-        A_log=inp.A_log,
-        dt_bias=inp.dt_bias,
-        lower_bound=_LOWER_BOUND,
-        state=inp.state,
-        cache_indices=inp.cache_indices,
-        intermediate_indices=inp.inter_indices,
-        intermediate_conv_window=inp.window,
-        output_gate=inp.output_gate,
-        norm_weight=inp.norm_weight,
-        norm_eps=_NORM_EPS,
-        num_tokens=num_tokens,
-        intermediate_states=inp.inter_states,
-        replay_ring=inp.ring,
-    )
+def test_kda_verify_rejects_conv_weight_without_unit_stride(monkeypatch):
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(1, 2, torch.bfloat16, False)
+    inp.conv_weight = torch.empty((_C, 8), dtype=torch.float32, device=_DEVICE)[:, ::2]
+    with pytest.raises(
+        ValueError, match="`conv_weight` must have an axis with stride 1"
+    ):
+        _run(inp, 2)
+
+
+def _set_input(inp, out, name, tensor):
+    """Replace ``name`` (an input field, a ring part or ``out``); return ``out``."""
+    if name == "out":
+        return tensor
+    if name in _RING_PARTS:
+        ring = list(inp.ring)
+        ring[_RING_PARTS.index(name)] = tensor
+        inp.ring = tuple(ring)
+    else:
+        setattr(inp, name, tensor)
+    return out
+
+
+def _get_input(inp, out, name):
+    if name == "out":
+        return out
+    if name in _RING_PARTS:
+        return inp.ring[_RING_PARTS.index(name)]
+    return getattr(inp, name)
+
+
+_WRITE_LABELS = {
+    "window": "intermediate_conv_window",
+    "inter_states": "intermediate_states",
+    **{name: f"replay_ring.{name}" for name in _RING_PARTS},
+    "out": "out",
+}
+
+
+# Inputs are [5 lines/slots, 5 steps, ...]; the ring holds L = 6 tokens.
+@pytest.mark.parametrize(
+    "name, strides",
+    [
+        # zeros(L, 1, 4608, 3).expand(L, 5, 4608, 3): every step aliases one.
+        ("window", (_WINDOW_STEP, 0, 3, 1)),
+        ("window", (0, _WINDOW_STEP, 1, _C)),
+        ("window", (5 * _WINDOW_STEP - 1, _WINDOW_STEP, 3, 1)),
+        ("window", (5 * _WINDOW_STEP, _WINDOW_STEP, 3, 0)),
+        ("window", (5 * _WINDOW_STEP, _WINDOW_STEP, 1, 1)),
+        ("window", (10 * _WINDOW_STEP, 2 * _WINDOW_STEP, 6, 2)),
+        ("inter_states", (0, _HDD, _D * _D, _D, 1)),
+        ("inter_states", (5 * _HDD - 1, _HDD, _D * _D, _D, 1)),
+        ("inter_states", (5 * _HDD, 0, _D * _D, _D, 1)),
+        ("inter_states", (5 * _HDD, _HDD, 0, _D, 1)),
+        ("raw_v", (0, 6 * _D, _D, 1)),
+        ("raw_k", (_H * 6 * _D - 1, 6 * _D, _D, 1)),
+        ("g", (_H * 6 * _D, 0, _D, 1)),
+        ("g", (_H * 6 * _D, _D, _D, 1)),
+        ("beta", (0, 6, 1)),
+        ("beta", (_H * 6 - 1, 6, 1)),
+        ("beta", (_H * 6, 0, 1)),
+        ("out", (0, _H * _D, _D - 1, 1)),
+        ("out", (0, 0, _D, 1)),
+    ],
+)
+def test_kda_verify_rejects_unsafe_write_layouts(monkeypatch, name, strides):
+    _reject_compile(monkeypatch)
+    with FakeTensorMode():
+        inp = _make_inputs(2, 5, torch.bfloat16, name in _RING_PARTS)
+        out = torch.empty((1, 10, _H, _D), dtype=torch.bfloat16, device=_DEVICE)
+        tensor = _get_input(inp, out, name)
+        view = torch.empty_strided(
+            tensor.shape, strides, dtype=tensor.dtype, device=_DEVICE
+        )
+        out = _set_input(inp, out, name, view)
+        label = re.escape(_WRITE_LABELS[name])
+        with pytest.raises(ValueError, match=f"`{label}`.*non-overlapping"):
+            _run(inp, 5, out=out)
+
+
+@pytest.mark.parametrize(
+    "name, dim",
+    # Cache and scratch inner strides are fixed by the dense-slot checks, so
+    # their byte span cannot overflow; unsafe layouts are covered above.
+    [
+        ("f_a", 0),
+        ("f_b_weight", 0),
+        ("x", 0),
+        ("conv_weight", 0),
+        ("conv_weight", 1),
+        ("raw_beta", 1),
+        ("output_gate", 0),
+        ("output_gate", 1),
+        ("out", 1),
+        ("out", 2),
+    ],
+)
+@pytest.mark.parametrize("stride", [2**30, 2**31])
+def test_kda_verify_rejects_i32_address_overflow(monkeypatch, name, dim, stride):
+    _reject_compile(monkeypatch)
+    # Fake views exercise multi-GiB spans without allocating or accessing them.
+    # 2**30 fits the launcher parameter but overflows the resulting byte span;
+    # 2**31 also overflows the stride parameter itself.
+    with FakeTensorMode():
+        inp = _make_inputs(2, 5, torch.bfloat16, False)
+        out = torch.empty((1, 10, _H, _D), dtype=torch.bfloat16, device=_DEVICE)
+        tensor = _get_input(inp, out, name)
+        strides = list(tensor.stride())
+        strides[dim] = stride
+        view = torch.empty_strided(
+            tensor.shape, strides, dtype=tensor.dtype, device=_DEVICE
+        )
+        out = _set_input(inp, out, name, view)
+        with pytest.raises(ValueError, match=f"`{name}`.*int32"):
+            _run(inp, 5, out=out)
 
 
 def _verify_work(batch, num_tokens, state_dtype, ring):
@@ -349,6 +691,22 @@ def _verify_work(batch, num_tokens, state_dtype, ring):
     return flops, nbytes
 
 
+def _checked_close(ref, act, msg, atol, rtol, tol_err_ratio=1e-3):
+    """checkAllclose that fails the sweep on a mismatch instead of only logging it."""
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        act.to(dtypes.fp32),
+        atol=atol,
+        rtol=rtol,
+        tol_err_ratio=tol_err_ratio,
+        msg=msg,
+    )
+    assert (
+        err <= tol_err_ratio
+    ), f"{msg}: {err:.4%} of elements outside atol={atol} rtol={rtol}"
+    return err
+
+
 @benchmark()
 def test_flydsl_kda_verify(batch, num_tokens, state_dtype, mode):
     ring = mode == "ring"
@@ -365,37 +723,29 @@ def test_flydsl_kda_verify(batch, num_tokens, state_dtype, mode):
         rotations = max(1, min(32, (1 << 30) // max(1, nbytes)))
         _, us = run_perftest(fn, inp, num_rotate_args=rotations)
         out = fn(inp)
-        err = checkAllclose(
-            ref_out.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            tol_err_ratio=1e-3,
-            msg=f"{name}: KDA verify output ",
-            **_OUT_TOL,
-        )
+        err = _checked_close(ref_out, out, f"{name}: KDA verify output ", **_OUT_TOL)
         assert torch.equal(inp.window, ref_window), f"{name}: conv windows differ"
         if ref_states is not None:
             err = max(
                 err,
-                checkAllclose(
-                    ref_states.to(dtypes.fp32),
-                    inp.inter_states.to(dtypes.fp32),
+                _checked_close(
+                    ref_states,
+                    inp.inter_states,
+                    f"{name}: KDA verify state snapshots ",
                     atol=1e-4,
                     rtol=1e-2,
-                    tol_err_ratio=1e-3,
-                    msg=f"{name}: KDA verify state snapshots ",
                 ),
             )
         if ref_ring is not None:
-            for ref_part, part, label in zip(ref_ring, inp.ring, ("v", "k", "g", "beta")):
+            for ref_part, part, label in zip(ref_ring, inp.ring, _RING_PARTS):
                 err = max(
                     err,
-                    checkAllclose(
-                        ref_part.to(dtypes.fp32),
-                        part.to(dtypes.fp32),
+                    _checked_close(
+                        ref_part,
+                        part,
+                        f"{name}: KDA verify ring {label} ",
                         atol=1e-2,
                         rtol=1e-2,
-                        tol_err_ratio=1e-3,
-                        msg=f"{name}: KDA verify ring {label} ",
                     ),
                 )
         ret[f"{name} us"] = us
@@ -423,12 +773,14 @@ def main():
     )
     parser.add_argument("-t", "--tokens", type=int, nargs="*", default=[5, 6, 8])
     parser.add_argument(
-        "--state-dtype",
+        "-d",
+        "--dtype",
         type=dtypes.str2Dtype,
         choices=[dtypes.fp32, dtypes.bf16],
         nargs="*",
         default=[dtypes.bf16],
-        help="Recurrent-state storage. Example: --state-dtype bf16 fp32",
+        help="Recurrent-state (and snapshot) storage dtype; Q/K/V and the output "
+        "are always BF16. Example: -d bf16 fp32",
     )
     parser.add_argument(
         "-m",
@@ -442,7 +794,7 @@ def main():
     rows = [
         test_flydsl_kda_verify(batch, tokens, state_dtype, mode)
         for state_dtype, mode, tokens, batch in itertools.product(
-            args.state_dtype, args.mode, args.tokens, args.batch
+            args.dtype, args.mode, args.tokens, args.batch
         )
     ]
     aiter.logger.info(
