@@ -27,6 +27,8 @@ from aiter.ops.asm.mla_decode_v4 import (
 )
 from aiter.ops.attention import (
     _mla_decode_launch_plan,
+    _mla_head_fold,
+    _mla_planned_cp_round_robin,
     _MlaBackendId,
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1418,25 +1420,39 @@ def mla_decode_fwd(
             cp_world_size,
         )
         has_scales = q_scale is not None and kv_scale is not None
+        cp_launch = g_kv_indptr is not None
         head_plan, max_splits = _mla_decode_launch_plan(
-            *plan_shape, g_kv_indptr is not None, has_scales
+            *plan_shape, cp_launch, has_scales
         )
-        planned_cprr = getattr(work_meta_data, "_aiter_planned_cp_round_robin", None)
-        if planned_cprr is not None and planned_cprr != (g_kv_indptr is not None):
-            planned, _ = _mla_decode_launch_plan(*plan_shape, planned_cprr, has_scales)
-            if (planned.qk_batch_ratio, planned.kernel_num_heads) != (
-                head_plan.qk_batch_ratio,
-                head_plan.kernel_num_heads,
-            ):
-                raise ValueError(
-                    f"work_meta_data was planned with is_cp_round_robin={planned_cprr}, "
-                    f"but g_kv_indptr is {'set' if g_kv_indptr is not None else 'None'}: "
-                    f"for {ori_nhead} heads at max_seqlen_q={max_seqlen_q} that changes "
-                    f"the head plan ({planned.qk_batch_ratio}x{planned.kernel_num_heads} "
-                    f"planned vs {head_plan.qk_batch_ratio}x{head_plan.kernel_num_heads}). "
-                    "Pass is_cp_round_robin=True to get_mla_metadata_v1 exactly when "
-                    "mla_decode_fwd gets g_kv_indptr."
-                )
+        # Where round-robin CP changes the head plan (96 fp8 heads at qlen 7 and 8
+        # on gfx950), the metadata's planned CP mode decides it, not g_kv_indptr.
+        # Unknown without CP is the default plan; unknown with CP fails closed.
+        planned_cprr = _mla_planned_cp_round_robin(work_meta_data)
+        if planned_cprr is None and not cp_launch:
+            planned_cprr = False
+        if planned_cprr is not cp_launch:
+            other, _ = _mla_decode_launch_plan(*plan_shape, not cp_launch, has_scales)
+            if _mla_head_fold(other) != _mla_head_fold(head_plan):
+                if planned_cprr is not False:
+                    why = (
+                        "has no recorded is_cp_round_robin (a clone, or not filled "
+                        "by get_mla_metadata_v1)"
+                        if planned_cprr is None
+                        else "was planned with is_cp_round_robin=True but "
+                        "g_kv_indptr is None"
+                    )
+                    raise ValueError(
+                        f"work_meta_data {why}; for {ori_nhead} heads at "
+                        f"max_seqlen_q={max_seqlen_q} the head plan depends on it "
+                        f"({other.qk_batch_ratio}x{other.kernel_num_heads} vs "
+                        f"{head_plan.qk_batch_ratio}x{head_plan.kernel_num_heads}). "
+                        "Plan with is_cp_round_robin=True for a round-robin CP launch "
+                        "(g_kv_indptr set) and pass the work_metadata_ptrs tensor "
+                        "get_mla_metadata_v1 filled, or a view of it."
+                    )
+                # Planned without CP (the default) but launched with it: run the
+                # fold the metadata holds, as before native CP heads existed.
+                head_plan = other
         if num_kv_splits is None:
             num_kv_splits = max_splits
         use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM

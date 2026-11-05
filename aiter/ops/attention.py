@@ -2469,9 +2469,12 @@ def _get_mla_metadata_v1_impl(
         max_split_per_batch: Cap on KV splits per batch. -1 means unbounded (default -1).
         intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
         is_cp_round_robin: Context-parallel round-robin work assignment (default False).
-            Must be True exactly when mla_decode_fwd gets g_kv_indptr: 96 fp8 heads at
-            qlen 7 and 8 are planned natively with it and folded without it, and
-            mla_decode_fwd raises ValueError where the two disagree on the plan.
+            Set it for a round-robin CP decode (mla_decode_fwd with g_kv_indptr): 96
+            fp8 heads at qlen 7 and 8 are planned natively with it and folded without
+            it. The mode is recorded with work_metadata_ptrs (views and deep copies
+            keep it) and mla_decode_fwd runs the head plan it records. Where the mode
+            changes the plan, mla_decode_fwd raises ValueError on a buffer without a
+            record (a clone) given g_kv_indptr, and on CP-planned metadata without it.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
@@ -2497,6 +2500,61 @@ def _get_mla_metadata_v1_impl(
         [5] reduce_partial_map  (#partial_tiles)                Partial-buffer locations of the
                                                 tiles awaiting reduction.
     """
+
+
+class _MlaPlannedCp:
+    """The is_cp_round_robin get_mla_metadata_v1 planned a work_metadata_ptrs with.
+
+    One cell per buffer, kept on its storage (keyed by data pointer, so views
+    share it) and on the planned tensor (so copy.deepcopy snapshots it). A clone
+    or copy_ into another buffer has none: its mode reads as unknown (None).
+    """
+
+    def __init__(self) -> None:
+        self.is_cp_round_robin: bool | None = None
+
+
+_MLA_PLANNED_CP_ATTR = "_aiter_mla_planned_cp"
+
+
+def _mla_planned_cp_cell(
+    work_metadata_ptrs: torch.Tensor, create: bool
+) -> _MlaPlannedCp | None:
+    storage = work_metadata_ptrs.untyped_storage()
+    cells = getattr(storage, _MLA_PLANNED_CP_ATTR, None)
+    cell = None if cells is None else cells.get(work_metadata_ptrs.data_ptr())
+    if not create:
+        return cell or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+    if cells is None:
+        cells = {}
+        setattr(storage, _MLA_PLANNED_CP_ATTR, cells)
+    if cell is None:
+        cell = cells[work_metadata_ptrs.data_ptr()] = _MlaPlannedCp()
+    setattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, cell)
+    return cell
+
+
+def _mla_record_planned_cp_round_robin(
+    work_metadata_ptrs: torch.Tensor, is_cp_round_robin: bool | None
+) -> None:
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=True)
+    cell.is_cp_round_robin = (
+        None if is_cp_round_robin is None else bool(is_cp_round_robin)
+    )
+
+
+def _mla_planned_cp_round_robin(
+    work_metadata_ptrs: torch.Tensor | None,
+) -> bool | None:
+    """The is_cp_round_robin get_mla_metadata_v1 planned these buffers with, or None."""
+    if work_metadata_ptrs is None:
+        return None
+    cell = _mla_planned_cp_cell(work_metadata_ptrs, create=False)
+    return None if cell is None else cell.is_cp_round_robin
+
+
+def _mla_head_fold(plan: _MlaHeadPlan) -> tuple[int, int]:
+    return plan.qk_batch_ratio, plan.kernel_num_heads
 
 
 def get_mla_metadata_v1(
@@ -2556,6 +2614,8 @@ def get_mla_metadata_v1(
     def _dtype_id(d):
         return _aiter_dtype_id(d) if d is not None else None
 
+    # Forget the previous plan's mode first, so a failed replan leaves it unknown.
+    _mla_record_planned_cp_round_robin(work_metadata_ptrs, None)
     _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
@@ -2584,10 +2644,9 @@ def get_mla_metadata_v1(
         dtype_kv_nope=_dtype_id(dtype_kv_nope),
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
-    # mla_decode_fwd checks its launch against this: for some shapes the head
-    # plan, folded or native, depends on round-robin CP. The flag lives on this
-    # tensor object, so a view or copy of it skips the check.
-    work_metadata_ptrs._aiter_planned_cp_round_robin = bool(is_cp_round_robin)
+    # mla_decode_fwd and decode_update_mla_metadata_v1 read this back: for some
+    # shapes the head plan, folded or native, depends on round-robin CP.
+    _mla_record_planned_cp_round_robin(work_metadata_ptrs, is_cp_round_robin)
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -2754,9 +2813,10 @@ def decode_update_mla_metadata_v1(
     """
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
-    Not for round-robin CP metadata: every request's KV grows by one token here.
-    Raises ValueError for metadata get_mla_metadata_v1 planned with
-    is_cp_round_robin=True.
+    Every request's KV grows by 1 - num_reject_tokens (default 1) tokens.
+    The head plan is the one without round-robin CP, so it raises ValueError on
+    metadata get_mla_metadata_v1 planned with is_cp_round_robin=True where CP
+    changes that plan (96 fp8 heads at qlen 7 and 8 on gfx950).
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2765,22 +2825,23 @@ def decode_update_mla_metadata_v1(
     assert (
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
-    # The head plan below assumes no CP, so for 96 fp8 heads at qlen 7 and 8 it
-    # would also rewrite a native plan as the fold, which decode would not catch.
-    if getattr(work_metadata_ptrs, "_aiter_planned_cp_round_robin", False):
-        raise ValueError(
-            "decode_update_mla_metadata_v1 cannot update metadata planned with "
-            "is_cp_round_robin=True: a round-robin CP rank's local KV does not grow "
-            "by one token per request. Call get_mla_metadata_v1 again instead."
-        )
+    plan_args = (num_heads_per_head_k, max_seqlen_qo, dtype_q, dtype_kv)
     head_plan = _mla_metadata_head_plan(
-        num_heads_per_head_k,
-        max_seqlen_qo,
-        dtype_q,
-        dtype_kv,
-        fast_mode=True,
-        intra_batch_mode=False,
+        *plan_args, fast_mode=True, intra_batch_mode=False
     )
+    if _mla_planned_cp_round_robin(work_metadata_ptrs):
+        cp_plan = _mla_metadata_head_plan(
+            *plan_args, fast_mode=True, intra_batch_mode=False, cp_round_robin=True
+        )
+        if _mla_head_fold(cp_plan) != _mla_head_fold(head_plan):
+            raise ValueError(
+                "decode_update_mla_metadata_v1 cannot update metadata planned with "
+                f"is_cp_round_robin=True for {num_heads_per_head_k} heads at "
+                f"max_seqlen_qo={max_seqlen_qo}: CP changes its head plan "
+                f"({'x'.join(map(str, _mla_head_fold(cp_plan)))} planned vs "
+                f"{'x'.join(map(str, _mla_head_fold(head_plan)))} here). "
+                "Call get_mla_metadata_v1 again instead."
+            )
     qk_batch_ratio = head_plan.qk_batch_ratio
     num_heads_per_head_k = head_plan.kernel_num_heads
     cu_num = work_indptr.shape[0] - 1

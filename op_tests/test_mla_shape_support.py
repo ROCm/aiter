@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 import inspect
 import itertools
 import sys
@@ -11,6 +12,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import attention
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
     _MLA_BACKENDS,
@@ -18,6 +20,7 @@ from aiter.ops.attention import (
     MlaBackend,
     _mla_decode_head_plan,
     _mla_decode_launch_plan,
+    _mla_planned_cp_round_robin,
     decode_update_mla_metadata_v1,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
@@ -360,7 +363,10 @@ def _indptrs(bs, msq, cp_rank=None):
     return qo, _indptr(kv), last
 
 
-def _run_planner(bs, msq, n, q, kv, cp_rank=None):
+def _run_planner(bs, msq, n, q, kv, cp_rank=None, cprr=None):
+    # cprr plans for round-robin CP or not; None follows cp_rank.
+    if cprr is None:
+        cprr = cp_rank is not None
     kw = {"fast_mode": True, "intra_batch_mode": False}
     kw["max_split_per_batch"] = MAX_SPLIT_PER_BATCH
     info = aiter.get_mla_metadata_info_v1(
@@ -379,10 +385,9 @@ def _run_planner(bs, msq, n, q, kv, cp_rank=None):
     wmd, wind, winfo, rind, rfm, rpm = bufs
     meta = (wmd, winfo, wind, rind, rfm, rpm)
     qo, kv_indptr, last = _indptrs(bs, msq, cp_rank)
-    cprr = cp_rank is not None
     # Round-robin CP callers plan non-causal: any local key may precede a query.
     aiter.get_mla_metadata_v1(
-        *(qo, kv_indptr, last, n, 1, not cprr, *meta),
+        *(qo, kv_indptr, last, n, 1, cp_rank is None and not cprr, *meta),
         page_size=1,
         kv_granularity=16,
         max_seqlen_qo=msq,
@@ -447,8 +452,10 @@ def _run_decode(
     v_head_dim=KV_LORA_RANK,
     cp_rank=None,
     plan_cprr=None,
+    meta_view=None,
 ):
     # plan_cprr plans the metadata for round-robin CP or not; None follows cp_rank.
+    # meta_view(work_meta_data) is what decode gets.
     qd = _dtype(d)
     qo, kv_indptr, last = _indptrs(bs, msq, cp_rank)
     total_q, total_kv = bs * msq, int(kv_indptr[-1].item())
@@ -463,11 +470,12 @@ def _run_decode(
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
     o = torch.empty(total_q, n, v_head_dim, dtype=torch.bfloat16, device="cuda")
     if persistent:
-        plan_rank = cp_rank if plan_cprr is None else (0 if plan_cprr else None)
-        _, _, meta = _run_planner(bs, msq, n, qd, qd, plan_rank)
+        _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank, plan_cprr)
         names = ("work_meta_data", "work_info_set", "work_indptr")
         names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
         kw.update(zip(names, meta))
+        if meta_view is not None:
+            kw["work_meta_data"] = meta_view(kw["work_meta_data"])
     if cp_rank is not None:
         kw["g_kv_indptr"] = _indptr(KV_LENS[:bs])
         kw.update(cp_world_size=CP_WORLD_SIZE, cp_rank=cp_rank)
@@ -505,6 +513,16 @@ def _cprr_reference(qt, kvb, qo, kv_indptr, kv_indices, msq, cp_rank, v_head_dim
     return out, lse
 
 
+def _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank):
+    ref, ref_lse = _cprr_reference(*inputs, msq, cp_rank, KV_LORA_RANK)
+    err = (out.float() - ref).abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.flatten(), dim=0
+    ).item()
+    lse_err = (lse.view_as(ref_lse).float() - ref_lse).abs().max().item()
+    assert err < 0.1 and cos > 0.999 and lse_err < 0.05, (msq, err, cos, lse_err)
+
+
 @requires_gpu
 def test_native_96_head_fp8_cprr_decode_matches_reference():
     # Under round-robin CP, gfx950 runs 96 fp8 heads natively up to qlen 8 (the
@@ -519,40 +537,137 @@ def test_native_96_head_fp8_cprr_decode_matches_reference():
         )
         assert support.native and support.supported, support
         out, lse, inputs = _run_decode(96, msq, "fp8", True, cp_rank=cp_rank)
-        ref, ref_lse = _cprr_reference(*inputs, msq, cp_rank, KV_LORA_RANK)
-        err = (out.float() - ref).abs().max().item()
-        cos = torch.nn.functional.cosine_similarity(
-            out.float().flatten(), ref.flatten(), dim=0
-        ).item()
-        lse_err = (lse.view_as(ref_lse).float() - ref_lse).abs().max().item()
-        assert err < 0.1 and cos > 0.999 and lse_err < 0.05, (msq, err, cos, lse_err)
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
 
 
 @requires_gpu
-def test_decode_rejects_metadata_planned_for_the_other_cp_mode():
+def test_decode_follows_the_planned_cp_mode(monkeypatch):
     # 96 fp8 heads at qlen 8 run natively under round-robin CP and folded without
-    # it, so metadata planned for one mode would drive the other layout silently.
+    # it. mla_decode_fwd runs the head plan get_mla_metadata_v1 recorded, and
+    # refuses a launch where the recorded plan is unknown or cannot run.
     if get_gfx() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
-    for cp_rank, plan_cprr in ((0, False), (None, True)):
-        with pytest.raises(ValueError, match="is_cp_round_robin"):
-            _run_decode(96, 8, "fp8", True, cp_rank=cp_rank, plan_cprr=plan_cprr)
+    folds = []
+    fold_seqlen_indptr = aiter.mla._fold_seqlen_indptr
+
+    def counting_fold(*args):
+        folds.append(args)
+        return fold_seqlen_indptr(*args)
+
+    monkeypatch.setattr(aiter.mla, "_fold_seqlen_indptr", counting_fold)
+    msq, cp_rank = 8, 3
+    # (plan_cprr, meta_view, folded): a view keeps the recorded mode, and metadata
+    # planned without CP (the default) still runs folded under CP.
+    for plan_cprr, meta_view, folded in (
+        (True, None, False),
+        (True, lambda t: t[:], False),
+        (False, None, True),
+    ):
+        folds.clear()
+        out, lse, inputs = _run_decode(
+            96,
+            msq,
+            "fp8",
+            True,
+            cp_rank=cp_rank,
+            plan_cprr=plan_cprr,
+            meta_view=meta_view,
+        )
+        assert bool(folds) is folded, (plan_cprr, folds)
+        _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
+    # A copy has no recorded mode: fail closed under CP, the default plan without.
+    with pytest.raises(ValueError, match="no recorded is_cp_round_robin"):
+        _run_decode(96, msq, "fp8", True, cp_rank=cp_rank, meta_view=torch.clone)
+    folds.clear()
+    _run_decode(96, msq, "fp8", True, plan_cprr=False, meta_view=torch.clone)
+    assert folds
+    with pytest.raises(ValueError, match="is_cp_round_robin=True but g_kv_indptr"):
+        _run_decode(96, msq, "fp8", True, plan_cprr=True)
+
+
+def test_planned_cp_mode_is_recorded_per_buffer(monkeypatch):
+    # get_mla_metadata_v1 records is_cp_round_robin per work_metadata_ptrs buffer:
+    # views see it and copy.deepcopy (the perf harness's rotated args) snapshots
+    # it; a clone, or another buffer carved from the same storage, has none; a
+    # failed replan forgets it, for every view of the buffer.
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
+    workspace = torch.zeros(4, dtype=torch.uint64)
+    wmd, other = workspace[:2], workspace[2:]
+    idx = torch.zeros(3, dtype=torch.int32)
+
+    def plan(work_metadata_ptrs, cprr):
+        aiter.get_mla_metadata_v1(
+            *(idx, idx, idx, 96, 1, False, work_metadata_ptrs, *(idx,) * 5),
+            is_cp_round_robin=cprr,
+        )
+
+    assert _mla_planned_cp_round_robin(wmd) is None
+    plan(wmd, True)
+    snapshot = copy.deepcopy(wmd)
+    assert _mla_planned_cp_round_robin(wmd) is True
+    assert _mla_planned_cp_round_robin(wmd[:]) is True
+    assert _mla_planned_cp_round_robin(wmd.view(torch.int64)) is True
+    assert _mla_planned_cp_round_robin(snapshot) is True
+    assert _mla_planned_cp_round_robin(wmd.clone()) is None
+    assert _mla_planned_cp_round_robin(other) is None
+    plan(other, False)
+    assert _mla_planned_cp_round_robin(other) is False
+    assert _mla_planned_cp_round_robin(wmd) is True
+    # Replanned through a view: the tensor sees the new mode, the copy the old.
+    plan(wmd[:], False)
+    assert _mla_planned_cp_round_robin(wmd) is False
+    assert _mla_planned_cp_round_robin(snapshot) is True
+
+    def failing_impl(*args, **kwargs):
+        raise RuntimeError("planner failed")
+
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", failing_impl)
+    with pytest.raises(RuntimeError, match="planner failed"):
+        plan(wmd[:], True)
+    assert _mla_planned_cp_round_robin(wmd) is None
+    assert _mla_planned_cp_round_robin(other) is False
+
+
+def _cp_changes_head_fold(n, msq):
+    plain, cprr = (
+        get_mla_decode_shape_support(n, msq, dtypes.fp8, dtypes.fp8, **_cp(rr))
+        for rr in (False, True)
+    )
+    return (plain.fold_factor, plain.seqlen_fold) != (
+        cprr.fold_factor,
+        cprr.seqlen_fold,
+    )
 
 
 @requires_gpu
-def test_decode_update_rejects_round_robin_cp_metadata():
-    # The incremental update grows every request's KV by one token and plans its
-    # heads without CP, so it would silently corrupt round-robin CP metadata.
-    bs, msq, n, qd = 2, 8, 96, dtypes.fp8
-    _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
-    qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
-    with pytest.raises(ValueError, match="is_cp_round_robin"):
-        decode_update_mla_metadata_v1(
-            *(qo, kv_indptr, last, n, 1, True, *meta),
-            max_seqlen_qo=msq,
-            dtype_q=qd,
-            dtype_kv=qd,
-        )
+def test_decode_update_rejects_cp_metadata_only_where_cp_changes_the_head_plan():
+    # The incremental update plans its heads without CP, so on CP metadata whose
+    # head plan CP changes (96 fp8 heads at qlen 7 and 8 on gfx950) it would
+    # rewrite a native plan as the fold. Other CP metadata updates as before.
+    bs, qd = 2, dtypes.fp8
+    shapes = ((96, 8), (96, 6), (128, 8))
+    if get_gfx() == "gfx950":
+        assert [_cp_changes_head_fold(n, msq) for n, msq in shapes] == [
+            True,
+            False,
+            False,
+        ]
+    for n, msq in shapes:
+        _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
+        qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
+        rejected = _cp_changes_head_fold(n, msq)
+        try:
+            decode_update_mla_metadata_v1(
+                *(qo, kv_indptr, last, n, 1, True, *meta),
+                max_seqlen_qo=msq,
+                dtype_q=qd,
+                dtype_kv=qd,
+            )
+            torch.cuda.synchronize()
+        except ValueError as e:
+            assert rejected and "is_cp_round_robin=True" in str(e), (n, msq, e)
+        else:
+            assert not rejected, (n, msq)
 
 
 @requires_gpu
