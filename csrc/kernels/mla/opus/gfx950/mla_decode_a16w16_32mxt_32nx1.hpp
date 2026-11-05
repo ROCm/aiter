@@ -413,11 +413,12 @@ __device__ inline auto q_lds_bases(char* smem_kv, const US& u_skv) {
 
 template<class T, class UG, class VP>
 __device__ inline auto kv_gmem_bases(const typename T::D_ATTN* p_kv, const UG& u_gkv,
-                                     const VP& kv_pages, int stride_kv_page) {
+                                     const VP& kv_pages, int stride_kv_page, opus::u32_t last_page) {
     opus::array<const typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
     auto g_off = opus::layout_to_offsets<T::VEC_KV>(u_gkv);
     opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
-        bases[ig.value] = p_kv + static_cast<int64_t>(kv_pages[ig.value]) * stride_kv_page + g_off[0];
+        const int page = min(static_cast<opus::u32_t>(kv_pages[ig.value]), last_page);
+        bases[ig.value] = p_kv + static_cast<int64_t>(page) * stride_kv_page + g_off[0];
     });
     return bases;
 }
@@ -938,6 +939,7 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const auto* p_kv = reinterpret_cast<const D_ATTN*>(kargs.kv_ptr);
+    const u32_t last_page = kargs.total_tokens - 1;
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
@@ -964,7 +966,7 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
 
     auto stage_tile = [&](auto slot, const auto& pages) {
         async_load_kv_tile<T, decltype(slot)::value>(
-            kv_gmem_bases<T>(p_kv, u_gkv, pages, kargs.stride_kv_page),
+            kv_gmem_bases<T>(p_kv, u_gkv, pages, kargs.stride_kv_page, last_page),
             kv_lds_bases<T, decltype(slot)::value>(smem_kv, u_skv), u_skv);
     };
 
@@ -984,7 +986,7 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
         constexpr int PRE = (CUR + DIST) % NBUF;
 
         auto lds_bases  = kv_lds_bases<T, PRE>(smem_kv, u_skv);
-        auto gmem_bases = kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
+        auto gmem_bases = kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page, last_page);
         auto issue_kv_load = [&](auto idx) {
             async_load_kv_inst<T, PRE, decltype(idx)::value>(gmem_bases, lds_bases, u_skv);
         };

@@ -252,8 +252,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
 
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
