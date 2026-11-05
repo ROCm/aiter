@@ -532,11 +532,15 @@ jobs:
     needs: [prechecks]
     runs-on: windows-latest
     steps:
+      - name: Configure Git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
+
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5

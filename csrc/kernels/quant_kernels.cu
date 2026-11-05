@@ -27,7 +27,7 @@ namespace aiter {
 // device properties, and this sits on the launch path of every quant call.
 static inline bool dyn_gq_tuned_arch()
 {
-    static const bool tuned = (get_gpu_arch() == "gfx1250");
+    static const bool tuned = ((get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"));
     return tuned;
 }
 
@@ -69,7 +69,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      // Row-strided outputs (row-major, unshuffled scale
+                                      // only): output row pitch in stored elements and
+                                      // scale row pitch in scale elements. -1: dense.
+                                      const int64_t out_row_stride         = -1,
+                                      const int64_t scale_row_stride       = -1)
 {
     // The 2D path is selected only for dense input without dynamic row counts.
     // This invariant is independent of the numeric M/K values.
@@ -110,7 +115,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // apart -- one byte per cache line, measured at 4.8 us (15% of the kernel) to move
     // 0.9 MB. Column-major makes that store contiguous and strides the data reads instead,
     // but each group still reads one contiguous 256B run. Net: 36.3 -> 32.0 us.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool kTunedForThisArch = true;
 #else
     static constexpr bool kTunedForThisArch = false;
@@ -145,7 +150,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
         (block_size % WARP_SIZE) == 0;
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // One descriptor per BLOCK: the tile is every wave's rows at once. tensorcnt retires
     // per wave, so only the issuer can wait and the rest need a barrier -- half the
     // descriptors and a 2x wider tile against two barriers per stage.
@@ -159,7 +164,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // All four lanes of a group share a group id, hence the same (x, y), so the DPP reduce
     // below never reads across an active/inactive lane boundary.
     auto resolve = [&](int64_t gid, int64_t& gx, int32_t& gy) -> bool {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr(grid_2d)
         {
             static_assert(kColumnMajorGroups && group_size == 128);
@@ -180,7 +185,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
         if constexpr(kColumnMajorGroups)
         {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
             if constexpr(kTiledTdm)
             {
                 constexpr int kTileCols = kTdmGroupsPerBlock / kTileRows;
@@ -365,7 +370,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         // Keep row and in-row offsets separate so tensors beyond a global descriptor's
         // 32-bit byte reach can use one row as the descriptor range.
         const int64_t out_row_offset =
-            std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
+            out_row_stride >= 0
+                ? x * out_row_stride
+                : (std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols);
         const int32_t out_thread_offset =
             (std::is_same_v<DTYPE_O, opus::fp4_t> ? y * group_size / 2
                                                   : y * group_size) +
@@ -382,7 +389,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         scale_elem_t  scale_val{};
         if(lane_in_group == 0)
         {
-            int64_t scale_idx = groupId;
+            int64_t scale_idx = scale_row_stride >= 0 ? x * scale_row_stride + y : groupId;
             if constexpr(shuffle_scale)
             {
                 if constexpr(use_e8m0_scale && group_size == 32)
@@ -546,7 +553,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
     };   // process
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     if constexpr(kUseTdmShape)
     {
         // Wave 0 stages the block's groups into shared LDS. It waits on tensorcnt;
@@ -1109,7 +1116,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                 opus::s_wait_loadcnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
@@ -1521,7 +1528,7 @@ dynamic_per_group_quant_m32k4_kernel(std::conditional_t<std::is_same_v<DTYPE_O, 
     using vec_o = std::conditional_t<kFp4,
                                      opus::vector_t<uint8_t, kElems / 2>,
                                      opus::vector_t<opus::fp8_t, kElems>>;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // The hardware divide-by-scale convert is the fp8 path's; fp4 casts through scaled_cast.
     static constexpr bool kHwConvertDiv = !kFp4 && std::is_same_v<DTYPE_I, opus::bf16_t>;
 #else
@@ -1703,12 +1710,30 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
-    AITER_CHECK(out.is_contiguous());
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int const row_stride  = input.stride(-2);
     int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
+
+    // Row-strided outputs: `out` and `scales` may be 2-D row views of one wider
+    // buffer (e.g. MegaMoE S1F's combined wire rows, payload | e8m0 | pad), as
+    // long as each row is dense and the scale is unshuffled. Dense tensors keep
+    // the original (stride -1) code path.
+    int64_t out_row_stride   = -1;
+    int64_t scale_row_stride = -1;
+    if(!out.is_contiguous() || !scales.is_contiguous())
+    {
+        AITER_CHECK(!shuffle_scale && out.dim() == 2 && scales.dim() == 2 &&
+                        out.stride(-1) == 1 && scales.stride(-1) == 1 &&
+                        out.size(0) == rows && scales.size(0) == rows &&
+                        scales.size(1) >= cols / group_size && num_rows_ptr == nullptr,
+                    __func__,
+                    " row-strided out/scales need 2-D dense rows, rows == input rows, "
+                    "an unshuffled scale and no num_rows");
+        out_row_stride   = out.stride(0);
+        scale_row_stride = scales.stride(0);
+    }
 
     AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
@@ -1775,7 +1800,10 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             static constexpr int32_t ooba = 4 / sizeof(out_t);
             const int64_t oob_elems =
                 (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
-            const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
+            const int64_t oob_size =
+                out_row_stride >= 0
+                    ? (static_cast<int64_t>(rows) * out_row_stride + 3) / 4 * 4
+                    : oob_elems * static_cast<int64_t>(sizeof(out_t));
 
             // Staging was decided at the block size above, because the two interact; it is
             // named again here only because it also changes the grid.
@@ -1800,6 +1828,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             return value && value[0] == '1' && value[1] == '\0';
                         }();
                         if(d01_tuning && dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
+                           out_row_stride < 0 &&
                            (rows == 16384 || (rows == 512 && cols == 16384)) && row_stride == cols &&
                            (cols == 7168 || cols == 16384))
                         {
@@ -1836,7 +1865,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         row_stride,
                         oob_size,
                         num_rows_ptr,
-                        num_rows_factor);
+                        num_rows_factor,
+                        out_row_stride,
+                        scale_row_stride);
                     };
                     using BlkTuned = std::integral_constant<int32_t, kBlkTuned>;
                     using Blk64    = std::integral_constant<int32_t, 64>;
@@ -2368,7 +2399,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
 #else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
