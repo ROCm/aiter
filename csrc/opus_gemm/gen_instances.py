@@ -843,20 +843,12 @@ class opus_gemm_codegen:
                 "    const D_BIAS_* bias, int stride_bias_batch);\n"
                 f"{extra_forward_decls}"
             )
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch host TU ({arch}). See gen_instances.py:_emit_fused_host_tu.\n"
-                "#ifndef __HIP_DEVICE_COMPILE__\n"
-                "#define OPUS_FUSED_HOST_TU 1\n"
-                '#include "aiter_tensor.h"\n'
-                '#include "aiter_stream.h"\n'
-                "#include <optional>\n"
-                + forward_decls
-                + "".join(f'#include "impl/{name}.cuh"\n' for name in impl_includes)
-                + host_body
-                + "#endif // host pass only\n"
+            contents = render_template(
+                "fused_host_tu.cu.j2",
+                arch=arch,
+                forward_decls=forward_decls,
+                impl_includes=impl_includes,
+                host_body=host_body,
             )
             write_if_changed(
                 os.path.join(self.instances_path, f"all_instances_host_{arch}.cu"),
