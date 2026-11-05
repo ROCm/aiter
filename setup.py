@@ -600,5 +600,6 @@ dist = setup(
     distclass=ForcePlatlibDistribution,
 )
 
-if (STAGED_AITER_META or "clean" in dist.commands) and os.path.isdir("aiter_meta"):
+# have_run, not commands: `clean --help` lists clean but runs nothing.
+if (STAGED_AITER_META or dist.have_run.get("clean")) and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")

@@ -86,10 +86,12 @@ def test_classifier_falls_back_without_setuptools_base_error(
         (["egg_info", "--egg-base", "."], True),
         # clean removes one an interrupted build left behind, as main did.
         (["clean"], False),
+        # Help on clean runs nothing, so it removes nothing.
+        (["clean", "--help"], True),
     ],
 )
 def test_metadata_only_run_and_an_existing_aiter_meta(tmp_path, command, kept):
-    """egg_info keeps an aiter_meta/ it did not stage; clean removes it."""
+    """egg_info and clean --help keep an aiter_meta/ they did not stage; clean removes it."""
     for name in (
         "setup.py",
         "pyproject.toml",
