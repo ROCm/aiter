@@ -407,6 +407,12 @@ def _make_inputs(
         query.zero_()
         key.zero_()
         value.fill_(0.5)
+    elif pattern == "constant_heads":
+        query.zero_()
+        key.zero_()
+        value.copy_(
+            2 * torch.arange(1, kv_heads + 1, device=device).view(1, kv_heads, 1, 1)
+        )
     elif pattern == "small_query":
         # Tiny Q values must survive FP8 normalization or native BF16 loads.
         query.fill_(2**-12)
@@ -1698,6 +1704,24 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             id="fp8-asymmetric-fp16-plain-v",
         ),
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+        *[
+            pytest.param(
+                {
+                    "kv_dtype": kv_dtype,
+                    "query_length": 8,
+                    "kv_heads": 2,
+                    "group_size": 8,
+                    "head_dim": 192,
+                    "value_dim": 128,
+                    "lengths": (64,),
+                    "max_partitions": 4,
+                    "pattern": "constant_heads",
+                    "wide": True,
+                },
+                id=f"{kv_dtype}-asymmetric-multihead-large-address",
+            )
+            for kv_dtype in ("bf16", "fp8")
+        ],
         *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
         *[
             pytest.param(
@@ -1902,6 +1926,25 @@ def test_pa_decode(case, device, monkeypatch):
             if case["trans_v"]
             else value.permute(0, 1, 3, 2).contiguous()
         )
+    device_table = table
+    if case["wide"]:
+        # Move both caches past 2 GiB; keep logical KV/table small for the oracle.
+        page_bytes = min(
+            c[0].numel() * c.element_size() for c in (key_cache, value_cache)
+        )
+        page_offset = 2**31 // page_bytes + 1
+        relocated = []
+        for cache in (key_cache, value_cache):
+            storage = torch.empty(
+                (page_offset + cache.shape[0], *cache.shape[1:]),
+                dtype=cache.dtype,
+                device=device,
+            )
+            storage[0].zero_()
+            storage[page_offset:].copy_(cache)
+            relocated.append(storage)
+        key_cache, value_cache = relocated
+        device_table = table + page_offset
     sinks = None
     if case["sink_dtype"] is not None:
         sinks = torch.linspace(
@@ -1929,7 +1972,7 @@ def test_pa_decode(case, device, monkeypatch):
         key_cache,
         value_cache,
         context,
-        table,
+        device_table,
         head_dim**-0.5,
         query_length,
     )
@@ -1990,6 +2033,19 @@ def test_pa_decode(case, device, monkeypatch):
 
     def check(out=None):
         out = output if out is None else out
+        if case["pattern"] == "constant_heads":
+            expected = logical_value[0, :, 0].repeat_interleave(group_size, dim=0)
+            expected = expected.to(out.dtype).unsqueeze(0).expand_as(out)
+            err = checkAllclose(
+                out,
+                expected,
+                rtol=0,
+                atol=0,
+                tol_err_ratio=0,
+                msg=f"pa_decode constant_heads ({case['kv_dtype']})",
+            )
+            assert err == 0, f"mismatch ratio={err}"
+            return
         if case["exact"]:
             # K = 0, Q = 0: the output is the mean of V, bit for bit and nonzero (the 5e-3
             # atol would pass a flushed result at 2**-126).
@@ -2041,7 +2097,7 @@ def test_pa_decode(case, device, monkeypatch):
                 key,
                 value,
                 context,
-                table,
+                device_table,
                 head_dim**-0.5,
                 query_length,
                 key_scale=ks,
@@ -2084,52 +2140,6 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
-
-
-@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
-def test_asymmetric_multihead_large_address(kv_dtype, device):
-    if get_gfx_runtime() not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    fp8 = (
-        torch.float8_e4m3fnuz if get_gfx_runtime() == "gfx942" else torch.float8_e4m3fn
-    )
-    dtype = torch.bfloat16 if kv_dtype == "bf16" else fp8
-    vector = 8 if kv_dtype == "bf16" else 16
-    element_bytes = 2 if kv_dtype == "bf16" else 1
-    # Both referenced K and V pages lie above a 2 GiB byte offset.
-    page = 2**31 // (2 * 128 * 64 * element_bytes) + 1
-    key = torch.empty(
-        (page + 1, 2, 192 // vector, 64, vector), dtype=dtype, device=device
-    )
-    value = torch.empty(
-        (page + 1, 2, 64 // vector, 128, vector), dtype=dtype, device=device
-    )
-    key[0].zero_()
-    value[0].zero_()
-    key[page].zero_()
-    value[page, 0].fill_(2)
-    value[page, 1].fill_(4)
-    query = torch.zeros((8, 16, 192), dtype=torch.bfloat16, device=device)
-    output = torch.empty((8, 16, 128), dtype=query.dtype, device=device)
-    context = torch.tensor([64], dtype=torch.int32, device=device)
-    table = torch.tensor([[page]], dtype=torch.int32, device=device)
-    plan = pa.plan_pa_decode(context, 2, query_length=8, max_partitions=4)
-    pa.pa_decode(
-        output, query, key, value, context, table, 192**-0.5, 8, work_plan=plan
-    )
-    expected = torch.empty_like(output)
-    expected[:, :8].fill_(2)
-    expected[:, 8:].fill_(4)
-    err = checkAllclose(
-        output,
-        expected,
-        rtol=0,
-        atol=0,
-        tol_err_ratio=0,
-        msg=f"asymmetric-large-address-{kv_dtype}",
-    )
-    assert err == 0, f"mismatch ratio={err}"
 
 
 def _poison_unowned(cache, scale, owned, fill):
