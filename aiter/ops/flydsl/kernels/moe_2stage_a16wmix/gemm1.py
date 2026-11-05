@@ -18,10 +18,10 @@ from .utils import (
     _BCol,
     _global_i32_at,
     _mma_bf16,
-    _udiv,
-    _umod,
+    gemm1_grid,
     make_a_loader,
     make_b_loader,
+    xcd_tile_map,
 )
 
 # =============================================================================
@@ -371,8 +371,7 @@ def _gemm1_body_a16w4(
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
     """Flattened grid for a16w4 gemm1: (m-blocks) x (inter/tile_n) n-blocks."""
-    num_n_blocks = INTER // TILE_N
-    return int(max_m_blocks) * num_n_blocks
+    return gemm1_grid(BM, INTER=INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
 
 
 @functools.cache
@@ -514,23 +513,8 @@ def compile_gemm1_a16w4_port(
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # weight-load traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2
         # locality (group = xcd_swizzle m-blocks). No-op at 0.
-        _NXCD = 8
-        _xq = _udiv(bound, _NXCD)
-        _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle
-
-        def _xcd(pid):
-            xc = _umod(pid, _NXCD)
-            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
-            _ng = fx.Int32(_SW * NUM_N_BLOCKS)
-            group_id = wgid // _ng
-            first_pid_m = group_id * fx.Int32(_SW)
-            remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
-            wig = wgid % _ng
-            m_block = first_pid_m + (wig % group_size_m)
-            n_block = wig // group_size_m
-            return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+        _xcd = xcd_tile_map(bound, total_m_blocks, NUM_N_BLOCKS, _SW)
 
         if bx_i32 < bound:
             if const_expr(_SW > 0):
