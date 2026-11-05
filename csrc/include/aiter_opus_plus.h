@@ -51,7 +51,7 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
-    defined(__gfx1201__) || defined(__gfx1250__)
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -81,7 +81,7 @@ OPUS_D fp8x2_t fp32_to_fp8_div_x2_noclamp(fp32x2_t s, int div_exponent)
     const float a = __builtin_amdgcn_ldexpf(s[0], div_exponent);
     const float b = __builtin_amdgcn_ldexpf(s[1], div_exponent);
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
-    defined(__gfx1201__) || defined(__gfx1250__)
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(a), "v"(b));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
@@ -101,7 +101,7 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 // bf16x8 / fp16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_{bf16,f16}, 1 instr)
 // Scale semantics: result[i] = s[i] / scale. Finite overflow is not saturated.
 // The caller's inverted_scale = 1/row_scale, so we pass 1/inverted_scale = row_scale.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
 template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
 OPUS_D decltype(auto) to_fp8_scalef32_x8(const S& s, float scale)
 {
@@ -135,7 +135,7 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
-    defined(__gfx1201__) || defined(__gfx1250__)
+    defined(__gfx1201__) || defined(__gfx1250__) || defined(__gfx1250_strict__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -641,7 +641,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 // silently quantizes it down to the enclosing power of two -- e.g. 0.006975 is applied as
 // 2^-8, a 1.79x error, which overflows the large codes to NaN. Only the e8m0 quant path
 // (where the row scale is ceil_pow2 by construction) may use this.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
 template <typename D,
           typename S,
           std::enable_if_t<is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
@@ -665,7 +665,7 @@ OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
 // ldexp, not a multiply by 1 / scale; see pow2_div_exponent.
 template <typename D,
           typename S,
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
           std::enable_if_t<!(is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
                              std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0)),
                            bool> = true>
@@ -733,7 +733,7 @@ template <typename D,
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 {
     constexpr index_t N = size<S>();
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // Eight values per convert straight from bf16/fp16, instead of widening to fp32 and
     // converting two at a time.
     if constexpr(is_any_of_v<get_value_t<S>, bf16_t, fp16_t> && N % 8 == 0)
@@ -1013,7 +1013,7 @@ __device__ void store_vector(opus::gmem<T>& buffer,
 template <index_t load_cnt, index_t async_load_cnt>
 OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     if constexpr(load_cnt >= 0)
         s_wait_loadcnt(number<load_cnt>{});
     if constexpr(async_load_cnt >= 0)
@@ -1034,7 +1034,7 @@ OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
 {
     if constexpr(ds_cnt >= 0)
     {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         s_wait_dscnt(number<ds_cnt>{});
 #else
         s_waitcnt_lgkmcnt(number<ds_cnt>{});
