@@ -709,6 +709,7 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvr = None
     _ep_nvt = None
     _fuse_ep_route_quant = False
+    _fused_psum = None
     ep_rowmap = None
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
@@ -795,8 +796,18 @@ def _grouped_a8w4_tdm_moe(
             )
     else:
         _fuse_ep_route_quant = False
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
+        if (
+            not enable_ep_scatter
+            and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+            and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+            and os.environ.get("AITER_TDM_FUSED_ROUTE_PSUM", "1") in _TRUTHY_ENV
+        ):
+            _masked_m, topids_to_rows, _fused_psum = fused_route_psum_remap(
+                topk_ids, E, max_m, _align_m
+            )
+        else:
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
     # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
     # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
@@ -847,6 +858,8 @@ def _grouped_a8w4_tdm_moe(
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             "route_max_m": int(max_m),
         }
+    elif not _is_ep and _fused_psum is not None:
+        psum = _fused_psum
     else:
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
@@ -1764,13 +1777,13 @@ def _get_compiled_contiguous_psum_remap():
 
 
 @functools.cache
-def _get_compiled_route_psum_fused():
+def _get_compiled_route_psum_fused(block: int = 512):
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_route_psum_fused_module,
     )
 
-    return build_moe_route_psum_fused_module()
+    return build_moe_route_psum_fused_module(block)
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
@@ -1778,7 +1791,7 @@ def _get_compiled_route_psum_fused():
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
-_FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+_FUSED_ROUTE_PSUM_MAX_EXPERTS = 1024
 
 
 def fused_route_psum_remap(
@@ -1811,7 +1824,7 @@ def fused_route_psum_remap(
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
-    launch = _get_compiled_route_psum_fused()
+    launch = _get_compiled_route_psum_fused(512 if experts <= 512 else 1024)
     launch(
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
         ptr_arg(topids_to_rows),

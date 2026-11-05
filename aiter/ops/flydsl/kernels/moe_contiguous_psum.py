@@ -69,6 +69,18 @@ class _RoutePsumStorage:
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
 
 
+# One lane per expert for models wider than one 512-lane block (Qwen3.8 fuses
+# its shared expert as expert 512, so E = 513).
+MAX_FUSED_ROUTE_EXPERTS = 1024
+
+
+@fx.struct
+class _RoutePsumStorageWide:
+    cnt: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+    lds0: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+    lds1: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+
+
 @fx.struct
 class _PsumRemapEpStorage:
     """LDS for the EP remap kernel: the scan ping-pong buffers only.
@@ -578,7 +590,7 @@ def build_moe_contiguous_psum_remap_ep_module():
     return launch_psum_remap_ep
 
 
-def build_moe_route_psum_fused_module():
+def build_moe_route_psum_fused_module(block: int = MAX_EXPERTS_PER_BLOCK):
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
 
     For small token counts every route fits in one workgroup, so the three
@@ -591,9 +603,12 @@ def build_moe_route_psum_fused_module():
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
     """
 
+    storage = _RoutePsumStorage if block == MAX_EXPERTS_PER_BLOCK else _RoutePsumStorageWide
+    kernel_name = "moe_route_psum_fused" if block == MAX_EXPERTS_PER_BLOCK else f"moe_route_psum_fused_b{block}"
+
     @flyc.kernel(
-        name="moe_route_psum_fused",
-        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+        name=kernel_name,
+        known_block_size=[block, 1, 1],
     )
     def route_psum_fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) i32 in
@@ -612,7 +627,7 @@ def build_moe_route_psum_fused_module():
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
-        lds = fx.SharedAllocator().allocate(_RoutePsumStorage).peek()
+        lds = fx.SharedAllocator().allocate(storage).peek()
         lds_cnt = lds.cnt.ptr
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
@@ -637,7 +652,7 @@ def build_moe_route_psum_fused_module():
         # create_llvm_ptr builds the addrspace(3) pointer via fx.to_llvm_ptr.
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
         numel_i32 = fx.Uint32(numel)
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
+        for route_i32 in range(tid, numel_i32, block):
             e = topk_p[route_i32]
             ptr = create_llvm_ptr(cnt_base_i64 + fx.Int64(e) * 4, 3)
             slot = llvm.AtomicRMWOp(
@@ -661,7 +676,7 @@ def build_moe_route_psum_fused_module():
 
         src = lds0
         dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+        for offset in range_constexpr(1, block):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
             if in_expert:
@@ -685,7 +700,7 @@ def build_moe_route_psum_fused_module():
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
+        for route_i32 in range(tid, numel_i32, block):
             row = fx.Uint32(rows_p[route_i32])
             m = fx.Uint32(max_m)
             expert = row // m
@@ -718,7 +733,7 @@ def build_moe_route_psum_fused_module():
             tile_m,
         ).launch(
             grid=(1, 1, 1),
-            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
