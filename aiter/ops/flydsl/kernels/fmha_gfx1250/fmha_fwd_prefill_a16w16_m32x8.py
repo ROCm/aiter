@@ -2560,8 +2560,12 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 + 1
             ) * 4
 
+            # The grid is sized for max_seqlen_q, so in a ragged batch a short sequence
+            # leaves whole WGs past its end with no row to compute AND none to zero.
+            first_row = _m_tile_idx() * fx.Int32(_block_m(NUM_Q_TILES))
+            tile_has_rows = first_row < q_len * fx.Int32(GQA_RATIO)
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
-            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)) & tile_has_rows:
                 _core_kwargs = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
@@ -2650,7 +2654,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     warp_idx=warp_idx,
                     **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
                 )
-            elif q_len > fx.Int32(0):
+            elif (q_len > fx.Int32(0)) & tile_has_rows:
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
