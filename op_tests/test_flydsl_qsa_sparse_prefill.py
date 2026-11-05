@@ -69,7 +69,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 HEAD_DIM = 256
 SCALE = HEAD_DIM**-0.5
 
