@@ -252,6 +252,37 @@ def flydsl_grouped_gemm_a8w4_masked(
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    # AITER_MOE_LOC (GEMM1): 1 IOD-local B + domain-parity persistent schedule,
+    # 2 the remote-only control, 3 placed B on the stock schedule.
+    iod_loc = int(os.environ.get("AITER_MOE_LOC", "0")) if stage1_act else 0
+    b_placed = loc_sched = 0
+    if iod_loc not in (0, 1, 2, 3):
+        raise ValueError("AITER_MOE_LOC must be 0, 1, 2 or 3")
+    if iod_loc:
+        from .iod_locality import placed_w1, supported
+
+        if not (
+            supported(N, K, tile_n, tile_k)
+            and cluster_m == 1
+            and cluster_n == 1
+            and waves_per_tensor_tdm == 2
+        ):
+            iod_loc = 0
+    if iod_loc:
+        w = placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k)
+        w_scales = w
+        b_placed = 1
+        if iod_loc in (1, 2):
+            loc_sched = iod_loc
+            # Four workers per CU: fewer leave the tail of the per-domain
+            # task list on too few CUs (measured on 256 CUs: 512 -> 73 us,
+            # 1024 -> 68.5 us, 2048 -> 68.5 us).
+            pw = persistent_workers or int(os.environ.get("AITER_MOE_LOC_PW", "0"))
+            if not pw:
+                from aiter.jit.utils.chip_info import get_cu_num
+
+                pw = 4 * int(get_cu_num())
+            persistent_workers = (pw + 7) // 8 * 8
     rolled_drain = int(rolled_drain)
     if rolled_drain not in (0, 1):
         raise ValueError("rolled_drain must be 0 or 1")
@@ -313,6 +344,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         rolled_drain,
         int(a_preshuffled),
         int(m_align),
+        b_placed,
+        loc_sched,
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
