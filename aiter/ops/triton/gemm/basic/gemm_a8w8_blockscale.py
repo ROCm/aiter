@@ -21,16 +21,25 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    clamp_num_buffers,
+    compute_splitk_params,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
 _TRITON_VERSION = Version(triton.__version__)
 
-_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
-_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
-_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250", "gfx1250-strict")
+_GLUON_PRESHUFFLE_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+_GLUON_DEFAULT_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
 
@@ -151,7 +160,7 @@ def gemm_a8w8_blockscale(
             impl = gluon_kernel
             extra_constexpr["NUM_WARPS"] = config["num_warps"]
             extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
-        elif arch == "gfx1250":
+        elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
                 _KERNEL_MAP,
             )
@@ -161,7 +170,8 @@ def gemm_a8w8_blockscale(
             for i in range(int(math.log2(config["num_warps"] // 2))):
                 warp_bases.append((1 << i, 0))
             extra_constexpr["warp_bases"] = tuple(warp_bases)
-            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+            k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+            config["NUM_BUFFERS"] = clamp_num_buffers(config["NUM_BUFFERS"], k_tiles)
         else:
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
@@ -390,7 +400,10 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+        config["NUM_BUFFERS"] = clamp_num_buffers(
+            config["NUM_BUFFERS"], k_tiles, prefetch_all=kernel_type == "compute_bound"
+        )
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 

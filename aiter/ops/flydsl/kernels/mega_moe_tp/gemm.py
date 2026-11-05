@@ -225,7 +225,7 @@ def build_gemm(kc: KernelCtx) -> dict:
 
         for kk in range_constexpr(nsk):
             issue_b(i32(kk), kk)
-        zero = fx.Vector.filled(4, 0.0, fx.Float32)
+        zero = fx.full(4, 0.0, fx.Float32)
         for grp_ in range(i32(0), nnb // i32(P), i32(1)):
             grp = i32(grp_)
             init = [zero] * (4 * MTE * P)
@@ -606,7 +606,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 issue(g_lo * i32(NKS) + i32(qq), qq)
         if const_expr(pre is not None):
             pre()
-        zero = fx.Vector.filled(4, 0.0, fx.Float32)
+        zero = fx.full(4, 0.0, fx.Float32)
 
         row_meta = []
         for m in range_constexpr(MTE):

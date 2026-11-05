@@ -25,7 +25,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 def _bytes_moved(B_SQ, V, dtype):
     # forward reads logits once and writes the gradient in-place once.
-    return 2 * B_SQ * V * torch.tensor([], dtype=dtype).element_size()
+    return 2 * B_SQ * V * torch.tensor([], dtype=dtype, device="cuda").element_size()
 
 
 def benchmark(args):
@@ -66,7 +66,7 @@ def benchmark(args):
             _, grad = cross_entropy_forward(
                 logits.clone(), target, 0.0, True, None, -100
             )
-            grad_output = torch.tensor(2.0, device="cuda")
+            grad_output = torch.tensor(2.0, dtype=torch.float32, device="cuda")
 
             def fn():
                 cross_entropy_backward(grad.clone(), grad_output)

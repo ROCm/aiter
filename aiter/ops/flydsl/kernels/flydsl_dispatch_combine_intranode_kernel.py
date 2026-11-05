@@ -17,7 +17,6 @@ from flydsl.expr.rocdl import (
     cvt_scalef32_pk_f32_fp4,
     cvt_scalef32_pk_fp4_f32,
     ds_bpermute,
-    readfirstlane,
     readlane,
 )
 from flydsl.expr.typing import Stream
@@ -38,6 +37,7 @@ from .communication_ops_utils import (
     wait_i32_until_equals,
     wait_i32_until_greater_than,
     wait_i64_until_equals,
+    wave_uniform_i64,
 )
 
 # Bump when generated kernel shape changes.
@@ -47,13 +47,6 @@ _DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v10-stage2-blockwise-fp8-scale-prefetch"
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
 # AMDGPU cache modifier used by Stage-3 buffer loads/stores.
 _SLC_CACHE = 2
-
-
-def _wave_uniform_i64(addr):
-    v = fx.Uint64(addr)
-    lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
-    hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
-    return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
 def _pack_f32x4_to_fp8(v4f32):
@@ -499,7 +492,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     elif _is_fp4:
 
@@ -534,7 +527,7 @@ def make_combine_kernel(
             return old
 
         def _zero_accum():
-            return Vec.filled(8, 0.0, fx.Float32)
+            return fx.full(8, 0.0, fx.Float32)
 
     elif hidden_elem_size == 2:  # bf16
 
@@ -549,7 +542,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)[0]
 
         def _zero_accum():
-            return Vec.filled(2, 0.0, fx.Float32)
+            return fx.full(2, 0.0, fx.Float32)
 
     elif hidden_elem_size == 4:  # f32
 
@@ -586,7 +579,7 @@ def make_combine_kernel(
             return _pack_f32x4_to_fp8(accum_val)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     def _accum_experts(vals):
         """Reduce the k per-expert i32 partials into one merged i32 (widen to f32,
@@ -967,7 +960,7 @@ def make_combine_kernel(
                     expert_tok_off = fx.Int64(slot_idx) * nbytes
                     expert_tok_addr = addr_shmem_tok + expert_tok_off
                     # Warp-uniform base -> SGPR (avoids per-lane waterfall).
-                    expert_tok_addr = _wave_uniform_i64(expert_tok_addr)
+                    expert_tok_addr = wave_uniform_i64(expert_tok_addr)
                     expert_rsrcs.append(
                         create_buffer_resource_from_addr(expert_tok_addr)
                     )
@@ -1012,7 +1005,7 @@ def make_combine_kernel(
                     # Warp-uniform base -> SGPR (avoids per-lane waterfall).
                     expert_rsrcs.append(
                         create_buffer_resource_from_addr(
-                            _wave_uniform_i64(expert_tok_addr)
+                            wave_uniform_i64(expert_tok_addr)
                         )
                     )
                     expert_vlds.append(vld_k)
@@ -1070,9 +1063,7 @@ def make_combine_kernel(
                                     scale_raws[u][k_slot],
                                 )
                             )
-                            scales[u].append(
-                                (sc_i32 << fx.Int32(23)).bitcast(fx.Float32)
-                            )
+                            scales[u].append((sc_i32 << 23).bitcast(fx.Float32))
 
                 if const_expr(_xfer_bf16_to_fp8 or blockwise_fp8_transport):
                     out_off = tok_id * out_n_i32 + ec_abs * 2
@@ -1154,7 +1145,7 @@ def make_combine_kernel(
                             wt_pe_base = fx.memref_load(_lds_p2p_wt_bases, wt_safe_pe)
                             wt_src_off = fx.Int64(wt_safe_dtok) * weight_bytes
                             wt_rsrc = create_buffer_resource_from_addr(
-                                _wave_uniform_i64(wt_pe_base + wt_src_off)
+                                wave_uniform_i64(wt_pe_base + wt_src_off)
                             )
                         else:
                             wt_src_off = (
@@ -1162,7 +1153,7 @@ def make_combine_kernel(
                                 * weight_bytes
                             )
                             wt_rsrc = create_buffer_resource_from_addr(
-                                _wave_uniform_i64(addr_shmem_wts + wt_src_off)
+                                wave_uniform_i64(addr_shmem_wts + wt_src_off)
                             )
                         wt_val = buffer_load(wt_rsrc, lane, vec_width=1, dtype=T.f32)
                         if const_expr(npes >= experts_per_token):

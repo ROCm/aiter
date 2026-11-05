@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -37,13 +37,11 @@ A16WI4_GROUP_SIZE = 32
 
 
 def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
 
 def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
 def _global_i32_at(addr_i64, idx):
@@ -57,7 +55,7 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     """
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
-    return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
+    return fx.memref_load_vec(r)[0]
 
 
 def _int_to_llvm_ptr(addr, address_space):
@@ -359,7 +357,7 @@ def make_a_loader(
         fx.copy_atom_call(
             lds_atom, fx.slice(tiles, (None, byte_off // fx.Int32(16))), r
         )
-        return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
+        return fx.memref_load_vec(r).bitcast(fx.BFloat16)  # v8bf16
 
     return _ALoader(load=lds_load_a, store_tile=store_a_tile)
 
@@ -435,8 +433,8 @@ def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
     lshr-16 used by gfx942 int4.
     """
     packed = fx.Int32(raw_i32)
-    even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
-    odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
+    even = packed & 0x0F0F0F0F  # K0,K2,K4,K6
+    odd = packed.shrui(fx.Int32(4)) & 0x0F0F0F0F  # K1,K3,K5,K7
     fe = _fp4x4_e2m1_to_f32x4(even)
     fo = _fp4x4_e2m1_to_f32x4(odd)
     scale = fx.Float32(scale_f32)
@@ -668,9 +666,9 @@ def make_b_loader(
             )
             # idx_pack is a fp4-byte offset; dwordx4 tile index = (idx_pack/4 dwords)/4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // fx.Int32(16))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // 16)), r)
             v4 = fx.Vector(fx.memref_load_vec(r))
-            raw.append([fx.Int32(v4[j]) for j in range(4)])
+            raw.append([v4[j] for j in range(4)])
         return raw
 
     def load_b_raw_int4(base_k, n_blk, n_intra):
@@ -700,12 +698,10 @@ def make_b_loader(
                 )
                 # idx is an int4-nibble byte offset; dwordx2 tile index = (idx bytes)/8.
                 r = fx.make_rmem_tensor(w_reg_lay2, fx.Int32)
-                fx.copy(
-                    w_copy_atom64, fx.slice(w_tiles8, (None, idx // fx.Int32(8))), r
-                )
+                fx.copy(w_copy_atom64, fx.slice(w_tiles8, (None, idx // 8)), r)
                 v2 = fx.Vector(fx.memref_load_vec(r))
-                four.append(fx.Int32(v2[0]))
-                four.append(fx.Int32(v2[1]))
+                four.append(v2[0])
+                four.append(v2[1])
             raw.append(four)
         return raw
 
@@ -733,7 +729,7 @@ def make_b_loader(
             )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile idx = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // 8)), r)
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
         return raw
 
@@ -799,7 +795,7 @@ def make_b_loader(
         i32s = []
         for sel in range_constexpr(4):
             p = rocdl.cvt_scalef32_pk_bf16_fp4(vec2_bf16, i32_val, s_raw, sel)
-            i32s.append(fx.Int32(fx.Vector(p).bitcast(fx.Int32)[0]))
+            i32s.append(fx.Vector(p).bitcast(fx.Int32)[0])
         v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
 

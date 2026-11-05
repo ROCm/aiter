@@ -69,7 +69,9 @@ def _build_topk_swa_pool(T, topk, num_pool, device, generator):
 
     # Pick n_pool visible blocks at random: score the visible ones in [0,1), push the rest to
     # 2.0, take the smallest.
-    score = torch.rand(T, num_pool, device=device, generator=generator)
+    score = torch.rand(
+        T, num_pool, device=device, dtype=torch.float32, generator=generator
+    )
     score = torch.where(visible, score, torch.full_like(score, 2.0))
     sel = score.argsort(dim=1)[:, :n_pool]
     pool = torch.where(torch.gather(visible, 1, sel), T + sel, torch.full_like(sel, -1))

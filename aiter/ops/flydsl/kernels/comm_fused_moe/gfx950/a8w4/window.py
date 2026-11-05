@@ -110,8 +110,8 @@ def _compose_compute(config: WindowConfig, window_index: int):
         ):
             worker = fx.Int32(gpu.block_id("x"))
             tid = fx.Int32(gpu.thread_id("x"))
-            lane = tid % fx.Int32(64)
-            wave = rocdl.readfirstlane(T.i32, tid // fx.Int32(64))
+            lane = tid % 64
+            wave = rocdl.readfirstlane(T.i32, tid // 64)
             lds = fx.SharedAllocator().allocate(shared_storage).peek()
             valid_rows = global_typed_ptr(fx.Int64(ptrtoint(num_valid_ids)), T.i32)[0]
             m_block, n_local = _producer_tile_index(
@@ -224,7 +224,7 @@ def _emit_local(
         columns_per_pass = threads_per_row * 8
         column_passes = (window + columns_per_pass - 1) // columns_per_pass
         for column_pass in range_constexpr(column_passes):
-            column = row_tid * fx.Int32(8) + fx.Int32(column_pass * columns_per_pass)
+            column = row_tid * 8 + fx.Int32(column_pass * columns_per_pass)
             if (token < fx.Int32(m)) & (column < fx.Int32(window)):
                 route_row_bytes = config.route_row_bytes
                 route_row = buffer_tensor_from_addr(
@@ -239,19 +239,18 @@ def _emit_local(
                     fx.Int8,
                     shape.topk * route_row_bytes,
                 )
-                acc = fx.Vector.filled(8, 0.0, fx.Float32)
+                acc = fx.full(8, 0.0, fx.Float32)
                 for slot in range_constexpr(shape.topk):
                     words = load_fp8_words(
                         route_row,
-                        fx.Int32(slot * (route_row_bytes // 4)) + column // fx.Int32(4),
+                        fx.Int32(slot * (route_row_bytes // 4)) + column // 4,
                         word_count=2,
                         load_width=2,
                         cache_modifier=config.local_load_cache_modifier,
                     )
                     scale = load_e8m0_scale(
                         route_scale_row,
-                        fx.Int32(slot * route_row_bytes + window)
-                        + column // fx.Int32(8),
+                        fx.Int32(slot * route_row_bytes + window) + column // 8,
                         config.local_load_cache_modifier,
                     )
                     values = decode_scaled_fp8_f32(words, scale)
@@ -268,7 +267,7 @@ def _emit_local(
                         shared_row, shared_column_offset + column, 8, 0
                     ).to(fx.Float32)
 
-                lane = row_tid & fx.Int32(63)
+                lane = row_tid & 63
                 local_max = fx.Float32(1e-10).maximumf(
                     fmath.absf(acc).reduce(ReductionOp.MAX)
                 )
@@ -276,7 +275,7 @@ def _emit_local(
                 for xor_lane in (1, 2):
                     remote_bits = fx.rocdl.ds_bpermute(
                         T.i32,
-                        (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
+                        (lane ^ fx.Int32(xor_lane)) * 4,
                         max_bits,
                     )
                     local_max = local_max.maximumf(
@@ -298,7 +297,7 @@ def _emit_local(
                 if const_expr(config.partial_payload_bits == 4):
                     store_buffer(
                         payload_row,
-                        column // fx.Int32(8),
+                        column // 8,
                         packed,
                         fx.Int32,
                         cache_modifier=CPOL_COHERENT,
@@ -311,7 +310,7 @@ def _emit_local(
                         2,
                         cache_modifier=CPOL_COHERENT,
                     )
-                if lane & fx.Int32(3) == fx.Int32(0):
+                if lane & 3 == 0:
                     scale_row = buffer_tensor_from_addr(
                         fx.Int64(ptrtoint(partial))
                         + fx.Int64(config.partial_payload_bytes)
@@ -321,7 +320,7 @@ def _emit_local(
                     )
                     store_buffer(
                         scale_row,
-                        column // fx.Int32(32),
+                        column // 32,
                         e8m0.to(fx.Int8),
                         fx.Int8,
                         cache_modifier=CPOL_COHERENT,
@@ -407,11 +406,11 @@ def _compose_cycle(
         ):
             linear = fx.Int32(gpu.block_id("x"))
             tid = fx.Int32(gpu.thread_id("x"))
-            lane = tid % fx.Int32(64)
-            wave = rocdl.readfirstlane(T.i32, tid // fx.Int32(64))
+            lane = tid % 64
+            wave = rocdl.readfirstlane(T.i32, tid // 64)
             lds = fx.SharedAllocator().allocate(shared_storage).peek()
             valid_rows = global_typed_ptr(fx.Int64(ptrtoint(num_valid_ids)), T.i32)[0]
-            producer_workers = fx.Int32(size_expert_ids) * fx.Int32(tiles_per_window)
+            producer_workers = size_expert_ids * fx.Int32(tiles_per_window)
             active_local_workers = (producer_workers < fx.Int32(local_workers)).select(
                 producer_workers, fx.Int32(local_workers)
             )
@@ -491,17 +490,17 @@ def _compose_cycle(
 
             if const_expr(service_grid > 0):
                 paired = linear < fx.Int32(service_grid * 3)
-                slot = linear % fx.Int32(3)
-                is_service = paired & (slot == fx.Int32(0))
+                slot = linear % 3
+                is_service = paired & (slot == 0)
                 is_compute = (linear >= fx.Int32(service_grid * 3)) | (
-                    paired & (slot != fx.Int32(0))
+                    paired & (slot != 0)
                 )
                 raw_compute = paired.select(
-                    (linear // fx.Int32(3)) * fx.Int32(2) + slot - fx.Int32(1),
+                    (linear // 3) * 2 + slot - 1,
                     linear - fx.Int32(service_grid),
                 )
                 compute_worker = is_compute.select(raw_compute, fx.Int32(0))
-                service_worker = linear // fx.Int32(3)
+                service_worker = linear // 3
             else:
                 compute_worker = linear
 
@@ -537,7 +536,7 @@ def _compose_cycle(
                     ):
                         # Keep the service population fixed while allowing both
                         # independent collective windows to make early progress.
-                        if service_worker & fx.Int32(1) == fx.Int32(0):
+                        if service_worker & 1 == 0:
                             emit_gather(service_worker)
                             emit_reduce(service_worker)
                         else:
@@ -749,7 +748,7 @@ def compile_drain(
             and has_all_gather
         ):
             # Alternate operation order without increasing the service grid.
-            if worker & fx.Int32(1) == fx.Int32(0):
+            if worker & 1 == 0:
                 emit_gather(worker)
                 emit_reduce(worker)
             else:
