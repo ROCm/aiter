@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
@@ -90,8 +93,19 @@ def get_x_vals():
 @pytest.mark.parametrize("fp4_shuffle", [True, False])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    config_name = (
+        "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
+        if fp4_shuffle
+        else "FUSED-GEMM-AFP4WFP4-A16W16"
+    )
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(resolve_config_dir("gemm", config_name), "DEFAULT.json")
+    ):
+        pytest.skip(f"No {config_name} config for {arch_info.get_arch()}.")
     torch.manual_seed(0)
 
     (

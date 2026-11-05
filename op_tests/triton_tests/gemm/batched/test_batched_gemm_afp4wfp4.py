@@ -1,8 +1,11 @@
+import os
+
 import pytest
 import torch
 
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -187,12 +190,32 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.bmm(x_f32, w_f32.transpose(1, 2)).to(dtype)
 
 
+def _assert_close(torch_out, out):
+    if arch_info.is_sw_emulated_fp4_avail():
+        # Same tolerance as test_gemm_afp4wfp4.py on these archs: the emulated
+        # dot_scaled result can differ from the reference by one ULP of the
+        # output dtype after rounding.
+        torch.testing.assert_close(
+            torch_out, out, atol=1e-2, rtol=torch.finfo(torch_out.dtype).eps
+        )
+    else:
+        torch.testing.assert_close(torch_out, out)
+
+
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(
+            resolve_config_dir("gemm", "BATCHED_GEMM-AFP4WFP4"), "DEFAULT.json"
+        )
+    ):
+        pytest.skip(f"No BATCHED_GEMM-AFP4WFP4 config for {arch_info.get_arch()}.")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -205,7 +228,7 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
 
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
-    torch.testing.assert_close(torch_out, out)
+    _assert_close(torch_out, out)
 
 
 def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
@@ -223,8 +246,16 @@ def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
 def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
     """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
     scale bytes past K // 32: 0xFF there is the e8m0 NaN."""
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(
+            resolve_config_dir("gemm", "BATCHED_GEMM-AFP4WFP4"), "DEFAULT.json"
+        )
+    ):
+        pytest.skip(f"No BATCHED_GEMM-AFP4WFP4 config for {arch_info.get_arch()}.")
 
     B, M, N, dtype = 2, 32, 64, torch.bfloat16
     x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
@@ -236,7 +267,8 @@ def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
     else:
         w_scales = _scales_with_tail(w_scales, 255)
     # With the BLOCK_SIZE_K of 256 that the gfx950 and gfx1250 tables give for
-    # M = 32, K = 2112 leaves a partial last block and K = 2048 does not.
+    # M = 32, and 128 from the gfx1101 table, K = 2112 leaves a partial last
+    # block and K = 2048 does not.
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
-    torch.testing.assert_close(torch_out, out)
+    _assert_close(torch_out, out)

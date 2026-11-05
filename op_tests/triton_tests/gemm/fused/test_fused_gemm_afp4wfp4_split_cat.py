@@ -184,8 +184,13 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
 )
 def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
 
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # The preshuffled kernel reads gfx950-shuffled scales and the preshuffled
+    # AFP4WFP4 config; archs with software-emulated FP4 run only the unshuffled path.
+    if arch_info.is_sw_emulated_fp4_avail() and shuffle:
+        pytest.skip(f"Only the unshuffled path is supported on {arch_info.get_arch()}.")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()

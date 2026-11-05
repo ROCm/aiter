@@ -71,7 +71,7 @@ def fused_gemm_afp4wfp4_a16w16(
         tuple(w_bf16.shape),
     )
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert arch_info.is_any_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x_fp4.shape
     N_fp4, K = w_fp4.shape
