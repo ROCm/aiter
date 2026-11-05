@@ -76,6 +76,14 @@ def _bitdiff(x, y):
     return int(d.sum().item())
 
 
+def _stacked(all_rows, t_max, j, cols, dtype):
+    """Field j of every rank's gathered rows as one [world, t_max, cols] tensor."""
+    out = torch.zeros(len(all_rows), t_max, cols, dtype=dtype)
+    for r_i, r in enumerate(all_rows):
+        out[r_i, : r[j].shape[0]] = r[j].reshape(r[j].shape[0], cols)
+    return out
+
+
 def _reference(x_fp8, ids, epr):
     """f32 sum over distinct destination ranks in top-k order -> bf16."""
     T, K = ids.shape
@@ -151,19 +159,19 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     )
                     n_in = max(1, world * max(int(r[0].shape[0]) for r in all_rows))
 
-                    def step(op=op, x=x, w=w, sc=sc, ids=ids, n_in=n_in):
-                        out = op.dispatch(x, w, sc, ids)
+                    def combine(out, op=op, ids=ids, n_in=n_in):
                         rows = min(out[0].shape[0], n_in)
                         cin = (out[0][:rows].float() * (1.0 + rank / 8.0)).to(
                             torch.bfloat16
                         )
-                        return out, op.combine(cin, None, ids)[0]
+                        return op.combine(cin, None, ids)[0]
 
-                    out, res = step()
+                    out = op.dispatch(x, w, sc, ids)
                     torch.cuda.synchronize()
                     tag = f"rank{rank} hidden={hidden} E={E} K={K} {routing} T={T0}"
-                    # dispatch
+                    # dispatch (read before combine, which resets the count)
                     n = int(out[4].reshape(-1)[0].item())
+                    src = op.get_dispatch_src_token_pos()[:n].long().cpu()
                     expect = sum(
                         int(
                             ((r[0].long() >= 0) & (r[0].long() // epr == rank))
@@ -175,22 +183,31 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     )
                     if n != expect:
                         failures.append(f"{tag}: received {n}, expected {expect}")
-                    src = op.get_dispatch_src_token_pos()[:n].long().cpu()
-                    rx = out[0][:n].view(torch.uint8).cpu()
-                    rs = out[2][:n].reshape(n, -1)[:, :sd].contiguous().cpu()
-                    rw, ri = out[1][:n].cpu(), out[3][:n].cpu()
-                    for i in range(n):
-                        s_r, s_t = int(src[i]) // max_tok, int(src[i]) % max_tok
-                        ids_s, x_s, sc_s, w_s = all_rows[s_r]
-                        if not (
-                            torch.equal(rx[i], x_s[s_t])
-                            and torch.equal(rs[i].view(torch.uint8), sc_s[s_t])
-                            and torch.equal(rw[i], w_s[s_t])
-                            and torch.equal(ri[i], ids_s[s_t])
+                    if n and n == expect:
+                        # every received row against its source token
+                        t_max = max(int(r[0].shape[0]) for r in all_rows)
+
+                        s_r, s_t = src // max_tok, src % max_tok
+                        got = (
+                            out[0][:n].view(torch.uint8).cpu(),
+                            out[2][:n].reshape(n, -1)[:, :sd].contiguous().cpu(),
+                            out[1][:n].cpu(),
+                            out[3][:n].cpu(),
+                        )
+                        want = (
+                            _stacked(all_rows, t_max, 1, hidden, torch.uint8)[s_r, s_t],
+                            _stacked(all_rows, t_max, 2, sd, torch.uint8)[s_r, s_t],
+                            _stacked(all_rows, t_max, 3, K, torch.float32)[s_r, s_t],
+                            _stacked(all_rows, t_max, 0, K, torch.int32)[s_r, s_t],
+                        )
+                        for name, g_t, w_t in zip(
+                            ("rows", "scales", "weights", "ids"), got, want
                         ):
-                            failures.append(f"{tag}: received row {i} differs")
-                            break
+                            if not torch.equal(g_t.view(w_t.dtype), w_t):
+                                failures.append(f"{tag}: received {name} differ")
                     # combine
+                    res = combine(out)
+                    torch.cuda.synchronize()
                     ref = _reference(x, ids, epr)
                     bad = _bitdiff(res[:T], ref) if T else 0
                     if bad:
@@ -201,7 +218,7 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     with torch.cuda.stream(s):
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph, stream=s):
-                            _, res_g = step()
+                            res_g = combine(op.dispatch(x, w, sc, ids))
                     torch.cuda.synchronize()
                     dist.barrier(group=group)
                     for _ in range(replays):

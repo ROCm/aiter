@@ -39,20 +39,162 @@ def _is_gfx125x() -> bool:
     return get_gfx_runtime().startswith("gfx125")
 
 
+# mori's shmem heap is initialised once per process, over the CPU group of the
+# first MoriAll2AllManager, when something first needs it (a mori handle, or a
+# FlyDSL op / attention all-to-all that keeps its buffers in that heap).
+_MORI_SHMEM_GROUP = None
+_MORI_SHMEM_READY = False
+
+
+def ensure_mori_shmem() -> None:
+    """Initialise mori's shmem heap over the EP group, once. Collective.
+
+    No-op until a :class:`MoriAll2AllManager` has been created (callers that
+    manage mori's heap themselves are unaffected) and on gfx125x, which has no
+    shmem (mori's EP backend there is CCO; running the init can hang).
+    """
+    global _MORI_SHMEM_READY
+    if _MORI_SHMEM_READY or _MORI_SHMEM_GROUP is None or _is_gfx125x():
+        return
+    import mori
+
+    torch._C._distributed_c10d._register_process_group("mori", _MORI_SHMEM_GROUP)
+    mori.shmem.shmem_torch_process_group_init("mori")
+    _MORI_SHMEM_READY = True
+
+
+def _flydsl_intranode_supported(
+    *,
+    world_size: int,
+    input_dtype: torch.dtype,
+    quant_dtype: torch.dtype,
+    token_hidden_size: int,
+    scale_dim: int,
+    scale_type_size: int,
+    num_experts_per_token: int,
+    quant_type: str,
+) -> bool:
+    """Whether the FlyDSL intra-node kernels serve this handle shape."""
+    if not 2 <= world_size <= 8 or num_experts_per_token > 64:
+        return False
+    if quant_type not in ("none", "fp8_direct_cast"):
+        return False
+    if input_dtype not in (torch.bfloat16, torch.float32):
+        return False
+    fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    wire_bytes = {
+        torch.bfloat16: 2,
+        torch.float32: 4,
+        torch.float8_e4m3fn: 1,
+        torch.float8_e4m3fnuz: 1,
+    }
+    if fp4 is not None and quant_dtype == fp4:
+        row_bytes = token_hidden_size // 2
+    elif quant_dtype in wire_bytes:
+        row_bytes = token_hidden_size * wire_bytes[quant_dtype]
+    else:
+        return False
+    if row_bytes % 16 or (token_hidden_size * input_dtype.itemsize) % 16:
+        return False
+    if scale_dim * scale_type_size > 256:
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        return False
+    return _has_module("flydsl")
+
+
+class _FlyDSLMoriCallSurface:
+    """A FlyDSL intra-node op behind mori ``EpDispatchCombineOp``'s call surface.
+
+    ``dispatch`` / ``combine`` take mori's arguments; the launch-geometry
+    keywords are accepted and ignored (the FlyDSL op picks its geometry from
+    the token count). Other attributes are the FlyDSL op's.
+    """
+
+    def __init__(self, op):
+        self._op = op
+
+    def dispatch(
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        block_num: int = -1,
+        rdma_block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        if weights.dtype != torch.float32:
+            weights = weights.float()
+        return self._op.dispatch(input, weights, scales, indices)
+
+    def combine(
+        self,
+        input,
+        weights,
+        indices,
+        block_num: int = -1,
+        rdma_block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._op.combine(input, weights, indices)
+
+    def __getattr__(self, name):
+        return getattr(self._op, name)
+
+
+def _flydsl_op_kwargs(
+    *,
+    rank: int,
+    num_ep_ranks: int,
+    input_dtype: torch.dtype,
+    quant_dtype: torch.dtype,
+    token_hidden_size: int,
+    scale_dim: int,
+    scale_type_size: int,
+    max_num_tokens_per_dp_rank: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    quant_type: str = "none",
+):
+    return {
+        "rank": rank,
+        "world_size": num_ep_ranks,
+        # Dispatch moves rows in the wire dtype (e.g. MXFP8 + e8m0 scales);
+        # combine returns the experts' output dtype.
+        "dispatch_dtype": quant_dtype,
+        "combine_dtype": input_dtype,
+        "hidden_dim": token_hidden_size,
+        "scale_dim": scale_dim,
+        "scale_type_size": scale_type_size,
+        "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
+        "num_experts_per_rank": num_local_experts,
+        "num_experts_per_token": num_experts_per_token,
+        "quant_type": quant_type,
+    }
+
+
 class MoriAll2AllManager(All2AllManagerBase):
+    """EP all-to-all handles with mori's call surface.
+
+    On one node, a high-throughput handle (``low_latency=False``) whose shape
+    the FlyDSL intra-node kernels support (gfx942 / gfx950, 2..8 ranks, bf16 or
+    fp32 tokens, a bf16 / fp32 / fp8 / fp4 wire, combine ``quant_type`` none or
+    fp8_direct_cast) is served by the FlyDSL op over HIP IPC buffers; mori is
+    not used for it. Every other handle -- inter-node, low latency, other
+    shapes or arches, or ``backend="mori"`` -- is a mori
+    ``EpDispatchCombineOp``. mori's shmem heap is initialised the first time
+    something needs it (see :func:`ensure_mori_shmem`).
+    """
+
     @staticmethod
     def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier.
-
-        Skipped on gfx125x: that arch has no shmem support, so mori's EP
-        backend there is CCO. Running this init would be useless and can hang.
-        """
-        if _is_gfx125x():
-            return
-        import mori
-
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        mori.shmem.shmem_torch_process_group_init("mori")
+        """Register *cpu_group* for mori's shmem heap (initialised lazily)."""
+        global _MORI_SHMEM_GROUP
+        if _MORI_SHMEM_GROUP is None:
+            _MORI_SHMEM_GROUP = cpu_group
 
     def __init__(self, cpu_group):
         assert has_mori(), (
@@ -62,6 +204,7 @@ class MoriAll2AllManager(All2AllManagerBase):
 
         super().__init__(cpu_group)
         self.handle_cache = Cache()
+        self._flydsl_handles: list[Any] = []
         self._init_mori_shmem(cpu_group)
 
     def _make_all2all_kwargs(
@@ -143,13 +286,63 @@ class MoriAll2AllManager(All2AllManagerBase):
         handle = mori.ops.EpDispatchCombineOp(mori_config)
         return handle
 
-    def get_handle(self, kwargs, index: int = 0):
+    def _uses_flydsl(self, kwargs) -> bool:
+        return (
+            not self.internode
+            and not kwargs.get("low_latency", False)
+            and _flydsl_intranode_supported(
+                world_size=kwargs["num_ep_ranks"],
+                input_dtype=kwargs["input_dtype"],
+                quant_dtype=kwargs["quant_dtype"],
+                token_hidden_size=kwargs["token_hidden_size"],
+                scale_dim=kwargs["scale_dim"],
+                scale_type_size=kwargs["scale_type_size"],
+                num_experts_per_token=kwargs["num_experts_per_token"],
+                quant_type=kwargs.get("quant_type", "none"),
+            )
+        )
+
+    def _make_flydsl_handle(self, impl, **kwargs):
+        del impl  # cache-key tag only
+        from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
+            FlyDSLDispatchCombineConfig,
+            FlyDSLDispatchCombineIntraNodeOp,
+        )
+
+        op = FlyDSLDispatchCombineIntraNodeOp(
+            FlyDSLDispatchCombineConfig(**kwargs), group=self.cpu_group
+        )
+        self._flydsl_handles.append(op)
+        return _FlyDSLMoriCallSurface(op)
+
+    def get_handle(self, kwargs, index: int = 0, *, backend: str = "auto"):
         """Cached op for one config and ``index``. Always a single handle.
 
         ``index=0`` (default) is the shared singleton. Callers with several
         operations in flight use a distinct index for each concurrent slot.
         All indexes use ``handle_cache``.
+
+        ``backend``: ``"auto"`` serves supported intra-node high-throughput
+        handles with the FlyDSL kernels (see the class docstring) and the rest
+        with mori; ``"mori"`` always returns a mori ``EpDispatchCombineOp``.
         """
+        if backend not in ("auto", "mori"):
+            raise ValueError(f"backend must be 'auto' or 'mori', got {backend!r}")
+        if backend == "auto" and self._uses_flydsl(kwargs):
+            fly_kwargs = _flydsl_op_kwargs(
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ("gpu_per_node", "low_latency")
+                }
+            )
+            logger.debug("FlyDSL all2all index=%d args %s", index, fly_kwargs)
+            return self.handle_cache.get_or_create(
+                {**fly_kwargs, "impl": "flydsl"},
+                self._make_flydsl_handle,
+                index=index,
+            )
+        ensure_mori_shmem()
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
         return self.handle_cache.get_or_create(
@@ -411,19 +604,10 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
 
     def _make_all2all_kwargs(
         self,
-        rank: int,
-        num_ep_ranks: int,
-        input_dtype: torch.dtype,
-        quant_dtype: torch.dtype,
-        token_hidden_size: int,
-        scale_dim: int,
-        scale_type_size: int,
-        max_num_tokens_per_dp_rank: int,
-        num_local_experts: int,
-        num_experts_per_token: int,
         gpu_per_node: int | None = None,
         low_latency: bool = False,
         quant_type: str = "none",
+        **kwargs,
     ):
         del gpu_per_node, low_latency  # mori-only knobs
         if quant_type not in ("none", "fp8_direct_cast"):
@@ -431,21 +615,7 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
                 f"FlyDSL combine quant_type={quant_type!r} unsupported "
                 "(none | fp8_direct_cast)"
             )
-        return {
-            "rank": rank,
-            "world_size": num_ep_ranks,
-            # Dispatch moves rows in the wire dtype (e.g. MXFP8 + e8m0
-            # scales); combine returns the experts' output dtype.
-            "dispatch_dtype": quant_dtype,
-            "combine_dtype": input_dtype,
-            "hidden_dim": token_hidden_size,
-            "scale_dim": scale_dim,
-            "scale_type_size": scale_type_size,
-            "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
-            "num_experts_per_rank": num_local_experts,
-            "num_experts_per_token": num_experts_per_token,
-            "quant_type": quant_type,
-        }
+        return _flydsl_op_kwargs(quant_type=quant_type, **kwargs)
 
     def _make_handle(self, **kwargs):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)
