@@ -252,6 +252,24 @@ def flydsl_grouped_gemm_a8w4_masked(
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    # AITER_MOE_LOC (GEMM1): 1 IOD-local B + domain-parity persistent schedule,
+    # 2 the remote-only control, 3 placed B on the stock schedule.
+    iod_loc = int(os.environ.get("AITER_MOE_LOC", "0")) if stage1_act else 0
+    b_placed = loc_sched = 0
+    if iod_loc:
+        if iod_loc not in (1, 2, 3):
+            raise ValueError("AITER_MOE_LOC must be 0, 1, 2 or 3")
+        if cluster_m != 1 or cluster_n != 1 or waves_per_tensor_tdm != 2:
+            raise ValueError("AITER_MOE_LOC needs a 1x1 cluster and 2 waves per tensor")
+        from .iod_locality import placed_w1
+
+        w = placed_w1(w, w_scales, n_experts, N, K, tile_n, tile_k)
+        w_scales = w
+        b_placed = 1
+        if iod_loc in (1, 2):
+            loc_sched = iod_loc
+            pw = persistent_workers or int(os.environ.get("AITER_MOE_LOC_PW", "512"))
+            persistent_workers = (pw + 7) // 8 * 8
     rolled_drain = int(rolled_drain)
     if rolled_drain not in (0, 1):
         raise ValueError("rolled_drain must be 0 or 1")
@@ -313,6 +331,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         rolled_drain,
         int(a_preshuffled),
         int(m_align),
+        b_placed,
+        loc_sched,
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,

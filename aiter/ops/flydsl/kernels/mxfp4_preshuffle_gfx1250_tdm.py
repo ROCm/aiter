@@ -182,6 +182,8 @@ def build_gemm_a8w4_tdm_task(
     raw_drain=0,
     defer_c_wait=0,
     tdm_snop=0,
+    b_placed=0,
+    loc_sched=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -232,6 +234,13 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
+    - ``b_placed``: B and B-scale come from one IOD-placed buffer (see
+      ``iod_locality.place_w1``) passed as both ``arg_b`` and
+      ``arg_scale_b``: page 0 holds the per-page phase, then 16 KiB granules.
+      Unit (expert, n-tile) lives on domain n % 2 at local granules
+      ``lu * GPU_LOC + j``; j < 2 * K_TILES is half j % 2 of k-tile j / 2,
+      the rest hold the B scales of 8 k-tiles each.
+    - ``loc_sched``: only tags the kernel name (the launcher's schedule).
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -334,8 +343,20 @@ def build_gemm_a8w4_tdm_task(
         persistent_workers,
         rolled_drain,
         m_align,
+        b_placed,
+        loc_sched,
     )
     _ = cache_tag
+    LOC_GRAN = 16384
+    LOC_PAGE = 2 << 20
+    GPU_LOC = 2 * K_TILES + ceildiv(K_TILES, 8)
+    if b_placed:
+        # One wave's B half of a k-tile is one granule; 8 k-tiles of B scales
+        # fill one more.
+        assert tile_n * tile_k == 4 * LOC_GRAN and tile_n % 64 == 0
+        assert num_waves_per_tensor_tdm == 2 and m_warp * n_warp == 4
+        assert not tdm_as_in_prologue and cluster_n == 1 and cluster_m == 1
+        assert not HAS_K_TAIL and GPU_LOC <= 64
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -534,6 +555,8 @@ def build_gemm_a8w4_tdm_task(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}"
+        f"{f'_bp{b_placed}' if b_placed else ''}"
+        f"{f'_ls{loc_sched}' if loc_sched else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -810,6 +833,27 @@ def build_gemm_a8w4_tdm_task(
         a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
+        loc_addr = None
+        if const_expr(b_placed):
+            loc_nt = blk_n // tile_n
+            loc_e = (expert < n_experts).select(expert, 0)
+            loc_d = loc_nt & 1
+            loc_g0 = (loc_e * (total_n_tiles >> 1) + (loc_nt >> 1)) * GPU_LOC
+            loc_pg0 = loc_g0 >> 6
+            loc_phs = fx.recast_iter(i32_ptr, arg_b)
+            loc_ph0 = loc_phs[loc_pg0]
+            loc_ph1 = loc_phs[loc_pg0 + 1]
+            b_off0 = fx.Int64(0)
+            sb_off0 = fx.Int64(0)
+
+            def loc_addr(j):
+                """Byte offset of the unit's local granule j (page 0 is the phase table)."""
+                g = loc_g0 + j
+                pg = g >> 6
+                k = g & 63
+                ph = (pg == loc_pg0).select(loc_ph0, loc_ph1)
+                bit = (loc_d ^ ph ^ (k >> 2) ^ (k >> 5)) & 1
+                return fx.Int64(pg + 1) * LOC_PAGE + fx.Int64((k << 1) | bit) * LOC_GRAN
         assert num_waves_per_tensor_tdm in (
             1,
             2,
@@ -847,7 +891,7 @@ def build_gemm_a8w4_tdm_task(
         Job = namedtuple(
             "Job",
             "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves "
-            "tail_ext",
+            "tail_ext loc",
         )
         jobs = []
         as_prologue_jobs = []
@@ -871,6 +915,7 @@ def build_gemm_a8w4_tdm_task(
             split_inner=False,
             target_jobs=None,
             cache_modifier=0,
+            loc=None,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -928,6 +973,7 @@ def build_gemm_a8w4_tdm_task(
                     k_adv,
                     wv,
                     tail_ext,
+                    loc,
                 )
             )
 
@@ -970,7 +1016,7 @@ def build_gemm_a8w4_tdm_task(
         add_tdm_loads(
             gB_base,
             b_off0,
-            Kp16,
+            PACK_TK * 16 if b_placed else Kp16,
             None,
             PACK_TK * 16,
             tile_n // 16,
@@ -982,6 +1028,7 @@ def build_gemm_a8w4_tdm_task(
             wv=waves[1],
             wg_mask=b_mcast_mask,
             cache_modifier=tdm_b_th,
+            loc="B" if b_placed else None,
         )
         if const_expr(row_major_ascale and tdm_as_in_prologue):
             # The compact wire is row-major with a padded global row pitch.
@@ -1055,7 +1102,7 @@ def build_gemm_a8w4_tdm_task(
         add_tdm_loads(
             gSB_base,
             sb_off0,
-            SB_OUTER_STRIDE,
+            SC_INNER if b_placed else SB_OUTER_STRIDE,
             None,
             SC_INNER,
             SB_SUPERS,
@@ -1065,6 +1112,7 @@ def build_gemm_a8w4_tdm_task(
             lds_row=SC_INNER,
             k_adv=SC_INNER * 4,
             wv=waves[3],
+            loc="S" if b_placed else None,
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
@@ -1103,7 +1151,19 @@ def build_gemm_a8w4_tdm_task(
                     )
                 elif const_expr(j.tail_ext is not None and is_tail):
                     atom = fx.atom_set_value(atom, "extent_1", fx.Int32(j.tail_ext))
-                fx.copy(atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+                if const_expr(j.loc == "B"):
+                    # The view already sits wl granules in; trade that for the
+                    # placed granule of this wave's half.
+                    wl = wave - j.waves[0]
+                    imm = loc_addr(2 * kt + wl) - fx.Int64(wl * LOC_GRAN)
+                elif const_expr(j.loc == "S"):
+                    assert SB_SUPERS * SC_INNER * 4 * 8 == LOC_GRAN
+                    imm = loc_addr(2 * K_TILES + kt // 8) + fx.Int64(
+                        (kt % 8) * (SB_SUPERS * SC_INNER * 4)
+                    )
+                else:
+                    imm = fx.Int64(kt * j.k_adv)
+                fx.copy(atom, j.gt, dst, imm_offset=imm)
                 if const_expr(tdm_snop):
                     # A branch must never directly follow a TDM issue (see
                     # mega_moe_gfx1250.tdm_prims); the owner test around this
@@ -2590,8 +2650,14 @@ def launch_gemm_a8w4_tdm(
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
+    b_placed: Constexpr[int] = 0,
+    loc_sched: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
+
+    ``loc_sched`` (persistent, IOD-placed B): worker b belongs to IOD domain
+    ``((b + 3) % 8) >= 4`` and visits only n-tiles of that parity (1) or of
+    the other one (2, the remote-only control).
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -2653,7 +2719,12 @@ def launch_gemm_a8w4_tdm(
         rolled_drain=rolled_drain,
         a_preshuffled=a_preshuffled,
         m_align=m_align,
+        explicit_tile=1 if loc_sched else 0,
+        b_placed=b_placed,
+        loc_sched=loc_sched,
     )
+    if loc_sched:
+        assert b_placed and persistent_workers % 8 == 0
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
@@ -2705,9 +2776,22 @@ def launch_gemm_a8w4_tdm(
             )
             tile_map = fx.recast_iter(map_ptr_type, arg_m_tile_map)
             rows = tile_map[n_experts - 1]
-            tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
-            for task_id in range(fx.block_idx.x, tasks, persistent_workers):
-                run_task(task_id, rows)
+            if const_expr(loc_sched):
+                bid = fx.Int32(fx.block_idx.x)
+                xr = (bid + 3) & 7
+                dom = xr >> 2
+                if const_expr(loc_sched == 2):
+                    dom = 1 - dom
+                wrank = (bid >> 3) * 4 + (xr & 3)
+                mt = ceildiv(rows, tile_m)
+                tasks = mt * (ceildiv(i32_n, tile_n) >> 1)
+                for t in range(wrank, tasks, persistent_workers // 2):
+                    nh = t // mt
+                    run_task(t - nh * mt, nh * 2 + dom)
+            else:
+                tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
+                for task_id in range(fx.block_idx.x, tasks, persistent_workers):
+                    run_task(task_id, rows)
         else:
             run_task(fx.block_idx.x, i32_m)
 
