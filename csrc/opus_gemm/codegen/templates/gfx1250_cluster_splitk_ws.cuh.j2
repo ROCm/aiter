@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "opus_gemm_common.cuh"
+#include <optional>
+#endif
+#ifdef OPUS_FUSED_HOST_TU
+#include "[[ traits_header ]]"
+[% if is_clusterlaunch %]#ifndef __cluster_dims__
+#define __cluster_dims__(...) __attribute__((cluster_dims(__VA_ARGS__)))
+#endif
+[% endif %]// Forward declaration for the host-side <<<>>> launch stub. Must match the
+// kernel's __launch_bounds__ (and __cluster_dims__ for the clusterlaunch tag, so
+// the <<<>>> launch sets the cluster geometry).
+template<typename Traits>
+__global__ __launch_bounds__(128, 1)
+[% if is_clusterlaunch %]__cluster_dims__([[ cluster_wg_m ]], [[ cluster_wg_n ]], 1)
+[% endif %]void [[ kernel_func ]]([[ kargs_name ]] kargs);
+#else
+#include "[[ pipeline_header ]]"
+#endif
+
+template <typename D_C>
+using [[ name ]]_Traits = [[ traits_name ]]<[[ k.BLOCK_SIZE ]],
+    [[ k.B_M ]], [[ k.B_N ]], [[ k.B_K ]],
+    [[ layout_int ]],
+    [[ da ]], [[ db ]], [[ workspace_dtype ]], fp32_t,
+    [[ enable_bias_str ]],
+    [[ num_slots ]], [[ wg_per_cu ]][% if is_clusterlaunch %],
+    [[ cluster_wg_m ]], [[ cluster_wg_n ]][% endif %]>;
+
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+// Host launch helper dispatches runtime split_k to the matching compile-time
+// reducer specialization. The device definitions remain in the per-arch TU.
+#include "gfx1250/splitk_reduce_launch_gfx1250.cuh"
+
+template <typename D_C>
+void
+[[ name ]](
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{
+    static_assert(std::is_same<D_C, fp32_t>::value,
+        "cluster_tdm_splitk_ws uses the fp32 launch-dispatch specialization");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16 || Y.dtype() == AITER_DTYPE_fp32,
+        "gfx1250 cluster_tdm_splitk_ws requires Y dtype bf16 or fp32");
+    // M / N need NOT be multiples of B_M / B_N: the grid is padded to
+    // ceil(M/B_M) x ceil(N/B_N) tiles, the main kernel TDM-clamps OOB global
+    // reads to the real (M, N) tensor extents (tensor_dim1 = m - tile_row /
+    // n - tile_col), partials for padded rows/cols land in the padded typed
+    // workspace, and the reduce kernel only iterates m in [0, M) and writes
+    // n in [0, N) (HAS_OOB tail). So M=49 transparently runs as a padded
+    // M=64 tile, etc.
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K)");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K, batch must be >= 1");
+    AITER_CHECK(batch == 1,
+        "gfx1250 cluster_tdm_splitk_ws supports batch == 1 only; got batch=",
+        batch);
+
+    const void* ptr_bias_ = nullptr;
+    int stride_bias_batch_ = 0;
+    bool bias_is_fp32_ = false;
+    if (bias.has_value()) {
+        const auto& bt = bias.value();
+        AITER_CHECK(bt.is_contiguous(),
+            "bias must be contiguous (got non-contiguous tensor)");
+        AITER_CHECK(bt.dtype() == AITER_DTYPE_fp32 || bt.dtype() == Y.dtype(),
+            "bias dtype must be fp32 or match Y dtype (got bias=",
+            AiterDtype_to_str(bt.dtype()),
+            " Y=", AiterDtype_to_str(Y.dtype()), ")");
+        bias_is_fp32_ = (bt.dtype() == AITER_DTYPE_fp32);
+        if (bt.dim() == 1) {
+            AITER_CHECK(bt.size(0) == N,
+                "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
+                " N=", N, ")");
+            stride_bias_batch_ = 0;
+        } else if (bt.dim() == 2) {
+            AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
+                "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
+                bt.size(1), "] vs batch=", batch, " N=", N, ")");
+            stride_bias_batch_ = N;
+        } else {
+            AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
+                bt.dim());
+        }
+        ptr_bias_ = bt.data_ptr();
+    }
+
+    using Traits = [[ name ]]_Traits<D_C>;
+
+    int split_k = (splitK <= 1) ? 1 : splitK;
+    int k_steps_tot = (K + [[ k.B_K ]] - 1) / [[ k.B_K ]];
+    // Clamp split_k so there is no empty trailing split -> n_active == split_k,
+    // so the reduce can sum all split_k slices (no garbage from unwritten ones).
+    while (split_k > 1) {
+        int steps_per = (k_steps_tot + split_k - 1) / split_k;
+        if ((split_k - 1) * steps_per < k_steps_tot) break;
+        split_k--;
+    }
+
+    // The reducer uses one logical row per grid.y block. Reject stale tuned
+    // rows and explicit kids before either kernel can launch an invalid grid.
+    AITER_CHECK(M <= [[ k.max_m ]],
+        "[[ name ]]: split-K reduce requires M <= [[ k.max_m ]]; got M=", M);
+
+    int num_tiles_m = 1 + (M - 1) / [[ k.B_M ]];
+    int num_tiles_n = 1 + (N - 1) / [[ k.B_N ]];
+    const size_t padded_M_size = opus_checked_extent_product(
+        {static_cast<size_t>(num_tiles_m), static_cast<size_t>([[ k.B_M ]])},
+        "[[ name ]]");
+    const size_t padded_N_size = opus_checked_extent_product(
+        {static_cast<size_t>(num_tiles_n), static_cast<size_t>([[ k.B_N ]])},
+        "[[ name ]]");
+    const size_t workspace_slice_numel = opus_checked_extent_product(
+        {padded_M_size, padded_N_size}, "[[ name ]]");
+    AITER_CHECK(padded_M_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && padded_N_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && workspace_slice_numel <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "[[ name ]]: padded workspace extents exceed 32-bit kernel stride limits");
+    int padded_M = static_cast<int>(padded_M_size);
+    int padded_N = static_cast<int>(padded_N_size);
+
+    // One-batch layout: [split_k, padded_M, padded_N].
+    const size_t required_numel = opus_checked_extent_product(
+        {static_cast<size_t>(split_k), workspace_slice_numel},
+        "[[ name ]]");
+    void* workspace_ptr_ = opus_validate_workspace(
+        workspace, XQ, [[ workspace_aiter_dtype ]], required_numel, 16, "[[ name ]]");
+    auto stream = aiter::getCurrentHIPStream();
+
+[% if is_clusterlaunch %]    // Round the physical grid to complete [[ cluster_wg_m ]]x[[ cluster_wg_n ]] clusters.
+    // Surplus WGs take the pipeline tile_oob exit; workspace layout
+    // continues to use the unrounded logical tile counts.
+    int grid_tiles_m = (num_tiles_m + [[ cluster_wg_m ]] - 1) / [[ cluster_wg_m ]] * [[ cluster_wg_m ]];
+    int grid_tiles_n = (num_tiles_n + [[ cluster_wg_n ]] - 1) / [[ cluster_wg_n ]] * [[ cluster_wg_n ]];
+    dim3 grid_main(grid_tiles_m, grid_tiles_n, split_k);
+[% else %]    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
+[% endif %]    dim3 block_main([[ k.BLOCK_SIZE ]]);
+
+    constexpr int REDUCE_VEC = [[ reduce_vec ]];
+    constexpr int REDUCE_BS  = [[ reduce_bs ]];
+    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS), M, 1);
+    dim3 block_reduce(REDUCE_BS);
+
+    // gfx1250 cluster_tdm_splitk_ws is batch==1 only (the Python layout guard
+    // and the 3D grid both assume a single batch). A single main + reduce
+    // launch handles the whole gemm -- no host batch loop, no per-batch
+    // pointer / bias offsets. The kernels still take stride_*_batch but with
+    // batch==1 every batch term collapses (b==0, split_stride==stride_ws_batch).
+    [[ kargs_name ]] kargs{};
+    kargs.ptr_a     = XQ.data_ptr();
+    kargs.ptr_b     = WQ.data_ptr();
+    kargs.ptr_ws    = workspace_ptr_;
+    kargs.ptr_c     = Y.data_ptr();
+    kargs.ptr_bias  = ptr_bias_;
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
+    kargs.stride_a        = XQ.stride(1);
+    kargs.stride_b        = WQ.stride(1);
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = XQ.stride(0);
+    kargs.stride_b_batch  = WQ.stride(0);
+    kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
+
+    [[ kernel_func ]]<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
+
+    // Reduce reads the exact kid's typed partials (D_WS=[[ workspace_ptr_type ]]),
+    // re-accumulates in fp32, folds bias, casts to Y dtype. split_k is dispatched
+    // to a compile-time (unrolled) reduce instance by the launch helper.
+    if (Y.dtype() == AITER_DTYPE_bf16) {
+        __bf16* y_ptr = reinterpret_cast<__bf16*>(Y.data_ptr());
+        if (ptr_bias_ && bias_is_fp32_) {
+            // fp32 bias + bf16 output: fold the exact fp32 bias in the
+            // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+        } else if (ptr_bias_) {
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
+        } else {
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+        }
+    } else {
+        float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
+        if (ptr_bias_) {
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+        } else {
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, [[ has_oob_str ]], [[ workspace_ptr_type ]]>(
+                grid_reduce, block_reduce, stream,
+                workspace_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+        }
+    }
+}
+#endif // launcher only on regular host pass
