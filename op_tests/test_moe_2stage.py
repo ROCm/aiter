@@ -116,6 +116,7 @@ def test_fmoe(
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
     output_offset=0,
+    output_perf=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -631,9 +632,18 @@ def test_fmoe(
         assert not out_failed, out_msg
     elif out_failed:
         logger.warning("accuracy check failed (non-strict): %s", out_msg)
-    # Time the output= call too: it is how the serving layer calls fused_moe, and
-    # writing into the caller's buffer is what saves the copy. Checked above, as
-    # the timed calls overwrite out_buf and may run on rotated copies of it.
+    ret = {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "output err": out_err,
+        "output logits_diff": float(out_logits_diff),
+    }
+    if not output_perf:
+        return ret
+    # Time the output= call too (--output-perf; it doubles the timed calls of a
+    # sweep): it is how the serving layer calls fused_moe, and writing into the
+    # caller's buffer is what saves the copy. Checked above, as the timed calls
+    # overwrite out_buf and may run on rotated copies of it.
     _, out_us = run_perftest(
         fused_moe,
         input,
@@ -669,15 +679,14 @@ def test_fmoe(
         + expert_bytes * routed_experts // E
     )
 
-    return {
-        "us": us2,
-        "logits_diff": float(logits_diff),
-        "output us": out_us,
-        "output TFLOPS": flops / out_us / 1e6,
-        "output TB/s": out_nbytes / out_us / 1e6,
-        "output err": out_err,
-        "output logits_diff": float(out_logits_diff),
-    }
+    ret.update(
+        {
+            "output us": out_us,
+            "output TFLOPS": flops / out_us / 1e6,
+            "output TB/s": out_nbytes / out_us / 1e6,
+        }
+    )
+    return ret
 
 
 l_quant = [
@@ -886,6 +895,13 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
+)
+
+parser.add_argument(
+    "--output-perf",
+    action="store_true",
+    help="Also time each case's fused_moe(output=) call and report its us, TFLOPS "
+    "and TB/s. Its accuracy is always checked; timing it doubles the timed calls.",
 )
 
 args = parser.parse_args()
@@ -1624,6 +1640,7 @@ def test_adaptive_sort_output_in_place():
                         use_g1u1=True,
                         check_aot_cache=False,
                         output_offset=output_offset,
+                        output_perf=True,
                     )
                 )
                 case = f"token={token} output_offset={output_offset}"
@@ -2102,7 +2119,10 @@ for kwargs, extras in case_iter:
         )
         with aot_guard:
             ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                **kwargs,
+                kernel_bench=args.kernel,
+                ref_dtype=args.ref_dtype,
+                output_perf=args.output_perf,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(
