@@ -61,8 +61,11 @@ def worker(rank, world):
         seq_lens = torch.tensor(
             [5, 0 if rank % 3 == 0 else 7], device="cuda", dtype=torch.int32
         )
-        for dim in (64, 128, 512, 576):
-            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
+        # dim 128 runs the debug build: epoch push and bounded poll.
+        for dim, debug in ((64, False), (128, True), (512, False), (576, False)):
+            cws = CombineWorkspace(
+                group, torch.device("cuda"), hl, dim, 64, debug=debug
+            )
             for base_e in (True, False):
                 for masked in (False, True):
                     out = torch.randn(

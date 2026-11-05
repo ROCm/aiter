@@ -68,11 +68,19 @@ class PeerBuffer:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
 
-    def close(self) -> None:
-        """Close peer mappings and free the local buffer."""
+    def close_peers(self) -> None:
+        """Close the mappings of every peer buffer."""
         opened, self._opened = self._opened, []
         for base in opened:
             UncachedIpcHeap.close_mem_handle(base)
+
+    def close(self) -> None:
+        """Close peer mappings and free the local buffer.
+
+        Call ``close_peers`` and a group barrier first when peers are alive:
+        a buffer freed while a peer still maps it cannot export a new handle.
+        """
+        self.close_peers()
         if self.local:
             self.bytes = None
             UncachedIpcHeap.free_device_mem(self.local)

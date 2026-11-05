@@ -17,6 +17,7 @@ from pathlib import Path
 import flydsl.expr as fx
 
 PAIR_BYTES = 8
+EPOCH_BYTES = 4
 
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ROOT = Path(__file__).resolve().parent
@@ -52,13 +53,28 @@ def key_tuple(key) -> tuple:
 
 
 def pair_layout(items) -> dict:
-    """Lay out named arrays of tagged 32-bit values."""
+    """Lay out named arrays of naturally aligned 8-byte tagged pairs."""
     out, offset = {}, 0
     for name, pairs in items:
         offset = (offset + PAIR_BYTES - 1) // PAIR_BYTES * PAIR_BYTES
         out[name] = (offset, pairs * PAIR_BYTES)
         offset += pairs * PAIR_BYTES
     return out
+
+
+def pair_span(layout) -> int:
+    """Return the byte span of one parity of tagged-pair regions."""
+    return max(offset + size for offset, size in layout.values())
+
+
+def epoch_offset(layout) -> int:
+    """Return the untagged epoch region offset after both pair parities."""
+    return 2 * pair_span(layout)
+
+
+def peer_bytes(layout, ranks) -> int:
+    """Return two pair parities plus one i32 epoch slot per rank."""
+    return epoch_offset(layout) + ranks * EPOCH_BYTES
 
 
 def _python_params(fn) -> tuple[str, ...]:
