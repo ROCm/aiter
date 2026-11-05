@@ -374,31 +374,16 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
     """
     EP all2all backend backed by FlyDSL intranode dispatch/combine kernels.
 
-    FlyDSL still uses mori's shmem heap for P2P buffer allocation, so mori
-    must be installed alongside flydsl. The dispatch/combine *kernels* however
-    are entirely FlyDSL-generated, replacing mori's comm primitives.
+    Self-contained: the symmetric P2P buffers are HIP IPC allocations exchanged
+    over this group's CPU group (``aiter.ops.flydsl.ipc_symm_heap``); mori is
+    not imported. Intra-node only.
 
+    ``get_handle`` takes the same arguments as :class:`MoriAll2AllManager`
+    (the mori-only ones -- ``gpu_per_node``, ``low_latency`` -- are accepted
+    and ignored) so a caller can switch backends without changing its call.
     TBO multi-instance ops use ``get_handle(..., index=)`` so ubatches get
     distinct cached ops. ``create_handle`` remains for a one-off uncached op.
     """
-
-    @staticmethod
-    def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier."""
-        import mori
-
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        mori.shmem.shmem_torch_process_group_init("mori")
-
-    @staticmethod
-    def _make_quant_type(input_dtype: torch.dtype, quant_dtype: torch.dtype) -> str:
-        fp8_dtypes = {
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        }
-        if input_dtype == torch.bfloat16 and quant_dtype in fp8_dtypes:
-            return "fp8_direct_cast"
-        return "none"
 
     def __init__(self, cpu_group):
         try:
@@ -412,10 +397,6 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
                 "'aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op'."
             ) from e
 
-        assert has_mori(), (
-            "mori is required alongside FlyDSL for shmem buffer allocation. "
-            "Please install mori."
-        )
         super().__init__(cpu_group)
         self._flydsl_dispatch_config_cls = FlyDSLDispatchCombineConfig
         self._flydsl_dispatch_op_cls = FlyDSLDispatchCombineIntraNodeOp
@@ -425,11 +406,8 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
                 "dispatch/combine. For inter-node EP, please use the mori "
                 "backend."
             )
-
-        # FlyDSL uses mori.shmem for P2P buffer allocation internally.
-        # Keep shmem init behavior aligned with MoriAll2AllManager.
-        self._init_mori_shmem(cpu_group)
         self.handle_cache = Cache()
+        self._live_handles: list[Any] = []
 
     def _make_all2all_kwargs(
         self,
@@ -443,28 +421,37 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         max_num_tokens_per_dp_rank: int,
         num_local_experts: int,
         num_experts_per_token: int,
+        gpu_per_node: int | None = None,
+        low_latency: bool = False,
+        quant_type: str = "none",
     ):
-
+        del gpu_per_node, low_latency  # mori-only knobs
+        if quant_type not in ("none", "fp8_direct_cast"):
+            raise ValueError(
+                f"FlyDSL combine quant_type={quant_type!r} unsupported "
+                "(none | fp8_direct_cast)"
+            )
         return {
             "rank": rank,
             "world_size": num_ep_ranks,
-            # Buffer sized for input dtype (bf16) so one op handles both
-            # bf16 and quantized input without reallocation; the dispatch
-            # kernel specialisation is selected at call time by input.dtype.
-            "data_type": input_dtype,
+            # Dispatch moves rows in the wire dtype (e.g. MXFP8 + e8m0
+            # scales); combine returns the experts' output dtype.
+            "dispatch_dtype": quant_dtype,
+            "combine_dtype": input_dtype,
             "hidden_dim": token_hidden_size,
             "scale_dim": scale_dim,
             "scale_type_size": scale_type_size,
-            "max_token_type_size": input_dtype.itemsize,
             "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
             "num_experts_per_rank": num_local_experts,
             "num_experts_per_token": num_experts_per_token,
-            "quant_type": self._make_quant_type(input_dtype, quant_dtype),
+            "quant_type": quant_type,
         }
 
     def _make_handle(self, **kwargs):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)
-        return self._flydsl_dispatch_op_cls(cfg)
+        handle = self._flydsl_dispatch_op_cls(cfg, group=self.cpu_group)
+        self._live_handles.append(handle)
+        return handle
 
     def get_handle(self, kwargs, index: int = 0):
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
@@ -482,3 +469,14 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("FlyDSL all2all (uncached) args %s", flydsl_kwargs)
         return self._make_handle(**flydsl_kwargs)
+
+    def destroy(self):
+        for handle in reversed(self._live_handles):
+            heap = getattr(handle, "_heap", None)
+            if heap is not None:
+                try:
+                    heap.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to free a FlyDSL all2all IPC heap")
+        self._live_handles.clear()
+        self.handle_cache = Cache()
