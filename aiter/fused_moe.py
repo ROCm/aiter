@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import itertools
 import math
 import os
 import re
@@ -470,51 +471,42 @@ def _validate_output_buffer_no_overlap(output, inputs, extra_args=()):
 
     inputs is a sequence of (name, tensor or None) pairs. The tensor values of
     the extra_args dicts count too: FHMoE passes its shared-expert weights and
-    scales there. output must be contiguous, as _validate_output_buffer_metadata
-    enforces.
+    scales there, none nested in a container. output must be contiguous, as
+    _validate_output_buffer_metadata enforces.
     """
-    if output is None:
-        return
-    # Chained in place: every eager fused_moe(output=) call runs this, so no
-    # merged dict is built.
-    inputs = [
-        *inputs,
-        *(
-            (n, v)
-            for extra in extra_args
-            if extra
-            for n, v in extra.items()
-            if isinstance(v, torch.Tensor)
-        ),
-    ]
-    # Every eager fused_moe(output=) call pays for this, so screen each input
-    # with the cheapest test first. An input starting at or past output's end
-    # cannot reach it (see _address_span), nor can a contiguous one ending at or
-    # before output's start. Strided inputs and possible hits take the exact
-    # check below.
     start = output.data_ptr()
     end = start + output.nbytes
-    for _, tensor in inputs:
-        if tensor is not None:
-            ptr = tensor.data_ptr()
-            if ptr < end and (
-                ptr + tensor.nbytes > start or not tensor.is_contiguous()
-            ):
-                break
-    else:
+    if start == end:
         return
-    output_span = _address_span(output)
-    if output_span is None:
-        return
-    # Accumulate mode zeroes the output rows at sort time, before the stages read
-    # any input, and atomic GEMM2 then writes into them while still reading.
+    if any(extra_args):
+        inputs = itertools.chain(
+            inputs,
+            (
+                (name, value)
+                for args in extra_args
+                if args
+                for name, value in args.items()
+                if isinstance(value, torch.Tensor)
+            ),
+        )
+    # Every eager fused_moe(output=) call runs this, so one pass clears each
+    # input with the cheapest test first. An input starting at or past output's
+    # end cannot reach it (see _address_span), nor can a contiguous one ending at
+    # or before output's start. Strided inputs and possible hits take the span.
     for name, tensor in inputs:
-        span = None if tensor is None else _address_span(tensor)
-        if span is not None and output_span[0] < span[1] and span[0] < output_span[1]:
-            raise RuntimeError(
-                f"output overlaps {name}, which moe_sorting zeroes before the MoE "
-                "stages read it"
-            )
+        if tensor is None:
+            continue
+        ptr = tensor.data_ptr()
+        if ptr < end and (ptr + tensor.nbytes > start or not tensor.is_contiguous()):
+            span = _address_span(tensor)
+            # Accumulate mode zeroes the output rows at sort time, before the
+            # stages read any input, and atomic GEMM2 then writes into them while
+            # still reading.
+            if span is not None and span[1] > start:
+                raise RuntimeError(
+                    f"output overlaps {name}, which moe_sorting zeroes before the "
+                    "MoE stages read it"
+                )
 
 
 def _return_output(ret, output):
