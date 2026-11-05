@@ -14,7 +14,7 @@ propagating it. See optCompilerConfig.json's flags_extra_hip for this module."
 // launcher's __device_stub__ resolves.
 // Both halves of the guard are load-bearing: the host pass reports warp size 64 and would
 // silently build the wave64 fragment layout with every byte count still matching.
-#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx1250__)
+#if !defined(__HIP_DEVICE_COMPILE__) || !(defined(__gfx1250__) || defined(__gfx1250_strict__))
 namespace opus_logits::gfx1250 {
 template <class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
 __global__ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs)

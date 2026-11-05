@@ -281,7 +281,7 @@ def pa_decode_sparse(
     # "gfx1250-only". An explicit unified_kv_rope on gfx950 still reaches that
     # raise, which is right -- the caller asked for this path by name.
     if (
-        DEVICE_ARCH == "gfx1250"
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
         and unified_kv_rope is None
         and unified_kv.dim() == 3
         and unified_kv.shape[-1] == _V4_REC_ALIGNED
@@ -408,7 +408,7 @@ def pa_decode_sparse(
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
 
-    use_gluon = DEVICE_ARCH == "gfx1250"
+    use_gluon = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
@@ -693,6 +693,39 @@ def _launch_splits(num_splits):
     return num_splits if num_splits <= 2 else -(-num_splits // 4) * 4
 
 
+def _check_epilogue(
+    q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8, skip_reduce=False
+):
+    """The output epilogue's arguments, for both gfx950 gluon drivers (this one
+    and sparse_mla's fp8 kernel)."""
+    num_queries, num_heads, head_dim = q.shape
+    inv_rope = inv_rope_positions is not None
+    assert inv_rope == (
+        inv_rope_cos_sin_cache is not None
+    ), "inv_rope_positions and inv_rope_cos_sin_cache go together"
+    assert not (
+        skip_reduce and (inv_rope or out_mxfp8 is not None)
+    ), "the output epilogue runs in the reduce, so skip_reduce cannot be set"
+    if inv_rope:
+        assert inv_rope_positions.shape == (num_queries,)
+        assert inv_rope_positions.stride(0) == 1
+        assert inv_rope_cos_sin_cache.dtype == torch.float32
+        # [P, 64]: the kernel steps rows by stride(0)
+        assert inv_rope_cos_sin_cache.ndim == 2
+        assert inv_rope_cos_sin_cache.shape[1] == 64
+        assert inv_rope_cos_sin_cache.stride(1) == 1
+        assert inv_rope_positions.device == q.device
+        assert inv_rope_cos_sin_cache.device == q.device
+    if out_mxfp8 is not None:
+        assert out is None, "out and out_mxfp8 are mutually exclusive"
+        out_data, out_scale = out_mxfp8
+        assert out_data.dtype == torch.float8_e4m3fn and out_scale.dtype == torch.uint8
+        assert out_data.shape == (num_queries, num_heads * head_dim)
+        assert out_scale.shape == (num_queries, num_heads * head_dim // 32)
+        assert out_data.stride(-1) == 1 and out_scale.stride(-1) == 1
+        assert out_data.device == q.device and out_scale.device == q.device
+
+
 def _pa_decode_sparse_gfx950_gluon(
     q,
     cache,
@@ -864,30 +897,11 @@ def _pa_decode_sparse_gfx950_gluon(
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     inv_rope = inv_rope_positions is not None
-    assert inv_rope == (
-        inv_rope_cos_sin_cache is not None
-    ), "inv_rope_positions and inv_rope_cos_sin_cache go together"
-    assert not (
-        skip_reduce and (inv_rope or out_mxfp8 is not None)
-    ), "the output epilogue runs in the reduce, so skip_reduce cannot be set"
-    if inv_rope:
-        assert inv_rope_positions.shape == (num_queries,)
-        assert inv_rope_positions.stride(0) == 1
-        assert inv_rope_cos_sin_cache.dtype == torch.float32
-        # [P, 64]: the kernel steps rows by stride(0)
-        assert inv_rope_cos_sin_cache.ndim == 2
-        assert inv_rope_cos_sin_cache.shape[1] == ROPE_DIM
-        assert inv_rope_cos_sin_cache.stride(1) == 1
-        assert inv_rope_positions.device == q.device
-        assert inv_rope_cos_sin_cache.device == q.device
+    _check_epilogue(
+        q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8, skip_reduce
+    )
     if out_mxfp8 is not None:
-        assert out is None, "out and out_mxfp8 are mutually exclusive"
         out_data, out_scale = out_mxfp8
-        assert out_data.dtype == torch.float8_e4m3fn and out_scale.dtype == torch.uint8
-        assert out_data.shape == (num_queries, num_heads * head_dim)
-        assert out_scale.shape == (num_queries, num_heads * head_dim // 32)
-        assert out_data.stride(-1) == 1 and out_scale.stride(-1) == 1
-        assert out_data.device == q.device and out_scale.device == q.device
         out = out_data.view(num_queries, num_heads, head_dim)
     else:
         out_scale = None
@@ -1068,6 +1082,7 @@ def _pa_decode_sparse_gfx950_gluon(
         **prefill_kw,
         # The epilogue runs where the output is written.
         **(epilogue if num_splits == 1 else {}),
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -1101,6 +1116,7 @@ def _pa_decode_sparse_gfx950_gluon(
         **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out
 
@@ -1234,7 +1250,7 @@ def _pa_decode_sparse_gfx1250_fp8(
     ``_pa_decode_sparse_gfx950_gluon`` for the reference implementation and
     ``test_pa_decode_sparse_inv_rope_mxfp8_epilogue`` for the expected numerics.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"the DSv4 2buff packed-fp8 path is gfx1250-only, got {DEVICE_ARCH}"
         )

@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
+from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
 __all__ = [
@@ -57,9 +60,23 @@ __all__ = [
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
+    "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i64",
 ]
+
+
+def wait_lds_wave():
+    # A workgroup barrier would deadlock wave-selected branches.
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+
+
+def wave_uniform_i64(addr):
+    v = fx.Uint64(addr)
+    lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
+    hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
+    return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
@@ -178,12 +195,29 @@ def load_v4i32_nt(base_i64, offset):
     return fx.generic_load(_ptr_plus(base_i64, offset, 4), count=4, nontemporal=True)
 
 
+def _device_trap():
+    # s_trap 2 is what llvm.trap lowers to on AMDGPU; it aborts the dispatch.
+    llvm.InlineAsmOp(None, [], "s_trap 2", "", has_side_effects=True)
+
+
 @flyc.jit
-def spin_until_ge_i64(addr_i64, val):
-    """Spin until a monotonic cross-device i64 flag is at least ``val``."""
+def spin_until_ge_i64(addr_i64, val, *, max_iters=0):
+    """Spin until a monotonic cross-device i64 flag is at least ``val``.
+
+    ``max_iters`` > 0 (compile-time, debug) traps the device after that many
+    polls so a missing producer fails instead of hanging; 0 emits no counter.
+    """
     cur = fx.Int64(load_i64_acquire(addr_i64))
-    while cur < fx.Int64(val):
-        cur = fx.Int64(load_i64_acquire(addr_i64))
+    if fx.const_expr(max_iters > 0):
+        polls = fx.Int32(0)
+        while cur < fx.Int64(val):
+            polls = polls + fx.Int32(1)
+            if polls >= fx.Int32(max_iters):
+                _device_trap()
+            cur = fx.Int64(load_i64_acquire(addr_i64))
+    else:
+        while cur < fx.Int64(val):
+            cur = fx.Int64(load_i64_acquire(addr_i64))
     return cur
 
 
@@ -347,6 +381,60 @@ def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
 def atomic_add_agent(addr_i64, val):
     """Agent-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
+
+
+def _llvm_ptr_global(addr_i64):
+    """Raw ``!llvm.ptr<1>`` for LLVM-dialect ops that reject FlyDSL pointers."""
+    return llvm.IntToPtrOp(
+        llvm.PointerType.get(address_space=1), arith.unwrap(fx.Int64(addr_i64))
+    ).result
+
+
+def _av_scope(syncscope):
+    return llvm.MetadataAsValueOp(
+        ir.Attribute.parse(f'#llvm.md_node<#llvm.md_string<"{syncscope}">>')
+    ).result
+
+
+def av_store_b128(addr_i64, val, syncscope="agent"):
+    """Store-available 128-bit global store at ``syncscope``.
+
+    ``llvm.amdgcn.av.store.b128`` makes the payload available at the given
+    scope by itself, which is what an ``amdgcn-av:none`` release relies on.
+    The scope operand must be an MD node wrapping the scope string.
+    """
+    v4i32 = ir.VectorType.get([4], T.i32)
+    data = llvm.BitcastOp(v4i32, arith.unwrap(val)).res
+    llvm.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_llvm_ptr_global(addr_i64), data, _av_scope(syncscope)],
+        [],
+        [],
+    )
+
+
+def atomic_add_agent_acq_rel_av_none(addr_i64, val):
+    """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
+
+    ``!mmra !{"amdgcn-av", "none"}`` removes the release's make-available and
+    the acquire's make-visible steps (no ``buffer_wbl2``/``buffer_inv``); the
+    RMW still synchronizes. Callers must provide payload availability and
+    visibility independently through AV accesses or a documented
+    target-specific cache-policy protocol.
+    """
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add,
+        _llvm_ptr_global(addr_i64),
+        arith.unwrap(val),
+        llvm.AtomicOrdering.acq_rel,
+        syncscope=fx.rocdl.SyncScope.Agent,
+        alignment=4,
+    )
+    op.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
+    return op.res
 
 
 def atomic_add_agent_one_as(addr_i64, val):
