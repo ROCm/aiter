@@ -24,6 +24,7 @@ from codegen.common import (
     reset_written_paths,
     write_if_changed,
 )
+from codegen.template_env import render as render_template
 from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
@@ -399,32 +400,13 @@ def _kargs_template_vars(kernel_tag, kargs_name):
 
 
 # INSTANCE_IMPL building blocks. Host pass needs torch/optional; RTC/device passes skip them.
-_INSTANCE_IMPL_PREAMBLE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"{extra_host_includes}
-#include <optional>
-#endif"""
-
-
 def instance_impl_preamble(extra_host_includes=""):
-    return _INSTANCE_IMPL_PREAMBLE_TEMPLATE.format(
-        extra_host_includes=extra_host_includes
+    return render_template(
+        "instance_impl_preamble.cuh.j2", extra_host_includes=extra_host_includes
     )
 
 
 # Fused host TU sees only traits header + fwd decl; avoids layout-helper ODR clash.
-_INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE = """#ifdef OPUS_FUSED_HOST_TU
-#include "{traits_header}"
-template<typename Traits{fwd_decl_kargs_tpl}>
-__global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);
-#else
-#include "{pipeline_header}"
-#endif"""
-
-
 def instance_impl_host_tu_split(
     traits_header,
     pipeline_header,
@@ -432,7 +414,8 @@ def instance_impl_host_tu_split(
     kernel_func,
     fwd_decl_kargs_fnarg,
 ):
-    return _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE.format(
+    return render_template(
+        "instance_impl_host_tu_split.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
