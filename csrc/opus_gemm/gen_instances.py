@@ -885,25 +885,11 @@ class opus_gemm_codegen:
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
-            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
-            # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
-            # OPUS_FUSED_HOST_TU is NOT defined here) an...
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                "// Auto-generated. Do not edit. See gen_instances.py:_emit_device_tus.\n"
-                "//\n"
-                "// Device-only translation unit for one (kid, dtype) pair.\n"
-                "// Keep both JIT and prebuild host passes on the minimal branch --\n"
-                "// no torch and no full HIP runtime.\n"
-                "#ifndef __HIPCC_RTC__\n"
-                "#define __HIPCC_RTC__ 1\n"
-                "#endif\n"
-                + guard_open
-                + f'#include "impl/{name}.cuh"\n'
-                + row["device_decl"]
-                + guard_close
+            contents = render_template(
+                "device_tu.cu.j2",
+                arch=_kid_name_arch(name),
+                name=name,
+                device_decl=row["device_decl"],
             )
             write_if_changed(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu"),
