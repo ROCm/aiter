@@ -224,7 +224,8 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
         config (Optional[dict]): Kernel tuning parameters, with the keys of
             fused_bf16_bmm_cat_quant_pad_mla. Defaults to the
             FUSED-BF16-BMM-ROPE-CAT-QUANT-PAD-CACHE-MLA config for the shape.
-        q_pe (torch.Tensor): (M, QH, R) bf16 before RoPE. R is a power of two.
+        q_pe (torch.Tensor): (M, QH, R) bf16 before RoPE. R is a power of two
+            and at least 2.
         kv_c (torch.Tensor): (M, L) bf16 compressed KV, L = w_uk_t.shape[-1].
         k_pe (torch.Tensor): (M, R) bf16 key pe before RoPE.
         kv_cache (torch.Tensor): (num_blocks, block_size, L + R) fp8 e4m3 cache.
@@ -252,6 +253,7 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     )
     m, _, d_pe = q_pe.shape
     n = w_uk_t.shape[-1]
+    assert d_pe >= 2, f"RoPE dim {d_pe} must be at least 2"
     assert d_pe == triton.next_power_of_2(d_pe), f"RoPE dim {d_pe} not a power of 2"
     assert kv_c.shape == (m, n), f"bad kv_c shape {kv_c.shape}"
     assert k_pe.shape == (m, d_pe), f"bad k_pe shape {k_pe.shape}"

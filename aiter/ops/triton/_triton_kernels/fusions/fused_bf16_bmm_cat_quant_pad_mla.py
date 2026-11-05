@@ -203,6 +203,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
     bmm_programs = QH * grid_mn
 
     inv_scale = 1.0 / tl.load(scale_ptr).to(tl.float32)
+    offs_d = tl.arange(0, BLOCK_D_PE).to(tl.int64)
 
     if pid < bmm_programs:
         pid_h = pid // grid_mn
@@ -269,7 +270,6 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         pid_h = tl.cast(pid_pe % QH, tl.int64)
         offs_m = (pid_pe // QH) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_om = tl.cast(offs_m, tl.int64)
-        offs_d = tl.arange(0, BLOCK_D_PE)
         row_mask = offs_m < M
         mask = row_mask[:, None] & (offs_d[None, :] < D_PE)
         pe = tl.load(
@@ -318,8 +318,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         # Issue every load before the slot check so their latencies overlap.
         tok_slot = tl.load(slot_ptr + tok).to(tl.int64)
         k_scale = tl.load(k_scale_ptr).to(tl.float32)
-        offs_c = tl.arange(0, BLOCK_N_KV)
-        offs_d = tl.arange(0, BLOCK_D_PE)
+        offs_c = tl.arange(0, BLOCK_N_KV).to(tl.int64)
         kv_c = tl.load(
             kv_c_ptr + tok * stride_kvc_m + offs_c * stride_kvc_d,
             mask=offs_c < N,
