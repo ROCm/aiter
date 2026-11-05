@@ -1236,3 +1236,37 @@ def test_mha_fwd_mid_head_selection(
         batch_heads=batch_heads,
     )
     assert cfg == fwd_cfg[expected]
+
+
+@pytest.mark.parametrize(
+    "enable_dropout, use_fp8, head_dim_v, expected",
+    [
+        (False, True, 256, "fp8_large_head"),  # at the threshold
+        (False, True, 512, "fp8_large_head"),  # above the threshold
+        (False, True, 255, "default"),  # one below the threshold
+        (False, True, 128, "default"),  # fp8 but head dim too small
+        (False, False, 256, "default"),  # bf16 at the same head dim: unaffected
+        (True, True, 256, "dropout_or_fp32"),  # dropout still takes precedence
+    ],
+)
+def test_mha_fwd_fp8_large_head_selection(
+    enable_dropout, use_fp8, head_dim_v, expected
+):
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+
+    fwd_cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
+    )["fwd"]
+    if get_arch() != "gfx942":
+        # Arches without fp8_large_head keep the pre-existing selection.
+        assert "fp8_large_head" not in fwd_cfg
+        pytest.skip("fp8_large_head is only defined for gfx942")
+    dtype = get_fp8_dtypes()[1] if use_fp8 else torch.bfloat16
+    cfg = _get_config(enable_dropout, dtype, head_dim_v=head_dim_v)
+    assert cfg == fwd_cfg[expected]
