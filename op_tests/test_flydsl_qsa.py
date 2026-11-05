@@ -2798,6 +2798,187 @@ def test_paged_gqa_two_prompt_prefill_matches_oracle():
         )
 
 
+def test_one_column_page_table_then_wider_matches_oracle():
+    """A width-1 page table must not pin the plan a later wider table uses.
+
+    This process launches ``[n_req, 1]`` first and ``[n_req, P]`` second,
+    through the indexer and through paged GQA. Both results are compared
+    to the fp32 oracle. A stuck compile reads request ``r >= 1`` at
+    ``r + p`` and returns the other request's pages without raising.
+
+    The indexer page holds 1024 blocks, so one column is already past the
+    emit cutoff. Emit only checks that a page id is in range and would
+    still write the logical block. Both indexer launches gather K on the
+    same scorer.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        pytest.skip("unsupported arch")
+    device = torch.device("cuda")
+    idx = FLASH_NEXT_INDEXER
+    # One column of this page is 1024 blocks, above emit's 512 cutoff.
+    index_page = 1024
+    if index_page <= _K:
+        raise AssertionError(f"indexer page of {index_page} blocks still emits")
+
+    def index_keys(n_blocks, hot_start):
+        keys = torch.zeros(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+        keys[hot_start : hot_start + _K] = 1
+        return keys
+
+    def run_indexer(n_blocks, what):
+        # Request 0's winning blocks sit on its last page. Request 1's sit
+        # on its first page, which a stuck row stride reads from request 0.
+        k_bars = (
+            index_keys(n_blocks, n_blocks - _K),
+            index_keys(n_blocks, 0),
+        )
+        caches, rows, base = [], [], 0
+        for k_bar in k_bars:
+            cache, table = pack_paged_cache(k_bar.unsqueeze(1), index_page)
+            caches.append(cache)
+            rows.append(table[0] + base)
+            base += int(cache.shape[0])
+        width = max(int(row.numel()) for row in rows)
+        page_table = torch.zeros(len(rows), width, dtype=dtypes.i32, device=device)
+        for req, row in enumerate(rows):
+            page_table[req, : row.numel()] = row
+        seq_len = n_blocks * idx.compress_ratio
+        q = torch.ones(
+            len(k_bars), idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        slen = torch.full((len(k_bars),), seq_len, dtype=dtypes.i32, device=device)
+        qpos = slen - 1
+        token_to_req = torch.arange(len(k_bars), dtype=dtypes.i32, device=device)
+        refs = []
+        for req, k_bar in enumerate(k_bars):
+            one = torch.zeros(1, dtype=dtypes.i32, device=device)
+            refs.append(
+                qsa_topk_blocks(
+                    qsa_indexer_scores(
+                        q[req : req + 1],
+                        k_bar,
+                        qpos[req : req + 1],
+                        slen[req : req + 1],
+                        one,
+                        idx.compress_ratio,
+                        score_scale=FLASH_NEXT_SCORE_SCALE,
+                    ),
+                    idx.block_budget,
+                )
+            )
+        got = qsa_indexer_block_ids(
+            q,
+            torch.cat(caches),
+            page_table,
+            token_to_req,
+            qpos,
+            slen,
+            heads=(idx.n_heads,),
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        )
+        _assert_indexer_block_ids(torch.cat(refs), got, what)
+        return page_table
+
+    narrow = run_indexer(index_page, "indexer width-1 page table diverged")
+    if tuple(narrow.shape) != (2, 1) or narrow.stride() != (1, 1):
+        raise AssertionError(
+            f"indexer width-1 table is {tuple(narrow.shape)} stride {narrow.stride()}"
+        )
+    wide = run_indexer(index_page * 2, "indexer multi-page table diverged")
+    if wide.shape[0] < 2 or wide.shape[1] < 2 or wide.stride()[0] == 1:
+        raise AssertionError(
+            f"indexer wider table is {tuple(wide.shape)} stride {wide.stride()}"
+        )
+
+    gqa = FLASH_NEXT_GQA
+    page_size = 16
+    width = 8
+
+    def run_gqa(seq_len, what):
+        torch.manual_seed(0)
+        gen = torch.Generator(device=device)
+        gen.manual_seed(2)
+        q_rows, k_rows, v_rows = [], [], []
+        k_caches, v_caches, table_rows = [], [], []
+        base = 0
+        # Distinct V per request: the wrong page is a different output.
+        for value in (1.0, 2.0):
+            q_rows.append(
+                torch.randn(
+                    1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+                )
+            )
+            k = torch.randn(
+                seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+            )
+            v = torch.full(
+                (seq_len, gqa.kv_heads, gqa.head_dim),
+                value,
+                dtype=dtypes.bf16,
+                device=device,
+            )
+            k_cache, table = pack_paged_cache(k, page_size, generator=gen)
+            v_cache, table_v = pack_paged_cache(v, page_size, physical=table[0])
+            if not torch.equal(table, table_v):
+                raise AssertionError("K and V page tables diverged")
+            k_rows.append(k)
+            v_rows.append(v)
+            k_caches.append(k_cache)
+            v_caches.append(v_cache)
+            table_rows.append(table[0] + base)
+            base += int(k_cache.shape[0])
+        page_width = max(int(row.numel()) for row in table_rows)
+        page_table = torch.zeros(
+            len(table_rows), page_width, dtype=dtypes.i32, device=device
+        )
+        for req, row in enumerate(table_rows):
+            page_table[req, : row.numel()] = row
+        q = torch.cat(q_rows, dim=0)
+        # Tokens 0..7 sit on page 0. Request 1's page 0 is the stuck read.
+        indices = torch.arange(width, device=device, dtype=dtypes.i32).repeat(
+            len(table_rows), 1
+        )
+        token_to_req = torch.arange(len(table_rows), device=device, dtype=dtypes.i32)
+        ref = torch.cat(
+            [
+                sparse_gqa_ref(
+                    q[req : req + 1], k_rows[req], v_rows[req], indices[req : req + 1]
+                )
+                for req in range(len(table_rows))
+            ],
+            dim=0,
+        )
+        out = flydsl_qsa_paged_gqa(
+            q,
+            torch.cat(k_caches),
+            torch.cat(v_caches),
+            indices,
+            page_table,
+            token_to_req,
+        )
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=what,
+        )
+        if err != 0:
+            raise AssertionError(f"{what} (err={err})")
+        return page_table
+
+    narrow = run_gqa(page_size, "paged GQA width-1 page table diverged")
+    if tuple(narrow.shape) != (2, 1) or narrow.stride() != (1, 1):
+        raise AssertionError(
+            f"paged GQA width-1 table is {tuple(narrow.shape)} stride {narrow.stride()}"
+        )
+    wide = run_gqa(page_size * 2, "paged GQA multi-page table diverged")
+    if wide.shape[0] < 2 or wide.shape[1] < 2 or wide.stride()[0] == 1:
+        raise AssertionError(
+            f"paged GQA wider table is {tuple(wide.shape)} stride {wide.stride()}"
+        )
+
+
 def test_paged_gqa_page_past_4gib():
     """A physical page at byte offset 2^32 must not alias page 0.
 

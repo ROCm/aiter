@@ -58,7 +58,8 @@ from .kernels.qsa.sparse_gqa import (
     _paged_gqa_lds_reason,
     build_qsa_sparse_gqa_module,
 )
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled as _dispatch_compiled
+from .kernels.topk.topk_launch import _launch_key
 from .kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
@@ -66,6 +67,22 @@ from .topk.topk_per_row import (
     _ONE_WORKGROUP_MAX_ROW_WIDTH,
     flydsl_top_k_per_row_decode,
 )
+
+
+def _run_compiled(exe, *args, specialization_key=None):
+    """Dispatch one compiled kernel per tensor layout of this plan.
+
+    ``_dispatch_compiled`` keeps the first build when ``specialization_key``
+    is left unset. FlyDSL freezes the first axis whose stride is 1 and
+    leaves every other stride dynamic, so a contiguous ``[n, 1]`` table
+    (strides ``(1, 1)``) makes a later ``[n, P]`` table read ``r + p``.
+    ``_launch_key`` is the dtype, rank, and that axis, the same record
+    TopK passes for its own launches.
+    """
+    if specialization_key is None:
+        specialization_key = _launch_key(args)
+    _dispatch_compiled(exe, *args, specialization_key=specialization_key)
+
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
