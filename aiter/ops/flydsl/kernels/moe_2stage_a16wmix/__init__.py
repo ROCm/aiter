@@ -74,6 +74,7 @@ def flydsl_a16w4_gemm1(
     w_dtype="fp4",
     w_layout="standard",
     activation_bf16=False,
+    prefetch=1,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
@@ -152,6 +153,7 @@ def flydsl_a16w4_gemm1(
         k_wave=k_wave,
         activation_bf16=activation_bf16,
         rocm_arch=str(get_rocm_arch()),
+        prefetch=prefetch,
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -395,6 +397,9 @@ def flydsl_a16w4_moe(
         or model_dim % tiles.stage1_k
         or model_dim % tiles.stage2_n
         or inter_dim % tiles.stage2_k
+        or tiles.stage1_k_wave not in (1, 2, 4)
+        or model_dim % (tiles.stage1_k_wave * tiles.stage1_k)
+        or tiles.stage1_prefetch not in (1, 2, 3, 4)
     ):
         raise ValueError("tile pair does not divide the physical MoE dimensions")
     sorted_ids, sorted_weights, sorted_experts, cumsum, _ = moe_sorting(
@@ -446,6 +451,8 @@ def flydsl_a16w4_moe(
         tile_m=tiles.block_m,
         tile_n=tiles.stage1_n,
         tile_k=tiles.stage1_k,
+        k_wave=tiles.stage1_k_wave,
+        prefetch=tiles.stage1_prefetch,
         act="silu_clamped",
         activation_bf16=activation_bf16,
         swiglu_limit=swiglu_limit,

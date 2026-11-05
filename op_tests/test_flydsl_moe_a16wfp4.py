@@ -208,13 +208,40 @@ def test_a16w4_policy_csv_validation(tmp_path):
         policy._load_tuned_tiles(path)
 
 
+def test_a16w4_policy_optional_stage1_columns(tmp_path):
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    header = (
+        "gfx,cu_num,token,hidden_dim,inter_dim,logical_inter,experts,topk,"
+        "swiglu_limit,act,activation_bf16,w_dtype,w_layout,block_m,stage1_n,"
+        "stage1_k,stage2_n,stage2_k,reuse_lds"
+    )
+    row = "gfx942,304,1,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,32,128,256,128,0"
+    path = tmp_path / "tiles.csv"
+    path.write_text(f"{header}\n{row}\n", encoding="utf-8")
+    (legacy,) = policy._load_tuned_tiles(path).values()
+    assert (legacy.stage1_k_wave, legacy.stage1_prefetch) == (1, 1)
+    path.write_text(
+        f"{header},stage1_k_wave,stage1_prefetch\n{row},2,3\n", encoding="utf-8"
+    )
+    (tiles,) = policy._load_tuned_tiles(path).values()
+    assert tiles == policy.A16W4Tiles(16, 32, 128, 256, 128, False, 2, 3)
+    for k_wave, prefetch in (("3", "1"), ("2", "0"), ("1", "5")):
+        path.write_text(
+            f"{header},stage1_k_wave,stage1_prefetch\n{row},{k_wave},{prefetch}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="semantics"):
+            policy._load_tuned_tiles(path)
+
+
 def test_a16w4_policy_decode_entry_and_boundaries(monkeypatch):
     from aiter.jit.utils import chip_info
     from aiter.ops.flydsl import moe_a16w4_policy as policy
 
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
-    for token_num in (7, 8, 9, 31, 32, 33, 1024, 4096):
+    for token_num in (1, 2, 7, 8, 9, 31, 32, 33, 1024, 4096):
         selected = policy.get_a16w4_tuned_tiles(
             token_num,
             5120,
@@ -226,11 +253,11 @@ def test_a16w4_policy_decode_entry_and_boundaries(monkeypatch):
             activation_bf16=True,
             swiglu_limit=10.0,
         )
-        expected = None
-        if token_num == 8:
-            expected = policy.A16W4Tiles(16, 64, 128, 256, 128, True)
-        elif token_num == 32:
-            expected = policy.A16W4Tiles(16, 128, 128, 256, 128, True)
+        expected = {
+            1: policy.A16W4Tiles(16, 32, 128, 256, 128, False, 4, 1),
+            8: policy.A16W4Tiles(16, 64, 256, 128, 128, True, 1, 4),
+            32: policy.A16W4Tiles(16, 32, 128, 128, 128, True, 2, 3),
+        }.get(token_num)
         assert selected == expected
 
 
@@ -697,6 +724,102 @@ def test_stage1_clamped_silu(token, activation_bf16):
     )
 
 
+@pytest.mark.parametrize(
+    "prefetch,arch,weight_dtype",
+    [
+        (0, "gfx942", "fp4"),
+        (5, "gfx942", "fp4"),
+        (2, "gfx950", "fp4"),
+        (2, "gfx942", "int4"),
+        (2, "gfx942", "bf16"),
+    ],
+)
+def test_compile_stage1_prefetch_scope(prefetch, arch, weight_dtype):
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1 import (
+        compile_gemm1_a16w4_port,
+    )
+
+    with pytest.raises(AssertionError, match="prefetch"):
+        compile_gemm1_a16w4_port(
+            BM=16,
+            D_HIDDEN=1024,
+            D_INTER=256,
+            NE=8,
+            TOPK=6,
+            TILE_N=64,
+            TILE_K=128,
+            w_dtype=weight_dtype,
+            rocm_arch=arch,
+            prefetch=prefetch,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="gfx942 VGPR-staged pipeline")
+@pytest.mark.parametrize("token", [1, 8, 33])
+@pytest.mark.parametrize(
+    "tile_m,tile_n,tile_k,k_wave",
+    [(16, 64, 256, 1), (32, 128, 256, 1), (16, 32, 128, 2)],
+)
+@pytest.mark.parametrize("prefetch", [2, 3, 4])
+def test_stage1_prefetch_is_bitwise(token, tile_m, tile_n, tile_k, k_wave, prefetch):
+    model_dim, inter_dim, experts, topk = 1024, 256, 8, 6
+    torch.manual_seed(23)
+    hidden = torch.randn((token, model_dim), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(
+        (experts, 2 * inter_dim, model_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    weight[:, 192:inter_dim] = 0
+    weight[:, inter_dim + 192 :] = 0
+    packed, scales = aiter.get_torch_quant(QuantType.per_1x32)(
+        weight, quant_dtype=dtypes.fp4x2
+    )
+    packed = packed.view(experts, 2 * inter_dim, model_dim // 2)
+    scales = scales.view(-1, model_dim // 32)
+    routing_ids = torch.randn((token, experts), device="cuda").topk(topk).indices
+    routing_weights = torch.rand((token, topk), device="cuda")
+    sorted_ids, _, sorted_experts, cumsum, _ = moe_sorting(
+        routing_ids.to(torch.int32),
+        routing_weights,
+        experts,
+        model_dim,
+        dtypes.bf16,
+        tile_m,
+    )
+    outputs = []
+    for depth in (1, prefetch):
+        output = torch.full(
+            (sorted_experts.numel() * tile_m, inter_dim),
+            -123.0,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        flydsl_a16w4_gemm1(
+            a_bf16=hidden,
+            w1_u8=shuffle_weight_a16w4(packed, 16, False).view(torch.uint8),
+            w1_scale_u8=shuffle_scale_a16w4(scales, experts, False).view(torch.uint8),
+            sorted_expert_ids=sorted_experts,
+            cumsum_tensor=cumsum,
+            m_indices=sorted_ids,
+            inter_sorted_bf16=output,
+            n_tokens=token,
+            NE=experts,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            k_wave=k_wave,
+            act="silu_clamped",
+            activation_bf16=True,
+            swiglu_limit=10.0,
+            prefetch=depth,
+        )
+        outputs.append(output)
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
 def _pack_mxfp4_reference(weight):
     experts, rows, columns = weight.shape
     packed, scales = _quantize_mxfp4_by_expert(weight)
@@ -956,7 +1079,7 @@ def test_moe_clamped_silu(token, tile_m, reuse_lds):
 
 
 @_SKIP
-@pytest.mark.parametrize("token", [8, 32])
+@pytest.mark.parametrize("token", [1, 8, 32])
 def test_moe_csv_real_shape(token):
     selected = get_a16w4_tuned_tiles(
         token,
@@ -970,7 +1093,11 @@ def test_moe_csv_real_shape(token):
         swiglu_limit=10.0,
     )
     if get_gfx() == "gfx942" and get_cu_num() == 304:
-        expected = A16W4Tiles(16, 64 if token == 8 else 128, 128, 256, 128, True)
+        expected = {
+            1: A16W4Tiles(16, 32, 128, 256, 128, False, 4, 1),
+            8: A16W4Tiles(16, 64, 256, 128, 128, True, 1, 4),
+            32: A16W4Tiles(16, 32, 128, 128, 128, True, 2, 3),
+        }[token]
         assert selected == expected
     else:
         assert selected is None

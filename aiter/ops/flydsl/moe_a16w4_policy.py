@@ -12,6 +12,8 @@ class A16W4Tiles(NamedTuple):
     stage2_n: int
     stage2_k: int
     reuse_lds: bool = False
+    stage1_k_wave: int = 1
+    stage1_prefetch: int = 1
 
 
 def _load_tuned_tiles(path: Path) -> dict[tuple, A16W4Tiles]:
@@ -28,6 +30,8 @@ def _load_tuned_tiles(path: Path) -> dict[tuple, A16W4Tiles]:
                 or row["w_dtype"] != "fp4"
                 or row["w_layout"] != "standard"
                 or row["reuse_lds"] not in ("0", "1")
+                or row.get("stage1_k_wave", "1") not in ("1", "2", "4")
+                or row.get("stage1_prefetch", "1") not in ("1", "2", "3", "4")
             ):
                 raise ValueError("Unsupported A16W4 CSV semantics")
             key = (
@@ -60,6 +64,8 @@ def _load_tuned_tiles(path: Path) -> dict[tuple, A16W4Tiles]:
                     )
                 ),
                 row["reuse_lds"] == "1",
+                int(row.get("stage1_k_wave", "1")),
+                int(row.get("stage1_prefetch", "1")),
             )
     return entries
 
