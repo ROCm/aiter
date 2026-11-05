@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Auto-generated. See gen_instances.py.
+#pragma once
+[% for arch in arches %]#define OPUS_BUILD_HAS_[[ arch ]] 1
+[% endfor %]

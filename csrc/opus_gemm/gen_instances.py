@@ -1362,11 +1362,8 @@ if __name__ == "__main__":
     Path(args.working_path).mkdir(parents=True, exist_ok=True)
     write_if_changed(
         os.path.join(args.working_path, "opus_build_archs.h"),
-        "// SPDX-License-Identifier: MIT\n"
-        "// Auto-generated. See gen_instances.py.\n"
-        "#pragma once\n"
-        + "".join(
-            f"#define OPUS_BUILD_HAS_{gfx.upper()} 1\n" for gfx in sorted(target_arches)
+        render_template(
+            "opus_build_archs.h.j2", arches=sorted(g.upper() for g in target_arches)
         ),
     )
     print(
