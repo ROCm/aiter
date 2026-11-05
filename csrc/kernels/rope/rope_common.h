@@ -8127,7 +8127,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     access_id_in_head;
                 out_kv_vec.store(k_out + k_out_offset);
             }
-            // Compile-time gate: a runtime null check here changed fp16 rounding of the off path.
+            // Only HAS_K_UNQUANT instantiations store k_out_unquantized; others keep base codegen.
             if constexpr(HAS_K_UNQUANT)
             {
                 const int64_t k_out_offset =
