@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 import os
 import warnings
@@ -12,6 +13,9 @@ import triton.language as tl
 from packaging.version import Version
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _MIN_PIPE_BLOCKS as _GLUON_MIN_PIPE_BLOCKS,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
@@ -53,6 +57,22 @@ def is_gluon_available() -> bool:
         return False
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+@functools.cache
+def is_gluon_async_copy_ok(
+    head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+) -> bool:
+    """True when the Gluon kernel can async-copy every K/V tile of this launch.
+
+    A pure function of the launch shape; the kernel's constexpr_function costs
+    tens of microseconds per call from host code, so make it cached.
+    """
+    return bool(
+        _gluon_kv_async_copy_ok(
+            head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+        )
+    )
 
 
 _MHA_BACKENDS = ("triton", "gluon")
@@ -463,16 +483,6 @@ def _gluon_flash_attn_forward(
             return 0
         return math.gcd(16, *strides[:3])
 
-    def _copy_ok(align):
-        return _gluon_kv_async_copy_ok(
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE_POW2,
-            BLOCK_N,
-            config["num_warps"],
-            k.element_size() * 8,
-            align,
-        )
-
     def _contiguous(t):
         # clone, not .contiguous(): a contiguous view at a misaligned offset has to
         # move too, and .contiguous() would hand it back unchanged.
@@ -481,18 +491,25 @@ def _gluon_flash_attn_forward(
             return t, (0, t.stride(1), t.stride(0), t.stride(2))
         return t, (t.stride(0), t.stride(2), t.stride(1), t.stride(3))
 
+    kv_async_args = (
+        BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE_POW2,
+        BLOCK_N,
+        config["num_warps"],
+        k.element_size() * 8,
+    )
     # Checked per tensor, so only the one that fails is copied.  The copy predicate
     # only gets easier as the alignment grows, so two passing tensors pass together.
     k_align = _stride_align(k, k_strides)
-    if not _copy_ok(k_align):
+    if not is_gluon_async_copy_ok(*kv_async_args, k_align):
         k, k_strides = _contiguous(k)
         k_align = _stride_align(k, k_strides)
     v_align = _stride_align(v, v_strides)
-    if not _copy_ok(v_align):
+    if not is_gluon_async_copy_ok(*kv_async_args, v_align):
         v, v_strides = _contiguous(v)
         v_align = _stride_align(v, v_strides)
     kv_stride_align = min(k_align, v_align)
-    assert _copy_ok(kv_stride_align), (
+    assert is_gluon_async_copy_ok(*kv_async_args, kv_stride_align), (
         f"Gluon MHA cannot async-copy K/V for head_dim={v_head_dim}, "
         f"BLOCK_N={BLOCK_N}, num_warps={config['num_warps']}"
     )
@@ -507,6 +524,16 @@ def _gluon_flash_attn_forward(
     # Eager FP8 keeps runtime lengths and scale to avoid register spills.
     # Other modes specialize them to simplify the dense pipeline.
     specialize = not IS_FP8 or bool(config.get("LAZY_RESCALE_THRESHOLD"))
+    # Causal lazy rescale with constant lengths spills on a Q/K head of 128+, so
+    # pass runtime lengths when the pipelined loop runs.  Windows and short K stay
+    # faster with constants.
+    specialize_seqlen = specialize and not (
+        causal
+        and sliding_window < 0
+        and qk_head_dim >= 128
+        and bool(config.get("LAZY_RESCALE_THRESHOLD"))
+        and seqlen_k_max >= _GLUON_MIN_PIPE_BLOCKS.value * BLOCK_N + BLOCK_M
+    )
     _gluon_attn_fwd[grid](
         q,
         k,
@@ -521,8 +548,8 @@ def _gluon_flash_attn_forward(
         gl.constexpr(sm_scale) if specialize else sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        gl.constexpr(seqlen_q) if specialize else seqlen_q,
-        gl.constexpr(seqlen_k) if specialize else seqlen_k,
+        gl.constexpr(seqlen_q) if specialize_seqlen else seqlen_q,
+        gl.constexpr(seqlen_k) if specialize_seqlen else seqlen_k,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -552,10 +579,11 @@ def _gluon_flash_attn_forward(
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         KV_STRIDE_ALIGN=kv_stride_align,
-        # FP16 can scale Q once when the multiplier cannot overflow its range.
-        # FP8 retains the scale in FP32 to avoid another low-precision conversion.
-        SCALE_ON_Q=not IS_FP8
-        and (q.dtype != torch.float16 or abs(sm_scale) <= math.log(2.0)),
+        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
+        # into fp8 would throw away far more than the multiply costs.  So does fp16:
+        # q*scale can leave its range where the fp32 scores would not -- overflow
+        # for a large scale, underflow to zero for a small q times a small scale.
+        SCALE_ON_Q=not IS_FP8 and q.dtype != torch.float16,
         **config,
         enable_fp_fusion=True,
     )

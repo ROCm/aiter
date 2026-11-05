@@ -55,6 +55,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import warp_pipeline_stage
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
+from triton.language import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
@@ -363,6 +364,7 @@ class MhaConfig:
     dotK: gl.constexpr
     dotP: gl.constexpr
     dotV: gl.constexpr
+    p_scale: gl.constexpr  # fp8: e8m0 A-scale of P@V, see `_fp8_p_shift`
     kt_shared: gl.constexpr
     v_shared: gl.constexpr
     kpe_shared: gl.constexpr
@@ -430,9 +432,7 @@ class MhaConfig:
         self.SCALE_ON_Q = gl.constexpr(SCALE_ON_Q)
         self.RETURN_SCORES = gl.constexpr(RETURN_SCORES)
         self.LAZY_THRESHOLD = gl.constexpr(LAZY_THRESHOLD)
-        self.P_LIFT = gl.constexpr(
-            _FP8_P_LIFT.value - LAZY_THRESHOLD if IS_FP8 else 0.0
-        )
+        self.P_LIFT = gl.constexpr(_FP8_P_LIFT.value if IS_FP8 else 0.0)
         self.DTYPE = gl.constexpr(DTYPE)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.BUF_DEPTH = gl.constexpr(2)
@@ -449,6 +449,11 @@ class MhaConfig:
         )
         self.dotV = gl.constexpr(
             gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=pv_k_width)
+        )
+        self.p_scale = gl.constexpr(
+            gl.amd.cdna4.get_mfma_scale_layout(self.dotP, [BLOCK_M, BLOCK_N // 32])
+            if IS_FP8
+            else None
         )
         self.kt_shared = gl.constexpr(kt_shared)
         self.v_shared = gl.constexpr(v_shared)
@@ -725,16 +730,45 @@ class ScoresOut:
 # 3. Per-tile math
 # ---------------------------------------------------------------------------
 
-# FP8 uses P_LIFT = 8.8 - LAZY_THRESHOLD to keep the numerator below 448.
-# The lift cancels in acc / l and is removed from LSE in the epilogue.
+# fp8 lifts P onto e4m3's range: exp2(s - m + P_LIFT) <= exp2(P_LIFT), with
+# log2(448) less a hair so exp2 rounding never carries P past e4m3's largest
+# value.  The row sum carries the same factor, so it cancels in acc / l; only the
+# LSE takes it back out.  `_fp8_p_shift` keeps the bound when m is not the tile's
+# max.
 _FP8_P_LIFT = gl.constexpr(8.8)
 
 
 @gluon.jit
-def _mma(a, b, acc, IS_FP8: gl.constexpr):
-    """One MFMA chain step: `mfma`, or e4m3 `mfma_scaled` without scales."""
+def _fp8_p_shift(tile_max, m):
+    """Whole log2 steps from `m` up to this tile's row max, for an fp8 P tile.
+
+    Taking exp2 against `m + shift` puts each row's largest P at the top of
+    e4m3's range whichever side of the tile `m` sits: above it (a tile well below
+    the running max would otherwise round its P into e4m3's subnormals, or to
+    zero) or, with lazy rescale, up to LAZY_THRESHOLD below it (P would overflow).
+    The P@V MFMA multiplies P back by 2**shift through its e8m0 A-scale, and the
+    row sum takes the same factor, so the shift costs no accumulator pass.
+    """
+    # The floor keeps a fully masked row (tile max -inf) finite: its P is then 0
+    # rather than exp2(-inf + inf).  A tile 2**-64 below the max adds nothing.
+    return gl.maximum(gl.ceil(tile_max - m), -64.0)
+
+
+@gluon.jit
+def _fp8_p_scale(cfg, unshift):
+    """`unshift = 2**p_shift` per row, as the e8m0 A-scale of the P@V MFMA.  A
+    positive power of two's fp32 exponent field is exactly its e8m0 encoding."""
+    e8m0 = (unshift.to(gl.int32, bitcast=True) >> 23).to(gl.uint8)
+    e8m0 = gl.convert_layout(e8m0, gl.SliceLayout(1, cfg.p_scale))
+    shape: gl.constexpr = [cfg.BLOCK_M, cfg.BLOCK_N // 32]
+    return gl.broadcast(e8m0[:, None], gl.zeros(shape, gl.uint8, cfg.p_scale))[0]
+
+
+@gluon.jit
+def _mma(a, b, acc, IS_FP8: gl.constexpr, a_scale=None):
+    """One MFMA chain step: `mfma`, or e4m3 `mfma_scaled` with an optional A-scale."""
     if IS_FP8:
-        return gl.amd.cdna4.mfma_scaled(a, None, "e4m3", b, None, "e4m3", acc)
+        return gl.amd.cdna4.mfma_scaled(a, a_scale, "e4m3", b, None, "e4m3", acc)
     else:
         return gl.amd.cdna4.mfma(a, b, acc)
 
@@ -750,10 +784,14 @@ def _dot_qk(cfg, q, q_pe, k, k_pe):
 
 @gluon.jit
 def _dot_pv(cfg, p_dot, v, v_hi, acc, acc2):
-    """P@V for one tile, into `acc` and, on a split P@V, `acc2`."""
-    acc = _mma(p_dot, v, acc, cfg.IS_FP8)
+    """P@V for one tile, into `acc` and, on a split P@V, `acc2`.  fp8's `p_dot`
+    is a pair: P and its `_fp8_p_scale`."""
+    p_scale = None
+    if cfg.IS_FP8:
+        p_dot, p_scale = p_dot
+    acc = _mma(p_dot, v, acc, cfg.IS_FP8, p_scale)
     if cfg.D_HI_PV > 0:
-        acc2 = _mma(p_dot, v_hi, acc2, cfg.IS_FP8)
+        acc2 = _mma(p_dot, v_hi, acc2, cfg.IS_FP8, p_scale)
     return acc, acc2
 
 
@@ -831,20 +869,24 @@ def _attn_softmax_pv(
 def _attn_softmax_pv_fp8(
     cfg, sd, acc, l_i, m_i, qk, v, qk_scale, offs_n, start_n, seqlen_k
 ):
-    """`_attn_softmax_pv` for e4m3: `qk` unscaled, P lifted by `_FP8_P_LIFT`."""
-    m_ij = gl.maximum(m_i, gl.max(qk, 1) * qk_scale)
-    p = gl.exp2(gl.fma(qk, qk_scale, cfg.P_LIFT - m_ij[:, None]))
+    """`_attn_softmax_pv` for e4m3: `qk` unscaled, P lifted by `_FP8_P_LIFT` and
+    shifted by `_fp8_p_shift`."""
+    tile_max = gl.max(qk, 1) * qk_scale
+    m_ij = gl.maximum(m_i, tile_max)
+    p_shift = _fp8_p_shift(tile_max, m_ij)
+    p = gl.exp2(gl.fma(qk, qk_scale, cfg.P_LIFT - (m_ij + p_shift)[:, None]))
     alpha = gl.exp2(m_i - m_ij)
-    l_ij = gl.sum(p, 1)
+    unshift = gl.exp2(p_shift)
+    l_ij = gl.sum(p, 1) * unshift
 
     if cfg.RETURN_SCORES:
-        sd.store(p, start_n, offs_n, seqlen_k, cfg.P_LIFT)
+        sd.store(p * unshift[:, None], start_n, offs_n, seqlen_k, cfg.P_LIFT)
 
     acc = acc * alpha[:, None]
     p = gl.convert_layout(
         p.to(v.dtype), layout=cfg.dotP, assert_trivial=v.dtype != gl.float32
     )
-    acc = _mma(p, v, acc, True)
+    acc = _mma(p, v, acc, True, _fp8_p_scale(cfg, unshift))
     l_i = l_i * alpha + l_ij
     return acc, l_i, m_ij
 
@@ -908,26 +950,45 @@ def _softmax_exp(qk, m, qk_scale, SCALE_ON_Q: gl.constexpr, P_LIFT: gl.constexpr
     return gl.exp2(gl.fma(qk, qk_scale, P_LIFT - m[:, None]))
 
 
+_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+
+
+@gluon.jit
+def _nan_max(a, b):
+    return gl.maximum(a, b, propagate_nan=_NAN_ALL)
+
+
 @gluon.jit
 def _sc_vec1(cfg, qk, m_run, qk_scale):
     """Compute the row max and five eighths of the softmax numerator."""
+    # The NaN-propagating max lowers to v_maximum3 alone; the default one also
+    # emits canonicalizing v_max copies inside the dot cluster.
     if cfg.SCALE_ON_Q:
-        tile_max = gl.max(qk, 1)
+        tile_max = gl.reduce(qk, 1, _nan_max)
     else:
-        tile_max = gl.max(qk, 1) * qk_scale
-    m_new = gl.maximum(m_run, tile_max)
+        tile_max = gl.reduce(qk, 1, _nan_max) * qk_scale
+    m_new = gl.maximum(m_run, tile_max, propagate_nan=_NAN_ALL)
     if cfg.LAZY_THRESHOLD > 0:
         m_new = gl.where(m_new - m_run > cfg.LAZY_THRESHOLD, m_new, m_run)
+    m_exp = m_new
+    if cfg.IS_FP8:
+        # `_fp8_p_shift` without its clamp, which costs ~1% here: these tiles are
+        # unmasked, so the difference is finite.  A tile so far below the max
+        # that 2**shift underflows contributes nothing either way.
+        p_shift = gl.ceil(tile_max - m_new)
+        m_exp = m_new + p_shift
     if cfg.LAZY_THRESHOLD > 0 and qk.shape[1] >= 64:
         q_lo, q_hi = _split_columns(qk)
         q_a, q_b = _split_columns(q_hi)
         q4, q5 = _split_columns(q_a)
         q6, q7 = _split_columns(q_b)
-        p_lo = _softmax_exp(q_lo, m_new, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
-        p4 = _softmax_exp(q4, m_new, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
+        p_lo = _softmax_exp(q_lo, m_exp, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
+        p4 = _softmax_exp(q4, m_exp, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
         p = (p_lo, p4, q5, q6, q7, m_new)
     else:
-        p = _softmax_exp(qk, m_new, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
+        p = _softmax_exp(qk, m_exp, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
+    if cfg.IS_FP8:
+        p = (p, p_shift)
     alpha = gl.exp2(m_run - m_new)
     return m_new, p, alpha
 
@@ -935,8 +996,13 @@ def _sc_vec1(cfg, qk, m_run, qk_scale):
 @gluon.jit
 def _sc_vec2(cfg, acc, acc2, l_i, p, alpha, qk_scale):
     """Finish the numerator, update the sum, and prepare the PV operand."""
+    if cfg.IS_FP8:
+        p, p_shift = p
     if cfg.LAZY_THRESHOLD > 0 and cfg.BLOCK_N >= 64:
+        # Carrying m rather than m + shift reuses the loop's running max register.
         p_lo, p4, q5, q6, q7, m = p
+        if cfg.IS_FP8:
+            m = m + p_shift
         p5 = _softmax_exp(q5, m, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
         p6 = _softmax_exp(q6, m, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
         p7 = _softmax_exp(q7, m, qk_scale, cfg.SCALE_ON_Q, cfg.P_LIFT)
@@ -948,8 +1014,16 @@ def _sc_vec2(cfg, acc, acc2, l_i, p, alpha, qk_scale):
         if cfg.D_HI_PV > 0:
             acc2 *= alpha[:, None]
         l_i *= alpha
-    l_i += gl.sum(p, axis=1)
-    p_dot = gl.convert_layout(p.to(cfg.DTYPE), cfg.dotP)
+    if cfg.IS_FP8:
+        unshift = gl.exp2(p_shift)
+        l_i += gl.sum(p, axis=1) * unshift
+        p_dot = (
+            gl.convert_layout(p.to(cfg.DTYPE), cfg.dotP),
+            _fp8_p_scale(cfg, unshift),
+        )
+    else:
+        l_i += gl.sum(p, axis=1)
+        p_dot = gl.convert_layout(p.to(cfg.DTYPE), cfg.dotP)
     return acc, acc2, l_i, p_dot
 
 
@@ -1214,6 +1288,15 @@ def _remap_xcd(
 
 
 @gluon.jit
+def _rows(cfg, start_m):
+    """This M-block's query rows, in the MFMA row layout.  Rebuilt at each use
+    rather than kept: a value live across the pipelined K loop gets spilled."""
+    return start_m * cfg.BLOCK_M + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma)
+    )
+
+
+@gluon.jit
 def _load_q(
     cfg,
     q_ptr,
@@ -1231,8 +1314,16 @@ def _load_q(
     """Q of one M-block in its MFMA operand layout, and the second Q@K^T operand
     (the PE slice or a split head's upper slice).  With SCALE_ON_Q both are
     pre-scaled by qk_scale (one extra rounding of Q)."""
-    qLoadLayout: gl.constexpr = _make_load_layout(
+    qBlockedLayout: gl.constexpr = _make_load_layout(
         cfg.D_LO, cfg.LOAD_VEC, cfg.NUM_WARPS, transposed=False
+    )
+    # Unsplit, this equals the output store's layout, so the compiler would merge
+    # (CSE) the two identical row aranges and keep Q's live, and spilled, across
+    # the K loop.  The linear form maps lanes the same but is a distinct type.
+    qLoadLayout: gl.constexpr = (
+        gl.to_linear_layout(qBlockedLayout, [cfg.BLOCK_M, cfg.D_LO])
+        if cfg.D_LO == cfg.BLOCK_DMODEL_POW2
+        else qBlockedLayout
     )
     offs_qm = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
     offs_qd = gl.arange(0, cfg.D_LO, layout=gl.SliceLayout(0, qLoadLayout))
@@ -1673,12 +1764,9 @@ def _attn_fwd(
     else:
         acc2 = acc  # never touched without a split P@V
 
-    offs_m = start_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma)
-    )
-
     # Lowest key each row may attend; like the causal mask, bottom-right aligned.
     if SLIDING_WINDOW >= 0:
+        offs_m = _rows(cfg, start_m)
         window_min = offs_m + (seqlen_k - seqlen_q - SLIDING_WINDOW)
     else:
         window_min = None
@@ -1691,14 +1779,8 @@ def _attn_fwd(
             + cu_seqlens_q_start * stride_lse_m
             + start_m * BLOCK_M * stride_lse_m
         )
-        offs_lse = (
-            gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma)) * stride_lse_m
-        ).to(gl.int32)
-        lse_mask = offs_m < seqlen_q
     else:
         lse_base = None
-        offs_lse = None
-        lse_mask = None
 
     if s_dmask_ptr is not None:
         sd_base = (
@@ -1712,7 +1794,12 @@ def _attn_fwd(
         sd_offsets = (
             offs_sd_m[:, None] * stride_sd_m + offs_sd_n[None, :] * stride_sd_n
         ).to(gl.int32)
-        sd = ScoresOut(sd_base, sd_offsets, offs_m < seqlen_q, stride_sd_n)
+        sd = ScoresOut(
+            sd_base,
+            sd_offsets,
+            _rows(cfg, start_m) < seqlen_q,
+            stride_sd_n,
+        )
     else:
         sd = ScoresOut(None, None, None, stride_sd_n)
 
@@ -1801,12 +1888,18 @@ def _attn_fwd(
                 lse = gl.zeros(
                     [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.mfma)
                 )
+                offs_lse = (
+                    gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma))
+                    * stride_lse_m
+                ).to(gl.int32)
                 gl.amd.cdna4.buffer_store(
-                    lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+                    lse,
+                    ptr=lse_base,
+                    offsets=offs_lse,
+                    mask=_rows(cfg, start_m) < seqlen_q,
                 )
             return
 
-    km = KeyMask(offs_m, seqlen_q, seqlen_k, n_extra_tokens, window_min)
     block_min = skipped_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
 
@@ -1815,6 +1908,13 @@ def _attn_fwd(
         k_base += skipped_blocks * BLOCK_N * stride_kn
         v_base += skipped_blocks * BLOCK_N * stride_vn
         if window_blocks > 0:
+            km = KeyMask(
+                _rows(cfg, start_m),
+                seqlen_q,
+                seqlen_k,
+                n_extra_tokens,
+                window_min,
+            )
             acc, acc2, l_i, m_i = _attn_fwd_inner(
                 cfg,
                 kv,
@@ -1867,6 +1967,13 @@ def _attn_fwd(
             block_max = n_blocks * BLOCK_N
             gl.barrier()  # WAR: the pipeline's last LDS reads vs. the next copies
 
+    km = KeyMask(
+        _rows(cfg, start_m),
+        seqlen_q,
+        seqlen_k,
+        n_extra_tokens,
+        window_min,
+    )
     if (not pipelined) and n_full_blocks > 0:
         block_max = block_min + n_full_blocks * BLOCK_N
         acc, acc2, l_i, m_i = _attn_fwd_inner(
@@ -1925,6 +2032,7 @@ def _attn_fwd(
     if D_HI_PV > 0:
         acc2 = acc2 * l_recip[:, None]
 
+    offs_m = _rows(cfg, start_m)
     # Rows before the causal start (seqlen_q > seqlen_k) saw only -inf scores and
     # hold NaN; zero them.  (Two equivalent orders: see the note at o_base.)
     if IS_FP8:
@@ -1950,8 +2058,11 @@ def _attn_fwd(
         softmax_lse = softmax_lse * LN2
         if IS_CAUSAL:
             softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
+        offs_lse = (
+            gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.mfma)) * stride_lse_m
+        ).to(gl.int32)
         gl.amd.cdna4.buffer_store(
-            softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+            softmax_lse, ptr=lse_base, offsets=offs_lse, mask=offs_m < seqlen_q
         )
 
     if IS_FP8:
@@ -2071,9 +2182,15 @@ def _get_config(
             return fwd_cfg["fp8_short"]
         return fwd_cfg["fp8"]
     elif has_pe:
-        # The wide tile fits only a V head <= 64; a wider one spills.
+        # The wide tile fits only a V head <= 64 at BLOCK_N = 64; a wider one spills.
         if v_head_dim and v_head_dim <= 64 and "pe_narrow_v" in fwd_cfg:
             return fwd_cfg["pe_narrow_v"]
+        if (
+            "pe_wide" in fwd_cfg
+            and sliding_window < 0
+            and not (causal and seqlen_k < fwd_cfg["causal_wide_min_seqlen_k"])
+        ):
+            return fwd_cfg["pe_wide"]
         return fwd_cfg["pe"]
     elif v_head_dim > 128 and "wide_head" in fwd_cfg:
         # Past 128 the default tile spills.
@@ -2091,6 +2208,9 @@ def _get_config(
     elif causal and "causal" in fwd_cfg:
         if v_head_dim <= 64:
             return fwd_cfg["causal_small_head"]
+        # A padded head spills under lazy rescale; it stays eager.
+        if v_head_dim < 128 and "causal_padded_head" in fwd_cfg:
+            return fwd_cfg["causal_padded_head"]
         return fwd_cfg["causal"]
     else:
         return fwd_cfg["default"]
