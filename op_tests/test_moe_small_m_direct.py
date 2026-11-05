@@ -62,29 +62,29 @@ def _make_gate_kwargs(
     topk_weights,
     topk_ids,
 ):
-    return dict(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weights,
-        topk_ids=topk_ids,
-        activation=aiter.ActivationType.Silu,
-        quant_type=aiter.QuantType.No,
-        dtype=dtypes.bf16,
-        doweight_stage1=False,
-        w1_scale=None,
-        w2_scale=None,
-        a1_scale=None,
-        a2_scale=None,
-        num_local_tokens=None,
-        moe_sorting_dispatch_policy=0,
-        expert_mask=None,
-        hidden_pad=0,
-        intermediate_pad=0,
-        bias1=None,
-        bias2=None,
-        gate_mode=GateMode.SEPARATED.value,
-    )
+    return {
+        "hidden_states": hidden_states,
+        "w1": w1,
+        "w2": w2,
+        "topk_weight": topk_weights,
+        "topk_ids": topk_ids,
+        "activation": aiter.ActivationType.Silu,
+        "quant_type": aiter.QuantType.No,
+        "dtype": dtypes.bf16,
+        "doweight_stage1": False,
+        "w1_scale": None,
+        "w2_scale": None,
+        "a1_scale": None,
+        "a2_scale": None,
+        "num_local_tokens": None,
+        "moe_sorting_dispatch_policy": 0,
+        "expert_mask": None,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "bias1": None,
+        "bias2": None,
+        "gate_mode": GateMode.SEPARATED.value,
+    }
 
 
 def _case_as_gate_kwargs(case):
@@ -176,15 +176,11 @@ def test_bf16_g1u1_small_m_direct_gate_rejects_unsupported_integration():
     gate_kwargs = _make_gate_kwargs(hidden_states, w1, w2, topk_weights, topk_ids)
 
     assert _can_use_bf16_g1u1_small_m_direct(**gate_kwargs)
-    assert not _can_use_bf16_g1u1_small_m_direct(
-        **gate_kwargs, stage2_scatter=object()
-    )
+    assert not _can_use_bf16_g1u1_small_m_direct(**gate_kwargs, stage2_scatter=object())
     assert not _can_use_bf16_g1u1_small_m_direct(**gate_kwargs, splitk=2)
 
     w1_bad_layout = shuffle_weight(w1, layout=(32, 16))
-    assert not _can_use_bf16_g1u1_small_m_direct(
-        **{**gate_kwargs, "w1": w1_bad_layout}
-    )
+    assert not _can_use_bf16_g1u1_small_m_direct(**{**gate_kwargs, "w1": w1_bad_layout})
 
     w1_guinterleave = shuffle_weight(
         w1, layout=(16, 16), is_guinterleave=True, gate_up=True

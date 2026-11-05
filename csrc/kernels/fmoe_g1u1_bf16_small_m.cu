@@ -8,7 +8,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
-AITER_CTYPES_ERROR_DECL;
+AITER_CTYPES_ERROR_DEF
 
 namespace aiter {
 

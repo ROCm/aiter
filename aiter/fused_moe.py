@@ -1490,12 +1490,14 @@ def _can_use_bf16_g1u1_small_m_direct(
         and topk == _BF16_G1U1_SMALL_M_DIRECT_TOPK
         and inter_dim in _BF16_G1U1_SMALL_M_DIRECT_INTER_DIMS
         and hidden_states.shape == (M, _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM)
-        and w1.shape == (
+        and w1.shape
+        == (
             _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
             2 * inter_dim,
             _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
         )
-        and w2.shape == (
+        and w2.shape
+        == (
             _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
             _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
             inter_dim,
