@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -1677,12 +1678,46 @@ public:
         register_graph_buffers(ptrs_per_rank.data());
     }
 
+    // The allgather kernels index the output with int. allgather_scalar does it
+    // per element; vec, naive and lastdim do it per 16-byte pack. Each launcher
+    // takes the element count as int64_t and checks its own index range before
+    // narrowing, so the vectorized kernels take any output of up to INT_MAX
+    // packs (16 * INT_MAX bytes, about 32 GiB) whatever the dtype.
+    // _resolve_custom_sizes in custom_all_reduce.py caps
+    // AITER_CUSTOM_AG_MAX_SIZE at the same bound; keep the two in sync.
+    template <typename T>
+    int allgather_packs(int64_t numel, const char* who) const
+    {
+        constexpr int64_t d = 16 / sizeof(T);
+        if(numel % d != 0)
+            throw std::runtime_error(std::string(who) +
+                                     " requires input length to be multiple of " +
+                                     std::to_string(d));
+        const int64_t packs = numel / d;
+        if(packs * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                std::string(who) + ": output of " + std::to_string(packs * world_size_) +
+                " 16-byte packs (numel " + std::to_string(numel) + " x world_size " +
+                std::to_string(world_size_) + ") exceeds the int32 index range; "
+                "route this size through should_custom_ag / RCCL instead");
+        return static_cast<int>(packs);
+    }
+
     template <typename T>
     void allgather_scalar(hipStream_t stream,
                           T* input,
                           T* output,
-                          int size)
+                          int64_t numel)
     {
+        // Indexes the output per element, not per pack.
+        if(numel * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                "gfx1250 allgather_scalar: output element count " +
+                std::to_string(numel * world_size_) + " (numel " + std::to_string(numel) +
+                " x world_size " + std::to_string(world_size_) +
+                ") exceeds the int32 index range; route this size through "
+                "should_custom_ag / RCCL instead");
+        const int size       = static_cast<int>(numel);
         RankData* input_ptrs = get_buffer_RD(stream, input);
 
         constexpr int threads = 512;
@@ -1699,15 +1734,10 @@ public:
     void allgather_vec(hipStream_t stream,
                        T* input,
                        T* output,
-                       int size)
+                       int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather_vec requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather_vec");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1723,15 +1753,10 @@ public:
     void allgather_naive(hipStream_t stream,
                          T* input,
                          T* output,
-                         int size)
+                         int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1747,17 +1772,22 @@ public:
     void allgather_lastdim(hipStream_t stream,
                            T* input,
                            T* output,
-                           int size,
-                           int last_dim_size)
+                           int64_t numel,
+                           int64_t last_dim_size)
     {
         auto d = 16 / sizeof(T);
-        if(size % d != 0 || last_dim_size % d != 0)
+        if(last_dim_size % d != 0)
             throw std::runtime_error(
                 "allgather_lastdim requires input length and last_dim_size "
                 "to be multiples of " + std::to_string(d));
-
+        // The kernel takes the row length in elements and divides it by the
+        // pack size itself.
+        if(last_dim_size > std::numeric_limits<int>::max())
+            throw std::runtime_error("allgather_lastdim: last_dim_size " +
+                                     std::to_string(last_dim_size) +
+                                     " exceeds the int32 range");
+        const int size       = allgather_packs<T>(numel, "allgather_lastdim");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 512;
         constexpr int unroll  = 4;
@@ -1765,7 +1795,7 @@ public:
                               (size + threads * unroll - 1) / (threads * unroll));
 #define LAUNCH_AG_LAST(NG) \
         ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
+            input_ptrs, sg_, self_sg_, output, rank_, size, static_cast<int>(last_dim_size))
         DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
 #undef LAUNCH_AG_LAST
     }
