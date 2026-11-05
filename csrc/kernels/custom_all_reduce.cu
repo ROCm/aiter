@@ -69,7 +69,98 @@ void dispose(fptr_t _fa)
 
 int64_t meta_size() { return sizeof(aiter::Signal); }
 
+// ---- Lamport path of all_reduce ----
+
+int64_t lamportBufferSize(int64_t world_size)
+{
+    return aiter::lamportBufferBytes((int)world_size);
+}
+
+void initLamport(fptr_t _fa,
+                 int64_t self_ptr,
+                 const std::vector<int64_t>& ipc_handle_ptrs,
+                 const std::vector<int64_t>& offsets)
+{
+    auto fa        = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int world_size = ipc_handle_ptrs.size();
+    if(world_size != fa->world_size_ || (int)offsets.size() != fa->world_size_)
+        throw std::invalid_argument("initLamport: need one IPC handle and one offset per rank");
+    std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    fa->initLamport((void*)self_ptr, ipc_handles.data(), offsets.data());
+}
+
+// What all_reduce runs for a 2-byte message of numel elements (0 none, 1
+// one-shot, 2 two-shot), for tests and tuning.
+int64_t lamportKernel(fptr_t _fa, int64_t numel)
+{
+    return (int64_t)reinterpret_cast<aiter::CustomAllreduce*>(_fa)->lamportKernel(numel);
+}
+
+// Runs one lamport kernel (1 one-shot, 2 two-shot) on inp whatever the
+// dispatch would pick, for tests and tuning. inp needs no IPC registration.
+void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream        = aiter::getCurrentHIPStream();
+    auto fa                   = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const auto lamport_kernel = static_cast<aiter::LamportKernel>(kernel);
+    if(lamport_kernel != aiter::LamportKernel::one_shot &&
+       lamport_kernel != aiter::LamportKernel::two_shot)
+        throw std::runtime_error("lamportAllReduce: kernel must be 1 (one-shot) or 2 (two-shot)");
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || out.device_id != inp.device_id)
+        throw std::runtime_error("lamportAllReduce: out must match the input's size, dtype and device");
+    if(!inp.is_contiguous() || !out.is_contiguous())
+        throw std::runtime_error("lamportAllReduce: tensors must be contiguous");
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16:
+        fa->runLamport<opus::fp16_t>(stream,
+                                     reinterpret_cast<const opus::fp16_t*>(inp.data_ptr()),
+                                     reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+                                     inp.numel(),
+                                     lamport_kernel);
+        break;
+    case AITER_DTYPE_bf16:
+        fa->runLamport<opus::bf16_t>(stream,
+                                     reinterpret_cast<const opus::bf16_t*>(inp.data_ptr()),
+                                     reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                     inp.numel(),
+                                     lamport_kernel);
+        break;
+    default: throw std::runtime_error("lamportAllReduce only supports float16 and bfloat16");
+    }
+}
+
 // ---- Internal dispatch helpers ----
+
+// Whether _all_reduce takes the fp8 quant kernel instead of allreduce<T>.
+static bool useFp8Quant(AiterDtype dtype, int64_t numel, bool open_fp8_quant)
+{
+    return dtype == AITER_DTYPE_fp16 && open_fp8_quant && numel >= 128 * 2048;
+}
+
+// Whether all_reduce can hand inp to _all_reduce without the copy into the
+// registered pool: allreduce<T> sends the message to a lamport kernel, which
+// reads only this rank's input, and inp is 16B aligned as the kernel loads
+// whole 16B packs. Built from the predicates _all_reduce and allreduce<T>
+// use themselves. Ranks may differ here (alignment) but not in the kernel
+// they run: an unaligned input is copied in and runs the same lamport kernel.
+static bool lamportSkipsCopyIn(fptr_t _fa, const void* inp, AiterDtype dtype, int64_t numel,
+                               bool use_new, bool open_fp8_quant)
+{
+    if(useFp8Quant(dtype, numel, open_fp8_quant))
+        return false;
+    if(dtype != AITER_DTYPE_fp16 && dtype != AITER_DTYPE_bf16)
+        return false;
+    if(reinterpret_cast<uintptr_t>(inp) % 16 != 0)
+        return false;
+    const auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    return fa->lamportDispatch(numel, 2, use_new) != aiter::LamportKernel::none;
+}
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
                         int64_t numel, AiterDtype dtype,
@@ -87,7 +178,7 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         break;
     }
     case AITER_DTYPE_fp16: {
-        if(open_fp8_quant && numel >= 128 * 2048)
+        if(useFp8Quant(dtype, numel, open_fp8_quant))
         {
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
                                         reinterpret_cast<opus::fp16_t*>(inp),
@@ -452,7 +543,10 @@ void all_reduce(fptr_t _fa,
     // != 0) the output is not IPC-registered, kernel uses temp-buffer path.
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
-    if(reg_inp_ptr != 0)
+    // The lamport kernels read only this rank's input, so the copy into the
+    // registered pool is skipped for the messages they take.
+    if(reg_inp_ptr != 0 &&
+       !lamportSkipsCopyIn(_fa, actual_inp, dtype, numel, use_new, open_fp8_quant))
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
@@ -521,8 +615,11 @@ void all_gather_unreg(fptr_t _fa,
 
     if(data_bytes > reg_bytes)
         throw std::runtime_error("registered buffer is too small to contain the input");
-    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
-                            hipMemcpyDeviceToDevice, stream));
+    if(data_bytes != 0)
+    {
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_buffer, inp.data_ptr(), data_bytes, hipMemcpyDeviceToDevice, stream));
+    }
     _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
 }

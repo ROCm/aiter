@@ -1645,11 +1645,12 @@ def main() -> None:
         run_csv_scenario(args)
         return
 
-    min_inter_dim = 256 if args.data_format == "a8w4" else 512
-    if args.model_dim < 512 or args.inter_dim < min_inter_dim:
+    # The >=256 floor is a FlyDSL grouped-kernel constraint (two K tiles at
+    # tile_k=128; e.g. Kimi-K3 TP8 runs inter_dim=384).
+    if args.model_dim < 256 or args.inter_dim < 256:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
-            f"at least 512/{min_inter_dim} for {args.data_format} grouped GEMM."
+            "at least 256 for the grouped GEMM kernels (two K tiles at tile_k=128)."
         )
 
     set_data_format(args.data_format)
