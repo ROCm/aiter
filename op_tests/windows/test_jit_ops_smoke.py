@@ -17,6 +17,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _is_gfx1201_64cu():
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+    try:
+        return get_gfx() == "gfx1201" and get_cu_num() == 64
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def _rms_norm_ref(x, weight, eps):
     xf = x.float()
@@ -157,12 +168,141 @@ def check_rotary_embedding_fwd():
         )
 
 
+def _make_bf16_g1u1_moe_case(tokens):
+    import aiter
+
+    model_dim = 2048
+    inter_dim = 128
+    num_experts = 256
+    topk = 8
+    hidden = torch.randn((tokens, model_dim), dtype=aiter.dtypes.bf16, device="cuda")
+    w1 = torch.randn(
+        (num_experts, 2 * inter_dim, model_dim),
+        dtype=aiter.dtypes.bf16,
+        device="cuda",
+    )
+    w2 = torch.randn(
+        (num_experts, model_dim, inter_dim),
+        dtype=aiter.dtypes.bf16,
+        device="cuda",
+    )
+    ids = torch.randint(
+        0, num_experts, (tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    return (
+        hidden,
+        w1.contiguous(),
+        w2.contiguous(),
+        weights.contiguous(),
+        ids.contiguous(),
+    )
+
+
+def check_moe_gemm_a16w16():
+    if not _is_gfx1201_64cu():
+        print("moe_gemm_a16w16: SKIP (requires gfx1201 64-CU target)")
+        return
+
+    import aiter
+    from aiter.fused_moe import fused_moe, torch_moe
+    from aiter.test_common import checkAllclose
+
+    torch.manual_seed(5059)
+    hidden, w1, w2, weights, ids = _make_bf16_g1u1_moe_case(1024)
+    actual = fused_moe(
+        hidden,
+        w1,
+        w2,
+        weights,
+        ids,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.No,
+        dtype=aiter.dtypes.bf16,
+    )
+    expected = torch_moe(
+        hidden,
+        w1,
+        w2,
+        weights,
+        ids,
+        activation=aiter.ActivationType.Silu,
+    )
+    assert checkAllclose(actual, expected, rtol=1e-2, atol=128) == 0
+
+
+def check_moe_ck2stage_bf16():
+    if not _is_gfx1201_64cu():
+        print("moe_ck2stage_bf16: SKIP (requires gfx1201 64-CU target)")
+        return
+
+    os.environ["AITER_DISABLE_GFX1201_BF16_G1U1_TRITON"] = "1"
+
+    import aiter
+    from aiter.fused_moe import fused_moe, get_2stage_cfgs, get_padded_M
+    from aiter.ops.enum import ActivationType, QuantType
+    from aiter.ops.flydsl.moe_common import GateMode
+    from aiter.ops.moe_sorting_opus import moe_sorting_opus_get_workspace_size
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(4815)
+    token = 2050
+    model_dim = 2048
+    inter_dim = 128
+    num_experts = 256
+    topk = 8
+
+    assert get_padded_M(token) == 4096
+    assert moe_sorting_opus_get_workspace_size(token, num_experts, topk, 0, 0) >= 0
+    metadata = get_2stage_cfgs(
+        get_padded_M(token),
+        model_dim,
+        inter_dim,
+        num_experts,
+        topk,
+        aiter.dtypes.bf16,
+        aiter.dtypes.bf16,
+        aiter.dtypes.bf16,
+        QuantType.No,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.SEPARATED.value,
+        opus_weights_shuffled=True,
+        input_dtype=aiter.dtypes.bf16,
+    )
+    assert metadata.stage1.keywords["kernelName"].startswith("moe_ck2stages_gemm1_")
+    assert metadata.stage2.keywords["kernelName"].startswith("moe_ck2stages_gemm2_")
+
+    hidden, w1, w2, weights, ids = _make_bf16_g1u1_moe_case(token)
+    actual = fused_moe(
+        hidden,
+        shuffle_weight(w1, layout=(16, 16)),
+        shuffle_weight(w2, layout=(16, 16)),
+        weights,
+        ids,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.No,
+        dtype=aiter.dtypes.bf16,
+        gate_mode=GateMode.SEPARATED.value,
+    )
+    assert actual.shape == (token, model_dim)
+    assert actual.dtype == aiter.dtypes.bf16
+    assert torch.isfinite(actual).all()
+
+
 CHECKS = {
     "rms_norm": check_rms_norm,
     "rmsnorm2d_fwd": check_rmsnorm2d_fwd,
     "silu_and_mul": check_silu_and_mul,
     "topk_softmax": check_topk_softmax,
     "rotary_embedding_fwd": check_rotary_embedding_fwd,
+    "moe_gemm_a16w16": check_moe_gemm_a16w16,
+    "moe_ck2stage_bf16": check_moe_ck2stage_bf16,
 }
 
 
@@ -170,6 +310,12 @@ TIMEOUT_S = 1800
 
 
 def _run_isolated(op):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        _REPO_ROOT
+        if not env.get("PYTHONPATH")
+        else f"{_REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}"
+    )
     try:
         return subprocess.run(
             [sys.executable, os.path.abspath(__file__), op],
@@ -177,6 +323,7 @@ def _run_isolated(op):
             text=True,
             check=False,
             timeout=TIMEOUT_S,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         # TimeoutExpired carries bytes even when text=True.
