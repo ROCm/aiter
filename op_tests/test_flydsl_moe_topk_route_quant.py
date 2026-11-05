@@ -205,6 +205,36 @@ def test_deferred_falls_back_when_not_fusable():
     )
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("m", [17, 128, 340])
+def test_deferred_gather_reduce_is_the_reduce(m, deferred):
+    """defer_gather_reduce: the deferral, reduced by flydsl_moe_gather_reduce,
+    is bitwise the MoE output (valid rows); one MoE call a scope."""
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        defer_gather_reduce,
+        flydsl_moe_gather_reduce,
+    )
+
+    weights = _moe_weights(512)
+    logits, hidden = _inputs(m, "randn")
+    nv = m - 3
+    nvr = torch.tensor([nv], dtype=torch.int32, device="cuda")
+    _, _, ref = _moe(logits, hidden, nvr, weights, deferred)
+    with defer_gather_reduce() as req:
+        _, _, stand_in = _moe(logits, hidden, nvr, weights, deferred)
+        _, _, second = _moe(logits, hidden, nvr, weights, deferred)
+    assert req.taken and stand_in.data_ptr() == req.placeholder.data_ptr()
+    out = flydsl_moe_gather_reduce(
+        req.grouped.view(1, *req.grouped.shape),
+        req.route_rows,
+        req.weights,
+        num_valid_tokens=req.num_valid_tokens,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out[:nv].view(torch.int16), ref[:nv].view(torch.int16))
+    assert torch.equal(second[:nv].view(torch.int16), ref[:nv].view(torch.int16))
+
+
 def _graph_us(fn, reps=20, rounds=30):
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
