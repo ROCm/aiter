@@ -107,9 +107,10 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_flydsl_linear_attention.py)
-            # The KDA decode regressions are pytest-only; the script entry point
-            # runs the performance sweep. Run both and fail if either fails.
+        op_tests/test_flydsl_linear_attention.py|op_tests/test_flydsl_kda_verify.py)
+            # The KDA decode and verify regressions are pytest-only; the script
+            # entry point runs the performance sweep. Run both and fail if
+            # either fails.
             test_cmd=(
                 timeout 60m
                 bash -c '
