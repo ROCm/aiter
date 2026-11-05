@@ -442,6 +442,7 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@_route(op="rmsnorm_with_add", version=1)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )

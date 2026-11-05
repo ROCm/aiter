@@ -170,27 +170,55 @@ def _rms_norm(out, input, weight, epsilon, gemma_norm=False):
     out.copy_((input.float() * scale * weight.float()).to(out.dtype))
 
 
+def _rms_norm_with_add(
+    out,
+    input,
+    residual_in,
+    residual_out,
+    weight,
+    epsilon,
+    gemma_norm=False,
+    use_model_sensitive_rmsnorm=0,
+):
+    """The residual-add path: both outputs are the caller's to keep."""
+    total = input.float() + residual_in.float()
+    residual_out.copy_(total.to(residual_out.dtype))
+    scale = torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + epsilon)
+    out.copy_((total * scale * weight.float()).to(out.dtype))
+
+
 class Provider:
     name = "refprov"
     api_versions = {plugin.API_VERSION}
-    op_versions = {"rmsnorm": {1}, "pertoken_quant": {1}}
+    # One release, two contracts. A provider need not cover an op family to
+    # serve part of it.
+    op_versions = {"rmsnorm": {1}, "rmsnorm_with_add": {1}, "pertoken_quant": {1}}
 
     def __init__(self):
-        self.candidate = plugin.KernelCandidate(
-            provider="refprov",
-            kernel_id="rms_norm_reference",
-            artifact_digest="sha256:0000",
-            qualification="https://example.invalid/evidence/rms_norm",
-            run=_rms_norm,
-        )
+        self.kernels = {
+            "rmsnorm": plugin.KernelCandidate(
+                provider="refprov",
+                kernel_id="rms_norm_reference",
+                artifact_digest="sha256:0000",
+                qualification="https://example.invalid/evidence/rms_norm",
+                run=_rms_norm,
+            ),
+            "rmsnorm_with_add": plugin.KernelCandidate(
+                provider="refprov",
+                kernel_id="add_rms_norm_reference",
+                artifact_digest="sha256:1111",
+                qualification="https://example.invalid/evidence/add_rms_norm",
+                run=_rms_norm_with_add,
+            ),
+        }
 
     def select(self, op, args, kwargs):
-        if op.name != "rmsnorm":
+        candidate = self.kernels.get(op.name)
+        if candidate is None:
             return None  # declining is normal, and must be observable
-        out = args[0]
-        if out.shape[-1] % 2:
+        if args[0].shape[-1] % 2:
             return None  # a per-call coverage decision, the shape it is for
-        return self.candidate
+        return candidate
 
 
 instance = Provider()
@@ -268,3 +296,58 @@ def test_a_per_call_decline_is_not_an_error(tmp_path, monkeypatch):
 
     assert explanation.decision.reason == "provider-declined"
     assert dict(explanation.declines) == {"refprov": "declined"}
+
+
+def test_the_residual_add_path_is_servable_too(tmp_path, monkeypatch):
+    """The path vLLM-ROCm and SGLang actually call for per-layer rmsnorm.
+
+    It dispatches to a different kernel than ``rmsnorm`` and has a second
+    output, so serving it is a separate contract rather than a shape of the
+    first one.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    value, residual, weight = torch.rand(2, 8), torch.rand(2, 8), torch.rand(8)
+    out, residual_out = torch.zeros(2, 8), torch.zeros(2, 8)
+
+    aiter.rmsnorm2d_fwd_with_add(out, value, residual, residual_out, weight, 1e-6)
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "refprov")
+    assert decision.kernel_id == "add_rms_norm_reference"
+    assert decision.op == plugin.Op("rmsnorm_with_add", 1)
+
+    total = value.float() + residual.float()
+    scale = torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(residual_out, total.to(residual_out.dtype))
+    torch.testing.assert_close(out, (total * scale * weight.float()).to(out.dtype))
+
+
+def test_one_provider_serving_two_contracts_is_recorded_separately(
+    tmp_path, monkeypatch
+):
+    """Each contract is answered on its own terms, and counted on its own."""
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    aiter.rmsnorm(torch.zeros(2, 8), torch.rand(2, 8), torch.rand(8), 1e-6)
+    aiter.rmsnorm2d_fwd_with_add(
+        torch.zeros(2, 8),
+        torch.rand(2, 8),
+        torch.rand(2, 8),
+        torch.zeros(2, 8),
+        torch.rand(8),
+        1e-6,
+    )
+    aiter.pertoken_quant(torch.rand(4, 8))
+
+    counts = plugin.decision_counts()
+    assert counts[("rmsnorm", "provider", "selected", "refprov")] == 1
+    assert counts[("rmsnorm_with_add", "provider", "selected", "refprov")] == 1
+    assert counts[("pertoken_quant", "native", "provider-declined", None)] == 1
+
+    routed = plugin.status()["routed_ops"]
+    assert routed["rmsnorm_with_add"]["eligible"] == ("refprov",)

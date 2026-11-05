@@ -2328,13 +2328,6 @@ def compile_ops(
             def ctypes_custom_wrapper(*args, **kwargs):
                 return ctypes_wrapper(*args, **kwargs)
 
-            # torch_compile_guard returns a (*args, **kwargs) closure, so
-            # inspect.signature() of a compiled op would report that instead of
-            # the op's real parameters. Anything reading the public signature --
-            # the kernel provider interface captures it as the op contract --
-            # would see no parameter names and no defaults. The guard already
-            # knows the original as calling_func_; this exposes it.
-            ctypes_custom_wrapper.__wrapped__ = func
             return ctypes_custom_wrapper
 
         elif ffi_type == "pybind":
@@ -2632,9 +2625,6 @@ def compile_ops(
             def custom_wrapper(*args, **kwargs):
                 return wrapper(*args, **kwargs)
 
-            # See the ctypes branch above: without this, the public signature of
-            # a compiled op is (*args, **kwargs).
-            custom_wrapper.__wrapped__ = func
             return custom_wrapper
 
         else:
