@@ -127,18 +127,18 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         {
             p_lds_seqlens_kv[bid] = seqlen_kv;
         }
+        // Stored before mla_v12_num_qo_tiles, which reads it back through qo_state.
+        if constexpr(QoState<Traits>::is_unique() == false)
+        {
+            p_lds_seqlens_qo[bid] =
+                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+        }
 
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
         const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
         sum_blocks += unit_blocks * num_qo_tiles;
-
-        if constexpr(QoState<Traits>::is_unique() == false)
-        {
-            p_lds_seqlens_qo[bid] =
-                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
-        }
     }
 
     return aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
