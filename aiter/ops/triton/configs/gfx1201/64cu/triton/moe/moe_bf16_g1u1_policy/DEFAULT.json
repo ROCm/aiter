@@ -17,6 +17,8 @@
     "validation": {
       "optimized_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/all_m_xcd1_w10_i30/public_aiter_vs_vllm_all_m.csv",
       "reference_source": "artifacts/pr5059_eval_run/policy_dispatch_validation/ref_all_m_xcd1/reference_all_m.csv",
+      "original_aiter_ck2stage_source": "artifacts/pr4815_followup_fallback_perf/original_fallback_all_m_followup.csv",
+      "large_m_vs_original_ck2stage_source": "artifacts/pr4815_followup_fallback_perf/large_m_vs_fallback_join.csv",
       "docker_image": "vllm/vllm-openai-rocm:v0.22.0",
       "machine": "supermicro5",
       "warmup": 10,
@@ -35,7 +37,13 @@
       "worst_median_delta_vs_vllm_pct": 3.43,
       "performance_preferred_rows": 1537,
       "new_reference_fail_rows": 0,
-      "scope_note": "original AITER fallback repair and #4815 config corrections are intentionally excluded from this PR"
+      "original_aiter_ck2stage_rows": 1537,
+      "original_aiter_ck2stage_status_ok_rows": 1537,
+      "new_mean_wins_vs_original_ck2stage_rows": 1537,
+      "original_ck2stage_mean_wins_rows": 0,
+      "new_average_mean_delta_vs_original_ck2stage_pct": 59.35,
+      "new_worst_mean_delta_vs_original_ck2stage_pct": 46.45,
+      "baseline_note": "Original AITER CK2Stage means the existing sorted-token CK two-stage BF16 MoE path selected through get_2stage_cfgs, using the Qwen3.6 BF16 tuned FMoE CSV rows and preshuffled W1/W2 weights."
     },
     "m_ranges": [
       [
