@@ -587,9 +587,8 @@ def build_gemm_a8w4_tdm_task(
         == (64, 256, 256, 1, 4, 3)
         and callable(getattr(rocdl, "sched_vgpr", None))
     )
-    # Ordinary short tiles have the same exact expert-end bound. One M wave
-    # makes the partial-M choice workgroup-uniform; retain the full TDM and
-    # output protocol while omitting only wholly out-of-bound M16 operands.
+    # Ordinary short tiles share a K loop for full and partial expert tails.
+    # A single M wave makes the back-row WMMA guard workgroup-uniform.
     ordinary_short_row_skip = bool(
         a_is_fp4
         and not a_preshuffled
@@ -2186,14 +2185,24 @@ def build_gemm_a8w4_tdm_task(
                 initialize_acc=initialize_acc,
             )
             if const_expr(len(BACK) > 0):
-                mma_rows(
-                    BACK,
-                    cur_rmem.a[front_wm:],
-                    cur_rmem.b,
-                    sa_k,
-                    sb_k,
-                    initialize_acc=initialize_acc,
-                )
+
+                def mma_back_rows():
+                    mma_rows(
+                        BACK,
+                        cur_rmem.a[front_wm:],
+                        cur_rmem.b,
+                        sa_k,
+                        sb_k,
+                        initialize_acc=initialize_acc,
+                    )
+
+                if const_expr(ordinary_short_row_skip):
+                    # One M wave gives every wave the same expert-end bound.
+                    # Keep the shared LDS/TDM loop and all dependency waits.
+                    if mn_oob > front_wm * M_ROW_STEP:
+                        mma_back_rows()
+                else:
+                    mma_back_rows()
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -2776,7 +2785,7 @@ def build_gemm_a8w4_tdm_task(
             # full descriptor and output layouts while skipping only M16 rows
             # wholly beyond the expert's live rows. Other row counts use the
             # complete original body, including ragged K and activation logic.
-            if const_expr(narrow_stage1_row_skip or ordinary_short_row_skip):
+            if const_expr(narrow_stage1_row_skip):
                 if mn_oob <= front_wm * M_ROW_STEP:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=front_wm)
                 else:
