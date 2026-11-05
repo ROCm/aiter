@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 E, TOPK, D, ALIGN = 256, 8, 2048, 16
-ROWS = [1, 5, 13, 16, 17, 33, 64, 65, 80, 100, 128]
+ROWS = [1, 5, 13, 16, 17, 33, 64, 65, 80, 100, 128, 160, 340, 512]
 
 
 def _align_up(x, a):
@@ -196,7 +196,7 @@ def test_deferred_falls_back_when_not_fusable():
     """Rows past the fused kernel's limit: the grouped path runs the plain
     top-k first, so the buffers and the output are still right."""
     weights = _moe_weights(256)
-    logits, hidden = _inputs(200, "randn")
+    logits, hidden = _inputs(600, "randn")
     _, ia, oa = _moe(logits, hidden, None, weights, deferred=False)
     _, ib, ob = _moe(logits, hidden, None, weights, deferred=True)
     torch.cuda.synchronize()
@@ -247,5 +247,7 @@ def benchmark(rows, repeats=3):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", type=int, nargs="+", default=[13, 16, 64, 80, 128])
+    ap.add_argument(
+        "--rows", type=int, nargs="+", default=[13, 16, 64, 80, 128, 340, 512]
+    )
     benchmark(ap.parse_args().rows)

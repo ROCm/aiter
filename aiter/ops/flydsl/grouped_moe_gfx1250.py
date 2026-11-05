@@ -2055,6 +2055,7 @@ def _get_compiled_topk_route_quant(
     align_m: int,
     quant_mode: str,
     local: bool,
+    max_rows: int,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant import (
         build_moe_topk_route_quant_module,
@@ -2067,6 +2068,7 @@ def _get_compiled_topk_route_quant(
         wmma_rep=wmma_rep,
         align_m=align_m,
         quant_mode=quant_mode,
+        max_rows=max_rows,
         local=local,
     )
 
@@ -2150,6 +2152,7 @@ def fused_topk_route_quant(
     from aiter.ops.flydsl.kernels.moe_topk_route_quant import (
         CLUSTER,
         LOCAL_MAX_ROWS,
+        topk_route_quant_max_rows,
         topk_route_quant_tokens_per_block,
     )
 
@@ -2158,13 +2161,19 @@ def fused_topk_route_quant(
     if local:
         grid = -(-token_num // tpb)
         exchange = torch.empty(0, dtype=torch.int32, device=device)
+        scale_exchange = exchange
     else:
-        clusters = -(-token_num // (CLUSTER * tpb))
+        # The payload clusters, then the scale cluster.
+        clusters = -(-token_num // (CLUSTER * tpb)) + 1
         grid = clusters * CLUSTER
         # Clusters past the first publish their ids here (the first uses
         # topk_ids); only a cluster's own workgroups ever read its row.
         exchange = torch.empty(
-            (max(clusters - 1, 0), token_num * topk), dtype=torch.int32, device=device
+            (clusters - 1, token_num * topk), dtype=torch.int32, device=device
+        )
+        # The scale cluster's per-token e8m0 rows (a dword per 4 MX blocks).
+        scale_exchange = torch.empty(
+            (token_num, feat_dim // 128), dtype=torch.int32, device=device
         )
     launch = _get_compiled_topk_route_quant(
         experts,
@@ -2174,6 +2183,7 @@ def fused_topk_route_quant(
         int(align_m),
         quant_mode,
         local,
+        topk_route_quant_max_rows(token_num, local),
     )
     launch(
         ptr_arg(gating_output),
@@ -2187,6 +2197,7 @@ def fused_topk_route_quant(
         ptr_arg(payload),
         ptr_arg(scale),
         ptr_arg(exchange),
+        ptr_arg(scale_exchange),
         int(token_num),
         int(gating_output.stride(0)),
         int(grid),

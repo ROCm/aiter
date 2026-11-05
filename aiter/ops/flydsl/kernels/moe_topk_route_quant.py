@@ -3,12 +3,15 @@
 
 """Fused top-k softmax + route/psum + MX quant/preshuffle for small decode MoE.
 
-Replaces three launches of the TP grouped a8w4/fp4 MoE front end
+Replaces three launches (four with the ``num_valid_rows * topk`` multiply
+the split path needs for its quant bound) of the TP grouped a8w4/fp4 MoE front
+end
 (``_grouped_a8w4_tdm_moe`` at small token counts):
 
     1. ``topk_softmax`` (HIP ``topkGatingSoftmax``)     logits -> top-k ids/weights
     2. ``moe_route_psum_fused``                         ids -> masked_m, psum, rows
-    3. ``moe_fused_quant_preshuffle_routeks``           hidden -> grouped MX payload
+    3. ``moe_fused_quant_preshuffle_routeks`` /
+       ``moe_token_multidest_quant``                    hidden -> grouped MX payload
                                                         + preshuffled e8m0 scale
 
 with one launch. Two schedules, both built here:
@@ -17,12 +20,22 @@ with one launch. Two schedules, both built here:
     independent workgroups; each computes the top-k of every row itself (one
     pass of the block, a few KB of L2-resident logits) and the routing in LDS,
     then quantizes its own 4 tokens. No workgroup waits on another.
-  * cluster (up to ``MAX_ROWS``): ``ceil(token_num / 64)`` gfx1250 clusters of
-    ``CLUSTER`` workgroups. A cluster's workgroups split the top-k of all rows
-    and publish the ids (SCOPE_DEV stores), meet at one cluster barrier, read
-    every id back and build the routing in LDS; each then quantizes its share
-    of the cluster's tokens. Splitting the top-k keeps it off the critical
-    path; a second cluster halves the quant stores each CU issues.
+  * cluster (up to ``MAX_ROWS`` = 512 rows: the DP decode verify step and the
+    drafter): ``ceil(token_num / 64)`` payload clusters of ``CLUSTER``
+    workgroups plus one scale cluster. Every cluster's workgroups split the
+    top-k of all rows (a wave a row, <= 32 rows a workgroup), publish the ids
+    (SCOPE_DEV stores), meet at one cluster barrier, read every id back and
+    build the routing in LDS (per-expert token bitmask + counts, tile-aligned
+    scan). A payload workgroup quantizes its <= 4 tokens before the barrier
+    (the quant needs no routing; it runs under the id read-back) and stores
+    the MXFP4 payload to each route's grouped row once the slots are known.
+    The scale cluster computes the e8m0 rows of all tokens (its workgroup w:
+    the rows of its top-k share), exchanges them like the ids, and writes the
+    WMMA-preshuffled scale tiles dest-major, one workgroup an expert: the
+    token-major scatter writes each 64 B scale segment from ~16 CUs at once,
+    which costs ~1.6-2.3 us at 340 rows (it is most of today's
+    ``moe_token_multidest_quant`` time too); dest-major the lines are private.
+    Above ``MAX_ROWS`` (prefill) the caller keeps the split path.
 
 A route's grouped row is assigned deterministically, token-major within an
 expert: a per-expert bitmask of the tokens that picked it gives both the count
@@ -57,16 +70,21 @@ from flydsl.expr.typing import Int32, T
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
     _SCALE_RSRC_MAX_BYTES,
-    _emit_quant_block_loop,
+    _emit_pk8_lane_amax,
+    _emit_quant_compute,
+    _emit_quant_stores,
+    _pack_block_group_dword,
     _quant_layout,
     _token_multidest_scale_base,
 )
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_buf_tensor,
 )
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE as _ROUND_MODE
 
 BLOCK_THREADS = 1024
 # Workgroups in the cluster (the whole grid); 16 is the gfx1250 maximum.
@@ -75,9 +93,14 @@ CLUSTER = 16
 # result (every key is unique); a whole wave a row halves each selection
 # step's dependent chain against the HIP kernel's 16 lanes x 16 logits.
 LANES_PER_ROW = 32
-# Rows the kernel serves. 128 covers the drafter (13-80 rows) and the target's
-# verify step; larger batches keep the split path.
-MAX_ROWS = 128
+# Rows the kernel serves: one top-k pass of a cluster (CLUSTER workgroups x
+# BLOCK_THREADS / LANES_PER_ROW rows). That covers the drafter (13-120 rows) and
+# the DP decode verify step (85-128 sequences x 4 rows); larger batches
+# (prefill) keep the split path.
+MAX_ROWS = 512
+# The routing's LDS footprint (the per-expert token bitmask, a dword per 32
+# rows) is built for the smallest of these that holds the batch.
+ROW_BUCKETS = (128, 256, 512)
 # Up to this many rows every workgroup computes all of the top-k itself (one
 # pass of the block), which beats the cluster exchange's barrier + read-back.
 LOCAL_MAX_ROWS = 16
@@ -110,14 +133,86 @@ def topk_route_quant_tokens_per_block(feat_dim: int, quant_mode: str) -> int:
     return (BLOCK_THREADS // L.wave_size) // L.block_iters
 
 
-def _set_token_bit(lds_bits, expert, token, words):
-    """Mark ``token`` in ``expert``'s token bitmask (LDS)."""
+def topk_route_quant_max_rows(token_num: int, local: bool) -> int:
+    """The ``max_rows`` build that serves ``token_num`` rows."""
+    if local:
+        return MAX_ROWS
+    return next(b for b in ROW_BUCKETS if token_num <= b)
+
+
+def _set_token_bit(lds_bits, lds_counts, expert, token, words):
+    """Mark ``token`` in ``expert``'s token bitmask and count it (LDS)."""
     fx.atomic_or(
         lds_bits
         + (fx.Int32(expert) * fx.Int32(words) + fx.Int32(fx.Uint32(token) >> 5)),
         fx.Int32(1) << fx.Int32(fx.Uint32(token) & 31),
         syncscope="workgroup",
     )
+    fx.atomic_add(lds_counts + fx.Int32(expert), fx.Int32(1), syncscope="workgroup")
+
+
+def _kth_token(lds_bits, expert, k, words):
+    """The token of an expert's ``k``-th grouped row: the ``k``-th set bit of
+    its token bitmask (LDS), ``k`` below the expert's count."""
+    base = fx.Int32(expert) * fx.Int32(words)
+    prefix = fx.Int32(0)
+    w_sel = fx.Int32(0)
+    m_sel = fx.Int32(0)
+    r_sel = fx.Int32(0)
+    for w in range(words):
+        m = fx.Int32(lds_bits[base + w])
+        pc = fx.ctpop(m)
+        here = (k >= prefix) & (k < prefix + pc)
+        w_sel = here.select(fx.Int32(w), w_sel)
+        m_sel = here.select(m, m_sel)
+        r_sel = here.select(k - prefix, r_sel)
+        prefix = prefix + pc
+    # The r-th set bit of the word: a binary search on the low halves' counts.
+    pos = fx.Int32(0)
+    m = fx.Uint32(m_sel)
+    for step in (16, 8, 4, 2, 1):
+        lo = fx.ctpop(fx.Int32(m & fx.Uint32((1 << step) - 1)))
+        skip = r_sel >= lo
+        r_sel = skip.select(r_sel - lo, r_sel)
+        pos = skip.select(pos + fx.Int32(step), pos)
+        m = skip.select(m >> fx.Uint32(step), m)
+    return w_sel * fx.Int32(32) + pos
+
+
+def _emit_route_stores(qc, results, rows, scales):
+    """The store pass of a task's early quant to its routes' grouped rows."""
+    payload_dests = [SimpleNamespace(payload_row_i32=r) for r in rows]
+    dests = [
+        SimpleNamespace(payload_row_i32=r, scale_row_dword_base=sc)
+        for r, sc in zip(rows, scales)
+    ]
+    c = SimpleNamespace(**vars(qc))
+    c.make_dests = lambda: (payload_dests, dests)
+    _emit_quant_stores(c, results, None)
+
+
+def _emit_scale_tile_stores(
+    lds_bits, lds_scale, scale_rsrc, expert, count, start, k, sd0, n_sd, words, L
+):
+    """Grouped row ``start + k`` of ``expert`` (``k`` < ``count``): e8m0 dwords
+    ``sd0 .. sd0 + n_sd - 1`` of its token's scale row (LDS) into the
+    WMMA-preshuffled scale layout."""
+    token = _kth_token(lds_bits, expert, k, words)
+    row = fx.Uint32(start + k)
+    base = _token_multidest_scale_base(
+        row,
+        fx.Int32(L.rows_per_tile),
+        fx.Int32(L.dst_scale_dwords_per_row),
+        fx.Int32(16),
+    )
+    src = token * fx.Int32(L.scale_dwords_per_row) + sd0
+    vals = [fx.Int32(lds_scale[src + fx.Int32(q)]) for q in range(n_sd)]
+    for q in range(n_sd):
+        buffer_ops.buffer_store(
+            vals[q],
+            scale_rsrc,
+            fx.Int32(base) + (sd0 + fx.Int32(q)) * fx.Int32(L.rows_per_tile),
+        )
 
 
 def build_moe_topk_route_quant_module(
@@ -171,20 +266,37 @@ def build_moe_topk_route_quant_module(
         max_rows = min(max_rows, rows_per_pass)
     if -(-max_rows // CLUSTER) * LANES_PER_ROW > BLOCK_THREADS:
         raise ValueError(f"max_rows {max_rows} needs more top-k lanes than a block")
-    if max_rows * topk > BLOCK_THREADS:
-        raise ValueError(f"max_rows {max_rows} * topk exceeds one id a thread")
+    # Routes each thread reads back from the exchange.
+    ids_per_thread = -(-max_rows * topk // BLOCK_THREADS)
     tasks_per_wave = 1
     vals_per_lane = experts // LANES_PER_ROW  # 8
     words = -(-max_rows // 32)  # bitmask dwords per expert
     if experts % wave_size:
         raise NotImplementedError("experts must be a multiple of the wave size")
     experts_per_lane = experts // wave_size
+    # The scale cluster: its workgroup w computes the e8m0 rows of top-k rows
+    # [w * T, (w + 1) * T) (T = ceil(rows / CLUSTER)), one (token, K-group)
+    # task a wave at a time, and then writes the scale tiles of experts
+    # w, w + CLUSTER, ...: two waves an expert, half of the row's dwords each.
+    sd_per_row = L.scale_dwords_per_row  # 16 dwords of e8m0 a row
+    scale_tasks_per_wave = -(-(-(-max_rows // CLUSTER) * k_groups) // waves)
+    sc_loads_per_thread = -(-max_rows * sd_per_row // (BLOCK_THREADS * 4))
+    experts_per_wg = experts // CLUSTER
+    if not local:
+        if experts % CLUSTER or experts_per_wg * 2 != waves:
+            raise NotImplementedError("scale tiles need two waves an expert")
+        if sd_per_row % 2 or k_groups * 2 != sd_per_row:
+            raise NotImplementedError("a K-group must pack two scale dwords")
+    sd_half = sd_per_row // 2
+    scale_lds = 1 if local else max_rows * sd_per_row
 
     @fx.struct
     class _Storage:
         ids: fx.Array[fx.Int32, max_rows * topk, 16]
         bits: fx.Array[fx.Int32, experts * words, 16]
         starts: fx.Array[fx.Int32, experts, 16]
+        counts: fx.Array[fx.Int32, experts, 16]
+        scale: fx.Array[fx.Int32, scale_lds, 16]
 
     module_name = (
         f"moe_topk_route_quant_e{experts}_k{topk}_fd{feat_dim}_r{wmma_rep}"
@@ -204,6 +316,7 @@ def build_moe_topk_route_quant_module(
         grouped_payload: fx.Pointer,  # (contiguous_m, payload_bytes) u8 out
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
         exchange: fx.Pointer,  # (clusters - 1, token_num * topk) i32 scratch
+        scale_exchange: fx.Pointer,  # (token_num, feat_dim // 128) i32 scratch
         token_num: Int32,
         logits_row_stride: Int32,  # elements
     ):
@@ -235,9 +348,12 @@ def build_moe_topk_route_quant_module(
         else:
             cl_id = bid // fx.Uint32(CLUSTER)
             wg_in_cl = bid - cl_id * fx.Uint32(CLUSTER)
+            # Payload clusters; the one after them is the scale cluster (its
+            # payload share below is empty).
             n_cl = (n_tok + fx.Uint32(CLUSTER * tokens_per_block - 1)) // fx.Uint32(
                 CLUSTER * tokens_per_block
             )
+            is_sc = cl_id == n_cl
             # The cluster's workgroups split the top-k of every row ...
             tk_count = (n_tok + fx.Uint32(CLUSTER - 1)) // fx.Uint32(CLUSTER)
             tk_base = wg_in_cl * tk_count
@@ -256,12 +372,18 @@ def build_moe_topk_route_quant_module(
             fx.Int64(ptrtoint(exchange))
             + fx.Int64(cl_id - fx.Uint32(1)) * fx.Int64(n_tok * fx.Uint32(topk * 4)),
         )
-        xchg_rsrc = buffer_ops.create_buffer_resource_from_addr(xchg_addr)
+        # Bounded to the batch's routes: the read-back below loads whole
+        # `ids_per_thread` strides, and the reads past the batch return 0.
+        xchg_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            xchg_addr, num_records_bytes=fx.Int32(n_tok * fx.Uint32(topk * 4))
+        )
 
         lds = fx.SharedAllocator().allocate(_Storage).peek()
         lds_ids = lds.ids.ptr
         lds_bits = lds.bits.ptr
         lds_starts = lds.starts.ptr
+        lds_counts = lds.counts.ptr
+        lds_scale = lds.scale.ptr
 
         wid = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - wid * fx.Uint32(wave_size)
@@ -308,6 +430,29 @@ def build_moe_topk_route_quant_module(
             )
             tasks.append((live, token, k_group, dwords))
 
+        # The scale cluster's tasks: (token, K-group) of the workgroup's top-k
+        # rows, wave-strided; dead (zero-length) everywhere else.
+        sc_tasks = []
+        if const_expr(not local):
+            for i in range_constexpr(scale_tasks_per_wave):
+                task = wid + fx.Uint32(i * waves)
+                tok_local = task // fx.Uint32(k_groups)
+                k_group = task - tok_local * fx.Uint32(k_groups)
+                token = tk_base + tok_local
+                live = is_sc & (tok_local < tk_count) & (token < n_tok)
+                rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    hid_base + fx.Int64(token) * fx.Int64(feat_dim * 2),
+                    num_records_bytes=live.select(fx.Int32(feat_dim * 2), c0_i32),
+                )
+                dwords = buffer_ops.buffer_load(
+                    rsrc,
+                    fx.Int32(k_group) * fx.Int32(L.mx_blocks_per_wave_iter * 16)
+                    + fx.Int32(lane) * fx.Int32(L.elems_per_lane // 2),
+                    vec_width=4,
+                    dtype=i32,
+                )
+                sc_tasks.append((live, token, k_group, dwords))
+
         # The logits of this lane's row: LANES_PER_ROW lanes a row, 8 logits
         # (one 16-byte load) a lane. One descriptor for the whole block keeps each
         # load a single buffer_load (a per-row one differs between the two rows
@@ -335,8 +480,8 @@ def build_moe_topk_route_quant_module(
             for h in range_constexpr(vals_per_lane // 8)
         ]
 
-        # Clear the per-expert token bitmask (made visible by the cluster
-        # barrier's workgroup barrier).
+        # Clear the per-expert token bitmask and counts (made visible by the
+        # cluster barrier's workgroup barrier).
         for i in range_constexpr(-(-(experts * words) // BLOCK_THREADS)):
             idx = tid + fx.Uint32(i * BLOCK_THREADS)
             if const_expr((i + 1) * BLOCK_THREADS <= experts * words):
@@ -344,6 +489,8 @@ def build_moe_topk_route_quant_module(
             else:
                 if idx < fx.Uint32(experts * words):
                     lds_bits[idx] = c0_i32
+        if tid < fx.Uint32(experts):
+            lds_counts[tid] = c0_i32
 
         n_valid = nvr_is_set.select(
             fx.Uint32((nvr_raw < c0_i32).select(c0_i32, nvr_raw)), n_tok
@@ -415,7 +562,7 @@ def build_moe_topk_route_quant_module(
                         ptr_buf_tensor(topk_ids)[route] = out_e
                     lds_ids[route] = out_e
                     if not is_pad:
-                        _set_token_bit(lds_bits, my_e, row, words)
+                        _set_token_bit(lds_bits, lds_counts, my_e, row, words)
                 else:
                     if cl_id == fx.Uint32(0):
                         ptr_buf_tensor(topk_weights, fx.Float32)[route] = is_pad.select(
@@ -425,9 +572,110 @@ def build_moe_topk_route_quant_module(
                         out_e, xchg_rsrc, route, cache_modifier=_CPOL_SCOPE_DEV
                     )
 
+        # The quant pass of this wave's task, which needs nothing from the
+        # routing: emitted ahead of the read-back's wait (cluster) or the
+        # barrier (local), so it runs under the cross-token part. Its stores
+        # wait for the grouped rows (phase 4). Dead tasks quantize the zeros
+        # their zero-length descriptor returned and store nothing.
+        scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(grouped_scale)),
+            num_records_bytes=_SCALE_RSRC_MAX_BYTES,
+        )
+        c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
+        block_in_wave = lane // fx.Uint32(c_lanes_per_block)
+        lane_in_block = lane - block_in_wave * c_lanes_per_block
+
+        def _quant_ctx(token, k_group, dwords):
+            return SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=1,
+                mx_group_base=fx.Int32(k_group),
+                payload_base=fx.Int64(ptrtoint(grouped_payload)),
+                payload_bytes_per_row=L.payload_bytes_per_row,
+                hidden_base=hid_base,
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=token,
+                # The prologue already holds this task's hidden slice.
+                hidden_lds_load=lambda _idx, _off, _d=dwords: _d,
+                hidden_lds_idx=None,
+                hidden_lds_row_off=c0_i32,
+                hidden_slot_bytes=0,
+                prequantized=False,
+                payload_dwords_per_lane=L.payload_bytes_per_lane // 4,
+                src_scale_base=fx.Int64(0),
+                src_scale_bytes_per_row=0,
+                mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
+                mx_blocks_per_row=L.mx_blocks_per_row,
+                amax_shuffle_dists=L.amax_shuffle_dists,
+                is_fp8=L.is_fp8,
+                use_native=L.use_native,
+                use_pk8=L.use_pk8,
+                mx_dtype=L.mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=fx.Int32(L.elems_per_lane),
+                c_payload_bytes_per_block=fx.Int32(L.payload_bytes_per_block),
+                c_payload_bytes_per_lane=fx.Int32(L.payload_bytes_per_lane),
+                c_wmma_rep=fx.Int32(wmma_rep),
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=lane_in_block == c0_i32,
+                # The destinations are set before the store pass.
+                make_dests=lambda: (None, None),
+                scale_rsrc=scale_rsrc,
+                scale_pack_dwords=True,
+                # Clustered, the scale cluster writes the e8m0 tiles.
+                skip_scale_stores=not local,
+            )
+
+        def _quant_pass():
+            out = []
+            for i in range_constexpr(tasks_per_wave):
+                _, token_i, k_group_i, dwords_i = tasks[i]
+                qc = _quant_ctx(token_i, k_group_i, dwords_i)
+                out.append((qc, _emit_quant_compute(qc)[0]))
+            return out
+
         if const_expr(local):
+            quant = _quant_pass()
             gpu.barrier()
         else:
+            # The scale cluster's e8m0 rows of its top-k rows, published like
+            # the ids (scale_exchange[token, K-group * 2 + half]): the 4 MX
+            # blocks of a dword gathered on the lane of the first, as the
+            # interleaved store packs them.
+            sc_xchg_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(scale_exchange)),
+                num_records_bytes=is_sc.select(
+                    fx.Int32(n_tok * fx.Uint32(sd_per_row * 4)), c0_i32
+                ),
+            )
+            pk = SimpleNamespace(c0_f32=c0_f32, c4_i32=c4_i32, c_wave=c_wave)
+            for live, token, k_group, dwords in sc_tasks:
+                bf16x8 = fx.Vector(dwords).bitcast(fx.Numeric.from_ir_type(T.bf16))
+                amax = _emit_pk8_lane_amax(bf16x8, pk)
+                for dist in L.amax_shuffle_dists:
+                    amax = fx.max(amax, amax.shuffle_xor(fx.Int32(dist), c_wave))
+                e8m0 = fx.Int32(
+                    emit_mx_e8m0_scale(amax, mode=_ROUND_MODE, dtype=L.mx_dtype)
+                )
+                packed = _pack_block_group_dword(pk, e8m0)
+                if live & ((lane & fx.Uint32(15)) == fx.Uint32(0)):
+                    buffer_ops.buffer_store(
+                        packed,
+                        sc_xchg_rsrc,
+                        fx.Int32(token) * fx.Int32(sd_per_row)
+                        + fx.Int32(k_group) * fx.Int32(2)
+                        + fx.Int32(lane >> fx.Uint32(4)),
+                        cache_modifier=_CPOL_SCOPE_DEV,
+                    )
+
             # Publish the ids to the cluster: the workgroup-scope release is
             # the s_wait_storecnt that lands them (device scope comes from
             # SCOPE_DEV on the store and on the read-back below).
@@ -435,31 +683,71 @@ def build_moe_topk_route_quant_module(
             cluster.cluster_barrier()
 
             # Phase 2: every route of the batch into the per-expert bitmask.
-            if tid < n_tok * fx.Uint32(topk):
-                e = fx.Int32(
-                    buffer_ops.buffer_load(
-                        xchg_rsrc,
-                        fx.Int32(tid),
-                        vec_width=1,
-                        dtype=i32,
-                        cache_modifier=_CPOL_SCOPE_DEV,
+            # All the read-backs are issued before the quant pass, which runs
+            # under their latency.
+            n_routes = n_tok * fx.Uint32(topk)
+            back = []
+            for j in range_constexpr(ids_per_thread):
+                idx = tid + fx.Uint32(j * BLOCK_THREADS)
+                back.append(
+                    (
+                        idx,
+                        fx.Int32(
+                            buffer_ops.buffer_load(
+                                xchg_rsrc,
+                                fx.Int32(idx),
+                                vec_width=1,
+                                dtype=i32,
+                                cache_modifier=_CPOL_SCOPE_DEV,
+                            )
+                        ),
                     )
                 )
-                lds_ids[tid] = e
-                if e >= c0_i32:
-                    _set_token_bit(lds_bits, e, tid // fx.Uint32(topk), words)
+            # The scale cluster reads every token's e8m0 row back too (the
+            # others' descriptor is zero-length), 4 dwords a lane.
+            sc_back = []
+            for j in range_constexpr(sc_loads_per_thread):
+                idx4 = (tid + fx.Uint32(j * BLOCK_THREADS)) * fx.Uint32(4)
+                sc_back.append(
+                    (
+                        idx4,
+                        fx.Vector(
+                            buffer_ops.buffer_load(
+                                sc_xchg_rsrc,
+                                fx.Int32(idx4),
+                                vec_width=4,
+                                dtype=i32,
+                                cache_modifier=_CPOL_SCOPE_DEV,
+                            )
+                        ),
+                    )
+                )
+            quant = _quant_pass()
+            for idx4, v in sc_back:
+                if const_expr(sc_loads_per_thread * BLOCK_THREADS * 4 <= scale_lds):
+                    for q in range_constexpr(4):
+                        lds_scale[idx4 + fx.Uint32(q)] = fx.Int32(v[q])
+                else:
+                    if idx4 < fx.Uint32(scale_lds):
+                        for q in range_constexpr(4):
+                            lds_scale[idx4 + fx.Uint32(q)] = fx.Int32(v[q])
+            for idx, e in back:
+                if idx < n_routes:
+                    lds_ids[idx] = e
+                    if e >= c0_i32:
+                        _set_token_bit(
+                            lds_bits, lds_counts, e, idx // fx.Uint32(topk), words
+                        )
             gpu.barrier()
 
         # Phase 3 (wave 0): per-expert counts and the tile-aligned exclusive
         # scan, `experts_per_lane` consecutive experts a lane.
         if wid == fx.Uint32(0):
             e0 = fx.Int32(lane) * fx.Int32(experts_per_lane)
-            cnts = []
-            for i in range_constexpr(experts_per_lane):
-                c = c0_i32
-                for w in range_constexpr(words):
-                    c = c + fx.ctpop(lds_bits[(e0 + fx.Int32(i)) * fx.Int32(words) + w])
-                cnts.append(c)
+            cnts = [
+                fx.Int32(lds_counts[e0 + fx.Int32(i)])
+                for i in range_constexpr(experts_per_lane)
+            ]
             padded = [(c + fx.Int32(align_m - 1)) & fx.Int32(-align_m) for c in cnts]
             incl = []
             run = c0_i32
@@ -482,13 +770,6 @@ def build_moe_topk_route_quant_module(
 
         # Phase 4: quantize this workgroup's tokens into their grouped rows.
         rows_t = ptr_buf_tensor(topids_to_rows)
-        scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(ptrtoint(grouped_scale)),
-            num_records_bytes=_SCALE_RSRC_MAX_BYTES,
-        )
-        c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
-        block_in_wave = lane // fx.Uint32(c_lanes_per_block)
-        lane_in_block = lane - block_in_wave * c_lanes_per_block
         # Every route row of the wave's tasks at once, one lane a route (lane
         # i * topk + k: task i, route k), then broadcast with readlane. Done a
         # route at a time, each row is a chain of dependent LDS round trips.
@@ -527,13 +808,13 @@ def build_moe_topk_route_quant_module(
             rows_t[l_route] = l_row
 
         for i in range_constexpr(tasks_per_wave):
-            live, token, k_group, dwords = tasks[i]
+            live, token, _, _ = tasks[i]
+            qc, results = quant[i]
             if live & (token < n_valid):
                 rows = [
                     fx.Uint32(rocdl.readlane(i32, l_row, i * topk + k))
                     for k in range_constexpr(topk)
                 ]
-
                 scales = [
                     _token_multidest_scale_base(
                         r,
@@ -543,55 +824,36 @@ def build_moe_topk_route_quant_module(
                     )
                     for r in rows
                 ]
-                qc = SimpleNamespace(
-                    i32=i32,
-                    f32=f32,
-                    block_iters=1,
-                    mx_group_base=fx.Int32(k_group),
-                    payload_base=fx.Int64(ptrtoint(grouped_payload)),
-                    payload_bytes_per_row=L.payload_bytes_per_row,
-                    hidden_base=hid_base,
-                    feat_bytes_per_row=feat_dim * 2,
-                    feat_row_i32=token,
-                    # The prologue already holds this task's hidden slice.
-                    hidden_lds_load=lambda _idx, _off, _d=dwords: _d,
-                    hidden_lds_idx=None,
-                    hidden_lds_row_off=c0_i32,
-                    hidden_slot_bytes=0,
-                    prequantized=False,
-                    payload_dwords_per_lane=L.payload_bytes_per_lane // 4,
-                    src_scale_base=fx.Int64(0),
-                    src_scale_bytes_per_row=0,
-                    mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
-                    mx_blocks_per_row=L.mx_blocks_per_row,
-                    amax_shuffle_dists=L.amax_shuffle_dists,
-                    is_fp8=L.is_fp8,
-                    use_native=L.use_native,
-                    use_pk8=L.use_pk8,
-                    mx_dtype=L.mx_dtype,
-                    c0_i32=c0_i32,
-                    c1_i32=c1_i32,
-                    c4_i32=c4_i32,
-                    c23_i32=c23_i32,
-                    c254_i32=c254_i32,
-                    c0_f32=c0_f32,
-                    c_wave=c_wave,
-                    c_elems_per_lane=fx.Int32(L.elems_per_lane),
-                    c_payload_bytes_per_block=fx.Int32(L.payload_bytes_per_block),
-                    c_payload_bytes_per_lane=fx.Int32(L.payload_bytes_per_lane),
-                    c_wmma_rep=fx.Int32(wmma_rep),
-                    block_in_wave=block_in_wave,
-                    lane_in_block=lane_in_block,
-                    is_block_lead=lane_in_block == c0_i32,
-                    payload_dests=[SimpleNamespace(payload_row_i32=r) for r in rows],
-                    dests=[
-                        SimpleNamespace(payload_row_i32=r, scale_row_dword_base=s)
-                        for r, s in zip(rows, scales)
-                    ],
-                    scale_rsrc=scale_rsrc,
-                    scale_pack_dwords=True,
-                )
-                _emit_quant_block_loop(qc)
+                _emit_route_stores(qc, results, rows, scales)
+
+        # The build-time and the runtime condition cannot share one `if`.
+        if const_expr(not local):  # noqa: SIM102
+            # Phase 5 (scale cluster): every expert's e8m0 rows, dest-major, so
+            # one workgroup writes each tile (a line written from many CUs at
+            # once, as the token-major scatter does, is what made it slow).
+            # Wave 2j + h: expert wg + CLUSTER * j, dwords h * sd_half ...;
+            # 32 grouped rows (a 128 B run of each dword column) a pass.
+            if is_sc:
+                e_sc = fx.Int32(wg_in_cl) + fx.Int32(CLUSTER) * fx.Int32(wid >> 1)
+                sd0 = fx.Int32(wid & fx.Uint32(1)) * fx.Int32(sd_half)
+                cnt_sc = fx.Int32(lds_counts[e_sc])
+                start_sc = fx.Int32(lds_starts[e_sc])
+                for h in range_constexpr(-(-max_rows // wave_size)):
+                    k_sc = fx.Int32(h * wave_size) + fx.Int32(lane)
+                    if k_sc < cnt_sc:
+                        _emit_scale_tile_stores(
+                            lds_bits,
+                            lds_scale,
+                            scale_rsrc,
+                            e_sc,
+                            cnt_sc,
+                            start_sc,
+                            k_sc,
+                            sd0,
+                            sd_half,
+                            words,
+                            L,
+                        )
 
     @flyc.jit
     def launch_topk_route_quant(
@@ -606,6 +868,7 @@ def build_moe_topk_route_quant_module(
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         exchange: fx.Pointer,
+        scale_exchange: fx.Pointer,
         token_num: fx.Int32,
         logits_row_stride: fx.Int32,
         grid_blocks: fx.Int32,
@@ -623,6 +886,7 @@ def build_moe_topk_route_quant_module(
             grouped_payload,
             grouped_scale,
             exchange,
+            scale_exchange,
             token_num,
             logits_row_stride,
         )

@@ -307,8 +307,42 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     )
 
 
+def _quant_payload_rsrcs(c):
+    """One payload-row descriptor per destination of ``c``."""
+    # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
+    # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
+    payload_bytes_per_row = c.payload_bytes_per_row
+    payload_dests = getattr(c, "payload_dests", c.dests)
+    # A zero-length descriptor is how a dead destination is switched off, so
+    # the quant pass stays one basic block.
+    payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
+    rsrcs = []
+    for dst in payload_dests:
+        row_addr = (
+            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+        )
+        rsrcs.append(
+            buffer_ops.create_buffer_resource_from_addr(
+                row_addr,
+                num_records_bytes=getattr(dst, "num_records", payload_records),
+            )
+        )
+    return rsrcs
+
+
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
+
+    The quant pass (``_emit_quant_compute``) followed by the store pass
+    (``_emit_quant_stores``); a caller that learns its destination rows late
+    can emit the two apart, the quant ahead of whatever the rows wait on.
+    """
+    _emit_quant_stores(c, *_emit_quant_compute(c))
+
+
+def _emit_quant_compute(c: SimpleNamespace):
+    """The quant pass of ``_emit_quant_block_loop``: ``(results, dst_payload)``
+    for ``_emit_quant_stores``.
 
     ``c`` carries the layout flags, SSA constants/types, the i64 row bases
     (``payload_base``, ``hidden_base``) with their per-row byte strides
@@ -332,33 +366,11 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     if mx_group_base is None:
         mx_group_base = fx.Int32(0)
 
-    # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
-    # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
-    payload_bytes_per_row = c.payload_bytes_per_row
-
-    def _payload_rsrcs():
-        payload_dests = getattr(c, "payload_dests", c.dests)
-        # A zero-length descriptor is how a dead destination is switched off, so
-        # the quant pass stays one basic block.
-        payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
-        rsrcs = []
-        for dst in payload_dests:
-            row_addr = (
-                c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
-            )
-            rsrcs.append(
-                buffer_ops.create_buffer_resource_from_addr(
-                    row_addr,
-                    num_records_bytes=getattr(dst, "num_records", payload_records),
-                )
-            )
-        return rsrcs
-
     # ``make_dests`` defers the destination rows until after the quant pass: the
     # scalar row loads then complete under the hidden-row loads instead of in
     # front of them, since nothing before the first load waits on them.
     make_dests = getattr(c, "make_dests", None)
-    dst_payload = None if make_dests is not None else _payload_rsrcs()
+    dst_payload = None if make_dests is not None else _quant_payload_rsrcs(c)
 
     # The hidden/payload SOURCE row stays on the width-agnostic buffer_ops V#
     # (one descriptor per buffer, per-access vec_width). Its pk8 dwordx4 load
@@ -554,7 +566,14 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     payload_val = fx.Uint8(packed_byte)  # 1 fp4x2 B
 
         quant_results.append((mx_block, payload_val, e8m0_scale))
+    return quant_results, dst_payload
 
+
+def _emit_quant_stores(c: SimpleNamespace, quant_results, dst_payload) -> None:
+    """The store pass of ``_emit_quant_block_loop`` over ``_emit_quant_compute``'s
+    results. ``dst_payload`` None builds the payload descriptors here (from
+    ``c.make_dests`` when set, else ``c.payload_dests`` / ``c.dests``)."""
+    make_dests = getattr(c, "make_dests", None)
     # Stores are a separate pass so the quant pass above stays one basic block and
     # its loads can cluster. That only works while the quant pass is branch-free:
     # a value defined inside a guarded region does not dominate this loop, so
@@ -563,7 +582,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # row in ``c.dests``.
     if const_expr(make_dests is not None):
         c.payload_dests, c.dests = make_dests()
-        dst_payload = _payload_rsrcs()
+        dst_payload = _quant_payload_rsrcs(c)
+    elif const_expr(dst_payload is None):
+        dst_payload = _quant_payload_rsrcs(c)
     for mx_block, payload_val, e8m0_scale in quant_results:
         _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
 
@@ -580,6 +601,9 @@ def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
     byte_in_dword = mx_block - scale_dword * c.c4_i32
     e8m0_byte = fx.Uint8(e8m0_scale)
     _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+    if const_expr(getattr(c, "skip_scale_stores", False)):
+        # The caller writes the e8m0 rows itself.
+        return
 
     if const_expr(getattr(c, "compact_scale", False)):
         _emit_compact_scale_dwords(c, scale_dword, e8m0_scale)
