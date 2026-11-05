@@ -28,15 +28,31 @@ Constraints common to both:
 See ``csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
 """
 
+import functools
+
 import torch
 
-from ..jit.core import compile_ops
+from ..jit.core import compile_ops, get_args_of_build
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_mla_v4_prefill_opus"
 
 SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+
+
+@functools.cache
+def fp8_kv_dma_layout_enabled(gfx: str) -> bool:
+    """Whether the fp8 kernel for ``gfx`` reads the DMA KV layout.
+
+    Only the gfx950 kernel has the DMA path, and only when the module is built
+    with ``-DOPUS_MLA_V4_DMA`` (its ``flags_extra_hip`` in optCompilerConfig.json),
+    so the wrapper follows that flag rather than assuming it.
+    """
+    if gfx != "gfx950":
+        return False
+    flags = get_args_of_build(MD_NAME)["flags_extra_hip"]
+    return any("-DOPUS_MLA_V4_DMA" in f for f in flags)
 
 
 def _dispatch(gfx: str, op_gfx950, op_gfx1250):
@@ -255,12 +271,19 @@ def pa_sparse_prefill_fp8_opus(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     """Sparse prefill attention with split fp8 NoPE and bf16 RoPE inputs.
 
     The trailing ``out`` keyword is an aiter-only convenience for callers that
     want to reuse a pre-allocated output buffer; pass ``None`` (the default) to
     have one allocated for you.
+
+    On gfx950 the kernel reads the KV caches in the DMA layout (one 512 B fp8 row
+    per position: NoPE at scale 2^0, fp8 RoPE in [448, 512)). Caches in the
+    served layout are converted to it on every call, into new tensors, by
+    :func:`aiter.ops.triton.mla_v4_kv_rescale.to_dma_kv_layout`; callers whose
+    caches are already in that layout pass ``kv_dma_layout=True`` to skip it.
 
     Args:
       q_nope:            ``[T, H, 512]`` fp8 query without positional encoding.
@@ -279,6 +302,8 @@ def pa_sparse_prefill_fp8_opus(
       softmax_scale:     float scalar applied to the combined QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
+      kv_dma_layout:     the KV caches are already in the DMA layout; ignored
+        where the kernel reads the served layout.
 
     Returns:
       ``out`` (``[T, H, 512]`` bf16).
@@ -289,6 +314,13 @@ def pa_sparse_prefill_fp8_opus(
         pa_sparse_prefill_fp8_gfx950_opus_fwd,
         pa_sparse_prefill_fp8_gfx1250_opus_fwd,
     )
+
+    if fp8_kv_dma_layout_enabled(gfx) and not kv_dma_layout:
+        from .triton.mla_v4_kv_rescale import to_dma_kv_layout
+
+        # Can be fused into SGLang's upstream KV quantization, which would then write this layout directly.
+        unified_kv_nope = to_dma_kv_layout(unified_kv_nope, unified_kv_rope)
+        kv_nope = to_dma_kv_layout(kv_nope, kv_rope)
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(

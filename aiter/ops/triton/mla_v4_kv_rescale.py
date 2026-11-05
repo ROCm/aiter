@@ -22,8 +22,9 @@ Storage is unchanged: the 14 bytes still live at offset 448 of each row, now
 holding the same values in every row, so the consuming kernel's scale load does
 not move.
 
-This is a correctness-first placeholder -- two passes over the cache, no fusion
-with the writer, not tuned.
+:func:`to_dma_kv_layout` does the unit-scale re-base and the RoPE fold in one
+out-of-place pass; it is what ``pa_sparse_prefill_fp8_opus`` runs. All of this is
+a placeholder for the KV cache writer emitting the layout directly.
 """
 
 import torch
@@ -217,3 +218,94 @@ def fold_rope_into_nope(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> None:
         D_NOPE=_D_NOPE,
         D_ROPE=64,
     )
+
+
+@triton.jit
+def _to_dma_layout_kernel(
+    src_ptr,
+    src_byte_ptr,
+    rope_ptr,
+    dst_ptr,
+    n_rows,
+    stride_src,
+    stride_rope,
+    BLOCK_ROWS: tl.constexpr,
+    NBLK: tl.constexpr,
+    BLK: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_PADDED: tl.constexpr,
+    D_ROPE: tl.constexpr,
+):
+    """Re-base each row to unit scale and fold its fp8 RoPE, into a new tensor."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_ok = rows < n_rows
+    for b in tl.range(0, NBLK):
+        cols = b * BLK + tl.arange(0, BLK)
+        q = tl.load(
+            src_ptr + rows[:, None] * stride_src + cols[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        e = tl.load(
+            src_byte_ptr + rows * stride_src + D_NOPE + b, mask=row_ok, other=127
+        )
+        v = q * tl.exp2(e.to(tl.float32) - 127.0)[:, None]
+        tl.store(
+            dst_ptr + rows[:, None] * D_PADDED + cols[None, :],
+            tl.clamp(v, -448.0, 448.0).to(tl.float8e4nv),
+            mask=row_ok[:, None],
+        )
+    rc = tl.arange(0, D_ROPE)
+    r = tl.load(
+        rope_ptr + rows[:, None] * stride_rope + rc[None, :],
+        mask=row_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        dst_ptr + rows[:, None] * D_PADDED + D_NOPE + rc[None, :],
+        tl.clamp(r, -448.0, 448.0).to(tl.float8e4nv),
+        mask=row_ok[:, None],
+    )
+
+
+def to_dma_kv_layout(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> torch.Tensor:
+    """Out-of-place, single-pass equivalent of :func:`rebase_kv_nope_to_dblock_scale`
+    (unit scale) followed by :func:`fold_rope_into_nope`.
+
+    Args:
+      kv_nope: ``[rows, 512]`` fp8 cache as served: 448 NoPE values whose E8M0
+        scales (one per 32 D elements, or a 64-element scale written twice)
+        sit at bytes [448, 462).
+      kv_rope: ``[rows, 64]`` bf16 RoPE.
+
+    Returns:
+      A new ``[rows, 512]`` fp8 tensor in the layout the DMA kernel reads: the
+      NoPE values at scale 2^0 in [0, 448) and fp8 RoPE in [448, 512). Values
+      beyond e4m3's +-448 saturate. The inputs are not modified.
+    """
+    assert kv_nope.dtype == torch.float8_e4m3fn, kv_nope.dtype
+    assert (
+        kv_nope.dim() == 2 and kv_nope.shape[1] == _D_PADDED and kv_nope.stride(1) == 1
+    )
+    assert kv_rope.dtype == torch.bfloat16, kv_rope.dtype
+    assert kv_rope.shape == (kv_nope.shape[0], 64) and kv_rope.stride(1) == 1
+    rows = kv_nope.shape[0]
+    out = torch.empty((rows, _D_PADDED), dtype=kv_nope.dtype, device=kv_nope.device)
+    if rows:
+        _to_dma_layout_kernel[(triton.cdiv(rows, 64),)](
+            kv_nope,
+            kv_nope.view(torch.uint8),
+            kv_rope,
+            out,
+            rows,
+            kv_nope.stride(0),
+            kv_rope.stride(0),
+            BLOCK_ROWS=64,
+            NBLK=_NBLK,
+            BLK=_BLK,
+            D_NOPE=_D_NOPE,
+            D_PADDED=_D_PADDED,
+            D_ROPE=64,
+        )
+    return out

@@ -12,11 +12,19 @@ latencies are directly comparable.
 The ``prec`` axis picks both the input format and the backends that run:
 
 * ``bf16`` -- single ``D=512`` Q/K/V/O tensor: ``opus``, ``triton``.
-* ``fp8``  -- split NoPE-fp8 / RoPE-bf16 DSA inputs: ``opus``, ``asm``.
+* ``fp8``  -- split NoPE-fp8 / RoPE-bf16 DSA inputs: ``opus``, ``opus_dma``,
+  ``asm``, ``a16w16``.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
 Both are gfx1250-only here and drop out of the sweep elsewhere.
+
+``a16w16`` is the path served today: the fp8 inputs dequantized to bf16 (not
+timed) and run through ``pa_sparse_prefill_opus``. The fp8 ``opus`` output is
+also checked against it directly. On gfx950 the fp8 ``opus`` wrapper converts
+the KV caches to the DMA layout on every call; ``opus_dma`` runs the same
+kernel on caches converted once up front (the kernel alone), and
+``run_kv_dma_layout`` checks that conversion on its own.
 
 Example CLI usage::
 
@@ -24,6 +32,15 @@ Example CLI usage::
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --mode dense
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec fp8 --no-verify
+
+DeepSeek-V4.1-Flash prefill (16,384 tokens per chunk, 16 heads per rank at
+TP4, top-k 512 plus SWA 128) over a 131k-row prefix cache, and the
+L2-resident case where every token reads the same 512 + 128 rows::
+
+    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py -n 16384 --h_q 16 \\
+        --mode swa_clus swa_rand --total_pages 131072
+    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py -n 16384 --h_q 16 \\
+        --mode dense --total_pages 512 --total_tokens 128
 """
 
 from __future__ import annotations
@@ -41,11 +58,14 @@ import torch
 import aiter  # noqa: F401  (registers the top-level export)
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
 from aiter.ops.pa_sparse_prefill_opus import (
+    fp8_kv_dma_layout_enabled,
     pa_sparse_prefill_fp8_opus,
     pa_sparse_prefill_opus,
 )
+from aiter.ops.triton.mla_v4_kv_rescale import to_dma_kv_layout
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -294,12 +314,66 @@ def _empty_csr(n: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Ten
     )
 
 
+# DeepSeek-V4.1-Flash prefill selection: each token reads its top-k rows of the
+# prefix cache plus a sliding window over the chunk's own tokens.
+_V41_TOPK = 512
+_V41_SWA = 128
+# swa_clus: each group of 64 neighbouring tokens shares 384 of its 512 top-k rows.
+_V41_GROUP = 64
+_V41_SHARED = 384
+
+
+def _topk_csr(
+    n: int, total_rows: int, *, clustered: bool, device: torch.device, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_V41_TOPK`` prefix rows per token, in position order like a top-k."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    if clustered:
+        groups = (n + _V41_GROUP - 1) // _V41_GROUP
+        shared = torch.randint(0, total_rows, (groups, _V41_SHARED), generator=g)
+        own = torch.randint(0, total_rows, (n, _V41_TOPK - _V41_SHARED), generator=g)
+        rows = torch.cat([shared.repeat_interleave(_V41_GROUP, 0)[:n], own], dim=1)
+    else:
+        rows = torch.randint(0, total_rows, (n, _V41_TOPK), generator=g)
+    rows = torch.sort(rows, dim=1).values
+    indptr = torch.arange(0, (n + 1) * _V41_TOPK, _V41_TOPK, dtype=torch.int32)
+    return indptr.to(device), rows.flatten().to(torch.int32).to(device)
+
+
+def _swa_csr(
+    n: int, total_tokens: int, *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sliding window: token t reads extend rows ``max(0, t - 127) .. t``."""
+    assert total_tokens >= n, "the window indexes the chunk's own tokens"
+    t = torch.arange(n, dtype=torch.int32)
+    lo = (t - (_V41_SWA - 1)).clamp(min=0)
+    indptr = torch.zeros(n + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(t - lo + 1, dim=0)
+    win = lo[:, None] + torch.arange(_V41_SWA, dtype=torch.int32)[None, :]
+    indices = win[win <= t[:, None]]
+    return indptr.to(device), indices.to(torch.int32).to(device)
+
+
 # ---------------------------------------------------------------------------
 # Input factory
 # ---------------------------------------------------------------------------
 
-# Applied symmetrically to both the prefix and the extend CSR.
-_MODES = ("sparse", "dense", "empty")
+# sparse / dense / empty apply symmetrically to the prefix and the extend CSR.
+# swa_rand / swa_clus are the V4.1 selection: top-k prefix rows (independent per
+# token, or shared by groups of neighbouring tokens) plus a sliding window.
+_MODES = ("sparse", "dense", "empty", "swa_rand", "swa_clus")
+_V41_MODES = ("swa_rand", "swa_clus")
+
+
+def _v41_csr(
+    n: int, total_pages: int, total_tokens: int, mode: str, *, device, seed: int
+):
+    ip_p, ix_p = _topk_csr(
+        n, total_pages, clustered=mode == "swa_clus", device=device, seed=seed * 2 + 1
+    )
+    ip_e, ix_e = _swa_csr(n, total_tokens, device=device)
+    return ip_p, ix_p, ip_e, ix_e
 
 
 def _make_inputs(
@@ -345,8 +419,13 @@ def _make_inputs(
             return _dense_csr(n, total_rows, device=device)
         return _empty_csr(n, device=device)
 
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
+    if mode in _V41_MODES:
+        ip_p, ix_p, ip_e, ix_e = _v41_csr(
+            n, total_pages, total_tokens, mode, device=device, seed=seed
+        )
+    else:
+        ip_p, ix_p = _csr(total_pages, 1)
+        ip_e, ix_e = _csr(total_tokens, 2)
 
     return {
         "q": q,
@@ -424,8 +503,13 @@ def _make_inputs_fp8(
             return _dense_csr(n, total_rows, device=device)
         return _empty_csr(n, device=device)
 
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
+    if mode in _V41_MODES:
+        ip_p, ix_p, ip_e, ix_e = _v41_csr(
+            n, total_pages, total_tokens, mode, device=device, seed=seed
+        )
+    else:
+        ip_p, ix_p = _csr(total_pages, 1)
+        ip_e, ix_e = _csr(total_tokens, 2)
 
     kernel = {
         "q_nope": qn,
@@ -457,11 +541,11 @@ def _make_inputs_fp8(
 # Backends
 # ---------------------------------------------------------------------------
 
-_BACKENDS = ("opus", "asm", "triton")
+_BACKENDS = ("opus", "opus_dma", "asm", "triton", "a16w16")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "fp8": ("opus", "asm"),
+    "fp8": ("opus", "opus_dma", "asm", "a16w16"),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
@@ -557,12 +641,54 @@ def run_pa_sparse_prefill(
                     ),
                 )
             )
+        if "opus_dma" in wanted and fp8_kv_dma_layout_enabled(get_gfx_runtime()):
+            # The kernel alone: caches converted once up front, as a KV writer
+            # emitting the DMA layout would leave them. ``opus`` converts per call.
+            dma_inputs = dict(
+                kernel_inputs,
+                unified_kv_nope=to_dma_kv_layout(
+                    kernel_inputs["unified_kv_nope"], kernel_inputs["unified_kv_rope"]
+                ),
+                kv_nope=to_dma_kv_layout(
+                    kernel_inputs["kv_nope"], kernel_inputs["kv_rope"]
+                ),
+            )
+            candidates.append(
+                (
+                    "opus_dma",
+                    lambda: pa_sparse_prefill_fp8_opus(
+                        **dma_inputs, softmax_scale=softmax_scale, kv_dma_layout=True
+                    ),
+                )
+            )
         if "asm" in wanted and h == _ASM_HEADS and _get_gpu_arch() == "gfx1250":
             candidates.append(
                 (
                     "asm",
                     lambda: mla_sparse_prefill_fp8_asm(
                         **kernel_inputs, softmax_scale=softmax_scale
+                    ),
+                )
+            )
+        if "a16w16" in wanted:
+            # The served path: KV dequantized to bf16 up front (outside the
+            # timed region), then the bf16 kernel on the same rows.
+            rf = data["ref"]
+            served_inputs = {
+                "q": rf["q_fp32"].to(torch.bfloat16),
+                "unified_kv": rf["ukv_fp32"].to(torch.bfloat16),
+                "kv": rf["kv_fp32"].to(torch.bfloat16),
+                "kv_indices_prefix": kernel_inputs["kv_indices_prefix"],
+                "kv_indptr_prefix": kernel_inputs["kv_indptr_prefix"],
+                "kv_indices_extend": kernel_inputs["kv_indices_extend"],
+                "kv_indptr_extend": kernel_inputs["kv_indptr_extend"],
+                "attn_sink": kernel_inputs["attn_sink"],
+            }
+            candidates.append(
+                (
+                    "a16w16",
+                    lambda: pa_sparse_prefill_opus(
+                        **served_inputs, softmax_scale=softmax_scale
                     ),
                 )
             )
@@ -611,10 +737,12 @@ def run_pa_sparse_prefill(
 
     ref = ref_fn(**ref_inputs, softmax_scale=softmax_scale) if verify else None
 
+    outs = {}
     for name, invoke in candidates:
         if verify:
+            outs[name] = invoke()
             err = checkAllclose(
-                invoke(),
+                outs[name],
                 ref,
                 rtol=_RTOL,
                 atol=_ATOL,
@@ -636,6 +764,73 @@ def run_pa_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
 
+    if "opus" in outs and "a16w16" in outs:
+        # fp8 against the served path on the same inputs, same tolerance.
+        err = checkAllclose(
+            outs["opus"],
+            outs["a16w16"],
+            rtol=_RTOL,
+            atol=_ATOL,
+            tol_err_ratio=_ERR_TOL,
+            msg=f"opus vs a16w16: {msg}",
+        )
+        row["opus vs a16w16 err"] = float(err)
+        assert err <= _ERR_TOL, (
+            f"opus vs a16w16: {msg} mismatch ratio {err:.3%} exceeds "
+            f"{_ERR_TOL:.1%} at rtol={_RTOL} atol={_ATOL}"
+        )
+
+    return row
+
+
+@benchmark()
+def run_kv_dma_layout(
+    rows: int,
+    *,
+    seed: int = 0,
+    data_init: str = "norm",
+    bench: bool = True,
+) -> dict | None:
+    """The KV conversion ``pa_sparse_prefill_fp8_opus`` runs on gfx950: NoPE
+    re-based to scale 2^0 and fp8 RoPE folded into slots [448, 512)."""
+    if _skip_if_unsupported(d=512):
+        return None
+    device = torch.device("cuda")
+    gen = make_generator(seed, device=device)
+    real = fill((rows, _FP8_D_NOPE), data_init, gen, dtype=torch.float32, device=device)
+    nope, deq = _quantize_nope(real * 0.5)
+    rope = (
+        fill((rows, _FP8_D_ROPE), data_init, gen, dtype=torch.float32, device=device)
+        * 0.5
+    ).to(torch.bfloat16)
+    nope_before = nope.view(torch.uint8).clone()
+
+    got = to_dma_kv_layout(nope, rope)
+    # The served row's real values, rounded once to e4m3 at scale 2^0.
+    ref = torch.cat([deq, rope.to(torch.float32)], dim=1).clamp(-448.0, 448.0)
+    ref = ref.to(torch.float8_e4m3fn)
+    err = checkAllclose(
+        got.to(torch.float32),
+        ref.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"to_dma_kv_layout: [rows={rows} data_init={data_init} seed={seed}]",
+    )
+    assert (
+        err == 0
+    ), f"to_dma_kv_layout differs from the reference on {err:.3%} of values"
+    assert torch.equal(nope.view(torch.uint8), nope_before), "input cache was modified"
+
+    row = {"err": float(err)}
+    if bench:
+        _, lat_us = _profile_func(
+            lambda: to_dma_kv_layout(nope, rope), backend="triton"
+        )
+        nbytes = rows * (
+            2 * _FP8_D_NOPE_PADDED + 2 * _FP8_D_ROPE
+        )  # read row + RoPE, write row
+        row["us"] = round(float(lat_us), 2)
+        row["TB/s"] = round(nbytes / max(lat_us * 1e-6, 1e-12) / 1e12, 3)
     return row
 
 
@@ -652,7 +847,7 @@ _PYTEST_SHAPES = [
     (256, 128, 2048, 2048),
 ]
 _PYTEST_PRECS = ["bf16", "fp8"]
-_PYTEST_MODES = ["sparse", "dense", "empty"]
+_PYTEST_MODES = ["sparse", "dense", "empty", "swa_rand", "swa_clus"]
 
 
 @pytest.mark.parametrize("prec", _PYTEST_PRECS)
@@ -675,6 +870,13 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
         verify=True,
         bench=False,
     )
+
+
+# 65536 rows is large enough to expose a cross-warp read/write race in an
+# in-place conversion; 1 is below one 64-row block.
+@pytest.mark.parametrize("rows", [1, 512, 65536])
+def test_kv_dma_layout(rows):
+    run_kv_dma_layout(rows=rows, seed=rows, bench=False)
 
 
 # ---------------------------------------------------------------------------
@@ -762,9 +964,13 @@ parser.add_argument(
     choices=list(_MODES),
     help=(
         "CSR mode(s) to sweep for both prefix and extend.\n"
-        "  sparse: random nnz/row in [0, total_rows]\n"
-        "  dense : every token sees every page / every kv row\n"
-        "  empty : all-empty CSR rows (sink-only output)\n"
+        "  sparse  : random nnz/row in [0, total_rows]\n"
+        "  dense   : every token sees every page / every kv row\n"
+        "  empty   : all-empty CSR rows (sink-only output)\n"
+        f"  swa_rand: {_V41_TOPK} random top-k prefix rows per token plus a\n"
+        f"            {_V41_SWA}-row sliding window over the extend tokens\n"
+        f"  swa_clus: as swa_rand, but each group of {_V41_GROUP} tokens shares\n"
+        f"            {_V41_SHARED} of its top-k rows\n"
         "Default: [sparse, dense]."
     ),
 )
@@ -838,5 +1044,27 @@ if __name__ == "__main__":
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
         print_json_table("pa_sparse_prefill summary", df)
-        sys.exit(0)
+
+    if "fp8" in args.prec:
+        # The conversion the fp8 wrapper runs, at the prefix-cache sizes swept above.
+        layout_rows = sorted(
+            {
+                p if p > 0 else n
+                for p, n in itertools.product(args.total_pages, args.n_tokens)
+            }
+        )
+        layout = [
+            run_kv_dma_layout(
+                rows=r,
+                seed=args.seed,
+                data_init=args.data_init[0],
+                bench=not args.no_bench,
+            )
+            for r in layout_rows
+        ]
+        layout = [r for r in layout if r]
+        if layout:
+            df = pd.DataFrame(layout)
+            df = df.drop(columns=[c for c in ("bench", "seed") if c in df.columns])
+            print_json_table("kv dma layout summary", df)
     sys.exit(0)
