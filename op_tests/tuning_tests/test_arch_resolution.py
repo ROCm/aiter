@@ -234,6 +234,19 @@ class TestNormalizeFp8Dtype(unittest.TestCase):
         for flavor in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             self.assertEqual(dtypes.normalize_fp8_dtype(flavor), dtypes.fp8)
 
+    def test_both_native_encodings_independent_of_host(self):
+        # CI runs this suite on a single arch, which only exercises one
+        # direction; pin gfx942 (fn -> fnuz) and gfx950 (fnuz -> fn) explicitly.
+        import torch
+
+        from aiter import dtypes
+
+        flavors = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        for native in flavors:
+            with self.subTest(native=native), mock.patch.object(dtypes, "fp8", native):
+                for flavor in flavors:
+                    self.assertIs(dtypes.normalize_fp8_dtype(flavor), native)
+
     def test_idempotent(self):
         import torch
 
@@ -286,17 +299,28 @@ class TestShippedShapeListsAreTunable(unittest.TestCase):
             yield from sorted(glob.glob(os.path.join(root, pattern)))
 
     def test_normalization_makes_every_fp8_shape_arch_native(self):
-        import csv
-
         import torch
 
         from aiter import dtypes
-        from aiter.jit.core import AITER_ROOT_DIR
-        from aiter.utility.base_tuner import TunerCommon
 
         if dtypes.fp8 not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             self.skipTest("arch has no native e4m3 (fp8 falls back to uint8)")
-        native = str(dtypes.fp8)
+        self._assert_shipped_lists_resolve_to(str(dtypes.fp8))
+
+    def test_shipped_lists_resolve_for_each_native_encoding(self):
+        import torch
+
+        from aiter import dtypes
+
+        for native in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with self.subTest(native=native), mock.patch.object(dtypes, "fp8", native):
+                self._assert_shipped_lists_resolve_to(str(native))
+
+    def _assert_shipped_lists_resolve_to(self, native):
+        import csv
+
+        from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.utility.base_tuner import TunerCommon
 
         checked = collections.Counter()
         for path in self._shape_lists(AITER_ROOT_DIR):
@@ -341,14 +365,17 @@ class TestShippedShapeListsAreTunable(unittest.TestCase):
         from aiter import dtypes
         from aiter.utility.base_tuner import TunerCommon
 
-        if dtypes.fp8 not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            self.skipTest("arch has no native e4m3 (fp8 falls back to uint8)")
-        native = str(dtypes.fp8)
-        # Leading/trailing whitespace must not defeat the match.
-        self.assertEqual(
-            TunerCommon._resolve_fp8_name("  torch.float8_e4m3fn "), native
-        )
-        self.assertEqual(TunerCommon._resolve_fp8_name("torch.float8_e4m3fnuz"), native)
+        for native in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with self.subTest(native=native), mock.patch.object(dtypes, "fp8", native):
+                # Leading/trailing whitespace must not defeat the match.
+                self.assertEqual(
+                    TunerCommon._resolve_fp8_name("  torch.float8_e4m3fn "),
+                    str(native),
+                )
+                self.assertEqual(
+                    TunerCommon._resolve_fp8_name("torch.float8_e4m3fnuz"),
+                    str(native),
+                )
         # Anything else is returned untouched, including values that would be
         # dangerous to eval().
         for passthrough in (
