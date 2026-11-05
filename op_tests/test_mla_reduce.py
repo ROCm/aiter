@@ -349,6 +349,105 @@ def run_case(
     return ok, ret
 
 
+def run_layout_case(
+    name,
+    num_heads,
+    head_dim,
+    out_dtype,
+    splits,
+    qo_len,
+    max_seqlen_q,
+    use_final_map,
+    sentinel_tiles=(),
+    pad_tiles=0,
+):
+    """Partial-map layouts the uniform builder never makes: no final map (rows
+    from the partial-map stride), a -1 tile whose single split already wrote its
+    output, a reduce_indptr tail padded for a CUDA-graph batch, and tiles with more
+    rows than max_seqlen_q, which take extra passes."""
+    device = "cuda"
+    indptr, pmap, fmap, num_partials, num_rows = [0], [], [], 0, 0
+    for t, s in enumerate(splits):
+        if t in sentinel_tiles:
+            pmap.append(-1)
+            indptr.append(indptr[-1] + 1)
+        else:
+            for _ in range(s):
+                pmap.append(num_partials)
+                num_partials += qo_len
+            indptr.append(indptr[-1] + s)
+        fmap.append([num_rows, num_rows + qo_len])
+        num_rows += qo_len
+    for _ in range(pad_tiles):
+        indptr.append(indptr[-1])
+        fmap.append([0, 0])
+    part_out = torch.randn(max(num_partials, 1), num_heads, head_dim, device=device)
+    part_lse = torch.randn(max(num_partials, 1), num_heads, device=device) * 4
+    # Rows the kernel must not write (the -1 tile's) keep this value.
+    untouched = 7.0
+    out = torch.full(
+        (num_rows, num_heads, head_dim), untouched, dtype=out_dtype, device=device
+    )
+    lse = torch.full((num_rows, num_heads), untouched, device=device)
+    ref_out, ref_lse = out.clone(), lse.clone()
+    for t in range(len(splits)):
+        slots = pmap[indptr[t] : indptr[t + 1]]
+        if slots == [-1]:
+            continue
+        if use_final_map:
+            q0, q1 = fmap[t]
+        else:
+            stride = slots[1] - slots[0] if len(slots) > 1 else 0
+            q0, q1 = t * stride, (t + 1) * stride
+        for r in range(q1 - q0):
+            idx = torch.tensor([slot + r for slot in slots], device=device)
+            max_lse = part_lse[idx].max(0).values
+            w = torch.exp(part_lse[idx] - max_lse)
+            ref_out[q0 + r] = (
+                (w.unsqueeze(-1) * part_out[idx]).sum(0) / w.sum(0).unsqueeze(-1)
+            ).to(out_dtype)
+            ref_lse[q0 + r] = max_lse + torch.log(w.sum(0))
+    as_i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+    aiter.mla_reduce_v1(
+        part_out,
+        part_lse,
+        as_i32(indptr),
+        as_i32(fmap) if use_final_map else None,
+        as_i32(pmap),
+        max_seqlen_q,
+        max(splits),
+        out,
+        lse,
+    )
+    err_out = checkAllclose(
+        ref_out.float(), out.float(), rtol=2e-2, atol=2e-2, msg=f"[{name}] output"
+    )
+    err_lse = checkAllclose(ref_lse, lse, rtol=2e-2, atol=2e-2, msg=f"[{name}] lse")
+    return err_out == 0 and err_lse == 0
+
+
+LAYOUT_CASES = [
+    # name, heads, head_dim, splits, qo_len, max_seqlen_q, use_final_map, kwargs
+    ("no final map, 1 tile", 16, 512, [250], 8, 8, False, {}),
+    ("no final map, 3 tiles", 16, 512, [40, 40, 40], 2, 2, False, {}),
+    (
+        "-1 tile among 64-split tiles",
+        16,
+        512,
+        [64, 1, 64],
+        4,
+        4,
+        True,
+        {"sentinel_tiles": (1,)},
+    ),
+    ("2 live tiles, 30 padded", 16, 512, [128, 96], 6, 6, True, {"pad_tiles": 30}),
+    ("8 rows, max_seqlen_q 4", 16, 512, [64, 64], 8, 4, True, {}),
+    ("8 rows, max_seqlen_q 1", 16, 512, [200], 8, 1, True, {}),
+    ("8 rows, max_seqlen_q 3", 16, 128, [32, 32, 32], 8, 3, True, {}),
+    ("80 tiles", 16, 128, [16] * 80, 1, 1, True, {}),
+]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test mla_reduce_v1 kernel")
     parser.add_argument(
@@ -439,6 +538,20 @@ def main():
                 )
                 all_ok &= ok
                 df.append(ret)
+
+        for name, heads, head_dim, splits, qo_len, max_q, use_fmap, kw in LAYOUT_CASES:
+            if head_dim in head_dims:
+                all_ok &= run_layout_case(
+                    name,
+                    heads,
+                    head_dim,
+                    out_dtype,
+                    splits,
+                    qo_len,
+                    max_q,
+                    use_fmap,
+                    **kw,
+                )
 
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
