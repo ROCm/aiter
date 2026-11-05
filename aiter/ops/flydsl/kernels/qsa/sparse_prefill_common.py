@@ -137,7 +137,9 @@ def platform() -> Platform:
 
 @functools.cache
 def gfx950() -> bool:
-    """CDNA4: the union kernel takes its gfx950 path (fourth part); the direct kernels run as on gfx942."""
+    """CDNA4: the union kernel takes its gfx950 path (fourth part), and the packed direct
+    kernel its own (sparse_prefill_direct_packed's gfx950 part); the raw direct kernel
+    runs as on gfx942."""
     return get_gfx_runtime() == "gfx950"
 
 
