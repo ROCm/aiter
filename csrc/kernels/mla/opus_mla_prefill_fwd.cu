@@ -3,8 +3,8 @@
 //
 // Launchers of the opus MLA sparse prefill kernels, bound to Python through the torch-free
 // ctypes C ABI (aiter_tensor_t* + trailing hipStream_t):
-//   gfx950  -- v4: kernels compiled from opus/mla_v4_prefill_*.hpp;
-//              v4.1: 16mx1_16nx4 compiled from opus/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
+//   gfx950  -- v4: kernels compiled from opus/gfx950/mla_v4_prefill_*.hpp;
+//              v4.1: 16mx1_16nx4 compiled from opus/gfx950/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
 //              16mx4_64nx1 prebuilt code objects in hsa/gfx950/mla_opus/.
 //   gfx1250 -- v4 and v4.1 (a8w8): prebuilt code objects in hsa/gfx1250/mla_opus/.
 
@@ -15,12 +15,12 @@
 #include "aiter_hip_common.h"
 
 #include "../../cpp_itfs/pa/pa_ps.cuh"
-#include "opus/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
-#include "opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
-#include "opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
+#include "opus/gfx950/mla_v4_prefill_a8w8_16mx8_32nx1.hpp"
 
 #include <cstddef>
 
@@ -31,7 +31,6 @@ AITER_CTYPES_ERROR_DEF
 // The reduce gives each split a lane of one wave, so a wave32 arch caps it.
 static constexpr int kOpusMlaPrefillMaxSplits = 32;
 
-// num_splits 1 runs without split-K and takes null partial buffers.
 static opus_mla_prefill_split_args opus_mla_prefill_split_buffers(aiter_tensor_t* partial_o,
                                                                   aiter_tensor_t* partial_max,
                                                                   aiter_tensor_t* partial_sum,
@@ -64,8 +63,7 @@ static opus_mla_prefill_split_args opus_mla_prefill_split_buffers(aiter_tensor_t
             num_splits};
 }
 
-// Folds the splits and the sink: a token is a batch row, a head a "kv head" of one query and a
-// thread one of the 512 columns.
+// A token is a batch row of the reduce, a head a one-query "kv head", a thread one of 512 columns.
 template <class D_OUT>
 static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& split,
                                           const void* attn_sink,
@@ -113,7 +111,6 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
                                                                   aiter_tensor_t* out,
                                                                   float softmax_scale)
 {
-    // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q->dim() == 3, "q must be 3-D [N, H, D], got ndim=", q->dim());
     AITER_CHECK(unified_kv->dim() == 2,
                 "unified_kv must be 2-D [total_pages, D], got ndim=",
@@ -152,12 +149,10 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1,
                 "kv_indptr_extend length must be N+1");
 
-    // Row-major contiguous strides are required for Q/UnifiedKV/KV/O along D.
     AITER_CHECK(q->stride(2) == 1 && unified_kv->stride(1) == 1 && kv->stride(1) == 1 &&
                     out->stride(2) == 1,
                 "Q/UnifiedKV/KV/O must be contiguous along the head-dim D");
 
-    // Kernel reads these 1-D buffers via raw pointer arithmetic; stride must be 1.
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
                     kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
                 "kv_indices/kv_indptr (prefix+extend) must be contiguous");
@@ -165,7 +160,6 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     const int total_pages  = static_cast<int>(unified_kv->size(0));
     const int total_tokens = static_cast<int>(kv->size(0));
 
-    // ---- Build kernel args -----------------------------------------------
     opus_mla_v4_prefill_kargs kargs{};
     kargs.q_ptr             = q->data_ptr();
     kargs.unified_kv_ptr    = unified_kv->data_ptr();
@@ -181,8 +175,6 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     kargs.D                 = D;
     kargs.total_pages       = total_pages;
     kargs.total_tokens      = total_tokens;
-    // The kernel assumes the standard row-major layout for [N, H, D] with the
-    // head dim contiguous; we already enforced stride(D) == 1 above.
     kargs.stride_qo_n       = static_cast<int>(q->stride(0));
     kargs.stride_qo_h       = static_cast<int>(q->stride(1));
     kargs.stride_kv_page    = static_cast<int>(unified_kv->stride(0));
@@ -222,7 +214,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
     if (N == 0) return;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
 
     if(num_splits > 1)
@@ -273,7 +264,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             launch(fp16_t{});                                                        \
     } while(0)
 
-    // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
     if(H <= 32)
         LAUNCH_OPUS_MLA_V4_PREFILL(opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel,
                                    opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits, 64, 4);
@@ -315,7 +305,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     constexpr int D_ROPE        = Traits::D_ROPE_SIZE;        // 64
     constexpr int D_HEAD        = Traits::D_HEAD_SIZE;        // 512
 
-    // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q_nope->dim() == 3, "q_nope must be 3-D [N, H, 512], got ndim=", q_nope->dim());
     AITER_CHECK(q_rope->dim() == 3, "q_rope must be 3-D [N, H, 64], got ndim=", q_rope->dim());
     AITER_CHECK(unified_kv_nope->dim() == 2,
@@ -395,7 +384,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(stride_kv_rope_page == static_cast<int>(kv_rope->stride(0)),
                 "unified_kv_rope and kv_rope must share row stride");
 
-    // ---- Build kernel args -----------------------------------------------
     opus_mla_v4_prefill_fp8_kargs kargs{};
     kargs.q_nope_ptr          = q_nope->data_ptr();
     kargs.q_rope_ptr          = q_rope->data_ptr();
@@ -423,7 +411,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.stride_kv_rope_page = stride_kv_rope_page;
     kargs.softmax_scale       = softmax_scale;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope->device_id);
 
     if(num_splits > 1)
@@ -461,7 +448,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         HIP_CALL_LAUNCH(hipGetLastError());                                       \
     } while(0)
 
-    // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
     if(H <= 32)
         LAUNCH_OPUS_MLA_V4_PREFILL_FP8(opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel,
                                        opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits, 64, 4);
@@ -476,100 +462,20 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 // gfx1250: prebuilt code object
 // ============================================================================
 
-// The code objects' kernel arguments are a field-for-field match of
-// opus_mla_v4_prefill_kargs and opus_mla_v4_prefill_fp8_kargs above, and of their
-// opus_mla_prefill_split_kargs for the split-K kernels, so those are reused verbatim as the
-// kernarg buffers.
-//
-// The catch is that nothing in this repo rebuilds the code objects: an edit made
-// for the gfx950 path would silently corrupt the gfx1250 launch. Pin every field
-// so such an edit fails the build instead. Sizes match the
-// `.kernarg_segment_size` reported by `llvm-readelf --notes <code object>`.
-#define OPUS_MLA_V4_GFX1250_CO_ABI(struct_, field_, offset_)                      \
-    static_assert(offsetof(struct_, field_) == (offset_),                         \
-                  #struct_ "::" #field_ " moved; rebuild the gfx1250 code objects")
-
-static_assert(sizeof(opus_mla_v4_prefill_kargs) == 112,
-              "opus_mla_v4_prefill_kargs resized; rebuild the gfx1250 code objects");
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, q_ptr, 0);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, unified_kv_ptr, 8);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, kv_ptr, 16);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, attn_sink_ptr, 24);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, out_ptr, 32);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, kv_indptr_prefix, 40);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, kv_indices_prefix, 48);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, kv_indptr_extend, 56);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, kv_indices_extend, 64);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, N, 72);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, H, 76);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, D, 80);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, total_pages, 84);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, total_tokens, 88);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, stride_qo_n, 92);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, stride_qo_h, 96);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, stride_kv_page, 100);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_kargs, softmax_scale, 104);
-
-static_assert(sizeof(opus_mla_v4_prefill_fp8_kargs) == 152,
-              "opus_mla_v4_prefill_fp8_kargs resized; rebuild the gfx1250 code objects");
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, q_nope_ptr, 0);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, q_rope_ptr, 8);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, unified_kv_nope_ptr, 16);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, unified_kv_rope_ptr, 24);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_nope_ptr, 32);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_rope_ptr, 40);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, attn_sink_ptr, 48);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, out_ptr, 56);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_indptr_prefix, 64);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_indices_prefix, 72);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_indptr_extend, 80);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, kv_indices_extend, 88);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, N, 96);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, H, 100);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, total_pages, 104);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, total_tokens, 108);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_q_nope_n, 112);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_q_nope_h, 116);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_q_rope_n, 120);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_q_rope_h, 124);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_o_n, 128);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_o_h, 132);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_kv_nope_page, 136);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_kv_rope_page, 140);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, softmax_scale, 144);
-
-static_assert(sizeof(opus_mla_prefill_split_args) == 32,
-              "opus_mla_prefill_split_args resized; rebuild the gfx1250 code objects");
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_o, 0);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_max, 8);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_sum, 16);
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, num_splits, 24);
-
-static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>) == 144,
-              "opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs> resized; rebuild the "
-              "gfx1250 code objects");
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>, split, 112);
-
-static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>) == 184,
-              "opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs> resized; rebuild the "
-              "gfx1250 code objects");
-OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>, split, 152);
-
-#undef OPUS_MLA_V4_GFX1250_CO_ABI
+// The code objects take opus_mla_v4_prefill{,_fp8}_kargs and their opus_mla_prefill_split_kargs
+// verbatim as kernarg buffers; opus/mla_prefill_kargs.h pins the layout.
 
 namespace {
 
-// Launch geometry of the code objects: a workgroup of four wave32s covers one query token and
-// kGfx1250Heads<tile> (Q_TILE_SIZE * T_M) query heads.
+// A workgroup covers one token and kGfx1250Heads<tile> heads.
 constexpr int kGfx1250NumWarps    = 4;
-constexpr int kGfx1250WarpSize    = 32; // wave32 on gfx1250
+constexpr int kGfx1250WarpSize    = 32;
 constexpr int kGfx1250BlockSize   = kGfx1250NumWarps * kGfx1250WarpSize;
 constexpr int kGfx1250Heads16mx1  = 16;
 constexpr int kGfx1250Heads32mx1  = 32;
 constexpr int kGfx1250Heads16mx4  = 64;
 constexpr int kGfx1250MaxClusterY = 2;
 
-// fp8 split-precision head layout.
 constexpr int kGfx1250DNopePadded = 512;
 constexpr int kGfx1250DRope       = 64;
 constexpr int kGfx1250DHead       = 512;
@@ -589,8 +495,7 @@ constexpr const char* kGfx1250A8W8Co16mx1 =
 constexpr const char* kGfx1250A8W8Co32mx1 =
     "mla_opus/opus_mla_v4_prefill_a8w8_32mx1_16nx4.co";
 
-// OPUS-managed prebuilt code objects: reuse AiterAsmKernel's file loader but opt
-// OUT of the gfx1250 B0-only asm gate (arch coverage is the OPUS layer's job).
+// AiterAsmKernel without its gfx1250 B0-only asm gate: the opus launchers check the arch.
 struct PrebuiltKernel : AiterAsmKernel
 {
     PrebuiltKernel(const char* kernel_name, const char* hsaco_path)
@@ -599,9 +504,7 @@ struct PrebuiltKernel : AiterAsmKernel
     }
 };
 
-// Largest cluster width that evenly divides grid.y. A cluster that does not
-// divide grid.y would gather through a masked peer set and silently corrupt the
-// tail workgroup, so the kernel only ever sees an exact divisor.
+// Largest cluster width dividing grid.y: a partial cluster would corrupt the tail workgroup.
 int gfx1250_pick_cluster_y(int num_h_blocks)
 {
     for(int c = kGfx1250MaxClusterY; c > 1; c >>= 1)
@@ -645,7 +548,24 @@ void gfx1250_launch(const std::string& name,
         launch(kargs);
 }
 
-// 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
+// Launches `<name>_cluster_kernel` of `co`, a token's num_splits workgroups as one cluster.
+template <class Kargs>
+void gfx1250_launch_cluster(const std::string& name,
+                            const char* co,
+                            const Kargs& kargs,
+                            const opus_mla_prefill_split_args& split,
+                            int grid_y,
+                            hipStream_t stream)
+{
+    static SynchronizedCache<std::string, PrebuiltKernel> kernels;
+    const std::string sym = name + "_cluster_kernel";
+    PrebuiltKernel& impl  = kernels.get_or_create(sym, [&] { return PrebuiltKernel(sym.c_str(), co); });
+    opus_mla_prefill_split_kargs<Kargs> args{kargs, split};
+    size_t arg_size = sizeof(args);
+    impl.launch_kernel({&args, &arg_size, kargs.N * split.num_splits, grid_y, 1, kGfx1250BlockSize, 1, 1,
+                        stream, split.num_splits, 1, 1});
+}
+
 template <class Kargs>
 void gfx1250_dispatch(const char* co_16mx1,
                       const char* co_32mx1,
@@ -699,7 +619,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_indptr_extend, attn_sink, out, softmax_scale, num_splits, partial_o, partial_max,
      partial_sum, stream))
 {
-    // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q->dim() == 3, "q must be 3-D [N, H, D], got ndim=", q->dim());
     AITER_CHECK(unified_kv->dim() == 2,
                 "unified_kv must be 2-D [total_pages, D], got ndim=",
@@ -710,7 +629,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(q->dtype() == kv->dtype() && q->dtype() == unified_kv->dtype() &&
                     q->dtype() == out->dtype(),
                 "q/unified_kv/kv/out must share dtype");
-    // Only the bf16 traits are instantiated in the gfx1250 code object.
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16,
                 "the gfx1250 code object only provides the bf16 variant");
 
@@ -746,7 +664,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(N == 0)
         return;
 
-    // ---- Build kernel args -----------------------------------------------
     opus_mla_v4_prefill_kargs args{};
     args.q_ptr             = q->data_ptr();
     args.unified_kv_ptr    = unified_kv->data_ptr();
@@ -769,7 +686,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "unified_kv and kv must share row stride along the D dim");
     args.softmax_scale = softmax_scale;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
     gfx1250_dispatch(
         kGfx1250A16W16Co16mx1, kGfx1250A16W16Co32mx1, kGfx1250A16W16Co16mx4, args, split, stream);
@@ -801,7 +717,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
      num_splits, partial_o, partial_max, partial_sum, stream))
 {
-    // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q_nope->dim() == 3, "q_nope must be 3-D [N, H, 512], got ndim=", q_nope->dim());
     AITER_CHECK(q_rope->dim() == 3, "q_rope must be 3-D [N, H, 64], got ndim=", q_rope->dim());
     AITER_CHECK(unified_kv_nope->dim() == 2,
@@ -882,7 +797,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(stride_kv_rope_page == static_cast<int>(kv_rope->stride(0)),
                 "unified_kv_rope and kv_rope must share row stride");
 
-    // ---- Build kernel args -----------------------------------------------
     opus_mla_v4_prefill_fp8_kargs args{};
     args.q_nope_ptr          = q_nope->data_ptr();
     args.q_rope_ptr          = q_rope->data_ptr();
@@ -910,7 +824,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.stride_kv_rope_page = stride_kv_rope_page;
     args.softmax_scale       = softmax_scale;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope->device_id);
     gfx1250_dispatch(
         kGfx1250A8W8Co16mx1, kGfx1250A8W8Co32mx1, kGfx1250A8W8Co16mx4, args, split, stream);
@@ -943,8 +856,7 @@ constexpr int kV41DHead               = 512;
 constexpr int kV41DScale              = kV41DHead / 32;
 constexpr int kV41DScaleFp4           = kV41DHead / 16;
 
-// gfx1250 code objects (ARCH=gfx1250 build_co.sh): 128 threads, 16 or 64 heads per workgroup; two
-// 16-head workgroups beat one 64-head one up to H = 32.
+// gfx1250: two 16-head workgroups beat one 64-head one up to H = 32.
 constexpr const char* kV41Gfx1250Co16mx1 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx1_16nx4.co";
 constexpr const char* kV41Gfx1250Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
 constexpr int kV41Gfx1250Heads16mx1      = 16;
@@ -985,7 +897,6 @@ opus_mla_v41_prefill_kargs v41_prefill_kargs(aiter_tensor_t* q,
                                              aiter_tensor_t* out,
                                              float softmax_scale)
 {
-    // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q->dim() == 3 && q_scale->dim() == 3 && out->dim() == 3,
                 "q, q_scale and out must be 3-D [N, H, *]");
     AITER_CHECK(unified_kv->dim() == 2 && unified_kv_scale->dim() == 2 && kv->dim() == 2 &&
@@ -1070,7 +981,6 @@ opus_mla_v41_prefill_kargs v41_prefill_kargs(aiter_tensor_t* q,
     AITER_CHECK(v41_aligned(out, out->stride(0), 16) && v41_aligned(out, out->stride(1), 16),
                 "out base and row strides must be 16-byte aligned");
 
-    // ---- Build kernel args -----------------------------------------------
     kargs.q_ptr                  = q->data_ptr();
     kargs.q_scale_ptr            = q_scale->data_ptr();
     kargs.unified_kv_ptr         = unified_kv->data_ptr();
@@ -1142,7 +1052,6 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
     if(N == 0)
         return;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
 
     const opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{kargs, split};
@@ -1339,14 +1248,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(N == 0)
         return;
 
-    // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
-    if(H <= kV41Gfx1250NarrowH)
-        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx1_16nx4", kV41Gfx1250Co16mx1, kargs, split,
-                       ceil_div(H, kV41Gfx1250Heads16mx1), 1, stream);
-    else
-        gfx1250_launch("opus_mla_v41_prefill_a8w8_16mx4_64nx1", kV41Gfx1250Co16mx4, kargs, split,
-                       ceil_div(H, kV41Gfx1250Heads16mx4), 1, stream);
+    const bool narrow = H <= kV41Gfx1250NarrowH;
+    const char* name  = narrow ? "opus_mla_v41_prefill_a8w8_16mx1_16nx4" : "opus_mla_v41_prefill_a8w8_16mx4_64nx1";
+    const char* co    = narrow ? kV41Gfx1250Co16mx1 : kV41Gfx1250Co16mx4;
+    const int grid_y  = ceil_div(H, narrow ? kV41Gfx1250Heads16mx1 : kV41Gfx1250Heads16mx4);
+    if(opus_mla_prefill_cluster_size_ok(num_splits))
+        return gfx1250_launch_cluster(name, co, kargs, split, grid_y, stream);
+    gfx1250_launch(name, co, kargs, split, grid_y, 1, stream);
     if(num_splits > 1)
         opus_mla_prefill_split_reduce<__hip_bfloat16>(
             split, kargs.attn_sink_ptr, out, N, H, stream);

@@ -458,8 +458,15 @@ if [ -z "$VALIDATION_REPORT" ] \
 fi
 
 if [ -n "$VALIDATION_REPORT" ]; then
+  # Every integrity check below is fail-closed: evidence that does not match this PR is
+  # never consumed. But rejecting evidence must not delete the review that would have
+  # carried it -- a stale report, or a missing optional dependency, aborted the run and
+  # produced no card at all, which reads to a human exactly like the bot being down.
+  # So: capture the rejection, record why in the outcome file, and fall through to the
+  # no-evidence branch. The card then says validation did not run, and names the reason.
+  set +e
   python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" "$SCHEMA" \
-    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
+    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY' 2>"$WORK/validation_rejected.txt"
 import hashlib
 import json
 import pathlib
@@ -710,7 +717,23 @@ elif perf["status"] in {"pass", "fail"}:
 else:
     print(f"perf stage: skip — {perf.get('note', 'no reason recorded')}")
 PY
-else
+  _CONSUME_RC=$?
+  set -e
+  if [ "$_CONSUME_RC" -ne 0 ]; then
+    # `|| true`: this file runs `set -euo pipefail`, so a rejection that wrote nothing
+    # makes grep exit 1 and kills the handler that exists to keep the review alive.
+    _why=$(grep -v "^$" "$WORK/validation_rejected.txt" 2>/dev/null | tail -1 || true)
+    cat "$WORK/validation_rejected.txt" >&2 2>/dev/null || true
+    rm -f "$WORK/validation_report.json"
+    printf "validation evidence was produced but rejected before use: %s\n" \
+      "${_why:-the consumer failed without a message}" \
+      >"$WORK/auto_validation_outcome.txt"
+    echo "validation evidence rejected; the review continues static-only" >&2
+    VALIDATION_REPORT=""
+  fi
+fi
+
+if [ -z "$VALIDATION_REPORT" ]; then
   # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
   # are different facts about the PR, and collapsing them into one sentence is what made the
   # old verdict line uninformative. Triage's blocker explains the runs never attempted; the
