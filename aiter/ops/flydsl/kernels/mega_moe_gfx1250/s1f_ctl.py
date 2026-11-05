@@ -112,10 +112,6 @@ def _s1f_xcc_queues(tile_m: int) -> int:
     return int(mode)
 
 
-def _s1f_iod_loc() -> int:
-    """``AITER_MOE_LOC=1``: IOD-placed W1 on per-XCC queues (``iod_locality``)."""
-    return int(os.environ.get("AITER_MOE_LOC", "0").strip() == "1")
-
 
 def read_s1f_mode() -> bool:
     """Dispatch and GEMM1 as one persistent stage-1 kernel; on by default.
@@ -490,10 +486,10 @@ class _Stage1Fusion:
         tdm_b_th=0,
         tdm_as_in_prologue=0,
         quant_out_preshuffled=0,
+        iod_loc=0,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        iod_loc = _s1f_iod_loc()
         xcc_queues = 1 if iod_loc else _s1f_xcc_queues(tile_m)
         key = (
             tile_m,
@@ -566,6 +562,7 @@ class _Stage1Fusion:
         tdm_b_th=0,
         tdm_as_in_prologue=0,
         quant_out_preshuffled=0,
+        iod_loc=0,
     ):
         from .compact_plan import compact_run_buffer_dwords
 
@@ -599,6 +596,7 @@ class _Stage1Fusion:
                 tdm_b_th=tdm_b_th,
                 tdm_as_in_prologue=tdm_as_in_prologue,
                 quant_out_preshuffled=quant_out_preshuffled,
+                iod_loc=iod_loc,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -698,11 +696,15 @@ class _Stage1Fusion:
         bufs = {**self.d._slot_bufs(step["slot"])}
         if stream is None:
             stream = torch.cuda.current_stream()
-        if _s1f_iod_loc():
-            from aiter.ops.flydsl.iod_locality import placed_w1
+        # AITER_MOE_LOC=1 with W1 placed by moe_shuffle_weight_iod at load
+        # time: the per-XCC queues hand each XCC its IOD's n-tiles.
+        placed = None
+        if os.environ.get("AITER_MOE_LOC", "0").strip() == "1":
+            from aiter.ops.flydsl.iod_locality import lookup
 
-            w = placed_w1(w, w_scales, n_experts, N, K, 256, 256)
-            w_scales = w
+            placed = lookup(w, w_scales, N, K, 256, 256)
+        if placed is not None:
+            w = w_scales = placed
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
             return (
@@ -731,12 +733,13 @@ class _Stage1Fusion:
         g1_opts = {
             "tdm_b_th": int(tdm_b_th),
             "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
+            "iod_loc": int(placed is not None),
         }
         keys = {(t, int(stage1_act), q, *g1_opts.values(), int(quant_out_preshuffled)) for t, q in self.launch_keys}
         keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values(), int(quant_out_preshuffled)))
         if not keys <= self.precompiled and not torch.cuda.is_current_stream_capturing():
-            for t, act, q, b_th, asprol, apre in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q, b_th, asprol, apre))
+            for t, act, q, b_th, asprol, loc, apre in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, b_th, asprol, loc, apre))
                 self._precompile(
                     launch_args,
                     tile_m=t,
@@ -745,6 +748,7 @@ class _Stage1Fusion:
                     quant_wmma_rep=q,
                     tdm_b_th=b_th,
                     tdm_as_in_prologue=asprol,
+                    iod_loc=loc,
                     quant_out_preshuffled=apre,
                 )
         launch = self._launcher(
