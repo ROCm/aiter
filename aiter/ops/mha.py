@@ -2686,7 +2686,8 @@ def can_impl_fmha_v3_bwd(
     ret &= dbias is None
     ret &= dropout_p == 0.0
     ret &= not deterministic
-    ret &= hdim_q == hdim_v
+    # 192 / 128 runs the hd192_128 pssk kernels
+    ret &= hdim_q == hdim_v or (hdim_q, hdim_v) == (192, 128)
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
     ret &= np() or pssk() or pddv() or psskddv()
@@ -2780,6 +2781,8 @@ def _flash_attn_backward(
         deterministic,
         is_v3_atomic_fp32,
     )
+    # the gfx942 hd192 / hd192_128 pssk kernels compute no d_sink
+    can_impl_fmha_v3_bwd_ &= q.shape[-1] != 192 or (sink is None and d_sink is None)
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -3650,7 +3653,9 @@ def _flash_attn_varlen_backward(
         # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
-        ret &= hdim_q == hdim_v
+        # 192 / 128 runs the hd192_128 pssk kernels; the hdim_q 192 ones compute no d_sink
+        ret &= hdim_q == hdim_v or (hdim_q, hdim_v) == (192, 128)
+        ret &= hdim_q != 192 or (sink is None and d_sink is None)
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= not swa
@@ -3691,8 +3696,8 @@ def _flash_attn_varlen_backward(
         return ret
 
     def can_impl_fmha_bwd_flydsl():
-        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
-        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
+        # d_qk=192 / d_v=128 causal varlen self-attention, taken only when no ASM v3
+        # kernel covers it (gfx942 has the hd192_128 pssk kernels).
         # `deterministic` is absent on purpose: the kernel uses no atomics and
         # writes each of dq/dk/dv exactly once, so it is deterministic either way.
         ret = get_gfx() == "gfx942"
@@ -3731,7 +3736,9 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
-    can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
+    can_impl_fmha_bwd_flydsl_ = (
+        _FLYDSL_AVAILABLE and not can_impl_fmha_v3_bwd_ and can_impl_fmha_bwd_flydsl()
+    )
 
     if can_impl_fmha_bwd_flydsl_:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd

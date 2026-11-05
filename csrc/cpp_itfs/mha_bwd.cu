@@ -280,6 +280,16 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+    // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
+    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  They run dK/dV workgroups
+    // (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in one dispatch and
+    // write dq / dk / dv once, so they are a16 rows without dq_acc or post kernel; they compute
+    // no d_sink.
+    const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192;
+    if(hd192)
+    {
+        a.v3_atomic_fp32 = false;
+    }
 
     // ASM mask type
     // 0: no mask
@@ -363,9 +373,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
     // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
-    // existing a16 causal kernels.
+    // existing a16 causal kernels. Group mode is left out: there a batch's seqlen_q and
+    // seqlen_k can differ, and the a16 hdim_q 192 group kernels have both masks.
     // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
-    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && !a.is_group_mode &&
+       a.seqlen_q == a.seqlen_k)
     {
         mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
     }
@@ -392,6 +404,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          post_cfgs);
 
     if((pre_kernel == "") || (dqdkdv_kernel == ""))
+    {
+        return -1;
+    }
+    if(hd192 && (a.sink_ptr != nullptr || a.d_sink_ptr != nullptr))
     {
         return -1;
     }
@@ -484,7 +500,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
     odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
+    // D = rowsum(dO * O) runs over the v head dim; gfx942 192/128 pairs with the hd128 odo
+    odo_args.head_dim        = hd192 ? a.hdim_v : a.hdim_q;
     odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
     odo_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
@@ -682,6 +699,22 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
+    if(hd192)
+    {
+        dqdkdv_args.Hs_dq    = a.nhead_stride_dq * 2;
+        dqdkdv_args.Seqs_dq  = a.stride_dq * 2;
+        dqdkdv_args.BAs_dq   = a.batch_stride_dq * 2;
+        dqdkdv_args.BAs_lsed = a.batch_stride_lsed * 4;
+        dqdkdv_args.n_kb     = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        dqdkdv_args.n_qb     = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+        // Rank-major order hands the longest jobs out first.  Once one batch alone fills the GPU,
+        // batch-major order keeps the running workgroups on a few sequences whose Q / K / V / dO
+        // stay in L2 / MALL instead of streaming every sequence from HBM at once.
+        const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
+        dqdkdv_args.dispatch_order =
+            (a.batch > 1 && 4 * a.nhead_q * ranks >= 5 * get_num_cu_func()) ? 2 : 0;
+    }
+
     auto dqdkdv_kernel_launch = [&]() {
         arg_size = sizeof(dqdkdv_args);
         int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : (a.hdim_q == 256 ? 512 : 256);
@@ -700,6 +733,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         else if((mt == 1) || (mt == 2))
         { // mask kb
             gdx = (gdx + 1) / 2;
+        }
+        if(hd192)
+        { // n_kb + n_qb ranks per (head, batch): (nhead_q, batch, ranks), or batch-major
+          // (nhead_q, ranks, batch)
+            const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
+            gdx             = a.nhead_q;
+            gdy             = dqdkdv_args.dispatch_order == 2 ? ranks : a.batch;
+            gdz             = dqdkdv_args.dispatch_order == 2 ? a.batch : ranks;
         }
 
         impl_ptr_dqdkdv->launch_kernel(

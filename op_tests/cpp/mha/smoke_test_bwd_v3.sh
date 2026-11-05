@@ -174,9 +174,43 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
+# gfx942 hdim 192 + hdim_v 128: the hd192_128 pssk kernels, batch and group mode. a32 requests
+# (-v3_atomic_fp32=1) run them as well.
+run_gfx942_hd192_128_bwd_v3() {
+    hdim=192
+    hdim_v=128
+
+    for prec in "bf16" "fp16" ; do
+    for mode in 0 1 ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for v3_bf16_cvt in 0 1 2 ; do
+    for mask in 0 "t" "b" ; do
+    for perm in 0 1 ; do
+    for sq in 62 174 ; do
+    for sk in 65 174 ; do
+
+    if [ $prec = "fp16" ] && [ $v3_bf16_cvt -gt 0 ]; then
+        echo "skip fp16 with bf16_convert cases"
+        continue
+    fi
+
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=1 -h=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 run_batch_mode_tests
 run_group_mode_tests
 run_swa_tests
+run_gfx942_hd192_128_bwd_v3
 # run_gfx950_group_bwd_v3
 # run_gfx950_bwd_v3
 
