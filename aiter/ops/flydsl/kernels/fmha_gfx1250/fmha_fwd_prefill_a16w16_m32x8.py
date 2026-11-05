@@ -1698,17 +1698,14 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
 
         # GEMM2(tile_idx-1) then GEMM1(tile_idx) on one ring: O += P^T(tile_idx-1) @ V(tile_idx-1), then
-        # S^T = K(tile_idx) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
-        # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
+        # S^T = K(tile_idx) @ Q^T. The ring issues the per-fragment s_wait_dscnt.
         if _is_lagging_softmax:
             kv_state_next = kv_policy.advance(prefetch_tile_idx)
             prefetch_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
-            rocdl.sched_barrier(0)
             pvqk_head = _pvqk_head()
-            rocdl.sched_barrier(0)
             p_list = _convert_vectors(p_f32, elem_dtype)
             # Anchor the conversion in THIS block. Its only real use is past the barrier,
             # so MachineSink (which ignores sched_barrier) would otherwise sink every
@@ -1740,7 +1737,6 @@ def _attention_core_multi_kv_tiles(
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
             prefetch_desc.async_load()
-            rocdl.sched_barrier(0)
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
@@ -1766,7 +1762,6 @@ def _attention_core_multi_kv_tiles(
             # and already fenced. Mirrors the lagging half -- both issue the head just
             # before the barrier preceding the gemm that consumes it, ahead of the
             # narrowing for the same reason.
-            rocdl.sched_barrier(0)
             head_next = _issue_head(
                 lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
             )
