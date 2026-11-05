@@ -500,7 +500,7 @@ jobs:
           runners = [
               ("linux-aiter-vultr-mi325-1", "MI35X"),
               ("amd-dpx-linux.aiter.gpu.gfx950.1", "MI350X"),
-              ("linux-aiter-do-mi350x-1", "MI350X-DO"),
+              ("linux-aiter-do-mi350x-1", "MI350X-SPX"),
           ]
           if os.environ["GITHUB_REF"] == "refs/heads/main":
               runners.append(("linux-aiter-oci-mi300x-1", "MI300X"))
