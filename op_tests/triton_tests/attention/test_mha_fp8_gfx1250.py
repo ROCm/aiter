@@ -174,7 +174,7 @@ def mha_varlen_torch(q, k, v, sm_scale, causal):
         ([16, 130], [4096, 6000]),
     ],
 )
-@pytest.mark.parametrize("heads", [12, 16])
+@pytest.mark.parametrize("heads", [8, 12, 16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("pad", [0, 50])
 def test_mha_varlen_fp8(seqlens_q, seqlens_k, heads, causal, pad, device="cuda"):
