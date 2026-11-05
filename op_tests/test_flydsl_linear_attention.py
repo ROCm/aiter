@@ -987,12 +987,12 @@ def _kda_decode_work(
 
 @benchmark()
 def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True):
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(
         batch,
         conv_width_major=conv_layout == "width_major",
         state_dtype=state_dtype,
     )
-    reference_inputs = _copy_kda_inputs(seed)
+    reference_inputs = _copy_kda_inputs(base_inputs)
     reference = _kda_reference(reference_inputs)
     cu_seqlens = torch.arange(batch + 1, dtype=torch.int64, device=_KDA_DEVICE)
 
@@ -1022,7 +1022,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
         # Both caches update in place; run_perftest rotates deep copies, which
         # keep the padded and transposed cache strides.
         # SGLang's KDA backend preallocates the output and passes it as out=.
-        perf_inputs = _copy_kda_inputs(seed)
+        perf_inputs = _copy_kda_inputs(base_inputs)
         _, us = run_perftest(
             candidate,
             perf_inputs,
@@ -1032,7 +1032,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             ),
         )
 
-        actual_inputs = _copy_kda_inputs(seed)
+        actual_inputs = _copy_kda_inputs(base_inputs)
         actual = candidate(actual_inputs, torch.empty_like(reference))
         err_out = _assert_kda_close(
             reference,
@@ -1049,7 +1049,7 @@ def test_flydsl_kda_decode(batch, conv_layout, state_dtype, include_triton=True)
             tol_err_ratio,
         )
         assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
-        flops, nbytes = _kda_decode_work(batch, fuse_f_b, seed.state)
+        flops, nbytes = _kda_decode_work(batch, fuse_f_b, base_inputs.state)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1152,24 +1152,24 @@ def _run_kda_api(
 def test_flydsl_kda_decode_bf16_state_matches_reference(
     batch: int, conv_layout: str, slot_layout: str, fused_f_b: bool
 ) -> None:
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(
         batch,
         conv_width_major=conv_layout == "width_major",
         state_dtype=torch.bfloat16,
     )
     if slot_layout == "dense":
         # SGLang's --mamba-ssm-dtype bfloat16 pool: [cache, 12, 128, 128].
-        seed.state = seed.state.contiguous()
-        assert seed.state.stride() == (_KDA_HEADS * _KDA_DIM * _KDA_DIM,) + (
+        base_inputs.state = base_inputs.state.contiguous()
+        assert base_inputs.state.stride() == (_KDA_HEADS * _KDA_DIM * _KDA_DIM,) + (
             _KDA_DIM * _KDA_DIM,
             _KDA_DIM,
             1,
         )
     else:
-        assert seed.state.stride(0) == _KDA_HEADS * _KDA_DIM * _KDA_DIM + 23
-    reference_inputs = _copy_kda_inputs(seed)
+        assert base_inputs.state.stride(0) == _KDA_HEADS * _KDA_DIM * _KDA_DIM + 23
+    reference_inputs = _copy_kda_inputs(base_inputs)
     reference = _kda_reference(reference_inputs)
-    actual_inputs = _copy_kda_inputs(seed)
+    actual_inputs = _copy_kda_inputs(base_inputs)
 
     actual = _run_kda_api(fused_f_b, f_a, f_b_weight, actual_inputs)
     torch.cuda.synchronize()
@@ -1178,14 +1178,14 @@ def test_flydsl_kda_decode_bf16_state_matches_reference(
     _assert_kda_state_close(
         reference_inputs.state, actual_inputs.state, "state", _kda_err_ratio(batch)
     )
-    assert actual_inputs.state.stride() == seed.state.stride()
+    assert actual_inputs.state.stride() == base_inputs.state.stride()
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
     # Slot zero and the spare slot past the batch are never addressed; a store
     # with the wrong element width or slot pitch would spill into them.
     for slot in (0, batch + 1):
         assert torch.equal(
             actual_inputs.state[slot].view(torch.int16),
-            seed.state[slot].view(torch.int16),
+            base_inputs.state[slot].view(torch.int16),
         )
 
 
@@ -1196,9 +1196,11 @@ def test_flydsl_kda_decode_bf16_state_recurrent_sequence(fused_f_b: bool) -> Non
     # that rounds at the same points. A one-ULP tie feeds the next step a
     # slightly different input, so a few elements may then sit past one ULP;
     # the decay keeps that bounded.
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=2, state_dtype=torch.bfloat16)
-    reference_inputs = _copy_kda_inputs(seed)
-    actual_inputs = _copy_kda_inputs(seed)
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(
+        batch=2, state_dtype=torch.bfloat16
+    )
+    reference_inputs = _copy_kda_inputs(base_inputs)
+    actual_inputs = _copy_kda_inputs(base_inputs)
     for step in range(8):
         reference = _kda_reference(reference_inputs)
         actual = _run_kda_api(fused_f_b, f_a, f_b_weight, actual_inputs)
@@ -1224,13 +1226,15 @@ def test_flydsl_kda_decode_graph_replay(
     """A captured decode must match eager bit for bit across replays: it reads the
     inputs written before each replay and carries the recurrent and conv state."""
     batch = 8
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=batch, state_dtype=state_dtype)
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(
+        batch=batch, state_dtype=state_dtype
+    )
     # Compile outside the capture on a throwaway copy, so capture records launches only.
-    _run_kda_api(fused_f_b, f_a.clone(), f_b_weight, _copy_kda_inputs(seed))
+    _run_kda_api(fused_f_b, f_a.clone(), f_b_weight, _copy_kda_inputs(base_inputs))
     torch.cuda.synchronize()
 
     graph_inputs, eager_inputs, reference_inputs = (
-        _copy_kda_inputs(seed) for _ in range(3)
+        _copy_kda_inputs(base_inputs) for _ in range(3)
     )
     graph_f_a, eager_f_a = f_a.clone(), f_a.clone()
     out = torch.empty(
@@ -1326,9 +1330,9 @@ def test_flydsl_kda_decode_kernel_names_identify_state_dtype() -> None:
         (False, "bf16"): "kda_decode_bf16_gfx950_bf16state",
         (True, "bf16"): "kda_decode_fused_projection_bf16_gfx950_bf16state",
     }
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=1)
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(batch=1)
     for (fused_f_b, state_dtype), name in expected.items():
-        inputs = _copy_kda_inputs(seed)
+        inputs = _copy_kda_inputs(base_inputs)
         if state_dtype == "bf16":
             inputs.state = inputs.state.to(torch.bfloat16)
         # Compile outside the profiled region.
@@ -1373,13 +1377,13 @@ def test_flydsl_kda_decode_negative_slots_do_not_modify_caches(
 def test_flydsl_kda_decode_slot_zero_is_live(fused_f_b: bool) -> None:
     # Only negative indices are padding, as in the Triton fused_kda_decode, so a
     # sequence that owns slot zero must be decoded and its caches updated.
-    f_a, f_b_weight, seed = _make_kda_fb_inputs(batch=2)
-    seed.state_indices.copy_(
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(batch=2)
+    base_inputs.state_indices.copy_(
         torch.tensor([0, 2], dtype=torch.int32, device=_KDA_DEVICE)
     )
-    reference_inputs = _copy_kda_inputs(seed)
+    reference_inputs = _copy_kda_inputs(base_inputs)
     reference = _kda_reference(reference_inputs)
-    actual_inputs = _copy_kda_inputs(seed)
+    actual_inputs = _copy_kda_inputs(base_inputs)
 
     actual = _run_kda_api(fused_f_b, f_a, f_b_weight, actual_inputs)
     torch.cuda.synchronize()
@@ -1388,7 +1392,7 @@ def test_flydsl_kda_decode_slot_zero_is_live(fused_f_b: bool) -> None:
     _assert_kda_close(reference, actual, _KDA_OUTPUT_TOL, "output")
     _assert_kda_state_close(reference_inputs.state, actual_inputs.state, "state")
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
-    assert not torch.equal(actual_inputs.state[0], seed.state[0])
+    assert not torch.equal(actual_inputs.state[0], base_inputs.state[0])
 
 
 @_requires_kda
@@ -1554,12 +1558,14 @@ def test_flydsl_kda_decode_large_cache_slot_offsets(
     slot_indices = (5_500, 10_999)
     batch = len(slot_indices)
     if fused_f_b:
-        f_a, f_b_weight, seed = _make_kda_fb_inputs(batch, state_dtype=state_dtype)
+        f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(
+            batch, state_dtype=state_dtype
+        )
     else:
-        seed = _make_kda_inputs(batch, state_dtype=state_dtype)
-    reference_inputs = _copy_kda_inputs(seed)
+        base_inputs = _make_kda_inputs(batch, state_dtype=state_dtype)
+    reference_inputs = _copy_kda_inputs(base_inputs)
     actual_inputs = _move_kda_to_large_caches(
-        seed,
+        base_inputs,
         slot_indices,
         slots,
         conv_slot_stride=1 << 18,
