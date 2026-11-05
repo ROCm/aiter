@@ -62,6 +62,71 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(config["libtype"], "torch")
 
 
+class TestGfx1250StrictOpusRow(unittest.TestCase):
+    """A gfx1250-strict device reuses gfx1250 rows, but OPUS dispatch keeps
+    the strict id, so a row is only usable if that dispatch accepts it."""
+
+    CU = 96
+    SHAPE = (4, 2112, 7168)
+    KID, SPLIT_K = 0, 5
+
+    def setUp(self):
+        if tuned._opus_launch is None:
+            self.skipTest("OPUS is not importable")
+        from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
+
+        instance = get_kernel_instance("gfx1250", "a16w16", self.KID, cu_num=self.CU)
+        row = {
+            "libtype": "opus",
+            "solidx": self.KID,
+            "splitK": self.SPLIT_K,
+            "kernelName": instance.name,
+        }
+        key = ("gfx1250", self.CU, *self.SHAPE, False, BF16, BF16, False, False)
+        for p in (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+
+    def _lookup(self, gfx):
+        args = (*self.SHAPE, False, BF16, BF16, False, False, gfx, self.CU)
+        return (
+            tuned.get_GEMM_A16W16_tuned_config(*args),
+            tuned.get_GEMM_A16W16_config(*args),
+        )
+
+    def test_base_id_selects_the_opus_row(self):
+        tuned_config, _ = self._lookup("gfx1250")
+        self.assertEqual(
+            (tuned_config["libtype"], tuned_config["solidx"]), ("opus", self.KID)
+        )
+
+    def test_strict_id_skips_a_row_its_dispatch_rejects(self):
+        from aiter.ops.opus import dispatch
+        from csrc.opus_gemm.opus_gemm_common import KernelKey
+
+        with self.assertRaises(ValueError):
+            dispatch._resolve_contract(
+                KernelKey("a16w16", "gfx1250-strict", self.CU, self.KID),
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                "plain",
+                False,
+                False,
+                False,
+                False,
+                self.SPLIT_K,
+            )
+        tuned_config, config = self._lookup("gfx1250-strict")
+        self.assertIsNone(tuned_config)
+        self.assertEqual(config["libtype"], "triton")
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 

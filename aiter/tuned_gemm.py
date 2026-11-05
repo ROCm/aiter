@@ -131,6 +131,7 @@ def get_GEMM_A16W16_tuned_config(
     padded_M = M
     config = None
     gfx = get_gfx() if gfx is None else gfx
+    runtime_gfx = gfx
     # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
@@ -183,17 +184,19 @@ def get_GEMM_A16W16_tuned_config(
                         parse_integer,
                     )
 
+                    # OPUS dispatch resolves the kid under the device's exact
+                    # arch, not the gfx1250 row key a strict device reuses.
                     try:
                         kid = parse_integer(config["solidx"], name="saved kernel id")
                         instance = get_kernel_instance(
-                            gfx, "a16w16", kid, cu_num=cu_num
+                            runtime_gfx, "a16w16", kid, cu_num=cu_num
                         )
                         name = str(config.get("kernelName", ""))
                         if instance is not None and (
                             name in ("", "nan", "None") or name == instance.name
                         ):
                             resolved = resolve_a16w16_tuned_candidate(
-                                arch=gfx,
+                                arch=runtime_gfx,
                                 M=M,
                                 N=N,
                                 K=K,
@@ -220,7 +223,7 @@ def get_GEMM_A16W16_tuned_config(
                             "Ignoring invalid OPUS tuned row for gfx=%s, "
                             "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
                             "the next padded row or default backend",
-                            gfx,
+                            runtime_gfx,
                             padded_M,
                             N,
                             K,
