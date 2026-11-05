@@ -4,6 +4,7 @@
 """Generic FlyDSL paged decode correctness test.
 
 Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+Benchmark with: python -m op_tests.op_benchmarks.flydsl.bench_pa_decode --help
 """
 
 import importlib.util
@@ -1592,70 +1593,75 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             assert (staged > 0) == (case["staged"] is not False)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "mxfp4",
-                    "kv_dtype": "mxfp4",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-mxfp4-{invalid}",
-            )
-            for invalid, error, match in _MXFP4_INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "select",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-select-{invalid}",
-            )
-            for invalid, error, match in _SELECT_INVALID_CASES
-        ],
+_PA_DECODE_CASES = [
+    *[
+        pytest.param(
+            dict(
+                geometry,
+                kv_dtype="fp8",
+                query_dtype=dtype,
+                scale_mode=scale_mode,
+                trans_v=trans_v,
+            ),
+            id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+        )
+        for name, geometry in _FP8_CASES
+        for dtype, scale_mode, trans_v in product(
+            (torch.bfloat16, torch.float16),
+            ("per-tensor", "per-token"),
+            (False, True),
+        )
     ],
-)
+    *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "error": error,
+                "match": match,
+                "lengths": (1,),
+            },
+            id=f"invalid-bf16-{invalid}",
+        )
+        for invalid, error, match in _INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "mxfp4",
+                "kv_dtype": "mxfp4",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-mxfp4-{invalid}",
+        )
+        for invalid, error, match in _MXFP4_INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "select",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-select-{invalid}",
+        )
+        for invalid, error, match in _SELECT_INVALID_CASES
+    ],
+]
+
+
+@pytest.mark.parametrize("case", _PA_DECODE_CASES)
 def test_pa_decode(case, device, monkeypatch):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    _run_pa_decode_case(case, device, monkeypatch)
+
+
+def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 
     A case with ``invalid_input`` is an input the wrapper must refuse before any
@@ -1988,6 +1994,9 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+    # Reuse the validated inputs after restoring the test compilation spy.
+    return case, launch, check, arguments, options, plan
 
 
 def _poison_unowned(cache, scale, owned, fill):
