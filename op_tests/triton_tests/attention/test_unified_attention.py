@@ -672,28 +672,33 @@ def _length_aware_seq_lens(batch: str, query_len: int):
 
 
 @pytest.mark.parametrize(
-    "batch, num_heads, max_query_len, use_sinks, seqused_k_dtype",
+    "batch, num_heads, max_query_len, option, seqused_k_dtype",
     [
         (batch, *shape, torch.int32)
         for shape in [
-            ((8, 2), 4, False),  # Kimi-K3 DSpark draft verify
-            ((8, 2), 1, False),
-            ((8, 1), 1, True),  # GPT-OSS TP8 full-attention decode
+            ((8, 2), 4, None),  # Kimi-K3 DSpark draft verify
+            ((8, 2), 1, None),
+            ((8, 1), 1, "sinks"),  # GPT-OSS TP8 full-attention decode
         ]
         for batch in ["skewed", "uniform", "skewed_empty"]
     ]
-    + [("skewed_300", (8, 2), 1, False, torch.int32)]
+    + [("skewed_300", (8, 2), 1, None, torch.int32)]
     # the widest verify query that still fits one block of the q >= 4 entry
-    + [("skewed", (8, 2), 8, False, torch.int32)]
+    + [("skewed", (8, 2), 8, None, torch.int32)]
     # sglang passes int64 sequence lengths
-    + [("skewed", (8, 2), 4, False, torch.int64)],
+    + [("skewed", (8, 2), 4, None, torch.int64)]
+    # the length-aware split does not exclude these inputs
+    + [
+        ("skewed", (8, 2), 4, option, torch.int32)
+        for option in ("shuffled_kv_cache", "softcap", "qq_bias")
+    ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_3d_length_aware_split(
     batch: str,
     num_heads: tuple[int, int],
     max_query_len: int,
-    use_sinks: bool,
+    option: str | None,
     seqused_k_dtype: torch.dtype,
     monkeypatch,
 ) -> None:
@@ -709,12 +714,13 @@ def test_triton_unified_attn_3d_length_aware_split(
     block_size = 128
     seq_lens = _length_aware_seq_lens(batch, max_query_len)
     max_blocks = max(triton.cdiv(kv, block_size) for _, kv in seq_lens)
+    shuffled_kv_cache = option == "shuffled_kv_cache"
     (
         query,
         key_cache,
         value_cache,
-        _,
-        _,
+        maybe_shuffled_key_cache,
+        maybe_shuffled_value_cache,
         sinks,
         output,
         cu_query_lens,
@@ -739,7 +745,16 @@ def test_triton_unified_attn_3d_length_aware_split(
         q_dtype=torch.bfloat16,
         kv_dtype=e4m3_dtype,
         out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
     )
+    sinks = sinks if option == "sinks" else None
+    # the scores here are ~0.1; a cap of 0.1 moves each request ~5%, past the bound
+    soft_cap = 0.1 if option == "softcap" else None
+    qq_bias = None
+    if option == "qq_bias":
+        qq_bias = torch.randn(
+            max_query_len, max_query_len, dtype=torch.float32, device="cuda"
+        )
 
     # record the split the launcher picks
     module = sys.modules[unified_attention.__module__]
@@ -755,8 +770,8 @@ def test_triton_unified_attn_3d_length_aware_split(
     output.fill_(float("nan"))  # the reduce must write every row
     unified_attention(
         q=query,
-        k=key_cache,
-        v=value_cache,
+        k=maybe_shuffled_key_cache,
+        v=maybe_shuffled_value_cache,
         out=output,
         cu_seqlens_q=cu_query_lens,
         seqused_k=kv_lens.to(seqused_k_dtype),
@@ -766,11 +781,13 @@ def test_triton_unified_attn_3d_length_aware_split(
         causal=True,
         window_size=window_size,
         block_table=block_tables,
-        softcap=0,
+        softcap=soft_cap or 0,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
-        sinks=sinks if use_sinks else None,
+        sinks=sinks,
+        qq_bias=qq_bias,
+        shuffled_kv_cache=shuffled_kv_cache,
     )
 
     # the split is length-aware, and the per-sequence counts (the kernels'
@@ -797,10 +814,12 @@ def test_triton_unified_attn_3d_length_aware_split(
         block_tables=block_tables,
         scale=scale,
         out_dtype=torch.bfloat16,
-        sinks=sinks if use_sinks else None,
+        soft_cap=soft_cap,
+        sinks=sinks,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        qq_bias=qq_bias,
     )
 
     # a dropped or doubly merged segment moves it far past the bound
