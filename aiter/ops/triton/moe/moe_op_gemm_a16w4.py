@@ -27,7 +27,7 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
 
 @lru_cache(maxsize=1)
@@ -100,11 +100,11 @@ def get_kernel_config_triton(m, n, k, routing_data):
 
     # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
     # tunable, because routing fixes it for the layer.
-    tuned = get_moe_dispatch("A16W4", get_arch(), "triton").get(
-        f"bm{block_m}_n{n}_k{k}"
-    )
+    arch = get_arch()
+    key = f"bm{block_m}_n{n}_k{k}"
+    tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
     if tuned is not None:
-        return {
+        config = {
             "block_m": block_m,
             "block_n": tuned["BLOCK_SIZE_N"],
             "block_k": tuned["BLOCK_SIZE_K"],
@@ -118,6 +118,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
             "kpack": tuned.get("kpack", 1),
         }
+        return config
 
     num_stages = 1
     block_k = 256
@@ -162,7 +163,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if arch == "gfx942" and block_m <= 32 else 1,
     }
     return ret
 
@@ -402,7 +403,7 @@ def moe_gemm_a16w4(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    if get_arch() == "gfx1250":
+    if get_arch() in ("gfx1250", "gfx1250-strict"):
         assert swizzle_mx_scale in (
             None,
             "GFX1250_SCALE",
@@ -442,7 +443,7 @@ def moe_gemm_a16w4(
     if backend == "gluon":
         use_pipelined_gluon = False
 
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
@@ -528,7 +529,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon":
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
                 y.stride(0),
@@ -824,7 +825,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:

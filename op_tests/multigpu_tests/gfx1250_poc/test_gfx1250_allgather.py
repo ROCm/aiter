@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Benchmark for gfx1250 (MI450) allgather kernels: naive vs warpsplit.
+# Benchmark for gfx1250 (MI450) allgather kernel (dim=0 naive path).
 # TP2 only. Reports latency (us) and XGMI bandwidth (GB/s).
 #
 # XGMI bandwidth = input_size_bytes / latency
@@ -162,9 +162,9 @@ def run_sweep(cases: list, distributed_init_method: str):
 
 
 if __name__ == "__main__":
-    kernel_names = {0: "naive", 1: "warpsplit"}
+    kernel_names = {0: "naive"}
 
-    cases = [(size, kt) for size in _SIZES for kt in [0, 1]]
+    cases = [(size, kt) for size in _SIZES for kt in [0]]
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     try:
         per_rank = run_sweep(cases, init_method)

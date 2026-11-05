@@ -3,6 +3,7 @@
 
 import csv
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -249,10 +250,39 @@ class TestA6W6Manifest(unittest.TestCase):
         self.assertTrue({"exact_M", "exact_N", "exact_K"}.issubset(configs.columns))
         exact_columns = ["exact_M", "exact_N", "exact_K"]
         specialized = configs[(configs[exact_columns] > 0).all(axis=1)]
-        self.assertEqual(len(specialized), 3)
+        self.assertEqual(len(specialized), 30)
+        for row in specialized.itertuples():
+            match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", row.knl_name)
+            self.assertIsNotNone(match)
+            declared_length, entrypoint = match.groups()
+            self.assertEqual(int(declared_length), len(entrypoint))
+            self.assertEqual(row.co_name, f"{entrypoint}.co")
         generic = configs[(configs[exact_columns] == 0).all(axis=1)]
         self.assertEqual(len(specialized) + len(generic), len(configs))
+        self.assertEqual(len(generic), 10)
         self.assertTrue((generic[exact_columns] == 0).all().all())
+        direct_scale_names = {
+            name
+            for name in generic["knl_name"]
+            if "f6gemm_bf16_per1x32Fp6_dmabig_m82" in name
+        }
+        self.assertEqual(
+            direct_scale_names,
+            {
+                "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE",
+                "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE",
+                "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g16_dscaleE",
+                "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g64_dscaleE",
+                "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_all_dscaleE",
+            },
+        )
+        for kernel_name in direct_scale_names:
+            match = re.fullmatch(r"_ZN5aiter44(.{44})E", kernel_name)
+            self.assertIsNotNone(match)
+            self.assertEqual(
+                configs.loc[configs["knl_name"] == kernel_name, "co_name"].iloc[0],
+                f"{match.group(1)}.co",
+            )
         swz0 = configs[
             configs["knl_name"] == gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
         ].iloc[0]

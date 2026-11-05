@@ -24,6 +24,12 @@ def _rms_norm_ref(x, weight, eps):
     return out.to(x.dtype)
 
 
+def _assert_close(name, out, ref, **tol):
+    diff = (out.float() - ref.float()).abs().max().item()
+    print(f"{name}: max_abs_diff={diff:.3e} tol={tol}")
+    torch.testing.assert_close(out, ref, **tol)
+
+
 def check_rms_norm():
     import aiter
 
@@ -31,9 +37,7 @@ def check_rms_norm():
     x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(4096, dtype=torch.bfloat16, device="cuda")
     out = aiter.rms_norm(x, weight, 1e-6)
-    torch.testing.assert_close(
-        out, _rms_norm_ref(x, weight, 1e-6), atol=2e-2, rtol=2e-2
-    )
+    _assert_close("rms_norm", out, _rms_norm_ref(x, weight, 1e-6), atol=2e-2, rtol=2e-2)
 
 
 def check_rmsnorm2d_fwd():
@@ -43,8 +47,8 @@ def check_rmsnorm2d_fwd():
     x = torch.randn(64, 1024, dtype=torch.float32, device="cuda")
     weight = torch.randn(1024, dtype=torch.float32, device="cuda")
     out = aiter.rmsnorm2d_fwd(x, weight, 1e-6)
-    torch.testing.assert_close(
-        out, _rms_norm_ref(x, weight, 1e-6), atol=1e-4, rtol=1e-4
+    _assert_close(
+        "rmsnorm2d_fwd", out, _rms_norm_ref(x, weight, 1e-6), atol=1e-4, rtol=1e-4
     )
 
 
@@ -56,7 +60,7 @@ def check_silu_and_mul():
     out = torch.empty(64, d, dtype=torch.bfloat16, device="cuda")
     aiter.silu_and_mul(out, x)
     ref = (F.silu(x[:, :d].float()) * x[:, d:].float()).to(x.dtype)
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    _assert_close("silu_and_mul", out, ref, atol=2e-2, rtol=2e-2)
 
 
 def check_topk_softmax():
@@ -75,9 +79,15 @@ def check_topk_softmax():
             ref_weights = ref_weights / ref_weights.sum(-1, keepdim=True)
         # The kernel does not promise any order within the selected top-k.
         order = ids.argsort(-1)
-        torch.testing.assert_close(ids.gather(-1, order), ref_ids.int().sort(-1)[0])
+        suffix = f"renorm={need_renorm}"
+        _assert_close(
+            f"topk_softmax_ids[{suffix}]",
+            ids.gather(-1, order),
+            ref_ids.int().sort(-1)[0],
+        )
         ref_order = ref_ids.argsort(-1)
-        torch.testing.assert_close(
+        _assert_close(
+            f"topk_softmax_weights[{suffix}]",
             weights.gather(-1, order),
             ref_weights.gather(-1, ref_order),
             atol=1e-4,
@@ -130,8 +140,21 @@ def check_rotary_embedding_fwd():
         aiter.rotary_embedding_fwd(
             positions, q, k, head_size, cos_cache, sin_cache, is_neox, False
         )
-        torch.testing.assert_close(q, ref_q.flatten(1), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(k, ref_k.flatten(1), atol=2e-2, rtol=2e-2)
+        suffix = f"is_neox={is_neox}"
+        _assert_close(
+            f"rotary_embedding_fwd_q[{suffix}]",
+            q,
+            ref_q.flatten(1),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        _assert_close(
+            f"rotary_embedding_fwd_k[{suffix}]",
+            k,
+            ref_k.flatten(1),
+            atol=2e-2,
+            rtol=2e-2,
+        )
 
 
 CHECKS = {
@@ -167,6 +190,7 @@ def _run_isolated(op):
 @pytest.mark.parametrize("op", list(CHECKS))
 def test_jit_op(op):
     proc = _run_isolated(op)
+    print(proc.stdout, end="")
     assert proc.returncode == 0, f"{op} failed:\n{proc.stdout}\n{proc.stderr}"
 
 
@@ -180,7 +204,7 @@ def main(ops):
     for op in ops:
         proc = _run_isolated(op)
         if proc.returncode == 0:
-            print(f"{op}: OK")
+            print(proc.stdout, end="")
         else:
             failed.append(op)
             print(f"{op}: FAILED\n{proc.stdout}\n{proc.stderr}")

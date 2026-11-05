@@ -52,6 +52,18 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def split_window_tiles(seq_len, query_len, TILE_SIZE, SLIDING_WINDOW: tl.constexpr):
+    """First tile and tile count a sliding-window split carves for one sequence.
+
+    No row sees a key before row 0's first, seq_len - query_len - SLIDING_WINDOW
+    + 1, so the split covers only [tile_lo, cdiv(seq_len, TILE_SIZE)). The 3d
+    kernels and reduce_segments must carve alike.
+    """
+    tile_lo = tl.maximum(seq_len - query_len - SLIDING_WINDOW + 1, 0) // TILE_SIZE
+    return tile_lo, cdiv_fn(seq_len, TILE_SIZE) - tile_lo
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -356,7 +368,7 @@ def kernel_unified_attention_2d(
                 is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
                 qq_bias = tl.load(
                     qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=is_query_key[None, :],
+                    mask=query_mask_0[:, None] & is_query_key[None, :],
                     other=0.0,
                 )
                 S += qq_bias * RCP_LN2
@@ -494,7 +506,8 @@ def kernel_unified_attention_2d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -668,9 +681,17 @@ def kernel_unified_attention_3d(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if SLIDING_WINDOW > 0:
+        tile_lo, window_tiles = split_window_tiles(
+            seq_len, cur_batch_query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        segm_tile_start = tile_lo + segm_idx * tiles_per_segment
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        segm_tile_start = segm_idx * tiles_per_segment
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_tile_start * TILE_SIZE >= seq_len:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -700,7 +721,10 @@ def kernel_unified_attention_3d(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-    query_mask_0 = query_pos < cur_batch_query_len
+    # Rows past BLOCK_Q tokens belong to the next q block, which stores them.
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m // num_queries_per_kv < BLOCK_Q
+    )
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -786,8 +810,8 @@ def kernel_unified_attention_3d(
 
     # iterate through tiles within current segment
     for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        segm_tile_start,
+        min(segm_tile_start + tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
@@ -909,7 +933,8 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -977,6 +1002,8 @@ _reduce_segments_repr = make_kernel_repr(
         "HEAD_SIZE",
         "V_HEAD_SIZE",
         "NUM_SEGMENTS_PER_SEQ",
+        "SEGMENT_BLOCK",
+        "BLOCK_D",
     ],
 )
 
@@ -1005,6 +1032,9 @@ def reduce_segments(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
+    BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
+    SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1022,49 +1052,119 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
-
-    # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    if SLIDING_WINDOW > 0:
+        query_len = tl.load(query_start_len_ptr + seq_idx + 1) - tl.load(
+            query_start_len_ptr + seq_idx
+        )
+        _, window_tiles = split_window_tiles(
+            seq_len, query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    single_tile: tl.constexpr = (
+        SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )
+    if single_tile:
+        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+        )
 
-    offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
+    # BLOCK_D splits the head dim across grid axis 2, so a small batch still
+    # launches enough programs to keep the reduce bandwidth- not latency-bound.
+    if BLOCK_D == 0:
+        D_TILE: tl.constexpr = V_HEAD_SIZE_PADDED
+        offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
+    else:
+        D_TILE: tl.constexpr = BLOCK_D
+        offs_vd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     if V_HEAD_SIZE_PADDED != V_HEAD_SIZE:
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    # load segment maxima
-    segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
-    )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+    if single_tile:
+        # load segment maxima
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        )
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max)
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
+        # load and rescale segment exp sums
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+        overall_expsum = tl.sum(segm_expsum)
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
-        + offs_vd[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & v_dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
+        # load, rescale, and add segment attention outputs
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
+            + offs_vd[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & v_dim_mask[None, :],
+            other=0.0,
+        )
+        segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
+        acc_sum = tl.sum(segm_output, axis=0)
+    else:
+        segm_base = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        )
+        segm_output_base = query_token_idx.to(tl.int64) * (
+            num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
+        ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+        # Pass 1: the global max and exp-sum from the [S] statistics. Pass 2 then
+        # weights each output tile by a fixed factor, so its loads carry no
+        # loop-carried rescale and can be issued back to back.
+        offs_all = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        all_mask = offs_all < act_num_segments
+        segm_max_all = tl.load(
+            segm_max_ptr + segm_base + offs_all, mask=all_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max_all)
+        segm_expsum_all = tl.load(
+            segm_expsum_ptr + segm_base + offs_all, mask=all_mask, other=0.0
+        )
+        overall_expsum = tl.sum(
+            segm_expsum_all * tl.math.exp2(segm_max_all - overall_max)
+        )
+
+        offs_s = tl.arange(0, SEGMENT_BLOCK)
+        acc_sum = tl.zeros([D_TILE], dtype=tl.float32)
+        for s0 in range(0, act_num_segments, SEGMENT_BLOCK):
+            segs = s0 + offs_s
+            segm_mask = segs < act_num_segments
+            weight = tl.math.exp2(
+                tl.load(
+                    segm_max_ptr + segm_base + segs,
+                    mask=segm_mask,
+                    other=float("-inf"),
+                )
+                - overall_max
+            )
+            segm_output = tl.load(
+                segm_output_ptr
+                + segm_output_base
+                + segs[:, None] * V_HEAD_SIZE_PADDED
+                + offs_vd[None, :],
+                mask=segm_mask[:, None] & v_dim_mask[None, :],
+                other=0.0,
+            )
+            acc_sum += tl.sum(segm_output * weight[:, None], axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 

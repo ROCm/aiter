@@ -9,7 +9,9 @@ Gluon (gfx1250) port of triton _fused_clamp_silu_mul_kernel for GFX1250
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _apply_activation_from_str,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _GLUON_REPR_KEYS = [

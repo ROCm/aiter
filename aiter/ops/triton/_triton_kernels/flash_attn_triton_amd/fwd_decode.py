@@ -1205,7 +1205,7 @@ def attention_forward_decode_triton_impl(
     IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
         arch = get_arch()
-        if not arch.supports_fp8:
+        if not arch.supports_any_fp8:
             raise RuntimeError(f"{arch.name} does not support FP8")
         rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if (

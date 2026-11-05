@@ -13,7 +13,9 @@ directly to ``out`` in its native dtype and no scales are produced.
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _apply_activation_from_str,
+)
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 

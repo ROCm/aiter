@@ -4,23 +4,20 @@
         "BLOCK_N": 64,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 0
     },
     "batch_512": {
         "BLOCK_M": 128,
         "BLOCK_N": 32,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 0
     },
     "large_batch": {
         "BLOCK_M": 128,
         "BLOCK_N": 32,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 0
     }
 }

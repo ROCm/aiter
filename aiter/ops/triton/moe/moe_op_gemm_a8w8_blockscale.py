@@ -341,7 +341,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:
