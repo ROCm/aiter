@@ -611,6 +611,7 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    allow_gather_defer=True,
 ):
     import functools
 
@@ -1452,6 +1453,16 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
+    _defer = _take_gather_defer_request() if allow_gather_defer else None
+    if _defer is not None and grouped_out.dim() == 3 and topids_to_rows is not None:
+        # The caller reduces the routed rows itself (its fused gather + tail
+        # norm), from exactly what the reduce below would read.
+        _defer.grouped = grouped_out.view(-1, model_dim)
+        _defer.route_rows = topids_to_rows
+        _defer.weights = gather_w
+        _defer.num_valid_tokens = _ep_nvt
+        _defer.placeholder = moe_out
+        return moe_out
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
@@ -1494,6 +1505,7 @@ def grouped_gemm_gfx1250_a8w4(
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
+    allow_gather_defer: bool = True,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1810,6 +1822,7 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            allow_gather_defer=allow_gather_defer,
             **_tdm_kw,
         )
 
@@ -2043,6 +2056,55 @@ def _same_count(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
     if a is None or b is None:
         return a is None and b is None
     return a.data_ptr() == b.data_ptr()
+
+
+class GatherReduceDeferral:
+    """What the grouped MoE's gather-reduce would have read, handed to a caller
+    that reduces the routed rows itself (``defer_gather_reduce``):
+    ``routed[t] = sum_k weights[t, k] * grouped[route_rows[t, k]]`` for tokens
+    below ``num_valid_tokens`` (a (1,) int32, or None for all), exactly as
+    ``flydsl_moe_gather_reduce(grouped.view(1, *grouped.shape), route_rows,
+    weights, num_valid_tokens=num_valid_tokens)`` computes it."""
+
+    __slots__ = ("grouped", "num_valid_tokens", "placeholder", "route_rows", "weights")
+
+    def __init__(self):
+        self.placeholder = None  # the unwritten tensor the MoE call returned
+        self.grouped = None
+        self.route_rows = None
+        self.weights = None
+        self.num_valid_tokens = None
+
+    @property
+    def taken(self) -> bool:
+        return self.grouped is not None
+
+
+_gather_defer_state = threading.local()
+
+
+class defer_gather_reduce:  # a context manager, named as one
+    """Within the scope, the next gfx1250 grouped MoE that ends in its weighted
+    gather-reduce (not the EP scatter epilogue, not the compact layout, no
+    caller ``output``) skips that reduce: it fills the yielded ``GatherReduceDeferral`` and
+    returns an unwritten [tokens, model_dim] tensor instead of the routed sum.
+    A call that cannot defer leaves the deferral untaken and reduces as usual,
+    so the caller checks ``.taken``. One MoE call a scope."""
+
+    def __enter__(self) -> GatherReduceDeferral:
+        self.prev = getattr(_gather_defer_state, "req", None)
+        self.req = GatherReduceDeferral()
+        _gather_defer_state.req = self.req
+        return self.req
+
+    def __exit__(self, *exc):
+        _gather_defer_state.req = self.prev
+
+
+def _take_gather_defer_request() -> GatherReduceDeferral | None:
+    """The scope's untaken deferral, if any."""
+    req = getattr(_gather_defer_state, "req", None)
+    return None if req is None or req.taken else req
 
 
 @functools.cache
