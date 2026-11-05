@@ -22,11 +22,18 @@ context chunk does.
 """
 
 import argparse
+import functools
 
 import torch
 import triton
 
 from aiter.ops.triton.attention.mha_fp8 import mha_fwd, mha_varlen_fwd
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_mha_fp8_gfx1250 import (
+    generate_mha_varlen_fp8_inputs,
+)
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -50,28 +57,28 @@ def make_inputs(b, hq, hk, sq, sk, d, device):
 
 def bench_case(b, hq, hk, sq, sk, d, causal, rep, device, varlen=False, d_pe=0):
     if varlen:
-        cu_q = torch.arange(0, (b + 1) * sq, sq, dtype=torch.int32, device=device)
-        cu_k = torch.arange(0, (b + 1) * sk, sk, dtype=torch.int32, device=device)
-        q, q_scale = quant_fp8(
-            torch.randn((b * sq, hq, d + d_pe), device=device, dtype=torch.float32)
+        assert hk == hq, "varlen needs the same head count for q and k/v"
+        rot_keys = [
+            "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
+            "q_descale", "k_descale", "v_descale", "out", "lse",
+        ]  # fmt: skip
+        bencher = RotatingBufferBench()
+        bencher.build_pool(
+            [
+                functools.partial(
+                    generate_mha_varlen_fp8_inputs, [sq] * b, [sk] * b, hq, 0, device
+                )
+            ],
+            [rot_keys],
         )
-        k, k_scale = quant_fp8(
-            torch.randn((b * sk, hq, d + d_pe), device=device, dtype=torch.float32)
+        kernel_fn = functools.partial(
+            mha_varlen_fwd,
+            max_seqlen_q=sq,
+            max_seqlen_k=sk,
+            causal=causal,
+            return_lse=not causal,
         )
-        v, v_scale = quant_fp8(
-            torch.randn((b * sk, hq, d), device=device, dtype=torch.float32)
-        )
-        q_scale, k_scale, v_scale = (s.reshape(1) for s in (q_scale, k_scale, v_scale))
-        o = torch.empty((b * sq, hq, d), device=device, dtype=torch.bfloat16)
-        lse = torch.empty((hq, b * sq), device=device, dtype=torch.float32)
-
-        def run():
-            mha_varlen_fwd(
-                q, k, v, cu_q, cu_k, sq, sk, q_scale, k_scale, v_scale,
-                causal=causal, return_lse=not causal, out=o, lse=lse,
-            )  # fmt: skip
-
-        ms = triton.testing.do_bench_cudagraph(run, rep=rep)
+        ms = bencher.bench(kernel_fn)
         num_pairs = sq * sk - sq * (sq - 1) / 2 if causal else sq * sk
         flops = 2.0 * b * hq * num_pairs * (2 * d + d_pe)
         num_bytes = b * hq * ((sq + sk) * (d + d_pe) + sk * d + 2 * sq * d)

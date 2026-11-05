@@ -185,9 +185,11 @@ def attn_fwd_tile(
             qk, start_n, offs_m, seqlen_k, causal_offset, BLOCK_N, MFMA_LAYOUT, CAUSAL
         )
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
-    qk_shifted = gl.fma(qk, qk_scale, -(m_ij - LOG2_FP8_MAX)[:, None])
+    # A row with no visible key yet keeps m_ij = -inf; shift it by 0 so p and alpha are 0, not NaN.
+    m_shift = gl.where(m_ij == float("-inf"), 0.0, m_ij)
+    qk_shifted = gl.fma(qk, qk_scale, -(m_shift - LOG2_FP8_MAX)[:, None])
     p = gl.exp2(qk_shifted)
-    alpha = gl.exp2(m_i - m_ij)
+    alpha = gl.exp2(m_i - m_shift)
     l_ij = gl.sum(p, 1)
     l_i = gl.fma(l_i, alpha, l_ij)
     acc = acc * alpha[:, None]
@@ -425,10 +427,12 @@ def _mha_varlen_fwd_fp8(
     base_stride_o_s = _stride(stride_o_s, INT64_OFFSETS)
     base_stride_lse_s = _stride(stride_lse_s, INT64_OFFSETS)
     q_row = q_start + pid_m * BLOCK_M
-    q_ptr += h_q * stride_q_h + q_row * base_stride_q_m
-    k_ptr += h_k * stride_k_h + k_start * base_stride_k_n
-    v_ptr += h_k * stride_v_h + k_start * base_stride_v_n
-    o_ptr += split * base_stride_o_s + h_q * stride_o_h + q_row * base_stride_o_m
+    h_q_off = _stride(h_q, INT64_OFFSETS)
+    h_k_off = _stride(h_k, INT64_OFFSETS)
+    q_ptr += h_q_off * stride_q_h + q_row * base_stride_q_m
+    k_ptr += h_k_off * stride_k_h + k_start * base_stride_k_n
+    v_ptr += h_k_off * stride_v_h + k_start * base_stride_v_n
+    o_ptr += split * base_stride_o_s + h_q_off * stride_o_h + q_row * base_stride_o_m
 
     offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_Q))
     offs_q_d = gl.arange(0, HEAD_DIM_NOPE, layout=gl.SliceLayout(0, LOAD_LAYOUT_Q))
@@ -585,7 +589,7 @@ def _mha_varlen_fwd_fp8(
         lse_base = (
             lse_ptr
             + split * base_stride_lse_s
-            + h_q * stride_lse_h
+            + h_q_off * stride_lse_h
             + _stride(q_start, INT64_OFFSETS)
         )
         gl.amd.cdna4.buffer_store(
@@ -637,6 +641,7 @@ def _mha_varlen_fp8_combine(
     if (m < gl.load(cu_seqlens_q)) | (m >= gl.load(cu_seqlens_q + batch)):
         return
     m = _stride(m, INT64_OFFSETS)
+    h_q = _stride(h_q, INT64_OFFSETS)
     offs_s = gl.arange(0, NUM_SPLITS, layout=gl.SliceLayout(1, LAYOUT))
     offs_d = gl.arange(0, HEAD_DIM_V, layout=gl.SliceLayout(0, LAYOUT))
     lse_s = gl.load(

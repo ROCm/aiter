@@ -264,9 +264,17 @@ def mha_varlen_fwd(
         128,
         64,
     ), f"needs d_v 128 and d_qk - d_v 64, got d_qk {DQK}, d_v {DV}"
-    assert (
-        k.shape[1] == H and v.shape[1] == H
-    ), "q, k and v must have the same head count"
+    Tk = k.shape[0]
+    assert k.shape == (
+        Tk,
+        H,
+        DQK,
+    ), f"k must be [{Tk}, {H}, {DQK}] like q, got {list(k.shape)}"
+    assert v.shape == (
+        Tk,
+        H,
+        DV,
+    ), f"v must be [{Tk}, {H}, {DV}] with the token count of k, got {list(v.shape)}"
     for t in (q, k, v):
         assert t.stride(-1) == 1, "the last dim must be contiguous"
         assert t.device == q.device, "q, k and v must be on the same device"
