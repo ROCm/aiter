@@ -45,6 +45,9 @@ def device(monkeypatch):
         (65, None, None, 0, 1, 100, 128),
         (100, None, None, 0, 1, 100, 128),
         (4097, None, None, 0, 1, 5000, 8192),
+        # 128 task slots per sequence: new gfx1250 plans take 128-token partitions.
+        (5, None, None, 0, 1, None, 8),
+        (3, None, None, 8193, 4, None, 4),
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
 )
@@ -63,7 +66,9 @@ def test_pa_decode_plan(
     from aiter.ops.flydsl.kernels import pa_decode_plan as planner
 
     properties = torch.cuda.get_device_properties(device)
-    sizes = planner.context_partition_sizes(properties.gcnArchName.split(":", 1)[0])
+    arch = properties.gcnArchName.split(":", 1)[0]
+    sizes = planner.context_partition_sizes(arch)
+    limit = planner.PAIRED_PARTITION_LIMIT
     lds_limit = batch is None
     if lds_limit:
         lds_bytes = getattr(properties, "shared_memory_per_block", None)
@@ -110,12 +115,20 @@ def test_pa_decode_plan(
             # to distribute slots by cumulative visible tile count.
             extra = (prefix_tiles + tiles) * remaining // total_tiles
             extra -= prefix_tiles * remaining // total_tiles
-            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            expected = min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            half = (tiles + 1) // 2
+            if size < 256 and (
+                half <= expected < tiles or (tiles > limit and half <= limit)
+            ):
+                # Pairs of partitions: they fill the slots or fit one cluster.
+                expected = min(expected, half)
+            assert count == expected
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
                 assert row == seq and original_length == ctx
                 assert begin == tile and begin < end <= last
+                assert end - begin <= -(-tiles // count)
                 tile = end
             assert tile == last
             cursor += count
@@ -123,7 +136,7 @@ def test_pa_decode_plan(
         assert cursor <= plan.capacity
         assert all(record == [0, 0, 0, 0] for record in work[cursor:])
 
-    pattern = (-1, 0, 1, 127, 128, 129, 255, 256, 257, 65537, 2**31 - 1)
+    pattern = (-1, 0, 1, 127, 128, 129, 255, 256, 257, 3000, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
     plan = planner.plan_pa_decode(
@@ -135,18 +148,24 @@ def test_pa_decode_plan(
         sliding_window=window,
         query_length=query_length,
     )
-    # New and hand-built plans share the architecture's default partition size.
-    assert plan.context_partition_size == sizes[0]
+    # New and hand-built plans pick the partition size from slots per sequence.
+    default = planner.default_context_partition_size(arch, batch, plan.capacity)
+    assert default == (
+        sizes[0] if plan.capacity >= planner.FINE_PARTITION_SLOTS * batch else 256
+    )
+    assert plan.context_partition_size == default
     assert (
         planner.PADecodePlan(
             plan.work_info, plan.reduce_info, 2, plan.max_partitions
         ).context_partition_size
-        == sizes[0]
+        == default
     )
     check(plan, lengths)
     config, launch = calls[-1]
     assert config[0] == bucket
-    for size in sizes[1:]:
+    for size in sizes:
+        if size == plan.context_partition_size:
+            continue
         # Each partition size compiles its own kernel for the same bucket.
         sized = planner.plan_pa_decode(
             context,
@@ -205,6 +224,7 @@ def test_pa_decode_plan(
             max_partitions=other_parts,
             max_batch_size=plan.max_batch_size,
             workgroup_budget=2 * other_capacity,
+            context_partition_size=plan.context_partition_size,
             sliding_window=other_window,
             query_length=query_length + 1,
         )
@@ -1559,8 +1579,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
     elif invalid == "partition-size":
         options["context_partition_size"] = 512
     elif invalid == "partition-mismatch":
-        # gfx1250 plans default to 128-token partitions.
-        options["context_partition_size"] = 256
+        # gfx1250 supports 128 and 256 tokens; restate the size the plan lacks.
+        options["context_partition_size"] = 384 - plan.context_partition_size
     elif invalid == "vector16-k":
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":

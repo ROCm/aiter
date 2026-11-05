@@ -294,7 +294,8 @@ def prepare_pa_decode_plan(
     ``max_batch_size`` sets the planner's batch cap (default 4096); the returned
     plan retains it for refreshes. Larger batches must fit the device's LDS.
     ``context_partition_size`` is passed to ``plan_pa_decode`` and partitions
-    the tuning cache; it defaults to the size of new plans on this device.
+    the tuning cache; it defaults to the size ``plan_pa_decode`` picks for the
+    default budget, which every candidate then keeps.
 
     A 4D ``key_cache`` is not implemented. Cache by attention geometry and
     execution modes. Tensor strides, total KV cache pages, block-table padding,
@@ -453,7 +454,7 @@ def _parse_args(argv=None):
         "--context-partition-size",
         type=int,
         choices=(128, 256),
-        help="Plan partition tokens (default: 128 on gfx1250, 256 elsewhere).",
+        help="Plan partition tokens (default: the planner's choice for the shape).",
     )
     parser.add_argument("--device", type=int, default=0, help="Visible GPU index.")
     parser.add_argument("--seed", type=int, default=0)

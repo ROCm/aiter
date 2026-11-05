@@ -24,7 +24,11 @@ from .kernels.pa_decode_kernel import (
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
 )
-from .kernels.pa_decode_plan import PADecodePlan, context_partition_sizes
+from .kernels.pa_decode_plan import (
+    PADecodePlan,
+    context_partition_sizes,
+    partition_bound,
+)
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
@@ -443,9 +447,10 @@ def pa_decode(
     """Decode FP8 or BF16 K/V using planned context partitions.
 
     The work plan sets the context partition size. Plans support 256 tokens on
-    all targets and 128 tokens on gfx1250; new plans default to 128 on gfx1250
-    and 256 on gfx942/gfx950. ``context_partition_size`` may restate the plan's
-    size.
+    all targets and 128 tokens on gfx1250. New gfx1250 plans default to 128
+    when they have at least 16 task slots per sequence and to 256 otherwise;
+    gfx942/gfx950 plans use 256. ``context_partition_size`` may restate the
+    plan's size.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -949,14 +954,13 @@ def pa_decode(
     max_partitions = min(
         num_partitions,
         work_plan.capacity,
-        max(1, -(-schedule_context_length // context_partition_size)),
+        partition_bound(
+            context_partition_size,
+            schedule_context_length,
+            sliding_window,
+            query_length,
+        ),
     )
-    if sliding_window > 0:
-        # Bound the unaligned MTP window without shrinking the reusable plan.
-        window_tiles = (
-            sliding_window + query_length - 2 + context_partition_size - 1
-        ) // context_partition_size + 1
-        max_partitions = min(max_partitions, window_tiles)
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
     # sequences given slots freed by empty ones merge in their last-arriving
