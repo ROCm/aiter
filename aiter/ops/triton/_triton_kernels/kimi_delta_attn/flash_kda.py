@@ -462,6 +462,7 @@ def _flash_kda_segment_kernel(
     cache_stride=0,
     PAGED_CACHE: tl.constexpr = False,
     PAGED_H_IN: tl.constexpr = False,
+    H_IN_IS_H0: tl.constexpr = False,
 ):
     """Delta-rule recurrence over one segment of chunks.
 
@@ -476,7 +477,9 @@ def _flash_kda_segment_kernel(
       * ``h=h_in`` from the scan, real ``v``, ``COMPUTE_OUTPUT`` -> the output
 
     With one segment per sequence this degenerates to a plain sequential scan
-    and only the third form runs.
+    and only the third form runs, from ``h_in`` = the caller's initial state
+    (``H_IN_IS_H0``: per sequence, laid out as ``STATE_V_FIRST`` says) instead
+    of the scan's K-first state per segment.
     """
     i_w = tl.program_id(0).to(tl.int64)
     i_sh = tl.program_id(1).to(tl.int64)
@@ -513,8 +516,18 @@ def _flash_kda_segment_kernel(
             b_h2 = tl.load(state_cache + f_off + o_k2[:, None], mask=m_h, other=0.0).to(
                 tl.float32
             )
+        elif H_IN_IS_H0 and STATE_V_FIRST:
+            i_n = tl.load(seg_seq + i_seg).to(tl.int64)
+            s_off = (i_n * H + i_h) * W * K + o_w[None, :] * K
+            b_h1 = tl.load(h_in + s_off + o_k1[:, None], mask=m_w[None, :], other=0.0)
+            b_h2 = tl.load(h_in + s_off + o_k2[:, None], mask=m_w[None, :], other=0.0)
+            b_h1 = b_h1.to(tl.float32)
+            b_h2 = b_h2.to(tl.float32)
         else:
-            s_off = (i_seg * H + i_h) * K * W + o_w[None, :]
+            i_st = i_seg
+            if H_IN_IS_H0:
+                i_st = tl.load(seg_seq + i_seg).to(tl.int64)
+            s_off = (i_st * H + i_h) * K * W + o_w[None, :]
             b_h1 = tl.load(
                 h_in + s_off + o_k1[:, None] * W, mask=m_w[None, :], other=0.0
             )
@@ -651,6 +664,7 @@ def _flash_kda_seg_scan_kernel(
     h_in,
     h0,
     seq_seg_off,
+    seq_order,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -661,18 +675,23 @@ def _flash_kda_seg_scan_kernel(
     has_initial_state=None,
     cache_stride=0,
     PAGED_CACHE: tl.constexpr = False,
+    H0_V_FIRST: tl.constexpr = False,
 ):
     """Serial scan across a sequence's segments: ``h <- A_seg h + b_seg``.
 
     Only runs once per segment rather than once per chunk, so its serial depth
-    is the segment count (single digits) instead of the chunk count.
+    is the segment count (single digits) instead of the chunk count. Programs
+    take the sequences in segment order (see ``_build_segments``): position
+    ``p`` is sequence ``seq_order[p]``, and its segment ``s`` has map ``s - p``,
+    since ``A_seg`` and ``b_seg`` skip each sequence's last segment.
     """
     i_v = tl.program_id(0).to(tl.int64)
-    i_nh = tl.program_id(1).to(tl.int64)
-    i_n, i_h = i_nh // H, i_nh % H
+    i_ph = tl.program_id(1).to(tl.int64)
+    p, i_h = i_ph // H, i_ph % H
+    i_n = tl.load(seq_order + p).to(tl.int64)
 
-    s0 = tl.load(seq_seg_off + i_n).to(tl.int64)
-    s1 = tl.load(seq_seg_off + i_n + 1).to(tl.int64)
+    s0 = tl.load(seq_seg_off + p).to(tl.int64)
+    s1 = tl.load(seq_seg_off + p + 1).to(tl.int64)
 
     o_k1 = tl.arange(0, 64)
     o_k2 = 64 + tl.arange(0, 64)
@@ -691,6 +710,14 @@ def _flash_kda_seg_scan_kernel(
             b_h2 = tl.load(state_cache + f_off + o_k2[:, None], mask=m_h, other=0.0).to(
                 tl.float32
             )
+        elif H0_V_FIRST:
+            base = (i_n * H + i_h) * V * K + o_v[None, :] * K
+            b_h1 = tl.load(h0 + base + o_k1[:, None], mask=m_v[None, :], other=0.0).to(
+                tl.float32
+            )
+            b_h2 = tl.load(h0 + base + o_k2[:, None], mask=m_v[None, :], other=0.0).to(
+                tl.float32
+            )
         else:
             base = (i_n * H + i_h) * K * V + o_v[None, :]
             b_h1 = tl.load(
@@ -703,7 +730,7 @@ def _flash_kda_seg_scan_kernel(
         b_h1 = tl.zeros([64, BV], dtype=tl.float32)
         b_h2 = tl.zeros([64, BV], dtype=tl.float32)
 
-    for s in range(s0, s1):
+    for s in range(s0, s1 - 1):
         hb = (s * H + i_h) * K * V + o_v[None, :]
         tl.store(h_in + hb + o_k1[:, None] * V, b_h1, mask=m_v[None, :])
         tl.store(h_in + hb + o_k2[:, None] * V, b_h2, mask=m_v[None, :])
@@ -711,7 +738,7 @@ def _flash_kda_seg_scan_kernel(
         # A_seg is stored bf16: the dots below consume it as bf16 anyway, and at
         # this block count the scan is bound by how fast it can pull the
         # operator in, not by arithmetic.
-        ab = (s * H + i_h) * K * K
+        ab = ((s - p) * H + i_h) * K * K
         b_A11 = tl.load(A_seg + ab + o_k1[:, None] * K + o_k1[None, :])
         b_A12 = tl.load(A_seg + ab + o_k1[:, None] * K + o_k2[None, :])
         b_A21 = tl.load(A_seg + ab + o_k2[:, None] * K + o_k1[None, :])
@@ -722,12 +749,17 @@ def _flash_kda_seg_scan_kernel(
         b_n1 = tl.dot(b_A11, b_h1_bf) + tl.dot(b_A12, b_h2_bf)
         b_n2 = tl.dot(b_A21, b_h1_bf) + tl.dot(b_A22, b_h2_bf)
 
+        bb = ((s - p) * H + i_h) * K * V + o_v[None, :]
         b_h1 = b_n1 + tl.load(
-            b_seg + hb + o_k1[:, None] * V, mask=m_v[None, :], other=0.0
+            b_seg + bb + o_k1[:, None] * V, mask=m_v[None, :], other=0.0
         )
         b_h2 = b_n2 + tl.load(
-            b_seg + hb + o_k2[:, None] * V, mask=m_v[None, :], other=0.0
+            b_seg + bb + o_k2[:, None] * V, mask=m_v[None, :], other=0.0
         )
+
+    hb = ((s1 - 1) * H + i_h) * K * V + o_v[None, :]
+    tl.store(h_in + hb + o_k1[:, None] * V, b_h1, mask=m_v[None, :])
+    tl.store(h_in + hb + o_k2[:, None] * V, b_h2, mask=m_v[None, :])
 
 
 @triton.jit
@@ -758,6 +790,7 @@ def _flash_kda_seg_scan_prefetch_kernel(
     h_in,
     h0,
     seq_seg_off,
+    seq_order,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -768,6 +801,7 @@ def _flash_kda_seg_scan_prefetch_kernel(
     has_initial_state=None,
     cache_stride=0,
     PAGED_CACHE: tl.constexpr = False,
+    H0_V_FIRST: tl.constexpr = False,
 ):
     """``_flash_kda_seg_scan_kernel`` with each load issued ahead of the update
     that needs it.
@@ -780,12 +814,17 @@ def _flash_kda_seg_scan_prefetch_kernel(
     update, which nothing reads, is not done.
     """
     i_v = tl.program_id(0).to(tl.int64)
-    i_nh = tl.program_id(1).to(tl.int64)
-    i_n, i_h = i_nh // H, i_nh % H
+    i_ph = tl.program_id(1).to(tl.int64)
+    p, i_h = i_ph // H, i_ph % H
+    i_n = tl.load(seq_order + p).to(tl.int64)
 
-    s0 = tl.load(seq_seg_off + i_n).to(tl.int64)
+    s0 = tl.load(seq_seg_off + p).to(tl.int64)
     # Update s takes h_in[s] to h_in[s + 1].
-    s_end = tl.load(seq_seg_off + i_n + 1).to(tl.int64) - 1
+    s_end = tl.load(seq_seg_off + p + 1).to(tl.int64) - 1
+    # Segment s's map is entry s - p: every earlier position has one last
+    # segment, which has no map.
+    A_seg = A_seg - p * (H * K * K)
+    b_seg = b_seg - p * (H * K * V)
 
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -801,6 +840,11 @@ def _flash_kda_seg_scan_prefetch_kernel(
             b_h = tl.load(
                 state_cache + f_off + o_k[:, None], mask=m_v[None, :] & take, other=0.0
             ).to(tl.float32)
+        elif H0_V_FIRST:
+            f_off = (i_n * H + i_h) * V * K + o_v[None, :] * K
+            b_h = tl.load(h0 + f_off + o_k[:, None], mask=m_v[None, :], other=0.0).to(
+                tl.float32
+            )
         else:
             b_h = tl.load(h0 + i_n * H * K * V + hb, mask=m_v[None, :], other=0.0).to(
                 tl.float32
@@ -811,9 +855,13 @@ def _flash_kda_seg_scan_prefetch_kernel(
 
     # Segment indices are clamped into the updates, which keeps every load in
     # bounds: the loads past the last update re-read its segment, and an odd
-    # count's last trip computes a second update from it and drops it.
-    b_n0 = _seg_scan_load_b(b_seg, s0, hb, m_v, H, K, V)
-    b_n1 = _seg_scan_load_b(b_seg, _seg_scan_clamp(s0 + 1, s0, s_end), hb, m_v, H, K, V)
+    # count's last trip computes a second update from it and drops it. A
+    # sequence without updates has no maps to read at all.
+    m_pre = m_v & (s0 < s_end)
+    b_n0 = _seg_scan_load_b(b_seg, s0, hb, m_pre, H, K, V)
+    b_n1 = _seg_scan_load_b(
+        b_seg, _seg_scan_clamp(s0 + 1, s0, s_end), hb, m_pre, H, K, V
+    )
     for s in range(s0, s_end, 2):
         s_b = _seg_scan_clamp(s + 1, s0, s_end)
         b_c0 = b_n0
@@ -979,8 +1027,78 @@ def _scan_schedule(n_seqs: int, H: int, V: int) -> tuple[int, int]:
     return _SCAN_BV_NARROW, 4
 
 
-def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> int:
-    """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
+# Pass times of the gfx1250 segmented schedule (us), fitted to forced-length
+# sweeps of 23 batches at H=12 (1 to 32 sequences, uniform and skewed, 128 to
+# 64k tokens), against which the lengths it picks are within 5% of the best.
+# A pass C block costs an entry/exit plus a per-chunk walk, and wide (BW=128)
+# blocks run one per CU, so full-length segments past the CU count take extra
+# rounds; past that the pass streams at a floor per chunk and head. Pass A maps
+# full-length segments only, and the scan grows with its depth and with the
+# sequences it copies initial states for. Segmenting also adds two launches.
+_SEG_C_BLOCK_US = 18.0
+_SEG_C_CHUNK_US = 0.52
+_SEG_C_CHUNK_US_NARROW = 0.44
+_SEG_C_STREAM_US = 0.0043
+_SEG_A_BLOCK_US = 13.0
+_SEG_A_CHUNK_US = 0.37
+_SEG_SCAN_US = 5.0
+_SEG_SCAN_STEP_US = 0.75
+_SEG_SCAN_SEQ_US = 0.4
+_SEG_LAUNCH_US = 6.0
+
+
+def _seg_cost_us(
+    chunks: tuple[int, ...], L: int, H: int, cus: int, wide_blocks: float
+) -> float:
+    """Modelled pass A + B + C time at segment length ``L``, ``chunks`` being
+    the sequences' chunk counts, longest first; ``L >= chunks[0]`` is the
+    unsegmented schedule. Pass C runs wide from ``wide_blocks`` blocks on."""
+    n, depth = len(chunks), -(-chunks[0] // L)
+    segs, full = n, 0
+    for c in chunks:
+        if c < L:
+            break
+        segs += (c - 1) // L
+        full += c // L
+    wide = segs * H >= wide_blocks
+    walk = _SEG_C_BLOCK_US + min(L, chunks[0]) * (
+        _SEG_C_CHUNK_US if wide else _SEG_C_CHUNK_US_NARROW
+    )
+    rounds = max(1, -(-full * H // cus)) if depth > 1 else 1
+    t = max(rounds * walk, sum(chunks) * H * _SEG_C_STREAM_US)
+    if depth > 1:
+        # Pass A runs narrow, two blocks of the (segment, head) per CU.
+        t += -(-(segs - n) * H // cus) * (_SEG_A_BLOCK_US + L * _SEG_A_CHUNK_US)
+        t += _SEG_SCAN_US + depth * _SEG_SCAN_STEP_US + n * _SEG_SCAN_SEQ_US
+        t += _SEG_LAUNCH_US
+    return t
+
+
+@functools.lru_cache(maxsize=256)
+def _seg_length_by_cost(chunks: tuple[int, ...], H: int, cus: int) -> int:
+    """The power-of-two segment length (at least two segments on the longest
+    sequence) the model prefers, or ``chunks[0]`` if none beats not
+    segmenting."""
+    wide = chunk_delta_attn_tuned_config(
+        "k2_c_gluon_wide", _K2_GLUON_FALLBACK, backend="gluon"
+    )
+    wide_blocks = wide.kwargs["MIN_BLOCKS_PER_CU"] * cus
+    best_l = chunks[0]
+    best_t = _seg_cost_us(chunks, chunks[0], H, cus, wide_blocks)
+    L = 16
+    while 2 * L <= chunks[0]:
+        t = _seg_cost_us(chunks, L, H, cus, wide_blocks)
+        if t < best_t:
+            best_l, best_t = L, t
+        L *= 2
+    return best_l
+
+
+def _choose_chunks_per_seg(
+    seq_chunks: tuple[int, ...], n_seqs: int, H: int, V: int
+) -> int:
+    """Segment length in chunks, or the longest sequence's chunk count to
+    disable segmentation.
 
     The recurrence kernel gets ``n_segments * H * (V / BW)`` blocks, so with one
     segment per sequence a low head count leaves most of the device idle: at
@@ -989,19 +1107,25 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     so what decides the length is the block count it lands on rather than the
     sequence length on its own.
     """
+    n_chunks_max = max(seq_chunks)
     override = os.getenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", "").strip()
     if override:
         val = int(override)
         return n_chunks_max if val <= 0 else val
     blocks = n_seqs * H * max(1, V // 32)
     cus = _num_cus()
-    # There has to be idle capacity to absorb the extra passes.
-    if blocks > cus:
-        return n_chunks_max
-    # And enough depth to amortize them, which no amount of idle capacity makes
-    # up for.
+    # Enough depth to amortize the extra passes, which no amount of idle
+    # capacity makes up for.
     if n_chunks_max < _SEG_MIN_CHUNKS:
         return n_chunks_max
+    # Without idle capacity to absorb the extra passes, only a sequence that
+    # outlasts the rest of the batch by enough pays for them: the cost model
+    # weighs its serial walk against the passes on gfx1250, the one device it
+    # is fitted to.
+    if blocks > cus:
+        if DEVICE_ARCH != "gfx1250" or V != FLASH_KDA_K:
+            return n_chunks_max
+        return _seg_length_by_cost(tuple(sorted(seq_chunks, reverse=True)), H, cus)
     # Enough segments to fill the device, and enough to keep a segment's own
     # serial walk from becoming the limit on a long sequence. Capped over both,
     # since the two extra passes scale with the segment count.
@@ -1034,10 +1158,19 @@ def _build_segments(
 ):
     """Descriptors for the segmented recurrence.
 
-    Returns ``(desc, seq_seg_off, num_segs, max_segs_per_seq)`` where ``desc`` is
-    a ``[6, num_segs]`` int32 tensor holding, per segment: the global chunk index
-    it starts at (indexing the K1 workspace), its chunk count, its first and
-    one-past-last token, its sequence, and whether it ends that sequence.
+    Returns ``(desc, desc_a, seq_seg_off, seq_order, num_segs, max_segs_per_seq)``
+    where ``desc`` is a ``[6, num_segs]`` int32 tensor holding, per segment: the
+    global chunk index it starts at (indexing the K1 workspace), its chunk
+    count, its first and one-past-last token, its sequence, and whether it ends
+    that sequence. ``desc_a`` holds the same for the segments pass A maps, every
+    one but each sequence's last, whose map nothing reads.
+
+    Sequences are laid out longest first, ``seq_order[p]`` being the one at
+    position ``p``: blocks are dispatched in segment order, and once they
+    outnumber the CUs a long sequence placed last would start its walks, and
+    its scan, only after the short ones. Position ``p``'s segments are
+    ``seq_seg_off[p]`` up to ``seq_seg_off[p + 1]``, and its segment ``s`` is
+    entry ``s - p`` of ``desc_a``.
 
     Cached on the sequence bounds: building these costs a Python loop and a host
     to device copy, which at this kernel's runtime is not noise, and a serving
@@ -1045,32 +1178,38 @@ def _build_segments(
     """
     chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
     seq_seg_off = [0]
-    g_chunk = 0
-    for i, (bos, eos) in enumerate(seqs):
-        nch = triton.cdiv(eos - bos, C)
+    seq_chunks = [triton.cdiv(eos - bos, C) for bos, eos in seqs]
+    first_chunk = [0]
+    for nch in seq_chunks[:-1]:
+        first_chunk.append(first_chunk[-1] + nch)
+    order = sorted(range(len(seqs)), key=lambda i: -seq_chunks[i])
+    for i in order:
+        bos, eos = seqs[i]
+        nch = seq_chunks[i]
         nseg = max(1, triton.cdiv(nch, chunks_per_seg))
         for s in range(nseg):
             c0 = s * chunks_per_seg
             m = min(chunks_per_seg, nch - c0)
-            chunk_base.append(g_chunk + c0)
+            chunk_base.append(first_chunk[i] + c0)
             nchunks.append(m)
             tok_base.append(bos + c0 * C)
             tok_end.append(min(bos + (c0 + m) * C, eos))
             seq_id.append(i)
             is_last.append(1 if s == nseg - 1 else 0)
         seq_seg_off.append(len(chunk_base))
-        g_chunk += nch
 
-    desc = torch.tensor(
-        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
-        dtype=torch.int32,
-        device=device,
-    )
+    cols = [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last]
+    desc = torch.tensor(cols, dtype=torch.int32, device=device)
+    keep = [s for s, last in enumerate(is_last) if not last]
+    desc_a = torch.tensor(
+        [[col[s] for s in keep] for col in cols], dtype=torch.int32, device=device
+    ).view(6, len(keep))
     off = torch.tensor(seq_seg_off, dtype=torch.int32, device=device)
+    seq_order = torch.tensor(order, dtype=torch.int32, device=device)
     max_per_seq = max(
         seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
     )
-    return desc, off, len(chunk_base), max_per_seq
+    return desc, desc_a, off, seq_order, len(chunk_base), max_per_seq
 
 
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel)
@@ -1254,15 +1393,18 @@ def flash_kda_fwd(
     # passing it as the segment length is what disables segmentation. Resolved
     # here rather than next to _build_segments because K1 launches first and the
     # cache modifiers below depend on the answer.
-    n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
+    seq_chunks = tuple(triton.cdiv(eos - bos, C) for bos, eos in seqs)
+    n_chunks_max = max(seq_chunks)
     if chunks_per_seg is None:
-        chunks_per_seg = _choose_chunks_per_seg(n_chunks_max, N, H, V)
+        chunks_per_seg = _choose_chunks_per_seg(seq_chunks, N, H, V)
     elif chunks_per_seg <= 0:
         chunks_per_seg = n_chunks_max
     segmented = n_chunks_max > chunks_per_seg
 
     CM_LOAD = ".cg"
-    CM_STORE = "" if segmented else ".wt"
+    # Write-through workspace stores are a gfx950 choice: on gfx1250 they slow
+    # K1 by 6-14% and gain pass C nothing.
+    CM_STORE = "" if segmented or DEVICE_ARCH == "gfx1250" else ".wt"
     CM_OUT_STORE = "" if segmented else ".cs"
 
     ws_shape = (H * total_tiles, C, K)
@@ -1360,17 +1502,16 @@ def flash_kda_fwd(
             CM_WS=CM_STORE,
         )
 
-    desc, seq_seg_off, num_segs, max_segs = _build_segments(
+    desc, desc_a, seq_seg_off, seq_order, num_segs, max_segs = _build_segments(
         seqs, C, chunks_per_seg, dev
     )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
+    num_segs_a = desc_a.shape[1]
 
-    # The kernel indexes h_in by segment, so normalize a V-first initial state
-    # once here instead of carrying the layout through three passes.
+    # The initial state is read in the caller's layout, by pass B or, without
+    # segments, by pass C.
     h0 = initial_state
     if h0 is not None:
-        if state_v_first:
-            h0 = h0.transpose(-1, -2)
         h0 = h0.contiguous()
 
     o = (
@@ -1436,19 +1577,26 @@ def flash_kda_fwd(
                 flash_kda_k2 as _g2,
             )
 
-    def _launch_k2(*, W, **kw):
+    def _launch_k2(*, W, segs=num_segs, **kw):
         launch_args = {**common, **unpaged_args, **kw}
         return _segment_fast[
-            lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
+            lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), segs * H)
         ](W=W, **launch_args)
 
     if max_segs > 1:
         # Pass A: b_seg (affine part) and A_seg (linear part), both fully
-        # parallel across segments. Neither writes outputs.
-        b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
-        A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
+        # parallel across segments. Neither writes outputs. Only the segments
+        # the scan steps across are mapped.
+        b_seg = torch.empty(num_segs_a, H, K, V, dtype=torch.float32, device=dev)
+        A_seg = torch.empty(num_segs_a, H, K, K, dtype=torch.bfloat16, device=dev)
+        seg_a = dict(
+            zip(
+                ("seg_chunk_base", "seg_nchunks", "seg_tok_base", "seg_tok_end"),
+                desc_a[:4],
+            )
+        )
         if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
-            sched = _k2_gluon_schedule(V, num_segs, H)
+            sched = _k2_gluon_schedule(V, num_segs_a, H)
             _g2.gluon_k2_ab_fused(
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
@@ -1458,25 +1606,22 @@ def flash_kda_fwd(
                 beta_raw=beta,
                 h_out_b=b_seg,
                 h_out_a=A_seg,
-                seg_chunk_base=seg_chunk_base,
-                seg_nchunks=seg_nchunks,
-                seg_tok_base=seg_tok_base,
-                seg_tok_end=seg_tok_end,
+                **seg_a,
                 TOTAL_TILES=total_tiles,
                 stride_v=stride_v,
                 H=H,
                 K=K,
                 V=V,
                 C=C,
-                num_segs=num_segs,
+                num_segs=num_segs_a,
                 BW=sched.kwargs["BW"],
                 CPL=sched.kwargs["CPL"],
                 num_warps=sched.num_warps,
             )
         elif use_gluon_k2a:
-            sched = _k2_gluon_schedule(V, num_segs, H)
+            sched = _k2_gluon_schedule(V, num_segs_a, H)
             bw, nw = sched.kwargs["BW"], sched.num_warps
-            _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs * H)](
+            _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs_a * H)](
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
                 ws_gt=ws_gt,
@@ -1485,10 +1630,7 @@ def flash_kda_fwd(
                 beta_raw=beta,
                 h_out_b=b_seg,
                 h_out_a=A_seg,
-                seg_chunk_base=seg_chunk_base,
-                seg_nchunks=seg_nchunks,
-                seg_tok_base=seg_tok_base,
-                seg_tok_end=seg_tok_end,
+                **seg_a,
                 TOTAL_TILES=total_tiles,
                 H=H,
                 K=K,
@@ -1510,12 +1652,17 @@ def flash_kda_fwd(
                     h_out=buf,
                     final_state=None,
                     W=width,
+                    segs=num_segs_a,
                     INIT_IDENTITY=identity,
                     HAS_H_IN=False,
                     HAS_V=has_v,
                     COMPUTE_OUTPUT=False,
                     STORE_H_OUT=True,
                     STORE_FINAL=False,
+                    **seg_a,
+                    seg_seq=desc_a[4],
+                    seg_is_last=desc_a[5],
+                    NUM_SEGS_CLASS=_seg_occupancy_class(num_segs_a),
                 )
 
         # Pass B: propagate across segments. Depth is the segment count.
@@ -1528,15 +1675,19 @@ def flash_kda_fwd(
             h_in=h_in,
             h0=h0,
             seq_seg_off=seq_seg_off,
+            seq_order=seq_order,
             H=H,
             K=K,
             V=V,
             BV=BV_SCAN,
             **paged_args,
+            H0_V_FIRST=h0 is not None and state_v_first,
             num_warps=SCAN_WARPS,
         )
+        h_in_is_h0 = False
     else:
         h_in = None if paged else h0
+        h_in_is_h0 = h_in is not None
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
     if use_gluon_k2c:
@@ -1571,6 +1722,7 @@ def flash_kda_fwd(
             num_warps=sched.num_warps,
             STORE_FINAL=store_final,
             STATE_V_FIRST=state_v_first,
+            H_IN_IS_H0=h_in_is_h0,
             CM_OUT=CM_OUT_STORE,
         )
     else:
@@ -1587,6 +1739,7 @@ def flash_kda_fwd(
             COMPUTE_OUTPUT=True,
             STORE_H_OUT=False,
             STORE_FINAL=store_final,
+            H_IN_IS_H0=h_in_is_h0,
             **(paged_args if paged else {}),
         )
 

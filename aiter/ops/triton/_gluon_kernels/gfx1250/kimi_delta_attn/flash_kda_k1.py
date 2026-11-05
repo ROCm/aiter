@@ -29,6 +29,17 @@ _MMA_F32: gl.constexpr = gl.amd.AMDWMMALayout(
 )
 _A_F32: gl.constexpr = gl.DotOperandLayout(0, _MMA_F32, 2)
 _B_F32: gl.constexpr = gl.DotOperandLayout(1, _MMA_F32, 2)
+# The four 16 x 16 tiles of a [C, C] matrix as a [4, 16, 16] batch, tile
+# 2 * row block + column block on the wave _MMA_B16 computes it on.
+_MMA_T32: gl.constexpr = gl.amd.AMDWMMALayout(
+    version=3,
+    transposed=True,
+    warp_bases=[[1, 0, 0], [2, 0, 0]],
+    instr_shape=[16, 16, 4],
+    rank=3,
+)
+_A_T32: gl.constexpr = gl.DotOperandLayout(0, _MMA_T32, 2)
+_B_T32: gl.constexpr = gl.DotOperandLayout(1, _MMA_T32, 2)
 
 # bf16 [C, K] tiles as TDM writes them and the WMMA operands read them: a 16 B
 # pad per 256 B row spreads an operand read's 16 rows over the banks.
@@ -38,6 +49,9 @@ _SH_CK: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
 # fp32 [C, C] operands: an 8 B pad per 128 B row, for the same reason.
 _SH_CC: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
     [[32, 2]], [32, 32], [1, 0]
+)
+_SH_T: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    [[16, 2]], [4, 16, 16], [2, 1, 0]
 )
 _SH_ROWS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 _SH_VEC: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
@@ -253,6 +267,114 @@ def k1_prepare_gluon(
         cache=CM_WS,
     )
 
+    if C == 2 * BC:
+        _inv_tiles(b_L, ws_cc, o_i_r, o_i_c, C, BC, NUM_DOUBLING, CM_WS)
+    else:
+        _inv_flat(b_L, ws_cc, o_i_r, o_i_c, C, BC, NUM_DOUBLING, NUM_MERGE, CM_WS)
+
+
+@gluon.jit
+def _tiles(x, BC: gl.constexpr):
+    """[2 BC, 2 BC] -> [4, BC, BC], tile 2 * row block + column block."""
+    return gl.reshape(
+        gl.permute(gl.reshape(x, [2, BC, 2, BC]), [0, 2, 1, 3]), [4, BC, BC]
+    )
+
+
+@gluon.jit
+def _op_a(x):
+    """x, from the _MMA_T32 accumulator, as the A operand."""
+    return gl.convert_layout(x, _A_T32)
+
+
+@gluon.jit
+def _op_b(x_t):
+    """x as the B operand, from x^T in the _MMA_T32 accumulator."""
+    return gl.convert_layout(gl.permute(x_t, [0, 2, 1]), _B_T32)
+
+
+@gluon.jit
+def _inv_tiles(
+    b_L,
+    ws_cc,
+    o_i_r,
+    o_i_c,
+    C: gl.constexpr,
+    BC: gl.constexpr,
+    NUM_DOUBLING: gl.constexpr,
+    CM_WS: gl.constexpr,
+):
+    """(I - L)^-1 into ws_cc as fp16 [C, C], for C = 2 BC: the doubling on the
+    two diagonal tiles and one merge, on the four tiles of L as a batch.
+
+    Each wave keeps the tile of L it computed, so a doubling product runs
+    K = BC on it where on the whole matrix it ran K = C. The accumulator holds
+    a tile as the A operand reads it, and x^T as the B operand reads x; with
+    the powers of D^T carried next to those of D, every operand of the
+    doubling comes from registers, and D^T is its only trip through LDS."""
+    gl.static_assert(C == 2 * BC)
+    b_D = gl.where(o_i_r[:, None] // BC == o_i_c[None, :] // BC, b_L, 0.0)
+    b_D = gl.convert_layout(_tiles(b_D, BC), _MMA_T32)
+    s_d = gl.allocate_shared_memory(gl.float32, [4, BC, BC], _SH_T, b_D)
+    # Allocated with s_d, so that it does not reuse LDS another wave may still
+    # be reading and cost a barrier of its own.
+    s_inv = gl.allocate_shared_memory(gl.float32, [4, BC, BC], _SH_T)
+    b_DT = s_d.permute([0, 2, 1]).load(_MMA_T32)
+    o_t = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, _MMA_T32)))
+    o_u = gl.arange(0, BC, layout=gl.SliceLayout(0, gl.SliceLayout(2, _MMA_T32)))
+    o_v = gl.arange(0, BC, layout=gl.SliceLayout(0, gl.SliceLayout(1, _MMA_T32)))
+    o_t = o_t[:, None, None]
+    o_u = o_u[None, :, None]
+    o_v = o_v[None, None, :]
+    zero_t = gl.zeros([4, BC, BC], gl.float32, _MMA_T32)
+    # I + D; D is strictly lower triangular, so its diagonal is free for the 1s.
+    b_INV = gl.where(o_u == o_v, 1.0, b_D)
+    b_Dp = gl.amd.gfx1250.wmma(_op_a(b_D), _op_b(b_DT), zero_t)
+    b_DpT = gl.amd.gfx1250.wmma(_op_a(b_DT), _op_b(b_D), zero_t)
+    for i in gl.static_range(NUM_DOUBLING):
+        b_INV = gl.amd.gfx1250.wmma(_op_a(b_INV), _op_b(b_DpT), b_INV)
+        if i + 1 < NUM_DOUBLING:
+            b_Dp_next = gl.amd.gfx1250.wmma(_op_a(b_Dp), _op_b(b_DpT), zero_t)
+            b_DpT = gl.amd.gfx1250.wmma(_op_a(b_DpT), _op_b(b_Dp), zero_t)
+            b_Dp = b_Dp_next
+
+    # Tile 2 = A11 L10 A00 takes tiles 0 and 3 from other waves: every wave
+    # computes it from them broadcast, so tile 2's wave has it like the rest.
+    # P = L10 A00 comes out transposed, as the B operand of A11 P reads it.
+    s_inv.store(b_INV)
+    b_PT = gl.amd.gfx1250.wmma(
+        s_inv.slice(0, 1, 0).permute([0, 2, 1]).load(_A_T32).broadcast_to([4, BC, BC]),
+        _op_b(gl.convert_layout(_tiles(b_L, BC), _MMA_T32)),
+        zero_t,
+    )
+    b_A10 = gl.amd.gfx1250.wmma(
+        s_inv.slice(3, 1, 0).load(_A_T32).broadcast_to([4, BC, BC]),
+        _op_b(b_PT),
+        zero_t,
+    )
+    b_INV = gl.where(o_t == 2, b_A10, gl.where(o_t == 1, 0.0, b_INV))
+    gl.amd.gfx1250.buffer_store(
+        b_INV.to(ws_cc.dtype.element_ty),
+        ws_cc,
+        ((o_t // 2) * BC + o_u) * C + (o_t % 2) * BC + o_v,
+        cache=CM_WS,
+    )
+
+
+@gluon.jit
+def _inv_flat(
+    b_L,
+    ws_cc,
+    o_i_r,
+    o_i_c,
+    C: gl.constexpr,
+    BC: gl.constexpr,
+    NUM_DOUBLING: gl.constexpr,
+    NUM_MERGE: gl.constexpr,
+    CM_WS: gl.constexpr,
+):
+    """(I - L)^-1 into ws_cc as fp16 [C, C]: the doubling on the BC blocks and
+    NUM_MERGE merges, each product on the whole [C, C] matrix."""
     if BC == C:
         b_D = b_L
     else:
@@ -310,7 +432,7 @@ def k1_prepare_gluon(
     o_f_r = gl.arange(0, C, layout=gl.SliceLayout(1, _MMA_F32))
     o_f_c = gl.arange(0, C, layout=gl.SliceLayout(0, _MMA_F32))
     gl.amd.gfx1250.buffer_store(
-        b_INV.to(ws_inv_mqk.dtype.element_ty),
+        b_INV.to(ws_cc.dtype.element_ty),
         ws_cc,
         o_f_r[:, None] * C + o_f_c[None, :],
         cache=CM_WS,

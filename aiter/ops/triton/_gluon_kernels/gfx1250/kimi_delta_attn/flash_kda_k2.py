@@ -7,7 +7,9 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import fast_sigmoid
-from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    remap_xcd_chunked,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -45,12 +47,18 @@ def _program(
     seg_tok_end,
     H: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    N_W: gl.constexpr,
 ):
-    # Keeps a (segment, head)'s V blocks on one XCD, so their re-reads of the
-    # chunk workspace share an L2.
+    # Keeps a (segment, head)'s N_W V blocks on one XCD, so their re-reads of
+    # the chunk workspace share an L2, and deals the (segment, head)s out over
+    # the XCDs in turn: segments are in sequence order, so a contiguous range
+    # per XCD would pile a long sequence's segments onto one or two of them.
     n_w = gl.num_programs(0)
-    pid = remap_xcd(
-        gl.program_id(1) * n_w + gl.program_id(0), n_w * gl.num_programs(1), NUM_XCDS
+    pid = remap_xcd_chunked(
+        gl.program_id(1) * n_w + gl.program_id(0),
+        n_w * gl.num_programs(1),
+        NUM_XCDS,
+        N_W,
     )
     i_w = pid % n_w
     i_sh = pid // n_w
@@ -330,7 +338,7 @@ def k2_ab_fused_gluon(
         [[C, 8]], [G, C], [1, 0]
     )
     i_w, i_seg, i_h, chunk_base, n_chunks, tok_base, n_tok = _program(
-        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS
+        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS, V // BW
     )
 
     s_kd = gl.allocate_shared_memory(ws_kd.dtype.element_ty, [2, G, K], SH_KD)
@@ -437,6 +445,7 @@ _k2_c_repr = make_kernel_repr(
         "STATE_V_FIRST",
         "PAGED_CACHE",
         "PAGED_H_IN",
+        "H_IN_IS_H0",
     ],
 )
 
@@ -480,9 +489,12 @@ def k2_c_gluon(
     MMA_O: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     CM_OUT: gl.constexpr = "",
+    H_IN_IS_H0: gl.constexpr = False,
 ):
     """Pass C: the output of one segment, head and BW-column block. CPL is the
-    number of chunks in one TDM load."""
+    number of chunks in one TDM load. ``h_in`` is the scan's K-first [K, V]
+    state per segment or, with ``H_IN_IS_H0``, the caller's initial state per
+    sequence, laid out as ``STATE_V_FIRST`` says."""
     NW: gl.constexpr = gl.num_warps()
     gl.static_assert(NW == 4 or NW == 8)
     gl.static_assert(C == 32 and K == 128 and V == K)
@@ -513,12 +525,12 @@ def k2_c_gluon(
         [[BW, 8]], [G, BW], [1, 0]
     )
     i_w, i_seg, i_h, chunk_base, n_chunks, tok_base, n_tok = _program(
-        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS
+        seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, H, NUM_XCDS, V // BW
     )
     # Read up front: past the output stores the compiler must assume these
     # words may have changed. When neither is set the pointers are null and
     # must not be read.
-    if STORE_FINAL or PAGED_CACHE:
+    if STORE_FINAL or PAGED_CACHE or H_IN_IS_H0:
         i_n = gl.load(seg_seq + i_seg).to(gl.int64)
     if STORE_FINAL:
         is_last = gl.load(seg_is_last + i_seg)
@@ -568,6 +580,10 @@ def k2_c_gluon(
             vk_off,
             mask=(o_w[:, None] < V) & (o_k[None, :] < K) & take,
             other=0.0,
+        ).to(gl.float32)
+    elif H_IN_IS_H0:
+        h = gl.amd.gfx1250.buffer_load(
+            h_in + (i_n * H + i_h) * (K * V), vk_off if STATE_V_FIRST else kv_off
         ).to(gl.float32)
     elif HAS_H_IN:
         h = gl.amd.gfx1250.buffer_load(
@@ -725,6 +741,7 @@ def gluon_k2_c(
     STORE_FINAL,
     STATE_V_FIRST,
     CM_OUT="",
+    H_IN_IS_H0=False,
 ):
     paged = state_cache is not None
     return k2_c_fast[(V // BW, num_segs * H)](
@@ -764,5 +781,6 @@ def gluon_k2_c(
         **build_layouts(num_warps),
         NUM_XCDS=_num_xcds(),
         CM_OUT=CM_OUT,
+        H_IN_IS_H0=h_in is not None and H_IN_IS_H0,
         num_warps=num_warps,
     )
